@@ -179,6 +179,19 @@ impl CpuState {
         }
     }
 
+    /// Direction flag (RFLAGS.DF, bit 10) — SDM Vol. 1 §3.4.3.
+    pub fn direction_flag(&self) -> bool {
+        self.rflags & (1 << 10) != 0
+    }
+
+    pub fn set_direction_flag(&mut self, on: bool) {
+        if on {
+            self.rflags |= 1 << 10;
+        } else {
+            self.rflags &= !(1 << 10);
+        }
+    }
+
     pub fn set_zf(&mut self, on: bool) {
         if on {
             self.rflags |= 1 << 6;

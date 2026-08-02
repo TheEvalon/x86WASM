@@ -347,6 +347,26 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_cf(!cf);
             cpu.set_ip16(next_ip);
         }
+        0xF8 => {
+            // CLC — Spec: Intel SDM Vol. 2 "CLC".
+            cpu.set_cf(false);
+            cpu.set_ip16(next_ip);
+        }
+        0xF9 => {
+            // STC — Spec: Intel SDM Vol. 2 "STC".
+            cpu.set_cf(true);
+            cpu.set_ip16(next_ip);
+        }
+        0xFC => {
+            // CLD — Spec: Intel SDM Vol. 2 "CLD".
+            cpu.set_direction_flag(false);
+            cpu.set_ip16(next_ip);
+        }
+        0xFD => {
+            // STD — Spec: Intel SDM Vol. 2 "STD".
+            cpu.set_direction_flag(true);
+            cpu.set_ip16(next_ip);
+        }
         0xEC => {
             let port = cpu.gpr_u16(CpuState::RDX);
             let v = bus.port_in_u8(port)?;
@@ -1138,6 +1158,39 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8E)));
         assert_eq!(cpu.cs.selector, 0); // unchanged
+    }
+
+    /// CLC/STC toggle CF only; CLD/STD toggle DF only (SDM Vol. 2).
+    #[test]
+    fn clc_stc_cld_std() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF9; // STC
+        mem[1] = 0xF8; // CLC
+        mem[2] = 0xFD; // STD
+        mem[3] = 0xFC; // CLD
+        mem[4] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_cf(false);
+        cpu.set_direction_flag(false);
+        let other = cpu.rflags;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap(); // STC
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & !1, other & !1);
+
+        step(&mut cpu, &mut bus).unwrap(); // CLC
+        assert_eq!(cpu.rflags & 1, 0);
+
+        step(&mut cpu, &mut bus).unwrap(); // STD
+        assert!(cpu.direction_flag());
+        assert_eq!(cpu.rflags & 1, 0); // CF untouched
+
+        step(&mut cpu, &mut bus).unwrap(); // CLD
+        assert!(!cpu.direction_flag());
     }
 
     /// MOV AX, CS is valid (read CS selector).

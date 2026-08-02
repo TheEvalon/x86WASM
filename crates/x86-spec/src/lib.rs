@@ -399,6 +399,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "CMC",
     },
     InstrDef {
+        mnemonic: "CLC",
+        opcode: 0xF8,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "CLC",
+    },
+    InstrDef {
+        mnemonic: "STC",
+        opcode: 0xF9,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "STC",
+    },
+    InstrDef {
         mnemonic: "CLI",
         opcode: 0xFA,
         encoding: Encoding::None,
@@ -411,6 +425,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
         encoding: Encoding::None,
         width: Width::OsZ,
         sdm: "STI",
+    },
+    InstrDef {
+        mnemonic: "CLD",
+        opcode: 0xFC,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "CLD",
+    },
+    InstrDef {
+        mnemonic: "STD",
+        opcode: 0xFD,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "STD",
     },
 ];
 
@@ -442,7 +470,8 @@ mod tests {
     fn subset_includes_hello_opcodes() {
         for op in [
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
-            0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E,
+            0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0xF8, 0xF9,
+            0xFC, 0xFD,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

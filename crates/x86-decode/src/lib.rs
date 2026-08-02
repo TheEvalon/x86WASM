@@ -410,4 +410,13 @@ mod tests {
         assert_eq!(decode(&[0x8C]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0x8E]), Err(DecodeError::Truncated));
     }
+
+    #[test]
+    fn decode_flag_ops() {
+        // Intel SDM Vol. 2: CLC/STC/CLD/STD — F8/F9/FC/FD
+        assert_eq!(decode(&[0xF8]).unwrap().mnemonic, "CLC");
+        assert_eq!(decode(&[0xF9]).unwrap().mnemonic, "STC");
+        assert_eq!(decode(&[0xFC]).unwrap().mnemonic, "CLD");
+        assert_eq!(decode(&[0xFD]).unwrap().mnemonic, "STD");
+    }
 }
