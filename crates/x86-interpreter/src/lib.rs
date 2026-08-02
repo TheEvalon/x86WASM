@@ -76,9 +76,10 @@ pub trait Bus {
 ///   architectural `#UD` (valid-but-unimplemented primary opcodes — see
 ///   [`real_mode_primary_opcode_is_ud`])
 /// - `MemoryFault`: bus errors that could not be classified as `#GP`/`#SS`
-///   (code fetch, IVT delivery failure)
+///   (IVT delivery failure; stack helpers used during delivery stay unchecked)
 /// - `Unsupported`: valid-but-unimplemented forms reached after decode
-///   (remaining opsize-32 niche forms if any; D3 CL + IMUL 69/6B under 0x66 landed)
+///   (ENTER/PUSHA/POPA/LEAVE with address-size 32 under 0x67 — needs ESP stack;
+///   MOVSQ/… qword strings are not architectural in REX-less real mode)
 /// - `ArchFault`: internal only — converted to IVT delivery inside [`step`];
 ///   never returned to callers of [`step`]/[`run`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -1545,7 +1546,7 @@ fn service_pending_external_interrupt(
 /// - Returns `Ok(true)` if a maskable external interrupt suspended the repeat
 ///   (IP already at the handler; CX/SI/DI preserved for resume).
 ///
-/// Unsupported here: asize 64 (RCX); non-REP per-instruction IRQ poll.
+/// Unsupported here: asize 64 (RCX). Per-instruction IRQ poll is in [`step`].
 fn exec_string_with_rep<F>(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -2027,10 +2028,13 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
             return Err(ExecError::Decode(DecodeError::TooLong));
         }
         // Real-mode fetch still uses IP low 16 bits; enforce cached CS.limit.
-        // Spec: Intel SDM Vol. 3 §5.3; §6.15 (#GP). Bus MemoryFault stays host error.
+        // Spec: Intel SDM Vol. 3 §5.3; §6.15 (#GP). Bus MemoryFault → #GP (CS).
         let ip = u64::from(cpu.ip16()).wrapping_add(buf.len() as u64) & 0xFFFF;
         let addr = seg_linear_checked(&cpu.cs, ip, 1, false)?;
-        buf.push(bus.read_u8(addr)?);
+        buf.push(
+            bus.read_u8(addr)
+                .map_err(|e| classify_mem_fault(e, false))?,
+        );
         match decode(&buf) {
             Ok(insn) => return Ok(insn),
             Err(DecodeError::Truncated) => continue,
@@ -2116,8 +2120,16 @@ fn step_two_byte(
 }
 
 /// Execute a single instruction at CS:IP.
+///
+/// When `IF=1`, services a latched/polled external IRQ before fetch/decode so
+/// non-REP instructions are interruptible (REP also polls between iterations).
+/// Spec: Intel SDM Vol. 3 §6.8.1 (maskable interrupts when IF=1).
 pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     if cpu.halted {
+        return Ok(());
+    }
+    // Per-instruction external IRQ poll (PIC stub via pending_irq / Bus).
+    if service_pending_external_interrupt(cpu, bus)? {
         return Ok(());
     }
     match step_inner(cpu, bus) {
@@ -2497,7 +2509,11 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // ENTER/ENTERD iw, ib — nesting level = imm8 mod 32.
             // Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5 / §3.6; Ch. 2 (66H).
             // Address-size 16: SP/BP used for stack walks; opsize selects word vs dword.
-            // Unsupported here: address-size 32/64; protected-mode.
+            // Unsupported here: address-size 32 (0x67 → ESP/EBP stack; push helpers
+            // are SP-only); asize 64; protected-mode.
+            if asize32(&insn) {
+                return Err(ExecError::Unsupported(op));
+            }
             let alloc = insn.immediate as u16;
             let nesting = (insn.displacement as u8) & 0x1F;
             if opsz32(&insn) {
@@ -2544,7 +2560,10 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xC9 => {
             // LEAVE — Spec: Intel SDM Vol. 2 "LEAVE"; Ch. 2 (66H).
             // Address-size 16: SP ← BP; opsize selects BP vs EBP pop width.
-            // Unsupported here: address-size 32/64.
+            // Unsupported here: address-size 32 (0x67 → ESP←EBP); asize 64.
+            if asize32(&insn) {
+                return Err(ExecError::Unsupported(op));
+            }
             let bp = cpu.gpr_u16(CpuState::RBP);
             cpu.set_gpr_u16(CpuState::RSP, bp);
             if opsz32(&insn) {
@@ -3265,7 +3284,11 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // PUSHA/PUSHAD — push AX…DI / EAX…EDI; Temp = SP/ESP before pushes.
             // Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD"; Ch. 2 (66H).
             // Address-size 16: Temp ← SP (zero-extended into dword slot for PUSHAD).
-            // Unsupported here: address-size 32/64.
+            // Unsupported here: address-size 32 (0x67 → ESP stack / Temp←ESP);
+            // asize 64. Stack push helpers remain SP-only in this slice.
+            if asize32(&insn) {
+                return Err(ExecError::Unsupported(op));
+            }
             if opsz32(&insn) {
                 let temp = u32::from(cpu.gpr_u16(CpuState::RSP));
                 push32(cpu, bus, cpu.gpr_u32(CpuState::RAX))?;
@@ -3292,7 +3315,10 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x61 => {
             // POPA/POPAD — pop DI…AX / EDI…EAX; discard saved SP/ESP slot.
             // Spec: Intel SDM Vol. 2 "POPA/POPAD"; Ch. 2 (66H).
-            // Unsupported here: address-size 32/64.
+            // Unsupported here: address-size 32 (0x67 → ESP stack); asize 64.
+            if asize32(&insn) {
+                return Err(ExecError::Unsupported(op));
+            }
             if opsz32(&insn) {
                 let di = pop32(cpu, bus)?;
                 let si = pop32(cpu, bus)?;
@@ -7290,7 +7316,7 @@ mod tests {
 
     /// Real-mode MemoryFault → #SS (vector 12) when the access uses SS; #GP (13) otherwise.
     /// Spec: Intel SDM Vol. 3 §6.4, §6.15 (#SS/#GP).
-    /// Unclear / not classified here: code fetch, IVT delivery MemoryFault.
+    /// Remaining host MemoryFault: IVT delivery stack/IVT bus errors (unchecked pushes).
     #[test]
     fn memory_fault_ss_gp_via_ivt() {
         // --- #SS: PUSH AX writes SS:SP-2 at poisoned linear address ---
@@ -11131,5 +11157,131 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00);
         assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0x2000);
+    }
+
+    /// Non-REP instruction: external IRQ when IF=1 is serviced before fetch/execute.
+    /// Spec: Intel SDM Vol. 3 §6.8.1 — saved IP is the interrupted instruction.
+    #[test]
+    fn non_rep_external_irq_before_instruction() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0x20 * 4] = 0x00;
+        mem[0x20 * 4 + 1] = 0x0E;
+        mem[0x20 * 4 + 2] = 0x00;
+        mem[0x20 * 4 + 3] = 0x00;
+        mem[0] = 0x90; // NOP — must not execute
+        mem[0xE00] = 0xF4;
+        mem[0x1000] = 0x00; // sentinel; NOP must not touch memory
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        cpu.request_interrupt(0x20);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), 0x0E00);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(cpu.pending_irq, None);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // saved IP = NOP
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+    }
+
+    /// IF=0: pending IRQ stays latched; non-REP instruction runs normally.
+    #[test]
+    fn non_rep_external_irq_ignored_when_if_clear() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x90; // NOP
+        mem[1] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(false);
+        cpu.request_interrupt(0x20);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), 1);
+        assert_eq!(cpu.pending_irq, Some(0x20));
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    /// Code-fetch bus MemoryFault → #GP via IVT (same classify as CS limit fault).
+    /// Spec: Intel SDM Vol. 3 §6.15 (#GP); Vol. 1 §3.3.4 (instruction fetch).
+    #[test]
+    fn code_fetch_memory_fault_gp_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+        mem[0] = 0x90; // NOP at poisoned fetch address
+        mem[0xD00] = 0xF4;
+        let poison = 0u64; // CS.base=0, IP=0 → linear 0
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        let mut bus = PoisonBus {
+            mem,
+            poison,
+            tripped: false,
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // fault IP
+        assert!(!cpu.interrupt_flag());
+    }
+
+    /// ENTER with address-size override (0x67) is Unsupported — needs ESP stack path.
+    /// Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §3.6 (stack address-size).
+    #[test]
+    fn enter_asize32_unsupported() {
+        let mut mem = vec![0u8; 0x10000];
+        // 67 C8 08 00 00 = ENTER 8, 0 with asize32
+        mem[0] = 0x67;
+        mem[1] = 0xC8;
+        mem[2] = 0x08;
+        mem[3] = 0x00;
+        mem[4] = 0x00;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+        let err = step(&mut cpu, &mut bus).unwrap_err();
+        assert_eq!(err, ExecError::Unsupported(0xC8));
+        assert_eq!(cpu.ip16(), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    /// PUSHA with address-size override (0x67) is Unsupported — needs ESP stack path.
+    /// Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD"; Vol. 1 §3.6 (stack address-size).
+    #[test]
+    fn pusha_asize32_unsupported() {
+        let mut mem = vec![0u8; 0x10000];
+        // 67 60 = PUSHA with asize32
+        mem[0] = 0x67;
+        mem[1] = 0x60;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+        let err = step(&mut cpu, &mut bus).unwrap_err();
+        assert_eq!(err, ExecError::Unsupported(0x60));
+        assert_eq!(cpu.ip16(), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
     }
 }
