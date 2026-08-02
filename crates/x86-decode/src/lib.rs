@@ -405,14 +405,25 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 i += 3;
             }
             Encoding::Ptr16_16 => {
-                // Far pointer: offset (imm16) then segment; segment stored in displacement.
-                // Spec: Intel SDM Vol. 2, CALL/JMP far ptr16:16.
-                if i + 3 >= bytes.len() {
-                    return Err(DecodeError::Truncated);
+                // Far pointer: offset then segment (segment in `displacement`).
+                // Spec: Intel SDM Vol. 2 CALL/JMP far ptr16:16 / ptr16:32; Ch. 2 (66H).
+                // Operand-size 16 → offset16+selector16; 0x66 → offset32+selector16.
+                if prefixes.op_size_override {
+                    if i + 5 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate =
+                        i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    displacement = i32::from(u16::from_le_bytes([bytes[i + 4], bytes[i + 5]]));
+                    i += 6;
+                } else {
+                    if i + 3 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                    displacement = i32::from(u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]));
+                    i += 4;
                 }
-                immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
-                displacement = i32::from(u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]));
-                i += 4;
             }
             Encoding::None | Encoding::Modrm | Encoding::OpcodeReg => {}
         }
@@ -600,6 +611,27 @@ mod tests {
         assert_eq!(d.immediate, 0x1234);
         assert_eq!(d.displacement, 0xF000);
         assert_eq!(d.length, 5);
+    }
+
+    #[test]
+    fn decode_call_jmp_far_ptr16_32_opsize() {
+        // Intel SDM Vol. 2: CALL/JMP ptr16:32 with 66H — offset32 then selector16.
+        let d = decode(&[0x66, 0x9A, 0x78, 0x56, 0x34, 0x12, 0x00, 0xF0]).unwrap();
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.mnemonic, "CALL_FAR");
+        assert_eq!(d.immediate, 0x1234_5678u32 as i32);
+        assert_eq!(d.displacement, 0xF000);
+        assert_eq!(d.length, 8);
+        let d = decode(&[0x66, 0xEA, 0x00, 0x02, 0x00, 0x00, 0x00, 0x10]).unwrap();
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.mnemonic, "JMP_FAR");
+        assert_eq!(d.immediate, 0x0000_0200);
+        assert_eq!(d.displacement, 0x1000);
+        assert_eq!(d.length, 8);
+        assert_eq!(
+            decode(&[0x66, 0x9A, 0x00, 0x00, 0x00, 0x00]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     #[test]
@@ -1430,8 +1462,17 @@ mod tests {
         assert_eq!(d.mnemonic, "TEST");
         assert_eq!(d.immediate, 0x00FF);
         assert_eq!(d.length, 3);
+        // 66 A9 id = TEST EAX,imm32 (SDM Vol. 2 TEST; Ch. 2).
+        let d = decode(&[0x66, 0xA9, 0xEF, 0xBE, 0xAD, 0xDE]).unwrap();
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.immediate, 0xDEAD_BEEFu32 as i32);
+        assert_eq!(d.length, 6);
         assert_eq!(decode(&[0xA8]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0xA9, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(
+            decode(&[0x66, 0xA9, 0x00, 0x00]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     #[test]

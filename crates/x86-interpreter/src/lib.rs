@@ -78,8 +78,8 @@ pub trait Bus {
 /// - `MemoryFault`: bus errors that could not be classified as `#GP`/`#SS`
 ///   (code fetch, IVT delivery failure)
 /// - `Unsupported`: valid-but-unimplemented forms reached after decode
-///   (remaining opsize-32 opcodes — INC/DEC r32 40–4F / FF, TEST EAX imm32 A9,
-///   CWDE/CDQ, XCHG EAX,r32, LES/LDS r32, BOUND r32, far ptr16:32, …)
+///   (remaining opsize-32: MOV moffs EAX A1/A3, POP r/m32 8F, MOV r32←Sreg
+///   zero-extend 8C, Group2/3 opsize-32 D1/C1/F7, …)
 /// - `ArchFault`: internal only — converted to IVT delivery inside [`step`];
 ///   never returned to callers of [`step`]/[`run`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -1619,6 +1619,27 @@ fn read_far_ptr16(
     Ok((offset, selector))
 }
 
+/// Read far pointer `m16:32` (offset32 then selector16) for LES/LDS opsize-32.
+/// Spec: Intel SDM Vol. 2 LES/LDS; Ch. 2 (66H).
+fn read_far_ptr32(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+) -> Result<(u32, u16), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        return Err(ExecError::Unsupported(insn.opcode));
+    }
+    let (addr, _, uses_ss) = ea(cpu, insn, 6)?;
+    let offset = bus
+        .read_u32(addr)
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    let selector = bus
+        .read_u16(addr.wrapping_add(4))
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    Ok((offset, selector))
+}
+
 /// SF/ZF/PF for shift results (SHL/SHR/SAR). AF undefined — left unchanged.
 /// Spec: Intel SDM Vol. 2 SAL/SAR/SHL/SHR — Flags Affected.
 fn set_shift_result_flags_u8(cpu: &mut CpuState, result: u8) {
@@ -2043,27 +2064,51 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x90 => cpu.set_ip16(next_ip),
         0x91..=0x97 => {
-            // XCHG AX, r16 — Spec: Intel SDM Vol. 2 "XCHG" (opcode 90+rw; 90 is NOP).
-            // Unsupported here: opsize 32 (XCHG EAX,r32); REX.W (XCHG RAX,r64).
+            // XCHG AX/EAX, r16/r32 — Spec: Intel SDM Vol. 2 "XCHG"; Ch. 2 (66H).
+            // Opcode 90 is NOP (XCHG AX/EAX,AX/EAX). Unsupported: REX.W (XCHG RAX,r64).
             let idx = (op - 0x90) as usize;
-            let ax = cpu.ax();
-            let other = cpu.gpr_u16(idx);
-            cpu.set_ax(other);
-            cpu.set_gpr_u16(idx, ax);
+            if opsz32(&insn) {
+                let eax = cpu.eax();
+                let other = cpu.gpr_u32(idx);
+                cpu.set_eax(other);
+                cpu.set_gpr_u32(idx, eax);
+            } else {
+                let ax = cpu.ax();
+                let other = cpu.gpr_u16(idx);
+                cpu.set_ax(other);
+                cpu.set_gpr_u16(idx, ax);
+            }
             cpu.set_ip16(next_ip);
         }
         0x98 => {
-            // CBW — sign-extend AL into AX. Spec: Intel SDM Vol. 2 "CBW/CWDE/CDQE".
-            // Unsupported here: CWDE (opsize 32), CDQE (REX.W).
-            let al = cpu.al() as i8 as i16 as u16;
-            cpu.set_ax(al);
+            // CBW/CWDE — Spec: Intel SDM Vol. 2 "CBW/CWDE/CDQE"; Ch. 2 (66H).
+            // Unsupported here: CDQE (REX.W).
+            if opsz32(&insn) {
+                // CWDE: sign-extend AX into EAX.
+                let eax = cpu.ax() as i16 as i32 as u32;
+                cpu.set_eax(eax);
+            } else {
+                // CBW: sign-extend AL into AX.
+                let al = cpu.al() as i8 as i16 as u16;
+                cpu.set_ax(al);
+            }
             cpu.set_ip16(next_ip);
         }
         0x99 => {
-            // CWD — sign-extend AX into DX:AX. Spec: Intel SDM Vol. 2 "CWD/CDQ/CQO".
-            // Unsupported here: CDQ (opsize 32), CQO (REX.W).
-            let dx = if cpu.ax() & 0x8000 != 0 { 0xFFFFu16 } else { 0 };
-            cpu.set_gpr_u16(CpuState::RDX, dx);
+            // CWD/CDQ — Spec: Intel SDM Vol. 2 "CWD/CDQ/CQO"; Ch. 2 (66H).
+            // Unsupported here: CQO (REX.W).
+            if opsz32(&insn) {
+                // CDQ: sign-extend EAX into EDX:EAX.
+                let edx = if cpu.eax() & 0x8000_0000 != 0 {
+                    0xFFFF_FFFFu32
+                } else {
+                    0
+                };
+                cpu.set_gpr_u32(CpuState::RDX, edx);
+            } else {
+                let dx = if cpu.ax() & 0x8000 != 0 { 0xFFFFu16 } else { 0 };
+                cpu.set_gpr_u16(CpuState::RDX, dx);
+            }
             cpu.set_ip16(next_ip);
         }
         0xF5 => {
@@ -2156,13 +2201,18 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0xEA => {
-            // JMP far ptr16:16 — real-address mode.
-            // Spec: Intel SDM Vol. 2 "JMP" (ptr16:16).
-            // Unsupported here: protected-mode / task-gate forms; opsize 32 (ptr16:32).
-            let offset = insn.immediate as u16;
+            // JMP far ptr16:16 / ptr16:32 — real-address mode.
+            // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H).
+            // Unsupported here: protected-mode / task-gate forms.
+            // Code fetch still uses IP16 (CS:IP); offset truncated to 16 bits.
+            let offset = if opsz32(&insn) {
+                insn.immediate as u32
+            } else {
+                u32::from(insn.immediate as u16)
+            };
             let selector = insn.displacement as u16;
             cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-            cpu.set_ip16(offset);
+            cpu.set_ip16(offset as u16);
         }
         0xE8 => {
             // CALL near rel16/rel32 — Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H).
@@ -2205,64 +2255,102 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0xC4 => {
-            // LES r16, m16:16 — load offset into r16 and selector into ES.
-            // Spec: Intel SDM Vol. 2 "LES".
+            // LES r16/r32, m16:16/m16:32 — load offset into r and selector into ES.
+            // Spec: Intel SDM Vol. 2 "LES"; Ch. 2 (66H).
             // Register form (mod=11) → #UD (Vol. 3 §6.15).
-            // Unsupported here: opsize 32 (LES r32); protected-mode descriptor checks.
+            // Unsupported here: protected-mode descriptor checks.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
-            cpu.set_gpr_u16(m.reg as usize, offset);
-            cpu.es.load_real_mode_selector(selector);
+            if opsz32(&insn) {
+                let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
+                cpu.set_gpr_u32(m.reg as usize, offset);
+                cpu.es.load_real_mode_selector(selector);
+            } else {
+                let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
+                cpu.set_gpr_u16(m.reg as usize, offset);
+                cpu.es.load_real_mode_selector(selector);
+            }
             cpu.set_ip16(next_ip);
         }
         0xC5 => {
-            // LDS r16, m16:16 — load offset into r16 and selector into DS.
-            // Spec: Intel SDM Vol. 2 "LDS".
+            // LDS r16/r32, m16:16/m16:32 — load offset into r and selector into DS.
+            // Spec: Intel SDM Vol. 2 "LDS"; Ch. 2 (66H).
             // Register form (mod=11) → #UD (Vol. 3 §6.15).
-            // Unsupported here: opsize 32 (LDS r32); protected-mode descriptor checks.
+            // Unsupported here: protected-mode descriptor checks.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
-            cpu.set_gpr_u16(m.reg as usize, offset);
-            cpu.ds.load_real_mode_selector(selector);
+            if opsz32(&insn) {
+                let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
+                cpu.set_gpr_u32(m.reg as usize, offset);
+                cpu.ds.load_real_mode_selector(selector);
+            } else {
+                let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
+                cpu.set_gpr_u16(m.reg as usize, offset);
+                cpu.ds.load_real_mode_selector(selector);
+            }
             cpu.set_ip16(next_ip);
         }
         0x9A => {
-            // CALL far ptr16:16 — real-address mode.
-            // Spec: Intel SDM Vol. 2 "CALL" (ptr16:16). Push CS then return IP; load CS:IP.
-            // Unsupported here: protected-mode privilege / gate transfer; opsize 32 (ptr16:32).
-            let offset = insn.immediate as u16;
+            // CALL far ptr16:16 / ptr16:32 — real-address mode.
+            // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H).
+            // Real-address OperandSize=32: push CS (16) then EIP (32) — 6-byte frame.
+            // Unsupported here: protected-mode privilege / gate transfer.
             let selector = insn.displacement as u16;
-            push16(cpu, bus, cpu.cs.selector)?;
-            push16(cpu, bus, next_ip)?;
-            cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-            cpu.set_ip16(offset);
+            if opsz32(&insn) {
+                let offset = insn.immediate as u32;
+                push16(cpu, bus, cpu.cs.selector)?;
+                push32(cpu, bus, u32::from(next_ip))?;
+                cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                cpu.set_ip16(offset as u16);
+            } else {
+                let offset = insn.immediate as u16;
+                push16(cpu, bus, cpu.cs.selector)?;
+                push16(cpu, bus, next_ip)?;
+                cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                cpu.set_ip16(offset);
+            }
         }
         0xCA => {
             // RETF iw — far return with stack release.
-            // Spec: Intel SDM Vol. 2 "RET" (far, imm16).
-            // Unsupported here: opsize 32; protected-mode privilege checks.
-            let ip = pop16(cpu, bus)?;
-            let cs_sel = pop16(cpu, bus)?;
+            // Spec: Intel SDM Vol. 2 "RET" (far, imm16); Ch. 2 (66H).
+            // Opsize 32: pop EIP32 then CS16; Imm16 release always.
+            // Unsupported here: protected-mode privilege checks.
             let release = insn.immediate as u16;
-            let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
-            cpu.set_gpr_u16(CpuState::RSP, sp);
-            cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
-            cpu.set_ip16(ip);
+            if opsz32(&insn) {
+                let eip = pop32(cpu, bus)?;
+                let cs_sel = pop16(cpu, bus)?;
+                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
+                cpu.set_gpr_u16(CpuState::RSP, sp);
+                cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+                cpu.set_ip16(eip as u16);
+            } else {
+                let ip = pop16(cpu, bus)?;
+                let cs_sel = pop16(cpu, bus)?;
+                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
+                cpu.set_gpr_u16(CpuState::RSP, sp);
+                cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+                cpu.set_ip16(ip);
+            }
         }
         0xCB => {
-            // RETF — far return, 16-bit stack frame (pop IP then CS).
-            // Spec: Intel SDM Vol. 2 "RET" (far).
-            // Unsupported here: opsize 32.
-            let ip = pop16(cpu, bus)?;
-            let cs_sel = pop16(cpu, bus)?;
-            cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
-            cpu.set_ip16(ip);
+            // RETF — far return.
+            // Spec: Intel SDM Vol. 2 "RET" (far); Ch. 2 (66H).
+            // Opsize 16: pop IP then CS; opsize 32: pop EIP then CS (6-byte frame).
+            if opsz32(&insn) {
+                let eip = pop32(cpu, bus)?;
+                let cs_sel = pop16(cpu, bus)?;
+                cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+                cpu.set_ip16(eip as u16);
+            } else {
+                let ip = pop16(cpu, bus)?;
+                let cs_sel = pop16(cpu, bus)?;
+                cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+                cpu.set_ip16(ip);
+            }
         }
         0xC8 => {
             // ENTER/ENTERD iw, ib — nesting level = imm8 mod 32.
@@ -2747,80 +2835,135 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xFF => {
-            // Group 5 r/m16 — INC/DEC/CALL/JMP/PUSH.
-            // Spec: Intel SDM Vol. 2 "INC"/"DEC"/"CALL"/"JMP"/"PUSH"; opcode map Group 5.
-            // /7 reserved and far CALL/JMP register forms → #UD (Vol. 3 §6.15).
-            // Unsupported here: opsize 32 (INC/DEC r/m32, PUSH r/m32, near/far m16:32);
-            // protected-mode transfers.
+            // Group 5 r/m16|32 — INC/DEC/CALL/JMP/PUSH.
+            // Spec: Intel SDM Vol. 2 "INC"/"DEC"/"CALL"/"JMP"/"PUSH"; opcode map Group 5;
+            // Ch. 2 (66H). /7 reserved and far CALL/JMP register forms → #UD (Vol. 3 §6.15).
+            // Unsupported here: protected-mode transfers.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let op32 = opsz32(&insn);
             match m.reg {
                 0 | 1 => {
-                    let v = read_rm_u16(cpu, bus, &insn)?;
                     let saved_cf = cpu.rflags & 1 != 0;
-                    if m.reg == 0 {
-                        let r = v.wrapping_add(1);
-                        write_rm_u16(cpu, bus, &insn, r)?;
-                        set_add_flags_u16(cpu, v, 1, r);
+                    if op32 {
+                        let v = read_rm_u32(cpu, bus, &insn)?;
+                        if m.reg == 0 {
+                            let r = v.wrapping_add(1);
+                            write_rm_u32(cpu, bus, &insn, r)?;
+                            set_add_flags_u32(cpu, v, 1, r);
+                        } else {
+                            let r = v.wrapping_sub(1);
+                            write_rm_u32(cpu, bus, &insn, r)?;
+                            set_sub_flags_u32(cpu, v, 1, r);
+                        }
                     } else {
-                        let r = v.wrapping_sub(1);
-                        write_rm_u16(cpu, bus, &insn, r)?;
-                        set_sub_flags_u16(cpu, v, 1, r);
+                        let v = read_rm_u16(cpu, bus, &insn)?;
+                        if m.reg == 0 {
+                            let r = v.wrapping_add(1);
+                            write_rm_u16(cpu, bus, &insn, r)?;
+                            set_add_flags_u16(cpu, v, 1, r);
+                        } else {
+                            let r = v.wrapping_sub(1);
+                            write_rm_u16(cpu, bus, &insn, r)?;
+                            set_sub_flags_u16(cpu, v, 1, r);
+                        }
                     }
                     // INC/DEC do not modify CF (Intel SDM Vol. 2, INC/DEC).
                     cpu.set_cf(saved_cf);
                     cpu.set_ip16(next_ip);
                 }
                 2 => {
-                    // CALL r/m16 near absolute indirect.
-                    let target = read_rm_u16(cpu, bus, &insn)?;
-                    push16(cpu, bus, next_ip)?;
-                    cpu.set_ip16(target);
+                    // CALL r/m16|32 near absolute indirect.
+                    if op32 {
+                        let target = read_rm_u32(cpu, bus, &insn)?;
+                        push32(cpu, bus, u32::from(next_ip))?;
+                        cpu.set_ip16(target as u16);
+                    } else {
+                        let target = read_rm_u16(cpu, bus, &insn)?;
+                        push16(cpu, bus, next_ip)?;
+                        cpu.set_ip16(target);
+                    }
                 }
                 3 => {
-                    // CALL FAR m16:16 — absolute indirect far (memory only).
-                    // Spec: Intel SDM Vol. 2 "CALL" (m16:16); opcode map Group 5 /3.
-                    // Register form is invalid (#UD). Unsupported: opsize 32 (m16:32); gates.
+                    // CALL FAR m16:16 / m16:32 — absolute indirect far (memory only).
+                    // Spec: Intel SDM Vol. 2 "CALL"; opcode map Group 5 /3; Ch. 2 (66H).
+                    // Register form is invalid (#UD). Unsupported: protected-mode gates.
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
-                    let offset = bus
-                        .read_u16(addr)
-                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
-                    let selector = bus
-                        .read_u16(addr.wrapping_add(2))
-                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
-                    push16(cpu, bus, cpu.cs.selector)?;
-                    push16(cpu, bus, next_ip)?;
-                    cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-                    cpu.set_ip16(offset);
+                    if op32 {
+                        let (addr, _, uses_ss) = ea(cpu, &insn, 6)?;
+                        let offset = bus
+                            .read_u32(addr)
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        let selector = bus
+                            .read_u16(addr.wrapping_add(4))
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        push16(cpu, bus, cpu.cs.selector)?;
+                        push32(cpu, bus, u32::from(next_ip))?;
+                        cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                        cpu.set_ip16(offset as u16);
+                    } else {
+                        let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
+                        let offset = bus
+                            .read_u16(addr)
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        let selector = bus
+                            .read_u16(addr.wrapping_add(2))
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        push16(cpu, bus, cpu.cs.selector)?;
+                        push16(cpu, bus, next_ip)?;
+                        cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                        cpu.set_ip16(offset);
+                    }
                 }
                 4 => {
-                    // JMP r/m16 near absolute indirect.
-                    let target = read_rm_u16(cpu, bus, &insn)?;
-                    cpu.set_ip16(target);
+                    // JMP r/m16|32 near absolute indirect.
+                    if op32 {
+                        let target = read_rm_u32(cpu, bus, &insn)?;
+                        cpu.set_ip16(target as u16);
+                    } else {
+                        let target = read_rm_u16(cpu, bus, &insn)?;
+                        cpu.set_ip16(target);
+                    }
                 }
                 5 => {
-                    // JMP FAR m16:16 — absolute indirect far (memory only).
-                    // Spec: Intel SDM Vol. 2 "JMP" (m16:16); opcode map Group 5 /5.
-                    // Register form is invalid (#UD). Unsupported: opsize 32 (m16:32); gates.
+                    // JMP FAR m16:16 / m16:32 — absolute indirect far (memory only).
+                    // Spec: Intel SDM Vol. 2 "JMP"; opcode map Group 5 /5; Ch. 2 (66H).
+                    // Register form is invalid (#UD). Unsupported: protected-mode gates.
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
-                    let offset = bus
-                        .read_u16(addr)
-                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
-                    let selector = bus
-                        .read_u16(addr.wrapping_add(2))
-                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
-                    cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-                    cpu.set_ip16(offset);
+                    if op32 {
+                        let (addr, _, uses_ss) = ea(cpu, &insn, 6)?;
+                        let offset = bus
+                            .read_u32(addr)
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        let selector = bus
+                            .read_u16(addr.wrapping_add(4))
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                        cpu.set_ip16(offset as u16);
+                    } else {
+                        let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
+                        let offset = bus
+                            .read_u16(addr)
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        let selector = bus
+                            .read_u16(addr.wrapping_add(2))
+                            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                        cpu.set_ip16(offset);
+                    }
                 }
                 6 => {
-                    // PUSH r/m16 — value is read before SP decrement (incl. PUSH SP).
-                    let v = read_rm_u16(cpu, bus, &insn)?;
-                    push16(cpu, bus, v)?;
+                    // PUSH r/m16|32 — value is read before SP decrement (incl. PUSH SP).
+                    if op32 {
+                        let v = read_rm_u32(cpu, bus, &insn)?;
+                        push32(cpu, bus, v)?;
+                    } else {
+                        let v = read_rm_u16(cpu, bus, &insn)?;
+                        push16(cpu, bus, v)?;
+                    }
                     cpu.set_ip16(next_ip);
                 }
                 _ => return real_mode_ud(cpu, bus), // /7 reserved
@@ -2836,27 +2979,39 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0x40..=0x47 => {
-            // INC r16 — Spec: Intel SDM Vol. 2 "INC".
-            // Unsupported here: opsize 32 (INC r32 via 0x66 40–47).
+            // INC r16/r32 — Spec: Intel SDM Vol. 2 "INC"; Ch. 2 (66H).
             let idx = (op - 0x40) as usize;
-            let old = cpu.gpr_u16(idx);
-            let v = old.wrapping_add(1);
             let saved_cf = cpu.rflags & 1 != 0;
-            cpu.set_gpr_u16(idx, v);
-            set_add_flags_u16(cpu, old, 1, v);
+            if opsz32(&insn) {
+                let old = cpu.gpr_u32(idx);
+                let v = old.wrapping_add(1);
+                cpu.set_gpr_u32(idx, v);
+                set_add_flags_u32(cpu, old, 1, v);
+            } else {
+                let old = cpu.gpr_u16(idx);
+                let v = old.wrapping_add(1);
+                cpu.set_gpr_u16(idx, v);
+                set_add_flags_u16(cpu, old, 1, v);
+            }
             // INC does not modify CF (Intel SDM Vol. 2, INC).
             cpu.set_cf(saved_cf);
             cpu.set_ip16(next_ip);
         }
         0x48..=0x4F => {
-            // DEC r16 — Spec: Intel SDM Vol. 2 "DEC".
-            // Unsupported here: opsize 32 (DEC r32 via 0x66 48–4F).
+            // DEC r16/r32 — Spec: Intel SDM Vol. 2 "DEC"; Ch. 2 (66H).
             let idx = (op - 0x48) as usize;
-            let old = cpu.gpr_u16(idx);
-            let v = old.wrapping_sub(1);
             let saved_cf = cpu.rflags & 1 != 0;
-            cpu.set_gpr_u16(idx, v);
-            set_sub_flags_u16(cpu, old, 1, v);
+            if opsz32(&insn) {
+                let old = cpu.gpr_u32(idx);
+                let v = old.wrapping_sub(1);
+                cpu.set_gpr_u32(idx, v);
+                set_sub_flags_u32(cpu, old, 1, v);
+            } else {
+                let old = cpu.gpr_u16(idx);
+                let v = old.wrapping_sub(1);
+                cpu.set_gpr_u16(idx, v);
+                set_sub_flags_u16(cpu, old, 1, v);
+            }
             // DEC does not modify CF (Intel SDM Vol. 2, DEC).
             cpu.set_cf(saved_cf);
             cpu.set_ip16(next_ip);
@@ -2951,27 +3106,38 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x62 => {
-            // BOUND r16, m16&16 — signed index in reg vs lower/upper bounds in memory.
-            // Spec: Intel SDM Vol. 2 "BOUND"; Vol. 3 §6.15 (#BR — fault, vector 5).
+            // BOUND r16/r32, m16&16 / m32&32 — signed index vs lower/upper bounds.
+            // Spec: Intel SDM Vol. 2 "BOUND"; Vol. 3 §6.15 (#BR — fault, vector 5); Ch. 2.
             // Register form (mod=11) → #UD. #BR saved IP = BOUND instruction.
-            // Unsupported here: opsize 32 (BOUND r32, m32&32); protected mode; 64-bit (#UD).
-            if opsz32(&insn) {
-                return Err(ExecError::Unsupported(op));
-            }
+            // Unsupported here: protected mode; 64-bit (#UD).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
-            let lower = bus
-                .read_u16(addr)
-                .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
-            let upper = bus
-                .read_u16(addr.wrapping_add(2))
-                .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
-            let index = cpu.gpr_u16(m.reg as usize) as i16;
-            if index < lower || index > upper {
-                return real_mode_exception(cpu, bus, 5);
+            if opsz32(&insn) {
+                let (addr, _, uses_ss) = ea(cpu, &insn, 8)?;
+                let lower =
+                    bus.read_u32(addr)
+                        .map_err(|e| classify_mem_fault(e, uses_ss))? as i32;
+                let upper =
+                    bus.read_u32(addr.wrapping_add(4))
+                        .map_err(|e| classify_mem_fault(e, uses_ss))? as i32;
+                let index = cpu.gpr_u32(m.reg as usize) as i32;
+                if index < lower || index > upper {
+                    return real_mode_exception(cpu, bus, 5);
+                }
+            } else {
+                let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
+                let lower =
+                    bus.read_u16(addr)
+                        .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
+                let upper =
+                    bus.read_u16(addr.wrapping_add(2))
+                        .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
+                let index = cpu.gpr_u16(m.reg as usize) as i16;
+                if index < lower || index > upper {
+                    return real_mode_exception(cpu, bus, 5);
+                }
             }
             cpu.set_ip16(next_ip);
         }
@@ -3270,12 +3436,13 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xA9 => {
-            // TEST AX/EAX, imm16/imm32 — Spec: Intel SDM Vol. 2 "TEST".
-            // Unsupported here: opsize 32 (TEST EAX,imm32) — follow-up slice.
+            // TEST AX/EAX, imm16/imm32 — Spec: Intel SDM Vol. 2 "TEST"; Ch. 2 (66H).
+            // Flags: CF=OF=0; SF/ZF/PF from (AX/EAX & imm); AF undefined (cleared).
             if opsz32(&insn) {
-                return Err(ExecError::Unsupported(op));
+                set_logic_flags_u32(cpu, cpu.eax() & insn.immediate as u32);
+            } else {
+                set_logic_flags_u16(cpu, cpu.ax() & insn.immediate as u16);
             }
-            set_logic_flags_u16(cpu, cpu.ax() & insn.immediate as u16);
             cpu.set_ip16(next_ip);
         }
         0xC6 => {
@@ -9669,6 +9836,286 @@ mod tests {
 
         step(&mut cpu, &mut bus).unwrap(); // ADD EAX, 1
         assert_eq!(cpu.eax(), 1);
+    }
+
+    /// 0x66 tranche-3: INC/DEC r32, XCHG EAX,r32, CWDE/CDQ, TEST EAX,imm32.
+    /// Spec: Intel SDM Vol. 2 INC/DEC/XCHG/CBW/CWDE/CWD/CDQ/TEST; Ch. 2 (66H).
+    #[test]
+    fn opsize32_inc_dec_xchg_cwde_cdq_test_eax() {
+        let mut mem = vec![0u8; 0x10000];
+        // 66 40 = INC EAX
+        mem[0] = 0x66;
+        mem[1] = 0x40;
+        // 66 48 = DEC EAX
+        mem[2] = 0x66;
+        mem[3] = 0x48;
+        // 66 FF C3 = INC EBX (Group5 /0 r32)
+        mem[4] = 0x66;
+        mem[5] = 0xFF;
+        mem[6] = 0xC3;
+        // 66 FF CB = DEC EBX (Group5 /1 r32)
+        mem[7] = 0x66;
+        mem[8] = 0xFF;
+        mem[9] = 0xCB;
+        // 66 93 = XCHG EAX, EBX
+        mem[10] = 0x66;
+        mem[11] = 0x93;
+        // 66 98 = CWDE
+        mem[12] = 0x66;
+        mem[13] = 0x98;
+        // 66 99 = CDQ
+        mem[14] = 0x66;
+        mem[15] = 0x99;
+        // 66 A9 EF BE AD DE = TEST EAX, 0xDEADBEEF
+        mem[16] = 0x66;
+        mem[17] = 0xA9;
+        mem[18] = 0xEF;
+        mem[19] = 0xBE;
+        mem[20] = 0xAD;
+        mem[21] = 0xDE;
+        mem[22] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_eax(0x0FFF_FFFF);
+        cpu.set_gpr_u32(CpuState::RBX, 0x10);
+        cpu.set_cf(true); // INC/DEC must preserve CF
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // INC EAX
+        assert_eq!(cpu.eax(), 0x1000_0000);
+        assert!(cpu.rflags & 1 != 0); // CF preserved
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF clear
+        assert_eq!(cpu.rflags & (1 << 7), 0); // SF clear
+
+        step(&mut cpu, &mut bus).unwrap(); // DEC EAX
+        assert_eq!(cpu.eax(), 0x0FFF_FFFF);
+        assert!(cpu.rflags & 1 != 0);
+
+        step(&mut cpu, &mut bus).unwrap(); // INC EBX
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x11);
+        step(&mut cpu, &mut bus).unwrap(); // DEC EBX
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x10);
+
+        step(&mut cpu, &mut bus).unwrap(); // XCHG EAX, EBX
+        assert_eq!(cpu.eax(), 0x10);
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x0FFF_FFFF);
+
+        // AX = 0x8000 → CWDE → EAX = 0xFFFF_8000
+        cpu.set_eax(0x0000_8000);
+        step(&mut cpu, &mut bus).unwrap(); // CWDE
+        assert_eq!(cpu.eax(), 0xFFFF_8000);
+
+        step(&mut cpu, &mut bus).unwrap(); // CDQ
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0xFFFF_FFFF);
+        assert_eq!(cpu.eax(), 0xFFFF_8000);
+
+        // TEST EAX, 0xDEADBEEF → EAX & imm = 0xDEAD_8000; SF=1 ZF=0
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 0xFFFF_8000); // unchanged
+        assert_eq!(cpu.rflags & 1, 0); // CF cleared
+        assert_eq!(cpu.rflags & (1 << 11), 0); // OF cleared
+        assert_ne!(cpu.rflags & (1 << 7), 0); // SF
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF
+    }
+
+    /// 0x66 LES/LDS r32,m16:32 — Spec: Intel SDM Vol. 2 LES/LDS; Ch. 2 (66H).
+    #[test]
+    fn opsize32_les_lds_r32() {
+        let mut mem = vec![0u8; 0x10000];
+        // Far ptr32 at 0x2000: offset 0x12345678, selector 0x1000
+        mem[0x2000] = 0x78;
+        mem[0x2001] = 0x56;
+        mem[0x2002] = 0x34;
+        mem[0x2003] = 0x12;
+        mem[0x2004] = 0x00;
+        mem[0x2005] = 0x10;
+        // Far ptr32 at 0x3000: offset 0xABCDEF01, selector 0xF000
+        mem[0x3000] = 0x01;
+        mem[0x3001] = 0xEF;
+        mem[0x3002] = 0xCD;
+        mem[0x3003] = 0xAB;
+        mem[0x3004] = 0x00;
+        mem[0x3005] = 0xF0;
+        // 66 C4 06 00 20 = LES EAX, [0x2000]
+        mem[0] = 0x66;
+        mem[1] = 0xC4;
+        mem[2] = 0x06;
+        mem[3] = 0x00;
+        mem[4] = 0x20;
+        // 66 C5 1E 00 30 = LDS EBX, [0x3000]
+        mem[5] = 0x66;
+        mem[6] = 0xC5;
+        mem[7] = 0x1E;
+        mem[8] = 0x00;
+        mem[9] = 0x30;
+        mem[10] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0x9999);
+        cpu.rip = 0;
+        cpu.rflags = 0x246;
+        let flags_before = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 0x1234_5678);
+        assert_eq!(cpu.es.selector, 0x1000);
+        assert_eq!(cpu.es.base, 0x1000u64 << 4);
+        assert_eq!(cpu.rflags, flags_before);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0xABCD_EF01);
+        assert_eq!(cpu.ds.selector, 0xF000);
+        assert_eq!(cpu.ds.base, 0xF000u64 << 4);
+        assert_eq!(cpu.rflags, flags_before);
+    }
+
+    /// 0x66 BOUND r32,m32&32 — Spec: Intel SDM Vol. 2 BOUND; Vol. 3 §6.15 (#BR).
+    #[test]
+    fn opsize32_bound_r32() {
+        let mut mem = vec![0u8; 0x10000];
+        // Bounds at 0x2000: lower=0x10, upper=0x20
+        mem[0x2000] = 0x10;
+        mem[0x2001] = 0x00;
+        mem[0x2002] = 0x00;
+        mem[0x2003] = 0x00;
+        mem[0x2004] = 0x20;
+        mem[0x2005] = 0x00;
+        mem[0x2006] = 0x00;
+        mem[0x2007] = 0x00;
+        // IVT[5] → 0000:0B00
+        mem[20] = 0x00;
+        mem[21] = 0x0B;
+        mem[22] = 0x00;
+        mem[23] = 0x00;
+        // 66 62 06 00 20 = BOUND EAX, [0x2000]
+        mem[0] = 0x66;
+        mem[1] = 0x62;
+        mem[2] = 0x06;
+        mem[3] = 0x00;
+        mem[4] = 0x20;
+        mem[0xB00] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_eax(0x0000_000F); // below lower → #BR
+        cpu.set_interrupt_flag(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // fault IP
+
+        // Inclusive endpoints succeed
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_eax(0x10);
+        cpu.halted = false;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 5);
+        cpu.rip = 0;
+        cpu.set_eax(0x20);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 5);
+    }
+
+    /// 0x66 far CALL/JMP/RETF ptr16:32 and Group5 m16:32.
+    /// Spec: Intel SDM Vol. 2 CALL/JMP/RET; Ch. 2 (66H). Real-mode OsZ32 → 6-byte frame.
+    #[test]
+    fn opsize32_far_call_jmp_retf_ptr16_32() {
+        let mut mem = vec![0u8; 0x20000];
+        // Far pointer memory at DS:0x4000 → 0x1000:0x0200
+        mem[0x4000] = 0x00;
+        mem[0x4001] = 0x02;
+        mem[0x4002] = 0x00;
+        mem[0x4003] = 0x00;
+        mem[0x4004] = 0x00;
+        mem[0x4005] = 0x10;
+        // Target at 0x1000:0x0200 = linear 0x10200: 66 CB RETF
+        let target = (0x1000u32 << 4) + 0x0200;
+        mem[target as usize] = 0x66;
+        mem[target as usize + 1] = 0xCB;
+        // Landing: HLT
+        mem[0x20] = 0xF4;
+
+        // 66 9A 00 02 00 00 00 10 = CALL FAR 1000:00000200
+        mem[0] = 0x66;
+        mem[1] = 0x9A;
+        mem[2] = 0x00;
+        mem[3] = 0x02;
+        mem[4] = 0x00;
+        mem[5] = 0x00;
+        mem[6] = 0x00;
+        mem[7] = 0x10;
+        // After RETF lands here (IP=8): NOP pad then JMP FAR mem
+        // 66 FF 2E 00 40 = JMP FAR dword [0x4000]
+        mem[8] = 0x66;
+        mem[9] = 0xFF;
+        mem[10] = 0x2E;
+        mem[11] = 0x00;
+        mem[12] = 0x40;
+        // After second RETF would be HLT at 0x20 — rewrite target after first return
+        // Also exercise Group5 CALL FAR: place at 0x30
+        // 66 FF 1E 00 40 = CALL FAR [0x4000]
+        mem[0x30] = 0x66;
+        mem[0x31] = 0xFF;
+        mem[0x32] = 0x1E;
+        mem[0x33] = 0x00;
+        mem[0x34] = 0x40;
+        mem[0x35] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // CALL FAR ptr16:32
+        assert_eq!(cpu.cs.selector, 0x1000);
+        assert_eq!(cpu.ip16(), 0x0200);
+        // 6-byte frame: EIP32 then CS16 above it on stack growth down
+        // SP was FFFE; push CS (−2→FFFC), push EIP (−4→FFF8)
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(bus.read_u32(0xFFF8).unwrap(), 8); // return EIP
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), 0); // saved CS
+
+        step(&mut cpu, &mut bus).unwrap(); // RETF opsize32
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 8);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+
+        // JMP FAR m16:32 to same target (no stack) — overwrite RETF with HLT for landing
+        bus.mem[target as usize] = 0xF4;
+        step(&mut cpu, &mut bus).unwrap(); // JMP FAR [0x4000]
+        assert_eq!(cpu.cs.selector, 0x1000);
+        assert_eq!(cpu.ip16(), 0x0200);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE); // unchanged
+
+        // Group5 CALL FAR m16:32
+        bus.mem[target as usize] = 0x66;
+        bus.mem[target as usize + 1] = 0xCB;
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0x30;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0x1000);
+        assert_eq!(cpu.ip16(), 0x0200);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(bus.read_u32(0xFFF8).unwrap(), 0x35); // next after CALL
+        step(&mut cpu, &mut bus).unwrap(); // RETF
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x35);
     }
 
     /// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
