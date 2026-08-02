@@ -5960,7 +5960,7 @@ mod tests {
     /// Decode-miss #UD policy (sparse primary table).
     ///
     /// - Architecturally invalid in real-address mode (e.g. ARPL 0x63) → IVT vector 6.
-    /// - Valid-but-unimplemented (x87, WAIT, IN/OUT EAX, 0F escape, …) stay host Decode errors.
+    /// - Valid-but-unimplemented (x87, WAIT, IN/OUT EAX, unimplemented 0F map, …) stay host Decode errors.
     /// - D6/F1 are reserved/undefined but do **not** generate #UD (SDM Vol. 3 §6.15).
     ///
     /// Spec: Intel SDM Vol. 3 §6.15 (#UD); Vol. 2 ARPL (real-address mode).
@@ -5992,7 +5992,7 @@ mod tests {
         assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0100);
 
         // Sparse-table misses that are valid-but-unimplemented must NOT become #UD.
-        for &op in &[0x9Bu8, 0xD8, 0xED, 0x0F, 0xD6, 0xF1] {
+        for &op in &[0x9Bu8, 0xD8, 0xED, 0xD6, 0xF1] {
             let mut mem = vec![0u8; 0x10000];
             mem[6 * 4] = 0x00;
             mem[6 * 4 + 1] = 0x0B;
@@ -6010,6 +6010,31 @@ mod tests {
             assert!(
                 matches!(err, ExecError::Decode(DecodeError::UnsupportedOpcode(o)) if o == op),
                 "opcode {op:#x} should remain Decode/UnsupportedOpcode, got {err:?}"
+            );
+            assert_eq!(cpu.ip16(), 0, "IP must not advance on host decode miss");
+            assert_eq!(cpu.cs.selector, 0);
+        }
+
+        // 0F is a real escape (IMUL 0F AF is implemented); unimplemented secondaries
+        // report UnsupportedOpcode(secondary) and must not vector #UD.
+        {
+            let mut mem = vec![0u8; 0x10000];
+            mem[6 * 4] = 0x00;
+            mem[6 * 4 + 1] = 0x0B;
+            mem[6 * 4 + 2] = 0x00;
+            mem[6 * 4 + 3] = 0x00;
+            mem[0] = 0x0F;
+            mem[1] = 0x90; // not in 0F map
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            let mut bus = VecBus { mem, ports: vec![] };
+            let err = step(&mut cpu, &mut bus).unwrap_err();
+            assert!(
+                matches!(err, ExecError::Decode(DecodeError::UnsupportedOpcode(0x90))),
+                "unimplemented 0F map entry should remain Decode/UnsupportedOpcode(secondary), got {err:?}"
             );
             assert_eq!(cpu.ip16(), 0, "IP must not advance on host decode miss");
             assert_eq!(cpu.cs.selector, 0);
