@@ -294,6 +294,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "JMP",
     },
     InstrDef {
+        mnemonic: "JMP_FAR",
+        opcode: 0xEA,
+        encoding: Encoding::Ptr16_16,
+        width: Width::OsZ,
+        sdm: "JMP",
+    },
+    InstrDef {
         mnemonic: "JMP",
         opcode: 0xEB,
         encoding: Encoding::Rel8,
@@ -372,7 +379,7 @@ mod tests {
     fn subset_includes_hello_opcodes() {
         for op in [
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
-            0x9A, 0xCB,
+            0x9A, 0xCB, 0xEA,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

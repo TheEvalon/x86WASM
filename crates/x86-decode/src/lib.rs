@@ -366,4 +366,14 @@ mod tests {
     fn truncated_call_far() {
         assert_eq!(decode(&[0x9A, 0x00, 0x10]), Err(DecodeError::Truncated));
     }
+
+    #[test]
+    fn decode_jmp_far_ptr16_16() {
+        // Intel SDM Vol. 2: JMP ptr16:16 — opcode EA cd
+        let d = decode(&[0xEA, 0x00, 0x01, 0x00, 0xF0]).unwrap();
+        assert_eq!(d.mnemonic, "JMP_FAR");
+        assert_eq!(d.immediate, 0x0100);
+        assert_eq!(d.displacement, 0xF000);
+        assert_eq!(d.length, 5);
+    }
 }

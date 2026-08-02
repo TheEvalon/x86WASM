@@ -300,6 +300,15 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let target = next_ip.wrapping_add(insn.immediate as i16 as u16);
             cpu.set_ip16(target);
         }
+        0xEA => {
+            // JMP far ptr16:16 — real-address mode.
+            // Spec: Intel SDM Vol. 2 "JMP" (ptr16:16).
+            // Unsupported here: protected-mode / task-gate forms; opsize 32 (ptr16:32).
+            let offset = insn.immediate as u16;
+            let selector = insn.displacement as u16;
+            cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+            cpu.set_ip16(offset);
+        }
         0xE8 => {
             push16(cpu, bus, next_ip)?;
             let target = next_ip.wrapping_add(insn.immediate as i16 as u16);
@@ -878,5 +887,33 @@ mod tests {
         assert_eq!(cpu.ip16(), 5);
         assert_eq!(cpu.cs.selector, 0);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    /// JMP far loads CS:IP from ptr16:16 without touching the stack (SDM Vol. 2 JMP).
+    #[test]
+    fn jmp_far_loads_cs_ip() {
+        let mut mem = vec![0u8; 0x20000];
+        // At 0000:0000 — JMP 1000:0200
+        mem[0] = 0xEA;
+        mem[1] = 0x00;
+        mem[2] = 0x02;
+        mem[3] = 0x00;
+        mem[4] = 0x10;
+        // Target linear = 0x1000<<4 + 0x200 = 0x10200
+        mem[0x10200] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.cs.selector, 0x1000);
+        assert_eq!(cpu.cs.base, 0x1000u64 << 4);
+        assert_eq!(cpu.ip16(), 0x0200);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE); // stack unchanged
     }
 }
