@@ -65,7 +65,7 @@ pub trait Bus {
 /// - `Decode`: truncated fetch / opcodes absent from the decoder table (not classified as #UD yet)
 /// - `MemoryFault`: bus/memory errors without a clear real-mode #GP/#SS class yet
 /// - `Unsupported`: valid-but-unimplemented forms (remaining opsize-32 opcodes,
-///   TEST EAX imm32, ENTER nesting>0, etc.)
+///   TEST EAX imm32, ENTERD/0x66 ENTER, etc.)
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExecError {
     #[error(transparent)]
@@ -1631,18 +1631,27 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(ip);
         }
         0xC8 => {
-            // ENTER iw, ib — 16-bit opsize, nesting level 0 only this slice.
-            // Spec: Intel SDM Vol. 2 "ENTER".
-            // Unsupported here: nesting level > 0 (imm8 & 0x1F != 0); opsize 32 (ENTERD).
+            // ENTER iw, ib — 16-bit opsize with nesting (imm8 mod 32).
+            // Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5 (block-structured display).
+            // Unsupported here: opsize 32 (ENTERD / 0x66).
             let alloc = insn.immediate as u16;
             let nesting = (insn.displacement as u8) & 0x1F;
-            if nesting != 0 {
-                return Err(ExecError::Unsupported(0xC8));
-            }
             push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
             let frame_temp = cpu.gpr_u16(CpuState::RSP);
+            if nesting > 0 {
+                // Copy nesting-1 display pointers from the caller's frame, then
+                // push frame_temp (current procedure's frame pointer for LEAVE).
+                for _ in 1..nesting {
+                    let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(2);
+                    cpu.set_gpr_u16(CpuState::RBP, bp);
+                    let addr = linear_addr(&cpu.ss, u64::from(bp));
+                    let display = bus.read_u16(addr)?;
+                    push16(cpu, bus, display)?;
+                }
+                push16(cpu, bus, frame_temp)?;
+            }
             cpu.set_gpr_u16(CpuState::RBP, frame_temp);
-            let sp = frame_temp.wrapping_sub(alloc);
+            let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(alloc);
             cpu.set_gpr_u16(CpuState::RSP, sp);
             cpu.set_ip16(next_ip);
         }
@@ -7628,24 +7637,77 @@ mod tests {
         assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
     }
 
-    /// ENTER with nesting level > 0 is explicitly unsupported this slice.
+    /// ENTER nesting level 1 pushes old BP and the new frame pointer (display).
+    /// Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5.
     #[test]
-    fn enter_nesting_nonzero_unsupported() {
+    fn enter_nesting_level1_display() {
         let mut mem = vec![0u8; 0x10000];
+        // ENTER 4, 1
         mem[0] = 0xC8;
-        mem[1] = 0x00;
+        mem[1] = 0x04;
         mem[2] = 0x00;
-        mem[3] = 0x01; // nesting = 1
+        mem[3] = 0x01;
+        mem[4] = 0xF4;
+
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = 0;
-        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        cpu.set_gpr_u16(CpuState::RBP, 0xABCD);
         let mut bus = VecBus { mem, ports: vec![] };
-        assert!(matches!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xC8))
-        ));
+
+        step(&mut cpu, &mut bus).unwrap();
+        // Push old BP; frame_temp = SP; Push(frame_temp); BP = frame_temp; SP -= 4.
+        assert_eq!(bus.read_u16(u64::from(sp0 - 2)).unwrap(), 0xABCD);
+        let frame = sp0 - 2;
+        assert_eq!(bus.read_u16(u64::from(sp0 - 4)).unwrap(), frame);
+        assert_eq!(cpu.gpr_u16(CpuState::RBP), frame);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), frame.wrapping_sub(2 + 4));
+    }
+
+    /// ENTER nesting level 2 copies one display word from the caller's frame.
+    /// Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5.
+    #[test]
+    fn enter_nesting_level2_copies_display() {
+        let mut mem = vec![0u8; 0x10000];
+        // ENTER 0, 1 then ENTER 0, 2
+        mem[0] = 0xC8;
+        mem[1] = 0x00;
+        mem[2] = 0x00;
+        mem[3] = 0x01;
+        mem[4] = 0xC8;
+        mem[5] = 0x00;
+        mem[6] = 0x00;
+        mem[7] = 0x02;
+        mem[8] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        cpu.set_gpr_u16(CpuState::RBP, 0x1111);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // ENTER 0,1
+        let parent_bp = cpu.gpr_u16(CpuState::RBP);
+        assert_eq!(parent_bp, sp0 - 2);
+        // Parent display: [BP]=old BP, [BP-2]=frame_temp (= parent_bp).
+        assert_eq!(bus.read_u16(u64::from(parent_bp)).unwrap(), 0x1111);
+        assert_eq!(bus.read_u16(u64::from(parent_bp - 2)).unwrap(), parent_bp);
+
+        step(&mut cpu, &mut bus).unwrap(); // ENTER 0,2
+        let child_bp = cpu.gpr_u16(CpuState::RBP);
+        // [BP] = parent frame pointer (pushed at start).
+        assert_eq!(bus.read_u16(u64::from(child_bp)).unwrap(), parent_bp);
+        // [BP-2] = copied display entry from parent [parent_bp-2] (= parent_bp).
+        assert_eq!(bus.read_u16(u64::from(child_bp - 2)).unwrap(), parent_bp);
+        // [BP-4] = child's frame_temp (= child_bp).
+        assert_eq!(bus.read_u16(u64::from(child_bp - 4)).unwrap(), child_bp);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), child_bp - 4);
     }
 
     /// RET iw / RETF iw release stack bytes after the return frame.
