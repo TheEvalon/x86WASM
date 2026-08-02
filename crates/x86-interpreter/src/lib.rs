@@ -201,6 +201,44 @@ fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
     Ok(v)
 }
 
+/// ModRM.reg → segment register index for MOV Sreg forms (SDM Vol. 2, MOV).
+/// Returns None for reserved encodings (6, 7) which cause #UD.
+fn sreg_from_modrm_reg(reg: u8) -> Option<u8> {
+    match reg {
+        0..=5 => Some(reg),
+        _ => None,
+    }
+}
+
+fn read_sreg_selector(cpu: &CpuState, sreg: u8) -> u16 {
+    match sreg {
+        0 => cpu.es.selector,
+        1 => cpu.cs.selector,
+        2 => cpu.ss.selector,
+        3 => cpu.ds.selector,
+        4 => cpu.fs.selector,
+        5 => cpu.gs.selector,
+        _ => unreachable!("sreg filtered by sreg_from_modrm_reg"),
+    }
+}
+
+fn write_sreg_real_mode(cpu: &mut CpuState, sreg: u8, selector: u16) -> Result<(), ExecError> {
+    // MOV to CS is invalid (#UD). Spec: Intel SDM Vol. 2 "MOV" — MOV to CS.
+    if sreg == 1 {
+        return Err(ExecError::Unsupported(0x8E));
+    }
+    let seg = x86_core::SegmentReg::real_mode(selector);
+    match sreg {
+        0 => cpu.es = seg,
+        2 => cpu.ss = seg,
+        3 => cpu.ds = seg,
+        4 => cpu.fs = seg,
+        5 => cpu.gs = seg,
+        _ => return Err(ExecError::Unsupported(0x8E)),
+    }
+    Ok(())
+}
+
 fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::DecodedInsn, ExecError> {
     // Grow the window until decode succeeds or we hit the 15-byte SDM limit.
     let mut buf = Vec::with_capacity(15);
@@ -484,6 +522,27 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = cpu.gpr_u16(m.reg as usize);
             write_rm_u16(cpu, bus, &insn, v)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x8C => {
+            // MOV r/m16, Sreg — real-address mode, 16-bit opsize.
+            // Spec: Intel SDM Vol. 2 "MOV" (r/m16, Sreg).
+            // Unsupported here: opsize 32 (zero-extend to r32); protected-mode side effects.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let sreg = sreg_from_modrm_reg(m.reg).ok_or(ExecError::Unsupported(op))?;
+            let v = read_sreg_selector(cpu, sreg);
+            write_rm_u16(cpu, bus, &insn, v)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x8E => {
+            // MOV Sreg, r/m16 — real-address mode load (base = selector << 4).
+            // Spec: Intel SDM Vol. 2 "MOV" (Sreg, r/m16); Vol. 3 §3.4.2.
+            // Unsupported here: MOV to CS (#UD); reserved Sreg encodings (#UD as Unsupported);
+            // protected-mode descriptor checks; one-instruction IRQ inhibit after MOV SS.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let sreg = sreg_from_modrm_reg(m.reg).ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u16(cpu, bus, &insn)?;
+            write_sreg_real_mode(cpu, sreg, v)?;
             cpu.set_ip16(next_ip);
         }
         0x84 => {
@@ -1001,5 +1060,102 @@ mod tests {
         assert_eq!(cpu.cs.base, 0x1000u64 << 4);
         assert_eq!(cpu.ip16(), 0x0200);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE); // stack unchanged
+    }
+
+    /// MOV AX, DS / MOV ES, AX — reg forms (SDM Vol. 2 MOV r/m16,Sreg / Sreg,r/m16).
+    #[test]
+    fn mov_sreg_reg_forms() {
+        let mut mem = vec![0u8; 0x10000];
+        // 8C D8 = MOV AX, DS; 8E C0 = MOV ES, AX
+        mem[0] = 0x8C;
+        mem[1] = 0xD8;
+        mem[2] = 0x8E;
+        mem[3] = 0xC0;
+        mem[4] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0x1234);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RAX, 0);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x1234);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.es.selector, 0x1234);
+        assert_eq!(cpu.es.base, 0x1234u64 << 4);
+    }
+
+    /// MOV r/m16, Sreg and MOV Sreg, r/m16 memory forms (SDM Vol. 2 MOV).
+    #[test]
+    fn mov_sreg_mem_forms() {
+        let mut mem = vec![0u8; 0x10000];
+        // Use ES as Sreg so DS remains 0 for the EA default segment.
+        // 8C 06 00 20 = MOV [0x2000], ES
+        // 8E 06 00 20 = MOV ES, [0x2000]
+        mem[0] = 0x8C;
+        mem[1] = 0x06;
+        mem[2] = 0x00;
+        mem[3] = 0x20;
+        mem[4] = 0x8E;
+        mem[5] = 0x06;
+        mem[6] = 0x00;
+        mem[7] = 0x20;
+        mem[8] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0xABCD);
+        cpu.rip = 0;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x2000).unwrap(), 0xABCD);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.es.selector, 0xABCD);
+        assert_eq!(cpu.es.base, 0xABCDu64 << 4);
+    }
+
+    /// MOV CS, r/m16 is invalid (#UD) — reported as Unsupported (SDM Vol. 2 MOV).
+    #[test]
+    fn mov_to_cs_unsupported() {
+        let mut mem = vec![0u8; 0x10000];
+        // 8E C8 = MOV CS, AX
+        mem[0] = 0x8E;
+        mem[1] = 0xC8;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RAX, 0x1000);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8E)));
+        assert_eq!(cpu.cs.selector, 0); // unchanged
+    }
+
+    /// MOV AX, CS is valid (read CS selector).
+    #[test]
+    fn mov_from_cs_to_ax() {
+        // Code at 1000:0000 → linear 0x10000
+        let mut mem = vec![0u8; 0x20000];
+        // 8C C8 = MOV AX, CS
+        mem[0x10000] = 0x8C;
+        mem[0x10001] = 0xC8;
+        mem[0x10002] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0x1000);
+        cpu.rip = 0;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x1000);
     }
 }

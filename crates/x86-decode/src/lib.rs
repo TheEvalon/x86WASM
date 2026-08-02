@@ -388,4 +388,26 @@ mod tests {
         assert_eq!(decode(&[0x1E]).unwrap().mnemonic, "PUSH_DS");
         assert_eq!(decode(&[0x1F]).unwrap().mnemonic, "POP_DS");
     }
+
+    #[test]
+    fn decode_mov_sreg() {
+        // Intel SDM Vol. 2: MOV r/m16, Sreg (8C /r); MOV Sreg, r/m16 (8E /r)
+        // 8C D8 = MOV AX, DS (mod=11, reg=DS=3, rm=AX=0)
+        let d = decode(&[0x8C, 0xD8]).unwrap();
+        assert_eq!(d.mnemonic, "MOV_Sreg");
+        assert_eq!(d.modrm.unwrap().reg, 3);
+        assert_eq!(d.modrm.unwrap().rm, 0);
+        assert_eq!(d.length, 2);
+        // 8E D8 = MOV DS, AX
+        let d = decode(&[0x8E, 0xD8]).unwrap();
+        assert_eq!(d.mnemonic, "MOV_Sreg");
+        assert_eq!(d.modrm.unwrap().reg, 3);
+        assert_eq!(d.length, 2);
+    }
+
+    #[test]
+    fn truncated_mov_sreg() {
+        assert_eq!(decode(&[0x8C]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x8E]), Err(DecodeError::Truncated));
+    }
 }
