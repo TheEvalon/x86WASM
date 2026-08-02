@@ -1320,12 +1320,12 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
-Status (2026-08-02, branch `feat/highbyte-modrm-ah-ch-dh-bh`): **in progress** — early real-mode foundation only. M2 exit criteria are not met.
+Status (2026-08-02, branch `feat/real-mode-int-iret`): **in progress** — early real-mode foundation only. M2 exit criteria are not met.
 
 Progress against implement list:
 
-- [x] Partial real-mode foundation (software INT/IRET/INT3, PUSHF/POPF, far CALL/RETF/JMP, segment MOV/PUSH/POP, Jcc, XCHG, LOOP/JCXZ, Group 1/2/3 full F6/F7 /0-/7 TEST/NOT/NEG/MUL/IMUL/DIV/IDIV with #DE, Group 4/5 INC/DEC r/m FE/FF /0-/1, Group 5 CALL/JMP/PUSH r/m FF /2,/4,/6, Group 5 far CALL/JMP m16:16 FF /3,/5, string byte ops without REP, LEA, CBW/CWD, flag ops, PUSH imm, SAHF/LAHF, INC/DEC r16, AND/OR ModRM 08-0B/20-23, AND/OR AL/AX imm 0C/0D/24/25, ADC/SBB ModRM 10-13/18-1B, ADC/SBB AL/AX imm 14/15/1C/1D, XOR ModRM 30-33, ADD/SUB ModRM byte 00/02/28/2A, SUB/XOR/CMP AL/AX imm 2C/2D/34/35/3C/3D, CMP ModRM byte 38/3A, ADD AX imm 05, related ALU ModRM forms, legacy high-byte ModR/M AL..BH via shared `gpr_u8`/`set_gpr_u8`, MOV C6/C7 r/m imm, MOV A0-A3 moffs, TEST A8/A9 AL/AX imm, RM-E stack/frame: PUSHA/POPA 60/61, ENTER nesting-0 / LEAVE C8/C9, RET/RETF iw C2/CA, POP r/m16 8F /0) - still incomplete vs BIOS needs
-- [ ] Complete real-mode foundation (remaining opcodes, exception delivery beyond software INT, REP strings, ENTER nesting>0, etc.)
+- [x] Partial real-mode foundation (software INT/IRET/INT3, PUSHF/POPF, far CALL/RETF/JMP, segment MOV/PUSH/POP, Jcc, XCHG, LOOP/JCXZ, Group 1/2/3 full F6/F7 /0-/7 TEST/NOT/NEG/MUL/IMUL/DIV/IDIV with #DE, Group 4/5 INC/DEC r/m FE/FF /0-/1, Group 5 CALL/JMP/PUSH r/m FF /2,/4,/6, Group 5 far CALL/JMP m16:16 FF /3,/5, string byte ops MOVSB/STOSB/LODSB/CMPSB/SCASB with REP/REPE/REPNE (CX=0 nop, CX loop, ZF early-exit, DF), LEA, CBW/CWD, flag ops, PUSH imm, SAHF/LAHF, INC/DEC r16, AND/OR ModRM 08-0B/20-23, AND/OR AL/AX imm 0C/0D/24/25, ADC/SBB ModRM 10-13/18-1B, ADC/SBB AL/AX imm 14/15/1C/1D, XOR ModRM 30-33, ADD/SUB ModRM byte 00/02/28/2A, SUB/XOR/CMP AL/AX imm 2C/2D/34/35/3C/3D, CMP ModRM byte 38/3A, ADD AX imm 05, related ALU ModRM forms, legacy high-byte ModR/M AL..BH via shared `gpr_u8`/`set_gpr_u8`, MOV C6/C7 r/m imm, MOV A0-A3 moffs, TEST A8/A9 AL/AX imm, RM-E stack/frame: PUSHA/POPA 60/61, ENTER nesting-0 / LEAVE C8/C9, RET/RETF iw C2/CA, POP r/m16 8F /0) - still incomplete vs BIOS needs
+- [ ] Complete real-mode foundation (remaining opcodes, exception delivery beyond software INT, word/dword string ops, interruptible REP, ENTER nesting>0, etc.)
 - [ ] Protected mode
 - [ ] Segmentation (beyond real-mode base<<4)
 - [ ] GDT
