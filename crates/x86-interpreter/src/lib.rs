@@ -309,6 +309,26 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let ip = pop16(cpu, bus)?;
             cpu.set_ip16(ip);
         }
+        0x9A => {
+            // CALL far ptr16:16 — real-address mode.
+            // Spec: Intel SDM Vol. 2 "CALL" (ptr16:16). Push CS then return IP; load CS:IP.
+            // Unsupported here: protected-mode privilege / gate transfer; opsize 32 (ptr16:32).
+            let offset = insn.immediate as u16;
+            let selector = insn.displacement as u16;
+            push16(cpu, bus, cpu.cs.selector)?;
+            push16(cpu, bus, next_ip)?;
+            cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+            cpu.set_ip16(offset);
+        }
+        0xCB => {
+            // RETF — far return, 16-bit stack frame (pop IP then CS).
+            // Spec: Intel SDM Vol. 2 "RET" (far).
+            // Unsupported here: RETF imm16 stack-release form (CA iw); opsize 32.
+            let ip = pop16(cpu, bus)?;
+            let cs_sel = pop16(cpu, bus)?;
+            cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+            cpu.set_ip16(ip);
+        }
         0x9C => {
             // PUSHF — 16-bit FLAGS in real-address mode (default opsize).
             // Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ".
@@ -777,5 +797,86 @@ mod tests {
 
         assert_eq!(cpu.rflags & 0xFFFF, flags_before);
         assert!(cpu.interrupt_flag());
+    }
+
+    /// CALL far: push CS/IP, load ptr16:16 (SDM Vol. 2 CALL).
+    #[test]
+    fn call_far_pushes_cs_ip_and_loads_target() {
+        let mut mem = vec![0u8; 0x10000];
+        // CALL 0000:0800 — encoding 9A 00 08 00 00
+        mem[0] = 0x9A;
+        mem[1] = 0x00;
+        mem[2] = 0x08;
+        mem[3] = 0x00;
+        mem[4] = 0x00;
+        mem[0x800] = 0xF4; // HLT at target
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0800);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFA);
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 5); // return IP
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), 0); // return CS
+    }
+
+    /// RETF restores IP/CS from the far-call frame.
+    #[test]
+    fn retf_restores_cs_ip() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0x100] = 0xCB; // RETF
+        mem[0xFFFA] = 0x34;
+        mem[0xFFFB] = 0x12; // IP
+        mem[0xFFFC] = 0x00;
+        mem[0xFFFD] = 0x20; // CS 0x2000
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0x100;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFA);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), 0x1234);
+        assert_eq!(cpu.cs.selector, 0x2000);
+        assert_eq!(cpu.cs.base, 0x2000u64 << 4);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    #[test]
+    fn call_far_then_retf_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        // 0: CALL 0000:0900; HLT
+        mem[0] = 0x9A;
+        mem[1] = 0x00;
+        mem[2] = 0x09;
+        mem[3] = 0x00;
+        mem[4] = 0x00;
+        mem[5] = 0xF4;
+        // Handler: RETF
+        mem[0x900] = 0xCB;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap(); // CALL far
+        step(&mut cpu, &mut bus).unwrap(); // RETF
+
+        assert_eq!(cpu.ip16(), 5);
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
     }
 }

@@ -12,6 +12,8 @@ pub enum Encoding {
     Imm16,
     Rel8,
     Rel16,
+    /// Far pointer `ptr16:16` — offset then segment (e.g. `CALL`/`JMP` far).
+    Ptr16_16,
     /// Opcode encodes register in low 3 bits (e.g. `B8+rw`).
     OpcodeReg,
     ModrmImm8,
@@ -201,6 +203,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "NOP",
     },
     InstrDef {
+        mnemonic: "CALL_FAR",
+        opcode: 0x9A,
+        encoding: Encoding::Ptr16_16,
+        width: Width::OsZ,
+        sdm: "CALL",
+    },
+    InstrDef {
         mnemonic: "PUSHF",
         opcode: 0x9C,
         encoding: Encoding::None,
@@ -213,6 +222,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
         encoding: Encoding::None,
         width: Width::OsZ,
         sdm: "POPF",
+    },
+    InstrDef {
+        mnemonic: "RETF",
+        opcode: 0xCB,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "RET",
     },
     InstrDef {
         mnemonic: "MOV_imm8",
@@ -356,6 +372,7 @@ mod tests {
     fn subset_includes_hello_opcodes() {
         for op in [
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
+            0x9A, 0xCB,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

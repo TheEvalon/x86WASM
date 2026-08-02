@@ -231,6 +231,16 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 immediate = i32::from(i16::from_le_bytes([bytes[i], bytes[i + 1]]));
                 i += 2;
             }
+            Encoding::Ptr16_16 => {
+                // Far pointer: offset (imm16) then segment; segment stored in displacement.
+                // Spec: Intel SDM Vol. 2, CALL/JMP far ptr16:16.
+                if i + 3 >= bytes.len() {
+                    return Err(DecodeError::Truncated);
+                }
+                immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                displacement = i32::from(u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]));
+                i += 4;
+            }
             Encoding::None | Encoding::Modrm | Encoding::ModrmImm8 | Encoding::OpcodeReg => {}
         }
     }
@@ -332,5 +342,28 @@ mod tests {
         let d = decode(&[0x9D]).unwrap();
         assert_eq!(d.mnemonic, "POPF");
         assert_eq!(d.length, 1);
+    }
+
+    #[test]
+    fn decode_call_far_ptr16_16() {
+        // Intel SDM Vol. 2: CALL ptr16:16 — opcode 9A cd (offset then segment)
+        let d = decode(&[0x9A, 0x34, 0x12, 0x00, 0xF0]).unwrap();
+        assert_eq!(d.mnemonic, "CALL_FAR");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.displacement, 0xF000);
+        assert_eq!(d.length, 5);
+    }
+
+    #[test]
+    fn decode_retf() {
+        // Intel SDM Vol. 2: RETF — opcode CB
+        let d = decode(&[0xCB]).unwrap();
+        assert_eq!(d.mnemonic, "RETF");
+        assert_eq!(d.length, 1);
+    }
+
+    #[test]
+    fn truncated_call_far() {
+        assert_eq!(decode(&[0x9A, 0x00, 0x10]), Err(DecodeError::Truncated));
     }
 }
