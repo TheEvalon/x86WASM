@@ -376,4 +376,16 @@ mod tests {
         assert_eq!(d.displacement, 0xF000);
         assert_eq!(d.length, 5);
     }
+
+    #[test]
+    fn decode_push_pop_segment() {
+        // Intel SDM Vol. 2: PUSH/POP ES/CS/SS/DS — opcodes 06/07/0E/16/17/1E/1F
+        assert_eq!(decode(&[0x06]).unwrap().mnemonic, "PUSH_ES");
+        assert_eq!(decode(&[0x07]).unwrap().mnemonic, "POP_ES");
+        assert_eq!(decode(&[0x0E]).unwrap().mnemonic, "PUSH_CS");
+        assert_eq!(decode(&[0x16]).unwrap().mnemonic, "PUSH_SS");
+        assert_eq!(decode(&[0x17]).unwrap().mnemonic, "POP_SS");
+        assert_eq!(decode(&[0x1E]).unwrap().mnemonic, "PUSH_DS");
+        assert_eq!(decode(&[0x1F]).unwrap().mnemonic, "POP_DS");
+    }
 }

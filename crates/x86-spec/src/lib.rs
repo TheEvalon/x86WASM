@@ -42,6 +42,55 @@ pub struct InstrDef {
 /// Executable primary-opcode subset (M1 HELLO path + early M2 real-mode INT).
 pub const M1_SUBSET: &[InstrDef] = &[
     InstrDef {
+        mnemonic: "PUSH_ES",
+        opcode: 0x06,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH",
+    },
+    InstrDef {
+        mnemonic: "POP_ES",
+        opcode: 0x07,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POP",
+    },
+    InstrDef {
+        mnemonic: "PUSH_CS",
+        opcode: 0x0E,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH",
+    },
+    InstrDef {
+        mnemonic: "PUSH_SS",
+        opcode: 0x16,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH",
+    },
+    InstrDef {
+        mnemonic: "POP_SS",
+        opcode: 0x17,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POP",
+    },
+    InstrDef {
+        mnemonic: "PUSH_DS",
+        opcode: 0x1E,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH",
+    },
+    InstrDef {
+        mnemonic: "POP_DS",
+        opcode: 0x1F,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POP",
+    },
+    InstrDef {
         mnemonic: "ADD",
         opcode: 0x01,
         encoding: Encoding::Modrm,
@@ -352,9 +401,9 @@ pub const M1_SUBSET: &[InstrDef] = &[
 ];
 
 pub fn lookup_primary(opcode: u8) -> Option<&'static InstrDef> {
-    // Opcode-reg groups
+    // Opcode-reg groups (indices shift when entries are prepended — match by opcode).
     if (0x40..=0x47).contains(&opcode) {
-        return Some(&M1_SUBSET[9]); // INC
+        return M1_SUBSET.iter().find(|d| d.opcode == 0x40);
     }
     if (0x50..=0x57).contains(&opcode) {
         return M1_SUBSET.iter().find(|d| d.opcode == 0x50);
@@ -379,7 +428,7 @@ mod tests {
     fn subset_includes_hello_opcodes() {
         for op in [
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
-            0x9A, 0xCB, 0xEA,
+            0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

@@ -252,6 +252,45 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     let op = insn.opcode;
 
     match op {
+        0x06 => {
+            // PUSH ES — Spec: Intel SDM Vol. 2 "PUSH".
+            push16(cpu, bus, cpu.es.selector)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x07 => {
+            // POP ES — Spec: Intel SDM Vol. 2 "POP".
+            let sel = pop16(cpu, bus)?;
+            cpu.es = x86_core::SegmentReg::real_mode(sel);
+            cpu.set_ip16(next_ip);
+        }
+        0x0E => {
+            // PUSH CS — Spec: Intel SDM Vol. 2 "PUSH".
+            push16(cpu, bus, cpu.cs.selector)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x16 => {
+            // PUSH SS — Spec: Intel SDM Vol. 2 "PUSH".
+            push16(cpu, bus, cpu.ss.selector)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x17 => {
+            // POP SS — Spec: Intel SDM Vol. 2 "POP".
+            // Unsupported here: one-instruction interrupt inhibit after POP SS (Vol. 2).
+            let sel = pop16(cpu, bus)?;
+            cpu.ss = x86_core::SegmentReg::real_mode(sel);
+            cpu.set_ip16(next_ip);
+        }
+        0x1E => {
+            // PUSH DS — Spec: Intel SDM Vol. 2 "PUSH".
+            push16(cpu, bus, cpu.ds.selector)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x1F => {
+            // POP DS — Spec: Intel SDM Vol. 2 "POP".
+            let sel = pop16(cpu, bus)?;
+            cpu.ds = x86_core::SegmentReg::real_mode(sel);
+            cpu.set_ip16(next_ip);
+        }
         0xF4 => {
             cpu.halted = true;
             cpu.set_ip16(next_ip);
@@ -887,6 +926,53 @@ mod tests {
         assert_eq!(cpu.ip16(), 5);
         assert_eq!(cpu.cs.selector, 0);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    /// PUSH/POP DS updates selector and real-mode base (SDM Vol. 2 PUSH/POP; Vol. 3 §3.4.2).
+    #[test]
+    fn push_pop_ds_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x1E; // PUSH DS
+        mem[1] = 0x1F; // POP DS
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0x1234);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap(); // PUSH DS
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), 0x1234);
+        cpu.ds = x86_core::SegmentReg::real_mode(0); // clobber
+        step(&mut cpu, &mut bus).unwrap(); // POP DS
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(cpu.ds.base, 0x1234u64 << 4);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    #[test]
+    fn push_cs_and_pop_es() {
+        // Code lives at F000:0000 (linear 0xF0000); stack still uses SS=0.
+        let mut mem = vec![0u8; 0x100000];
+        mem[0xF0000] = 0x0E; // PUSH CS
+        mem[0xF0001] = 0x07; // POP ES
+        mem[0xF0002] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0xF000);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.es.selector, 0xF000);
+        assert_eq!(cpu.es.base, 0xF000u64 << 4);
     }
 
     /// JMP far loads CS:IP from ptr16:16 without touching the stack (SDM Vol. 2 JMP).
