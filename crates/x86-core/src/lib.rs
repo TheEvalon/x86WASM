@@ -75,6 +75,13 @@ pub struct CpuState {
     pub cr8: u64,
     pub efer: u64,
     pub halted: bool,
+    /// Latched maskable external IRQ vector (PIC stub for later).
+    ///
+    /// Not guest-architectural beyond interrupt delivery. Recognized at
+    /// interpreter poll points when `IF=1` (currently: between REP string
+    /// iterations). Use [`Self::request_interrupt`]. Full 8259 is out of scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_irq: Option<u8>,
 }
 
 impl Default for CpuState {
@@ -122,7 +129,16 @@ impl CpuState {
             cr8: 0,
             efer: 0,
             halted: false,
+            pending_irq: None,
         }
+    }
+
+    /// Queue a maskable external interrupt vector (test / future PIC hook).
+    ///
+    /// Delivered at architected poll points when `RFLAGS.IF=1`. Does not
+    /// implement 8259 priority, IRR/ISR, or spurious IRQ semantics.
+    pub fn request_interrupt(&mut self, vector: u8) {
+        self.pending_irq = Some(vector);
     }
 
     pub fn gpr_u16(&self, idx: usize) -> u16 {
@@ -330,6 +346,9 @@ impl CpuState {
         }
         if self.halted != other.halted {
             out.push("halted");
+        }
+        if self.pending_irq != other.pending_irq {
+            out.push("pending_irq");
         }
         out
     }
