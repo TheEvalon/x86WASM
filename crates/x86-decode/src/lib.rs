@@ -885,6 +885,33 @@ mod tests {
     }
 
     #[test]
+    fn decode_bcd_adjust() {
+        // Intel SDM Vol. 2: DAA (27), DAS (2F), AAA (37), AAS (3F), AAM (D4 ib), AAD (D5 ib).
+        assert_eq!(decode(&[0x27]).unwrap().mnemonic, "DAA");
+        assert_eq!(decode(&[0x27]).unwrap().length, 1);
+        assert_eq!(decode(&[0x2F]).unwrap().mnemonic, "DAS");
+        assert_eq!(decode(&[0x37]).unwrap().mnemonic, "AAA");
+        assert_eq!(decode(&[0x3F]).unwrap().mnemonic, "AAS");
+
+        let aam = decode(&[0xD4, 0x0A]).unwrap();
+        assert_eq!(aam.mnemonic, "AAM");
+        assert_eq!(aam.immediate, 0x0A);
+        assert_eq!(aam.length, 2);
+
+        let aad = decode(&[0xD5, 0x0A]).unwrap();
+        assert_eq!(aad.mnemonic, "AAD");
+        assert_eq!(aad.immediate, 0x0A);
+        assert_eq!(aad.length, 2);
+
+        // Non-default bases are valid encodings (imm8 is not fixed to 0Ah).
+        assert_eq!(decode(&[0xD4, 0x10]).unwrap().immediate, 0x10);
+        assert_eq!(decode(&[0xD5, 0x10]).unwrap().immediate, 0x10);
+
+        assert_eq!(decode(&[0xD4]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xD5]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_lea() {
         // Intel SDM Vol. 2: LEA r16, m — 8D /r
         // 8D 06 34 12 = LEA AX, [0x1234]

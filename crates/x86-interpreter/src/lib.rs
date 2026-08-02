@@ -76,6 +76,100 @@ pub enum ExecError {
     Unsupported(u8),
 }
 
+/// SF/ZF/PF from an 8-bit BCD-adjust result (DAA/DAS/AAM/AAD).
+/// Spec: Intel SDM Vol. 2 DAA/DAS/AAM/AAD — Flags Affected.
+fn set_bcd_szp_flags_u8(cpu: &mut CpuState, result: u8) {
+    cpu.set_sf(result & 0x80 != 0);
+    cpu.set_zf(result == 0);
+    cpu.set_pf(parity_even(result));
+}
+
+/// DAA — Decimal Adjust AL after Addition.
+/// Spec: Intel SDM Vol. 2 "DAA". OF undefined (left unchanged).
+fn exec_daa(cpu: &mut CpuState) {
+    let old_al = cpu.al();
+    let old_cf = cpu.rflags & 1 != 0;
+    let af = cpu.rflags & (1 << 4) != 0;
+    let mut al = old_al;
+    cpu.set_cf(false);
+    if (al & 0x0F) > 9 || af {
+        let (r, carry) = al.overflowing_add(6);
+        al = r;
+        cpu.set_cf(old_cf || carry);
+        cpu.set_af(true);
+    } else {
+        cpu.set_af(false);
+    }
+    if old_al > 0x99 || old_cf {
+        al = al.wrapping_add(0x60);
+        cpu.set_cf(true);
+    } else {
+        cpu.set_cf(false);
+    }
+    cpu.set_al(al);
+    set_bcd_szp_flags_u8(cpu, al);
+}
+
+/// DAS — Decimal Adjust AL after Subtraction.
+/// Spec: Intel SDM Vol. 2 "DAS". OF undefined (left unchanged).
+fn exec_das(cpu: &mut CpuState) {
+    let old_al = cpu.al();
+    let old_cf = cpu.rflags & 1 != 0;
+    let af = cpu.rflags & (1 << 4) != 0;
+    let mut al = old_al;
+    cpu.set_cf(false);
+    if (al & 0x0F) > 9 || af {
+        let (r, borrow) = al.overflowing_sub(6);
+        al = r;
+        cpu.set_cf(old_cf || borrow);
+        cpu.set_af(true);
+    } else {
+        cpu.set_af(false);
+    }
+    if old_al > 0x99 || old_cf {
+        al = al.wrapping_sub(0x60);
+        cpu.set_cf(true);
+    } else {
+        cpu.set_cf(false);
+    }
+    cpu.set_al(al);
+    set_bcd_szp_flags_u8(cpu, al);
+}
+
+/// AAA — ASCII Adjust After Addition.
+/// Spec: Intel SDM Vol. 2 "AAA". OF/SF/ZF/PF undefined (left unchanged).
+fn exec_aaa(cpu: &mut CpuState) {
+    let al = cpu.al();
+    let af = cpu.rflags & (1 << 4) != 0;
+    if (al & 0x0F) > 9 || af {
+        let ax = cpu.ax().wrapping_add(0x106);
+        cpu.set_ax(ax);
+        cpu.set_af(true);
+        cpu.set_cf(true);
+    } else {
+        cpu.set_af(false);
+        cpu.set_cf(false);
+    }
+    cpu.set_al(cpu.al() & 0x0F);
+}
+
+/// AAS — ASCII Adjust AL After Subtraction.
+/// Spec: Intel SDM Vol. 2 "AAS". OF/SF/ZF/PF undefined (left unchanged).
+fn exec_aas(cpu: &mut CpuState) {
+    let al = cpu.al();
+    let af = cpu.rflags & (1 << 4) != 0;
+    if (al & 0x0F) > 9 || af {
+        let ax = cpu.ax().wrapping_sub(0x106);
+        cpu.set_ax(ax);
+        cpu.set_af(true);
+        cpu.set_cf(true);
+    } else {
+        cpu.set_af(false);
+        cpu.set_cf(false);
+    }
+    cpu.set_al(cpu.al() & 0x0F);
+}
+
 fn parity_even(v: u8) -> bool {
     v.count_ones().is_multiple_of(2)
 }
@@ -1628,6 +1722,33 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // Preserve high RFLAGS; bit 1 of FLAGS is reserved-1.
             cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
         }
+        0xD4 => {
+            // AAM — ASCII Adjust AX After Multiply. Spec: Intel SDM Vol. 2 "AAM".
+            // imm8=0 → #DE (Vol. 3 §6.15). OF/AF/CF undefined (left unchanged).
+            // Unsupported here: 64-bit mode (#UD).
+            let base = insn.immediate as u8;
+            if base == 0 {
+                return real_mode_exception(cpu, bus, 0);
+            }
+            let temp_al = cpu.al();
+            cpu.set_ah(temp_al / base);
+            let al = temp_al % base;
+            cpu.set_al(al);
+            set_bcd_szp_flags_u8(cpu, al);
+            cpu.set_ip16(next_ip);
+        }
+        0xD5 => {
+            // AAD — ASCII Adjust AX Before Division. Spec: Intel SDM Vol. 2 "AAD".
+            // OF/AF/CF undefined (left unchanged). Unsupported here: 64-bit mode (#UD).
+            let base = insn.immediate as u8;
+            let temp_al = cpu.al();
+            let temp_ah = cpu.ah();
+            let al = temp_al.wrapping_add(temp_ah.wrapping_mul(base));
+            cpu.set_al(al);
+            cpu.set_ah(0);
+            set_bcd_szp_flags_u8(cpu, al);
+            cpu.set_ip16(next_ip);
+        }
         0xD7 => {
             // XLAT/XLATB — AL ← DS:[BX + AL] (segment overrideable); 16-bit address size.
             // Spec: Intel SDM Vol. 2 "XLAT/XLATB".
@@ -2849,6 +2970,24 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         // SUB/XOR/CMP AL/AX/EAX,imm — Spec: Intel SDM Vol. 2 accumulator forms; Ch. 2.
+        // BCD adjust — Spec: Intel SDM Vol. 2 DAA/DAS/AAA/AAS.
+        // Unsupported here: 64-bit mode (#UD); INTO/BOUND (separate opcodes).
+        0x27 => {
+            exec_daa(cpu);
+            cpu.set_ip16(next_ip);
+        }
+        0x2F => {
+            exec_das(cpu);
+            cpu.set_ip16(next_ip);
+        }
+        0x37 => {
+            exec_aaa(cpu);
+            cpu.set_ip16(next_ip);
+        }
+        0x3F => {
+            exec_aas(cpu);
+            cpu.set_ip16(next_ip);
+        }
         0x2C => {
             let a = cpu.al();
             let b = insn.immediate as u8;
@@ -4892,6 +5031,216 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x80);
+    }
+
+    /// BCD adjust: DAA/DAS/AAA/AAS/AAM/AAD results + flags (Intel SDM Vol. 2).
+    #[test]
+    fn bcd_adjust_daa_das_aaa_aas_aam_aad_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // 0: DAA  1: DAS  2: AAA  3: AAS  4-5: AAM 0Ah  6-7: AAD 0Ah  8-9: AAM 10h  10-11: AAD 10h
+        mem[0] = 0x27;
+        mem[1] = 0x2F;
+        mem[2] = 0x37;
+        mem[3] = 0x3F;
+        mem[4] = 0xD4;
+        mem[5] = 0x0A;
+        mem[6] = 0xD5;
+        mem[7] = 0x0A;
+        mem[8] = 0xD4;
+        mem[9] = 0x10;
+        mem[10] = 0xD5;
+        mem[11] = 0x10;
+        mem[12] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // DAA: AL=0x0A, AF=0, CF=0 → AL=0x10, AF=1, CF=0; SF/ZF/PF from AL.
+        // Spec: Intel SDM Vol. 2 "DAA".
+        cpu.set_al(0x0A);
+        cpu.set_af(false);
+        cpu.set_cf(false);
+        cpu.set_of(true); // OF undefined — left unchanged
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x10);
+        assert!(cpu.rflags & (1 << 4) != 0); // AF
+        assert!(cpu.rflags & 1 == 0); // CF
+        assert!(cpu.rflags & (1 << 6) == 0); // ZF
+        assert!(cpu.rflags & (1 << 7) == 0); // SF
+                                             // PF: 0x10 has one set bit (odd) → PF clear
+        assert!(cpu.rflags & (1 << 2) == 0);
+        assert!(cpu.rflags & (1 << 11) != 0); // OF preserved
+
+        // DAA: AL=0x9A → low adjust then +60H → AL=0x00, AF=1, CF=1, ZF=1.
+        cpu.rip = 0;
+        cpu.set_al(0x9A);
+        cpu.set_af(false);
+        cpu.set_cf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x00);
+        assert!(cpu.rflags & (1 << 4) != 0);
+        assert!(cpu.rflags & 1 != 0);
+        assert!(cpu.rflags & (1 << 6) != 0);
+
+        // DAA: AL=0x15, AF=1 → +6 → 0x1B; no high adjust.
+        cpu.rip = 0;
+        cpu.set_al(0x15);
+        cpu.set_af(true);
+        cpu.set_cf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x1B);
+        assert!(cpu.rflags & (1 << 4) != 0);
+        assert!(cpu.rflags & 1 == 0);
+
+        // DAS: AL=0x10, AF=0, CF=0 → no adjust (nibble ok, high ok).
+        // Spec: Intel SDM Vol. 2 "DAS".
+        cpu.rip = 1;
+        cpu.set_al(0x10);
+        cpu.set_af(false);
+        cpu.set_cf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x10);
+        assert!(cpu.rflags & (1 << 4) == 0);
+        assert!(cpu.rflags & 1 == 0);
+
+        // DAS: AL=0x05, AF=1 → AL−6 = 0xFF, AF=1; high adjust off → CF=0.
+        cpu.rip = 1;
+        cpu.set_al(0x05);
+        cpu.set_af(true);
+        cpu.set_cf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xFF);
+        assert!(cpu.rflags & (1 << 4) != 0);
+        assert!(cpu.rflags & 1 == 0);
+        assert!(cpu.rflags & (1 << 7) != 0); // SF
+
+        // DAS: AL=0xA0 → high adjust −60H → AL=0x40, CF=1.
+        cpu.rip = 1;
+        cpu.set_al(0xA0);
+        cpu.set_af(false);
+        cpu.set_cf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x40);
+        assert!(cpu.rflags & 1 != 0);
+
+        // AAA: AL=0x0A → AX+=0x106, AL&=0x0F → AX=0x0100, AF=CF=1.
+        // Spec: Intel SDM Vol. 2 "AAA". OF/SF/ZF/PF undefined (left unchanged).
+        cpu.rip = 2;
+        cpu.set_ax(0x000A);
+        cpu.set_af(false);
+        cpu.set_cf(false);
+        cpu.set_zf(true);
+        cpu.set_sf(true);
+        cpu.set_of(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x0100);
+        assert!(cpu.rflags & (1 << 4) != 0);
+        assert!(cpu.rflags & 1 != 0);
+        assert!(cpu.rflags & (1 << 6) != 0); // ZF preserved
+        assert!(cpu.rflags & (1 << 7) != 0); // SF preserved
+        assert!(cpu.rflags & (1 << 11) != 0); // OF preserved
+
+        // AAA: AL=0x05, AF=0 → no adjust; AL&=0x0F stays 5; AF=CF=0.
+        cpu.rip = 2;
+        cpu.set_ax(0x1205);
+        cpu.set_af(false);
+        cpu.set_cf(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x1205);
+        assert!(cpu.rflags & (1 << 4) == 0);
+        assert!(cpu.rflags & 1 == 0);
+
+        // AAS: AL=0x0A → AX−=0x106, AL&=0x0F → AX=0xFF04? Wait: 0x000A - 0x106 = 0xFF04, then AL&=0x0F → 0xFF04.
+        // Spec: Intel SDM Vol. 2 "AAS".
+        cpu.rip = 3;
+        cpu.set_ax(0x000A);
+        cpu.set_af(false);
+        cpu.set_cf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0xFF04);
+        assert!(cpu.rflags & (1 << 4) != 0);
+        assert!(cpu.rflags & 1 != 0);
+
+        // AAS: AL=0x03, AF=0 → AL&=0x0F; AF=CF=0.
+        cpu.rip = 3;
+        cpu.set_ax(0x5503);
+        cpu.set_af(false);
+        cpu.set_cf(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x5503);
+        assert!(cpu.rflags & (1 << 4) == 0);
+        assert!(cpu.rflags & 1 == 0);
+
+        // AAM base 10: AL=0x0F → AH=1, AL=5; SF/ZF/PF from AL.
+        // Spec: Intel SDM Vol. 2 "AAM".
+        cpu.rip = 4;
+        cpu.set_ax(0x000F);
+        cpu.set_cf(true); // undefined — left unchanged
+        cpu.set_of(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x0105);
+        assert!(cpu.rflags & (1 << 6) == 0); // ZF
+        assert!(cpu.rflags & (1 << 7) == 0); // SF
+        assert!(cpu.rflags & (1 << 2) != 0); // PF even(5)=true? 5=101b two bits → even → PF=1
+        assert!(cpu.rflags & 1 != 0); // CF preserved
+        assert!(cpu.rflags & (1 << 11) != 0); // OF preserved
+
+        // AAD base 10: AH=2, AL=3 → AL=23=0x17, AH=0.
+        // Spec: Intel SDM Vol. 2 "AAD".
+        cpu.rip = 6;
+        cpu.set_ax(0x0203);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x0017);
+        assert!(cpu.rflags & (1 << 6) == 0);
+        assert!(cpu.rflags & (1 << 7) == 0);
+
+        // AAM base 16: AL=0x2A → AH=2, AL=0x0A.
+        cpu.rip = 8;
+        cpu.set_ax(0x002A);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x020A);
+
+        // AAD base 16: AH=1, AL=5 → AL = 5 + 16 = 0x15.
+        cpu.rip = 10;
+        cpu.set_ax(0x0105);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x0015);
+        // PF for 0x15: three set bits → odd → PF clear
+        assert!(cpu.rflags & (1 << 2) == 0);
+    }
+
+    /// AAM imm8=0 raises #DE via IVT vector 0 (SDM Vol. 2 AAM; Vol. 3 §6.15).
+    #[test]
+    fn aam_base_zero_de_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[0] → 0000:0900
+        mem[0] = 0x00;
+        mem[1] = 0x09;
+        mem[2] = 0x00;
+        mem[3] = 0x00;
+        mem[0x1000] = 0xD4;
+        mem[0x1001] = 0x00; // AAM 0
+        mem[0x900] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0x0100);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        cpu.set_ax(0x0010);
+        let ax_before = cpu.ax();
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0900);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // fault IP
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0100);
+        assert_eq!(cpu.ax(), ax_before); // no partial update
     }
 
     /// CBW/CWD sign-extend AL→AX and AX→DX:AX (SDM Vol. 2).
