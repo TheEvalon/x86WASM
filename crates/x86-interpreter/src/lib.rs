@@ -1454,7 +1454,6 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xC6 => {
             // Group 11 MOV r/m8, imm8 — Spec: Intel SDM Vol. 2 "MOV" / opcode map.
             // Only /0 is defined; /1–/7 → Unsupported (not #UD delivery yet).
-            // Unsupported here: AH/CH/DH/BH high-byte rm (uses low-byte helpers).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg != 0 {
                 return Err(ExecError::Unsupported(op));
