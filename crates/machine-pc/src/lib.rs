@@ -149,6 +149,53 @@ impl Bus for MachineBus<'_> {
         self.ports.port_write(port, 1, u32::from(val));
         Ok(())
     }
+
+    fn port_in_u16(&mut self, port: u16) -> Result<u16, ExecError> {
+        // Spec: Intel SDM Vol. 2 INS/OUTS/IN/OUT — I/O address in DX, size = operand size.
+        if (0x3F8..0x400).contains(&port) {
+            return Ok(self.com1.port_read(port, 2) as u16);
+        }
+        if port == 0x402 {
+            return Ok(self.debug.port_read(port, 2) as u16);
+        }
+        Ok(self.ports.port_read(port, 2) as u16)
+    }
+
+    fn port_out_u16(&mut self, port: u16, val: u16) -> Result<(), ExecError> {
+        if (0x3F8..0x400).contains(&port) {
+            self.com1.port_write(port, 2, u32::from(val));
+            return Ok(());
+        }
+        if port == 0x402 {
+            self.debug.port_write(port, 2, u32::from(val));
+            return Ok(());
+        }
+        self.ports.port_write(port, 2, u32::from(val));
+        Ok(())
+    }
+
+    fn port_in_u32(&mut self, port: u16) -> Result<u32, ExecError> {
+        if (0x3F8..0x400).contains(&port) {
+            return Ok(self.com1.port_read(port, 4));
+        }
+        if port == 0x402 {
+            return Ok(self.debug.port_read(port, 4));
+        }
+        Ok(self.ports.port_read(port, 4))
+    }
+
+    fn port_out_u32(&mut self, port: u16, val: u32) -> Result<(), ExecError> {
+        if (0x3F8..0x400).contains(&port) {
+            self.com1.port_write(port, 4, val);
+            return Ok(());
+        }
+        if port == 0x402 {
+            self.debug.port_write(port, 4, val);
+            return Ok(());
+        }
+        self.ports.port_write(port, 4, val);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

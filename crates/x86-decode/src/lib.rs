@@ -630,6 +630,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_ins_outs() {
+        // Intel SDM Vol. 2: INS/INSB/INSW/INSD — 6C/6D; OUTS/OUTSB/OUTSW/OUTSD — 6E/6F.
+        // Under 0x66, 6D/6F are dword forms; mnemonic stays *W in this decoder.
+        assert_eq!(decode(&[0x6C]).unwrap().mnemonic, "INSB");
+        assert_eq!(decode(&[0x6D]).unwrap().mnemonic, "INSW");
+        assert_eq!(decode(&[0x6E]).unwrap().mnemonic, "OUTSB");
+        assert_eq!(decode(&[0x6F]).unwrap().mnemonic, "OUTSW");
+        let rep_ins = decode(&[0xF3, 0x6C]).unwrap();
+        assert!(rep_ins.prefixes.rep);
+        assert_eq!(rep_ins.mnemonic, "INSB");
+        assert_eq!(rep_ins.length, 2);
+        let opsz = decode(&[0x66, 0x6D]).unwrap();
+        assert!(opsz.prefixes.op_size_override);
+        assert_eq!(opsz.mnemonic, "INSW");
+        assert_eq!(opsz.length, 2);
+        let rep_outsd = decode(&[0xF3, 0x66, 0x6F]).unwrap();
+        assert!(rep_outsd.prefixes.rep);
+        assert!(rep_outsd.prefixes.op_size_override);
+        assert_eq!(rep_outsd.mnemonic, "OUTSW");
+    }
+
+    #[test]
     fn decode_rep_prefixes_on_string_ops() {
         // Intel SDM Vol. 2: REP/REPE = F3, REPNE = F2 (legacy prefixes).
         let rep_stos = decode(&[0xF3, 0xAA]).unwrap();

@@ -34,6 +34,27 @@ pub trait Bus {
     }
     fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError>;
     fn port_out_u8(&mut self, port: u16, val: u8) -> Result<(), ExecError>;
+    /// Default: two consecutive byte ports (port, port+1). Machine buses may override.
+    fn port_in_u16(&mut self, port: u16) -> Result<u16, ExecError> {
+        let lo = self.port_in_u8(port)?;
+        let hi = self.port_in_u8(port.wrapping_add(1))?;
+        Ok(u16::from_le_bytes([lo, hi]))
+    }
+    fn port_out_u16(&mut self, port: u16, val: u16) -> Result<(), ExecError> {
+        let bytes = val.to_le_bytes();
+        self.port_out_u8(port, bytes[0])?;
+        self.port_out_u8(port.wrapping_add(1), bytes[1])
+    }
+    /// Default: two consecutive word ports (port, port+2). Machine buses may override.
+    fn port_in_u32(&mut self, port: u16) -> Result<u32, ExecError> {
+        let lo = self.port_in_u16(port)?;
+        let hi = self.port_in_u16(port.wrapping_add(2))?;
+        Ok(u32::from(lo) | (u32::from(hi) << 16))
+    }
+    fn port_out_u32(&mut self, port: u16, val: u32) -> Result<(), ExecError> {
+        self.port_out_u16(port, val as u16)?;
+        self.port_out_u16(port.wrapping_add(2), (val >> 16) as u16)
+    }
 }
 
 /// Host-visible execution errors.
@@ -800,6 +821,80 @@ fn cmpsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     let d = string_index_delta(cpu, 4);
     cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
     cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One INSB iteration (no IP update). Spec: SDM Vol. 2 INS/INSB/INSW/INSD.
+/// Port = DX; destination = ES:(E)DI (no segment override for dest).
+fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let port = cpu.gpr_u16(CpuState::RDX);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let v = bus.port_in_u8(port)?;
+    bus.write_u8(dst, v)?;
+    let d = string_index_delta(cpu, 1);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One INSW iteration (no IP update). Spec: SDM Vol. 2 INS/INSW.
+fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let port = cpu.gpr_u16(CpuState::RDX);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let v = bus.port_in_u16(port)?;
+    bus.write_u16(dst, v)?;
+    let d = string_index_delta(cpu, 2);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One INSD iteration (no IP update). Spec: SDM Vol. 2 INS/INSD (opsize 32).
+fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let port = cpu.gpr_u16(CpuState::RDX);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let v = bus.port_in_u32(port)?;
+    bus.write_u32(dst, v)?;
+    let d = string_index_delta(cpu, 4);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One OUTSB iteration (no IP update). Spec: SDM Vol. 2 OUTS/OUTSB/OUTSW/OUTSD.
+/// Port = DX; source = DS:(E)SI (segment override allowed).
+fn outsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let port = cpu.gpr_u16(CpuState::RDX);
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let v = bus.read_u8(src)?;
+    bus.port_out_u8(port, v)?;
+    let d = string_index_delta(cpu, 1);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    Ok(())
+}
+
+/// One OUTSW iteration (no IP update). Spec: SDM Vol. 2 OUTS/OUTSW.
+fn outsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let port = cpu.gpr_u16(CpuState::RDX);
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let v = bus.read_u16(src)?;
+    bus.port_out_u16(port, v)?;
+    let d = string_index_delta(cpu, 2);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    Ok(())
+}
+
+/// One OUTSD iteration (no IP update). Spec: SDM Vol. 2 OUTS/OUTSD (opsize 32).
+fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let port = cpu.gpr_u16(CpuState::RDX);
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let v = bus.read_u32(src)?;
+    bus.port_out_u32(port, v)?;
+    let d = string_index_delta(cpu, 4);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
     Ok(())
 }
 
@@ -2038,6 +2133,50 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             } else {
                 let v = insn.immediate as i8 as i16 as u16;
                 push16(cpu, bus, v)?;
+            }
+            cpu.set_ip16(next_ip);
+        }
+        0x6C => {
+            // INSB — Spec: Intel SDM Vol. 2 "INS/INSB/INSW/INSD"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Port = DX; dest = ES:DI. F2/F3 act as unconditional REP (count = CX).
+            // Unsupported here: interruptible REP; asize 32/64; IOPL/CPL checks.
+            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| insb_once(cpu, bus))?;
+            cpu.set_ip16(next_ip);
+        }
+        0x6D => {
+            // INSW/INSD — Spec: Intel SDM Vol. 2 "INS/INSB/INSW/INSD"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Operand-size 16 → word; 0x66 → dword. Unsupported: interruptible REP; asize 32/64; IOPL.
+            if opsz32(&insn) {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| insd_once(cpu, bus))?;
+            } else {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| insw_once(cpu, bus))?;
+            }
+            cpu.set_ip16(next_ip);
+        }
+        0x6E => {
+            // OUTSB — Spec: Intel SDM Vol. 2 "OUTS/OUTSB/OUTSW/OUTSD"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Port = DX; src = DS:SI (segment override allowed).
+            // Unsupported here: interruptible REP; asize 32/64; IOPL/CPL checks.
+            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                outsb_once(cpu, bus, insn)
+            })?;
+            cpu.set_ip16(next_ip);
+        }
+        0x6F => {
+            // OUTSW/OUTSD — Spec: Intel SDM Vol. 2 "OUTS/OUTSB/OUTSW/OUTSD"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Operand-size 16 → word; 0x66 → dword. Unsupported: interruptible REP; asize 32/64; IOPL.
+            if opsz32(&insn) {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    outsd_once(cpu, bus, insn)
+                })?;
+            } else {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    outsw_once(cpu, bus, insn)
+                })?;
             }
             cpu.set_ip16(next_ip);
         }
@@ -4053,6 +4192,376 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u32(0x2100).unwrap(), 0xDEAD_BEEF);
         assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2104);
+    }
+
+    /// Port bus with sequenced IN bytes and recorded OUT traffic for INS/OUTS tests.
+    struct PortSeqBus {
+        mem: Vec<u8>,
+        in_bytes: Vec<u8>,
+        in_idx: usize,
+        /// Recorded (port, size, value) outs.
+        outs: Vec<(u16, u8, u32)>,
+    }
+
+    impl Bus for PortSeqBus {
+        fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+            let i = addr as usize;
+            if i >= self.mem.len() {
+                return Err(ExecError::MemoryFault(addr));
+            }
+            Ok(self.mem[i])
+        }
+        fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+            let i = addr as usize;
+            if i >= self.mem.len() {
+                return Err(ExecError::MemoryFault(addr));
+            }
+            self.mem[i] = val;
+            Ok(())
+        }
+        fn port_in_u8(&mut self, _port: u16) -> Result<u8, ExecError> {
+            if self.in_idx >= self.in_bytes.len() {
+                return Ok(0xFF);
+            }
+            let v = self.in_bytes[self.in_idx];
+            self.in_idx += 1;
+            Ok(v)
+        }
+        fn port_out_u8(&mut self, port: u16, val: u8) -> Result<(), ExecError> {
+            self.outs.push((port, 1, u32::from(val)));
+            Ok(())
+        }
+        fn port_in_u16(&mut self, port: u16) -> Result<u16, ExecError> {
+            let lo = self.port_in_u8(port)?;
+            let hi = self.port_in_u8(port.wrapping_add(1))?;
+            Ok(u16::from_le_bytes([lo, hi]))
+        }
+        fn port_out_u16(&mut self, port: u16, val: u16) -> Result<(), ExecError> {
+            self.outs.push((port, 2, u32::from(val)));
+            Ok(())
+        }
+        fn port_in_u32(&mut self, port: u16) -> Result<u32, ExecError> {
+            let lo = u32::from(self.port_in_u16(port)?);
+            let hi = u32::from(self.port_in_u16(port.wrapping_add(2))?);
+            Ok(lo | (hi << 16))
+        }
+        fn port_out_u32(&mut self, port: u16, val: u32) -> Result<(), ExecError> {
+            self.outs.push((port, 4, val));
+            Ok(())
+        }
+    }
+
+    /// INSB: DX port → ES:[DI], DI ±1 by DF (SDM Vol. 2 INS/INSB/INSW/INSD).
+    #[test]
+    fn insb_df_forward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x6C; // INSB
+        mem[1] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x3F8);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![0x41],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x2000).unwrap(), 0x41);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2001);
+        assert_eq!(cpu.ip16(), 1);
+    }
+
+    #[test]
+    fn insb_df_backward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x6C;
+        mem[1] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x60);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2000);
+        cpu.set_direction_flag(true);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![0xAB],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x2000).unwrap(), 0xAB);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x1FFF);
+    }
+
+    /// OUTSB: DS:[SI] → DX port, SI ±1 by DF (SDM Vol. 2 OUTS/OUTSB/OUTSW/OUTSD).
+    #[test]
+    fn outsb_df_forward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x6E; // OUTSB
+        mem[1] = 0xF4;
+        mem[0x1000] = b'Z';
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x3F8);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x3F8, 1, u32::from(b'Z'))]);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x1001);
+        assert_eq!(cpu.ip16(), 1);
+    }
+
+    #[test]
+    fn outsb_segment_override_es() {
+        // Spec: SDM Vol. 2 OUTS — source may use segment override; dest port is DX.
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x26; // ES:
+        mem[1] = 0x6E; // OUTSB
+        mem[2] = 0xF4;
+        mem[0x3000] = 0x55;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        // Put source data under ES base ≠ DS: use es.base via selector.
+        cpu.es = x86_core::SegmentReg::real_mode(0x0300); // base 0x3000
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x402);
+        cpu.set_gpr_u16(CpuState::RSI, 0); // ES:0 → linear 0x3000
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x402, 1, 0x55)]);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 1);
+    }
+
+    #[test]
+    fn rep_insb_fills_and_clears_cx() {
+        // Spec: SDM Vol. 2 INS + REP/REPE/REPNE (count = CX in asize 16).
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0x6C; // REP INSB
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x60);
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RDI, 0x4000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![0x11, 0x22, 0x33],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0x11);
+        assert_eq!(bus.read_u8(0x4001).unwrap(), 0x22);
+        assert_eq!(bus.read_u8(0x4002).unwrap(), 0x33);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x4003);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    #[test]
+    fn rep_outsb_cx_zero_is_nop() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0x6E; // REP OUTSB
+        mem[2] = 0xF4;
+        mem[0x1000] = 0x99;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x3F8);
+        cpu.set_gpr_u16(CpuState::RCX, 0);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(bus.outs.is_empty());
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x1000);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    #[test]
+    fn rep_outsb_writes_and_clears_cx() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0x6E; // REP OUTSB
+        mem[2] = 0xF4;
+        mem[0x1000] = b'A';
+        mem[0x1001] = b'B';
+        mem[0x1002] = b'C';
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x3F8);
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(
+            bus.outs,
+            [
+                (0x3F8, 1, u32::from(b'A')),
+                (0x3F8, 1, u32::from(b'B')),
+                (0x3F8, 1, u32::from(b'C')),
+            ]
+        );
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x1003);
+    }
+
+    /// INSW/OUTSW: word port I/O, SI/DI ±2 (SDM Vol. 2 INS/OUTS).
+    #[test]
+    fn insw_outsw_df_forward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x6D; // INSW
+        mem[1] = 0x6F; // OUTSW
+        mem[2] = 0xF4;
+        // OUTSW source after INSW wrote 0x1234 at ES:2000; point SI there.
+        // We'll set SI=0x2000 before OUTSW via separate setup — run step by step.
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x1F0);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            // little-endian word 0x1234 via default port_in_u16 (port, port+1)
+            in_bytes: vec![0x34, 0x12],
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap(); // INSW
+        assert_eq!(bus.read_u16(0x2000).unwrap(), 0x1234);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2002);
+
+        cpu.set_gpr_u16(CpuState::RSI, 0x2000);
+        step(&mut cpu, &mut bus).unwrap(); // OUTSW
+        assert_eq!(bus.outs, [(0x1F0, 2, 0x1234)]);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x2002);
+    }
+
+    #[test]
+    fn rep_insw_fills_words() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0x6D; // REP INSW
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x1F0);
+        cpu.set_gpr_u16(CpuState::RCX, 2);
+        cpu.set_gpr_u16(CpuState::RDI, 0x3000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![0xEE, 0xBE, 0xAD, 0xDE], // 0xBEEE, 0xDEAD
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x3000).unwrap(), 0xBEEE);
+        assert_eq!(bus.read_u16(0x3002).unwrap(), 0xDEAD);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x3004);
+    }
+
+    /// 0x66 6D/6F = INSD/OUTSD — dword element, DI/SI ±4 (SDM Vol. 2 INS/OUTS + opsize).
+    #[test]
+    fn rep_insd_outsd_opsize32() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0x66;
+        mem[2] = 0x6D; // REP INSD
+        mem[3] = 0x66;
+        mem[4] = 0x6F; // OUTSD (single)
+        mem[5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RDX, 0x1F0);
+        cpu.set_gpr_u16(CpuState::RCX, 1);
+        cpu.set_gpr_u16(CpuState::RDI, 0x5000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = PortSeqBus {
+            mem,
+            in_bytes: vec![0x01, 0x02, 0x03, 0x04], // 0x04030201
+            in_idx: 0,
+            outs: vec![],
+        };
+        step(&mut cpu, &mut bus).unwrap(); // REP INSD
+        assert_eq!(bus.read_u32(0x5000).unwrap(), 0x0403_0201);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x5004);
+
+        cpu.set_gpr_u16(CpuState::RSI, 0x5000);
+        step(&mut cpu, &mut bus).unwrap(); // OUTSD
+        assert_eq!(bus.outs, [(0x1F0, 4, 0x0403_0201)]);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x5004);
     }
 
     /// Short Jcc take/not-take for unsigned and signed conditions (SDM Vol. 2 Jcc).
