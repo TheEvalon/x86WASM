@@ -33,6 +33,7 @@ Desktop.ini
 *.vmdk
 *.iso
 firmware/seabios/*.bin
+firmware/seavgabios/*.bin
 firmware/ovmf/*.fd
 !firmware/manifests/**
 
@@ -45,3 +46,4 @@ firmware/ovmf/*.fd
 lcov.info
 tarpaulin-report.html
 perf.data*
+

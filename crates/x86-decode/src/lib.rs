@@ -183,6 +183,11 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         modrm = Some(m);
     }
 
+    // Group 3 TEST (F6/F7 /0 and /1) takes an immediate; other /r forms do not.
+    // Spec: Intel SDM Vol. 2 opcode map — F6 /0,/1 ib; F7 /0,/1 iw.
+    let grp3_test_imm =
+        matches!(opcode, 0xF6 | 0xF7) && matches!(modrm.map(|m| m.reg), Some(0) | Some(1));
+
     if (0xB0..=0xB7).contains(&opcode) {
         if i >= bytes.len() {
             return Err(DecodeError::Truncated);
@@ -201,6 +206,21 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 return Err(DecodeError::Truncated);
             }
             immediate = i32::from(i16::from_le_bytes([bytes[i], bytes[i + 1]]));
+            i += 2;
+        }
+    } else if grp3_test_imm {
+        if opcode == 0xF6 {
+            if i >= bytes.len() {
+                return Err(DecodeError::Truncated);
+            }
+            immediate = i32::from(bytes[i]);
+            i += 1;
+        } else {
+            // F7 /0,/1 iw — opsize-16 path (opsize 32 out of scope).
+            if i + 1 >= bytes.len() {
+                return Err(DecodeError::Truncated);
+            }
+            immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
             i += 2;
         }
     } else {
@@ -258,7 +278,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         return Err(DecodeError::TooLong);
     }
 
-    // Group 1 / 2 / 3: mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
+    // Group 1 / 2 / 3 / 4 / 5: mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
     let mnemonic = if matches!(opcode, 0x80 | 0x81 | 0x83) {
         match modrm.map(|m| m.reg) {
             Some(0) => "ADD",
@@ -284,10 +304,32 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             _ => def.mnemonic,
         }
     } else if matches!(opcode, 0xF6 | 0xF7) {
+        // Group 3: /0,/1 TEST; /2 NOT; /3 NEG; /4 MUL; /5 IMUL; /6 DIV; /7 IDIV (SDM Vol. 2).
         match modrm.map(|m| m.reg) {
+            Some(0) | Some(1) => "TEST",
             Some(2) => "NOT",
             Some(3) => "NEG",
-            Some(_) => "GRP3",
+            Some(4) => "MUL",
+            Some(5) => "IMUL",
+            Some(6) => "DIV",
+            Some(7) => "IDIV",
+            _ => def.mnemonic,
+        }
+    } else if opcode == 0xFE {
+        match modrm.map(|m| m.reg) {
+            Some(0) => "INC",
+            Some(1) => "DEC",
+            _ => def.mnemonic,
+        }
+    } else if opcode == 0xFF {
+        // Group 5: /0 INC, /1 DEC, /2 CALL near, /3 CALL far, /4 JMP near, /5 JMP far,
+        // /6 PUSH (SDM Vol. 2 opcode map). /7 remains GRP5 placeholder (#UD).
+        match modrm.map(|m| m.reg) {
+            Some(0) => "INC",
+            Some(1) => "DEC",
+            Some(2) | Some(3) => "CALL",
+            Some(4) | Some(5) => "JMP",
+            Some(6) => "PUSH",
             _ => def.mnemonic,
         }
     } else {
@@ -592,6 +634,31 @@ mod tests {
     }
 
     #[test]
+    fn decode_and_or_al_ax_imm() {
+        // Intel SDM Vol. 2: OR AL/AX,imm (0C/0D); AND AL/AX,imm (24/25)
+        let d = decode(&[0x0C, 0x0F]).unwrap();
+        assert_eq!(d.mnemonic, "OR");
+        assert_eq!(d.immediate, 0x0F);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0x0D, 0xF0, 0x0F]).unwrap();
+        assert_eq!(d.mnemonic, "OR");
+        assert_eq!(d.immediate, 0x0FF0);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0x24, 0xF0]).unwrap();
+        assert_eq!(d.mnemonic, "AND");
+        assert_eq!(d.immediate, 0xF0);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0x25, 0xFF, 0x00]).unwrap();
+        assert_eq!(d.mnemonic, "AND");
+        assert_eq!(d.immediate, 0x00FF);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0x0C]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x0D, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x24]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x25, 0x00]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_loop_jcxz() {
         // Intel SDM Vol. 2: LOOPNE/LOOPE/LOOP/JCXZ — E0–E3 rel8
         assert_eq!(decode(&[0xE0, 0xFE]).unwrap().mnemonic, "LOOPNE");
@@ -651,8 +718,54 @@ mod tests {
         assert_eq!(decode(&[0xF6, 0xD8]).unwrap().mnemonic, "NEG"); // NEG AL
         assert_eq!(decode(&[0xF7, 0xD0]).unwrap().mnemonic, "NOT"); // NOT AX
         assert_eq!(decode(&[0xF7, 0xD8]).unwrap().mnemonic, "NEG"); // NEG AX
-        assert_eq!(decode(&[0xF6, 0xC0]).unwrap().mnemonic, "GRP3"); // /0 TEST — not this slice
         assert_eq!(decode(&[0xF6]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_grp3_test_mul() {
+        // Intel SDM Vol. 2 Group 3: F6/F7 /0,/1 TEST imm; /4 MUL.
+        let d = decode(&[0xF6, 0xC0, 0x0F]).unwrap(); // TEST AL, 0x0F
+        assert_eq!(d.mnemonic, "TEST");
+        assert_eq!(d.modrm.unwrap().reg, 0);
+        assert_eq!(d.immediate, 0x0F);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0xF6, 0xC8, 0x01]).unwrap(); // TEST AL, 1 (/1 alias)
+        assert_eq!(d.mnemonic, "TEST");
+        assert_eq!(d.modrm.unwrap().reg, 1);
+        assert_eq!(d.immediate, 1);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0xF7, 0xC0, 0x34, 0x12]).unwrap(); // TEST AX, 0x1234
+        assert_eq!(d.mnemonic, "TEST");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0xF6, 0xE0]).unwrap().mnemonic, "MUL"); // MUL AL
+        assert_eq!(decode(&[0xF7, 0xE0]).unwrap().mnemonic, "MUL"); // MUL AX
+        let d = decode(&[0xF6, 0x06, 0x00, 0x40, 0xFF]).unwrap(); // TEST byte [0x4000], 0xFF (/0)
+        assert_eq!(d.mnemonic, "TEST");
+        assert_eq!(d.modrm.unwrap().reg, 0);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.immediate, 0xFF);
+        assert_eq!(d.length, 5);
+        assert_eq!(decode(&[0xF6, 0xC0]), Err(DecodeError::Truncated)); // TEST needs imm8
+        assert_eq!(decode(&[0xF7, 0xC0, 0x00]), Err(DecodeError::Truncated)); // TEST needs imm16
+    }
+
+    #[test]
+    fn decode_grp3_imul_div_idiv() {
+        // Intel SDM Vol. 2 Group 3: F6/F7 /5 IMUL, /6 DIV, /7 IDIV (no immediate).
+        assert_eq!(decode(&[0xF6, 0xE8]).unwrap().mnemonic, "IMUL"); // IMUL AL
+        assert_eq!(decode(&[0xF6, 0xF0]).unwrap().mnemonic, "DIV"); // DIV AL
+        assert_eq!(decode(&[0xF6, 0xF8]).unwrap().mnemonic, "IDIV"); // IDIV AL
+        assert_eq!(decode(&[0xF7, 0xE8]).unwrap().mnemonic, "IMUL"); // IMUL AX
+        assert_eq!(decode(&[0xF7, 0xF0]).unwrap().mnemonic, "DIV"); // DIV AX
+        assert_eq!(decode(&[0xF7, 0xF8]).unwrap().mnemonic, "IDIV"); // IDIV AX
+        let d = decode(&[0xF6, 0x36, 0x00, 0x40]).unwrap(); // DIV byte [0x4000]
+        assert_eq!(d.mnemonic, "DIV");
+        assert_eq!(d.modrm.unwrap().reg, 6);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0xF6, 0xE8]).unwrap().length, 2);
+        assert_eq!(decode(&[0xF7, 0xF0]).unwrap().length, 2);
     }
 
     #[test]
@@ -672,5 +785,214 @@ mod tests {
         assert_eq!(d.length, 4);
         assert_eq!(decode(&[0x08]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0x23]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_adc_sbb_modrm() {
+        // Intel SDM Vol. 2: ADC/SBB r/m,r and r,r/m (10–13, 18–1B).
+        assert_eq!(decode(&[0x10, 0xC3]).unwrap().mnemonic, "ADC"); // ADC BL, AL
+        assert_eq!(decode(&[0x11, 0xC3]).unwrap().mnemonic, "ADC"); // ADC BX, AX
+        assert_eq!(decode(&[0x12, 0xC3]).unwrap().mnemonic, "ADC"); // ADC AL, BL
+        assert_eq!(decode(&[0x13, 0xC3]).unwrap().mnemonic, "ADC"); // ADC AX, BX
+        assert_eq!(decode(&[0x18, 0xC3]).unwrap().mnemonic, "SBB"); // SBB BL, AL
+        assert_eq!(decode(&[0x19, 0xC3]).unwrap().mnemonic, "SBB"); // SBB BX, AX
+        assert_eq!(decode(&[0x1A, 0xC3]).unwrap().mnemonic, "SBB"); // SBB AL, BL
+        assert_eq!(decode(&[0x1B, 0xC3]).unwrap().mnemonic, "SBB"); // SBB AX, BX
+        let d = decode(&[0x11, 0x06, 0x00, 0x30]).unwrap(); // ADC [0x3000], AX
+        assert_eq!(d.mnemonic, "ADC");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0x10]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x1B]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_adc_sbb_al_ax_imm() {
+        // Intel SDM Vol. 2: ADC AL/AX,imm (14/15); SBB AL/AX,imm (1C/1D).
+        let d = decode(&[0x14, 0x01]).unwrap();
+        assert_eq!(d.mnemonic, "ADC");
+        assert_eq!(d.immediate, 0x01);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0x15, 0x00, 0x10]).unwrap();
+        assert_eq!(d.mnemonic, "ADC");
+        assert_eq!(d.immediate, 0x1000);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0x1C, 0x02]).unwrap();
+        assert_eq!(d.mnemonic, "SBB");
+        assert_eq!(d.immediate, 0x02);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0x1D, 0x01, 0x00]).unwrap();
+        assert_eq!(d.mnemonic, "SBB");
+        assert_eq!(d.immediate, 0x0001);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0x14]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x15, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x1C]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x1D, 0x00]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_xor_modrm() {
+        // Intel SDM Vol. 2: XOR r/m,r and r,r/m (30–33).
+        assert_eq!(decode(&[0x30, 0xC3]).unwrap().mnemonic, "XOR"); // XOR BL, AL
+        assert_eq!(decode(&[0x31, 0xC3]).unwrap().mnemonic, "XOR"); // XOR BX, AX
+        assert_eq!(decode(&[0x32, 0xC3]).unwrap().mnemonic, "XOR"); // XOR AL, BL
+        assert_eq!(decode(&[0x33, 0xC3]).unwrap().mnemonic, "XOR"); // XOR AX, BX
+        let d = decode(&[0x30, 0x06, 0x00, 0x30]).unwrap(); // XOR [0x3000], AL
+        assert_eq!(d.mnemonic, "XOR");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0x30]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x32]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_add_sub_modrm_byte() {
+        // Intel SDM Vol. 2: ADD/SUB r/m8,r8 and r8,r/m8 (00/02, 28/2A).
+        assert_eq!(decode(&[0x00, 0xC3]).unwrap().mnemonic, "ADD"); // ADD BL, AL
+        assert_eq!(decode(&[0x02, 0xC3]).unwrap().mnemonic, "ADD"); // ADD AL, BL
+        assert_eq!(decode(&[0x28, 0xC3]).unwrap().mnemonic, "SUB"); // SUB BL, AL
+        assert_eq!(decode(&[0x2A, 0xC3]).unwrap().mnemonic, "SUB"); // SUB AL, BL
+        let d = decode(&[0x00, 0x06, 0x00, 0x30]).unwrap(); // ADD [0x3000], AL
+        assert_eq!(d.mnemonic, "ADD");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        let d = decode(&[0x28, 0x06, 0x00, 0x30]).unwrap(); // SUB [0x3000], AL
+        assert_eq!(d.mnemonic, "SUB");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x02]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x28]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x2A]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_cmp_modrm_byte() {
+        // Intel SDM Vol. 2: CMP r/m8,r8 and r8,r/m8 (38/3A).
+        assert_eq!(decode(&[0x38, 0xC3]).unwrap().mnemonic, "CMP"); // CMP BL, AL
+        assert_eq!(decode(&[0x3A, 0xC3]).unwrap().mnemonic, "CMP"); // CMP AL, BL
+        let d = decode(&[0x38, 0x06, 0x00, 0x30]).unwrap(); // CMP [0x3000], AL
+        assert_eq!(d.mnemonic, "CMP");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        let d = decode(&[0x3A, 0x06, 0x00, 0x30]).unwrap(); // CMP AL, [0x3000]
+        assert_eq!(d.mnemonic, "CMP");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0x38]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x3A]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_sub_xor_cmp_al_ax_imm() {
+        // Intel SDM Vol. 2: SUB AL/AX,imm (2C/2D); XOR AL/AX,imm (34/35); CMP AL/AX,imm (3C/3D).
+        let d = decode(&[0x2C, 0x01]).unwrap();
+        assert_eq!(d.mnemonic, "SUB");
+        assert_eq!(d.immediate, 0x01);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0x2D, 0x00, 0x10]).unwrap();
+        assert_eq!(d.mnemonic, "SUB");
+        assert_eq!(d.immediate, 0x1000);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0x34, 0x0F]).unwrap();
+        assert_eq!(d.mnemonic, "XOR");
+        assert_eq!(d.immediate, 0x0F);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0x35, 0xFF, 0x00]).unwrap();
+        assert_eq!(d.mnemonic, "XOR");
+        assert_eq!(d.immediate, 0x00FF);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0x3C, 0x05]).unwrap();
+        assert_eq!(d.mnemonic, "CMP");
+        assert_eq!(d.immediate, 0x05);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0x3D, 0x34, 0x12]).unwrap();
+        assert_eq!(d.mnemonic, "CMP");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0x2C]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x2D, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x34]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x35, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x3C]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x3D, 0x00]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_add_ax_imm() {
+        // Intel SDM Vol. 2: ADD AX, imm16 (05 iw).
+        let d = decode(&[0x05, 0x34, 0x12]).unwrap();
+        assert_eq!(d.mnemonic, "ADD");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0x05, 0x00, 0x80]).unwrap();
+        assert_eq!(d.mnemonic, "ADD");
+        // Imm16 is decoded via i16; high bit set → negative i32; value as u16 is 0x8000.
+        assert_eq!(d.immediate as u16, 0x8000);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0x05]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x05, 0x00]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_grp4_grp5_inc_dec() {
+        // Intel SDM Vol. 2 Group 4/5: FE/FF /0 INC, /1 DEC.
+        assert_eq!(decode(&[0xFE, 0xC0]).unwrap().mnemonic, "INC"); // INC AL
+        assert_eq!(decode(&[0xFE, 0xC8]).unwrap().mnemonic, "DEC"); // DEC AL
+        assert_eq!(decode(&[0xFF, 0xC0]).unwrap().mnemonic, "INC"); // INC AX
+        assert_eq!(decode(&[0xFF, 0xC8]).unwrap().mnemonic, "DEC"); // DEC AX
+        let d = decode(&[0xFE, 0x06, 0x00, 0x40]).unwrap(); // INC byte [0x4000]
+        assert_eq!(d.mnemonic, "INC");
+        assert_eq!(d.modrm.unwrap().reg, 0);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.length, 4);
+        let d = decode(&[0xFF, 0x0E, 0x00, 0x40]).unwrap(); // DEC word [0x4000]
+        assert_eq!(d.mnemonic, "DEC");
+        assert_eq!(d.modrm.unwrap().reg, 1);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.length, 4);
+        // Other FE /r forms remain group placeholders; FF /2,/4,/6 named below.
+        assert_eq!(decode(&[0xFE, 0xD0]).unwrap().mnemonic, "GRP4"); // FE /2
+        assert_eq!(decode(&[0xFE]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xFF]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_grp5_call_jmp_push() {
+        // Intel SDM Vol. 2 Group 5: FF /2 CALL near, /4 JMP near, /6 PUSH r/m.
+        assert_eq!(decode(&[0xFF, 0xD0]).unwrap().mnemonic, "CALL"); // CALL AX
+        assert_eq!(decode(&[0xFF, 0xE0]).unwrap().mnemonic, "JMP"); // JMP AX
+        assert_eq!(decode(&[0xFF, 0xF0]).unwrap().mnemonic, "PUSH"); // PUSH AX
+        let d = decode(&[0xFF, 0x16, 0x00, 0x40]).unwrap(); // CALL word [0x4000]
+        assert_eq!(d.mnemonic, "CALL");
+        assert_eq!(d.modrm.unwrap().reg, 2);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.length, 4);
+        let d = decode(&[0xFF, 0x26, 0x00, 0x40]).unwrap(); // JMP word [0x4000]
+        assert_eq!(d.mnemonic, "JMP");
+        assert_eq!(d.modrm.unwrap().reg, 4);
+        let d = decode(&[0xFF, 0x36, 0x00, 0x40]).unwrap(); // PUSH word [0x4000]
+        assert_eq!(d.mnemonic, "PUSH");
+        assert_eq!(d.modrm.unwrap().reg, 6);
+        assert_eq!(decode(&[0xFF, 0xF8]).unwrap().mnemonic, "GRP5"); // FF /7
+    }
+
+    #[test]
+    fn decode_grp5_call_jmp_far() {
+        // Intel SDM Vol. 2 Group 5: FF /3 CALL far m16:16, /5 JMP far m16:16.
+        assert_eq!(decode(&[0xFF, 0xD8]).unwrap().mnemonic, "CALL"); // CALL FAR AX (reg → #UD at exec)
+        assert_eq!(decode(&[0xFF, 0xE8]).unwrap().mnemonic, "JMP"); // JMP FAR AX (reg → #UD at exec)
+        let d = decode(&[0xFF, 0x1E, 0x00, 0x40]).unwrap(); // CALL FAR [0x4000]
+        assert_eq!(d.mnemonic, "CALL");
+        assert_eq!(d.modrm.unwrap().reg, 3);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.length, 4);
+        let d = decode(&[0xFF, 0x2E, 0x00, 0x40]).unwrap(); // JMP FAR [0x4000]
+        assert_eq!(d.mnemonic, "JMP");
+        assert_eq!(d.modrm.unwrap().reg, 5);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0xFF, 0xF8]).unwrap().mnemonic, "GRP5"); // FF /7 still placeholder
     }
 }

@@ -1324,7 +1324,7 @@ Status (2026-08-02, branch `feat/real-mode-int-iret` / PR #1): **in progress** �
 
 Progress against implement list:
 
-- [x] Partial real-mode foundation (software INT/IRET/INT3, PUSHF/POPF, far CALL/RETF/JMP, segment MOV/PUSH/POP, Jcc, XCHG, LOOP/JCXZ, Group 1/2/3 subset, string byte ops without REP, LEA, CBW/CWD, flag ops, PUSH imm, SAHF/LAHF, INC/DEC r16, AND/OR ModRM 08–0B/20–23, and related ALU ModRM forms) — still incomplete vs BIOS needs
+- [x] Partial real-mode foundation (software INT/IRET/INT3, PUSHF/POPF, far CALL/RETF/JMP, segment MOV/PUSH/POP, Jcc, XCHG, LOOP/JCXZ, Group 1/2/3 full F6/F7 /0–/7 TEST/NOT/NEG/MUL/IMUL/DIV/IDIV with #DE, Group 4/5 INC/DEC r/m FE/FF /0–/1, Group 5 CALL/JMP/PUSH r/m FF /2,/4,/6, Group 5 far CALL/JMP m16:16 FF /3,/5, string byte ops without REP, LEA, CBW/CWD, flag ops, PUSH imm, SAHF/LAHF, INC/DEC r16, AND/OR ModRM 08–0B/20–23, AND/OR AL/AX imm 0C/0D/24/25, ADC/SBB ModRM 10–13/18–1B, ADC/SBB AL/AX imm 14/15/1C/1D, XOR ModRM 30–33, ADD/SUB ModRM byte 00/02/28/2A, SUB/XOR/CMP AL/AX imm 2C/2D/34/35/3C/3D, CMP ModRM byte 38/3A, ADD AX imm 05, and related ALU ModRM forms) — still incomplete vs BIOS needs
 - [ ] Complete real-mode foundation (remaining opcodes, exception delivery beyond software INT, REP strings, etc.)
 - [ ] Protected mode
 - [ ] Segmentation (beyond real-mode base<<4)
