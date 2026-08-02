@@ -1308,6 +1308,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
     },
 ];
 
+/// Two-byte opcode map entries (primary escape `0F`).
+/// Spec: Intel SDM Vol. 2 Chapter 2; opcode map 2.
+pub const M1_0F_SUBSET: &[InstrDef] = &[InstrDef {
+    mnemonic: "IMUL",
+    opcode: 0xAF,
+    encoding: Encoding::Modrm,
+    width: Width::OsZ,
+    sdm: "IMUL",
+}];
+
+pub fn lookup_0f(opcode: u8) -> Option<&'static InstrDef> {
+    M1_0F_SUBSET.iter().find(|d| d.opcode == opcode)
+}
+
 pub fn lookup_primary(opcode: u8) -> Option<&'static InstrDef> {
     // Opcode-reg groups (indices shift when entries are prepended — match by opcode).
     if (0x40..=0x47).contains(&opcode) {
@@ -1356,5 +1370,6 @@ mod tests {
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
+        assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
     }
 }

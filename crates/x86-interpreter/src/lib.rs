@@ -183,6 +183,14 @@ fn set_imul_flags_i16(cpu: &mut CpuState, prod: i32) {
     cpu.set_of(!fits);
 }
 
+/// Two-operand IMUL opsize-32: CF=OF=1 iff signed product does not fit in i32.
+/// SF/ZF/AF/PF undefined (left unchanged). Spec: Intel SDM Vol. 2 "IMUL".
+fn set_imul_flags_i32(cpu: &mut CpuState, prod: i64) {
+    let fits = prod == i64::from(prod as i32);
+    cpu.set_cf(!fits);
+    cpu.set_of(!fits);
+}
+
 fn set_logic_flags_u8(cpu: &mut CpuState, result: u8) {
     cpu.set_cf(false);
     cpu.set_of(false);
@@ -1346,6 +1354,39 @@ fn real_mode_ud(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> 
     real_mode_exception(cpu, bus, 6)
 }
 
+/// Two-byte opcode map (0F xx). Spec: Intel SDM Vol. 2 Chapter 2; "IMUL".
+fn step_two_byte(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    next_ip: u16,
+) -> Result<(), ExecError> {
+    match insn.opcode {
+        0xAF => {
+            // IMUL r16, r/m16 / IMUL r32, r/m32 — Spec: Intel SDM Vol. 2 "IMUL".
+            // Dest = ModRM.reg := ModRM.reg * r/m (signed).
+            // Unsupported here: REX.W r64 form; LOCK #UD.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0xAF))?;
+            if opsz32(insn) {
+                let src = read_rm_u32(cpu, bus, insn)?;
+                let dst = cpu.gpr_u32(m.reg as usize);
+                let prod = i64::from(dst as i32).wrapping_mul(i64::from(src as i32));
+                cpu.set_gpr_u32(m.reg as usize, prod as u32);
+                set_imul_flags_i32(cpu, prod);
+            } else {
+                let src = read_rm_u16(cpu, bus, insn)?;
+                let dst = cpu.gpr_u16(m.reg as usize);
+                let prod = i32::from(dst as i16).wrapping_mul(i32::from(src as i16));
+                cpu.set_gpr_u16(m.reg as usize, prod as u16);
+                set_imul_flags_i16(cpu, prod);
+            }
+            cpu.set_ip16(next_ip);
+            Ok(())
+        }
+        op => Err(ExecError::Unsupported(op)),
+    }
+}
+
 /// Execute a single instruction at CS:IP.
 pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     if cpu.halted {
@@ -1354,6 +1395,10 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     let insn = fetch_decode(cpu, bus)?;
     let next_ip = cpu.ip16().wrapping_add(insn.length as u16);
     let op = insn.opcode;
+
+    if insn.two_byte {
+        return step_two_byte(cpu, bus, &insn, next_ip);
+    }
 
     match op {
         0x06 => {
@@ -2275,7 +2320,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x69 | 0x6B => {
             // IMUL r16, r/m16, imm16/imm8 — Spec: Intel SDM Vol. 2 "IMUL".
             // Dest = ModRM.reg; src = r/m; imm sign-extended for 6B.
-            // Unsupported here: opsize 32; 0F AF two-operand form.
+            // Unsupported here: opsize 32 on 69/6B.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let src = read_rm_u16(cpu, bus, &insn)?;
             let imm = if op == 0x6B {
@@ -7990,6 +8035,89 @@ mod tests {
         assert_eq!(bus.read_u16(0x4000).unwrap(), 5);
         assert_eq!(cpu.rflags & 1, 0);
         assert_eq!(cpu.rflags & (1 << 11), 0);
+    }
+
+    /// IMUL r16/r32, r/m16/r/m32 — opcode 0F AF (SDM Vol. 2 "IMUL").
+    /// Dest = ModRM.reg * r/m; CF=OF iff signed product does not fit in dest width.
+    #[test]
+    fn imul_0f_af_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // 0: 0F AF D8          IMUL BX, AX
+        // 3: 0F AF D8          IMUL BX, AX (overflow)
+        // 6: 0F AF 1E 00 40    IMUL BX, [0x4000]
+        // B: 66 0F AF C3       IMUL EAX, EBX
+        // F: 66 0F AF C3       IMUL EAX, EBX (overflow)
+        // 13: F4               HLT
+        mem[0] = 0x0F;
+        mem[1] = 0xAF;
+        mem[2] = 0xD8;
+        mem[3] = 0x0F;
+        mem[4] = 0xAF;
+        mem[5] = 0xD8;
+        mem[6] = 0x0F;
+        mem[7] = 0xAF;
+        mem[8] = 0x1E;
+        mem[9] = 0x00;
+        mem[10] = 0x40;
+        mem[11] = 0x66;
+        mem[12] = 0x0F;
+        mem[13] = 0xAF;
+        mem[14] = 0xC3;
+        mem[15] = 0x66;
+        mem[16] = 0x0F;
+        mem[17] = 0xAF;
+        mem[18] = 0xC3;
+        mem[19] = 0xF4;
+        mem[0x4000] = 0x05;
+        mem[0x4001] = 0x00;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // IMUL BX, AX: 3*2=6 fits → CF=OF=0; AX unchanged
+        cpu.set_ax(2);
+        cpu.set_gpr_u16(CpuState::RBX, 3);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 6);
+        assert_eq!(cpu.ax(), 2);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL BX, AX: 0x100*0x100=0x10000 does not fit in i16 → CF=OF=1
+        cpu.set_ax(0x0100);
+        cpu.set_gpr_u16(CpuState::RBX, 0x0100);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0);
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL BX, [0x4000]: 7*5=35; memory unchanged
+        cpu.set_gpr_u16(CpuState::RBX, 7);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 35);
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 5);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL EAX, EBX: 0x10 * 0x20 = 0x200 fits → CF=OF=0
+        cpu.set_gpr_u32(CpuState::RAX, 0x10);
+        cpu.set_gpr_u32(CpuState::RBX, 0x20);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x200);
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x20);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL EAX, EBX: 0x10000 * 0x10000 = 0x1_0000_0000 does not fit in i32
+        cpu.set_gpr_u32(CpuState::RAX, 0x0001_0000);
+        cpu.set_gpr_u32(CpuState::RBX, 0x0001_0000);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0);
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 11), 0);
     }
 
     /// Operand-size override 0x66: MOV/PUSH/POP/ALU 32-bit in real mode.

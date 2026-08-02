@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use thiserror::Error;
-use x86_spec::{lookup_primary, Encoding};
+use x86_spec::{lookup_0f, lookup_primary, Encoding};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixState {
@@ -39,7 +39,11 @@ impl Modrm {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedInsn {
     pub prefixes: PrefixState,
+    /// Primary opcode, or secondary opcode when `two_byte` (0F escape).
     pub opcode: u8,
+    /// True when the instruction used the two-byte opcode map (0F xx).
+    /// Spec: Intel SDM Vol. 2 Chapter 2 (two-byte opcode escape).
+    pub two_byte: bool,
     pub modrm: Option<Modrm>,
     pub displacement: i32,
     pub immediate: i32,
@@ -96,9 +100,21 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
     if i >= bytes.len() {
         return Err(DecodeError::Truncated);
     }
-    let opcode = bytes[i];
+    let primary = bytes[i];
     i += 1;
-    let def = lookup_primary(opcode).ok_or(DecodeError::UnsupportedOpcode(opcode))?;
+    // Two-byte opcode escape 0F — Spec: Intel SDM Vol. 2 Chapter 2.
+    let (opcode, two_byte, def) = if primary == 0x0F {
+        if i >= bytes.len() {
+            return Err(DecodeError::Truncated);
+        }
+        let secondary = bytes[i];
+        i += 1;
+        let def = lookup_0f(secondary).ok_or(DecodeError::UnsupportedOpcode(secondary))?;
+        (secondary, true, def)
+    } else {
+        let def = lookup_primary(primary).ok_or(DecodeError::UnsupportedOpcode(primary))?;
+        (primary, false, def)
+    };
 
     let mut modrm = None;
     let mut displacement = 0i32;
@@ -107,23 +123,24 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
     let needs_modrm = matches!(
         def.encoding,
         Encoding::Modrm | Encoding::ModrmImm8 | Encoding::ModrmImm16
-    ) || matches!(
-        opcode,
-        0x01 | 0x03
-            | 0x09
-            | 0x29
-            | 0x2B
-            | 0x31
-            | 0x33
-            | 0x39
-            | 0x3B
-            | 0x84
-            | 0x85
-            | 0x88
-            | 0x89
-            | 0x8A
-            | 0x8B
-    );
+    ) || (!two_byte
+        && matches!(
+            opcode,
+            0x01 | 0x03
+                | 0x09
+                | 0x29
+                | 0x2B
+                | 0x31
+                | 0x33
+                | 0x39
+                | 0x3B
+                | 0x84
+                | 0x85
+                | 0x88
+                | 0x89
+                | 0x8A
+                | 0x8B
+        ));
 
     if needs_modrm {
         if i >= bytes.len() {
@@ -416,6 +433,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
     Ok(DecodedInsn {
         prefixes,
         opcode,
+        two_byte,
         modrm,
         displacement,
         immediate,
@@ -464,9 +482,11 @@ mod tests {
 
     #[test]
     fn unsupported_opcode() {
+        // Lone 0F waits for secondary; unknown secondary is unsupported.
+        assert_eq!(decode(&[0x0F]), Err(DecodeError::Truncated));
         assert!(matches!(
-            decode(&[0x0F]),
-            Err(DecodeError::UnsupportedOpcode(0x0F))
+            decode(&[0x0F, 0x01]),
+            Err(DecodeError::UnsupportedOpcode(0x01))
         ));
     }
 
@@ -759,6 +779,45 @@ mod tests {
         assert_eq!(decode(&[0x69, 0xD8]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0x6B, 0xD8]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0x69]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_imul_0f_af() {
+        // Intel SDM Vol. 2 "IMUL": 0F AF /r — IMUL r16, r/m16 (two-operand).
+        // Distinct from primary AF (SCASW).
+        let d = decode(&[0x0F, 0xAF, 0xD8]).unwrap(); // IMUL BX, AX
+        assert_eq!(d.mnemonic, "IMUL");
+        assert_eq!(d.opcode, 0xAF);
+        assert!(d.two_byte);
+        assert_eq!(d.modrm.unwrap().reg, 3); // BX
+        assert_eq!(d.modrm.unwrap().rm, 0); // AX
+        assert_eq!(d.length, 3);
+
+        // Memory: 0F AF 1E 00 40 = IMUL BX, [0x4000]
+        let d = decode(&[0x0F, 0xAF, 0x1E, 0x00, 0x40]).unwrap();
+        assert_eq!(d.mnemonic, "IMUL");
+        assert!(d.two_byte);
+        assert_eq!(d.length, 5);
+
+        // Opsize 32: 66 0F AF C3 = IMUL EAX, EBX
+        let d = decode(&[0x66, 0x0F, 0xAF, 0xC3]).unwrap();
+        assert_eq!(d.mnemonic, "IMUL");
+        assert!(d.two_byte);
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.modrm.unwrap().reg, 0); // EAX
+        assert_eq!(d.modrm.unwrap().rm, 3); // EBX
+        assert_eq!(d.length, 4);
+
+        // Truncated escape / unknown secondary.
+        assert_eq!(decode(&[0x0F]), Err(DecodeError::Truncated));
+        assert!(matches!(
+            decode(&[0x0F, 0x00]),
+            Err(DecodeError::UnsupportedOpcode(0x00))
+        ));
+        // Primary AF remains SCASW (not two-byte).
+        let d = decode(&[0xAF]).unwrap();
+        assert_eq!(d.mnemonic, "SCASW");
+        assert!(!d.two_byte);
     }
 
     #[test]
