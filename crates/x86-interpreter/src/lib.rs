@@ -274,130 +274,197 @@ fn set_shift_result_flags_u16(cpu: &mut CpuState, result: u16) {
     cpu.set_pf(parity_even(result as u8));
 }
 
-/// Group 2 byte ops with count=1 (opcode D0). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-fn grp2_u8(cpu: &mut CpuState, reg: u8, val: u8) -> Result<u8, ExecError> {
-    let cf = cpu.rflags & 1 != 0;
+/// Group 2 byte ops (D0/C0/D2). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+/// `raw_count` is masked to 5 bits; count 0 leaves dest and flags unchanged.
+fn grp2_u8(cpu: &mut CpuState, reg: u8, mut val: u8, raw_count: u8) -> Result<u8, ExecError> {
+    let count = raw_count & 0x1F;
+    if count == 0 {
+        return Ok(val);
+    }
     match reg {
         0 => {
-            // ROL — rotate left; CF=bit shifted out; OF=MSB(result) XOR CF (count=1).
-            let r = val.rotate_left(1);
-            let new_cf = (val & 0x80) != 0;
+            // ROL — tempCOUNT = COUNT mod 8; CF = LSB(result) when COUNT>0.
+            let n = count % 8;
+            if n != 0 {
+                val = val.rotate_left(u32::from(n));
+            }
+            let new_cf = (val & 1) != 0;
             cpu.set_cf(new_cf);
-            cpu.set_of(((r & 0x80) != 0) ^ new_cf);
-            Ok(r)
+            if count == 1 {
+                cpu.set_of(((val & 0x80) != 0) ^ new_cf);
+            }
+            Ok(val)
         }
         1 => {
-            // ROR — rotate right; OF = two MSBs of result XOR (count=1).
-            let r = val.rotate_right(1);
-            let new_cf = (val & 1) != 0;
+            let n = count % 8;
+            if n != 0 {
+                val = val.rotate_right(u32::from(n));
+            }
+            let new_cf = (val & 0x80) != 0;
             cpu.set_cf(new_cf);
-            cpu.set_of(((r ^ (r << 1)) & 0x80) != 0);
-            Ok(r)
+            if count == 1 {
+                cpu.set_of(((val ^ (val << 1)) & 0x80) != 0);
+            }
+            Ok(val)
         }
         2 => {
-            // RCL — rotate through carry left.
-            let new_cf = (val & 0x80) != 0;
-            let r = (val << 1) | u8::from(cf);
-            cpu.set_cf(new_cf);
-            cpu.set_of(((r & 0x80) != 0) ^ new_cf);
-            Ok(r)
+            // RCL — rotate through CF; tempCOUNT = COUNT mod 9.
+            let n = count % 9;
+            for _ in 0..n {
+                let new_cf = (val & 0x80) != 0;
+                val = (val << 1) | u8::from(cpu.rflags & 1 != 0);
+                cpu.set_cf(new_cf);
+            }
+            if count == 1 {
+                let cf = cpu.rflags & 1 != 0;
+                cpu.set_of(((val & 0x80) != 0) ^ cf);
+            }
+            Ok(val)
         }
         3 => {
-            // RCR — rotate through carry right.
-            let new_cf = (val & 1) != 0;
-            let r = (val >> 1) | (u8::from(cf) << 7);
-            cpu.set_cf(new_cf);
-            cpu.set_of(((r ^ (r << 1)) & 0x80) != 0);
-            Ok(r)
+            let n = count % 9;
+            for _ in 0..n {
+                let new_cf = (val & 1) != 0;
+                val = (val >> 1) | (u8::from(cpu.rflags & 1 != 0) << 7);
+                cpu.set_cf(new_cf);
+            }
+            if count == 1 {
+                cpu.set_of(((val ^ (val << 1)) & 0x80) != 0);
+            }
+            Ok(val)
         }
         4 => {
             // SHL/SAL
-            let new_cf = (val & 0x80) != 0;
-            let r = val << 1;
-            cpu.set_cf(new_cf);
-            cpu.set_of(((r & 0x80) != 0) ^ new_cf);
-            set_shift_result_flags_u8(cpu, r);
-            Ok(r)
+            for _ in 0..count {
+                cpu.set_cf((val & 0x80) != 0);
+                val <<= 1;
+            }
+            if count == 1 {
+                let cf = cpu.rflags & 1 != 0;
+                cpu.set_of(((val & 0x80) != 0) ^ cf);
+            }
+            set_shift_result_flags_u8(cpu, val);
+            Ok(val)
         }
         5 => {
-            // SHR — logical; OF = original MSB (count=1).
-            let new_cf = (val & 1) != 0;
-            let r = val >> 1;
-            cpu.set_cf(new_cf);
-            cpu.set_of((val & 0x80) != 0);
-            set_shift_result_flags_u8(cpu, r);
-            Ok(r)
+            let orig = val;
+            for _ in 0..count {
+                cpu.set_cf((val & 1) != 0);
+                val >>= 1;
+            }
+            if count == 1 {
+                cpu.set_of((orig & 0x80) != 0);
+            }
+            set_shift_result_flags_u8(cpu, val);
+            Ok(val)
         }
         6 => Err(ExecError::Unsupported(0xD0)), // reserved encoding
         7 => {
-            // SAR — arithmetic; OF cleared for count=1.
-            let new_cf = (val & 1) != 0;
-            let r = ((val as i8) >> 1) as u8;
-            cpu.set_cf(new_cf);
-            cpu.set_of(false);
-            set_shift_result_flags_u8(cpu, r);
-            Ok(r)
+            for _ in 0..count {
+                cpu.set_cf((val & 1) != 0);
+                val = ((val as i8) >> 1) as u8;
+            }
+            if count == 1 {
+                cpu.set_of(false);
+            }
+            set_shift_result_flags_u8(cpu, val);
+            Ok(val)
         }
         _ => Err(ExecError::Unsupported(0xD0)),
     }
 }
 
-/// Group 2 word ops with count=1 (opcode D1). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-fn grp2_u16(cpu: &mut CpuState, reg: u8, val: u16) -> Result<u16, ExecError> {
-    let cf = cpu.rflags & 1 != 0;
+/// Group 2 word ops (D1/C1/D3). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+fn grp2_u16(cpu: &mut CpuState, reg: u8, mut val: u16, raw_count: u8) -> Result<u16, ExecError> {
+    let count = raw_count & 0x1F;
+    if count == 0 {
+        return Ok(val);
+    }
     match reg {
         0 => {
-            let r = val.rotate_left(1);
-            let new_cf = (val & 0x8000) != 0;
+            let n = count % 16;
+            if n != 0 {
+                val = val.rotate_left(u32::from(n));
+            }
+            let new_cf = (val & 1) != 0;
             cpu.set_cf(new_cf);
-            cpu.set_of(((r & 0x8000) != 0) ^ new_cf);
-            Ok(r)
+            if count == 1 {
+                cpu.set_of(((val & 0x8000) != 0) ^ new_cf);
+            }
+            Ok(val)
         }
         1 => {
-            let r = val.rotate_right(1);
-            let new_cf = (val & 1) != 0;
+            let n = count % 16;
+            if n != 0 {
+                val = val.rotate_right(u32::from(n));
+            }
+            let new_cf = (val & 0x8000) != 0;
             cpu.set_cf(new_cf);
-            cpu.set_of(((r ^ (r << 1)) & 0x8000) != 0);
-            Ok(r)
+            if count == 1 {
+                cpu.set_of(((val ^ (val << 1)) & 0x8000) != 0);
+            }
+            Ok(val)
         }
         2 => {
-            let new_cf = (val & 0x8000) != 0;
-            let r = (val << 1) | u16::from(cf);
-            cpu.set_cf(new_cf);
-            cpu.set_of(((r & 0x8000) != 0) ^ new_cf);
-            Ok(r)
+            let n = count % 17;
+            for _ in 0..n {
+                let new_cf = (val & 0x8000) != 0;
+                val = (val << 1) | u16::from(cpu.rflags & 1 != 0);
+                cpu.set_cf(new_cf);
+            }
+            if count == 1 {
+                let cf = cpu.rflags & 1 != 0;
+                cpu.set_of(((val & 0x8000) != 0) ^ cf);
+            }
+            Ok(val)
         }
         3 => {
-            let new_cf = (val & 1) != 0;
-            let r = (val >> 1) | (u16::from(cf) << 15);
-            cpu.set_cf(new_cf);
-            cpu.set_of(((r ^ (r << 1)) & 0x8000) != 0);
-            Ok(r)
+            let n = count % 17;
+            for _ in 0..n {
+                let new_cf = (val & 1) != 0;
+                val = (val >> 1) | (u16::from(cpu.rflags & 1 != 0) << 15);
+                cpu.set_cf(new_cf);
+            }
+            if count == 1 {
+                cpu.set_of(((val ^ (val << 1)) & 0x8000) != 0);
+            }
+            Ok(val)
         }
         4 => {
-            let new_cf = (val & 0x8000) != 0;
-            let r = val << 1;
-            cpu.set_cf(new_cf);
-            cpu.set_of(((r & 0x8000) != 0) ^ new_cf);
-            set_shift_result_flags_u16(cpu, r);
-            Ok(r)
+            for _ in 0..count {
+                cpu.set_cf((val & 0x8000) != 0);
+                val <<= 1;
+            }
+            if count == 1 {
+                let cf = cpu.rflags & 1 != 0;
+                cpu.set_of(((val & 0x8000) != 0) ^ cf);
+            }
+            set_shift_result_flags_u16(cpu, val);
+            Ok(val)
         }
         5 => {
-            let new_cf = (val & 1) != 0;
-            let r = val >> 1;
-            cpu.set_cf(new_cf);
-            cpu.set_of((val & 0x8000) != 0);
-            set_shift_result_flags_u16(cpu, r);
-            Ok(r)
+            let orig = val;
+            for _ in 0..count {
+                cpu.set_cf((val & 1) != 0);
+                val >>= 1;
+            }
+            if count == 1 {
+                cpu.set_of((orig & 0x8000) != 0);
+            }
+            set_shift_result_flags_u16(cpu, val);
+            Ok(val)
         }
         6 => Err(ExecError::Unsupported(0xD1)),
         7 => {
-            let new_cf = (val & 1) != 0;
-            let r = ((val as i16) >> 1) as u16;
-            cpu.set_cf(new_cf);
-            cpu.set_of(false);
-            set_shift_result_flags_u16(cpu, r);
-            Ok(r)
+            for _ in 0..count {
+                cpu.set_cf((val & 1) != 0);
+                val = ((val as i16) >> 1) as u16;
+            }
+            if count == 1 {
+                cpu.set_of(false);
+            }
+            set_shift_result_flags_u16(cpu, val);
+            Ok(val)
         }
         _ => Err(ExecError::Unsupported(0xD1)),
     }
@@ -665,19 +732,37 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD0 => {
             // Group 2 r/m8, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-            // Unsupported here: count≠1 forms (C0/D2); /6 reserved; AH/CH/DH/BH via high-byte rm.
+            // Unsupported here: /6 reserved; AH/CH/DH/BH via high-byte rm.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u8(cpu, bus, &insn)?;
-            let r = grp2_u8(cpu, m.reg, v)?;
+            let r = grp2_u8(cpu, m.reg, v, 1)?;
             write_rm_u8(cpu, bus, &insn, r)?;
             cpu.set_ip16(next_ip);
         }
         0xD1 => {
             // Group 2 r/m16, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-            // Unsupported here: opsize 32; count≠1 forms (C1/D3); /6 reserved.
+            // Unsupported here: opsize 32; /6 reserved.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u16(cpu, bus, &insn)?;
-            let r = grp2_u16(cpu, m.reg, v)?;
+            let r = grp2_u16(cpu, m.reg, v, 1)?;
+            write_rm_u16(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
+        }
+        0xC0 => {
+            // Group 2 r/m8, imm8 — Spec: Intel SDM Vol. 2 (COUNT masked to 5 bits).
+            // Unsupported here: /6 reserved; AH/CH/DH/BH high-byte rm.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u8(cpu, bus, &insn)?;
+            let r = grp2_u8(cpu, m.reg, v, insn.immediate as u8)?;
+            write_rm_u8(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
+        }
+        0xC1 => {
+            // Group 2 r/m16, imm8 — Spec: Intel SDM Vol. 2 (COUNT masked to 5 bits).
+            // Unsupported here: opsize 32; /6 reserved.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u16(cpu, bus, &insn)?;
+            let r = grp2_u16(cpu, m.reg, v, insn.immediate as u8)?;
             write_rm_u16(cpu, bus, &insn, r)?;
             cpu.set_ip16(next_ip);
         }
@@ -1718,5 +1803,58 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x02);
         assert_eq!(cpu.rflags & ((1 << 6) | (1 << 7) | (1 << 2)), zf_sf_pf);
+    }
+
+    /// Group 2 C0/C1 imm8 count (masked to 5 bits). Spec: SDM Vol. 2.
+    #[test]
+    fn grp2_imm8_shl_shr_count0() {
+        let mut mem = vec![0u8; 0x10000];
+        // C0 E0 03 = SHL AL, 3; C1 E8 04 = SHR AX, 4; C0 E0 00 = SHL AL, 0 (no-op)
+        mem[0] = 0xC0;
+        mem[1] = 0xE0;
+        mem[2] = 0x03;
+        mem[3] = 0xC1;
+        mem[4] = 0xE8;
+        mem[5] = 0x04;
+        mem[6] = 0xC0;
+        mem[7] = 0xE0;
+        mem[8] = 0x00;
+        mem[9] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_al(0x01);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // SHL AL,3 → 0x08
+        assert_eq!(cpu.al(), 0x08);
+        assert_eq!(cpu.rflags & 1, 0);
+
+        cpu.set_ax(0x8000);
+        step(&mut cpu, &mut bus).unwrap(); // SHR AX,4 → 0x0800
+        assert_eq!(cpu.ax(), 0x0800);
+
+        let flags_before = cpu.rflags;
+        cpu.set_al(0x55);
+        step(&mut cpu, &mut bus).unwrap(); // SHL AL,0 — unchanged
+        assert_eq!(cpu.al(), 0x55);
+        assert_eq!(cpu.rflags, flags_before);
+    }
+
+    #[test]
+    fn grp2_imm8_count_masked_to_5_bits() {
+        // COUNT & 0x1F: imm=0x21 → count 1 (SDM Vol. 2).
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xC0;
+        mem[1] = 0xE0;
+        mem[2] = 0x21; // SHL AL, 0x21 → effective 1
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_al(0x40);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x80);
     }
 }

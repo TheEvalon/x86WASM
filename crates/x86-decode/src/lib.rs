@@ -203,7 +203,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         }
     } else {
         match def.encoding {
-            Encoding::Imm8 | Encoding::Imm8Port => {
+            Encoding::Imm8 | Encoding::Imm8Port | Encoding::ModrmImm8 => {
                 if i >= bytes.len() {
                     return Err(DecodeError::Truncated);
                 }
@@ -241,7 +241,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 displacement = i32::from(u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]));
                 i += 4;
             }
-            Encoding::None | Encoding::Modrm | Encoding::ModrmImm8 | Encoding::OpcodeReg => {}
+            Encoding::None | Encoding::Modrm | Encoding::OpcodeReg => {}
         }
     }
 
@@ -249,8 +249,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         return Err(DecodeError::TooLong);
     }
 
-    // Group 2 (D0/D1): mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
-    let mnemonic = if matches!(opcode, 0xD0 | 0xD1) {
+    // Group 2 (D0/D1/C0/C1): mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
+    let mnemonic = if matches!(opcode, 0xD0 | 0xD1 | 0xC0 | 0xC1) {
         match modrm.map(|m| m.reg) {
             Some(0) => "ROL",
             Some(1) => "ROR",
@@ -486,5 +486,20 @@ mod tests {
     fn truncated_grp2() {
         assert_eq!(decode(&[0xD0]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0xD1]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_grp2_imm8() {
+        // Intel SDM Vol. 2 Group 2: C0/C1 /r ib
+        // C0 E0 03 = SHL AL, 3
+        let d = decode(&[0xC0, 0xE0, 0x03]).unwrap();
+        assert_eq!(d.mnemonic, "SHL");
+        assert_eq!(d.immediate, 3);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0xC1, 0xE8, 0x04]).unwrap();
+        assert_eq!(d.mnemonic, "SHR");
+        assert_eq!(d.immediate, 4);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0xC0, 0xE0]), Err(DecodeError::Truncated));
     }
 }

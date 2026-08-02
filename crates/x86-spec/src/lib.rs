@@ -447,7 +447,21 @@ pub const M1_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "IRET",
     },
-    // Group 2: shift/rotate by 1 — ModRM.reg selects op (SDM Vol. 2 opcode map).
+    // Group 2: shift/rotate — ModRM.reg selects op (SDM Vol. 2 opcode map).
+    InstrDef {
+        mnemonic: "GRP2",
+        opcode: 0xC0,
+        encoding: Encoding::ModrmImm8,
+        width: Width::W8,
+        sdm: "SAL/SAR/SHL/SHR/ROL/ROR/RCL/RCR",
+    },
+    InstrDef {
+        mnemonic: "GRP2",
+        opcode: 0xC1,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "SAL/SAR/SHL/SHR/ROL/ROR/RCL/RCR",
+    },
     InstrDef {
         mnemonic: "GRP2",
         opcode: 0xD0,
@@ -606,7 +620,7 @@ mod tests {
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
             0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0xF8, 0xF9,
             0xFC, 0xFD, 0xCC, 0x70, 0x71, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D,
-            0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0xD0, 0xD1,
+            0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0xC0, 0xC1, 0xD0, 0xD1,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
