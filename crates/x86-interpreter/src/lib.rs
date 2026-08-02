@@ -1143,6 +1143,19 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_gpr_u16(idx, v);
             cpu.set_ip16(next_ip);
         }
+        0x68 => {
+            // PUSH imm16 — Spec: Intel SDM Vol. 2 "PUSH".
+            // Unsupported here: opsize 32 (push imm32).
+            push16(cpu, bus, insn.immediate as u16)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x6A => {
+            // PUSH imm8 (sign-extended to opsize) — Spec: Intel SDM Vol. 2 "PUSH".
+            // Unsupported here: opsize 32.
+            let v = insn.immediate as i8 as i16 as u16;
+            push16(cpu, bus, v)?;
+            cpu.set_ip16(next_ip);
+        }
         0xA4 => {
             // MOVSB — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ".
             // Unsupported here: MOVSW/D/Q; REP/REPE/REPNE prefixes.
@@ -2473,6 +2486,40 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0x2000);
         assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1000);
+    }
+
+    /// PUSH imm16 / sign-extended imm8 (SDM Vol. 2 PUSH).
+    #[test]
+    fn push_imm16_and_imm8() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x68;
+        mem[1] = 0x34;
+        mem[2] = 0x12; // PUSH 0x1234
+        mem[3] = 0x6A;
+        mem[4] = 0xFE; // PUSH -2 → 0xFFFE
+        mem[5] = 0x58; // POP AX
+        mem[6] = 0x5B; // POP BX
+        mem[7] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFC);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), 0x1234);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFA);
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0xFFFE);
+
+        step(&mut cpu, &mut bus).unwrap(); // POP AX ← 0xFFFE
+        assert_eq!(cpu.ax(), 0xFFFE);
+        step(&mut cpu, &mut bus).unwrap(); // POP BX ← 0x1234
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1234);
     }
 
     /// LAHF/SAHF transfer SF ZF AF PF CF via AH (SDM Vol. 2).

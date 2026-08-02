@@ -542,6 +542,21 @@ mod tests {
     }
 
     #[test]
+    fn decode_push_imm() {
+        // Intel SDM Vol. 2: PUSH imm16 (68 iw), PUSH imm8 (6A ib sign-ext)
+        let d = decode(&[0x68, 0x34, 0x12]).unwrap();
+        assert_eq!(d.mnemonic, "PUSH");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0x6A, 0xFE]).unwrap();
+        assert_eq!(d.mnemonic, "PUSH");
+        assert_eq!(d.immediate, 0xFE); // raw byte; sign-ext at execute
+        assert_eq!(d.length, 2);
+        assert_eq!(decode(&[0x68, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x6A]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_sahf_lahf() {
         // Intel SDM Vol. 2: SAHF (9E), LAHF (9F)
         assert_eq!(decode(&[0x9E]).unwrap().mnemonic, "SAHF");
