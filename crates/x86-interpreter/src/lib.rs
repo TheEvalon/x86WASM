@@ -239,6 +239,34 @@ fn write_sreg_real_mode(cpu: &mut CpuState, sreg: u8, selector: u16) -> Result<(
     Ok(())
 }
 
+/// Short Jcc condition for opcodes 0x70–0x7F (Intel SDM Vol. 2, Jcc).
+fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
+    let cf = cpu.rflags & 1 != 0;
+    let pf = cpu.rflags & (1 << 2) != 0;
+    let zf = cpu.rflags & (1 << 6) != 0;
+    let sf = cpu.rflags & (1 << 7) != 0;
+    let of = cpu.rflags & (1 << 11) != 0;
+    match opcode {
+        0x70 => of,                // JO
+        0x71 => !of,               // JNO
+        0x72 => cf,                // JB / JC / JNAE
+        0x73 => !cf,               // JAE / JNB / JNC
+        0x74 => zf,                // JE / JZ
+        0x75 => !zf,               // JNE / JNZ
+        0x76 => cf || zf,          // JBE / JNA
+        0x77 => !cf && !zf,        // JA / JNBE
+        0x78 => sf,                // JS
+        0x79 => !sf,               // JNS
+        0x7A => pf,                // JP / JPE
+        0x7B => !pf,               // JNP / JPO
+        0x7C => sf != of,          // JL / JNGE
+        0x7D => sf == of,          // JGE / JNL
+        0x7E => zf || (sf != of),  // JLE / JNG
+        0x7F => !zf && (sf == of), // JG / JNLE
+        _ => false,
+    }
+}
+
 fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::DecodedInsn, ExecError> {
     // Grow the window until decode succeeds or we hit the 15-byte SDM limit.
     let mut buf = Vec::with_capacity(15);
@@ -471,23 +499,10 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // Preserve high RFLAGS; bit 1 of FLAGS is reserved-1.
             cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
         }
-        0x74 => {
-            // JZ
-            if cpu.rflags & (1 << 6) != 0 {
-                cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
-            } else {
-                cpu.set_ip16(next_ip);
-            }
-        }
-        0x75 => {
-            if cpu.rflags & (1 << 6) == 0 {
-                cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
-            } else {
-                cpu.set_ip16(next_ip);
-            }
-        }
-        0x72 => {
-            if cpu.rflags & 1 != 0 {
+        0x70..=0x7F => {
+            // Jcc rel8 — Spec: Intel SDM Vol. 2 "Jcc".
+            // Unsupported here: near rel16/rel32 forms (0F 8x); JCXZ/JECXZ (E3).
+            if jcc_condition(cpu, op) {
                 cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
             } else {
                 cpu.set_ip16(next_ip);
@@ -1164,6 +1179,68 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8E)));
         assert_eq!(cpu.cs.selector, 0); // unchanged
+    }
+
+    /// Short Jcc take/not-take for unsigned and signed conditions (SDM Vol. 2 Jcc).
+    #[test]
+    fn jcc_short_conditions() {
+        // Layout: JA +2 → target HLT at ip=4; fall-through HLT at ip=2.
+        // 77 02 = JA +2; F4; F4
+        let run = |opcode: u8, flags: u64, expect_taken: bool| {
+            let mut mem = vec![0u8; 0x10000];
+            mem[0] = opcode;
+            mem[1] = 0x02; // rel8 = +2 → land on second HLT
+            mem[2] = 0xF4;
+            mem[3] = 0x90;
+            mem[4] = 0xF4;
+
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.rip = 0;
+            cpu.rflags = 0x2 | flags;
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            if expect_taken {
+                assert_eq!(cpu.ip16(), 4, "op {opcode:#x} flags {flags:#x} should take");
+            } else {
+                assert_eq!(
+                    cpu.ip16(),
+                    2,
+                    "op {opcode:#x} flags {flags:#x} should fall through"
+                );
+            }
+        };
+
+        // JA (77): CF=0 and ZF=0
+        run(0x77, 0, true);
+        run(0x77, 1, false); // CF
+        run(0x77, 1 << 6, false); // ZF
+                                  // JAE (73): CF=0
+        run(0x73, 0, true);
+        run(0x73, 1, false);
+        // JBE (76): CF|ZF
+        run(0x76, 0, false);
+        run(0x76, 1, true);
+        run(0x76, 1 << 6, true);
+        // JL (7C): SF != OF
+        run(0x7C, 0, false);
+        run(0x7C, 1 << 7, true); // SF
+        run(0x7C, (1 << 7) | (1 << 11), false); // SF+OF
+                                                // JG (7F): ZF=0 and SF==OF
+        run(0x7F, 0, true);
+        run(0x7F, 1 << 6, false);
+        run(0x7F, 1 << 7, false);
+        // JO (70) / JS (78) / JP (7A)
+        run(0x70, 1 << 11, true);
+        run(0x70, 0, false);
+        run(0x78, 1 << 7, true);
+        run(0x7A, 1 << 2, true);
+        // JGE (7D) / JLE (7E) / JNO (71) / JNS (79) / JNP (7B)
+        run(0x7D, 0, true);
+        run(0x7E, 1 << 6, true);
+        run(0x71, 0, true);
+        run(0x79, 0, true);
+        run(0x7B, 0, true);
     }
 
     /// INT3 delivers vector 3 through the IVT like INT 3 (SDM Vol. 2 INT3; Vol. 3 §6.4).

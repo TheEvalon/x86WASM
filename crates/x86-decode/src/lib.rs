@@ -427,4 +427,16 @@ mod tests {
         assert_eq!(d.mnemonic, "INT3");
         assert_eq!(d.length, 1);
     }
+
+    #[test]
+    fn decode_jcc_short_rel8() {
+        // Intel SDM Vol. 2: Jcc — 70..7F cb
+        assert_eq!(decode(&[0x70, 0x05]).unwrap().mnemonic, "JO");
+        assert_eq!(decode(&[0x73, 0xFE]).unwrap().mnemonic, "JAE");
+        assert_eq!(decode(&[0x7F, 0x00]).unwrap().mnemonic, "JG");
+        let d = decode(&[0x7C, 0x10]).unwrap();
+        assert_eq!(d.mnemonic, "JL");
+        assert_eq!(d.immediate, 0x10);
+        assert_eq!(d.length, 2);
+    }
 }
