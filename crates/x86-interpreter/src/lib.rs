@@ -1201,6 +1201,72 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_gpr_u16(idx, insn.immediate as u16);
             cpu.set_ip16(next_ip);
         }
+        0xA0 => {
+            // MOV AL, moffs8 — Spec: Intel SDM Vol. 2 "MOV".
+            // Unsupported here: address-size 32/64.
+            let off = insn.immediate as u16;
+            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+            let v = bus.read_u8(addr)?;
+            cpu.set_al(v);
+            cpu.set_ip16(next_ip);
+        }
+        0xA1 => {
+            // MOV AX, moffs16 — Spec: Intel SDM Vol. 2 "MOV".
+            // Unsupported here: opsize 32; address-size 32/64.
+            let off = insn.immediate as u16;
+            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+            let v = bus.read_u16(addr)?;
+            cpu.set_ax(v);
+            cpu.set_ip16(next_ip);
+        }
+        0xA2 => {
+            // MOV moffs8, AL — Spec: Intel SDM Vol. 2 "MOV".
+            let off = insn.immediate as u16;
+            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+            bus.write_u8(addr, cpu.al())?;
+            cpu.set_ip16(next_ip);
+        }
+        0xA3 => {
+            // MOV moffs16, AX — Spec: Intel SDM Vol. 2 "MOV".
+            // Unsupported here: opsize 32; address-size 32/64.
+            let off = insn.immediate as u16;
+            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+            bus.write_u16(addr, cpu.ax())?;
+            cpu.set_ip16(next_ip);
+        }
+        0xA8 => {
+            // TEST AL, imm8 — Spec: Intel SDM Vol. 2 "TEST".
+            // Flags: CF=OF=0; SF/ZF/PF from (AL & imm); AF undefined (cleared).
+            set_logic_flags_u8(cpu, cpu.al() & insn.immediate as u8);
+            cpu.set_ip16(next_ip);
+        }
+        0xA9 => {
+            // TEST AX, imm16 — Spec: Intel SDM Vol. 2 "TEST".
+            // Unsupported here: opsize 32 (imm32).
+            set_logic_flags_u16(cpu, cpu.ax() & insn.immediate as u16);
+            cpu.set_ip16(next_ip);
+        }
+        0xC6 => {
+            // Group 11 MOV r/m8, imm8 — Spec: Intel SDM Vol. 2 "MOV" / opcode map.
+            // Only /0 is defined; /1–/7 → Unsupported (not #UD delivery yet).
+            // Unsupported here: AH/CH/DH/BH high-byte rm (uses low-byte helpers).
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg != 0 {
+                return Err(ExecError::Unsupported(op));
+            }
+            write_rm_u8(cpu, bus, &insn, insn.immediate as u8)?;
+            cpu.set_ip16(next_ip);
+        }
+        0xC7 => {
+            // Group 11 MOV r/m16, imm16 — Spec: Intel SDM Vol. 2 "MOV" / opcode map.
+            // Unsupported here: opsize 32 (imm32); /1–/7 → Unsupported.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg != 0 {
+                return Err(ExecError::Unsupported(op));
+            }
+            write_rm_u16(cpu, bus, &insn, insn.immediate as u16)?;
+            cpu.set_ip16(next_ip);
+        }
         0x8A => {
             // MOV r8, r/m8
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
@@ -2961,5 +3027,159 @@ mod tests {
         cpu.set_ax(0xFFFF);
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0xF0FF);
+    }
+
+    /// MOV C6/C7 r/m,imm — Spec: Intel SDM Vol. 2 MOV.
+    #[test]
+    fn mov_rm_imm_c6_c7_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // C6 C0 5A = MOV AL, 0x5A
+        // C6 06 00 40 99 = MOV byte [0x4000], 0x99
+        // C7 C3 34 12 = MOV BX, 0x1234
+        // C7 06 00 30 CD AB = MOV word [0x3000], 0xABCD
+        // C6 C8 00 = MOV /1 — unsupported
+        mem[0] = 0xC6;
+        mem[1] = 0xC0;
+        mem[2] = 0x5A;
+        mem[3] = 0xC6;
+        mem[4] = 0x06;
+        mem[5] = 0x00;
+        mem[6] = 0x40;
+        mem[7] = 0x99;
+        mem[8] = 0xC7;
+        mem[9] = 0xC3;
+        mem[10] = 0x34;
+        mem[11] = 0x12;
+        mem[12] = 0xC7;
+        mem[13] = 0x06;
+        mem[14] = 0x00;
+        mem[15] = 0x30;
+        mem[16] = 0xCD;
+        mem[17] = 0xAB;
+        mem[18] = 0xC6;
+        mem[19] = 0xC8;
+        mem[20] = 0x00;
+        mem[21] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_al(0);
+        cpu.rflags = 0x246;
+        let flags_before = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x5A);
+        assert_eq!(cpu.rflags, flags_before); // MOV does not touch flags
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0x99);
+        assert_eq!(cpu.rflags, flags_before);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1234);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x3000).unwrap(), 0xABCD);
+
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0xC6)));
+    }
+
+    /// MOV A0–A3 AL/AX ↔ moffs — Spec: Intel SDM Vol. 2 MOV.
+    #[test]
+    fn mov_moffs_a0_a3_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // A0 00 40 = MOV AL, [0x4000]
+        // A2 00 50 = MOV [0x5000], AL
+        // A1 00 30 = MOV AX, [0x3000]
+        // A3 00 60 = MOV [0x6000], AX
+        // 2E A0 00 10 = MOV AL, CS:[0x1000]
+        mem[0] = 0xA0;
+        mem[1] = 0x00;
+        mem[2] = 0x40;
+        mem[3] = 0xA2;
+        mem[4] = 0x00;
+        mem[5] = 0x50;
+        mem[6] = 0xA1;
+        mem[7] = 0x00;
+        mem[8] = 0x30;
+        mem[9] = 0xA3;
+        mem[10] = 0x00;
+        mem[11] = 0x60;
+        mem[12] = 0x2E;
+        mem[13] = 0xA0;
+        mem[14] = 0x00;
+        mem[15] = 0x10;
+        mem[16] = 0xF4;
+        mem[0x4000] = 0xAB;
+        mem[0x3000] = 0x34;
+        mem[0x3001] = 0x12;
+        mem[0x1000] = 0xCD; // CS=0 → linear 0x1000
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xAB);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x5000).unwrap(), 0xAB);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x1234);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x6000).unwrap(), 0x1234);
+
+        cpu.set_al(0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xCD);
+    }
+
+    /// TEST A8/A9 AL/AX,imm — Spec: Intel SDM Vol. 2 TEST.
+    #[test]
+    fn test_al_ax_imm_a8_a9_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // A8 0F = TEST AL, 0x0F
+        // A9 FF 00 = TEST AX, 0x00FF
+        // A8 00 = TEST AL, 0 (ZF)
+        mem[0] = 0xA8;
+        mem[1] = 0x0F;
+        mem[2] = 0xA9;
+        mem[3] = 0xFF;
+        mem[4] = 0x00;
+        mem[5] = 0xA8;
+        mem[6] = 0x00;
+        mem[7] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_al(0xF0);
+        cpu.set_cf(true);
+        cpu.set_of(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xF0); // unchanged
+        assert_eq!(cpu.rflags & 1, 0); // CF cleared
+        assert_eq!(cpu.rflags & (1 << 11), 0); // OF cleared
+        assert_eq!(cpu.rflags & (1 << 6), 1 << 6); // ZF (0xF0 & 0x0F == 0)
+
+        cpu.set_ax(0x12F0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x12F0);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0 (0x12F0 & 0x00FF == 0x00F0)
+        assert_eq!(cpu.rflags & (1 << 7), 0); // SF from 16-bit result (bit 15 clear)
+
+        cpu.set_al(0x55);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x55);
+        assert_eq!(cpu.rflags & (1 << 6), 1 << 6); // ZF
     }
 }

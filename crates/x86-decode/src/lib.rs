@@ -250,6 +250,19 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 displacement = i32::from(u16::from_le_bytes([bytes[i + 2], bytes[i + 3]]));
                 i += 4;
             }
+            Encoding::Moffs => {
+                // Absolute moffs — address-size attribute; real-mode default is 16-bit.
+                // Spec: Intel SDM Vol. 2, MOV AL/AX/EAX/RAX, moffs / moffs, AL/AX/….
+                // Unsupported here: address-size 32/64 (0x67 / long mode).
+                if prefixes.addr_size_override {
+                    return Err(DecodeError::UnsupportedOpcode(opcode));
+                }
+                if i + 1 >= bytes.len() {
+                    return Err(DecodeError::Truncated);
+                }
+                immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                i += 2;
+            }
             Encoding::None | Encoding::Modrm | Encoding::OpcodeReg => {}
         }
     }
@@ -288,6 +301,12 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             Some(2) => "NOT",
             Some(3) => "NEG",
             Some(_) => "GRP3",
+            _ => def.mnemonic,
+        }
+    } else if matches!(opcode, 0xC6 | 0xC7) {
+        // Group 11: /0 MOV; other reg encodings reserved.
+        match modrm.map(|m| m.reg) {
+            Some(0) => "MOV",
             _ => def.mnemonic,
         }
     } else {
@@ -672,5 +691,81 @@ mod tests {
         assert_eq!(d.length, 4);
         assert_eq!(decode(&[0x08]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0x23]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_mov_rm_imm_c6_c7() {
+        // Intel SDM Vol. 2: MOV r/m8,imm8 (C6 /0); MOV r/m16,imm16 (C7 /0).
+        // C6 C0 5A = MOV AL, 0x5A
+        let d = decode(&[0xC6, 0xC0, 0x5A]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.modrm.unwrap().reg, 0);
+        assert_eq!(d.immediate, 0x5A);
+        assert_eq!(d.length, 3);
+        // C6 06 00 40 99 = MOV byte [0x4000], 0x99
+        let d = decode(&[0xC6, 0x06, 0x00, 0x40, 0x99]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.immediate, 0x99);
+        assert_eq!(d.length, 5);
+        // C7 C3 34 12 = MOV BX, 0x1234
+        let d = decode(&[0xC7, 0xC3, 0x34, 0x12]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 4);
+        // C7 06 00 30 CD AB = MOV word [0x3000], 0xABCD
+        let d = decode(&[0xC7, 0x06, 0x00, 0x30, 0xCD, 0xAB]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.immediate, 0xABCD);
+        assert_eq!(d.length, 6);
+        // Non-/0 keeps group mnemonic
+        assert_eq!(decode(&[0xC6, 0xC8, 0x00]).unwrap().mnemonic, "GRP11");
+        assert_eq!(decode(&[0xC6]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xC6, 0xC0]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xC7, 0xC0]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_mov_moffs_a0_a3() {
+        // Intel SDM Vol. 2: MOV AL/AX, moffs; MOV moffs, AL/AX (A0–A3).
+        let d = decode(&[0xA0, 0x34, 0x12]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0xA1, 0x00, 0x40]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.immediate, 0x4000);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0xA2, 0x00, 0x50]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.immediate, 0x5000);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0xA3, 0xFE, 0xFF]).unwrap();
+        assert_eq!(d.mnemonic, "MOV");
+        assert_eq!(d.immediate, 0xFFFE);
+        assert_eq!(d.length, 3);
+        // CS: override prefix
+        let d = decode(&[0x2E, 0xA0, 0x00, 0x10]).unwrap();
+        assert_eq!(d.prefixes.segment_override, Some(0x2E));
+        assert_eq!(d.immediate, 0x1000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0xA0]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xA1, 0x00]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_test_al_ax_imm_a8_a9() {
+        // Intel SDM Vol. 2: TEST AL,imm8 (A8); TEST AX,imm16 (A9).
+        let d = decode(&[0xA8, 0x0F]).unwrap();
+        assert_eq!(d.mnemonic, "TEST");
+        assert_eq!(d.immediate, 0x0F);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0xA9, 0xFF, 0x00]).unwrap();
+        assert_eq!(d.mnemonic, "TEST");
+        assert_eq!(d.immediate, 0x00FF);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0xA8]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xA9, 0x00]), Err(DecodeError::Truncated));
     }
 }

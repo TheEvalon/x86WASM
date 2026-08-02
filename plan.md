@@ -1324,7 +1324,7 @@ Status (2026-08-02, branch `feat/real-mode-int-iret` / PR #1): **in progress** �
 
 Progress against implement list:
 
-- [x] Partial real-mode foundation (software INT/IRET/INT3, PUSHF/POPF, far CALL/RETF/JMP, segment MOV/PUSH/POP, Jcc, XCHG, LOOP/JCXZ, Group 1/2/3 subset, string byte ops without REP, LEA, CBW/CWD, flag ops, PUSH imm, SAHF/LAHF, INC/DEC r16, AND/OR ModRM 08–0B/20–23, and related ALU ModRM forms) — still incomplete vs BIOS needs
+- [x] Partial real-mode foundation (software INT/IRET/INT3, PUSHF/POPF, far CALL/RETF/JMP, segment MOV/PUSH/POP, Jcc, XCHG, LOOP/JCXZ, Group 1/2/3 subset, string byte ops without REP, LEA, CBW/CWD, flag ops, PUSH imm, SAHF/LAHF, INC/DEC r16, AND/OR ModRM 08–0B/20–23, related ALU ModRM forms, MOV C6/C7 r/m imm, MOV A0–A3 moffs, TEST A8/A9 AL/AX imm) — still incomplete vs BIOS needs
 - [ ] Complete real-mode foundation (remaining opcodes, exception delivery beyond software INT, REP strings, etc.)
 - [ ] Protected mode
 - [ ] Segmentation (beyond real-mode base<<4)

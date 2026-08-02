@@ -21,6 +21,9 @@ pub enum Encoding {
     ModrmImm16,
     /// `OUT imm8, AL` / `IN AL, imm8`
     Imm8Port,
+    /// Absolute memory offset (moffs) following address-size attribute.
+    /// Real-mode default: 16-bit offset in the immediate field.
+    Moffs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,6 +369,48 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "ADD",
     },
     InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA0,
+        encoding: Encoding::Moffs,
+        width: Width::W8,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA1,
+        encoding: Encoding::Moffs,
+        width: Width::OsZ,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA2,
+        encoding: Encoding::Moffs,
+        width: Width::W8,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA3,
+        encoding: Encoding::Moffs,
+        width: Width::OsZ,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "TEST",
+        opcode: 0xA8,
+        encoding: Encoding::Imm8,
+        width: Width::W8,
+        sdm: "TEST",
+    },
+    InstrDef {
+        mnemonic: "TEST",
+        opcode: 0xA9,
+        encoding: Encoding::Imm16,
+        width: Width::OsZ,
+        sdm: "TEST",
+    },
+    InstrDef {
         mnemonic: "MOVSB",
         opcode: 0xA4,
         encoding: Encoding::None,
@@ -613,6 +658,21 @@ pub const M1_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "SAL/SAR/SHL/SHR/ROL/ROR/RCL/RCR",
     },
+    // Group 11: MOV r/m, imm — only /0 is valid (SDM Vol. 2 opcode map).
+    InstrDef {
+        mnemonic: "GRP11",
+        opcode: 0xC6,
+        encoding: Encoding::ModrmImm8,
+        width: Width::W8,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "GRP11",
+        opcode: 0xC7,
+        encoding: Encoding::ModrmImm16,
+        width: Width::OsZ,
+        sdm: "MOV",
+    },
     InstrDef {
         mnemonic: "GRP2",
         opcode: 0xD0,
@@ -836,7 +896,8 @@ mod tests {
             0x68, 0x6A, 0x8C, 0x8E, 0xF8, 0xF9, 0xFC, 0xFD, 0xCC, 0x70, 0x71, 0x73, 0x76, 0x77,
             0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0x8D, 0x86, 0x87,
             0x91, 0x97, 0x98, 0x99, 0x80, 0x81, 0x83, 0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3, 0xE0,
-            0xE1, 0xE2, 0xE3, 0xF6, 0xF7, 0x08, 0x09, 0x0A, 0x0B, 0x20, 0x21, 0x22, 0x23,
+            0xE1, 0xE2, 0xE3, 0xF6, 0xF7, 0x08, 0x09, 0x0A, 0x0B, 0x20, 0x21, 0x22, 0x23, 0xA0,
+            0xA1, 0xA2, 0xA3, 0xA8, 0xA9, 0xC6, 0xC7,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
