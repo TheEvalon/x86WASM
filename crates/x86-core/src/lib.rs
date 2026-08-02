@@ -143,12 +143,46 @@ impl CpuState {
         self.gpr[idx] = (old & !0xFF) | u64::from(val);
     }
 
+    /// Legacy 8-bit GPR view for ModR/M.reg / ModR/M.rm / opcodes B0–B7 (no REX).
+    ///
+    /// Indices 0–3 → AL/CL/DL/BL; 4–7 → AH/CH/DH/BH.
+    /// Spec: Intel SDM Vol. 1 §3.4.1.1; Vol. 2 Appendix B (ModR/M byte).
+    pub fn gpr_u8(&self, idx: usize) -> u8 {
+        debug_assert!(idx < 8, "legacy byte GPR index must be 0..7");
+        if idx < 4 {
+            self.gpr_u8_low(idx)
+        } else {
+            (self.gpr[idx - 4] >> 8) as u8
+        }
+    }
+
+    /// Write legacy 8-bit GPR (AL..BH). Preserves the sibling low/high byte and upper bits.
+    /// Spec: Intel SDM Vol. 1 §3.4.1.1; Vol. 2 Appendix B (ModR/M byte).
+    pub fn set_gpr_u8(&mut self, idx: usize, val: u8) {
+        debug_assert!(idx < 8, "legacy byte GPR index must be 0..7");
+        if idx < 4 {
+            self.set_gpr_u8_low(idx, val);
+        } else {
+            let g = idx - 4;
+            let old = self.gpr[g];
+            self.gpr[g] = (old & !0xFF00) | (u64::from(val) << 8);
+        }
+    }
+
     pub fn al(&self) -> u8 {
         self.gpr_u8_low(Self::RAX)
     }
 
     pub fn set_al(&mut self, v: u8) {
         self.set_gpr_u8_low(Self::RAX, v);
+    }
+
+    pub fn ah(&self) -> u8 {
+        self.gpr_u8(4)
+    }
+
+    pub fn set_ah(&mut self, v: u8) {
+        self.set_gpr_u8(4, v);
     }
 
     pub fn ax(&self) -> u16 {
@@ -312,6 +346,33 @@ mod tests {
         assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_ABCD);
         cpu.set_al(0x55);
         assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_AB55);
+    }
+
+    /// Legacy ModR/M byte regs 4–7 are AH/CH/DH/BH (SDM Vol. 1 §3.4.1.1).
+    #[test]
+    fn gpr_u8_legacy_high_bytes() {
+        let mut cpu = CpuState::reset();
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4455;
+        cpu.gpr[CpuState::RCX] = 0xAAAA_BBBB_CCCC_DDEE;
+        cpu.gpr[CpuState::RDX] = 0x0000_0000_0000_1122;
+        cpu.gpr[CpuState::RBX] = 0x0000_0000_0000_3344;
+
+        assert_eq!(cpu.gpr_u8(0), 0x55); // AL
+        assert_eq!(cpu.gpr_u8(4), 0x44); // AH
+        assert_eq!(cpu.gpr_u8(1), 0xEE); // CL
+        assert_eq!(cpu.gpr_u8(5), 0xDD); // CH
+        assert_eq!(cpu.gpr_u8(2), 0x22); // DL
+        assert_eq!(cpu.gpr_u8(6), 0x11); // DH
+        assert_eq!(cpu.gpr_u8(3), 0x44); // BL
+        assert_eq!(cpu.gpr_u8(7), 0x33); // BH
+
+        cpu.set_gpr_u8(4, 0xAB); // AH
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_AB55);
+        cpu.set_gpr_u8(5, 0x10); // CH
+        assert_eq!(cpu.gpr[CpuState::RCX], 0xAAAA_BBBB_CCCC_10EE);
+        cpu.set_ah(0x99);
+        assert_eq!(cpu.ah(), 0x99);
+        assert_eq!(cpu.al(), 0x55);
     }
 
     #[test]

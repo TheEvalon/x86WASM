@@ -295,10 +295,23 @@ fn calc_ea16(cpu: &CpuState, mod_: u8, rm: u8, displacement: i32) -> Result<u16,
     })
 }
 
+/// ModR/M.reg / opcode B0–B7 legacy byte register (AL..BH).
+#[inline]
+fn read_reg_u8(cpu: &CpuState, reg: u8) -> u8 {
+    cpu.gpr_u8(reg as usize)
+}
+
+/// Write ModR/M.reg / opcode B0–B7 legacy byte register (AL..BH).
+#[inline]
+fn write_reg_u8(cpu: &mut CpuState, reg: u8, val: u8) {
+    cpu.set_gpr_u8(reg as usize, val);
+}
+
 fn read_rm_u8(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<u8, ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     if m.mod_ == 3 {
-        Ok(cpu.gpr_u8_low(m.rm as usize))
+        // Legacy byte r/m: 0–3 AL/CL/DL/BL, 4–7 AH/CH/DH/BH (SDM Vol. 2 App. B).
+        Ok(read_reg_u8(cpu, m.rm))
     } else {
         let (addr, _) = ea_16(cpu, insn)?;
         bus.read_u8(addr)
@@ -313,7 +326,7 @@ fn write_rm_u8(
 ) -> Result<(), ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     if m.mod_ == 3 {
-        cpu.set_gpr_u8_low(m.rm as usize, val);
+        write_reg_u8(cpu, m.rm, val);
         Ok(())
     } else {
         let (addr, _) = ea_16(cpu, insn)?;
@@ -923,7 +936,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x9E => {
             // SAHF — load SF,ZF,AF,PF,CF from AH. Spec: Intel SDM Vol. 2 "SAHF".
             // Unsupported here: none for real-mode 16-bit; OF unaffected.
-            let ah = (cpu.ax() >> 8) as u8;
+            let ah = cpu.ah();
             cpu.set_cf(ah & 1 != 0);
             cpu.set_pf(ah & (1 << 2) != 0);
             cpu.set_af(ah & (1 << 4) != 0);
@@ -949,7 +962,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if cpu.rflags & (1 << 7) != 0 {
                 ah |= 1 << 7;
             }
-            cpu.set_ax((cpu.ax() & 0x00FF) | (u16::from(ah) << 8));
+            cpu.set_ah(ah);
             cpu.set_ip16(next_ip);
         }
         0xCC => {
@@ -976,7 +989,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD0 => {
             // Group 2 r/m8, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-            // Unsupported here: /6 reserved; AH/CH/DH/BH via high-byte rm.
+            // Unsupported here: /6 reserved.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u8(cpu, bus, &insn)?;
             let r = grp2_u8(cpu, m.reg, v, 1)?;
@@ -994,7 +1007,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x80 => {
             // Group 1 r/m8, imm8 — Spec: Intel SDM Vol. 2 opcode map / ADD…CMP.
-            // Unsupported here: opcode 82 alias; AH/CH/DH/BH high-byte rm; LOCK.
+            // Unsupported here: opcode 82 alias; LOCK.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let a = read_rm_u8(cpu, bus, &insn)?;
             let b = insn.immediate as u8;
@@ -1027,7 +1040,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xC0 => {
             // Group 2 r/m8, imm8 — Spec: Intel SDM Vol. 2 (COUNT masked to 5 bits).
-            // Unsupported here: /6 reserved; AH/CH/DH/BH high-byte rm.
+            // Unsupported here: /6 reserved.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u8(cpu, bus, &insn)?;
             let r = grp2_u8(cpu, m.reg, v, insn.immediate as u8)?;
@@ -1045,7 +1058,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD2 => {
             // Group 2 r/m8, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits).
-            // Unsupported here: /6 reserved; AH/CH/DH/BH high-byte rm.
+            // Unsupported here: /6 reserved.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u8(cpu, bus, &insn)?;
             let r = grp2_u8(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
@@ -1063,7 +1076,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xF6 => {
             // Group 3 r/m8 — NOT (/2) / NEG (/3). Spec: Intel SDM Vol. 2 "NOT"/"NEG".
-            // Unsupported here: TEST (/0), MUL/IMUL/DIV/IDIV (/4–/7); AH/CH/DH/BH.
+            // Unsupported here: TEST (/0), MUL/IMUL/DIV/IDIV (/4–/7).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u8(cpu, bus, &insn)?;
             match m.reg {
@@ -1192,8 +1205,8 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xB0..=0xB7 => {
-            let idx = (op - 0xB0) as usize;
-            cpu.set_gpr_u8_low(idx, insn.immediate as u8);
+            // MOV r8, imm8 — B0–B3 AL/CL/DL/BL; B4–B7 AH/CH/DH/BH (SDM Vol. 2 MOV).
+            write_reg_u8(cpu, op - 0xB0, insn.immediate as u8);
             cpu.set_ip16(next_ip);
         }
         0xB8..=0xBF => {
@@ -1202,15 +1215,16 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x8A => {
-            // MOV r8, r/m8
+            // MOV r8, r/m8 — Spec: Intel SDM Vol. 2 "MOV".
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u8(cpu, bus, &insn)?;
-            cpu.set_gpr_u8_low(m.reg as usize, v);
+            write_reg_u8(cpu, m.reg, v);
             cpu.set_ip16(next_ip);
         }
         0x88 => {
+            // MOV r/m8, r8 — Spec: Intel SDM Vol. 2 "MOV".
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
-            let v = cpu.gpr_u8_low(m.reg as usize);
+            let v = read_reg_u8(cpu, m.reg);
             write_rm_u8(cpu, bus, &insn, v)?;
             cpu.set_ip16(next_ip);
         }
@@ -1261,13 +1275,12 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x86 => {
             // XCHG r8, r/m8 — Spec: Intel SDM Vol. 2 "XCHG".
-            // Flags unchanged. Unsupported here: LOCK bus-lock; AH/CH/DH/BH (high-byte
-            // GPR views not wired — same gap as MOV r8).
+            // Flags unchanged. Unsupported here: LOCK bus-lock.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let rm = read_rm_u8(cpu, bus, &insn)?;
-            let reg = cpu.gpr_u8_low(m.reg as usize);
+            let reg = read_reg_u8(cpu, m.reg);
             write_rm_u8(cpu, bus, &insn, reg)?;
-            cpu.set_gpr_u8_low(m.reg as usize, rm);
+            write_reg_u8(cpu, m.reg, rm);
             cpu.set_ip16(next_ip);
         }
         0x87 => {
@@ -1283,7 +1296,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x84 => {
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let a = read_rm_u8(cpu, bus, &insn)?;
-            let b = cpu.gpr_u8_low(m.reg as usize);
+            let b = read_reg_u8(cpu, m.reg);
             set_logic_flags_u8(cpu, a & b);
             cpu.set_ip16(next_ip);
         }
@@ -1376,7 +1389,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x08 => {
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let a = read_rm_u8(cpu, bus, &insn)?;
-            let b = cpu.gpr_u8_low(m.reg as usize);
+            let b = read_reg_u8(cpu, m.reg);
             let r = a | b;
             write_rm_u8(cpu, bus, &insn, r)?;
             set_logic_flags_u8(cpu, r);
@@ -1393,10 +1406,10 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x0A => {
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
-            let a = cpu.gpr_u8_low(m.reg as usize);
+            let a = read_reg_u8(cpu, m.reg);
             let b = read_rm_u8(cpu, bus, &insn)?;
             let r = a | b;
-            cpu.set_gpr_u8_low(m.reg as usize, r);
+            write_reg_u8(cpu, m.reg, r);
             set_logic_flags_u8(cpu, r);
             cpu.set_ip16(next_ip);
         }
@@ -1412,7 +1425,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x20 => {
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let a = read_rm_u8(cpu, bus, &insn)?;
-            let b = cpu.gpr_u8_low(m.reg as usize);
+            let b = read_reg_u8(cpu, m.reg);
             let r = a & b;
             write_rm_u8(cpu, bus, &insn, r)?;
             set_logic_flags_u8(cpu, r);
@@ -1429,10 +1442,10 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x22 => {
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
-            let a = cpu.gpr_u8_low(m.reg as usize);
+            let a = read_reg_u8(cpu, m.reg);
             let b = read_rm_u8(cpu, bus, &insn)?;
             let r = a & b;
-            cpu.set_gpr_u8_low(m.reg as usize, r);
+            write_reg_u8(cpu, m.reg, r);
             set_logic_flags_u8(cpu, r);
             cpu.set_ip16(next_ip);
         }
@@ -2961,5 +2974,112 @@ mod tests {
         cpu.set_ax(0xFFFF);
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0xF0FF);
+    }
+
+    /// AH/CH/DH/BH via ModR/M reg and r/m for MOV and OR (SDM Vol. 1 §3.4.1.1; Vol. 2 MOV/OR).
+    #[test]
+    fn high_byte_modrm_mov_or_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // 88 E0 = MOV AL, AH   (r/m=AL, reg=AH)
+        // 8A E3 = MOV AH, BL   (reg=AH, r/m=BL)
+        // 88 FD = MOV CH, BH   (r/m=CH, reg=BH)
+        // 8A F9 = MOV BH, CL   (reg=BH, r/m=CL)
+        // 08 E5 = OR  CH, AH   (r/m=CH, reg=AH)
+        // 0A F1 = OR  DH, CL   (reg=DH, r/m=CL)
+        // B4 77 = MOV AH, 0x77
+        // B7 88 = MOV BH, 0x88
+        // 80 E4 0F = AND AH, 0x0F  (Group 1 /4, r/m=AH)
+        mem[0] = 0x88;
+        mem[1] = 0xE0;
+        mem[2] = 0x8A;
+        mem[3] = 0xE3;
+        mem[4] = 0x88;
+        mem[5] = 0xFD;
+        mem[6] = 0x8A;
+        mem[7] = 0xF9;
+        mem[8] = 0x08;
+        mem[9] = 0xE5;
+        mem[10] = 0x0A;
+        mem[11] = 0xF1;
+        mem[12] = 0xB4;
+        mem[13] = 0x77;
+        mem[14] = 0xB7;
+        mem[15] = 0x88;
+        mem[16] = 0x80;
+        mem[17] = 0xE4; // mod=3,reg=4(AND),rm=4(AH)
+        mem[18] = 0x0F;
+        mem[19] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        // AX=0xABCD, BX=0x1234, CX=0x5678, DX=0x9ABC
+        cpu.set_ax(0xABCD);
+        cpu.set_gpr_u16(CpuState::RBX, 0x1234);
+        cpu.set_gpr_u16(CpuState::RCX, 0x5678);
+        cpu.set_gpr_u16(CpuState::RDX, 0x9ABC);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // MOV AL, AH → AL=0xAB, AH unchanged → AX=0xABAB
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0xABAB);
+
+        // MOV AH, BL → AH=0x34, AL preserved → AX=0x34AB
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x34AB);
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1234);
+
+        // MOV CH, BH → CH=0x12, CL preserved → CX=0x1278
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0x1278);
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1234);
+
+        // MOV BH, CL → BH=0x78, BL preserved → BX=0x7834
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x7834);
+
+        // OR CH, AH → CH |= AH = 0x12 | 0x34 = 0x36 → CX=0x3678
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0x3678);
+        assert_eq!(cpu.ax(), 0x34AB);
+
+        // OR DH, CL → DH |= CL = 0x9A | 0x78 = 0xFA → DX=0xFABC
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RDX), 0xFABC);
+
+        // MOV AH, 0x77 → AX=0x77AB
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x77AB);
+
+        // MOV BH, 0x88 → BX=0x8834
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x8834);
+
+        // AND AH, 0x0F → AH=0x07, AL preserved → AX=0x07AB
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x07AB);
+        assert_eq!(cpu.rflags & 1, 0); // CF cleared by AND
+    }
+
+    /// XCHG high-byte reg ↔ r/m (SDM Vol. 2 XCHG).
+    #[test]
+    fn high_byte_xchg_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // 86 E3 = XCHG AH, BL
+        mem[0] = 0x86;
+        mem[1] = 0xE3;
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_ax(0x11AA);
+        cpu.set_gpr_u16(CpuState::RBX, 0x22BB);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        // AH↔BL: AH=0xBB, BL=0x11; AL/BH preserved
+        assert_eq!(cpu.ax(), 0xBBAA);
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x2211);
     }
 }
