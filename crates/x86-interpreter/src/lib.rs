@@ -27,6 +27,14 @@ pub trait Bus {
     fn port_out_u8(&mut self, port: u16, val: u8) -> Result<(), ExecError>;
 }
 
+/// Host-visible execution errors.
+///
+/// Architectural faults that this slice delivers through the real-mode IVT
+/// (`#DE` vector 0, `#UD` vector 6) return `Ok(())` from `step` after vectoring.
+/// Remaining host errors:
+/// - `Decode`: truncated fetch / opcodes absent from the decoder table (not classified as #UD yet)
+/// - `MemoryFault`: bus/memory errors without a clear real-mode #GP/#SS class yet
+/// - `Unsupported`: valid-but-unimplemented forms (opsize 32, ENTER nesting>0, etc.)
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExecError {
     #[error(transparent)]
@@ -397,10 +405,7 @@ fn read_sreg_selector(cpu: &CpuState, sreg: u8) -> u16 {
 }
 
 fn write_sreg_real_mode(cpu: &mut CpuState, sreg: u8, selector: u16) -> Result<(), ExecError> {
-    // MOV to CS is invalid (#UD). Spec: Intel SDM Vol. 2 "MOV" — MOV to CS.
-    if sreg == 1 {
-        return Err(ExecError::Unsupported(0x8E));
-    }
+    // Caller must reject MOV CS and reserved Sreg encodings (#UD) before calling.
     let seg = x86_core::SegmentReg::real_mode(selector);
     match sreg {
         0 => cpu.es = seg,
@@ -642,7 +647,7 @@ fn grp2_u8(cpu: &mut CpuState, reg: u8, mut val: u8, raw_count: u8) -> Result<u8
             set_shift_result_flags_u8(cpu, val);
             Ok(val)
         }
-        6 => Err(ExecError::Unsupported(0xD0)), // reserved encoding
+        6 => Err(ExecError::Unsupported(0xD0)), // reserved; callers deliver #UD
         7 => {
             for _ in 0..count {
                 cpu.set_cf((val & 1) != 0);
@@ -821,6 +826,20 @@ fn real_mode_software_interrupt(
     cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
     cpu.set_ip16(offset);
     Ok(())
+}
+
+/// Real-mode exception fault delivery (#DE, #UD, …) through the IVT.
+///
+/// Saved IP is the faulting instruction address (instruction start).
+/// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.15 (exception reference).
+fn real_mode_exception(cpu: &mut CpuState, bus: &mut dyn Bus, vector: u8) -> Result<(), ExecError> {
+    real_mode_software_interrupt(cpu, bus, vector, cpu.ip16())
+}
+
+/// #UD — Invalid Opcode Exception (vector 6).
+/// Spec: Intel SDM Vol. 3 §6.15 (#UD).
+fn real_mode_ud(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    real_mode_exception(cpu, bus, 6)
 }
 
 /// Execute a single instruction at CS:IP.
@@ -1146,8 +1165,11 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD0 => {
             // Group 2 r/m8, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-            // Unsupported here: /6 reserved.
+            // /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg == 6 {
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u8(cpu, bus, &insn)?;
             let r = grp2_u8(cpu, m.reg, v, 1)?;
             write_rm_u8(cpu, bus, &insn, r)?;
@@ -1155,8 +1177,11 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD1 => {
             // Group 2 r/m16, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-            // Unsupported here: opsize 32; /6 reserved.
+            // Unsupported here: opsize 32. /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg == 6 {
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u16(cpu, bus, &insn)?;
             let r = grp2_u16(cpu, m.reg, v, 1)?;
             write_rm_u16(cpu, bus, &insn, r)?;
@@ -1197,8 +1222,11 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xC0 => {
             // Group 2 r/m8, imm8 — Spec: Intel SDM Vol. 2 (COUNT masked to 5 bits).
-            // Unsupported here: /6 reserved.
+            // /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg == 6 {
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u8(cpu, bus, &insn)?;
             let r = grp2_u8(cpu, m.reg, v, insn.immediate as u8)?;
             write_rm_u8(cpu, bus, &insn, r)?;
@@ -1206,8 +1234,11 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xC1 => {
             // Group 2 r/m16, imm8 — Spec: Intel SDM Vol. 2 (COUNT masked to 5 bits).
-            // Unsupported here: opsize 32; /6 reserved.
+            // Unsupported here: opsize 32. /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg == 6 {
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u16(cpu, bus, &insn)?;
             let r = grp2_u16(cpu, m.reg, v, insn.immediate as u8)?;
             write_rm_u16(cpu, bus, &insn, r)?;
@@ -1215,8 +1246,11 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD2 => {
             // Group 2 r/m8, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits).
-            // Unsupported here: /6 reserved.
+            // /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg == 6 {
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u8(cpu, bus, &insn)?;
             let r = grp2_u8(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
             write_rm_u8(cpu, bus, &insn, r)?;
@@ -1224,8 +1258,11 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD3 => {
             // Group 2 r/m16, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits).
-            // Unsupported here: opsize 32; /6 reserved.
+            // Unsupported here: opsize 32. /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg == 6 {
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u16(cpu, bus, &insn)?;
             let r = grp2_u16(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
             write_rm_u16(cpu, bus, &insn, r)?;
@@ -1271,28 +1308,28 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     // DIV r/m8 — AX / r/m8 → AL=quot, AH=rem. #DE if divisor=0 or quot>0xFF.
                     // Spec: Intel SDM Vol. 2 "DIV"; Vol. 3 §6.15 (#DE). Faulting IP = insn start.
                     if v == 0 {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     let dividend = u32::from(cpu.ax());
                     let quot = dividend / u32::from(v);
                     let rem = dividend % u32::from(v);
                     if quot > 0xFF {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     cpu.set_ax(((rem as u16) << 8) | (quot as u16));
                 }
                 7 => {
                     // IDIV r/m8 — signed AX / r/m8 → AL=quot, AH=rem. #DE on 0 or quot∉i8.
                     if v == 0 {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     let dividend = cpu.ax() as i16;
                     let divisor = i16::from(v as i8);
                     let Some(quot) = dividend.checked_div(divisor) else {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     };
                     if !(i16::from(i8::MIN)..=i16::from(i8::MAX)).contains(&quot) {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     // Safe: checked_div already rejected i16::MIN / -1.
                     let rem = dividend.wrapping_rem(divisor);
@@ -1342,14 +1379,14 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 6 => {
                     // DIV r/m16 — DX:AX / r/m16 → AX=quot, DX=rem. #DE if divisor=0 or quot>0xFFFF.
                     if v == 0 {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     let dividend =
                         (u32::from(cpu.gpr_u16(CpuState::RDX)) << 16) | u32::from(cpu.ax());
                     let quot = dividend / u32::from(v);
                     let rem = dividend % u32::from(v);
                     if quot > 0xFFFF {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     cpu.set_ax(quot as u16);
                     cpu.set_gpr_u16(CpuState::RDX, rem as u16);
@@ -1357,16 +1394,16 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 7 => {
                     // IDIV r/m16 — signed DX:AX / r/m16 → AX=quot, DX=rem. #DE on 0 or quot∉i16.
                     if v == 0 {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     let dividend = ((u32::from(cpu.gpr_u16(CpuState::RDX)) << 16)
                         | u32::from(cpu.ax())) as i32;
                     let divisor = i32::from(v as i16);
                     let Some(quot) = dividend.checked_div(divisor) else {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     };
                     if !(i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&quot) {
-                        return real_mode_software_interrupt(cpu, bus, 0, cpu.ip16());
+                        return real_mode_exception(cpu, bus, 0);
                     }
                     // Safe: checked_div already rejected i32::MIN / -1.
                     let rem = dividend.wrapping_rem(divisor);
@@ -1379,22 +1416,21 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xFE => {
             // Group 4 r/m8 — INC (/0) / DEC (/1). Spec: Intel SDM Vol. 2 "INC"/"DEC".
-            // Unsupported here: /2–/7 (#UD); AH/CH/DH/BH high-byte rm.
+            // /2–/7 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg > 1 {
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u8(cpu, bus, &insn)?;
             let saved_cf = cpu.rflags & 1 != 0;
-            match m.reg {
-                0 => {
-                    let r = v.wrapping_add(1);
-                    write_rm_u8(cpu, bus, &insn, r)?;
-                    set_add_flags_u8(cpu, v, 1, r);
-                }
-                1 => {
-                    let r = v.wrapping_sub(1);
-                    write_rm_u8(cpu, bus, &insn, r)?;
-                    set_sub_flags_u8(cpu, v, 1, r);
-                }
-                _ => return Err(ExecError::Unsupported(op)),
+            if m.reg == 0 {
+                let r = v.wrapping_add(1);
+                write_rm_u8(cpu, bus, &insn, r)?;
+                set_add_flags_u8(cpu, v, 1, r);
+            } else {
+                let r = v.wrapping_sub(1);
+                write_rm_u8(cpu, bus, &insn, r)?;
+                set_sub_flags_u8(cpu, v, 1, r);
             }
             // INC/DEC do not modify CF (Intel SDM Vol. 2, INC/DEC).
             cpu.set_cf(saved_cf);
@@ -1403,7 +1439,8 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xFF => {
             // Group 5 r/m16 — INC/DEC/CALL/JMP/PUSH.
             // Spec: Intel SDM Vol. 2 "INC"/"DEC"/"CALL"/"JMP"/"PUSH"; opcode map Group 5.
-            // Unsupported here: /7 (#UD); opsize 32 (incl. far m16:32); protected-mode transfers.
+            // /7 reserved and far CALL/JMP register forms → #UD (Vol. 3 §6.15).
+            // Unsupported here: opsize 32 (incl. far m16:32); protected-mode transfers.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             match m.reg {
                 0 | 1 => {
@@ -1433,7 +1470,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     // Spec: Intel SDM Vol. 2 "CALL" (m16:16); opcode map Group 5 /3.
                     // Register form is invalid (#UD). Unsupported: opsize 32 (m16:32); gates.
                     if m.mod_ == 3 {
-                        return Err(ExecError::Unsupported(op));
+                        return real_mode_ud(cpu, bus);
                     }
                     let (addr, _) = ea_16(cpu, &insn)?;
                     let offset = bus.read_u16(addr)?;
@@ -1453,7 +1490,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     // Spec: Intel SDM Vol. 2 "JMP" (m16:16); opcode map Group 5 /5.
                     // Register form is invalid (#UD). Unsupported: opsize 32 (m16:32); gates.
                     if m.mod_ == 3 {
-                        return Err(ExecError::Unsupported(op));
+                        return real_mode_ud(cpu, bus);
                     }
                     let (addr, _) = ea_16(cpu, &insn)?;
                     let offset = bus.read_u16(addr)?;
@@ -1467,7 +1504,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     push16(cpu, bus, v)?;
                     cpu.set_ip16(next_ip);
                 }
-                _ => return Err(ExecError::Unsupported(op)),
+                _ => return real_mode_ud(cpu, bus), // /7 reserved
             }
         }
         0x70..=0x7F => {
@@ -1553,10 +1590,10 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x8F => {
             // POP r/m16 — Group /0 only.
             // Spec: Intel SDM Vol. 2 "POP".
-            // Unsupported here: 8F /1–/7 (#UD); opsize 32.
+            // /1–/7 reserved → #UD (Vol. 3 §6.15). Unsupported here: opsize 32.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg != 0 {
-                return Err(ExecError::Unsupported(0x8F));
+                return real_mode_ud(cpu, bus);
             }
             let v = pop16(cpu, bus)?;
             write_rm_u16(cpu, bus, &insn, v)?;
@@ -1684,20 +1721,20 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xC6 => {
             // Group 11 MOV r/m8, imm8 — Spec: Intel SDM Vol. 2 "MOV" / opcode map.
-            // Only /0 is defined; /1–/7 → Unsupported (not #UD delivery yet).
+            // Only /0 is defined; /1–/7 → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg != 0 {
-                return Err(ExecError::Unsupported(op));
+                return real_mode_ud(cpu, bus);
             }
             write_rm_u8(cpu, bus, &insn, insn.immediate as u8)?;
             cpu.set_ip16(next_ip);
         }
         0xC7 => {
             // Group 11 MOV r/m16, imm16 — Spec: Intel SDM Vol. 2 "MOV" / opcode map.
-            // Unsupported here: opsize 32 (imm32); /1–/7 → Unsupported.
+            // Only /0 is defined; /1–/7 → #UD (Vol. 3 §6.15). Unsupported here: opsize 32.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg != 0 {
-                return Err(ExecError::Unsupported(op));
+                return real_mode_ud(cpu, bus);
             }
             write_rm_u16(cpu, bus, &insn, insn.immediate as u16)?;
             cpu.set_ip16(next_ip);
@@ -1740,9 +1777,12 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x8C => {
             // MOV r/m16, Sreg — real-address mode, 16-bit opsize.
             // Spec: Intel SDM Vol. 2 "MOV" (r/m16, Sreg).
+            // Reserved Sreg encodings (reg=6,7) → #UD (Vol. 3 §6.15).
             // Unsupported here: opsize 32 (zero-extend to r32); protected-mode side effects.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
-            let sreg = sreg_from_modrm_reg(m.reg).ok_or(ExecError::Unsupported(op))?;
+            let Some(sreg) = sreg_from_modrm_reg(m.reg) else {
+                return real_mode_ud(cpu, bus);
+            };
             let v = read_sreg_selector(cpu, sreg);
             write_rm_u16(cpu, bus, &insn, v)?;
             cpu.set_ip16(next_ip);
@@ -1750,10 +1790,11 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x8D => {
             // LEA r16, m — load 16-bit effective address (offset only; no memory read).
             // Spec: Intel SDM Vol. 2 "LEA".
-            // Unsupported here: opsize 32; address-size 32; register source (#UD).
+            // Register source (mod=11) → #UD (Vol. 3 §6.15).
+            // Unsupported here: opsize 32; address-size 32.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
-                return Err(ExecError::Unsupported(op));
+                return real_mode_ud(cpu, bus);
             }
             let off = calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?;
             cpu.set_gpr_u16(m.reg as usize, off);
@@ -1762,10 +1803,16 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x8E => {
             // MOV Sreg, r/m16 — real-address mode load (base = selector << 4).
             // Spec: Intel SDM Vol. 2 "MOV" (Sreg, r/m16); Vol. 3 §3.4.2.
-            // Unsupported here: MOV to CS (#UD); reserved Sreg encodings (#UD as Unsupported);
-            // protected-mode descriptor checks; one-instruction IRQ inhibit after MOV SS.
+            // MOV to CS and reserved Sreg encodings → #UD (Vol. 3 §6.15).
+            // Unsupported here: protected-mode descriptor checks; IRQ inhibit after MOV SS.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
-            let sreg = sreg_from_modrm_reg(m.reg).ok_or(ExecError::Unsupported(op))?;
+            let Some(sreg) = sreg_from_modrm_reg(m.reg) else {
+                return real_mode_ud(cpu, bus);
+            };
+            if sreg == 1 {
+                // MOV to CS is invalid (#UD). Spec: Intel SDM Vol. 2 "MOV".
+                return real_mode_ud(cpu, bus);
+            }
             let v = read_rm_u16(cpu, bus, &insn)?;
             write_sreg_real_mode(cpu, sreg, v)?;
             cpu.set_ip16(next_ip);
@@ -2713,22 +2760,34 @@ mod tests {
         assert_eq!(cpu.es.base, 0xABCDu64 << 4);
     }
 
-    /// MOV CS, r/m16 is invalid (#UD) — reported as Unsupported (SDM Vol. 2 MOV).
+    /// MOV CS, r/m16 is invalid (#UD) — delivered via IVT vector 6 (SDM Vol. 2 MOV; Vol. 3 §6.15).
     #[test]
-    fn mov_to_cs_unsupported() {
+    fn mov_to_cs_ud_via_ivt() {
         let mut mem = vec![0u8; 0x10000];
+        // IVT[6] → 0000:0B00
+        mem[24] = 0x00;
+        mem[25] = 0x0B;
+        mem[26] = 0x00;
+        mem[27] = 0x00;
         // 8E C8 = MOV CS, AX
         mem[0] = 0x8E;
         mem[1] = 0xC8;
+        mem[0xB00] = 0xF4;
 
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         cpu.set_gpr_u16(CpuState::RAX, 0x1000);
+        cpu.set_interrupt_flag(true);
 
         let mut bus = VecBus { mem, ports: vec![] };
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8E)));
-        assert_eq!(cpu.cs.selector, 0); // unchanged
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // fault IP
     }
 
     /// LODSB/STOSB/MOVSB advance SI/DI by DF (SDM Vol. 2 LODS/STOS/MOVS).
@@ -3216,15 +3275,26 @@ mod tests {
     }
 
     #[test]
-    fn grp2_reserved_slash6_unsupported() {
+    fn grp2_reserved_slash6_ud_via_ivt() {
         let mut mem = vec![0u8; 0x10000];
+        // IVT[6] → 0000:0B00
+        mem[24] = 0x00;
+        mem[25] = 0x0B;
+        mem[26] = 0x00;
+        mem[27] = 0x00;
         mem[0] = 0xD0;
         mem[1] = 0xF0; // /6 AL
+        mem[0xB00] = 0xF4;
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
         let mut bus = VecBus { mem, ports: vec![] };
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0xD0)));
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
     }
 
     #[test]
@@ -3359,15 +3429,26 @@ mod tests {
     }
 
     #[test]
-    fn lea_register_source_unsupported() {
+    fn lea_register_source_ud_via_ivt() {
         let mut mem = vec![0u8; 0x10000];
+        // IVT[6] → 0000:0B00
+        mem[24] = 0x00;
+        mem[25] = 0x0B;
+        mem[26] = 0x00;
+        mem[27] = 0x00;
         mem[0] = 0x8D;
         mem[1] = 0xC0; // LEA AX, AX — mod=11 → #UD
+        mem[0xB00] = 0xF4;
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
         let mut bus = VecBus { mem, ports: vec![] };
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8D)));
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
     }
 
     /// Group 3 NOT/NEG (F6/F7 /2 /3). Spec: SDM Vol. 2 NOT/NEG.
@@ -3674,6 +3755,82 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0900);
         assert_eq!(bus.read_u16(0xFFF8).unwrap(), 4);
+    }
+
+    /// #UD (vector 6) via real-mode IVT for reserved / invalid encodings.
+    /// Spec: Intel SDM Vol. 3 §6.15 (#UD); Vol. 2 opcode map (Group 2 /6, Group 5 /7, …).
+    /// Faulting IP = instruction start (same frame shape as software INT / #DE).
+    #[test]
+    fn ud_exception_via_ivt_reserved_encodings() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[6] → handler at 0000:0A00
+        mem[6 * 4] = 0x00;
+        mem[6 * 4 + 1] = 0x0A;
+        mem[6 * 4 + 2] = 0x00;
+        mem[6 * 4 + 3] = 0x00;
+        // CS base 0x1000 (selector 0x0100), IP 0:
+        // 0: D0 F0         Group 2 /6 AL (reserved)
+        // 2: FF F8         Group 5 /7 AX (reserved)
+        // 4: 8D C0         LEA AX, AX (register source)
+        // 6: 8E C8         MOV CS, AX
+        // 8: C6 C8 00      MOV r/m8,imm /1 (Group 11 reserved)
+        // B: FE D0         Group 4 /2 AL (reserved)
+        // D: FF D8         Group 5 /3 CALL far reg (#UD)
+        // F: 8F C0         POP r/m /0 would be valid; 8F C8 = /1 AX (#UD)
+        mem[0x1000] = 0xD0;
+        mem[0x1001] = 0xF0;
+        mem[0x1002] = 0xFF;
+        mem[0x1003] = 0xF8;
+        mem[0x1004] = 0x8D;
+        mem[0x1005] = 0xC0;
+        mem[0x1006] = 0x8E;
+        mem[0x1007] = 0xC8;
+        mem[0x1008] = 0xC6;
+        mem[0x1009] = 0xC8;
+        mem[0x100A] = 0x00;
+        mem[0x100B] = 0xFE;
+        mem[0x100C] = 0xD0;
+        mem[0x100D] = 0xFF;
+        mem[0x100E] = 0xD8;
+        mem[0x100F] = 0x8F;
+        mem[0x1010] = 0xC8; // POP /1 AX
+        mem[0xA00] = 0xF4; // handler HLT
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0x0100);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        let cases: &[(u16, u16)] = &[
+            (0, 0),     // Group 2 /6
+            (2, 2),     // Group 5 /7
+            (4, 4),     // LEA reg
+            (6, 6),     // MOV CS
+            (8, 8),     // C6 /1
+            (0xB, 0xB), // FE /2
+            (0xD, 0xD), // FF /3 far CALL reg
+            (0xF, 0xF), // 8F /1
+        ];
+        for &(ip, expect_saved_ip) in cases {
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0x0100);
+            cpu.rip = u64::from(ip);
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            cpu.set_interrupt_flag(true);
+            cpu.halted = false;
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.cs.selector, 0, "handler CS at IP {ip:#x}");
+            assert_eq!(cpu.ip16(), 0x0A00, "handler IP at fault IP {ip:#x}");
+            assert!(!cpu.interrupt_flag());
+            assert_eq!(
+                bus.read_u16(0xFFF8).unwrap(),
+                expect_saved_ip,
+                "saved fault IP"
+            );
+            assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0100); // CS
+        }
     }
 
     /// Group 2 D2/D3 count = CL (SDM Vol. 2).
@@ -4803,7 +4960,7 @@ mod tests {
         // FF C8          DEC AX
         // FF 06 00 40    INC word [0x4000]
         // FF 0E 00 40    DEC word [0x4000]
-        // FE D0          FE /2 — unsupported
+        // FE /2 #UD covered by ud_exception_via_ivt_reserved_encodings
         mem[0] = 0xFE;
         mem[1] = 0xC0;
         mem[2] = 0xFE;
@@ -4830,9 +4987,7 @@ mod tests {
         mem[23] = 0x0E;
         mem[24] = 0x00;
         mem[25] = 0x40;
-        mem[26] = 0xFE;
-        mem[27] = 0xD0;
-        mem[28] = 0xF4;
+        mem[26] = 0xF4;
         mem[0x4000] = 0x7F;
         mem[0x4001] = 0x00;
 
@@ -4898,12 +5053,6 @@ mod tests {
         // DEC word [0x4000]: 0x0080 → 0x007F
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u16(0x4000).unwrap(), 0x007F);
-
-        // FE /2 unsupported
-        assert!(matches!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xFE))
-        ));
     }
 
     /// FF Group 5 CALL/JMP/PUSH r/m — /2 CALL near, /4 JMP near, /6 PUSH (SDM Vol. 2).
@@ -4920,8 +5069,7 @@ mod tests {
         // F: F4             HLT (should not reach)
         // 10: FF F0         PUSH AX
         // 12: FF 36 00 40   PUSH word [0x4000]
-        // 16: FF D8         FF /3 CALL far reg — #UD / Unsupported
-        // 18: F4            HLT
+        // FF /3 far CALL reg #UD covered by ud_exception_via_ivt_reserved_encodings
         mem[0] = 0xFF;
         mem[1] = 0xD0;
         mem[2] = 0xF4;
@@ -5014,12 +5162,6 @@ mod tests {
         assert_eq!(cpu.ip16(), 0x16);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFA);
         assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x1234);
-
-        // FF /3 register form unsupported (#UD)
-        assert!(matches!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xFF))
-        ));
     }
 
     /// FF Group 5 far CALL/JMP m16:16 — /3 CALL far, /5 JMP far (SDM Vol. 2).
@@ -5030,9 +5172,7 @@ mod tests {
         // 4: F4             HLT (return landing after RETF)
         // 5: FF 2E 00 40    JMP FAR [0x4000]
         // 9: F4             HLT (should not reach after JMP)
-        // A: FF D8          CALL FAR AX — #UD
-        // C: FF E8          JMP FAR AX — #UD
-        // E: F4             HLT
+        // Far CALL/JMP register #UD covered by ud_exception_via_ivt_reserved_encodings
         mem[0] = 0xFF;
         mem[1] = 0x1E;
         mem[2] = 0x00;
@@ -5043,11 +5183,6 @@ mod tests {
         mem[7] = 0x00;
         mem[8] = 0x40;
         mem[9] = 0xF4;
-        mem[0xA] = 0xFF;
-        mem[0xB] = 0xD8;
-        mem[0xC] = 0xFF;
-        mem[0xD] = 0xE8;
-        mem[0xE] = 0xF4;
         // Far pointer at DS:0x4000 → CS:IP = 0x1000:0x0200 → linear 0x10200
         mem[0x4000] = 0x00;
         mem[0x4001] = 0x02; // offset 0x0200
@@ -5095,20 +5230,6 @@ mod tests {
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE); // no stack change
         step(&mut cpu, &mut bus).unwrap(); // HLT
         assert!(cpu.halted);
-
-        // Register forms of far CALL/JMP are #UD
-        cpu.halted = false;
-        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
-        cpu.rip = 0xA;
-        assert!(matches!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xFF))
-        ));
-        cpu.rip = 0xC;
-        assert!(matches!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xFF))
-        ));
     }
 
     /// AH/CH/DH/BH via ModR/M reg and r/m for MOV and OR (SDM Vol. 1 ┬º3.4.1.1; Vol. 2 MOV/OR).
@@ -5226,7 +5347,7 @@ mod tests {
         // C6 06 00 40 99 = MOV byte [0x4000], 0x99
         // C7 C3 34 12 = MOV BX, 0x1234
         // C7 06 00 30 CD AB = MOV word [0x3000], 0xABCD
-        // C6 C8 00 = MOV /1 — unsupported
+        // C6 /1 #UD covered by ud_exception_via_ivt_reserved_encodings
         mem[0] = 0xC6;
         mem[1] = 0xC0;
         mem[2] = 0x5A;
@@ -5245,10 +5366,7 @@ mod tests {
         mem[15] = 0x30;
         mem[16] = 0xCD;
         mem[17] = 0xAB;
-        mem[18] = 0xC6;
-        mem[19] = 0xC8;
-        mem[20] = 0x00;
-        mem[21] = 0xF4;
+        mem[18] = 0xF4;
 
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
@@ -5272,8 +5390,6 @@ mod tests {
 
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u16(0x3000).unwrap(), 0xABCD);
-
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0xC6)));
     }
 
     /// MOV A0–A3 AL/AX ↔ moffs — Spec: Intel SDM Vol. 2 MOV.
@@ -5537,10 +5653,10 @@ mod tests {
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6);
     }
 
-    /// POP r/m16 (8F /0) reg and mem forms; /1 unsupported.
-    /// Spec: Intel SDM Vol. 2 "POP".
+    /// POP r/m16 (8F /0) reg and mem forms.
+    /// Spec: Intel SDM Vol. 2 "POP". /1–/7 #UD covered by ud_exception_via_ivt_reserved_encodings.
     #[test]
-    fn pop_rm16_reg_mem_and_invalid_reg() {
+    fn pop_rm16_reg_mem() {
         let mut mem = vec![0u8; 0x10000];
         mem[0] = 0x8F;
         mem[1] = 0xC3; // POP BX
@@ -5548,8 +5664,7 @@ mod tests {
         mem[3] = 0x06;
         mem[4] = 0x00;
         mem[5] = 0x40; // POP [0x4000]
-        mem[6] = 0x8F;
-        mem[7] = 0xC8; // /1 — unsupported
+        mem[6] = 0xF4;
 
         // Stack: 0xAAAA then 0xBBBB
         mem[0xFFFA] = 0xBB;
@@ -5573,10 +5688,5 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u16(0x4000).unwrap(), 0xBBBB);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFC);
-
-        assert!(matches!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0x8F))
-        ));
     }
 }
