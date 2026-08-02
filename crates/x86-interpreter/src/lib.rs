@@ -1087,6 +1087,19 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_cf(saved_cf);
             cpu.set_ip16(next_ip);
         }
+        0x48..=0x4F => {
+            // DEC r16 — Spec: Intel SDM Vol. 2 "DEC".
+            // Unsupported here: opsize 32 (DEC r32); FE/FF r/m forms.
+            let idx = (op - 0x48) as usize;
+            let old = cpu.gpr_u16(idx);
+            let v = old.wrapping_sub(1);
+            let saved_cf = cpu.rflags & 1 != 0;
+            cpu.set_gpr_u16(idx, v);
+            set_sub_flags_u16(cpu, old, 1, v);
+            // DEC does not modify CF (Intel SDM Vol. 2, DEC).
+            cpu.set_cf(saved_cf);
+            cpu.set_ip16(next_ip);
+        }
         0x50..=0x57 => {
             let idx = (op - 0x50) as usize;
             push16(cpu, bus, cpu.gpr_u16(idx))?;
@@ -2428,6 +2441,40 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0x2000);
         assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1000);
+    }
+
+    /// DEC r16: result/flags; CF preserved (SDM Vol. 2 DEC).
+    #[test]
+    fn dec_r16_preserves_cf() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x48; // DEC AX
+        mem[1] = 0x4B; // DEC BX
+        mem[2] = 0x4F; // DEC DI
+        mem[3] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_ax(1);
+        cpu.set_gpr_u16(CpuState::RBX, 0);
+        cpu.set_gpr_u16(CpuState::RDI, 0x8000);
+        cpu.set_cf(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0);
+        assert_ne!(cpu.rflags & (1 << 6), 0); // ZF
+        assert_ne!(cpu.rflags & 1, 0); // CF preserved
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0xFFFF);
+        assert_ne!(cpu.rflags & (1 << 7), 0); // SF
+        assert_ne!(cpu.rflags & 1, 0); // CF still set
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x7FFF);
+        assert_ne!(cpu.rflags & (1 << 11), 0); // OF: 0x8000-1
+        assert_ne!(cpu.rflags & 1, 0);
     }
 
     /// Group 1 80/81/83 imm ALU — results and flags (SDM Vol. 2).

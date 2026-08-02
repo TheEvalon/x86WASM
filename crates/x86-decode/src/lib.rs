@@ -542,6 +542,15 @@ mod tests {
     }
 
     #[test]
+    fn decode_dec_r16() {
+        // Intel SDM Vol. 2: DEC r16 — 48+rw
+        assert_eq!(decode(&[0x48]).unwrap().mnemonic, "DEC"); // DEC AX
+        assert_eq!(decode(&[0x4B]).unwrap().mnemonic, "DEC"); // DEC BX
+        assert_eq!(decode(&[0x4F]).unwrap().mnemonic, "DEC"); // DEC DI
+        assert_eq!(decode(&[0x40]).unwrap().mnemonic, "INC");
+    }
+
+    #[test]
     fn decode_grp1_imm() {
         // Intel SDM Vol. 2 Group 1: 80/81/83 — /r selects ALU op
         assert_eq!(decode(&[0x80, 0xC0, 0x01]).unwrap().mnemonic, "ADD"); // ADD AL,1
