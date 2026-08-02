@@ -76,8 +76,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             0x66 => prefixes.op_size_override = true,
             0x67 => prefixes.addr_size_override = true,
             0xF0 => prefixes.lock = true,
-            0xF3 => prefixes.rep = true,
-            0xF2 => prefixes.repne = true,
+            // F2/F3 are mutually exclusive; last one wins (SDM Vol. 2, Chapter 2).
+            0xF3 => {
+                prefixes.rep = true;
+                prefixes.repne = false;
+            }
+            0xF2 => {
+                prefixes.repne = true;
+                prefixes.rep = false;
+            }
             s @ (0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) => prefixes.segment_override = Some(s),
             _ => {}
         }
@@ -487,10 +494,38 @@ mod tests {
 
     #[test]
     fn decode_string_byte_ops() {
-        // Intel SDM Vol. 2: MOVSB/STOSB/LODSB — A4/AA/AC
+        // Intel SDM Vol. 2: MOVSB/STOSB/LODSB/CMPSB/SCASB — A4/AA/AC/A6/AE
         assert_eq!(decode(&[0xA4]).unwrap().mnemonic, "MOVSB");
         assert_eq!(decode(&[0xAA]).unwrap().mnemonic, "STOSB");
         assert_eq!(decode(&[0xAC]).unwrap().mnemonic, "LODSB");
+        assert_eq!(decode(&[0xA6]).unwrap().mnemonic, "CMPSB");
+        assert_eq!(decode(&[0xAE]).unwrap().mnemonic, "SCASB");
+    }
+
+    #[test]
+    fn decode_rep_prefixes_on_string_ops() {
+        // Intel SDM Vol. 2: REP/REPE = F3, REPNE = F2 (legacy prefixes).
+        let rep_stos = decode(&[0xF3, 0xAA]).unwrap();
+        assert!(rep_stos.prefixes.rep);
+        assert!(!rep_stos.prefixes.repne);
+        assert_eq!(rep_stos.mnemonic, "STOSB");
+        assert_eq!(rep_stos.length, 2);
+
+        let repe_scas = decode(&[0xF3, 0xAE]).unwrap();
+        assert!(repe_scas.prefixes.rep);
+        assert!(!repe_scas.prefixes.repne);
+
+        let repne_cmps = decode(&[0xF2, 0xA6]).unwrap();
+        assert!(repne_cmps.prefixes.repne);
+        assert!(!repne_cmps.prefixes.rep);
+
+        // Last F2/F3 wins (mutually exclusive).
+        let last_f2 = decode(&[0xF3, 0xF2, 0xA4]).unwrap();
+        assert!(last_f2.prefixes.repne);
+        assert!(!last_f2.prefixes.rep);
+        let last_f3 = decode(&[0xF2, 0xF3, 0xA4]).unwrap();
+        assert!(last_f3.prefixes.rep);
+        assert!(!last_f3.prefixes.repne);
     }
 
     #[test]

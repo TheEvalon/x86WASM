@@ -421,6 +421,116 @@ fn data_seg_for_string_src<'a>(cpu: &'a CpuState, insn: &DecodedInsn) -> &'a x86
     }
 }
 
+fn zf_set(cpu: &CpuState) -> bool {
+    cpu.rflags & (1 << 6) != 0
+}
+
+/// One MOVSB iteration (no IP update). Spec: SDM Vol. 2 MOVS/MOVSB.
+fn movsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let v = bus.read_u8(src)?;
+    bus.write_u8(dst, v)?;
+    let d = string_index_delta(cpu, 1);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One STOSB iteration (no IP update). Spec: SDM Vol. 2 STOS/STOSB.
+fn stosb_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    bus.write_u8(dst, cpu.al())?;
+    let d = string_index_delta(cpu, 1);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One LODSB iteration (no IP update). Spec: SDM Vol. 2 LODS/LODSB.
+fn lodsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let v = bus.read_u8(src)?;
+    cpu.set_al(v);
+    let d = string_index_delta(cpu, 1);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    Ok(())
+}
+
+/// One SCASB iteration (no IP update). Spec: SDM Vol. 2 SCAS/SCASB.
+fn scasb_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let addr = linear_addr(&cpu.es, u64::from(di));
+    let mem = bus.read_u8(addr)?;
+    let al = cpu.al();
+    let result = al.wrapping_sub(mem);
+    set_sub_flags_u8(cpu, al, mem, result);
+    let d = string_index_delta(cpu, 1);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One CMPSB iteration (no IP update). Spec: SDM Vol. 2 CMPS/CMPSB.
+fn cmpsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let a = bus.read_u8(src)?;
+    let b = bus.read_u8(dst)?;
+    let result = a.wrapping_sub(b);
+    set_sub_flags_u8(cpu, a, b, result);
+    let d = string_index_delta(cpu, 1);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// REP / REPE / REPNE wrapper for address-size 16 (count = CX).
+///
+/// Spec: Intel SDM Vol. 2 "REP/REPE/REPNE/REPZ/REPNZ".
+/// - `zf_terminate`: `None` = unconditional REP (MOVS/STOS/LODS);
+///   `Some(true)` = REPE (stop when ZF=0 after an iteration);
+///   `Some(false)` = REPNE (stop when ZF=1 after an iteration).
+///
+/// Unsupported here: interrupt recognition between iterations; asize 32/64 (ECX/RCX).
+fn exec_string_with_rep<F>(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    zf_terminate: Option<bool>,
+    mut once: F,
+) -> Result<(), ExecError>
+where
+    F: FnMut(&mut CpuState, &mut dyn Bus, &DecodedInsn) -> Result<(), ExecError>,
+{
+    let use_rep = insn.prefixes.rep || insn.prefixes.repne;
+    if !use_rep {
+        once(cpu, bus, insn)?;
+        return Ok(());
+    }
+
+    loop {
+        let cx = cpu.gpr_u16(CpuState::RCX);
+        if cx == 0 {
+            break;
+        }
+        once(cpu, bus, insn)?;
+        cpu.set_gpr_u16(CpuState::RCX, cx.wrapping_sub(1));
+        if let Some(continue_while_zf) = zf_terminate {
+            // REPE (`true`): stop when ZF=0. REPNE (`false`): stop when ZF=1.
+            let zf = zf_set(cpu);
+            if continue_while_zf != zf {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// SF/ZF/PF for shift results (SHL/SHR/SAR). AF undefined — left unchanged.
 /// Spec: Intel SDM Vol. 2 SAL/SAR/SHL/SHR — Flags Affected.
 fn set_shift_result_flags_u8(cpu: &mut CpuState, result: u8) {
@@ -1157,38 +1267,65 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xA4 => {
-            // MOVSB — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ".
-            // Unsupported here: MOVSW/D/Q; REP/REPE/REPNE prefixes.
-            let si = cpu.gpr_u16(CpuState::RSI);
-            let di = cpu.gpr_u16(CpuState::RDI);
-            let src = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(si));
-            let dst = linear_addr(&cpu.es, u64::from(di));
-            let v = bus.read_u8(src)?;
-            bus.write_u8(dst, v)?;
-            let d = string_index_delta(cpu, 1);
-            cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
-            cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+            // MOVSB — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Unsupported here: MOVSW/D/Q; interruptible REP; asize 32/64.
+            // F2/F3 both act as unconditional REP for MOVS (count = CX).
+            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                movsb_once(cpu, bus, insn)
+            })?;
             cpu.set_ip16(next_ip);
         }
         0xAA => {
-            // STOSB — Spec: Intel SDM Vol. 2 "STOS/STOSB/STOSW/STOSD/STOSQ".
-            // Unsupported here: STOSW/D/Q; REP prefix.
-            let di = cpu.gpr_u16(CpuState::RDI);
-            let dst = linear_addr(&cpu.es, u64::from(di));
-            bus.write_u8(dst, cpu.al())?;
-            let d = string_index_delta(cpu, 1);
-            cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+            // STOSB — Spec: Intel SDM Vol. 2 "STOS/STOSB/STOSW/STOSD/STOSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Unsupported here: STOSW/D/Q; interruptible REP; asize 32/64.
+            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| {
+                stosb_once(cpu, bus)
+            })?;
             cpu.set_ip16(next_ip);
         }
         0xAC => {
-            // LODSB — Spec: Intel SDM Vol. 2 "LODS/LODSB/LODSW/LODSD/LODSQ".
-            // Unsupported here: LODSW/D/Q; REP prefix.
-            let si = cpu.gpr_u16(CpuState::RSI);
-            let src = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(si));
-            let v = bus.read_u8(src)?;
-            cpu.set_al(v);
-            let d = string_index_delta(cpu, 1);
-            cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+            // LODSB — Spec: Intel SDM Vol. 2 "LODS/LODSB/LODSW/LODSD/LODSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Unsupported here: LODSW/D/Q; interruptible REP; asize 32/64.
+            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                lodsb_once(cpu, bus, insn)
+            })?;
+            cpu.set_ip16(next_ip);
+        }
+        0xA6 => {
+            // CMPSB — Spec: Intel SDM Vol. 2 "CMPS/CMPSB/CMPSW/CMPSD/CMPSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // F3 = REPE (while ZF=1); F2 = REPNE (while ZF=0).
+            // Unsupported here: CMPSW/D/Q; interruptible REP; asize 32/64.
+            let zf_term = if insn.prefixes.repne {
+                Some(false)
+            } else if insn.prefixes.rep {
+                Some(true)
+            } else {
+                None
+            };
+            exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, insn| {
+                cmpsb_once(cpu, bus, insn)
+            })?;
+            cpu.set_ip16(next_ip);
+        }
+        0xAE => {
+            // SCASB — Spec: Intel SDM Vol. 2 "SCAS/SCASB/SCASW/SCASD/SCASQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // F3 = REPE (while ZF=1); F2 = REPNE (while ZF=0).
+            // Unsupported here: SCASW/D/Q; interruptible REP; asize 32/64.
+            let zf_term = if insn.prefixes.repne {
+                Some(false)
+            } else if insn.prefixes.rep {
+                Some(true)
+            } else {
+                None
+            };
+            exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, _insn| {
+                scasb_once(cpu, bus)
+            })?;
             cpu.set_ip16(next_ip);
         }
         0xB0..=0xB7 => {
@@ -1995,6 +2132,200 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0xAB);
         assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x0FFF);
+    }
+
+    /// REP/REPE/REPNE on string byte ops (SDM Vol. 2 REP/REPE/REPNE + MOVS/STOS/LODS/SCAS/CMPS).
+    #[test]
+    fn rep_stosb_cx_zero_is_nop() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xAA; // REP STOSB
+        mem[2] = 0xF4;
+        mem[0x2000] = 0x55;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_al(0xAA);
+        cpu.set_gpr_u16(CpuState::RCX, 0);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x2000).unwrap(), 0x55); // unchanged
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2000);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    #[test]
+    fn rep_stosb_fills_and_clears_cx() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xAA; // REP STOSB
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_al(b'Z');
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RDI, 0x3000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x3000).unwrap(), b'Z');
+        assert_eq!(bus.read_u8(0x3001).unwrap(), b'Z');
+        assert_eq!(bus.read_u8(0x3002).unwrap(), b'Z');
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x3003);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    #[test]
+    fn rep_movsb_df_backward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xA4; // REP MOVSB
+        mem[2] = 0xF4;
+        mem[0x1010] = b'A';
+        mem[0x100F] = b'B';
+        mem[0x100E] = b'C';
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1010);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2010);
+        cpu.set_direction_flag(true);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x2010).unwrap(), b'A');
+        assert_eq!(bus.read_u8(0x200F).unwrap(), b'B');
+        assert_eq!(bus.read_u8(0x200E).unwrap(), b'C');
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x100D);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x200D);
+    }
+
+    #[test]
+    fn rep_lodsb_loads_last_byte_into_al() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xAC; // REP LODSB
+        mem[2] = 0xF4;
+        mem[0x4000] = 0x11;
+        mem[0x4001] = 0x22;
+        mem[0x4002] = 0x33;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RSI, 0x4000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x33);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x4003);
+    }
+
+    #[test]
+    fn repe_scasb_stops_on_mismatch() {
+        // REPE SCASB: repeat while ZF=1; stop early on first mismatch.
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xAE; // REPE SCASB
+        mem[2] = 0xF4;
+        mem[0x5000] = b'x';
+        mem[0x5001] = b'x';
+        mem[0x5002] = b'y'; // mismatch
+        mem[0x5003] = b'x';
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_al(b'x');
+        cpu.set_gpr_u16(CpuState::RCX, 4);
+        cpu.set_gpr_u16(CpuState::RDI, 0x5000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 1); // 4→3→2→1 after mismatch at third
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x5003);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0
+    }
+
+    #[test]
+    fn repne_scasb_stops_on_match() {
+        // REPNE SCASB: repeat while ZF=0; stop when equal found.
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF2;
+        mem[1] = 0xAE; // REPNE SCASB
+        mem[2] = 0xF4;
+        mem[0x6000] = b'a';
+        mem[0x6001] = b'b';
+        mem[0x6002] = b'Q'; // match AL
+        mem[0x6003] = b'c';
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_al(b'Q');
+        cpu.set_gpr_u16(CpuState::RCX, 4);
+        cpu.set_gpr_u16(CpuState::RDI, 0x6000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 1);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x6003);
+        assert_ne!(cpu.rflags & (1 << 6), 0); // ZF=1
+    }
+
+    #[test]
+    fn repe_cmpsb_compares_strings() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xA6; // REPE CMPSB
+        mem[2] = 0xF4;
+        mem[0x7000] = 1;
+        mem[0x7001] = 2;
+        mem[0x7002] = 3;
+        mem[0x8000] = 1;
+        mem[0x8001] = 2;
+        mem[0x8002] = 9; // mismatch
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RSI, 0x7000);
+        cpu.set_gpr_u16(CpuState::RDI, 0x8000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x7003);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x8003);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0 after mismatch
     }
 
     /// Short Jcc take/not-take for unsigned and signed conditions (SDM Vol. 2 Jcc).
