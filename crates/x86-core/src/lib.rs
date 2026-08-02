@@ -134,6 +134,19 @@ impl CpuState {
         self.gpr[idx] = (old & !0xFFFF) | u64::from(val);
     }
 
+    /// 32-bit GPR view (EAX…EDI). Spec: Intel SDM Vol. 1 §3.4.1 / §3.6
+    /// (operand-size attribute selects 16 vs 32 in real-address mode).
+    pub fn gpr_u32(&self, idx: usize) -> u32 {
+        self.gpr[idx] as u32
+    }
+
+    /// Write 32-bit GPR; preserves bits 63:32 of the u64 storage
+    /// (same pattern as `set_gpr_u16`; long-mode zero-extend is a later slice).
+    pub fn set_gpr_u32(&mut self, idx: usize, val: u32) {
+        let old = self.gpr[idx];
+        self.gpr[idx] = (old & !0xFFFF_FFFF) | u64::from(val);
+    }
+
     pub fn gpr_u8_low(&self, idx: usize) -> u8 {
         self.gpr[idx] as u8
     }
@@ -191,6 +204,14 @@ impl CpuState {
 
     pub fn set_ax(&mut self, v: u16) {
         self.set_gpr_u16(Self::RAX, v);
+    }
+
+    pub fn eax(&self) -> u32 {
+        self.gpr_u32(Self::RAX)
+    }
+
+    pub fn set_eax(&mut self, v: u32) {
+        self.set_gpr_u32(Self::RAX, v);
     }
 
     pub fn ip16(&self) -> u16 {
@@ -346,6 +367,20 @@ mod tests {
         assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_ABCD);
         cpu.set_al(0x55);
         assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_AB55);
+    }
+
+    /// 32-bit GPR helpers (opsize attribute / 0x66). Spec: SDM Vol. 1 §3.4.1, §3.6.
+    #[test]
+    fn gpr_u32_helpers_preserve_upper_dword() {
+        let mut cpu = CpuState::reset();
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x3333_4444);
+        cpu.set_gpr_u32(CpuState::RAX, 0xABCD_EF01);
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_ABCD_EF01);
+        cpu.set_eax(0x1234_5678);
+        assert_eq!(cpu.eax(), 0x1234_5678);
+        assert_eq!(cpu.ax(), 0x5678);
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_1234_5678);
     }
 
     /// Legacy ModR/M byte regs 4–7 are AH/CH/DH/BH (SDM Vol. 1 §3.4.1.1).

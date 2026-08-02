@@ -240,11 +240,22 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 i += 1;
             }
             Encoding::ModrmImm16 => {
-                if i + 1 >= bytes.len() {
-                    return Err(DecodeError::Truncated);
+                // OsZ immediate: Imm16 default, Imm32 with 0x66 in 16-bit default modes.
+                // Spec: Intel SDM Vol. 2 Ch. 2 (operand-size override); opcode map 81/C7.
+                if prefixes.op_size_override {
+                    if i + 3 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate =
+                        i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    i += 4;
+                } else {
+                    if i + 1 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                    i += 2;
                 }
-                immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
-                i += 2;
             }
             Encoding::Rel8 => {
                 if i >= bytes.len() {
@@ -254,18 +265,42 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 i += 1;
             }
             Encoding::Rel16 => {
-                if i + 1 >= bytes.len() {
-                    return Err(DecodeError::Truncated);
+                // Near CALL/JMP: rel16 default; rel32 with operand-size override.
+                // Spec: Intel SDM Vol. 2 Ch. 2; "CALL"/"JMP" near relative.
+                if prefixes.op_size_override {
+                    if i + 3 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate =
+                        i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    i += 4;
+                } else {
+                    if i + 1 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate = i32::from(i16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                    i += 2;
                 }
-                immediate = i32::from(i16::from_le_bytes([bytes[i], bytes[i + 1]]));
-                i += 2;
             }
             Encoding::Imm16 => {
-                if i + 1 >= bytes.len() {
-                    return Err(DecodeError::Truncated);
+                // Most Imm16 encodings follow OsZ (imm16↔imm32). Exceptions: RET/RETF iw
+                // (C2/CA) always take a 16-bit immediate stack-release count.
+                // Spec: Intel SDM Vol. 2 Ch. 2; "RET" (near/far imm16).
+                let always_imm16 = matches!(opcode, 0xC2 | 0xCA);
+                if prefixes.op_size_override && !always_imm16 {
+                    if i + 3 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate =
+                        i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    i += 4;
+                } else {
+                    if i + 1 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate = i32::from(i16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                    i += 2;
                 }
-                immediate = i32::from(i16::from_le_bytes([bytes[i], bytes[i + 1]]));
-                i += 2;
             }
             Encoding::Moffs => {
                 // Absolute moffs — address-size attribute; real-mode default is 16-bit.
@@ -1249,5 +1284,59 @@ mod tests {
             decode(&[0x26, 0xD7]).unwrap().prefixes.segment_override,
             Some(0x26)
         );
+    }
+
+    /// Operand-size override 0x66 selects 32-bit immediates / rel32 in real mode.
+    /// Spec: Intel SDM Vol. 2 Chapter 2 (66H operand-size override); Vol. 1 §3.6.
+    #[test]
+    fn decode_opsize32_imm_and_rel() {
+        // MOV EAX, imm32 — 66 B8 id
+        let d = decode(&[0x66, 0xB8, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.opcode, 0xB8);
+        assert_eq!(d.immediate, 0x1234_5678);
+        assert_eq!(d.length, 6);
+
+        // Without 0x66: MOV AX, imm16
+        let d = decode(&[0xB8, 0x78, 0x56]).unwrap();
+        assert!(!d.prefixes.op_size_override);
+        assert_eq!(d.immediate, 0x5678);
+        assert_eq!(d.length, 3);
+
+        // ADD EAX, imm32 — 66 05 id
+        let d = decode(&[0x66, 0x05, 0x01, 0x00, 0x00, 0x80]).unwrap();
+        assert_eq!(d.immediate as u32, 0x8000_0001);
+        assert_eq!(d.length, 6);
+
+        // PUSH imm32 — 66 68 id
+        let d = decode(&[0x66, 0x68, 0xEF, 0xBE, 0xAD, 0xDE]).unwrap();
+        assert_eq!(d.immediate as u32, 0xDEAD_BEEF);
+        assert_eq!(d.length, 6);
+
+        // MOV r/m32, imm32 — 66 C7 /0 id
+        let d = decode(&[0x66, 0xC7, 0xC0, 0x44, 0x33, 0x22, 0x11]).unwrap();
+        assert_eq!(d.immediate as u32, 0x1122_3344);
+        assert_eq!(d.length, 7);
+
+        // Group1 r/m32, imm32 — 66 81 /0 id
+        let d = decode(&[0x66, 0x81, 0xC3, 0x00, 0x00, 0x00, 0x01]).unwrap();
+        assert_eq!(d.immediate as u32, 0x0100_0000);
+        assert_eq!(d.length, 7);
+
+        // Near JMP rel32 — 66 E9 cd
+        let d = decode(&[0x66, 0xE9, 0x10, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(d.immediate, 0x10);
+        assert_eq!(d.length, 6);
+
+        // Near CALL rel32 — 66 E8 cd
+        let d = decode(&[0x66, 0xE8, 0x04, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(d.immediate, 0x04);
+        assert_eq!(d.length, 6);
+
+        // RET iw keeps imm16 even with 0x66 (stack-release count).
+        let d = decode(&[0x66, 0xC2, 0x04, 0x00]).unwrap();
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.immediate, 4);
+        assert_eq!(d.length, 4);
     }
 }
