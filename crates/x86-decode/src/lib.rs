@@ -45,6 +45,9 @@ pub struct DecodedInsn {
     /// Spec: Intel SDM Vol. 2 Chapter 2 (two-byte opcode escape).
     pub two_byte: bool,
     pub modrm: Option<Modrm>,
+    /// SIB byte when address-size 32 and ModRM.rm = 4 (memory form).
+    /// Spec: Intel SDM Vol. 2 Chapter 2 (SIB byte).
+    pub sib: Option<u8>,
     pub displacement: i32,
     pub immediate: i32,
     pub length: usize,
@@ -117,6 +120,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
     };
 
     let mut modrm = None;
+    let mut sib = None;
     let mut displacement = 0i32;
     let mut immediate = 0i32;
 
@@ -148,7 +152,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         }
         let m = Modrm::decode(bytes[i]);
         i += 1;
-        // 16-bit addressing displacements (default real mode, no 0x67).
+        // Address-size attribute: real-mode default 16; 0x67 → 32.
+        // Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (ModR/M, SIB, displacement).
         let addr16 = !prefixes.addr_size_override;
         if addr16 {
             match (m.mod_, m.rm) {
@@ -175,33 +180,85 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 }
                 _ => {}
             }
-        } else {
-            // Minimal 32-bit path: mod=0 rm=5 disp32; mod=1 disp8; mod=2 disp32.
-            match m.mod_ {
-                0 if m.rm == 5 => {
-                    if i + 3 >= bytes.len() {
-                        return Err(DecodeError::Truncated);
-                    }
-                    displacement =
-                        i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-                    i += 4;
+        } else if m.mod_ != 3 {
+            // 32-bit addressing: optional SIB when rm=4; disp per mod/base.
+            if m.rm == 4 {
+                if i >= bytes.len() {
+                    return Err(DecodeError::Truncated);
                 }
-                1 => {
-                    if i >= bytes.len() {
-                        return Err(DecodeError::Truncated);
+                let sib_byte = bytes[i];
+                i += 1;
+                sib = Some(sib_byte);
+                let base = sib_byte & 7;
+                match m.mod_ {
+                    0 if base == 5 => {
+                        if i + 3 >= bytes.len() {
+                            return Err(DecodeError::Truncated);
+                        }
+                        displacement = i32::from_le_bytes([
+                            bytes[i],
+                            bytes[i + 1],
+                            bytes[i + 2],
+                            bytes[i + 3],
+                        ]);
+                        i += 4;
                     }
-                    displacement = bytes[i] as i8 as i32;
-                    i += 1;
-                }
-                2 => {
-                    if i + 3 >= bytes.len() {
-                        return Err(DecodeError::Truncated);
+                    1 => {
+                        if i >= bytes.len() {
+                            return Err(DecodeError::Truncated);
+                        }
+                        displacement = bytes[i] as i8 as i32;
+                        i += 1;
                     }
-                    displacement =
-                        i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-                    i += 4;
+                    2 => {
+                        if i + 3 >= bytes.len() {
+                            return Err(DecodeError::Truncated);
+                        }
+                        displacement = i32::from_le_bytes([
+                            bytes[i],
+                            bytes[i + 1],
+                            bytes[i + 2],
+                            bytes[i + 3],
+                        ]);
+                        i += 4;
+                    }
+                    _ => {}
                 }
-                _ => {}
+            } else {
+                match m.mod_ {
+                    0 if m.rm == 5 => {
+                        if i + 3 >= bytes.len() {
+                            return Err(DecodeError::Truncated);
+                        }
+                        displacement = i32::from_le_bytes([
+                            bytes[i],
+                            bytes[i + 1],
+                            bytes[i + 2],
+                            bytes[i + 3],
+                        ]);
+                        i += 4;
+                    }
+                    1 => {
+                        if i >= bytes.len() {
+                            return Err(DecodeError::Truncated);
+                        }
+                        displacement = bytes[i] as i8 as i32;
+                        i += 1;
+                    }
+                    2 => {
+                        if i + 3 >= bytes.len() {
+                            return Err(DecodeError::Truncated);
+                        }
+                        displacement = i32::from_le_bytes([
+                            bytes[i],
+                            bytes[i + 1],
+                            bytes[i + 2],
+                            bytes[i + 3],
+                        ]);
+                        i += 4;
+                    }
+                    _ => {}
+                }
             }
         }
         modrm = Some(m);
@@ -435,6 +492,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         opcode,
         two_byte,
         modrm,
+        sib,
         displacement,
         immediate,
         length: i,
@@ -1490,5 +1548,48 @@ mod tests {
         assert!(d.prefixes.op_size_override);
         assert_eq!(d.immediate, 4);
         assert_eq!(d.length, 4);
+    }
+
+    /// Address-size override 0x67: 32-bit ModRM displacement / SIB forms.
+    /// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (address-size attribute, SIB).
+    #[test]
+    fn decode_asize32_modrm_disp_and_sib() {
+        // 67 8B 03 = MOV r16, [EBX] (mod=0 rm=3, no disp)
+        let d = decode(&[0x67, 0x8B, 0x03]).unwrap();
+        assert!(d.prefixes.addr_size_override);
+        assert_eq!(d.modrm.unwrap().rm, 3);
+        assert_eq!(d.displacement, 0);
+        assert!(d.sib.is_none());
+        assert_eq!(d.length, 3);
+
+        // 67 8B 05 78 56 34 12 = MOV r16, [0x12345678] (mod=0 rm=5 disp32)
+        let d = decode(&[0x67, 0x8B, 0x05, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert_eq!(d.displacement, 0x1234_5678);
+        assert_eq!(d.length, 7);
+
+        // 67 8B 43 04 = MOV r16, [EBX+0x04] (mod=1 disp8)
+        let d = decode(&[0x67, 0x8B, 0x43, 0x04]).unwrap();
+        assert_eq!(d.displacement, 4);
+        assert_eq!(d.length, 4);
+
+        // 67 8B 83 00 10 00 00 = MOV r16, [EBX+0x1000] (mod=2 disp32)
+        let d = decode(&[0x67, 0x8B, 0x83, 0x00, 0x10, 0x00, 0x00]).unwrap();
+        assert_eq!(d.displacement, 0x1000);
+        assert_eq!(d.length, 7);
+
+        // 67 8B 44 24 08 = MOV r16, [ESP+8] (mod=1 rm=4 SIB=0x24 disp8)
+        // Spec: SDM Vol. 2 Chapter 2 — SIB with base=ESP, index=none (index=4).
+        let d = decode(&[0x67, 0x8B, 0x44, 0x24, 0x08]).unwrap();
+        assert_eq!(d.modrm.unwrap().rm, 4);
+        assert_eq!(d.sib, Some(0x24));
+        assert_eq!(d.displacement, 8);
+        assert_eq!(d.length, 5);
+
+        // 67 8B 04 85 00 20 00 00 = MOV r16, [EAX*4 + 0x2000]
+        // mod=0 rm=4; SIB scale=2 index=0 base=5 → disp32, no base reg.
+        let d = decode(&[0x67, 0x8B, 0x04, 0x85, 0x00, 0x20, 0x00, 0x00]).unwrap();
+        assert_eq!(d.sib, Some(0x85));
+        assert_eq!(d.displacement, 0x2000);
+        assert_eq!(d.length, 8);
     }
 }

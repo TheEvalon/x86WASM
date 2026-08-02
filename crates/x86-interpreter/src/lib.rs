@@ -506,9 +506,25 @@ fn opsz32(insn: &DecodedInsn) -> bool {
     insn.prefixes.op_size_override
 }
 
-/// 16-bit effective address from ModRM (real-mode / 16-bit address size).
+/// Real-mode default address size is 16; 0x67 selects 32.
+/// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (address-size attribute).
+fn asize32(insn: &DecodedInsn) -> bool {
+    insn.prefixes.addr_size_override
+}
+
+/// Effective address from ModRM using the instruction address-size attribute.
 /// Returns `(linear, is_register, uses_ss)` — `uses_ss` selects `#SS` vs `#GP`
 /// when a bus `MemoryFault` is classified (SDM Vol. 3 §6.15).
+/// Real-mode segmentation remains `selector << 4` (base + offset).
+fn ea(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecError> {
+    if asize32(insn) {
+        ea_32(cpu, insn)
+    } else {
+        ea_16(cpu, insn)
+    }
+}
+
+/// 16-bit effective address from ModRM (real-mode / 16-bit address size).
 fn ea_16(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     if m.mod_ == 3 {
@@ -524,6 +540,40 @@ fn ea_16(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecEr
         Some(0x3E) | None => {
             // Default DS, except BP-based uses SS.
             if m.rm == 2 || m.rm == 3 || (m.rm == 6 && m.mod_ != 0) {
+                (&cpu.ss, true)
+            } else {
+                (&cpu.ds, false)
+            }
+        }
+        _ => (&cpu.ds, false),
+    };
+    Ok((linear_addr(seg, u64::from(off)), false, uses_ss))
+}
+
+/// 32-bit effective address from ModRM/SIB (real-mode with 0x67).
+/// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (32-bit addressing forms).
+fn ea_32(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        return Ok((0, true, false));
+    }
+    let off = calc_ea32(cpu, insn)?;
+    let (seg, uses_ss) = match insn.prefixes.segment_override {
+        Some(0x2E) => (&cpu.cs, false),
+        Some(0x36) => (&cpu.ss, true),
+        Some(0x26) => (&cpu.es, false),
+        Some(0x64) => (&cpu.fs, false),
+        Some(0x65) => (&cpu.gs, false),
+        Some(0x3E) | None => {
+            // Default DS; SS when base is EBP/ESP (incl. SIB base).
+            let uses_ss = if m.rm == 4 {
+                let sib = insn.sib.ok_or(ExecError::Unsupported(insn.opcode))?;
+                let base = sib & 7;
+                base == 4 || (base == 5 && m.mod_ != 0)
+            } else {
+                m.rm == 5 && m.mod_ != 0
+            };
+            if uses_ss {
                 (&cpu.ss, true)
             } else {
                 (&cpu.ds, false)
@@ -572,6 +622,46 @@ fn calc_ea16(cpu: &CpuState, mod_: u8, rm: u8, displacement: i32) -> Result<u16,
     })
 }
 
+/// 32-bit ModRM/SIB effective address (offset only).
+/// Spec: Intel SDM Vol. 2 Chapter 2 — 32-bit addressing forms + SIB.
+fn calc_ea32(cpu: &CpuState, insn: &DecodedInsn) -> Result<u32, ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    let disp = insn.displacement as u32;
+    if m.rm == 4 {
+        let sib = insn.sib.ok_or(ExecError::Unsupported(insn.opcode))?;
+        let scale = 1u32 << (sib >> 6);
+        let index = (sib >> 3) & 7;
+        let base_reg = sib & 7;
+        let index_val = if index == 4 {
+            0
+        } else {
+            cpu.gpr_u32(index as usize).wrapping_mul(scale)
+        };
+        let base_val = if base_reg == 5 && m.mod_ == 0 {
+            0
+        } else {
+            cpu.gpr_u32(base_reg as usize)
+        };
+        return Ok(base_val.wrapping_add(index_val).wrapping_add(disp));
+    }
+    let base = match (m.mod_, m.rm) {
+        (0, 5) => return Ok(disp),
+        (_, 0) => cpu.gpr_u32(CpuState::RAX),
+        (_, 1) => cpu.gpr_u32(CpuState::RCX),
+        (_, 2) => cpu.gpr_u32(CpuState::RDX),
+        (_, 3) => cpu.gpr_u32(CpuState::RBX),
+        (_, 5) => cpu.gpr_u32(CpuState::RBP),
+        (_, 6) => cpu.gpr_u32(CpuState::RSI),
+        (_, 7) => cpu.gpr_u32(CpuState::RDI),
+        _ => return Err(ExecError::Unsupported(insn.opcode)),
+    };
+    Ok(match m.mod_ {
+        0 => base,
+        1 | 2 => base.wrapping_add(disp),
+        _ => return Err(ExecError::Unsupported(insn.opcode)),
+    })
+}
+
 /// ModR/M.reg / opcode B0-B7 legacy byte register (AL..BH).
 #[inline]
 fn read_reg_u8(cpu: &CpuState, reg: u8) -> u8 {
@@ -590,7 +680,7 @@ fn read_rm_u8(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<u
         // Legacy byte r/m: 0-3 AL/CL/DL/BL, 4-7 AH/CH/DH/BH (SDM Vol. 2 App. B).
         Ok(read_reg_u8(cpu, m.rm))
     } else {
-        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea(cpu, insn)?;
         bus.read_u8(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
@@ -607,7 +697,7 @@ fn write_rm_u8(
         write_reg_u8(cpu, m.rm, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea(cpu, insn)?;
         bus.write_u8(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
@@ -618,7 +708,7 @@ fn read_rm_u16(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u16(m.rm as usize))
     } else {
-        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea(cpu, insn)?;
         bus.read_u16(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
@@ -635,7 +725,7 @@ fn write_rm_u16(
         cpu.set_gpr_u16(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea(cpu, insn)?;
         bus.write_u16(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
@@ -646,7 +736,7 @@ fn read_rm_u32(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u32(m.rm as usize))
     } else {
-        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea(cpu, insn)?;
         bus.read_u32(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
@@ -663,7 +753,7 @@ fn write_rm_u32(
         cpu.set_gpr_u32(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea(cpu, insn)?;
         bus.write_u32(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
@@ -768,6 +858,15 @@ fn string_index_delta(cpu: &CpuState, size: u16) -> u16 {
     }
 }
 
+/// ESI/EDI step for address-size 32 string ops (SDM Vol. 1 §3.4.3 / §3.6).
+fn string_index_delta32(cpu: &CpuState, size: u32) -> u32 {
+    if cpu.direction_flag() {
+        size.wrapping_neg()
+    } else {
+        size
+    }
+}
+
 fn data_seg_for_string_src<'a>(cpu: &'a CpuState, insn: &DecodedInsn) -> &'a x86_core::SegmentReg {
     match insn.prefixes.segment_override {
         Some(0x26) => &cpu.es,
@@ -786,230 +885,419 @@ fn zf_set(cpu: &CpuState) -> bool {
 
 /// One MOVSB iteration (no IP update). Spec: SDM Vol. 2 MOVS/MOVSB.
 fn movsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let v = bus.read_u8(src)?;
-    bus.write_u8(dst, v)?;
-    let d = string_index_delta(cpu, 1);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.read_u8(src)?;
+        bus.write_u8(dst, v)?;
+        let d = string_index_delta32(cpu, 1);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.read_u8(src)?;
+        bus.write_u8(dst, v)?;
+        let d = string_index_delta(cpu, 1);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One STOSB iteration (no IP update). Spec: SDM Vol. 2 STOS/STOSB.
-fn stosb_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    bus.write_u8(dst, cpu.al())?;
-    let d = string_index_delta(cpu, 1);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+fn stosb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        bus.write_u8(dst, cpu.al())?;
+        let d = string_index_delta32(cpu, 1);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        bus.write_u8(dst, cpu.al())?;
+        let d = string_index_delta(cpu, 1);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One LODSB iteration (no IP update). Spec: SDM Vol. 2 LODS/LODSB.
 fn lodsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let v = bus.read_u8(src)?;
-    cpu.set_al(v);
-    let d = string_index_delta(cpu, 1);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u8(src)?;
+        cpu.set_al(v);
+        let d = string_index_delta32(cpu, 1);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u8(src)?;
+        cpu.set_al(v);
+        let d = string_index_delta(cpu, 1);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One SCASB iteration (no IP update). Spec: SDM Vol. 2 SCAS/SCASB.
-fn scasb_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let addr = linear_addr(&cpu.es, u64::from(di));
-    let mem = bus.read_u8(addr)?;
-    let al = cpu.al();
-    let result = al.wrapping_sub(mem);
-    set_sub_flags_u8(cpu, al, mem, result);
-    let d = string_index_delta(cpu, 1);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+fn scasb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let addr = linear_addr(&cpu.es, u64::from(di));
+        let mem = bus.read_u8(addr)?;
+        let al = cpu.al();
+        let result = al.wrapping_sub(mem);
+        set_sub_flags_u8(cpu, al, mem, result);
+        let d = string_index_delta32(cpu, 1);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let addr = linear_addr(&cpu.es, u64::from(di));
+        let mem = bus.read_u8(addr)?;
+        let al = cpu.al();
+        let result = al.wrapping_sub(mem);
+        set_sub_flags_u8(cpu, al, mem, result);
+        let d = string_index_delta(cpu, 1);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One CMPSB iteration (no IP update). Spec: SDM Vol. 2 CMPS/CMPSB.
 fn cmpsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let a = bus.read_u8(src)?;
-    let b = bus.read_u8(dst)?;
-    let result = a.wrapping_sub(b);
-    set_sub_flags_u8(cpu, a, b, result);
-    let d = string_index_delta(cpu, 1);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let a = bus.read_u8(src)?;
+        let b = bus.read_u8(dst)?;
+        let result = a.wrapping_sub(b);
+        set_sub_flags_u8(cpu, a, b, result);
+        let d = string_index_delta32(cpu, 1);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let a = bus.read_u8(src)?;
+        let b = bus.read_u8(dst)?;
+        let result = a.wrapping_sub(b);
+        set_sub_flags_u8(cpu, a, b, result);
+        let d = string_index_delta(cpu, 1);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One MOVSW iteration (no IP update). Spec: SDM Vol. 2 MOVS/MOVSW.
 fn movsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let v = bus.read_u16(src)?;
-    bus.write_u16(dst, v)?;
-    let d = string_index_delta(cpu, 2);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.read_u16(src)?;
+        bus.write_u16(dst, v)?;
+        let d = string_index_delta32(cpu, 2);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.read_u16(src)?;
+        bus.write_u16(dst, v)?;
+        let d = string_index_delta(cpu, 2);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One MOVSD iteration (no IP update). Spec: SDM Vol. 2 MOVS/MOVSD (opsize 32).
 fn movsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let v = bus.read_u32(src)?;
-    bus.write_u32(dst, v)?;
-    let d = string_index_delta(cpu, 4);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.read_u32(src)?;
+        bus.write_u32(dst, v)?;
+        let d = string_index_delta32(cpu, 4);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.read_u32(src)?;
+        bus.write_u32(dst, v)?;
+        let d = string_index_delta(cpu, 4);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One STOSW iteration (no IP update). Spec: SDM Vol. 2 STOS/STOSW.
-fn stosw_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    bus.write_u16(dst, cpu.ax())?;
-    let d = string_index_delta(cpu, 2);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+fn stosw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        bus.write_u16(dst, cpu.ax())?;
+        let d = string_index_delta32(cpu, 2);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        bus.write_u16(dst, cpu.ax())?;
+        let d = string_index_delta(cpu, 2);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One STOSD iteration (no IP update). Spec: SDM Vol. 2 STOS/STOSD (opsize 32).
-fn stosd_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    bus.write_u32(dst, cpu.eax())?;
-    let d = string_index_delta(cpu, 4);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+fn stosd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        bus.write_u32(dst, cpu.eax())?;
+        let d = string_index_delta32(cpu, 4);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        bus.write_u32(dst, cpu.eax())?;
+        let d = string_index_delta(cpu, 4);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One LODSW iteration (no IP update). Spec: SDM Vol. 2 LODS/LODSW.
 fn lodsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let v = bus.read_u16(src)?;
-    cpu.set_ax(v);
-    let d = string_index_delta(cpu, 2);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u16(src)?;
+        cpu.set_ax(v);
+        let d = string_index_delta32(cpu, 2);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u16(src)?;
+        cpu.set_ax(v);
+        let d = string_index_delta(cpu, 2);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One LODSD iteration (no IP update). Spec: SDM Vol. 2 LODS/LODSD (opsize 32).
 fn lodsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let v = bus.read_u32(src)?;
-    cpu.set_eax(v);
-    let d = string_index_delta(cpu, 4);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u32(src)?;
+        cpu.set_eax(v);
+        let d = string_index_delta32(cpu, 4);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u32(src)?;
+        cpu.set_eax(v);
+        let d = string_index_delta(cpu, 4);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One SCASW iteration (no IP update). Spec: SDM Vol. 2 SCAS/SCASW.
-fn scasw_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let addr = linear_addr(&cpu.es, u64::from(di));
-    let mem = bus.read_u16(addr)?;
-    let ax = cpu.ax();
-    let result = ax.wrapping_sub(mem);
-    set_sub_flags_u16(cpu, ax, mem, result);
-    let d = string_index_delta(cpu, 2);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+fn scasw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let addr = linear_addr(&cpu.es, u64::from(di));
+        let mem = bus.read_u16(addr)?;
+        let ax = cpu.ax();
+        let result = ax.wrapping_sub(mem);
+        set_sub_flags_u16(cpu, ax, mem, result);
+        let d = string_index_delta32(cpu, 2);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let addr = linear_addr(&cpu.es, u64::from(di));
+        let mem = bus.read_u16(addr)?;
+        let ax = cpu.ax();
+        let result = ax.wrapping_sub(mem);
+        set_sub_flags_u16(cpu, ax, mem, result);
+        let d = string_index_delta(cpu, 2);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One SCASD iteration (no IP update). Spec: SDM Vol. 2 SCAS/SCASD (opsize 32).
-fn scasd_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let addr = linear_addr(&cpu.es, u64::from(di));
-    let mem = bus.read_u32(addr)?;
-    let eax = cpu.eax();
-    let result = eax.wrapping_sub(mem);
-    set_sub_flags_u32(cpu, eax, mem, result);
-    let d = string_index_delta(cpu, 4);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+fn scasd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let addr = linear_addr(&cpu.es, u64::from(di));
+        let mem = bus.read_u32(addr)?;
+        let eax = cpu.eax();
+        let result = eax.wrapping_sub(mem);
+        set_sub_flags_u32(cpu, eax, mem, result);
+        let d = string_index_delta32(cpu, 4);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let addr = linear_addr(&cpu.es, u64::from(di));
+        let mem = bus.read_u32(addr)?;
+        let eax = cpu.eax();
+        let result = eax.wrapping_sub(mem);
+        set_sub_flags_u32(cpu, eax, mem, result);
+        let d = string_index_delta(cpu, 4);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One CMPSW iteration (no IP update). Spec: SDM Vol. 2 CMPS/CMPSW.
 fn cmpsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let a = bus.read_u16(src)?;
-    let b = bus.read_u16(dst)?;
-    let result = a.wrapping_sub(b);
-    set_sub_flags_u16(cpu, a, b, result);
-    let d = string_index_delta(cpu, 2);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let a = bus.read_u16(src)?;
+        let b = bus.read_u16(dst)?;
+        let result = a.wrapping_sub(b);
+        set_sub_flags_u16(cpu, a, b, result);
+        let d = string_index_delta32(cpu, 2);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let a = bus.read_u16(src)?;
+        let b = bus.read_u16(dst)?;
+        let result = a.wrapping_sub(b);
+        set_sub_flags_u16(cpu, a, b, result);
+        let d = string_index_delta(cpu, 2);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One CMPSD iteration (no IP update). Spec: SDM Vol. 2 CMPS/CMPSD (opsize 32).
 fn cmpsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let a = bus.read_u32(src)?;
-    let b = bus.read_u32(dst)?;
-    let result = a.wrapping_sub(b);
-    set_sub_flags_u32(cpu, a, b, result);
-    let d = string_index_delta(cpu, 4);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let a = bus.read_u32(src)?;
+        let b = bus.read_u32(dst)?;
+        let result = a.wrapping_sub(b);
+        set_sub_flags_u32(cpu, a, b, result);
+        let d = string_index_delta32(cpu, 4);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let a = bus.read_u32(src)?;
+        let b = bus.read_u32(dst)?;
+        let result = a.wrapping_sub(b);
+        set_sub_flags_u32(cpu, a, b, result);
+        let d = string_index_delta(cpu, 4);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One INSB iteration (no IP update). Spec: SDM Vol. 2 INS/INSB/INSW/INSD.
 /// Port = DX; destination = ES:(E)DI (no segment override for dest).
-fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     let port = cpu.gpr_u16(CpuState::RDX);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let v = bus.port_in_u8(port)?;
-    bus.write_u8(dst, v)?;
-    let d = string_index_delta(cpu, 1);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.port_in_u8(port)?;
+        bus.write_u8(dst, v)?;
+        let d = string_index_delta32(cpu, 1);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.port_in_u8(port)?;
+        bus.write_u8(dst, v)?;
+        let d = string_index_delta(cpu, 1);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One INSW iteration (no IP update). Spec: SDM Vol. 2 INS/INSW.
-fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     let port = cpu.gpr_u16(CpuState::RDX);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let v = bus.port_in_u16(port)?;
-    bus.write_u16(dst, v)?;
-    let d = string_index_delta(cpu, 2);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.port_in_u16(port)?;
+        bus.write_u16(dst, v)?;
+        let d = string_index_delta32(cpu, 2);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.port_in_u16(port)?;
+        bus.write_u16(dst, v)?;
+        let d = string_index_delta(cpu, 2);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One INSD iteration (no IP update). Spec: SDM Vol. 2 INS/INSD (opsize 32).
-fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     let port = cpu.gpr_u16(CpuState::RDX);
-    let di = cpu.gpr_u16(CpuState::RDI);
-    let dst = linear_addr(&cpu.es, u64::from(di));
-    let v = bus.port_in_u32(port)?;
-    bus.write_u32(dst, v)?;
-    let d = string_index_delta(cpu, 4);
-    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    if asize32(insn) {
+        let di = cpu.gpr_u32(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.port_in_u32(port)?;
+        bus.write_u32(dst, v)?;
+        let d = string_index_delta32(cpu, 4);
+        cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
+    } else {
+        let di = cpu.gpr_u16(CpuState::RDI);
+        let dst = linear_addr(&cpu.es, u64::from(di));
+        let v = bus.port_in_u32(port)?;
+        bus.write_u32(dst, v)?;
+        let d = string_index_delta(cpu, 4);
+        cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    }
     Ok(())
 }
 
@@ -1017,47 +1305,74 @@ fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
 /// Port = DX; source = DS:(E)SI (segment override allowed).
 fn outsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     let port = cpu.gpr_u16(CpuState::RDX);
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let v = bus.read_u8(src)?;
-    bus.port_out_u8(port, v)?;
-    let d = string_index_delta(cpu, 1);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u8(src)?;
+        bus.port_out_u8(port, v)?;
+        let d = string_index_delta32(cpu, 1);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u8(src)?;
+        bus.port_out_u8(port, v)?;
+        let d = string_index_delta(cpu, 1);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One OUTSW iteration (no IP update). Spec: SDM Vol. 2 OUTS/OUTSW.
 fn outsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     let port = cpu.gpr_u16(CpuState::RDX);
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let v = bus.read_u16(src)?;
-    bus.port_out_u16(port, v)?;
-    let d = string_index_delta(cpu, 2);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u16(src)?;
+        bus.port_out_u16(port, v)?;
+        let d = string_index_delta32(cpu, 2);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u16(src)?;
+        bus.port_out_u16(port, v)?;
+        let d = string_index_delta(cpu, 2);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    }
     Ok(())
 }
 
 /// One OUTSD iteration (no IP update). Spec: SDM Vol. 2 OUTS/OUTSD (opsize 32).
 fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     let port = cpu.gpr_u16(CpuState::RDX);
-    let si = cpu.gpr_u16(CpuState::RSI);
-    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-    let v = bus.read_u32(src)?;
-    bus.port_out_u32(port, v)?;
-    let d = string_index_delta(cpu, 4);
-    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    if asize32(insn) {
+        let si = cpu.gpr_u32(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u32(src)?;
+        bus.port_out_u32(port, v)?;
+        let d = string_index_delta32(cpu, 4);
+        cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
+    } else {
+        let si = cpu.gpr_u16(CpuState::RSI);
+        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let v = bus.read_u32(src)?;
+        bus.port_out_u32(port, v)?;
+        let d = string_index_delta(cpu, 4);
+        cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    }
     Ok(())
 }
 
-/// REP / REPE / REPNE wrapper for address-size 16 (count = CX).
+/// REP / REPE / REPNE wrapper — count = CX (asize16) or ECX (asize32).
 ///
-/// Spec: Intel SDM Vol. 2 "REP/REPE/REPNE/REPZ/REPNZ".
+/// Spec: Intel SDM Vol. 2 "REP/REPE/REPNE/REPZ/REPNZ"; Vol. 1 §3.6.
 /// - `zf_terminate`: `None` = unconditional REP (MOVS/STOS/LODS);
 ///   `Some(true)` = REPE (stop when ZF=0 after an iteration);
 ///   `Some(false)` = REPNE (stop when ZF=1 after an iteration).
 ///
-/// Unsupported here: interrupt recognition between iterations; asize 32/64 (ECX/RCX).
+/// Unsupported here: interrupt recognition between iterations; asize 64 (RCX).
 fn exec_string_with_rep<F>(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1074,13 +1389,23 @@ where
         return Ok(());
     }
 
+    let use_ecx = asize32(insn);
     loop {
-        let cx = cpu.gpr_u16(CpuState::RCX);
-        if cx == 0 {
-            break;
+        if use_ecx {
+            let ecx = cpu.gpr_u32(CpuState::RCX);
+            if ecx == 0 {
+                break;
+            }
+            once(cpu, bus, insn)?;
+            cpu.set_gpr_u32(CpuState::RCX, ecx.wrapping_sub(1));
+        } else {
+            let cx = cpu.gpr_u16(CpuState::RCX);
+            if cx == 0 {
+                break;
+            }
+            once(cpu, bus, insn)?;
+            cpu.set_gpr_u16(CpuState::RCX, cx.wrapping_sub(1));
         }
-        once(cpu, bus, insn)?;
-        cpu.set_gpr_u16(CpuState::RCX, cx.wrapping_sub(1));
         if let Some(continue_while_zf) = zf_terminate {
             // REPE (`true`): stop when ZF=0. REPNE (`false`): stop when ZF=1.
             let zf = zf_set(cpu);
@@ -1104,7 +1429,7 @@ fn read_far_ptr16(
         // Caller should deliver #UD; keep helper defensive.
         return Err(ExecError::Unsupported(insn.opcode));
     }
-    let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+    let (addr, _, uses_ss) = ea(cpu, insn)?;
     let offset = bus
         .read_u16(addr)
         .map_err(|e| classify_mem_fault(e, uses_ss))?;
@@ -2233,7 +2558,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea_16(cpu, &insn)?;
+                    let (addr, _, uses_ss) = ea(cpu, &insn)?;
                     let offset = bus
                         .read_u16(addr)
                         .map_err(|e| classify_mem_fault(e, uses_ss))?;
@@ -2257,7 +2582,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea_16(cpu, &insn)?;
+                    let (addr, _, uses_ss) = ea(cpu, &insn)?;
                     let offset = bus
                         .read_u16(addr)
                         .map_err(|e| classify_mem_fault(e, uses_ss))?;
@@ -2379,7 +2704,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let (addr, _, uses_ss) = ea_16(cpu, &insn)?;
+            let (addr, _, uses_ss) = ea(cpu, &insn)?;
             let lower = bus
                 .read_u16(addr)
                 .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
@@ -2444,18 +2769,24 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // INSB — Spec: Intel SDM Vol. 2 "INS/INSB/INSW/INSD"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
             // Port = DX; dest = ES:DI. F2/F3 act as unconditional REP (count = CX).
-            // Unsupported here: interruptible REP; asize 32/64; IOPL/CPL checks.
-            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| insb_once(cpu, bus))?;
+            // Unsupported here: interruptible REP; asize 64; IOPL/CPL checks.
+            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                insb_once(cpu, bus, insn)
+            })?;
             cpu.set_ip16(next_ip);
         }
         0x6D => {
             // INSW/INSD — Spec: Intel SDM Vol. 2 "INS/INSB/INSW/INSD"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Operand-size 16 → word; 0x66 → dword. Unsupported: interruptible REP; asize 32/64; IOPL.
+            // Operand-size 16 → word; 0x66 → dword. Unsupported: interruptible REP; asize 64; IOPL.
             if opsz32(&insn) {
-                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| insd_once(cpu, bus))?;
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    insd_once(cpu, bus, insn)
+                })?;
             } else {
-                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| insw_once(cpu, bus))?;
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    insw_once(cpu, bus, insn)
+                })?;
             }
             cpu.set_ip16(next_ip);
         }
@@ -2463,7 +2794,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // OUTSB — Spec: Intel SDM Vol. 2 "OUTS/OUTSB/OUTSW/OUTSD"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
             // Port = DX; src = DS:SI (segment override allowed).
-            // Unsupported here: interruptible REP; asize 32/64; IOPL/CPL checks.
+            // Unsupported here: interruptible REP; asize 64; IOPL/CPL checks.
             exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                 outsb_once(cpu, bus, insn)
             })?;
@@ -2472,7 +2803,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x6F => {
             // OUTSW/OUTSD — Spec: Intel SDM Vol. 2 "OUTS/OUTSB/OUTSW/OUTSD"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Operand-size 16 → word; 0x66 → dword. Unsupported: interruptible REP; asize 32/64; IOPL.
+            // Operand-size 16 → word; 0x66 → dword. Unsupported: interruptible REP; asize 64; IOPL.
             if opsz32(&insn) {
                 exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                     outsd_once(cpu, bus, insn)
@@ -2487,8 +2818,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xA4 => {
             // MOVSB — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: MOVSQ; interruptible REP; asize 32/64.
-            // F2/F3 both act as unconditional REP for MOVS (count = CX).
+            // Unsupported here: MOVSQ; interruptible REP; asize 64.
+            // F2/F3 both act as unconditional REP for MOVS (count = (E)CX).
             exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                 movsb_once(cpu, bus, insn)
             })?;
@@ -2497,7 +2828,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xA5 => {
             // MOVSW/MOVSD — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Operand-size 16 → word; 0x66 → dword. Unsupported: MOVSQ; interruptible REP; asize 32/64.
+            // Operand-size 16 → word; 0x66 → dword. Unsupported: MOVSQ; interruptible REP; asize 64.
             if opsz32(&insn) {
                 exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                     movsd_once(cpu, bus, insn)
@@ -2512,23 +2843,23 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xAA => {
             // STOSB — Spec: Intel SDM Vol. 2 "STOS/STOSB/STOSW/STOSD/STOSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: STOSQ; interruptible REP; asize 32/64.
-            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| {
-                stosb_once(cpu, bus)
+            // Unsupported here: STOSQ; interruptible REP; asize 64.
+            exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                stosb_once(cpu, bus, insn)
             })?;
             cpu.set_ip16(next_ip);
         }
         0xAB => {
             // STOSW/STOSD — Spec: Intel SDM Vol. 2 "STOS/STOSB/STOSW/STOSD/STOSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: STOSQ; interruptible REP; asize 32/64.
+            // Unsupported here: STOSQ; interruptible REP; asize 64.
             if opsz32(&insn) {
-                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| {
-                    stosd_once(cpu, bus)
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    stosd_once(cpu, bus, insn)
                 })?;
             } else {
-                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| {
-                    stosw_once(cpu, bus)
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    stosw_once(cpu, bus, insn)
                 })?;
             }
             cpu.set_ip16(next_ip);
@@ -2536,7 +2867,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xAC => {
             // LODSB — Spec: Intel SDM Vol. 2 "LODS/LODSB/LODSW/LODSD/LODSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: LODSQ; interruptible REP; asize 32/64.
+            // Unsupported here: LODSQ; interruptible REP; asize 64.
             exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                 lodsb_once(cpu, bus, insn)
             })?;
@@ -2545,7 +2876,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xAD => {
             // LODSW/LODSD — Spec: Intel SDM Vol. 2 "LODS/LODSB/LODSW/LODSD/LODSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: LODSQ; interruptible REP; asize 32/64.
+            // Unsupported here: LODSQ; interruptible REP; asize 64.
             if opsz32(&insn) {
                 exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                     lodsd_once(cpu, bus, insn)
@@ -2561,7 +2892,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // CMPSB — Spec: Intel SDM Vol. 2 "CMPS/CMPSB/CMPSW/CMPSD/CMPSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
             // F3 = REPE (while ZF=1); F2 = REPNE (while ZF=0).
-            // Unsupported here: CMPSQ; interruptible REP; asize 32/64.
+            // Unsupported here: CMPSQ; interruptible REP; asize 64.
             let zf_term = if insn.prefixes.repne {
                 Some(false)
             } else if insn.prefixes.rep {
@@ -2577,7 +2908,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xA7 => {
             // CMPSW/CMPSD — Spec: Intel SDM Vol. 2 "CMPS/CMPSB/CMPSW/CMPSD/CMPSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // F3 = REPE; F2 = REPNE. Unsupported: CMPSQ; interruptible REP; asize 32/64.
+            // F3 = REPE; F2 = REPNE. Unsupported: CMPSQ; interruptible REP; asize 64.
             let zf_term = if insn.prefixes.repne {
                 Some(false)
             } else if insn.prefixes.rep {
@@ -2600,7 +2931,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // SCASB — Spec: Intel SDM Vol. 2 "SCAS/SCASB/SCASW/SCASD/SCASQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
             // F3 = REPE (while ZF=1); F2 = REPNE (while ZF=0).
-            // Unsupported here: SCASQ; interruptible REP; asize 32/64.
+            // Unsupported here: SCASQ; interruptible REP; asize 64.
             let zf_term = if insn.prefixes.repne {
                 Some(false)
             } else if insn.prefixes.rep {
@@ -2608,15 +2939,15 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             } else {
                 None
             };
-            exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, _insn| {
-                scasb_once(cpu, bus)
+            exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, insn| {
+                scasb_once(cpu, bus, insn)
             })?;
             cpu.set_ip16(next_ip);
         }
         0xAF => {
             // SCASW/SCASD — Spec: Intel SDM Vol. 2 "SCAS/SCASB/SCASW/SCASD/SCASQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // F3 = REPE; F2 = REPNE. Unsupported: SCASQ; interruptible REP; asize 32/64.
+            // F3 = REPE; F2 = REPNE. Unsupported: SCASQ; interruptible REP; asize 64.
             let zf_term = if insn.prefixes.repne {
                 Some(false)
             } else if insn.prefixes.rep {
@@ -2625,12 +2956,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 None
             };
             if opsz32(&insn) {
-                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, _insn| {
-                    scasd_once(cpu, bus)
+                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, insn| {
+                    scasd_once(cpu, bus, insn)
                 })?;
             } else {
-                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, _insn| {
-                    scasw_once(cpu, bus)
+                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, insn| {
+                    scasw_once(cpu, bus, insn)
                 })?;
             }
             cpu.set_ip16(next_ip);
@@ -2773,16 +3104,28 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x8D => {
-            // LEA r16, m — load 16-bit effective address (offset only; no memory read).
-            // Spec: Intel SDM Vol. 2 "LEA".
+            // LEA r16/r32, m — load effective address (offset only; no memory read).
+            // Spec: Intel SDM Vol. 2 "LEA"; Vol. 1 §3.6 (address-/operand-size).
             // Register source (mod=11) → #UD (Vol. 3 §6.15).
-            // Unsupported here: opsize 32; address-size 32.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let off = calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?;
-            cpu.set_gpr_u16(m.reg as usize, off);
+            if asize32(&insn) {
+                let off = calc_ea32(cpu, &insn)?;
+                if opsz32(&insn) {
+                    cpu.set_gpr_u32(m.reg as usize, off);
+                } else {
+                    cpu.set_gpr_u16(m.reg as usize, off as u16);
+                }
+            } else {
+                let off = calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?;
+                if opsz32(&insn) {
+                    cpu.set_gpr_u32(m.reg as usize, u32::from(off));
+                } else {
+                    cpu.set_gpr_u16(m.reg as usize, off);
+                }
+            }
             cpu.set_ip16(next_ip);
         }
         0x8E => {
@@ -8587,5 +8930,115 @@ mod tests {
 
         step(&mut cpu, &mut bus).unwrap(); // ADD EAX, 1
         assert_eq!(cpu.eax(), 1);
+    }
+
+    /// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
+    /// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (address-size attribute).
+    #[test]
+    fn asize32_modrm_ea_mov_and_lea() {
+        let mut mem = vec![0u8; 0x20000];
+        // 67 8B 03 = MOV AX, [EBX]
+        mem[0] = 0x67;
+        mem[1] = 0x8B;
+        mem[2] = 0x03;
+        // 67 8D 4B 10 = LEA CX, [EBX+0x10]
+        mem[3] = 0x67;
+        mem[4] = 0x8D;
+        mem[5] = 0x4B;
+        mem[6] = 0x10;
+        // 67 8B 44 24 04 = MOV AX, [ESP+4]
+        mem[7] = 0x67;
+        mem[8] = 0x8B;
+        mem[9] = 0x44;
+        mem[10] = 0x24;
+        mem[11] = 0x04;
+        mem[12] = 0xF4;
+
+        // DS:EBX → linear 0x1000; payload 0xBEEF
+        mem[0x1000] = 0xEF;
+        mem[0x1001] = 0xBE;
+        // SS:ESP+4 → linear 0x3004; payload 0xCAFE
+        mem[0x3004] = 0xFE;
+        mem[0x3005] = 0xCA;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u32(CpuState::RBX, 0x1000);
+        cpu.set_gpr_u32(CpuState::RSP, 0x3000);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0xBEEF);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0x1010);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0xCAFE);
+    }
+
+    /// Absolute disp32 under 0x67 uses DS:(disp32), not EBP.
+    /// Spec: Intel SDM Vol. 2 Chapter 2 — mod=00 rm=101 → disp32.
+    #[test]
+    fn asize32_modrm_disp32_absolute() {
+        let mut mem = vec![0u8; 0x20000];
+        // 67 8A 05 00 40 00 00 = MOV AL, [0x4000]
+        mem[0] = 0x67;
+        mem[1] = 0x8A;
+        mem[2] = 0x05;
+        mem[3] = 0x00;
+        mem[4] = 0x40;
+        mem[5] = 0x00;
+        mem[6] = 0x00;
+        mem[7] = 0xF4;
+        mem[0x4000] = 0x5A;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u32(CpuState::RBP, 0xFFFF_FFFF); // must not participate
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x5A);
+    }
+
+    /// String ops with 0x67 use ESI/EDI (and ECX for REP), not SI/DI/CX.
+    /// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 MOVS / REP (address-size attribute).
+    #[test]
+    fn asize32_movsb_uses_esi_edi_and_rep_ecx() {
+        let mut mem = vec![0u8; 0x20000];
+        // F3 67 A4 = REP MOVSB
+        mem[0] = 0xF3;
+        mem[1] = 0x67;
+        mem[2] = 0xA4;
+        mem[3] = 0xF4;
+        mem[0x5000] = 0x11;
+        mem[0x5001] = 0x22;
+        mem[0x5002] = 0x33;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        // High halves must participate under asize32 (would be ignored with SI/DI/CX).
+        cpu.set_gpr_u32(CpuState::RSI, 0x0000_5000);
+        cpu.set_gpr_u32(CpuState::RDI, 0x0000_6000);
+        cpu.set_gpr_u32(CpuState::RCX, 0x0000_0003);
+        cpu.set_direction_flag(false);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x6000).unwrap(), 0x11);
+        assert_eq!(bus.read_u8(0x6001).unwrap(), 0x22);
+        assert_eq!(bus.read_u8(0x6002).unwrap(), 0x33);
+        assert_eq!(cpu.gpr_u32(CpuState::RSI), 0x5003);
+        assert_eq!(cpu.gpr_u32(CpuState::RDI), 0x6003);
+        assert_eq!(cpu.gpr_u32(CpuState::RCX), 0);
     }
 }
