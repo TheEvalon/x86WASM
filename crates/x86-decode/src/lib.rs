@@ -1622,6 +1622,17 @@ mod tests {
             decode(&[0x66, 0xF7, 0xC0, 0x00, 0x00]),
             Err(DecodeError::Truncated)
         );
+
+        // IMUL r32, r/m32, imm32 — 66 69 /r id (ModrmImm16 follows OsZ).
+        // Spec: Intel SDM Vol. 2 "IMUL"; Ch. 2 (66H).
+        let d = decode(&[0x66, 0x69, 0xD8, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.immediate as u32, 0x1234_5678);
+        assert_eq!(d.length, 7);
+        assert_eq!(
+            decode(&[0x66, 0x69, 0xD8, 0x00, 0x00]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     /// Address-size override 0x67: 32-bit ModRM displacement / SIB forms.

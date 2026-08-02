@@ -78,7 +78,7 @@ pub trait Bus {
 /// - `MemoryFault`: bus errors that could not be classified as `#GP`/`#SS`
 ///   (code fetch, IVT delivery failure)
 /// - `Unsupported`: valid-but-unimplemented forms reached after decode
-///   (remaining opsize-32: Group2 D3 CL forms, IMUL 69/6B imm opsize-32, …)
+///   (remaining opsize-32 niche forms if any; D3 CL + IMUL 69/6B under 0x66 landed)
 /// - `ArchFault`: internal only — converted to IVT delivery inside [`step`];
 ///   never returned to callers of [`step`]/[`run`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -1877,7 +1877,7 @@ fn grp2_u16(cpu: &mut CpuState, reg: u8, mut val: u16, raw_count: u8) -> Result<
     }
 }
 
-/// Group 2 dword ops (D1/C1 under OsZ32). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+/// Group 2 dword ops (D1/C1/D3 under OsZ32). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
 /// COUNT masked to 5 bits; RCL/RCR use COUNT mod 33.
 fn grp2_u32(cpu: &mut CpuState, reg: u8, mut val: u32, raw_count: u8) -> Result<u32, ExecError> {
     let count = raw_count & 0x1F;
@@ -2813,18 +2813,22 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xD3 => {
-            // Group 2 r/m16, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits).
-            // Unsupported here: opsize 32 (tranche-4 covers D1/C1 only). /6 → #UD.
+            // Group 2 r/m16|32, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits); Ch. 2.
+            // /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg == 6 {
                 return real_mode_ud(cpu, bus);
             }
+            let count = cpu.gpr_u8_low(CpuState::RCX);
             if opsz32(&insn) {
-                return Err(ExecError::Unsupported(op));
+                let v = read_rm_u32(cpu, bus, &insn)?;
+                let r = grp2_u32(cpu, m.reg, v, count)?;
+                write_rm_u32(cpu, bus, &insn, r)?;
+            } else {
+                let v = read_rm_u16(cpu, bus, &insn)?;
+                let r = grp2_u16(cpu, m.reg, v, count)?;
+                write_rm_u16(cpu, bus, &insn, r)?;
             }
-            let v = read_rm_u16(cpu, bus, &insn)?;
-            let r = grp2_u16(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
-            write_rm_u16(cpu, bus, &insn, r)?;
             cpu.set_ip16(next_ip);
         }
         0xF6 => {
@@ -3387,19 +3391,30 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x69 | 0x6B => {
-            // IMUL r16, r/m16, imm16/imm8 — Spec: Intel SDM Vol. 2 "IMUL".
-            // Dest = ModRM.reg; src = r/m; imm sign-extended for 6B.
-            // Unsupported here: opsize 32 on 69/6B.
+            // IMUL r16/r32, r/m16/32, imm — Spec: Intel SDM Vol. 2 "IMUL"; Ch. 2 (66H).
+            // Dest = ModRM.reg; src = r/m; 6B imm8 sign-extended; 69 imm follows OsZ.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
-            let src = read_rm_u16(cpu, bus, &insn)?;
-            let imm = if op == 0x6B {
-                i32::from(insn.immediate as i8)
+            if opsz32(&insn) {
+                let src = read_rm_u32(cpu, bus, &insn)?;
+                let imm = if op == 0x6B {
+                    i32::from(insn.immediate as i8)
+                } else {
+                    insn.immediate
+                };
+                let prod = i64::from(src as i32).wrapping_mul(i64::from(imm));
+                cpu.set_gpr_u32(m.reg as usize, prod as u32);
+                set_imul_flags_i32(cpu, prod);
             } else {
-                i32::from(insn.immediate as u16 as i16)
-            };
-            let prod = i32::from(src as i16).wrapping_mul(imm);
-            cpu.set_gpr_u16(m.reg as usize, prod as u16);
-            set_imul_flags_i16(cpu, prod);
+                let src = read_rm_u16(cpu, bus, &insn)?;
+                let imm = if op == 0x6B {
+                    i32::from(insn.immediate as i8)
+                } else {
+                    i32::from(insn.immediate as u16 as i16)
+                };
+                let prod = i32::from(src as i16).wrapping_mul(imm);
+                cpu.set_gpr_u16(m.reg as usize, prod as u16);
+                set_imul_flags_i16(cpu, prod);
+            }
             cpu.set_ip16(next_ip);
         }
         0x6A => {
@@ -10591,6 +10606,99 @@ mod tests {
 
         step(&mut cpu, &mut bus).unwrap(); // NOT dword [0x4000]
         assert_eq!(bus.read_u32(0x4000).unwrap(), 0xF0F0_F0F0);
+    }
+
+    /// 0x66 Group 2 D3 r/m32,CL and IMUL 69/6B r32,r/m32,imm.
+    /// Spec: Intel SDM Vol. 2 SHL/IMUL; Ch. 2 (66H).
+    #[test]
+    fn opsize32_grp2_d3_cl_and_imul_69_6b() {
+        let mut mem = vec![0u8; 0x10000];
+        // 66 D3 E0                   = SHL EAX, CL
+        mem[0] = 0x66;
+        mem[1] = 0xD3;
+        mem[2] = 0xE0;
+        // 66 69 D8 02 00 00 00       = IMUL EBX, EAX, 2
+        mem[3] = 0x66;
+        mem[4] = 0x69;
+        mem[5] = 0xD8;
+        mem[6] = 0x02;
+        mem[7] = 0x00;
+        mem[8] = 0x00;
+        mem[9] = 0x00;
+        // 66 69 D8 00 00 01 00       = IMUL EBX, EAX, 0x00010000
+        mem[10] = 0x66;
+        mem[11] = 0x69;
+        mem[12] = 0xD8;
+        mem[13] = 0x00;
+        mem[14] = 0x00;
+        mem[15] = 0x01;
+        mem[16] = 0x00;
+        // 66 6B D8 FD                = IMUL EBX, EAX, -3
+        mem[17] = 0x66;
+        mem[18] = 0x6B;
+        mem[19] = 0xD8;
+        mem[20] = 0xFD;
+        // 66 69 1E 00 40 03 00 00 00 = IMUL EBX, [0x4000], 3
+        mem[21] = 0x66;
+        mem[22] = 0x69;
+        mem[23] = 0x1E;
+        mem[24] = 0x00;
+        mem[25] = 0x40;
+        mem[26] = 0x03;
+        mem[27] = 0x00;
+        mem[28] = 0x00;
+        mem[29] = 0x00;
+        mem[30] = 0xF4;
+        mem[0x4000] = 0x05;
+        mem[0x4001] = 0x00;
+        mem[0x4002] = 0x00;
+        mem[0x4003] = 0x00;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // SHL EAX, CL: 0x4000_0000 << 1 = 0x8000_0000; CF=0, OF=1
+        cpu.set_eax(0x4000_0000);
+        cpu.set_gpr_u8_low(CpuState::RCX, 1);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 0x8000_0000);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL EBX, EAX, 2: 3*2=6 fits → CF=OF=0; EAX unchanged
+        cpu.set_eax(3);
+        cpu.set_gpr_u32(CpuState::RBX, 0xDEAD_BEEF);
+        let ip_before = cpu.ip16();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), ip_before + 7); // 66 + 69 + modrm + imm32
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 6);
+        assert_eq!(cpu.eax(), 3);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL EBX, EAX, 0x10000: 0x10000*0x10000 = 0x1_0000_0000 does not fit in i32
+        cpu.set_eax(0x0001_0000);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0);
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL EBX, EAX, -3: (-2)*(-3)=6 fits
+        cpu.set_eax(0xFFFF_FFFE);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 6);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL EBX, [0x4000], 3: 5*3=15; memory unchanged
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 15);
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 5);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
     }
 
     /// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
