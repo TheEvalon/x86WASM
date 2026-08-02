@@ -4039,7 +4039,6 @@ mod tests {
         }
     }
 
-
     /// Test bus: latch an external IRQ after N successful `write_u8` calls.
     /// Used to exercise REP interruptibility between iterations (PIC stub).
     struct IrqAfterWritesBus {
