@@ -728,7 +728,8 @@ fn read_rm_u8(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<u
         // Legacy byte r/m: 0-3 AL/CL/DL/BL, 4-7 AH/CH/DH/BH (SDM Vol. 2 App. B).
         Ok(read_reg_u8(cpu, m.rm))
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn, 1)?;        bus.read_u8(addr)
+        let (addr, _, uses_ss) = ea(cpu, insn, 1)?;
+        bus.read_u8(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -744,7 +745,8 @@ fn write_rm_u8(
         write_reg_u8(cpu, m.rm, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn, 1)?;        bus.write_u8(addr, val)
+        let (addr, _, uses_ss) = ea(cpu, insn, 1)?;
+        bus.write_u8(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -754,7 +756,8 @@ fn read_rm_u16(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u16(m.rm as usize))
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn, 2)?;        bus.read_u16(addr)
+        let (addr, _, uses_ss) = ea(cpu, insn, 2)?;
+        bus.read_u16(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -770,7 +773,8 @@ fn write_rm_u16(
         cpu.set_gpr_u16(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn, 2)?;        bus.write_u16(addr, val)
+        let (addr, _, uses_ss) = ea(cpu, insn, 2)?;
+        bus.write_u16(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -780,7 +784,8 @@ fn read_rm_u32(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u32(m.rm as usize))
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn, 4)?;        bus.read_u32(addr)
+        let (addr, _, uses_ss) = ea(cpu, insn, 4)?;
+        bus.read_u32(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -796,7 +801,8 @@ fn write_rm_u32(
         cpu.set_gpr_u32(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn, 4)?;        bus.write_u32(addr, val)
+        let (addr, _, uses_ss) = ea(cpu, insn, 4)?;
+        bus.write_u32(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -1603,7 +1609,8 @@ fn read_far_ptr16(
         // Caller should deliver #UD; keep helper defensive.
         return Err(ExecError::Unsupported(insn.opcode));
     }
-    let (addr, _, uses_ss) = ea(cpu, insn, 4)?;    let offset = bus
+    let (addr, _, uses_ss) = ea(cpu, insn, 4)?;
+    let offset = bus
         .read_u16(addr)
         .map_err(|e| classify_mem_fault(e, uses_ss))?;
     let selector = bus
@@ -2776,7 +2783,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;                    let offset = bus
+                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
+                    let offset = bus
                         .read_u16(addr)
                         .map_err(|e| classify_mem_fault(e, uses_ss))?;
                     let selector = bus
@@ -2799,7 +2807,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;                    let offset = bus
+                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
+                    let offset = bus
                         .read_u16(addr)
                         .map_err(|e| classify_mem_fault(e, uses_ss))?;
                     let selector = bus
@@ -2953,7 +2962,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;            let lower = bus
+            let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
+            let lower = bus
                 .read_u16(addr)
                 .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
             let upper = bus
@@ -3202,19 +3212,20 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xA0 => {
             // MOV AL, moffs8 — Spec: Intel SDM Vol. 2 "MOV".
-// Address-size 16 → moffs16; 0x67 → moffs32 (unreal high offsets).
+            // Address-size 16 → moffs16; 0x67 → moffs32 (unreal high offsets).
             let off = moffs_offset(&insn);
             let seg = data_seg_for_string_src(cpu, &insn);
             let uses_ss = string_src_uses_ss(&insn);
             let addr = seg_linear_checked(seg, off, 1, uses_ss)?;
             let v = bus
                 .read_u8(addr)
-                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_al(v);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;
+            cpu.set_al(v);
             cpu.set_ip16(next_ip);
         }
         0xA1 => {
             // MOV AX, moffs16 — Spec: Intel SDM Vol. 2 "MOV".
-// Unsupported here: opsize 32 (MOV EAX, moffs).
+            // Unsupported here: opsize 32 (MOV EAX, moffs).
             if opsz32(&insn) {
                 return Err(ExecError::Unsupported(op));
             }
@@ -3224,21 +3235,23 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
             let v = bus
                 .read_u16(addr)
-                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_ax(v);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;
+            cpu.set_ax(v);
             cpu.set_ip16(next_ip);
         }
         0xA2 => {
             // MOV moffs8, AL — Spec: Intel SDM Vol. 2 "MOV".
-let off = moffs_offset(&insn);
+            let off = moffs_offset(&insn);
             let seg = data_seg_for_string_src(cpu, &insn);
             let uses_ss = string_src_uses_ss(&insn);
             let addr = seg_linear_checked(seg, off, 1, uses_ss)?;
             bus.write_u8(addr, cpu.al())
-                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_ip16(next_ip);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;
+            cpu.set_ip16(next_ip);
         }
         0xA3 => {
             // MOV moffs16, AX — Spec: Intel SDM Vol. 2 "MOV".
-// Unsupported here: opsize 32 (MOV moffs, EAX).
+            // Unsupported here: opsize 32 (MOV moffs, EAX).
             if opsz32(&insn) {
                 return Err(ExecError::Unsupported(op));
             }
@@ -3247,7 +3260,8 @@ let off = moffs_offset(&insn);
             let uses_ss = string_src_uses_ss(&insn);
             let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
             bus.write_u16(addr, cpu.ax())
-                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_ip16(next_ip);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;
+            cpu.set_ip16(next_ip);
         }
         0xA8 => {
             // TEST AL, imm8 — Spec: Intel SDM Vol. 2 "TEST".
@@ -9657,7 +9671,7 @@ mod tests {
         assert_eq!(cpu.eax(), 1);
     }
 
-/// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
+    /// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
     /// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (address-size attribute).
     #[test]
     fn asize32_modrm_ea_mov_and_lea() {
