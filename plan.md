@@ -1320,7 +1320,7 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
-Status (2026-08-02, branch `slice/rm-opsize32-tranche3`): **in progress** — real-mode foundation **audit tranche** landed (RM-D/E/F/G, REP, word strings, opsize32, #UD IVT, INS/OUTS, BCD, INTO/BOUND, ENTER nesting>0, 0F AF IMUL, decode-miss #UD + ModRM/stack/string/moffs #GP/#SS, address-size 0x67 ModRM/SIB + string ESI/EDI/ECX, **0x66 tranche-2**: ENTERD/LEAVE32, PUSHAD/POPAD, PUSHFD/POPFD, **0x66 tranche-3**: INC/DEC r32 + Group5 r/m32 + far m16:32, TEST EAX imm32, CWDE/CDQ, XCHG EAX,r32, LES/LDS r32, BOUND r32, far CALL/JMP/RETF ptr16:32, interruptible REP via `pending_irq` stub, **unreal segment limits** / sticky DS/ES/SS/FS/GS cache + moffs32); **not SeaBIOS-ready**. M2 exit criteria are not met.
+Status (2026-08-02, branch `feat/real-mode-int-iret`): **in progress** — real-mode foundation **audit tranche** landed (RM-D/E/F/G, REP, word strings, opsize32, #UD IVT, INS/OUTS, BCD, INTO/BOUND, ENTER nesting>0, 0F AF IMUL, decode-miss #UD + ModRM/stack/string/moffs #GP/#SS, address-size 0x67 ModRM/SIB + string ESI/EDI/ECX, **0x66 tranche-2**: ENTERD/LEAVE32, PUSHAD/POPAD, PUSHFD/POPFD, **0x66 tranche-3**: INC/DEC r32 + Group5 r/m32 + far m16:32, TEST EAX imm32, CWDE/CDQ, XCHG EAX,r32, LES/LDS r32, BOUND r32, far CALL/JMP/RETF ptr16:32, interruptible REP via `pending_irq` stub, **unreal segment limits** / sticky DS/ES/SS/FS/GS cache + moffs32); **not SeaBIOS-ready**. M2 exit criteria are not met.
 
 Progress against implement list:
 
