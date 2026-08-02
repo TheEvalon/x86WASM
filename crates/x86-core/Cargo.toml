@@ -1,0 +1,13 @@
+[package]
+name = "x86-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU architectural state for x86WASM"
+
+[dependencies]
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/x86-spec",
+    "crates/x86-decode",
+    "crates/x86-core",
+    "crates/x86-mmu",
+    "crates/x86-ir",
+    "crates/x86-interpreter",
+    "crates/machine-pc",
+    "crates/devices",
+    "crates/firmware-interface",
+    "crates/emulator-cli",
+    "crates/emulator-web",
+]
+default-members = [
+    "crates/emulator-cli",
+    "crates/machine-pc",
+    "crates/x86-core",
+    "crates/x86-decode",
+    "crates/x86-interpreter",
+    "crates/devices",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/TheEvalon/x86WASM"
+rust-version = "1.80"
+
+[workspace.dependencies]
+x86-spec = { path = "crates/x86-spec" }
+x86-decode = { path = "crates/x86-decode" }
+x86-core = { path = "crates/x86-core" }
+x86-mmu = { path = "crates/x86-mmu" }
+x86-ir = { path = "crates/x86-ir" }
+x86-interpreter = { path = "crates/x86-interpreter" }
+machine-pc = { path = "crates/machine-pc" }
+devices = { path = "crates/devices" }
+firmware-interface = { path = "crates/firmware-interface" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+wasm-bindgen = "0.2.126"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"

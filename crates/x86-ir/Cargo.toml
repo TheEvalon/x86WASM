@@ -1,0 +1,8 @@
+[package]
+name = "x86-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed IR placeholder for future Wasm JIT"
+
+[dependencies]

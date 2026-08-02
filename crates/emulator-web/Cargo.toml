@@ -1,0 +1,14 @@
+[package]
+name = "emulator-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly exports for the browser worker"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+machine-pc = { workspace = true }
+wasm-bindgen = { workspace = true }
+console_error_panic_hook = { workspace = true }

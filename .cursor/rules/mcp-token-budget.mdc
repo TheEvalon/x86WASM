@@ -1,0 +1,37 @@
+---
+description: Prefer MCP tools that keep agent context small and reusable
+alwaysApply: true
+---
+
+# MCP token budget
+
+Keep sessions cheap. Prefer structured MCP lookups over dumping trees into chat.
+
+## Prefer
+
+| MCP | Use for |
+|---|---|
+| **jcodemunch** | After the repo is indexed: `search_symbols`, `get_context_bundle`, `get_file_outline`, `assemble_task_context`, `get_session_context` instead of broad Grep/Read/Glob sweeps |
+| **cursor10x-mcp** | `initConversation`, `storeMilestone` / `storeDecision` / `storeRequirement`, `getComprehensiveContext` at session boundaries |
+| **Context7** | Current Rust, wasm-bindgen, Vite, Playwright API docs |
+| **desktop-commander** | Long builds/tests or surgical file ops when useful |
+
+## Avoid
+
+- Pasting whole crates or large file dumps into chat when jcodemunch can answer
+- Re-stating milestone status every turn when cursor10x already stores it
+- Guessing library APIs when Context7 can resolve them
+- Replacing normal `git` / `cargo` flow with desktop-commander for routine work
+- Duplicating `plan.md` content into user-memory
+
+## Session pattern
+
+```text
+cursor10x initConversation
+→ jcodemunch get_session_context / assemble_task_context (once indexed)
+→ next-slice skill
+→ Plan Mode → implement → quality-gate
+→ cursor10x storeMilestone / endConversation
+```
+
+Re-index with jcodemunch (`index_folder`) after each meaningful merge or when symbols drift.

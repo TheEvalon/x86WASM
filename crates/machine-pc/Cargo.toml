@@ -1,0 +1,17 @@
+[package]
+name = "machine-pc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Virtual PC wiring: CPU, memory, buses, devices"
+
+[dependencies]
+x86-core = { workspace = true }
+x86-interpreter = { workspace = true }
+x86-mmu = { workspace = true }
+devices = { workspace = true }
+firmware-interface = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+x86-decode = { workspace = true }

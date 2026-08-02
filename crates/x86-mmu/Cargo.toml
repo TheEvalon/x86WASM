@@ -1,0 +1,9 @@
+[package]
+name = "x86-mmu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Segmentation/paging helpers (M1: real-mode linear)"
+
+[dependencies]
+x86-core = { workspace = true }

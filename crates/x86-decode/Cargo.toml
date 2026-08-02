@@ -1,0 +1,10 @@
+[package]
+name = "x86-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "x86 instruction decoder"
+
+[dependencies]
+x86-spec = { workspace = true }
+thiserror = { workspace = true }

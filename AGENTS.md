@@ -61,3 +61,38 @@ Until Milestone 1 exit criteria are met: repository, CPU state, buses, decoder f
 ## Plan authority
 
 [plan.md](plan.md) is the product and roadmap source of truth. If code and plan disagree, fix the smaller delta and update docs in the same change when behavior is intentional.
+
+## MCP token-saving policy
+
+Prefer structured MCP tools over dumping source into chat. Details live in `.cursor/rules/mcp-token-budget.mdc`.
+
+| MCP | Use for | Avoid |
+|---|---|---|
+| **jcodemunch** | After index: `search_symbols` / `get_context_bundle` / `get_file_outline` / `assemble_task_context` | Broad Grep/Read/Glob of whole crates |
+| **cursor10x-mcp** | `initConversation`, milestones/decisions/requirements, `getComprehensiveContext` at boundaries | Re-pasting milestone status every chat |
+| **Context7** | Rust, wasm-bindgen, Vite, Playwright docs | Guessing current API shapes |
+| **desktop-commander** | Long builds/tests; surgical file ops | Replacing git/`cargo` for normal flow |
+| **user-memory** | Durable cross-project facts only if needed | Duplicating `plan.md` |
+
+Session start:
+
+```text
+cursor10x initConversation
+→ jcodemunch get_session_context / assemble_task_context (once indexed)
+→ next-slice skill
+→ Plan Mode → implement → quality-gate
+→ cursor10x storeMilestone / endConversation
+```
+
+Re-index with jcodemunch after each meaningful merge (or when symbols drift).
+
+## Ongoing cadence (after Milestone 1)
+
+Follow [plan.md](plan.md) milestones 2→7. Each session:
+
+1. Invoke `next-slice` against §21 / §25
+2. Plan Mode → implement one slice → `quality-gate`
+3. Push a branch → open a PR to `main` on [TheEvalon/x86WASM](https://github.com/TheEvalon/x86WASM)
+4. Record a cursor10x milestone; re-index jcodemunch when crate/layout symbols change
+
+Do not expand a chat into the next epic. Prefer a new chat (and a git worktree when parallel agents would touch the same crates).

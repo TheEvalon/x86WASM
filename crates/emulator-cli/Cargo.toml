@@ -1,0 +1,13 @@
+[package]
+name = "emulator-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native CLI runner for x86WASM"
+
+[[bin]]
+name = "emulator-cli"
+path = "src/main.rs"
+
+[dependencies]
+machine-pc = { workspace = true }

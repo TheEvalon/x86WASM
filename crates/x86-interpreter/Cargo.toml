@@ -1,0 +1,12 @@
+[package]
+name = "x86-interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference x86 interpreter"
+
+[dependencies]
+x86-core = { workspace = true }
+x86-decode = { workspace = true }
+x86-mmu = { workspace = true }
+thiserror = { workspace = true }
