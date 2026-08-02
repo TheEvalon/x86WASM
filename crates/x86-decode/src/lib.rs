@@ -317,4 +317,20 @@ mod tests {
     fn truncated_int() {
         assert_eq!(decode(&[0xCD]), Err(DecodeError::Truncated));
     }
+
+    #[test]
+    fn decode_pushf() {
+        // Intel SDM Vol. 2: PUSHF — opcode 9C
+        let d = decode(&[0x9C]).unwrap();
+        assert_eq!(d.mnemonic, "PUSHF");
+        assert_eq!(d.length, 1);
+    }
+
+    #[test]
+    fn decode_popf() {
+        // Intel SDM Vol. 2: POPF — opcode 9D
+        let d = decode(&[0x9D]).unwrap();
+        assert_eq!(d.mnemonic, "POPF");
+        assert_eq!(d.length, 1);
+    }
 }

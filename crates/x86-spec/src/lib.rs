@@ -201,6 +201,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "NOP",
     },
     InstrDef {
+        mnemonic: "PUSHF",
+        opcode: 0x9C,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSHF",
+    },
+    InstrDef {
+        mnemonic: "POPF",
+        opcode: 0x9D,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POPF",
+    },
+    InstrDef {
         mnemonic: "MOV_imm8",
         opcode: 0xB0,
         encoding: Encoding::OpcodeReg,
@@ -341,7 +355,7 @@ mod tests {
     #[test]
     fn subset_includes_hello_opcodes() {
         for op in [
-            0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF,
+            0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

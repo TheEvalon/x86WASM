@@ -309,6 +309,20 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let ip = pop16(cpu, bus)?;
             cpu.set_ip16(ip);
         }
+        0x9C => {
+            // PUSHF — 16-bit FLAGS in real-address mode (default opsize).
+            // Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ".
+            push16(cpu, bus, cpu.rflags as u16)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x9D => {
+            // POPF — 16-bit FLAGS in real-address mode (default opsize).
+            // Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ".
+            // Unsupported here: IOPL/VIP/VIF privilege masking (protected / V86).
+            let flags = pop16(cpu, bus)?;
+            cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
+            cpu.set_ip16(next_ip);
+        }
         0xCD => {
             // INT imm8 — real-address mode via IVT / IDTR base.
             // Spec: Intel SDM Vol. 2 "INT n", Vol. 3 §6.4 (real-address mode).
@@ -685,6 +699,83 @@ mod tests {
         assert_eq!(cpu.ip16(), 2);
         assert_eq!(cpu.cs.selector, 0);
         assert_eq!(cpu.rflags & 0xFFFF, flags_before & 0xFFFF);
+        assert!(cpu.interrupt_flag());
+    }
+
+    /// PUSHF pushes 16-bit FLAGS (SDM Vol. 2 PUSHF/PUSHFD/PUSHFQ, real-address mode).
+    #[test]
+    fn pushf_pushes_flags16() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x9C; // PUSHF
+        mem[1] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        cpu.rflags |= 1; // CF
+        let flags16 = cpu.rflags as u16;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFC);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), flags16);
+        assert_eq!(cpu.ip16(), 1);
+    }
+
+    /// POPF restores 16-bit FLAGS; reserved bit 1 stays set (SDM Vol. 2 POPF).
+    #[test]
+    fn popf_restores_flags16() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x9D; // POPF
+        mem[1] = 0xF4;
+        mem[0xFFFC] = 0x03; // CF + reserved1; IF clear
+        mem[0xFFFD] = 0x00;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFC);
+        cpu.set_interrupt_flag(true);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert!(!cpu.interrupt_flag());
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & 2, 2);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+        assert_eq!(cpu.ip16(), 1);
+    }
+
+    #[test]
+    fn pushf_popf_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x9C; // PUSHF
+        mem[1] = 0xFA; // CLI (clear IF in live flags)
+        mem[2] = 0x9D; // POPF (restore)
+        mem[3] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        cpu.rflags |= 1;
+        let flags_before = cpu.rflags & 0xFFFF;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap(); // PUSHF
+        step(&mut cpu, &mut bus).unwrap(); // CLI
+        assert!(!cpu.interrupt_flag());
+        step(&mut cpu, &mut bus).unwrap(); // POPF
+
+        assert_eq!(cpu.rflags & 0xFFFF, flags_before);
         assert!(cpu.interrupt_flag());
     }
 }
