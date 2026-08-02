@@ -70,7 +70,8 @@ pub trait Bus {
 /// - `MemoryFault`: bus errors that could not be classified as `#GP`/`#SS`
 ///   (code fetch, string paths not yet classified, IVT delivery failure)
 /// - `Unsupported`: valid-but-unimplemented forms reached after decode
-///   (remaining opsize-32 opcodes, TEST EAX imm32, ENTERD/0x66 ENTER, etc.)
+///   (remaining opsize-32 opcodes — INC/DEC r32 40–4F / FF, TEST EAX imm32 A9,
+///   CWDE/CDQ, XCHG EAX,r32, LES/LDS r32, BOUND r32, far ptr16:32, …)
 /// - `ArchFault`: internal only — converted to IVT delivery inside [`step`];
 ///   never returned to callers of [`step`]/[`run`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -2085,51 +2086,92 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(ip);
         }
         0xC8 => {
-            // ENTER iw, ib — 16-bit opsize with nesting (imm8 mod 32).
-            // Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5 (block-structured display).
-            // Unsupported here: opsize 32 (ENTERD / 0x66).
+            // ENTER/ENTERD iw, ib — nesting level = imm8 mod 32.
+            // Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5 / §3.6; Ch. 2 (66H).
+            // Address-size 16: SP/BP used for stack walks; opsize selects word vs dword.
+            // Unsupported here: address-size 32/64; stack-limit #SS beyond bus faults;
+            // protected-mode.
             let alloc = insn.immediate as u16;
             let nesting = (insn.displacement as u8) & 0x1F;
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
-            let frame_temp = cpu.gpr_u16(CpuState::RSP);
-            if nesting > 0 {
-                // Copy nesting-1 display pointers from the caller's frame, then
-                // push frame_temp (current procedure's frame pointer for LEAVE).
-                for _ in 1..nesting {
-                    let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(2);
-                    cpu.set_gpr_u16(CpuState::RBP, bp);
-                    let addr = linear_addr(&cpu.ss, u64::from(bp));
-                    let display = bus.read_u16(addr)?;
-                    push16(cpu, bus, display)?;
+            if opsz32(&insn) {
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RBP))?;
+                let frame_temp = cpu.gpr_u32(CpuState::RSP);
+                if nesting > 0 {
+                    for _ in 1..nesting {
+                        let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(4);
+                        cpu.set_gpr_u16(CpuState::RBP, bp);
+                        let addr = linear_addr(&cpu.ss, u64::from(bp));
+                        let display = bus
+                            .read_u32(addr)
+                            .map_err(|e| classify_mem_fault(e, true))?;
+                        push32(cpu, bus, display)?;
+                    }
+                    push32(cpu, bus, frame_temp)?;
                 }
-                push16(cpu, bus, frame_temp)?;
+                cpu.set_gpr_u32(CpuState::RBP, frame_temp);
+                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(alloc);
+                cpu.set_gpr_u16(CpuState::RSP, sp);
+            } else {
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
+                let frame_temp = cpu.gpr_u16(CpuState::RSP);
+                if nesting > 0 {
+                    // Copy nesting-1 display pointers from the caller's frame, then
+                    // push frame_temp (current procedure's frame pointer for LEAVE).
+                    for _ in 1..nesting {
+                        let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(2);
+                        cpu.set_gpr_u16(CpuState::RBP, bp);
+                        let addr = linear_addr(&cpu.ss, u64::from(bp));
+                        let display = bus
+                            .read_u16(addr)
+                            .map_err(|e| classify_mem_fault(e, true))?;
+                        push16(cpu, bus, display)?;
+                    }
+                    push16(cpu, bus, frame_temp)?;
+                }
+                cpu.set_gpr_u16(CpuState::RBP, frame_temp);
+                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(alloc);
+                cpu.set_gpr_u16(CpuState::RSP, sp);
             }
-            cpu.set_gpr_u16(CpuState::RBP, frame_temp);
-            let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(alloc);
-            cpu.set_gpr_u16(CpuState::RSP, sp);
             cpu.set_ip16(next_ip);
         }
         0xC9 => {
-            // LEAVE — Spec: Intel SDM Vol. 2 "LEAVE".
-            // Unsupported here: opsize 32.
+            // LEAVE — Spec: Intel SDM Vol. 2 "LEAVE"; Ch. 2 (66H).
+            // Address-size 16: SP ← BP; opsize selects BP vs EBP pop width.
+            // Unsupported here: address-size 32/64.
             let bp = cpu.gpr_u16(CpuState::RBP);
             cpu.set_gpr_u16(CpuState::RSP, bp);
-            let v = pop16(cpu, bus)?;
-            cpu.set_gpr_u16(CpuState::RBP, v);
+            if opsz32(&insn) {
+                let v = pop32(cpu, bus)?;
+                cpu.set_gpr_u32(CpuState::RBP, v);
+            } else {
+                let v = pop16(cpu, bus)?;
+                cpu.set_gpr_u16(CpuState::RBP, v);
+            }
             cpu.set_ip16(next_ip);
         }
         0x9C => {
-            // PUSHF — 16-bit FLAGS in real-address mode (default opsize).
-            // Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ".
-            push16(cpu, bus, cpu.rflags as u16)?;
+            // PUSHF/PUSHFD — Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ"; Ch. 2 (66H).
+            // Real-address mode: push FLAGS (16) or EFLAGS (32). Unsupported: PUSHFQ.
+            if opsz32(&insn) {
+                push32(cpu, bus, cpu.rflags as u32)?;
+            } else {
+                push16(cpu, bus, cpu.rflags as u16)?;
+            }
             cpu.set_ip16(next_ip);
         }
         0x9D => {
-            // POPF — 16-bit FLAGS in real-address mode (default opsize).
-            // Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ".
-            // Unsupported here: IOPL/VIP/VIF privilege masking (protected / V86).
-            let flags = pop16(cpu, bus)?;
-            cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
+            // POPF/POPFD — Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ"; Ch. 2 (66H).
+            // Real-address mode: VM and RF unaffected; reserved bit 1 stays set.
+            // Unsupported here: IOPL/VIP/VIF privilege masking (protected / V86); POPFQ.
+            if opsz32(&insn) {
+                let flags = pop32(cpu, bus)?;
+                let vm_rf = cpu.rflags & ((1 << 16) | (1 << 17));
+                cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | u64::from(flags) | 2;
+                cpu.rflags = (cpu.rflags & !((1 << 16) | (1 << 17))) | vm_rf;
+            } else {
+                let flags = pop16(cpu, bus)?;
+                cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
+            }
             cpu.set_ip16(next_ip);
         }
         0x9E => {
@@ -2526,7 +2568,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // Group 5 r/m16 — INC/DEC/CALL/JMP/PUSH.
             // Spec: Intel SDM Vol. 2 "INC"/"DEC"/"CALL"/"JMP"/"PUSH"; opcode map Group 5.
             // /7 reserved and far CALL/JMP register forms → #UD (Vol. 3 §6.15).
-            // Unsupported here: opsize 32 (incl. far m16:32); protected-mode transfers.
+            // Unsupported here: opsize 32 (INC/DEC r/m32, PUSH r/m32, near/far m16:32);
+            // protected-mode transfers.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             match m.reg {
                 0 | 1 => {
@@ -2611,6 +2654,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0x40..=0x47 => {
+            // INC r16 — Spec: Intel SDM Vol. 2 "INC".
+            // Unsupported here: opsize 32 (INC r32 via 0x66 40–47).
             let idx = (op - 0x40) as usize;
             let old = cpu.gpr_u16(idx);
             let v = old.wrapping_add(1);
@@ -2623,7 +2668,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x48..=0x4F => {
             // DEC r16 — Spec: Intel SDM Vol. 2 "DEC".
-            // Unsupported here: opsize 32 (DEC r32).
+            // Unsupported here: opsize 32 (DEC r32 via 0x66 48–4F).
             let idx = (op - 0x48) as usize;
             let old = cpu.gpr_u16(idx);
             let v = old.wrapping_sub(1);
@@ -2657,39 +2702,70 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x60 => {
-            // PUSHA — push AX,CX,DX,BX, original SP,BP,SI,DI (16-bit).
-            // Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD".
-            // Unsupported here: opsize 32 (PUSHAD).
-            let sp0 = cpu.gpr_u16(CpuState::RSP);
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RAX))?;
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RCX))?;
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RDX))?;
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RBX))?;
-            push16(cpu, bus, sp0)?;
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RSI))?;
-            push16(cpu, bus, cpu.gpr_u16(CpuState::RDI))?;
+            // PUSHA/PUSHAD — push AX…DI / EAX…EDI; Temp = SP/ESP before pushes.
+            // Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD"; Ch. 2 (66H).
+            // Address-size 16: Temp ← SP (zero-extended into dword slot for PUSHAD).
+            // Unsupported here: address-size 32/64.
+            if opsz32(&insn) {
+                let temp = u32::from(cpu.gpr_u16(CpuState::RSP));
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RAX))?;
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RCX))?;
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RDX))?;
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RBX))?;
+                push32(cpu, bus, temp)?;
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RBP))?;
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RSI))?;
+                push32(cpu, bus, cpu.gpr_u32(CpuState::RDI))?;
+            } else {
+                let sp0 = cpu.gpr_u16(CpuState::RSP);
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RAX))?;
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RCX))?;
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RDX))?;
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RBX))?;
+                push16(cpu, bus, sp0)?;
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RSI))?;
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RDI))?;
+            }
             cpu.set_ip16(next_ip);
         }
         0x61 => {
-            // POPA — pop DI,SI,BP, discard, BX,DX,CX,AX (16-bit).
-            // Spec: Intel SDM Vol. 2 "POPA/POPAD".
-            // Unsupported here: opsize 32 (POPAD).
-            let di = pop16(cpu, bus)?;
-            let si = pop16(cpu, bus)?;
-            let bp = pop16(cpu, bus)?;
-            let _discard_sp = pop16(cpu, bus)?;
-            let bx = pop16(cpu, bus)?;
-            let dx = pop16(cpu, bus)?;
-            let cx = pop16(cpu, bus)?;
-            let ax = pop16(cpu, bus)?;
-            cpu.set_gpr_u16(CpuState::RDI, di);
-            cpu.set_gpr_u16(CpuState::RSI, si);
-            cpu.set_gpr_u16(CpuState::RBP, bp);
-            cpu.set_gpr_u16(CpuState::RBX, bx);
-            cpu.set_gpr_u16(CpuState::RDX, dx);
-            cpu.set_gpr_u16(CpuState::RCX, cx);
-            cpu.set_gpr_u16(CpuState::RAX, ax);
+            // POPA/POPAD — pop DI…AX / EDI…EAX; discard saved SP/ESP slot.
+            // Spec: Intel SDM Vol. 2 "POPA/POPAD"; Ch. 2 (66H).
+            // Unsupported here: address-size 32/64.
+            if opsz32(&insn) {
+                let di = pop32(cpu, bus)?;
+                let si = pop32(cpu, bus)?;
+                let bp = pop32(cpu, bus)?;
+                let _discard_esp = pop32(cpu, bus)?;
+                let bx = pop32(cpu, bus)?;
+                let dx = pop32(cpu, bus)?;
+                let cx = pop32(cpu, bus)?;
+                let ax = pop32(cpu, bus)?;
+                cpu.set_gpr_u32(CpuState::RDI, di);
+                cpu.set_gpr_u32(CpuState::RSI, si);
+                cpu.set_gpr_u32(CpuState::RBP, bp);
+                cpu.set_gpr_u32(CpuState::RBX, bx);
+                cpu.set_gpr_u32(CpuState::RDX, dx);
+                cpu.set_gpr_u32(CpuState::RCX, cx);
+                cpu.set_gpr_u32(CpuState::RAX, ax);
+            } else {
+                let di = pop16(cpu, bus)?;
+                let si = pop16(cpu, bus)?;
+                let bp = pop16(cpu, bus)?;
+                let _discard_sp = pop16(cpu, bus)?;
+                let bx = pop16(cpu, bus)?;
+                let dx = pop16(cpu, bus)?;
+                let cx = pop16(cpu, bus)?;
+                let ax = pop16(cpu, bus)?;
+                cpu.set_gpr_u16(CpuState::RDI, di);
+                cpu.set_gpr_u16(CpuState::RSI, si);
+                cpu.set_gpr_u16(CpuState::RBP, bp);
+                cpu.set_gpr_u16(CpuState::RBX, bx);
+                cpu.set_gpr_u16(CpuState::RDX, dx);
+                cpu.set_gpr_u16(CpuState::RCX, cx);
+                cpu.set_gpr_u16(CpuState::RAX, ax);
+            }
             cpu.set_ip16(next_ip);
         }
         0x62 => {
@@ -8412,6 +8488,173 @@ mod tests {
         // [BP-4] = child's frame_temp (= child_bp).
         assert_eq!(bus.read_u16(u64::from(child_bp - 4)).unwrap(), child_bp);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), child_bp - 4);
+    }
+
+    /// ENTERD (0x66 ENTER) nesting 0 + LEAVE opsize-32 round-trip.
+    /// Spec: Intel SDM Vol. 2 "ENTER"/"LEAVE"; Ch. 2 (66H); Vol. 1 §3.6 / §6.5.
+    #[test]
+    fn enterd_level0_leave_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        // 66 C8 08 00 00 = ENTERD 8, 0
+        mem[0] = 0x66;
+        mem[1] = 0xC8;
+        mem[2] = 0x08;
+        mem[3] = 0x00;
+        mem[4] = 0x00;
+        // 66 C9 = LEAVE (opsize 32)
+        mem[5] = 0x66;
+        mem[6] = 0xC9;
+        mem[7] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        cpu.set_gpr_u32(CpuState::RBP, 0xAAAA_ABCD);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        // Push EBP (4); frame = SP; EBP = frame; SP = frame - 8.
+        assert_eq!(bus.read_u32(u64::from(sp0 - 4)).unwrap(), 0xAAAA_ABCD);
+        let frame = u32::from(sp0 - 4);
+        assert_eq!(cpu.gpr_u32(CpuState::RBP), frame);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), (frame as u16).wrapping_sub(8));
+
+        step(&mut cpu, &mut bus).unwrap(); // LEAVE opsize32
+        assert_eq!(cpu.gpr_u32(CpuState::RBP), 0xAAAA_ABCD);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
+    }
+
+    /// ENTERD nesting level 1: push EBP, push frame_temp (dword display).
+    /// Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5; Ch. 2 (66H).
+    #[test]
+    fn enterd_nesting_level1_display() {
+        let mut mem = vec![0u8; 0x10000];
+        // 66 C8 04 00 01 = ENTERD 4, 1
+        mem[0] = 0x66;
+        mem[1] = 0xC8;
+        mem[2] = 0x04;
+        mem[3] = 0x00;
+        mem[4] = 0x01;
+        mem[5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        cpu.set_gpr_u32(CpuState::RBP, 0x1111_ABCD);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(u64::from(sp0 - 4)).unwrap(), 0x1111_ABCD);
+        let frame = u32::from(sp0 - 4);
+        assert_eq!(bus.read_u32(u64::from(sp0 - 8)).unwrap(), frame);
+        assert_eq!(cpu.gpr_u32(CpuState::RBP), frame);
+        // frame_temp push (4) + alloc 4.
+        assert_eq!(
+            cpu.gpr_u16(CpuState::RSP),
+            (frame as u16).wrapping_sub(4 + 4)
+        );
+    }
+
+    /// PUSHAD stack layout then POPAD restores GPRs (discards saved ESP).
+    /// Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD", "POPA/POPAD"; Ch. 2 (66H).
+    #[test]
+    fn pushad_popad_stack_layout_and_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x66;
+        mem[1] = 0x60; // PUSHAD
+        mem[2] = 0x66;
+        mem[3] = 0x61; // POPAD
+        mem[4] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1111_1111);
+        cpu.set_gpr_u32(CpuState::RCX, 0x2222_2222);
+        cpu.set_gpr_u32(CpuState::RDX, 0x3333_3333);
+        cpu.set_gpr_u32(CpuState::RBX, 0x4444_4444);
+        cpu.set_gpr_u32(CpuState::RBP, 0x5555_5555);
+        cpu.set_gpr_u32(CpuState::RSI, 0x6666_6666);
+        cpu.set_gpr_u32(CpuState::RDI, 0x7777_7777);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0.wrapping_sub(32));
+        assert_eq!(bus.read_u32(u64::from(sp0 - 4)).unwrap(), 0x1111_1111); // EAX
+        assert_eq!(bus.read_u32(u64::from(sp0 - 8)).unwrap(), 0x2222_2222); // ECX
+        assert_eq!(bus.read_u32(u64::from(sp0 - 12)).unwrap(), 0x3333_3333); // EDX
+        assert_eq!(bus.read_u32(u64::from(sp0 - 16)).unwrap(), 0x4444_4444); // EBX
+        assert_eq!(bus.read_u32(u64::from(sp0 - 20)).unwrap(), u32::from(sp0)); // orig ESP
+        assert_eq!(bus.read_u32(u64::from(sp0 - 24)).unwrap(), 0x5555_5555); // EBP
+        assert_eq!(bus.read_u32(u64::from(sp0 - 28)).unwrap(), 0x6666_6666); // ESI
+        assert_eq!(bus.read_u32(u64::from(sp0 - 32)).unwrap(), 0x7777_7777); // EDI
+
+        cpu.set_gpr_u32(CpuState::RAX, 0);
+        cpu.set_gpr_u32(CpuState::RCX, 0);
+        cpu.set_gpr_u32(CpuState::RDX, 0);
+        cpu.set_gpr_u32(CpuState::RBX, 0);
+        cpu.set_gpr_u32(CpuState::RBP, 0);
+        cpu.set_gpr_u32(CpuState::RSI, 0);
+        cpu.set_gpr_u32(CpuState::RDI, 0);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1111_1111);
+        assert_eq!(cpu.gpr_u32(CpuState::RCX), 0x2222_2222);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0x3333_3333);
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x4444_4444);
+        assert_eq!(cpu.gpr_u32(CpuState::RBP), 0x5555_5555);
+        assert_eq!(cpu.gpr_u32(CpuState::RSI), 0x6666_6666);
+        assert_eq!(cpu.gpr_u32(CpuState::RDI), 0x7777_7777);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
+    }
+
+    /// PUSHFD/POPFD round-trip in real-address mode (opsize 32).
+    /// Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ", "POPF/POPFD/POPFQ"; Ch. 2 (66H).
+    /// VM and RF are unaffected by POPFD in real-address mode.
+    #[test]
+    fn pushfd_popfd_round_trip_preserves_vm_rf() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x66;
+        mem[1] = 0x9C; // PUSHFD
+        mem[2] = 0x66;
+        mem[3] = 0x9D; // POPFD
+        mem[4] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        // CF+PF+AF+ZF+SF+IF+OF + synthetic VM/RF that must survive POPFD.
+        cpu.rflags = 0x0002_0AD7 | (1 << 16) | (1 << 17);
+        let flags_before = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // PUSHFD
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0.wrapping_sub(4));
+        assert_eq!(
+            bus.read_u32(u64::from(sp0 - 4)).unwrap(),
+            (flags_before as u32)
+        );
+
+        // Clobber writable flags but keep VM/RF set for the POPFD preserve check.
+        cpu.rflags = (1 << 16) | (1 << 17) | 2;
+        step(&mut cpu, &mut bus).unwrap(); // POPFD
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
+        // Lower image restored (bit 1 forced); VM/RF unchanged from pre-POPFD.
+        assert_eq!(cpu.rflags & 0xFFFF, u64::from(flags_before as u16 | 2));
+        assert_ne!(cpu.rflags & (1 << 16), 0); // RF
+        assert_ne!(cpu.rflags & (1 << 17), 0); // VM
     }
 
     /// RET iw / RETF iw release stack bytes after the return frame.
