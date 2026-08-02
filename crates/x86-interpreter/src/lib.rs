@@ -49,6 +49,15 @@ fn parity_even(v: u8) -> bool {
     v.count_ones().is_multiple_of(2)
 }
 
+/// Two/three-operand IMUL (and Group 3 word IMUL fit check): CF=OF=1 iff signed
+/// product does not fit in i16. SF/ZF/AF/PF undefined (left unchanged).
+/// Spec: Intel SDM Vol. 2 "IMUL".
+fn set_imul_flags_i16(cpu: &mut CpuState, prod: i32) {
+    let fits = prod == i32::from(prod as i16);
+    cpu.set_cf(!fits);
+    cpu.set_of(!fits);
+}
+
 fn set_logic_flags_u8(cpu: &mut CpuState, result: u8) {
     cpu.set_cf(false);
     cpu.set_of(false);
@@ -1429,9 +1438,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     let prod = i32::from(cpu.ax() as i16).wrapping_mul(i32::from(v as i16));
                     cpu.set_ax(prod as u16);
                     cpu.set_gpr_u16(CpuState::RDX, (prod >> 16) as u16);
-                    let fits = prod == i32::from(prod as i16);
-                    cpu.set_cf(!fits);
-                    cpu.set_of(!fits);
+                    set_imul_flags_i16(cpu, prod);
                 }
                 6 => {
                     // DIV r/m16 — DX:AX / r/m16 → AX=quot, DX=rem. #DE if divisor=0 or quot>0xFFFF.
@@ -1660,6 +1667,22 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // PUSH imm16 — Spec: Intel SDM Vol. 2 "PUSH".
             // Unsupported here: opsize 32 (push imm32).
             push16(cpu, bus, insn.immediate as u16)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x69 | 0x6B => {
+            // IMUL r16, r/m16, imm16/imm8 — Spec: Intel SDM Vol. 2 "IMUL".
+            // Dest = ModRM.reg; src = r/m; imm sign-extended for 6B.
+            // Unsupported here: opsize 32; 0F AF two-operand form.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let src = read_rm_u16(cpu, bus, &insn)?;
+            let imm = if op == 0x6B {
+                i32::from(insn.immediate as i8)
+            } else {
+                i32::from(insn.immediate as u16 as i16)
+            };
+            let prod = i32::from(src as i16).wrapping_mul(imm);
+            cpu.set_gpr_u16(m.reg as usize, prod as u16);
+            set_imul_flags_i16(cpu, prod);
             cpu.set_ip16(next_ip);
         }
         0x6A => {
@@ -5858,5 +5881,82 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0xCD);
         assert_eq!(cpu.rflags, flags_before);
+    }
+
+    /// IMUL r16, r/m16, imm — opcodes 69/6B (SDM Vol. 2 "IMUL").
+    /// CF=OF set iff signed product does not fit in r16; SF/ZF/AF/PF undefined.
+    #[test]
+    fn imul_imm_69_6b_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // 0: 69 D8 02 00     IMUL BX, AX, 2
+        // 4: 69 D8 00 01     IMUL BX, AX, 0x100
+        // 8: 6B D8 FD        IMUL BX, AX, -3 (imm8)
+        // B: 6B DB FF        IMUL BX, BX, -1 (two-op sugar)
+        // E: 69 1E 00 40 03 00  IMUL BX, [0x4000], 3
+        mem[0] = 0x69;
+        mem[1] = 0xD8;
+        mem[2] = 0x02;
+        mem[3] = 0x00;
+        mem[4] = 0x69;
+        mem[5] = 0xD8;
+        mem[6] = 0x00;
+        mem[7] = 0x01;
+        mem[8] = 0x6B;
+        mem[9] = 0xD8;
+        mem[10] = 0xFD;
+        mem[11] = 0x6B;
+        mem[12] = 0xDB;
+        mem[13] = 0xFF;
+        mem[14] = 0x69;
+        mem[15] = 0x1E;
+        mem[16] = 0x00;
+        mem[17] = 0x40;
+        mem[18] = 0x03;
+        mem[19] = 0x00;
+        mem[20] = 0xF4;
+        mem[0x4000] = 0x05;
+        mem[0x4001] = 0x00;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // IMUL BX, AX, 2: 3*2=6 fits → CF=OF=0; AX unchanged
+        cpu.set_ax(3);
+        cpu.set_gpr_u16(CpuState::RBX, 0xDEAD);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 6);
+        assert_eq!(cpu.ax(), 3);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL BX, AX, 0x100: 0x100*0x100=0x10000 does not fit in i16 → CF=OF=1
+        cpu.set_ax(0x0100);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0);
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL BX, AX, -3: (-2)*(-3)=6 fits
+        cpu.set_ax(0xFFFE); // -2
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 6);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL BX, BX, -1: 6*(-1)=-6 fits
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0xFFFA); // -6
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL BX, [0x4000], 3: 5*3=15; memory unchanged
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 15);
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 5);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
     }
 }

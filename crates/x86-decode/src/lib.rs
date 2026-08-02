@@ -629,6 +629,38 @@ mod tests {
     }
 
     #[test]
+    fn decode_imul_imm_69_6b() {
+        // Intel SDM Vol. 2 "IMUL": 69 /r iw — IMUL r16, r/m16, imm16; 6B /r ib — imm8.
+        // ModRM.reg = dest, ModRM.rm = src. 0xD8 = mod3 reg=BX rm=AX.
+        let d = decode(&[0x69, 0xD8, 0x34, 0x12]).unwrap(); // IMUL BX, AX, 0x1234
+        assert_eq!(d.mnemonic, "IMUL");
+        assert_eq!(d.opcode, 0x69);
+        assert_eq!(d.modrm.unwrap().reg, 3); // BX
+        assert_eq!(d.modrm.unwrap().rm, 0); // AX
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 4);
+
+        let d = decode(&[0x6B, 0xD8, 0xFF]).unwrap(); // IMUL BX, AX, -1 (imm8)
+        assert_eq!(d.mnemonic, "IMUL");
+        assert_eq!(d.opcode, 0x6B);
+        assert_eq!(d.immediate, 0xFF);
+        assert_eq!(d.length, 3);
+
+        // Memory form: 69 1E 00 40 02 00 = IMUL BX, [0x4000], 2
+        let d = decode(&[0x69, 0x1E, 0x00, 0x40, 0x02, 0x00]).unwrap();
+        assert_eq!(d.mnemonic, "IMUL");
+        assert_eq!(d.modrm.unwrap().mod_, 0);
+        assert_eq!(d.modrm.unwrap().rm, 6);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.immediate, 2);
+        assert_eq!(d.length, 6);
+
+        assert_eq!(decode(&[0x69, 0xD8]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x6B, 0xD8]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x69]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_grp2_imm8() {
         // Intel SDM Vol. 2 Group 2: C0/C1 /r ib
         // C0 E0 03 = SHL AL, 3
