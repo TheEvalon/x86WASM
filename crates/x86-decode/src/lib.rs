@@ -521,6 +521,27 @@ mod tests {
     }
 
     #[test]
+    fn decode_xchg() {
+        // Intel SDM Vol. 2: XCHG r/m8,r8 (86 /r); XCHG r/m16,r16 (87 /r);
+        // XCHG AX,r16 (91–97); 90 remains NOP.
+        let d = decode(&[0x86, 0xC3]).unwrap(); // XCHG AL, BL
+        assert_eq!(d.mnemonic, "XCHG");
+        assert_eq!(d.modrm.unwrap().reg, 0);
+        assert_eq!(d.modrm.unwrap().rm, 3);
+        assert_eq!(d.length, 2);
+
+        let d = decode(&[0x87, 0x06, 0x00, 0x20]).unwrap(); // XCHG AX, [0x2000]
+        assert_eq!(d.mnemonic, "XCHG");
+        assert_eq!(d.displacement, 0x2000);
+        assert_eq!(d.length, 4);
+
+        assert_eq!(decode(&[0x91]).unwrap().mnemonic, "XCHG");
+        assert_eq!(decode(&[0x97]).unwrap().mnemonic, "XCHG");
+        assert_eq!(decode(&[0x90]).unwrap().mnemonic, "NOP");
+        assert_eq!(decode(&[0x86]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_cbw_cwd() {
         // Intel SDM Vol. 2: CBW (98), CWD (99) — 16-bit forms
         assert_eq!(decode(&[0x98]).unwrap().mnemonic, "CBW");

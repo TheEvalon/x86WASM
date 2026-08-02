@@ -611,6 +611,16 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x90 => cpu.set_ip16(next_ip),
+        0x91..=0x97 => {
+            // XCHG AX, r16 — Spec: Intel SDM Vol. 2 "XCHG" (opcode 90+rw; 90 is NOP).
+            // Unsupported here: opsize 32 (XCHG EAX,r32); REX.W (XCHG RAX,r64).
+            let idx = (op - 0x90) as usize;
+            let ax = cpu.ax();
+            let other = cpu.gpr_u16(idx);
+            cpu.set_ax(other);
+            cpu.set_gpr_u16(idx, ax);
+            cpu.set_ip16(next_ip);
+        }
         0x98 => {
             // CBW — sign-extend AL into AX. Spec: Intel SDM Vol. 2 "CBW/CWDE/CDQE".
             // Unsupported here: CWDE (opsize 32), CDQE (REX.W).
@@ -978,6 +988,27 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let sreg = sreg_from_modrm_reg(m.reg).ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u16(cpu, bus, &insn)?;
             write_sreg_real_mode(cpu, sreg, v)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x86 => {
+            // XCHG r8, r/m8 — Spec: Intel SDM Vol. 2 "XCHG".
+            // Flags unchanged. Unsupported here: LOCK bus-lock; AH/CH/DH/BH (high-byte
+            // GPR views not wired — same gap as MOV r8).
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let rm = read_rm_u8(cpu, bus, &insn)?;
+            let reg = cpu.gpr_u8_low(m.reg as usize);
+            write_rm_u8(cpu, bus, &insn, reg)?;
+            cpu.set_gpr_u8_low(m.reg as usize, rm);
+            cpu.set_ip16(next_ip);
+        }
+        0x87 => {
+            // XCHG r16, r/m16 — Spec: Intel SDM Vol. 2 "XCHG".
+            // Flags unchanged. Unsupported here: opsize 32; LOCK bus-lock.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let rm = read_rm_u16(cpu, bus, &insn)?;
+            let reg = cpu.gpr_u16(m.reg as usize);
+            write_rm_u16(cpu, bus, &insn, reg)?;
+            cpu.set_gpr_u16(m.reg as usize, rm);
             cpu.set_ip16(next_ip);
         }
         0x84 => {
@@ -2115,5 +2146,76 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0xF800); // SAR sign-extends
         assert_eq!(cpu.rflags & 1, 0); // last shifted bit was 0
+    }
+
+    /// XCHG r/m↔reg and XCHG AX,r16; flags unchanged (SDM Vol. 2 XCHG).
+    #[test]
+    fn xchg_reg_mem_and_ax_forms() {
+        let mut mem = vec![0u8; 0x10000];
+        // 86 C3 = XCHG AL, BL
+        // 87 06 00 30 = XCHG AX, [0x3000]
+        // 91 = XCHG AX, CX
+        // 97 = XCHG AX, DI
+        mem[0] = 0x86;
+        mem[1] = 0xC3;
+        mem[2] = 0x87;
+        mem[3] = 0x06;
+        mem[4] = 0x00;
+        mem[5] = 0x30;
+        mem[6] = 0x91;
+        mem[7] = 0x97;
+        mem[8] = 0xF4;
+        mem[0x3000] = 0x34;
+        mem[0x3001] = 0x12;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_al(0xAA);
+        cpu.set_gpr_u8_low(CpuState::RBX, 0x55);
+        cpu.rflags = 0x246; // arbitrary non-zero flags; must be preserved
+        let flags_before = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x55);
+        assert_eq!(cpu.gpr_u8_low(CpuState::RBX), 0xAA);
+        assert_eq!(cpu.rflags, flags_before);
+
+        cpu.set_ax(0xABCD);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x1234);
+        assert_eq!(bus.read_u16(0x3000).unwrap(), 0xABCD);
+        assert_eq!(cpu.rflags, flags_before);
+
+        cpu.set_ax(0x1111);
+        cpu.set_gpr_u16(CpuState::RCX, 0x2222);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x2222);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0x1111);
+
+        cpu.set_gpr_u16(CpuState::RDI, 0x3333);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x3333);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2222);
+        assert_eq!(cpu.rflags, flags_before);
+    }
+
+    #[test]
+    fn xchg_reg16_reg16_modrm() {
+        // 87 D8 = XCHG AX, BX (mod=11)
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x87;
+        mem[1] = 0xD8;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_ax(0x1000);
+        cpu.set_gpr_u16(CpuState::RBX, 0x2000);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x2000);
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1000);
     }
 }

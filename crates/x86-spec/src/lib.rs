@@ -329,6 +329,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "TEST",
     },
     InstrDef {
+        mnemonic: "XCHG",
+        opcode: 0x86,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "XCHG",
+    },
+    InstrDef {
+        mnemonic: "XCHG",
+        opcode: 0x87,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "XCHG",
+    },
+    InstrDef {
         mnemonic: "MOV",
         opcode: 0x88,
         encoding: Encoding::Modrm,
@@ -383,6 +397,14 @@ pub const M1_SUBSET: &[InstrDef] = &[
         encoding: Encoding::None,
         width: Width::OsZ,
         sdm: "NOP",
+    },
+    // XCHG AX, r16 — opcode 91+rw (CX…DI). 90 remains NOP (XCHG AX,AX).
+    InstrDef {
+        mnemonic: "XCHG",
+        opcode: 0x91,
+        encoding: Encoding::OpcodeReg,
+        width: Width::OsZ,
+        sdm: "XCHG",
     },
     InstrDef {
         mnemonic: "CBW",
@@ -651,6 +673,9 @@ pub fn lookup_primary(opcode: u8) -> Option<&'static InstrDef> {
     if (0x58..=0x5F).contains(&opcode) {
         return M1_SUBSET.iter().find(|d| d.opcode == 0x58);
     }
+    if (0x91..=0x97).contains(&opcode) {
+        return M1_SUBSET.iter().find(|d| d.opcode == 0x91);
+    }
     if (0xB0..=0xB7).contains(&opcode) {
         return M1_SUBSET.iter().find(|d| d.opcode == 0xB0);
     }
@@ -670,8 +695,8 @@ mod tests {
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
             0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0xF8, 0xF9,
             0xFC, 0xFD, 0xCC, 0x70, 0x71, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D,
-            0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0x8D, 0x98, 0x99, 0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3,
-            0xF6, 0xF7,
+            0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0x8D, 0x86, 0x87, 0x91, 0x97, 0x98, 0x99, 0xC0, 0xC1,
+            0xD0, 0xD1, 0xD2, 0xD3, 0xF6, 0xF7,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
