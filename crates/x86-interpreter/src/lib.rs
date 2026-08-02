@@ -682,6 +682,33 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             bus.port_out_u8(port, cpu.al())?;
             cpu.set_ip16(next_ip);
         }
+        0xE0..=0xE2 => {
+            // LOOPNE/LOOPE/LOOP rel8 — Spec: Intel SDM Vol. 2 "LOOP/LOOPcc".
+            // Address-size 16: count register is CX. Unsupported: asize 32/64 (ECX/RCX).
+            let cx = cpu.gpr_u16(CpuState::RCX).wrapping_sub(1);
+            cpu.set_gpr_u16(CpuState::RCX, cx);
+            let zf = cpu.rflags & (1 << 6) != 0;
+            let take = match op {
+                0xE0 => cx != 0 && !zf, // LOOPNE / LOOPNZ
+                0xE1 => cx != 0 && zf,  // LOOPE / LOOPZ
+                0xE2 => cx != 0,        // LOOP
+                _ => unreachable!("matched 0xE0..=0xE2"),
+            };
+            if take {
+                cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
+            } else {
+                cpu.set_ip16(next_ip);
+            }
+        }
+        0xE3 => {
+            // JCXZ rel8 — Spec: Intel SDM Vol. 2 "JCXZ/JECXZ/JRCXZ".
+            // Address-size 16: test CX == 0. Unsupported: JECXZ/JRCXZ (ascale 32/64).
+            if cpu.gpr_u16(CpuState::RCX) == 0 {
+                cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
+            } else {
+                cpu.set_ip16(next_ip);
+            }
+        }
         0xEB => {
             let target = next_ip.wrapping_add(insn.immediate as i16 as u16);
             cpu.set_ip16(target);
@@ -858,7 +885,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x70..=0x7F => {
             // Jcc rel8 — Spec: Intel SDM Vol. 2 "Jcc".
-            // Unsupported here: near rel16/rel32 forms (0F 8x); JCXZ/JECXZ (E3).
+            // Unsupported here: near rel16/rel32 forms (0F 8x).
             if jcc_condition(cpu, op) {
                 cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
             } else {
@@ -2217,5 +2244,88 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0x2000);
         assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1000);
+    }
+
+    /// LOOP/LOOPcc decrement CX then branch; JCXZ tests CX (SDM Vol. 2).
+    #[test]
+    fn loop_loopcc_jcxz() {
+        let mut mem = vec![0u8; 0x10000];
+        // E2 FE = LOOP $-0 (rel8=-2) → branch back to self while CX≠0 after dec
+        // After CX hits 0, fall through.
+        mem[0] = 0xE2;
+        mem[1] = 0xFE;
+        // E0 02 = LOOPNE +2; E1 02 = LOOPE +2; padding HLTs
+        mem[2] = 0xE0;
+        mem[3] = 0x02;
+        mem[4] = 0xF4; // skip target when not taken
+        mem[5] = 0xF4;
+        mem[6] = 0x90; // taken landing
+        mem[7] = 0xE1;
+        mem[8] = 0x02;
+        mem[9] = 0xF4;
+        mem[10] = 0xF4;
+        mem[11] = 0x90;
+        // E3 02 = JCXZ +2
+        mem[12] = 0xE3;
+        mem[13] = 0x02;
+        mem[14] = 0xF4;
+        mem[15] = 0xF4;
+        mem[16] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // LOOP three times: CX 3→2→1→0, then fall through to IP=2
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 2);
+        assert_eq!(cpu.ip16(), 0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 1);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.ip16(), 2);
+
+        // LOOPNE: CX=2, ZF=0 → take; then CX=1, ZF=1 → no take
+        cpu.set_gpr_u16(CpuState::RCX, 2);
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 1);
+        assert_eq!(cpu.ip16(), 6); // taken → next_ip(4)+2
+
+        cpu.rip = 2;
+        cpu.set_gpr_u16(CpuState::RCX, 2);
+        cpu.set_zf(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 1);
+        assert_eq!(cpu.ip16(), 4); // not taken
+
+        // LOOPE: ZF=1 and CX after dec ≠0 → take
+        cpu.rip = 7;
+        cpu.set_gpr_u16(CpuState::RCX, 1);
+        cpu.set_zf(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.ip16(), 9); // CX became 0 → not taken
+
+        cpu.rip = 7;
+        cpu.set_gpr_u16(CpuState::RCX, 2);
+        cpu.set_zf(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 11); // taken
+
+        // JCXZ: CX==0 takes; CX!=0 falls through
+        cpu.rip = 12;
+        cpu.set_gpr_u16(CpuState::RCX, 0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 16);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0); // unchanged
+
+        cpu.rip = 12;
+        cpu.set_gpr_u16(CpuState::RCX, 1);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 14);
     }
 }

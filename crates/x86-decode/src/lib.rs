@@ -521,6 +521,19 @@ mod tests {
     }
 
     #[test]
+    fn decode_loop_jcxz() {
+        // Intel SDM Vol. 2: LOOPNE/LOOPE/LOOP/JCXZ — E0–E3 rel8
+        assert_eq!(decode(&[0xE0, 0xFE]).unwrap().mnemonic, "LOOPNE");
+        assert_eq!(decode(&[0xE1, 0x00]).unwrap().mnemonic, "LOOPE");
+        let d = decode(&[0xE2, 0xFB]).unwrap();
+        assert_eq!(d.mnemonic, "LOOP");
+        assert_eq!(d.immediate, -5);
+        assert_eq!(d.length, 2);
+        assert_eq!(decode(&[0xE3, 0x02]).unwrap().mnemonic, "JCXZ");
+        assert_eq!(decode(&[0xE2]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_xchg() {
         // Intel SDM Vol. 2: XCHG r/m8,r8 (86 /r); XCHG r/m16,r16 (87 /r);
         // XCHG AX,r16 (91–97); 90 remains NOP.

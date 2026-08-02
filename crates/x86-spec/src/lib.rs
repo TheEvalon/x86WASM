@@ -549,6 +549,34 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "NOT/NEG",
     },
     InstrDef {
+        mnemonic: "LOOPNE",
+        opcode: 0xE0,
+        encoding: Encoding::Rel8,
+        width: Width::W8,
+        sdm: "LOOP",
+    },
+    InstrDef {
+        mnemonic: "LOOPE",
+        opcode: 0xE1,
+        encoding: Encoding::Rel8,
+        width: Width::W8,
+        sdm: "LOOP",
+    },
+    InstrDef {
+        mnemonic: "LOOP",
+        opcode: 0xE2,
+        encoding: Encoding::Rel8,
+        width: Width::W8,
+        sdm: "LOOP",
+    },
+    InstrDef {
+        mnemonic: "JCXZ",
+        opcode: 0xE3,
+        encoding: Encoding::Rel8,
+        width: Width::W8,
+        sdm: "JCXZ/JECXZ/JRCXZ",
+    },
+    InstrDef {
         mnemonic: "IN_imm8",
         opcode: 0xE4,
         encoding: Encoding::Imm8Port,
@@ -696,7 +724,7 @@ mod tests {
             0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0xF8, 0xF9,
             0xFC, 0xFD, 0xCC, 0x70, 0x71, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D,
             0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0x8D, 0x86, 0x87, 0x91, 0x97, 0x98, 0x99, 0xC0, 0xC1,
-            0xD0, 0xD1, 0xD2, 0xD3, 0xF6, 0xF7,
+            0xD0, 0xD1, 0xD2, 0xD3, 0xE0, 0xE1, 0xE2, 0xE3, 0xF6, 0xF7,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
