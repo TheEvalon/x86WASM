@@ -21,6 +21,9 @@ pub enum Encoding {
     ModrmImm16,
     /// `OUT imm8, AL` / `IN AL, imm8`
     Imm8Port,
+    /// Absolute memory offset (moffs) following address-size attribute.
+    /// Real-mode default: 16-bit offset in the immediate field.
+    Moffs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -583,6 +586,48 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "ADD",
     },
     InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA0,
+        encoding: Encoding::Moffs,
+        width: Width::W8,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA1,
+        encoding: Encoding::Moffs,
+        width: Width::OsZ,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA2,
+        encoding: Encoding::Moffs,
+        width: Width::W8,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0xA3,
+        encoding: Encoding::Moffs,
+        width: Width::OsZ,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "TEST",
+        opcode: 0xA8,
+        encoding: Encoding::Imm8,
+        width: Width::W8,
+        sdm: "TEST",
+    },
+    InstrDef {
+        mnemonic: "TEST",
+        opcode: 0xA9,
+        encoding: Encoding::Imm16,
+        width: Width::OsZ,
+        sdm: "TEST",
+    },
+    InstrDef {
         mnemonic: "MOVSB",
         opcode: 0xA4,
         encoding: Encoding::None,
@@ -873,6 +918,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "TEST/NOT/NEG/MUL/IMUL/DIV/IDIV",
     },
+    InstrDef {
+        mnemonic: "GRP11",
+        opcode: 0xC7,
+        encoding: Encoding::ModrmImm16,
+        width: Width::OsZ,
+        sdm: "MOV",
+    },
+    InstrDef {
+        mnemonic: "GRP11",
+        opcode: 0xC6,
+        encoding: Encoding::ModrmImm8,
+        width: Width::W8,
+        sdm: "MOV",
+    },
     // Group 4/5: ModRM.reg selects op (SDM Vol. 2 opcode map).
     InstrDef {
         mnemonic: "GRP4",
@@ -1072,7 +1131,8 @@ mod tests {
             0x13, 0x14, 0x15, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x20, 0x21, 0x22, 0x23, 0x24,
             0x25, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x30,
             0x31, 0x32, 0x33, 0x34, 0x35, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D,
-        ] {
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA8, 0xA9, 0xC6, 0xC7,
+            ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
     }
