@@ -542,6 +542,14 @@ mod tests {
     }
 
     #[test]
+    fn decode_sahf_lahf() {
+        // Intel SDM Vol. 2: SAHF (9E), LAHF (9F)
+        assert_eq!(decode(&[0x9E]).unwrap().mnemonic, "SAHF");
+        assert_eq!(decode(&[0x9F]).unwrap().mnemonic, "LAHF");
+        assert_eq!(decode(&[0x9E]).unwrap().length, 1);
+    }
+
+    #[test]
     fn decode_dec_r16() {
         // Intel SDM Vol. 2: DEC r16 — 48+rw
         assert_eq!(decode(&[0x48]).unwrap().mnemonic, "DEC"); // DEC AX

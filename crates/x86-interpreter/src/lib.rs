@@ -920,6 +920,38 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
             cpu.set_ip16(next_ip);
         }
+        0x9E => {
+            // SAHF — load SF,ZF,AF,PF,CF from AH. Spec: Intel SDM Vol. 2 "SAHF".
+            // Unsupported here: none for real-mode 16-bit; OF unaffected.
+            let ah = (cpu.ax() >> 8) as u8;
+            cpu.set_cf(ah & 1 != 0);
+            cpu.set_pf(ah & (1 << 2) != 0);
+            cpu.set_af(ah & (1 << 4) != 0);
+            cpu.set_zf(ah & (1 << 6) != 0);
+            cpu.set_sf(ah & (1 << 7) != 0);
+            cpu.set_ip16(next_ip);
+        }
+        0x9F => {
+            // LAHF — AH = SF:ZF:0:AF:0:PF:1:CF. Spec: Intel SDM Vol. 2 "LAHF".
+            let mut ah = 1u8 << 1; // reserved bit 1 always set in the transferred image
+            if cpu.rflags & 1 != 0 {
+                ah |= 1;
+            }
+            if cpu.rflags & (1 << 2) != 0 {
+                ah |= 1 << 2;
+            }
+            if cpu.rflags & (1 << 4) != 0 {
+                ah |= 1 << 4;
+            }
+            if cpu.rflags & (1 << 6) != 0 {
+                ah |= 1 << 6;
+            }
+            if cpu.rflags & (1 << 7) != 0 {
+                ah |= 1 << 7;
+            }
+            cpu.set_ax((cpu.ax() & 0x00FF) | (u16::from(ah) << 8));
+            cpu.set_ip16(next_ip);
+        }
         0xCC => {
             // INT3 — one-byte breakpoint; vector 3 via IVT (real-address mode).
             // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §6.4.
@@ -2441,6 +2473,45 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0x2000);
         assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1000);
+    }
+
+    /// LAHF/SAHF transfer SF ZF AF PF CF via AH (SDM Vol. 2).
+    #[test]
+    fn lahf_sahf_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x9F; // LAHF
+        mem[1] = 0x9E; // SAHF
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        // SF ZF AF PF CF = 1 0 1 0 1 → AH pattern 1x0x0x0x with bit1=1 → 0b1001_0011 = 0x93
+        cpu.set_sf(true);
+        cpu.set_zf(false);
+        cpu.set_af(true);
+        cpu.set_pf(false);
+        cpu.set_cf(true);
+        cpu.set_of(true); // must survive SAHF
+        cpu.set_ax(0x0000);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!((cpu.ax() >> 8) as u8, 0x93);
+
+        // Clear status flags then restore via SAHF; OF stays set
+        cpu.set_sf(false);
+        cpu.set_zf(true);
+        cpu.set_af(false);
+        cpu.set_pf(true);
+        cpu.set_cf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(cpu.rflags & (1 << 7) != 0); // SF
+        assert!(cpu.rflags & (1 << 6) == 0); // ZF
+        assert!(cpu.rflags & (1 << 4) != 0); // AF
+        assert!(cpu.rflags & (1 << 2) == 0); // PF
+        assert!(cpu.rflags & 1 != 0); // CF
+        assert!(cpu.rflags & (1 << 11) != 0); // OF preserved
     }
 
     /// DEC r16: result/flags; CF preserved (SDM Vol. 2 DEC).
