@@ -1,0 +1,25 @@
+---
+description: Mandatory architecture and provenance rules for the x86WASM emulator
+alwaysApply: true
+---
+
+# Authority
+
+- Intel manuals and approved entries in `docs/sources.md` are authoritative.
+- Never invent x86, paging, APIC, ACPI, or device behavior from memory.
+- Cite the relevant specification section in tests or a short implementation note.
+- Do not copy implementation code from v86, QEMU, Bochs, VirtualBox, DOSBox, or other emulators. Specs and differential oracles only.
+
+# Architecture
+
+- GPRs and architectural addresses use 64-bit-capable types from the first commit.
+- Interpreter is the semantic reference; JIT must match its architectural state.
+- No browser APIs in `x86-core`, `x86-decode`, `x86-mmu`, `x86-ir`, `x86-interpreter`, or `devices`.
+- Never hand-edit generated decoder/table files; change metadata and regenerate.
+- CPUID must never expose an unimplemented feature.
+- Prefer shared reviewed helpers over duplicated flag/exception semantics.
+
+# Scope
+
+- Implement only the assigned slice. No opportunistic opcodes, devices, or refactors.
+- Record unsupported cases explicitly; do not hide them behind advertised features.

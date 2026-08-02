@@ -1,0 +1,23 @@
+---
+description: Rust conventions for emulator crates
+globs: crates/**/*.rs
+alwaysApply: false
+---
+
+# Rust core conventions
+
+- Prefer explicit errors (`Result`) over panics in guest-visible paths; panics are for invariant bugs only.
+- Keep crates dependency-clean: core/decode/mmu/interpreter must not depend on `wasm-bindgen` or web crates.
+- Use `u64` for GPRs, RIP, and linear/physical addresses unless a width-truncated helper is intentional.
+- Flag updates go through shared helpers; do not re-derive OF/AF/PF ad hoc in each opcode.
+- Exceptions: deliver precise fault/trap semantics; do not partially commit state when the manual forbids it.
+- Snapshot/serde fields need stable names and a schema version when persisted.
+- `unsafe` only with a one-line SAFETY comment stating the invariant.
+
+```rust
+// ❌ BAD: silent width loss
+let eax = regs[0] as u32;
+
+// ✅ GOOD: explicit view
+let eax = regs[0] as u32; // low 32 of RAX; callers must use writeback helper
+```

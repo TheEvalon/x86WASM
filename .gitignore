@@ -1,0 +1,47 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node / web
+node_modules/
+web/dist/
+web/.vite/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Wasm / bindgen packaging
+crates/emulator-web/pkg/
+web/pkg/
+*.wasm
+!roms/**/*.bin
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Large guest artifacts (keep out of git)
+*.img
+*.qcow2
+*.vhd
+*.vmdk
+*.iso
+firmware/seabios/*.bin
+firmware/ovmf/*.fd
+!firmware/manifests/**
+
+# Local agent / tool caches
+.jcodemunch/
+.cursor10x/
+*.log
+
+# Coverage / profiling
+lcov.info
+tarpaulin-report.html
+perf.data*

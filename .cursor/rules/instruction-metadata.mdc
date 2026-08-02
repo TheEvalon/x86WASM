@@ -1,0 +1,13 @@
+---
+description: Rules for declarative instruction metadata and generated decoder code
+globs: crates/x86-spec/**/*,crates/x86-decode/**/*
+alwaysApply: false
+---
+
+# Instruction metadata
+
+- Edit declarative metadata only; regenerate tables/code. Never hand-patch generated outputs.
+- New opcodes need: mnemonic, opcode map, operands, flags written/read, modes, feature gate, semantic key.
+- Feature gates must match CPU profiles; do not enable SSE4.2/AVX/etc. until implemented and tested.
+- Decoder must reject truncated and overlong encodings with tests.
+- After metadata changes, run decoder tests and XED oracle comparison when available.

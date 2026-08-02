@@ -1,0 +1,12 @@
+---
+description: Licensing and third-party provenance for firmware and deps
+alwaysApply: true
+---
+
+# Licensing
+
+- Keep firmware (SeaBIOS, OVMF, etc.) under `firmware/` with build scripts and license notices.
+- Update `third_party/NOTICE` when adding third-party binaries or substantial code.
+- Record provenance in `docs/sources.md` and `docs/licensing.md`.
+- Do not vendor GPL sources into MIT/Apache crates without an explicit license decision recorded in an ADR.
+- Do not paste code from other emulator projects regardless of license ambiguity.

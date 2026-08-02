@@ -1,0 +1,12 @@
+# Third-party notices
+
+This file records provenance for third-party binaries and substantial third-party
+code that ships with or is built alongside x86WASM.
+
+No third-party firmware or emulator binaries are vendored in the initial
+bootstrap. When SeaBIOS, OVMF, or other firmware is added under `firmware/`,
+record license, version, and source URL here and in `docs/sources.md` /
+`docs/licensing.md`.
+
+Project code is dual-licensed Apache-2.0 OR MIT unless a subdirectory says
+otherwise.

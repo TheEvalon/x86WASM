@@ -1,0 +1,28 @@
+---
+description: How to vibe-code this repo in Cursor without scope collapse
+alwaysApply: true
+---
+
+# Session discipline
+
+- One bounded slice per chat. Prefer new chat over expanding an old one.
+- Reject broad prompts ("implement long mode", "add Windows support"). Split them.
+- Start in Plan Mode: files to touch + acceptance tests. Edit only after that plan is clear.
+- Prefer invoking project skills: `next-slice`, `implement-instruction`, `implement-device`, `guest-boot-debug`, `quality-gate`.
+- Do not let two agents edit CPU state layout or instruction metadata at the same time; use worktrees.
+
+# Prompt shape (required)
+
+```text
+Task: <one feature>
+In scope: <bullets>
+Out of scope: <bullets>
+Acceptance tests: <bullets>
+Spec refs: <manual sections or docs paths>
+```
+
+# Stop conditions
+
+- Stop when the slice's acceptance tests pass and `quality-gate` is green.
+- Stop and ask if a change requires redesigning crate boundaries, CPU state, or metadata schema.
+- Never continue into the next epic without an explicit user request.

@@ -1,0 +1,18 @@
+---
+description: Browser/TypeScript boundary rules for the emulator UI and worker
+globs: web/**/*.{ts,tsx,js,jsx}
+alwaysApply: false
+---
+
+# Web boundary
+
+- Emulator execution runs in a Worker; UI thread owns canvas, input, and storage UX only.
+- Talk to Wasm through a narrow typed API; do not reach into Rust internals from ad-hoc JS.
+- v86 compatibility lives in `web/src/v86-compat/` as an adapter — do not reshape the core API to match v86 quirks.
+- Persist disks via IndexedDB/OPFS behind a storage interface; keep paths swappable.
+- Never put instruction semantics or device models in TypeScript.
+
+# Checks
+
+- Prefer Playwright for smoke boot/UI flows once the harness exists.
+- Keep worker message types versioned when changing the protocol.

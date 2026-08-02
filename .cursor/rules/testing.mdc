@@ -1,0 +1,32 @@
+---
+description: Test-first and definition-of-done rules for emulator changes
+alwaysApply: true
+---
+
+# Testing contract
+
+- Add or extend a failing test before implementing or correcting behavior.
+- Instruction changes must cover result, flags, exceptions, widths, memory forms, and relevant CPU modes.
+- JIT changes require interpreter↔JIT lockstep/differential tests.
+- Snapshot/format changes require round-trip and version-compat tests.
+- Device register changes require device-level tests (reset, R/W, interrupts when applicable).
+
+# Done means green gates
+
+Before claiming complete, run what exists for the workspace:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Also run Wasm build, browser tests, and oracle diffs when those targets exist.
+
+# Report format
+
+- Files changed
+- Spec sections used
+- Tests added
+- Commands run and results
+- Unsupported cases remaining
