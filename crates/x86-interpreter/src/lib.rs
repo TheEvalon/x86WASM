@@ -955,6 +955,28 @@ fn map_es_mem_fault(err: ExecError) -> ExecError {
     classify_mem_fault(err, false)
 }
 
+/// String source linear address with cached segment-limit check.
+/// Spec: Intel SDM Vol. 3 §5.3; Vol. 2 MOVS/LODS/CMPS/OUTS.
+fn string_src_linear(
+    cpu: &CpuState,
+    insn: &DecodedInsn,
+    offset: u64,
+    size: u64,
+) -> Result<u64, ExecError> {
+    seg_linear_checked(
+        data_seg_for_string_src(cpu, insn),
+        offset,
+        size,
+        string_src_uses_ss(insn),
+    )
+}
+
+/// ES:(E)DI string destination / SCAS linear address with limit check → `#GP`.
+/// Spec: Intel SDM Vol. 3 §5.3; Vol. 2 MOVS/STOS/SCAS/INS.
+fn string_es_linear(cpu: &CpuState, offset: u64, size: u64) -> Result<u64, ExecError> {
+    seg_linear_checked(&cpu.es, offset, size, false)
+}
+
 fn zf_set(cpu: &CpuState) -> bool {
     cpu.rflags & (1 << 6) != 0
 }
@@ -964,8 +986,8 @@ fn movsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
         let di = cpu.gpr_u32(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         let v = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -976,8 +998,8 @@ fn movsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
         let di = cpu.gpr_u16(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         let v = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -993,13 +1015,13 @@ fn movsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn stosb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         bus.write_u8(dst, cpu.al()).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 1);
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         bus.write_u8(dst, cpu.al()).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 1);
         cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
@@ -1011,7 +1033,7 @@ fn stosb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn lodsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
         let v = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1020,7 +1042,7 @@ fn lodsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
         let v = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1035,7 +1057,7 @@ fn lodsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn scasb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let addr = linear_addr(&cpu.es, u64::from(di));
+        let addr = string_es_linear(cpu, u64::from(di), 1)?;
         let mem = bus.read_u8(addr).map_err(map_es_mem_fault)?;
         let al = cpu.al();
         let result = al.wrapping_sub(mem);
@@ -1044,7 +1066,7 @@ fn scasb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let addr = linear_addr(&cpu.es, u64::from(di));
+        let addr = string_es_linear(cpu, u64::from(di), 1)?;
         let mem = bus.read_u8(addr).map_err(map_es_mem_fault)?;
         let al = cpu.al();
         let result = al.wrapping_sub(mem);
@@ -1060,8 +1082,8 @@ fn cmpsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
         let di = cpu.gpr_u32(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         let a = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1074,8 +1096,8 @@ fn cmpsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
         let di = cpu.gpr_u16(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         let a = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1094,8 +1116,8 @@ fn movsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
         let di = cpu.gpr_u32(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         let v = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1106,8 +1128,8 @@ fn movsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
         let di = cpu.gpr_u16(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         let v = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1124,8 +1146,8 @@ fn movsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
         let di = cpu.gpr_u32(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         let v = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1136,8 +1158,8 @@ fn movsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
         let di = cpu.gpr_u16(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         let v = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1153,13 +1175,13 @@ fn movsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn stosw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         bus.write_u16(dst, cpu.ax()).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 2);
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         bus.write_u16(dst, cpu.ax()).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 2);
         cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
@@ -1171,13 +1193,13 @@ fn stosw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn stosd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         bus.write_u32(dst, cpu.eax()).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 4);
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         bus.write_u32(dst, cpu.eax()).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 4);
         cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
@@ -1189,7 +1211,7 @@ fn stosd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn lodsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
         let v = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1198,7 +1220,7 @@ fn lodsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
         let v = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1213,7 +1235,7 @@ fn lodsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn lodsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
         let v = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1222,7 +1244,7 @@ fn lodsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
         let v = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1237,7 +1259,7 @@ fn lodsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn scasw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let addr = linear_addr(&cpu.es, u64::from(di));
+        let addr = string_es_linear(cpu, u64::from(di), 2)?;
         let mem = bus.read_u16(addr).map_err(map_es_mem_fault)?;
         let ax = cpu.ax();
         let result = ax.wrapping_sub(mem);
@@ -1246,7 +1268,7 @@ fn scasw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let addr = linear_addr(&cpu.es, u64::from(di));
+        let addr = string_es_linear(cpu, u64::from(di), 2)?;
         let mem = bus.read_u16(addr).map_err(map_es_mem_fault)?;
         let ax = cpu.ax();
         let result = ax.wrapping_sub(mem);
@@ -1261,7 +1283,7 @@ fn scasw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
 fn scasd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let addr = linear_addr(&cpu.es, u64::from(di));
+        let addr = string_es_linear(cpu, u64::from(di), 4)?;
         let mem = bus.read_u32(addr).map_err(map_es_mem_fault)?;
         let eax = cpu.eax();
         let result = eax.wrapping_sub(mem);
@@ -1270,7 +1292,7 @@ fn scasd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let addr = linear_addr(&cpu.es, u64::from(di));
+        let addr = string_es_linear(cpu, u64::from(di), 4)?;
         let mem = bus.read_u32(addr).map_err(map_es_mem_fault)?;
         let eax = cpu.eax();
         let result = eax.wrapping_sub(mem);
@@ -1286,8 +1308,8 @@ fn cmpsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
         let di = cpu.gpr_u32(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         let a = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1300,8 +1322,8 @@ fn cmpsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
         let di = cpu.gpr_u16(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         let a = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1320,8 +1342,8 @@ fn cmpsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
         let di = cpu.gpr_u32(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         let a = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1334,8 +1356,8 @@ fn cmpsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
         let di = cpu.gpr_u16(CpuState::RDI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         let a = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1355,14 +1377,14 @@ fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     let port = cpu.gpr_u16(CpuState::RDX);
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         let v = bus.port_in_u8(port)?;
         bus.write_u8(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 1);
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 1)?;
         let v = bus.port_in_u8(port)?;
         bus.write_u8(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 1);
@@ -1376,14 +1398,14 @@ fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     let port = cpu.gpr_u16(CpuState::RDX);
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         let v = bus.port_in_u16(port)?;
         bus.write_u16(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 2);
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 2)?;
         let v = bus.port_in_u16(port)?;
         bus.write_u16(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 2);
@@ -1397,14 +1419,14 @@ fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     let port = cpu.gpr_u16(CpuState::RDX);
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         let v = bus.port_in_u32(port)?;
         bus.write_u32(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 4);
         cpu.set_gpr_u32(CpuState::RDI, di.wrapping_add(d));
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
-        let dst = linear_addr(&cpu.es, u64::from(di));
+        let dst = string_es_linear(cpu, u64::from(di), 4)?;
         let v = bus.port_in_u32(port)?;
         bus.write_u32(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 4);
@@ -1419,7 +1441,7 @@ fn outsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     let port = cpu.gpr_u16(CpuState::RDX);
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
         let v = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1428,7 +1450,7 @@ fn outsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 1)?;
         let v = bus
             .read_u8(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1444,7 +1466,7 @@ fn outsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     let port = cpu.gpr_u16(CpuState::RDX);
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
         let v = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1453,7 +1475,7 @@ fn outsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 2)?;
         let v = bus
             .read_u16(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1469,7 +1491,7 @@ fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     let port = cpu.gpr_u16(CpuState::RDX);
     if asize32(insn) {
         let si = cpu.gpr_u32(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
         let v = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1478,7 +1500,7 @@ fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
         cpu.set_gpr_u32(CpuState::RSI, si.wrapping_add(d));
     } else {
         let si = cpu.gpr_u16(CpuState::RSI);
-        let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+        let src = string_src_linear(cpu, insn, u64::from(si), 4)?;
         let v = bus
             .read_u32(src)
             .map_err(|e| map_string_src_fault(e, insn))?;
@@ -1902,9 +1924,10 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
         if buf.len() >= 15 {
             return Err(ExecError::Decode(DecodeError::TooLong));
         }
+        // Real-mode fetch still uses IP low 16 bits; enforce cached CS.limit.
+        // Spec: Intel SDM Vol. 3 §5.3; §6.15 (#GP). Bus MemoryFault stays host error.
         let ip = u64::from(cpu.ip16()).wrapping_add(buf.len() as u64) & 0xFFFF;
-        let addr = linear_addr(&cpu.cs, ip);
-        // Code-fetch MemoryFault: not classified as #GP here (host ExecError).
+        let addr = seg_linear_checked(&cpu.cs, ip, 1, false)?;
         buf.push(bus.read_u8(addr)?);
         match decode(&buf) {
             Ok(insn) => return Ok(insn),
@@ -2160,15 +2183,26 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xE0..=0xE2 => {
             // LOOPNE/LOOPE/LOOP rel8 — Spec: Intel SDM Vol. 2 "LOOP/LOOPcc".
-            // Address-size 16: count register is CX. Unsupported: asize 32/64 (ECX/RCX).
-            let cx = cpu.gpr_u16(CpuState::RCX).wrapping_sub(1);
-            cpu.set_gpr_u16(CpuState::RCX, cx);
+            // Address-size selects CX (16) or ECX (32). Unsupported: asize 64 (RCX).
             let zf = cpu.rflags & (1 << 6) != 0;
-            let take = match op {
-                0xE0 => cx != 0 && !zf, // LOOPNE / LOOPNZ
-                0xE1 => cx != 0 && zf,  // LOOPE / LOOPZ
-                0xE2 => cx != 0,        // LOOP
-                _ => unreachable!("matched 0xE0..=0xE2"),
+            let take = if asize32(&insn) {
+                let ecx = cpu.gpr_u32(CpuState::RCX).wrapping_sub(1);
+                cpu.set_gpr_u32(CpuState::RCX, ecx);
+                match op {
+                    0xE0 => ecx != 0 && !zf, // LOOPNE / LOOPNZ
+                    0xE1 => ecx != 0 && zf,  // LOOPE / LOOPZ
+                    0xE2 => ecx != 0,        // LOOP
+                    _ => unreachable!("matched 0xE0..=0xE2"),
+                }
+            } else {
+                let cx = cpu.gpr_u16(CpuState::RCX).wrapping_sub(1);
+                cpu.set_gpr_u16(CpuState::RCX, cx);
+                match op {
+                    0xE0 => cx != 0 && !zf,
+                    0xE1 => cx != 0 && zf,
+                    0xE2 => cx != 0,
+                    _ => unreachable!("matched 0xE0..=0xE2"),
+                }
             };
             if take {
                 cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
@@ -2177,9 +2211,14 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0xE3 => {
-            // JCXZ rel8 — Spec: Intel SDM Vol. 2 "JCXZ/JECXZ/JRCXZ".
-            // Address-size 16: test CX == 0. Unsupported: JECXZ/JRCXZ (ascale 32/64).
-            if cpu.gpr_u16(CpuState::RCX) == 0 {
+            // JCXZ/JECXZ rel8 — Spec: Intel SDM Vol. 2 "JCXZ/JECXZ/JRCXZ".
+            // Address-size selects CX (16) or ECX (32). Unsupported: JRCXZ (asize 64).
+            let zero = if asize32(&insn) {
+                cpu.gpr_u32(CpuState::RCX) == 0
+            } else {
+                cpu.gpr_u16(CpuState::RCX) == 0
+            };
+            if zero {
                 cpu.set_ip16(next_ip.wrapping_add(insn.immediate as i16 as u16));
             } else {
                 cpu.set_ip16(next_ip);
@@ -2533,14 +2572,17 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xD7 => {
-            // XLAT/XLATB — AL ← DS:[BX + AL] (segment overrideable); 16-bit address size.
-            // Spec: Intel SDM Vol. 2 "XLAT/XLATB".
-            // Unsupported here: address-size 32 (EBX); opsize does not apply.
-            let bx = cpu.gpr_u16(CpuState::RBX);
-            let off = bx.wrapping_add(u16::from(cpu.al()));
+            // XLAT/XLATB — AL ← [rBX + AL] (segment overrideable).
+            // Spec: Intel SDM Vol. 2 "XLAT/XLATB"; Vol. 1 §3.6 (address-size).
+            // Address-size 16 → BX; 0x67 → EBX. Opsize does not apply. Unsupported: asize 64.
+            let off = if asize32(&insn) {
+                u64::from(cpu.gpr_u32(CpuState::RBX).wrapping_add(u32::from(cpu.al())))
+            } else {
+                u64::from(cpu.gpr_u16(CpuState::RBX).wrapping_add(u16::from(cpu.al())))
+            };
             let seg = data_seg_for_string_src(cpu, &insn);
             let uses_ss = matches!(insn.prefixes.segment_override, Some(0x36));
-            let addr = seg_linear_checked(seg, u64::from(off), 1, uses_ss)?;
+            let addr = seg_linear_checked(seg, off, 1, uses_ss)?;
             let v = bus
                 .read_u8(addr)
                 .map_err(|e| classify_mem_fault(e, uses_ss))?;
@@ -10373,5 +10415,180 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00);
         assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
+    }
+
+    /// Address-size 0x67: LOOP/LOOPcc use ECX; JECXZ tests ECX (SDM Vol. 2 LOOP / JCXZ).
+    /// High half of ECX participates (asize16 would only see CX=0 when ECX=0x10000).
+    #[test]
+    fn asize32_loop_jecxz_uses_ecx() {
+        let mut mem = vec![0u8; 0x10000];
+        // 0: 67 E2 FD = LOOP $-3 (self; 3-byte insn with 0x67)
+        // 3: 67 E3 02 = JECXZ +2
+        // 6: F4 F4 F4
+        mem[0] = 0x67;
+        mem[1] = 0xE2;
+        mem[2] = 0xFD;
+        mem[3] = 0x67;
+        mem[4] = 0xE3;
+        mem[5] = 0x02;
+        mem[6] = 0xF4;
+        mem[7] = 0xF4;
+        mem[8] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        // ECX=0x10000 → after dec 0xFFFF ≠ 0 → take; CX alone would already be 0.
+        cpu.set_gpr_u32(CpuState::RCX, 0x1_0000);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RCX), 0xFFFF);
+        assert_eq!(cpu.ip16(), 0);
+
+        // Fall-through when ECX becomes 0 (short path; high-half case covered above).
+        cpu.set_gpr_u32(CpuState::RCX, 1);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RCX), 0);
+        assert_eq!(cpu.ip16(), 3);
+
+        // JECXZ: ECX=0 takes
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 8);
+        assert_eq!(cpu.gpr_u32(CpuState::RCX), 0);
+
+        // JECXZ: ECX=0x10000 (CX=0) must NOT take under asize32
+        cpu.rip = 3;
+        cpu.set_gpr_u32(CpuState::RCX, 0x1_0000);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 6);
+        assert_eq!(cpu.gpr_u32(CpuState::RCX), 0x1_0000);
+    }
+
+    /// Address-size 0x67: XLAT uses EBX+AL (SDM Vol. 2 XLAT/XLATB; Vol. 1 §3.6).
+    #[test]
+    fn asize32_xlat_uses_ebx() {
+        let mut mem = vec![0u8; 0x20000];
+        mem[0x10005] = 0x5A;
+        // 67 D7 = XLAT (asize32)
+        mem[0] = 0x67;
+        mem[1] = 0xD7;
+        mem[2] = 0xF4;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ds.limit = 0xFFFF_FFFF;
+        cpu.rip = 0;
+        // BX=0 would miss; EBX high half required.
+        cpu.set_gpr_u32(CpuState::RBX, 0x1_0000);
+        cpu.set_al(0x05);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x5A);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    /// String ops enforce cached SegmentReg.limit before bus access (parity with ModRM).
+    /// Spec: SDM Vol. 3 §5.3 / §6.15; Vol. 2 MOVS.
+    #[test]
+    fn string_op_segment_limit_gp_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+        mem[0xD00] = 0xF4;
+        // A4 = MOVSB; SI=0x9000 past DS.limit=0x7FFF
+        mem[0] = 0xA4;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.ds.limit = 0x7FFF;
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSI, 0x9000);
+        cpu.set_gpr_u16(CpuState::RDI, 0x1000);
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00);
+        // Faulting IP; indices must not advance on limit fault.
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x9000);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x1000);
+    }
+
+    /// STOSB ES limit → #GP; SS override on LODSB source → #SS.
+    /// Spec: SDM Vol. 3 §5.3, §6.15 (#GP/#SS); Vol. 2 STOS/LODS.
+    #[test]
+    fn string_op_es_limit_gp_and_ss_override_ss() {
+        // STOSB past ES.limit → #GP
+        {
+            let mut mem = vec![0u8; 0x10000];
+            mem[13 * 4] = 0x00;
+            mem[13 * 4 + 1] = 0x0D;
+            mem[13 * 4 + 2] = 0x00;
+            mem[13 * 4 + 3] = 0x00;
+            mem[0xD00] = 0xF4;
+            mem[0] = 0xAA; // STOSB
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.es = x86_core::SegmentReg::real_mode(0);
+            cpu.es.limit = 0x0FFF;
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RDI, 0x2000);
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 0x0D00);
+            assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2000);
+        }
+        // LODSB with SS override past SS.limit → #SS
+        {
+            let mut mem = vec![0u8; 0x10000];
+            mem[12 * 4] = 0x00;
+            mem[12 * 4 + 1] = 0x0C;
+            mem[12 * 4 + 2] = 0x00;
+            mem[12 * 4 + 3] = 0x00;
+            mem[0xC00] = 0xF4;
+            // 36 AC = LODSB SS:
+            mem[0] = 0x36;
+            mem[1] = 0xAC;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.ss.limit = 0x0FFF;
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RSI, 0x2000);
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 0x0C00);
+            assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x2000);
+        }
+    }
+
+    /// CS instruction-fetch past cached limit → #GP via IVT.
+    /// Spec: SDM Vol. 3 §5.3, §6.15 (#GP); Vol. 1 §3.3.4 (CS:IP fetch).
+    #[test]
+    fn cs_fetch_limit_gp_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+        mem[0xD00] = 0xF4;
+        mem[0x2000] = 0xF4; // would be HLT if fetch succeeded
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.cs.limit = 0x1FFF;
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0x2000;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0x2000);
     }
 }

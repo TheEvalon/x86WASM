@@ -41,7 +41,8 @@ pub fn checked_linear_addr(seg: &SegmentReg, offset: u64, size: u64) -> Result<u
 }
 
 pub fn cs_linear(cpu: &CpuState) -> u64 {
-    // Instruction fetch still uses IP low 16 bits (real CS); CS limit not enforced here.
+    // Instruction fetch still uses IP low 16 bits (real CS).
+    // Limit enforcement lives in the interpreter fetch path (`seg_linear_checked`).
     linear_addr(&cpu.cs, cpu.rip & 0xFFFF)
 }
 
