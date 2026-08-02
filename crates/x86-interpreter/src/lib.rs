@@ -59,13 +59,20 @@ pub trait Bus {
 
 /// Host-visible execution errors.
 ///
-/// Architectural faults that this slice delivers through the real-mode IVT
-/// (`#DE` vector 0, `#UD` vector 6) return `Ok(())` from `step` after vectoring.
+/// Architectural faults delivered through the real-mode IVT return `Ok(())`
+/// from [`step`] after vectoring:
+/// - `#DE` 0, `#BR` 5, `#UD` 6, `#SS` 12, `#GP` 13 (and software INT vectors)
+///
 /// Remaining host errors:
-/// - `Decode`: truncated fetch / opcodes absent from the decoder table (not classified as #UD yet)
-/// - `MemoryFault`: bus/memory errors without a clear real-mode #GP/#SS class yet
-/// - `Unsupported`: valid-but-unimplemented forms (remaining opsize-32 opcodes,
-///   TEST EAX imm32, ENTERD/0x66 ENTER, etc.)
+/// - `Decode`: truncated fetch, or sparse-table misses that are **not**
+///   architectural `#UD` (valid-but-unimplemented primary opcodes — see
+///   [`real_mode_primary_opcode_is_ud`])
+/// - `MemoryFault`: bus errors that could not be classified as `#GP`/`#SS`
+///   (code fetch, string paths not yet classified, IVT delivery failure)
+/// - `Unsupported`: valid-but-unimplemented forms reached after decode
+///   (remaining opsize-32 opcodes, TEST EAX imm32, ENTERD/0x66 ENTER, etc.)
+/// - `ArchFault`: internal only — converted to IVT delivery inside [`step`];
+///   never returned to callers of [`step`]/[`run`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExecError {
     #[error(transparent)]
@@ -74,6 +81,9 @@ pub enum ExecError {
     MemoryFault(u64),
     #[error("unsupported encoding for opcode 0x{0:02X}")]
     Unsupported(u8),
+    /// Pending real-mode IVT delivery (`vector`); consumed by [`step`].
+    #[error("architectural fault vector {0}")]
+    ArchFault(u8),
 }
 
 /// SF/ZF/PF from an 8-bit BCD-adjust result (DAA/DAS/AAM/AAD).
@@ -497,29 +507,40 @@ fn opsz32(insn: &DecodedInsn) -> bool {
 }
 
 /// 16-bit effective address from ModRM (real-mode / 16-bit address size).
-fn ea_16(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool), ExecError> {
+/// Returns `(linear, is_register, uses_ss)` — `uses_ss` selects `#SS` vs `#GP`
+/// when a bus `MemoryFault` is classified (SDM Vol. 3 §6.15).
+fn ea_16(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     if m.mod_ == 3 {
-        return Ok((0, true));
+        return Ok((0, true, false));
     }
     let off = calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?;
-    let seg = match insn.prefixes.segment_override {
-        Some(0x2E) => &cpu.cs,
-        Some(0x36) => &cpu.ss,
-        Some(0x26) => &cpu.es,
-        Some(0x64) => &cpu.fs,
-        Some(0x65) => &cpu.gs,
+    let (seg, uses_ss) = match insn.prefixes.segment_override {
+        Some(0x2E) => (&cpu.cs, false),
+        Some(0x36) => (&cpu.ss, true),
+        Some(0x26) => (&cpu.es, false),
+        Some(0x64) => (&cpu.fs, false),
+        Some(0x65) => (&cpu.gs, false),
         Some(0x3E) | None => {
             // Default DS, except BP-based uses SS.
             if m.rm == 2 || m.rm == 3 || (m.rm == 6 && m.mod_ != 0) {
-                &cpu.ss
+                (&cpu.ss, true)
             } else {
-                &cpu.ds
+                (&cpu.ds, false)
             }
         }
-        _ => &cpu.ds,
+        _ => (&cpu.ds, false),
     };
-    Ok((linear_addr(seg, u64::from(off)), false))
+    Ok((linear_addr(seg, u64::from(off)), false, uses_ss))
+}
+
+/// Map a bus `MemoryFault` to `#SS` (vector 12) or `#GP` (vector 13).
+/// Spec: Intel SDM Vol. 3 §6.15 (#SS / #GP).
+fn classify_mem_fault(err: ExecError, uses_ss: bool) -> ExecError {
+    match err {
+        ExecError::MemoryFault(_) => ExecError::ArchFault(if uses_ss { 12 } else { 13 }),
+        e => e,
+    }
 }
 
 fn calc_ea16(cpu: &CpuState, mod_: u8, rm: u8, displacement: i32) -> Result<u16, ExecError> {
@@ -569,8 +590,9 @@ fn read_rm_u8(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<u
         // Legacy byte r/m: 0-3 AL/CL/DL/BL, 4-7 AH/CH/DH/BH (SDM Vol. 2 App. B).
         Ok(read_reg_u8(cpu, m.rm))
     } else {
-        let (addr, _) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
         bus.read_u8(addr)
+            .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
 
@@ -585,8 +607,9 @@ fn write_rm_u8(
         write_reg_u8(cpu, m.rm, val);
         Ok(())
     } else {
-        let (addr, _) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
         bus.write_u8(addr, val)
+            .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
 
@@ -595,8 +618,9 @@ fn read_rm_u16(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u16(m.rm as usize))
     } else {
-        let (addr, _) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
         bus.read_u16(addr)
+            .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
 
@@ -611,8 +635,9 @@ fn write_rm_u16(
         cpu.set_gpr_u16(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
         bus.write_u16(addr, val)
+            .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
 
@@ -621,8 +646,9 @@ fn read_rm_u32(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u32(m.rm as usize))
     } else {
-        let (addr, _) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
         bus.read_u32(addr)
+            .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
 
@@ -637,22 +663,37 @@ fn write_rm_u32(
         cpu.set_gpr_u32(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _) = ea_16(cpu, insn)?;
+        let (addr, _, uses_ss) = ea_16(cpu, insn)?;
         bus.write_u32(addr, val)
+            .map_err(|e| classify_mem_fault(e, uses_ss))
+    }
+}
+
+/// Stack push without `#SS` classification (used by IVT delivery itself).
+fn push16_unchecked(cpu: &mut CpuState, bus: &mut dyn Bus, val: u16) -> Result<(), ExecError> {
+    let old_sp = cpu.gpr_u16(CpuState::RSP);
+    let sp = old_sp.wrapping_sub(2);
+    cpu.set_gpr_u16(CpuState::RSP, sp);
+    let addr = linear_addr(&cpu.ss, u64::from(sp));
+    match bus.write_u16(addr, val) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            cpu.set_gpr_u16(CpuState::RSP, old_sp);
+            Err(e)
+        }
     }
 }
 
 fn push16(cpu: &mut CpuState, bus: &mut dyn Bus, val: u16) -> Result<(), ExecError> {
-    let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(2);
-    cpu.set_gpr_u16(CpuState::RSP, sp);
-    let addr = linear_addr(&cpu.ss, u64::from(sp));
-    bus.write_u16(addr, val)
+    push16_unchecked(cpu, bus, val).map_err(|e| classify_mem_fault(e, true))
 }
 
 fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
     let sp = cpu.gpr_u16(CpuState::RSP);
     let addr = linear_addr(&cpu.ss, u64::from(sp));
-    let v = bus.read_u16(addr)?;
+    let v = bus
+        .read_u16(addr)
+        .map_err(|e| classify_mem_fault(e, true))?;
     cpu.set_gpr_u16(CpuState::RSP, sp.wrapping_add(2));
     Ok(v)
 }
@@ -660,16 +701,25 @@ fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
 /// PUSH with 32-bit operand size; address-size 16 still uses SP (decrement by 4).
 /// Spec: Intel SDM Vol. 2 "PUSH"; Vol. 1 §3.6.
 fn push32(cpu: &mut CpuState, bus: &mut dyn Bus, val: u32) -> Result<(), ExecError> {
-    let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(4);
+    let old_sp = cpu.gpr_u16(CpuState::RSP);
+    let sp = old_sp.wrapping_sub(4);
     cpu.set_gpr_u16(CpuState::RSP, sp);
     let addr = linear_addr(&cpu.ss, u64::from(sp));
-    bus.write_u32(addr, val)
+    match bus.write_u32(addr, val) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            cpu.set_gpr_u16(CpuState::RSP, old_sp);
+            Err(classify_mem_fault(e, true))
+        }
+    }
 }
 
 fn pop32(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u32, ExecError> {
     let sp = cpu.gpr_u16(CpuState::RSP);
     let addr = linear_addr(&cpu.ss, u64::from(sp));
-    let v = bus.read_u32(addr)?;
+    let v = bus
+        .read_u32(addr)
+        .map_err(|e| classify_mem_fault(e, true))?;
     cpu.set_gpr_u16(CpuState::RSP, sp.wrapping_add(4));
     Ok(v)
 }
@@ -1054,9 +1104,13 @@ fn read_far_ptr16(
         // Caller should deliver #UD; keep helper defensive.
         return Err(ExecError::Unsupported(insn.opcode));
     }
-    let (addr, _) = ea_16(cpu, insn)?;
-    let offset = bus.read_u16(addr)?;
-    let selector = bus.read_u16(addr.wrapping_add(2))?;
+    let (addr, _, uses_ss) = ea_16(cpu, insn)?;
+    let offset = bus
+        .read_u16(addr)
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    let selector = bus
+        .read_u16(addr.wrapping_add(2))
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
     Ok((offset, selector))
 }
 
@@ -1298,6 +1352,23 @@ fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
     }
 }
 
+/// Primary opcodes that are architectural `#UD` in real-address mode when the
+/// sparse decoder table has no entry (or rejects the opcode).
+///
+/// **Rule (sparse tables):** do **not** treat every `UnsupportedOpcode` as `#UD`.
+/// Only opcodes the SDM classifies as invalid/unrecognized in real mode vector
+/// through the IVT. Valid-but-unimplemented primaries (x87 `D8`–`DF`, `WAIT`/`9B`,
+/// `IN`/`OUT` EAX forms `E5`/`E7`/`ED`/`EF`, two-byte escape `0F`, Grp1 alias `82`,
+/// …) remain host `Decode(UnsupportedOpcode)`.
+///
+/// Note: `D6` and `F1` are reserved/undefined but do **not** generate `#UD`
+/// (Intel SDM Vol. 3 §6.15 — Invalid Opcode Exception).
+///
+/// Spec: Intel SDM Vol. 3 §6.15 (#UD); Vol. 2 ARPL (Real-Address Mode Exceptions).
+fn real_mode_primary_opcode_is_ud(opcode: u8) -> bool {
+    matches!(opcode, 0x63) // ARPL — not recognized in real-address mode
+}
+
 fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::DecodedInsn, ExecError> {
     // Grow the window until decode succeeds or we hit the 15-byte SDM limit.
     let mut buf = Vec::with_capacity(15);
@@ -1307,10 +1378,14 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
         }
         let ip = u64::from(cpu.ip16()).wrapping_add(buf.len() as u64) & 0xFFFF;
         let addr = linear_addr(&cpu.cs, ip);
+        // Code-fetch MemoryFault: not classified as #GP here (host ExecError).
         buf.push(bus.read_u8(addr)?);
         match decode(&buf) {
             Ok(insn) => return Ok(insn),
             Err(DecodeError::Truncated) => continue,
+            Err(DecodeError::UnsupportedOpcode(op)) if real_mode_primary_opcode_is_ud(op) => {
+                return Err(ExecError::ArchFault(6));
+            }
             Err(e) => return Err(ExecError::Decode(e)),
         }
     }
@@ -1318,7 +1393,9 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
 
 /// Real-mode software interrupt delivery through the IVT at `IDTR.base`.
 ///
-/// Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1"; Vol. 3 §6.4.
+/// Uses unchecked stack pushes so a delivery-time bus fault stays `MemoryFault`
+/// (not re-classified as a nested `#SS` ArchFault). Spec: Intel SDM Vol. 2
+/// "INT n/INTO/INT3/INT1"; Vol. 3 §6.4.
 fn real_mode_software_interrupt(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1326,9 +1403,9 @@ fn real_mode_software_interrupt(
     return_ip: u16,
 ) -> Result<(), ExecError> {
     let flags16 = cpu.rflags as u16;
-    push16(cpu, bus, flags16)?;
-    push16(cpu, bus, cpu.cs.selector)?;
-    push16(cpu, bus, return_ip)?;
+    push16_unchecked(cpu, bus, flags16)?;
+    push16_unchecked(cpu, bus, cpu.cs.selector)?;
+    push16_unchecked(cpu, bus, return_ip)?;
     // Clear IF and TF (Vol. 2 INT n Operation, real-address mode).
     cpu.rflags &= !((1 << 9) | (1 << 8));
     let entry = cpu.idtr.base.wrapping_add(u64::from(vector) * 4);
@@ -1339,7 +1416,7 @@ fn real_mode_software_interrupt(
     Ok(())
 }
 
-/// Real-mode exception fault delivery (#DE, #UD, #BR, …) through the IVT.
+/// Real-mode exception fault delivery (#DE, #UD, #BR, #SS, #GP, …) through the IVT.
 ///
 /// Saved IP is the faulting instruction address (instruction start).
 /// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.15 (exception reference).
@@ -1392,6 +1469,13 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     if cpu.halted {
         return Ok(());
     }
+    match step_inner(cpu, bus) {
+        Err(ExecError::ArchFault(vector)) => real_mode_exception(cpu, bus, vector),
+        other => other,
+    }
+}
+
+fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     let insn = fetch_decode(cpu, bus)?;
     let next_ip = cpu.ip16().wrapping_add(insn.length as u16);
     let op = insn.opcode;
@@ -2149,9 +2233,13 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _) = ea_16(cpu, &insn)?;
-                    let offset = bus.read_u16(addr)?;
-                    let selector = bus.read_u16(addr.wrapping_add(2))?;
+                    let (addr, _, uses_ss) = ea_16(cpu, &insn)?;
+                    let offset = bus
+                        .read_u16(addr)
+                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                    let selector = bus
+                        .read_u16(addr.wrapping_add(2))
+                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
                     push16(cpu, bus, cpu.cs.selector)?;
                     push16(cpu, bus, next_ip)?;
                     cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
@@ -2169,9 +2257,13 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _) = ea_16(cpu, &insn)?;
-                    let offset = bus.read_u16(addr)?;
-                    let selector = bus.read_u16(addr.wrapping_add(2))?;
+                    let (addr, _, uses_ss) = ea_16(cpu, &insn)?;
+                    let offset = bus
+                        .read_u16(addr)
+                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                    let selector = bus
+                        .read_u16(addr.wrapping_add(2))
+                        .map_err(|e| classify_mem_fault(e, uses_ss))?;
                     cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
                     cpu.set_ip16(offset);
                 }
@@ -2287,9 +2379,13 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let (addr, _) = ea_16(cpu, &insn)?;
-            let lower = bus.read_u16(addr)? as i16;
-            let upper = bus.read_u16(addr.wrapping_add(2))? as i16;
+            let (addr, _, uses_ss) = ea_16(cpu, &insn)?;
+            let lower = bus
+                .read_u16(addr)
+                .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
+            let upper = bus
+                .read_u16(addr.wrapping_add(2))
+                .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
             let index = cpu.gpr_u16(m.reg as usize) as i16;
             if index < lower || index > upper {
                 return real_mode_exception(cpu, bus, 5);
@@ -5859,6 +5955,201 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0900);
         assert_eq!(bus.read_u16(0xFFF8).unwrap(), 4);
+    }
+
+    /// Decode-miss #UD policy (sparse primary table).
+    ///
+    /// - Architecturally invalid in real-address mode (e.g. ARPL 0x63) → IVT vector 6.
+    /// - Valid-but-unimplemented (x87, WAIT, IN/OUT EAX, 0F escape, …) stay host Decode errors.
+    /// - D6/F1 are reserved/undefined but do **not** generate #UD (SDM Vol. 3 §6.15).
+    ///
+    /// Spec: Intel SDM Vol. 3 §6.15 (#UD); Vol. 2 ARPL (real-address mode).
+    #[test]
+    fn decode_miss_ud_via_ivt_only_for_architectural_ud() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[6] → 0000:0B00
+        mem[6 * 4] = 0x00;
+        mem[6 * 4 + 1] = 0x0B;
+        mem[6 * 4 + 2] = 0x00;
+        mem[6 * 4 + 3] = 0x00;
+        mem[0x1000] = 0x63; // ARPL — #UD in real-address mode
+        mem[0x1001] = 0xC0;
+        mem[0xB00] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0x0100);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // fault IP = insn start
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0100);
+
+        // Sparse-table misses that are valid-but-unimplemented must NOT become #UD.
+        for &op in &[0x9Bu8, 0xD8, 0xED, 0x0F, 0xD6, 0xF1] {
+            let mut mem = vec![0u8; 0x10000];
+            mem[6 * 4] = 0x00;
+            mem[6 * 4 + 1] = 0x0B;
+            mem[6 * 4 + 2] = 0x00;
+            mem[6 * 4 + 3] = 0x00;
+            mem[0] = op;
+            mem[1] = 0x90;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            let mut bus = VecBus { mem, ports: vec![] };
+            let err = step(&mut cpu, &mut bus).unwrap_err();
+            assert!(
+                matches!(err, ExecError::Decode(DecodeError::UnsupportedOpcode(o)) if o == op),
+                "opcode {op:#x} should remain Decode/UnsupportedOpcode, got {err:?}"
+            );
+            assert_eq!(cpu.ip16(), 0, "IP must not advance on host decode miss");
+            assert_eq!(cpu.cs.selector, 0);
+        }
+    }
+
+    /// Bus that returns MemoryFault once for a poisoned linear address, then allows it.
+    /// Needed when the faulting stack write address overlaps the later IVT frame pushes.
+    struct PoisonBus {
+        mem: Vec<u8>,
+        poison: u64,
+        tripped: bool,
+    }
+
+    impl Bus for PoisonBus {
+        fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+            if addr == self.poison && !self.tripped {
+                self.tripped = true;
+                return Err(ExecError::MemoryFault(addr));
+            }
+            let i = addr as usize;
+            if i >= self.mem.len() {
+                return Err(ExecError::MemoryFault(addr));
+            }
+            Ok(self.mem[i])
+        }
+        fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+            if addr == self.poison && !self.tripped {
+                self.tripped = true;
+                return Err(ExecError::MemoryFault(addr));
+            }
+            let i = addr as usize;
+            if i >= self.mem.len() {
+                return Err(ExecError::MemoryFault(addr));
+            }
+            self.mem[i] = val;
+            Ok(())
+        }
+        fn port_in_u8(&mut self, _port: u16) -> Result<u8, ExecError> {
+            Ok(0xFF)
+        }
+        fn port_out_u8(&mut self, _port: u16, _val: u8) -> Result<(), ExecError> {
+            Ok(())
+        }
+    }
+
+    /// Real-mode MemoryFault → #SS (vector 12) when the access uses SS; #GP (13) otherwise.
+    /// Spec: Intel SDM Vol. 3 §6.4, §6.15 (#SS/#GP).
+    /// Unclear / not classified here: code fetch, string ops, IVT delivery MemoryFault.
+    #[test]
+    fn memory_fault_ss_gp_via_ivt() {
+        // --- #SS: PUSH AX writes SS:SP-2 at poisoned linear address ---
+        {
+            let mut mem = vec![0u8; 0x10000];
+            mem[12 * 4] = 0x00;
+            mem[12 * 4 + 1] = 0x0C;
+            mem[12 * 4 + 2] = 0x00;
+            mem[12 * 4 + 3] = 0x00;
+            mem[0] = 0x50; // PUSH AX
+            mem[0xC00] = 0xF4;
+            let poison = 0xFFFC; // first byte of PUSH write at SP=0xFFFE → SP-2=0xFFFC
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            cpu.set_interrupt_flag(true);
+            let mut bus = PoisonBus {
+                mem,
+                poison,
+                tripped: false,
+            };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.cs.selector, 0);
+            assert_eq!(cpu.ip16(), 0x0C00);
+            assert!(!cpu.interrupt_flag());
+            // After SP restore + 3× push16: SP = 0xFFFE - 6 = 0xFFF8; saved IP at 0xFFF8
+            assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
+            assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        }
+
+        // --- #GP: MOV AX,[BX] DS-relative read at poisoned address ---
+        {
+            let mut mem = vec![0u8; 0x10000];
+            mem[13 * 4] = 0x00;
+            mem[13 * 4 + 1] = 0x0D;
+            mem[13 * 4 + 2] = 0x00;
+            mem[13 * 4 + 3] = 0x00;
+            // 8B 07 = MOV AX, [BX]
+            mem[0] = 0x8B;
+            mem[1] = 0x07;
+            mem[0xD00] = 0xF4;
+            let poison = 0x3000;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.ds = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RBX, 0x3000);
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            cpu.set_interrupt_flag(true);
+            let mut bus = PoisonBus {
+                mem,
+                poison,
+                tripped: false,
+            };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 0x0D00);
+            assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // fault IP
+            assert!(!cpu.interrupt_flag());
+        }
+
+        // --- #SS: MOV AX,[BP] default segment is SS ---
+        {
+            let mut mem = vec![0u8; 0x10000];
+            mem[12 * 4] = 0x00;
+            mem[12 * 4 + 1] = 0x0C;
+            mem[12 * 4 + 2] = 0x00;
+            mem[12 * 4 + 3] = 0x00;
+            mem[0] = 0x8B;
+            mem[1] = 0x46;
+            mem[2] = 0x00; // MOV AX, [BP+0]
+            mem[0xC00] = 0xF4;
+            let poison = 0x4000;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RBP, 0x4000);
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            cpu.set_interrupt_flag(true);
+            let mut bus = PoisonBus {
+                mem,
+                poison,
+                tripped: false,
+            };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 0x0C00);
+            assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
+        }
     }
 
     /// #UD (vector 6) via real-mode IVT for reserved / invalid encodings.
