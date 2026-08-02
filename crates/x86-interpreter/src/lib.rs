@@ -79,6 +79,16 @@ fn set_sub_flags_u16(cpu: &mut CpuState, a: u16, b: u16, result: u16) {
     cpu.set_of(of);
 }
 
+fn set_sub_flags_u8(cpu: &mut CpuState, a: u8, b: u8, result: u8) {
+    cpu.set_cf(a < b);
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x80 != 0);
+    cpu.set_pf(parity_even(result));
+    cpu.set_af(((a ^ b ^ result) & 0x10) != 0);
+    let of = ((a ^ b) & (a ^ result) & 0x80) != 0;
+    cpu.set_of(of);
+}
+
 /// 16-bit effective address from ModRM (real-mode / 16-bit address size).
 fn ea_16(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool), ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
@@ -782,6 +792,44 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let v = read_rm_u16(cpu, bus, &insn)?;
             let r = grp2_u16(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
             write_rm_u16(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
+        }
+        0xF6 => {
+            // Group 3 r/m8 — NOT (/2) / NEG (/3). Spec: Intel SDM Vol. 2 "NOT"/"NEG".
+            // Unsupported here: TEST (/0), MUL/IMUL/DIV/IDIV (/4–/7); AH/CH/DH/BH.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u8(cpu, bus, &insn)?;
+            match m.reg {
+                2 => {
+                    // NOT — one's complement; flags unaffected.
+                    write_rm_u8(cpu, bus, &insn, !v)?;
+                }
+                3 => {
+                    // NEG — two's complement; flags as SUB from 0 (CF cleared iff operand was 0).
+                    let r = v.wrapping_neg();
+                    write_rm_u8(cpu, bus, &insn, r)?;
+                    set_sub_flags_u8(cpu, 0, v, r);
+                }
+                _ => return Err(ExecError::Unsupported(op)),
+            }
+            cpu.set_ip16(next_ip);
+        }
+        0xF7 => {
+            // Group 3 r/m16 — NOT (/2) / NEG (/3). Spec: Intel SDM Vol. 2 "NOT"/"NEG".
+            // Unsupported here: TEST (/0), MUL/IMUL/DIV/IDIV (/4–/7); opsize 32.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u16(cpu, bus, &insn)?;
+            match m.reg {
+                2 => {
+                    write_rm_u16(cpu, bus, &insn, !v)?;
+                }
+                3 => {
+                    let r = v.wrapping_neg();
+                    write_rm_u16(cpu, bus, &insn, r)?;
+                    set_sub_flags_u16(cpu, 0, v, r);
+                }
+                _ => return Err(ExecError::Unsupported(op)),
+            }
             cpu.set_ip16(next_ip);
         }
         0x70..=0x7F => {
@@ -1874,6 +1922,75 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x80);
+    }
+
+    /// Group 3 NOT/NEG (F6/F7 /2 /3). Spec: SDM Vol. 2 NOT/NEG.
+    #[test]
+    fn grp3_not_neg() {
+        let mut mem = vec![0u8; 0x10000];
+        // F6 D0 = NOT AL; F6 D8 = NEG AL; F7 D0 = NOT AX; F7 D8 = NEG AX
+        mem[0] = 0xF6;
+        mem[1] = 0xD0;
+        mem[2] = 0xF6;
+        mem[3] = 0xD8;
+        mem[4] = 0xF7;
+        mem[5] = 0xD0;
+        mem[6] = 0xF7;
+        mem[7] = 0xD8;
+        mem[8] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_al(0x0F);
+        cpu.set_zf(true);
+        let flags_before_not = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // NOT AL
+        assert_eq!(cpu.al(), 0xF0);
+        assert_eq!(cpu.rflags, flags_before_not); // NOT: flags unaffected
+
+        cpu.set_al(0x01);
+        step(&mut cpu, &mut bus).unwrap(); // NEG AL → 0xFF, CF=1, SF=1
+        assert_eq!(cpu.al(), 0xFF);
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 7), 0);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF clear
+
+        cpu.set_ax(0x00FF);
+        let flags_before = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap(); // NOT AX
+        assert_eq!(cpu.ax(), 0xFF00);
+        assert_eq!(cpu.rflags, flags_before);
+
+        cpu.set_ax(0);
+        step(&mut cpu, &mut bus).unwrap(); // NEG AX 0 → 0, CF=0, ZF=1
+        assert_eq!(cpu.ax(), 0);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+    }
+
+    #[test]
+    fn grp3_neg_mem8_and_unsupported_test() {
+        let mut mem = vec![0u8; 0x10000];
+        // F6 1E 00 40 = NEG byte [0x4000]; F6 C0 = TEST AL,imm — unsupported (/0)
+        mem[0] = 0xF6;
+        mem[1] = 0x1E;
+        mem[2] = 0x00;
+        mem[3] = 0x40;
+        mem[4] = 0xF6;
+        mem[5] = 0xC0;
+        mem[0x4000] = 0x10;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0xF0); // −0x10
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0xF6)));
     }
 
     /// Group 2 D2/D3 count = CL (SDM Vol. 2).

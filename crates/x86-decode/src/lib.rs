@@ -249,7 +249,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         return Err(DecodeError::TooLong);
     }
 
-    // Group 2 (D0–D3/C0/C1): mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
+    // Group 2 / Group 3: mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
     let mnemonic = if matches!(opcode, 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xC0 | 0xC1) {
         match modrm.map(|m| m.reg) {
             Some(0) => "ROL",
@@ -260,6 +260,13 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             Some(5) => "SHR",
             Some(6) => "GRP2_RES",
             Some(7) => "SAR",
+            _ => def.mnemonic,
+        }
+    } else if matches!(opcode, 0xF6 | 0xF7) {
+        match modrm.map(|m| m.reg) {
+            Some(2) => "NOT",
+            Some(3) => "NEG",
+            Some(_) => "GRP3",
             _ => def.mnemonic,
         }
     } else {
@@ -511,5 +518,16 @@ mod tests {
         assert_eq!(d.length, 2);
         assert_eq!(decode(&[0xD3, 0xE8]).unwrap().mnemonic, "SHR");
         assert_eq!(decode(&[0xD2]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_grp3_not_neg() {
+        // Intel SDM Vol. 2 Group 3: F6/F7 /2 NOT, /3 NEG
+        assert_eq!(decode(&[0xF6, 0xD0]).unwrap().mnemonic, "NOT"); // NOT AL
+        assert_eq!(decode(&[0xF6, 0xD8]).unwrap().mnemonic, "NEG"); // NEG AL
+        assert_eq!(decode(&[0xF7, 0xD0]).unwrap().mnemonic, "NOT"); // NOT AX
+        assert_eq!(decode(&[0xF7, 0xD8]).unwrap().mnemonic, "NEG"); // NEG AX
+        assert_eq!(decode(&[0xF6, 0xC0]).unwrap().mnemonic, "GRP3"); // /0 TEST — not this slice
+        assert_eq!(decode(&[0xF6]), Err(DecodeError::Truncated));
     }
 }
