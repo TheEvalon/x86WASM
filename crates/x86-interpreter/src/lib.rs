@@ -260,6 +260,149 @@ fn data_seg_for_string_src<'a>(cpu: &'a CpuState, insn: &DecodedInsn) -> &'a x86
     }
 }
 
+/// SF/ZF/PF for shift results (SHL/SHR/SAR). AF undefined — left unchanged.
+/// Spec: Intel SDM Vol. 2 SAL/SAR/SHL/SHR — Flags Affected.
+fn set_shift_result_flags_u8(cpu: &mut CpuState, result: u8) {
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x80 != 0);
+    cpu.set_pf(parity_even(result));
+}
+
+fn set_shift_result_flags_u16(cpu: &mut CpuState, result: u16) {
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x8000 != 0);
+    cpu.set_pf(parity_even(result as u8));
+}
+
+/// Group 2 byte ops with count=1 (opcode D0). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+fn grp2_u8(cpu: &mut CpuState, reg: u8, val: u8) -> Result<u8, ExecError> {
+    let cf = cpu.rflags & 1 != 0;
+    match reg {
+        0 => {
+            // ROL — rotate left; CF=bit shifted out; OF=MSB(result) XOR CF (count=1).
+            let r = val.rotate_left(1);
+            let new_cf = (val & 0x80) != 0;
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r & 0x80) != 0) ^ new_cf);
+            Ok(r)
+        }
+        1 => {
+            // ROR — rotate right; OF = two MSBs of result XOR (count=1).
+            let r = val.rotate_right(1);
+            let new_cf = (val & 1) != 0;
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r ^ (r << 1)) & 0x80) != 0);
+            Ok(r)
+        }
+        2 => {
+            // RCL — rotate through carry left.
+            let new_cf = (val & 0x80) != 0;
+            let r = (val << 1) | u8::from(cf);
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r & 0x80) != 0) ^ new_cf);
+            Ok(r)
+        }
+        3 => {
+            // RCR — rotate through carry right.
+            let new_cf = (val & 1) != 0;
+            let r = (val >> 1) | (u8::from(cf) << 7);
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r ^ (r << 1)) & 0x80) != 0);
+            Ok(r)
+        }
+        4 => {
+            // SHL/SAL
+            let new_cf = (val & 0x80) != 0;
+            let r = val << 1;
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r & 0x80) != 0) ^ new_cf);
+            set_shift_result_flags_u8(cpu, r);
+            Ok(r)
+        }
+        5 => {
+            // SHR — logical; OF = original MSB (count=1).
+            let new_cf = (val & 1) != 0;
+            let r = val >> 1;
+            cpu.set_cf(new_cf);
+            cpu.set_of((val & 0x80) != 0);
+            set_shift_result_flags_u8(cpu, r);
+            Ok(r)
+        }
+        6 => Err(ExecError::Unsupported(0xD0)), // reserved encoding
+        7 => {
+            // SAR — arithmetic; OF cleared for count=1.
+            let new_cf = (val & 1) != 0;
+            let r = ((val as i8) >> 1) as u8;
+            cpu.set_cf(new_cf);
+            cpu.set_of(false);
+            set_shift_result_flags_u8(cpu, r);
+            Ok(r)
+        }
+        _ => Err(ExecError::Unsupported(0xD0)),
+    }
+}
+
+/// Group 2 word ops with count=1 (opcode D1). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+fn grp2_u16(cpu: &mut CpuState, reg: u8, val: u16) -> Result<u16, ExecError> {
+    let cf = cpu.rflags & 1 != 0;
+    match reg {
+        0 => {
+            let r = val.rotate_left(1);
+            let new_cf = (val & 0x8000) != 0;
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r & 0x8000) != 0) ^ new_cf);
+            Ok(r)
+        }
+        1 => {
+            let r = val.rotate_right(1);
+            let new_cf = (val & 1) != 0;
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r ^ (r << 1)) & 0x8000) != 0);
+            Ok(r)
+        }
+        2 => {
+            let new_cf = (val & 0x8000) != 0;
+            let r = (val << 1) | u16::from(cf);
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r & 0x8000) != 0) ^ new_cf);
+            Ok(r)
+        }
+        3 => {
+            let new_cf = (val & 1) != 0;
+            let r = (val >> 1) | (u16::from(cf) << 15);
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r ^ (r << 1)) & 0x8000) != 0);
+            Ok(r)
+        }
+        4 => {
+            let new_cf = (val & 0x8000) != 0;
+            let r = val << 1;
+            cpu.set_cf(new_cf);
+            cpu.set_of(((r & 0x8000) != 0) ^ new_cf);
+            set_shift_result_flags_u16(cpu, r);
+            Ok(r)
+        }
+        5 => {
+            let new_cf = (val & 1) != 0;
+            let r = val >> 1;
+            cpu.set_cf(new_cf);
+            cpu.set_of((val & 0x8000) != 0);
+            set_shift_result_flags_u16(cpu, r);
+            Ok(r)
+        }
+        6 => Err(ExecError::Unsupported(0xD1)),
+        7 => {
+            let new_cf = (val & 1) != 0;
+            let r = ((val as i16) >> 1) as u16;
+            cpu.set_cf(new_cf);
+            cpu.set_of(false);
+            set_shift_result_flags_u16(cpu, r);
+            Ok(r)
+        }
+        _ => Err(ExecError::Unsupported(0xD1)),
+    }
+}
+
 /// Short Jcc condition for opcodes 0x70–0x7F (Intel SDM Vol. 2, Jcc).
 fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
     let cf = cpu.rflags & 1 != 0;
@@ -519,6 +662,24 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(ip);
             // Preserve high RFLAGS; bit 1 of FLAGS is reserved-1.
             cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
+        }
+        0xD0 => {
+            // Group 2 r/m8, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+            // Unsupported here: count≠1 forms (C0/D2); /6 reserved; AH/CH/DH/BH via high-byte rm.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u8(cpu, bus, &insn)?;
+            let r = grp2_u8(cpu, m.reg, v)?;
+            write_rm_u8(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
+        }
+        0xD1 => {
+            // Group 2 r/m16, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+            // Unsupported here: opsize 32; count≠1 forms (C1/D3); /6 reserved.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u16(cpu, bus, &insn)?;
+            let r = grp2_u16(cpu, m.reg, v)?;
+            write_rm_u16(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
         }
         0x70..=0x7F => {
             // Jcc rel8 — Spec: Intel SDM Vol. 2 "Jcc".
@@ -1438,5 +1599,124 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0x1000);
+    }
+
+    /// Group 2 D0/D1 count=1: ROL/ROR/RCL/RCR/SHL/SHR/SAR (SDM Vol. 2).
+    #[test]
+    fn grp2_shift_rotate_by1_reg() {
+        let run8 = |modrm_reg: u8, al: u8, cf_in: bool| -> (u8, bool, bool) {
+            let mut mem = vec![0u8; 0x10000];
+            // D0 C0+8*reg = op AL, 1
+            mem[0] = 0xD0;
+            mem[1] = 0xC0 | (modrm_reg << 3);
+            mem[2] = 0xF4;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.rip = 0;
+            cpu.set_al(al);
+            cpu.set_cf(cf_in);
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            (cpu.al(), cpu.rflags & 1 != 0, cpu.rflags & (1 << 11) != 0)
+        };
+
+        // ROL AL,1: 0x81 → 0x03, CF=1, OF=MSB xor CF = 0 xor 1 = 1
+        let (r, cf, of) = run8(0, 0x81, false);
+        assert_eq!((r, cf, of), (0x03, true, true));
+
+        // ROR AL,1: 0x03 → 0x81, CF=1, OF = two MSBs differ
+        let (r, cf, of) = run8(1, 0x03, false);
+        assert_eq!((r, cf), (0x81, true));
+        assert!(of);
+
+        // RCL AL,1 with CF=1: 0x40 → 0x81, CF=0, OF=1 xor 0 = 1
+        let (r, cf, of) = run8(2, 0x40, true);
+        assert_eq!((r, cf, of), (0x81, false, true));
+
+        // RCR AL,1 with CF=1: 0x02 → 0x81, CF=0
+        let (r, cf, _) = run8(3, 0x02, true);
+        assert_eq!((r, cf), (0x81, false));
+
+        // SHL AL,1: 0x40 → 0x80, CF=0, OF=1, SF=1, ZF=0
+        let (r, cf, of) = run8(4, 0x40, false);
+        assert_eq!((r, cf, of), (0x80, false, true));
+
+        // SHR AL,1: 0x81 → 0x40, CF=1, OF=original MSB=1
+        let (r, cf, of) = run8(5, 0x81, false);
+        assert_eq!((r, cf, of), (0x40, true, true));
+
+        // SAR AL,1: 0x81 → 0xC0, CF=1, OF=0, SF=1
+        let (r, cf, of) = run8(7, 0x81, false);
+        assert_eq!((r, cf, of), (0xC0, true, false));
+
+        // Word SHL AX,1
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xD1;
+        mem[1] = 0xE0; // SHL AX,1
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_ax(0x4000);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x8000);
+        assert_eq!(cpu.rflags & 1, 0); // CF
+        assert_ne!(cpu.rflags & (1 << 11), 0); // OF
+        assert_ne!(cpu.rflags & (1 << 7), 0); // SF
+    }
+
+    #[test]
+    fn grp2_shl_mem8_and_flags() {
+        let mut mem = vec![0u8; 0x10000];
+        // D0 26 00 30 = SHL byte [0x3000], 1
+        mem[0] = 0xD0;
+        mem[1] = 0x26;
+        mem[2] = 0x00;
+        mem[3] = 0x30;
+        mem[4] = 0xF4;
+        mem[0x3000] = 0x01;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x3000).unwrap(), 0x02);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF clear
+    }
+
+    #[test]
+    fn grp2_reserved_slash6_unsupported() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xD0;
+        mem[1] = 0xF0; // /6 AL
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0xD0)));
+    }
+
+    #[test]
+    fn grp2_rol_does_not_touch_zf() {
+        // Rotates leave SF/ZF/AF/PF unchanged (SDM Vol. 2 ROL — Flags Affected).
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xD0;
+        mem[1] = 0xC0; // ROL AL,1
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_al(0x01);
+        cpu.set_zf(true);
+        cpu.set_sf(true);
+        cpu.set_pf(false);
+        let zf_sf_pf = cpu.rflags & ((1 << 6) | (1 << 7) | (1 << 2));
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x02);
+        assert_eq!(cpu.rflags & ((1 << 6) | (1 << 7) | (1 << 2)), zf_sf_pf);
     }
 }

@@ -249,6 +249,23 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         return Err(DecodeError::TooLong);
     }
 
+    // Group 2 (D0/D1): mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
+    let mnemonic = if matches!(opcode, 0xD0 | 0xD1) {
+        match modrm.map(|m| m.reg) {
+            Some(0) => "ROL",
+            Some(1) => "ROR",
+            Some(2) => "RCL",
+            Some(3) => "RCR",
+            Some(4) => "SHL",
+            Some(5) => "SHR",
+            Some(6) => "GRP2_RES",
+            Some(7) => "SAR",
+            _ => def.mnemonic,
+        }
+    } else {
+        def.mnemonic
+    };
+
     Ok(DecodedInsn {
         prefixes,
         opcode,
@@ -256,7 +273,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         displacement,
         immediate,
         length: i,
-        mnemonic: def.mnemonic,
+        mnemonic,
     })
 }
 
@@ -446,5 +463,28 @@ mod tests {
         assert_eq!(decode(&[0xA4]).unwrap().mnemonic, "MOVSB");
         assert_eq!(decode(&[0xAA]).unwrap().mnemonic, "STOSB");
         assert_eq!(decode(&[0xAC]).unwrap().mnemonic, "LODSB");
+    }
+
+    #[test]
+    fn decode_grp2_shift_rotate_by1() {
+        // Intel SDM Vol. 2 Group 2: D0/D1 /r with count=1.
+        // D0 C0 = ROL AL,1; D1 E0 = SHL AX,1; D0 F8 = SAR AL,1
+        let d = decode(&[0xD0, 0xC0]).unwrap();
+        assert_eq!(d.mnemonic, "ROL");
+        assert_eq!(d.modrm.unwrap().reg, 0);
+        assert_eq!(d.length, 2);
+        assert_eq!(decode(&[0xD0, 0xC8]).unwrap().mnemonic, "ROR");
+        assert_eq!(decode(&[0xD0, 0xD0]).unwrap().mnemonic, "RCL");
+        assert_eq!(decode(&[0xD0, 0xD8]).unwrap().mnemonic, "RCR");
+        assert_eq!(decode(&[0xD1, 0xE0]).unwrap().mnemonic, "SHL");
+        assert_eq!(decode(&[0xD1, 0xE8]).unwrap().mnemonic, "SHR");
+        assert_eq!(decode(&[0xD0, 0xF8]).unwrap().mnemonic, "SAR");
+        assert_eq!(decode(&[0xD0, 0xF0]).unwrap().mnemonic, "GRP2_RES");
+    }
+
+    #[test]
+    fn truncated_grp2() {
+        assert_eq!(decode(&[0xD0]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xD1]), Err(DecodeError::Truncated));
     }
 }
