@@ -10,6 +10,8 @@ pub enum Encoding {
     Modrm,
     Imm8,
     Imm16,
+    /// `ENTER iw, ib` — frame size then nesting level (Intel SDM Vol. 2 ENTER).
+    Imm16Imm8,
     Rel8,
     Rel16,
     /// Far pointer `ptr16:16` — offset then segment (e.g. `CALL`/`JMP` far).
@@ -790,6 +792,55 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "LAHF",
     },
     InstrDef {
+        mnemonic: "PUSHA",
+        opcode: 0x60,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSHA/PUSHAD",
+    },
+    InstrDef {
+        mnemonic: "POPA",
+        opcode: 0x61,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POPA/POPAD",
+    },
+    InstrDef {
+        mnemonic: "POP",
+        opcode: 0x8F,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "POP",
+    },
+    InstrDef {
+        mnemonic: "RET",
+        opcode: 0xC2,
+        encoding: Encoding::Imm16,
+        width: Width::OsZ,
+        sdm: "RET",
+    },
+    InstrDef {
+        mnemonic: "ENTER",
+        opcode: 0xC8,
+        encoding: Encoding::Imm16Imm8,
+        width: Width::OsZ,
+        sdm: "ENTER",
+    },
+    InstrDef {
+        mnemonic: "LEAVE",
+        opcode: 0xC9,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "LEAVE",
+    },
+    InstrDef {
+        mnemonic: "RETF",
+        opcode: 0xCA,
+        encoding: Encoding::Imm16,
+        width: Width::OsZ,
+        sdm: "RET",
+    },
+    InstrDef {
         mnemonic: "RETF",
         opcode: 0xCB,
         encoding: Encoding::None,
@@ -1131,7 +1182,7 @@ mod tests {
             0x13, 0x14, 0x15, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x20, 0x21, 0x22, 0x23, 0x24,
             0x25, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x30,
             0x31, 0x32, 0x33, 0x34, 0x35, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0xA0, 0xA1, 0xA2,
-            0xA3, 0xA8, 0xA9, 0xC6, 0xC7,
+            0xA3, 0xA8, 0xA9, 0xC6, 0xC7, 0x60, 0x61, 0x8F, 0xC2, 0xC8, 0xC9, 0xCA,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

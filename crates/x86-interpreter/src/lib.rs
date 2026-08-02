@@ -895,6 +895,16 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let target = next_ip.wrapping_add(insn.immediate as i16 as u16);
             cpu.set_ip16(target);
         }
+        0xC2 => {
+            // RET iw — near return with stack release.
+            // Spec: Intel SDM Vol. 2 "RET" (near, imm16).
+            // Unsupported here: opsize 32.
+            let ip = pop16(cpu, bus)?;
+            let release = insn.immediate as u16;
+            let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
+            cpu.set_gpr_u16(CpuState::RSP, sp);
+            cpu.set_ip16(ip);
+        }
         0xC3 => {
             let ip = pop16(cpu, bus)?;
             cpu.set_ip16(ip);
@@ -910,14 +920,51 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
             cpu.set_ip16(offset);
         }
+        0xCA => {
+            // RETF iw — far return with stack release.
+            // Spec: Intel SDM Vol. 2 "RET" (far, imm16).
+            // Unsupported here: opsize 32; protected-mode privilege checks.
+            let ip = pop16(cpu, bus)?;
+            let cs_sel = pop16(cpu, bus)?;
+            let release = insn.immediate as u16;
+            let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
+            cpu.set_gpr_u16(CpuState::RSP, sp);
+            cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+            cpu.set_ip16(ip);
+        }
         0xCB => {
             // RETF — far return, 16-bit stack frame (pop IP then CS).
             // Spec: Intel SDM Vol. 2 "RET" (far).
-            // Unsupported here: RETF imm16 stack-release form (CA iw); opsize 32.
+            // Unsupported here: opsize 32.
             let ip = pop16(cpu, bus)?;
             let cs_sel = pop16(cpu, bus)?;
             cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
             cpu.set_ip16(ip);
+        }
+        0xC8 => {
+            // ENTER iw, ib — 16-bit opsize, nesting level 0 only this slice.
+            // Spec: Intel SDM Vol. 2 "ENTER".
+            // Unsupported here: nesting level > 0 (imm8 & 0x1F != 0); opsize 32 (ENTERD).
+            let alloc = insn.immediate as u16;
+            let nesting = (insn.displacement as u8) & 0x1F;
+            if nesting != 0 {
+                return Err(ExecError::Unsupported(0xC8));
+            }
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
+            let frame_temp = cpu.gpr_u16(CpuState::RSP);
+            cpu.set_gpr_u16(CpuState::RBP, frame_temp);
+            let sp = frame_temp.wrapping_sub(alloc);
+            cpu.set_gpr_u16(CpuState::RSP, sp);
+            cpu.set_ip16(next_ip);
+        }
+        0xC9 => {
+            // LEAVE — Spec: Intel SDM Vol. 2 "LEAVE".
+            // Unsupported here: opsize 32.
+            let bp = cpu.gpr_u16(CpuState::RBP);
+            cpu.set_gpr_u16(CpuState::RSP, bp);
+            let v = pop16(cpu, bus)?;
+            cpu.set_gpr_u16(CpuState::RBP, v);
+            cpu.set_ip16(next_ip);
         }
         0x9C => {
             // PUSHF — 16-bit FLAGS in real-address mode (default opsize).
@@ -1355,6 +1402,54 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let idx = (op - 0x58) as usize;
             let v = pop16(cpu, bus)?;
             cpu.set_gpr_u16(idx, v);
+            cpu.set_ip16(next_ip);
+        }
+        0x60 => {
+            // PUSHA — push AX,CX,DX,BX, original SP,BP,SI,DI (16-bit).
+            // Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD".
+            // Unsupported here: opsize 32 (PUSHAD).
+            let sp0 = cpu.gpr_u16(CpuState::RSP);
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RAX))?;
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RCX))?;
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RDX))?;
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RBX))?;
+            push16(cpu, bus, sp0)?;
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RSI))?;
+            push16(cpu, bus, cpu.gpr_u16(CpuState::RDI))?;
+            cpu.set_ip16(next_ip);
+        }
+        0x61 => {
+            // POPA — pop DI,SI,BP, discard, BX,DX,CX,AX (16-bit).
+            // Spec: Intel SDM Vol. 2 "POPA/POPAD".
+            // Unsupported here: opsize 32 (POPAD).
+            let di = pop16(cpu, bus)?;
+            let si = pop16(cpu, bus)?;
+            let bp = pop16(cpu, bus)?;
+            let _discard_sp = pop16(cpu, bus)?;
+            let bx = pop16(cpu, bus)?;
+            let dx = pop16(cpu, bus)?;
+            let cx = pop16(cpu, bus)?;
+            let ax = pop16(cpu, bus)?;
+            cpu.set_gpr_u16(CpuState::RDI, di);
+            cpu.set_gpr_u16(CpuState::RSI, si);
+            cpu.set_gpr_u16(CpuState::RBP, bp);
+            cpu.set_gpr_u16(CpuState::RBX, bx);
+            cpu.set_gpr_u16(CpuState::RDX, dx);
+            cpu.set_gpr_u16(CpuState::RCX, cx);
+            cpu.set_gpr_u16(CpuState::RAX, ax);
+            cpu.set_ip16(next_ip);
+        }
+        0x8F => {
+            // POP r/m16 — Group /0 only.
+            // Spec: Intel SDM Vol. 2 "POP".
+            // Unsupported here: 8F /1–/7 (#UD); opsize 32.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.reg != 0 {
+                return Err(ExecError::Unsupported(0x8F));
+            }
+            let v = pop16(cpu, bus)?;
+            write_rm_u16(cpu, bus, &insn, v)?;
             cpu.set_ip16(next_ip);
         }
         0x68 => {
@@ -4944,5 +5039,213 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x55);
         assert_eq!(cpu.rflags & (1 << 6), 1 << 6); // ZF
+    }
+
+    /// PUSHA stack layout then POPA restores GPRs (except SP from the saved slot).
+    /// Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD", "POPA/POPAD".
+    #[test]
+    fn pusha_popa_stack_layout_and_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x60; // PUSHA
+        mem[1] = 0x61; // POPA
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        cpu.set_gpr_u16(CpuState::RAX, 0x1111);
+        cpu.set_gpr_u16(CpuState::RCX, 0x2222);
+        cpu.set_gpr_u16(CpuState::RDX, 0x3333);
+        cpu.set_gpr_u16(CpuState::RBX, 0x4444);
+        cpu.set_gpr_u16(CpuState::RBP, 0x5555);
+        cpu.set_gpr_u16(CpuState::RSI, 0x6666);
+        cpu.set_gpr_u16(CpuState::RDI, 0x7777);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0.wrapping_sub(16));
+        // Highest addresses first: AX at sp0-2 … DI at sp0-16.
+        assert_eq!(bus.read_u16(u64::from(sp0 - 2)).unwrap(), 0x1111); // AX
+        assert_eq!(bus.read_u16(u64::from(sp0 - 4)).unwrap(), 0x2222); // CX
+        assert_eq!(bus.read_u16(u64::from(sp0 - 6)).unwrap(), 0x3333); // DX
+        assert_eq!(bus.read_u16(u64::from(sp0 - 8)).unwrap(), 0x4444); // BX
+        assert_eq!(bus.read_u16(u64::from(sp0 - 10)).unwrap(), sp0); // original SP
+        assert_eq!(bus.read_u16(u64::from(sp0 - 12)).unwrap(), 0x5555); // BP
+        assert_eq!(bus.read_u16(u64::from(sp0 - 14)).unwrap(), 0x6666); // SI
+        assert_eq!(bus.read_u16(u64::from(sp0 - 16)).unwrap(), 0x7777); // DI
+
+        // Clobber GPRs (leave SP as after PUSHA).
+        cpu.set_gpr_u16(CpuState::RAX, 0);
+        cpu.set_gpr_u16(CpuState::RCX, 0);
+        cpu.set_gpr_u16(CpuState::RDX, 0);
+        cpu.set_gpr_u16(CpuState::RBX, 0);
+        cpu.set_gpr_u16(CpuState::RBP, 0);
+        cpu.set_gpr_u16(CpuState::RSI, 0);
+        cpu.set_gpr_u16(CpuState::RDI, 0);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x1111);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0x2222);
+        assert_eq!(cpu.gpr_u16(CpuState::RDX), 0x3333);
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x4444);
+        assert_eq!(cpu.gpr_u16(CpuState::RBP), 0x5555);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x6666);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x7777);
+        // POPA discards the saved SP; SP ends at the pre-PUSHA value.
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
+    }
+
+    /// ENTER nesting level 0 + LEAVE round-trip (SDM Vol. 2 ENTER/LEAVE).
+    #[test]
+    fn enter_level0_leave_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        // ENTER 8, 0
+        mem[0] = 0xC8;
+        mem[1] = 0x08;
+        mem[2] = 0x00;
+        mem[3] = 0x00;
+        mem[4] = 0xC9; // LEAVE
+        mem[5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let sp0 = 0xFFFE_u16;
+        cpu.set_gpr_u16(CpuState::RSP, sp0);
+        cpu.set_gpr_u16(CpuState::RBP, 0xABCD);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        // After ENTER 8,0: PUSH old BP; BP = new frame; SP = BP - 8.
+        assert_eq!(bus.read_u16(u64::from(sp0 - 2)).unwrap(), 0xABCD);
+        let frame = sp0 - 2;
+        assert_eq!(cpu.gpr_u16(CpuState::RBP), frame);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), frame.wrapping_sub(8));
+
+        step(&mut cpu, &mut bus).unwrap(); // LEAVE
+        assert_eq!(cpu.gpr_u16(CpuState::RBP), 0xABCD);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
+    }
+
+    /// ENTER with nesting level > 0 is explicitly unsupported this slice.
+    #[test]
+    fn enter_nesting_nonzero_unsupported() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xC8;
+        mem[1] = 0x00;
+        mem[2] = 0x00;
+        mem[3] = 0x01; // nesting = 1
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+        assert!(matches!(
+            step(&mut cpu, &mut bus),
+            Err(ExecError::Unsupported(0xC8))
+        ));
+    }
+
+    /// RET iw / RETF iw release stack bytes after the return frame.
+    /// Spec: Intel SDM Vol. 2 "RET".
+    #[test]
+    fn ret_retf_imm16_release_stack() {
+        let mut mem = vec![0u8; 0x10000];
+        // Near: RET 4 with IP on stack and 4 dummy bytes below the frame.
+        mem[0] = 0xC2;
+        mem[1] = 0x04;
+        mem[2] = 0x00;
+        // Far: RETF 2 at 0x100
+        mem[0x100] = 0xCA;
+        mem[0x101] = 0x02;
+        mem[0x102] = 0x00;
+
+        // Near frame at SP=0xFFF0: IP=0x2000, then 4 pad bytes, then marker 0xBEEF at 0xFFF6.
+        mem[0xFFF0] = 0x00;
+        mem[0xFFF1] = 0x20; // return IP
+        mem[0xFFF2] = 0x11;
+        mem[0xFFF3] = 0x11;
+        mem[0xFFF4] = 0x22;
+        mem[0xFFF5] = 0x22;
+        mem[0xFFF6] = 0xEF;
+        mem[0xFFF7] = 0xBE;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFF0);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x2000);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6);
+        assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0xBEEF);
+
+        // Far frame at SP=0xFFF0: IP, CS, then 2 pad bytes, marker at 0xFFF6.
+        bus.mem[0xFFF0] = 0x34;
+        bus.mem[0xFFF1] = 0x12; // IP
+        bus.mem[0xFFF2] = 0x00;
+        bus.mem[0xFFF3] = 0x30; // CS 0x3000
+        bus.mem[0xFFF4] = 0xAA;
+        bus.mem[0xFFF5] = 0xAA;
+        bus.mem[0xFFF6] = 0xEF;
+        bus.mem[0xFFF7] = 0xBE;
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0x100;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFF0);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x1234);
+        assert_eq!(cpu.cs.selector, 0x3000);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6);
+    }
+
+    /// POP r/m16 (8F /0) reg and mem forms; /1 unsupported.
+    /// Spec: Intel SDM Vol. 2 "POP".
+    #[test]
+    fn pop_rm16_reg_mem_and_invalid_reg() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x8F;
+        mem[1] = 0xC3; // POP BX
+        mem[2] = 0x8F;
+        mem[3] = 0x06;
+        mem[4] = 0x00;
+        mem[5] = 0x40; // POP [0x4000]
+        mem[6] = 0x8F;
+        mem[7] = 0xC8; // /1 — unsupported
+
+        // Stack: 0xAAAA then 0xBBBB
+        mem[0xFFFA] = 0xBB;
+        mem[0xFFFB] = 0xBB;
+        mem[0xFFFC] = 0xAA;
+        mem[0xFFFD] = 0xAA;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFC);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0xAAAA);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFA);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 0xBBBB);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFC);
+
+        assert!(matches!(
+            step(&mut cpu, &mut bus),
+            Err(ExecError::Unsupported(0x8F))
+        ));
     }
 }

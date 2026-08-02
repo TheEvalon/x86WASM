@@ -273,6 +273,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
                 i += 2;
             }
+            Encoding::Imm16Imm8 => {
+                // ENTER iw, ib — Spec: Intel SDM Vol. 2 "ENTER".
+                if i + 2 >= bytes.len() {
+                    return Err(DecodeError::Truncated);
+                }
+                immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                displacement = i32::from(bytes[i + 2]);
+                i += 3;
+            }
             Encoding::Ptr16_16 => {
                 // Far pointer: offset (imm16) then segment; segment stored in displacement.
                 // Spec: Intel SDM Vol. 2, CALL/JMP far ptr16:16.
@@ -349,6 +358,13 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         // Group 11: /0 MOV; other reg encodings reserved.
         match modrm.map(|m| m.reg) {
             Some(0) => "MOV",
+            _ => def.mnemonic,
+        }
+    } else if opcode == 0x8F {
+        // Group: POP r/m — only /0 is defined (Intel SDM Vol. 2 opcode map).
+        match modrm.map(|m| m.reg) {
+            Some(0) => "POP",
+            Some(_) => "GRP_POP",
             _ => def.mnemonic,
         }
     } else {
@@ -1089,5 +1105,51 @@ mod tests {
         assert_eq!(d.length, 3);
         assert_eq!(decode(&[0xA8]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0xA9, 0x00]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_pusha_popa_enter_leave() {
+        // Intel SDM Vol. 2: PUSHA (60), POPA (61), ENTER iw,ib (C8), LEAVE (C9).
+        assert_eq!(decode(&[0x60]).unwrap().mnemonic, "PUSHA");
+        assert_eq!(decode(&[0x60]).unwrap().length, 1);
+        assert_eq!(decode(&[0x61]).unwrap().mnemonic, "POPA");
+        let d = decode(&[0xC8, 0x08, 0x00, 0x00]).unwrap(); // ENTER 8, 0
+        assert_eq!(d.mnemonic, "ENTER");
+        assert_eq!(d.immediate, 8);
+        assert_eq!(d.displacement, 0);
+        assert_eq!(d.length, 4);
+        let d = decode(&[0xC8, 0x10, 0x00, 0x02]).unwrap(); // ENTER 16, 2
+        assert_eq!(d.immediate, 16);
+        assert_eq!(d.displacement, 2);
+        assert_eq!(decode(&[0xC9]).unwrap().mnemonic, "LEAVE");
+        assert_eq!(decode(&[0xC8, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xC8, 0x00, 0x00]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_ret_retf_imm16() {
+        // Intel SDM Vol. 2: RET iw (C2), RETF iw (CA).
+        let d = decode(&[0xC2, 0x04, 0x00]).unwrap();
+        assert_eq!(d.mnemonic, "RET");
+        assert_eq!(d.immediate, 4);
+        assert_eq!(d.length, 3);
+        let d = decode(&[0xCA, 0x02, 0x00]).unwrap();
+        assert_eq!(d.mnemonic, "RETF");
+        assert_eq!(d.immediate, 2);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0xC2, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xCA]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_pop_rm16() {
+        // Intel SDM Vol. 2: POP r/m16 — 8F /0
+        assert_eq!(decode(&[0x8F, 0xC0]).unwrap().mnemonic, "POP"); // POP AX
+        let d = decode(&[0x8F, 0x06, 0x00, 0x30]).unwrap(); // POP [0x3000]
+        assert_eq!(d.mnemonic, "POP");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0x8F, 0xC8]).unwrap().mnemonic, "GRP_POP"); // /1 reserved
+        assert_eq!(decode(&[0x8F]), Err(DecodeError::Truncated));
     }
 }
