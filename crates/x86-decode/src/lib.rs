@@ -419,4 +419,12 @@ mod tests {
         assert_eq!(decode(&[0xFC]).unwrap().mnemonic, "CLD");
         assert_eq!(decode(&[0xFD]).unwrap().mnemonic, "STD");
     }
+
+    #[test]
+    fn decode_int3() {
+        // Intel SDM Vol. 2: INT3 — opcode CC (1-byte breakpoint)
+        let d = decode(&[0xCC]).unwrap();
+        assert_eq!(d.mnemonic, "INT3");
+        assert_eq!(d.length, 1);
+    }
 }

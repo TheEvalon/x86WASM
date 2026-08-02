@@ -315,6 +315,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "RET",
     },
     InstrDef {
+        mnemonic: "INT3",
+        opcode: 0xCC,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "INT3",
+    },
+    InstrDef {
         mnemonic: "INT",
         opcode: 0xCD,
         encoding: Encoding::Imm8,
@@ -471,7 +478,7 @@ mod tests {
         for op in [
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
             0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0xF8, 0xF9,
-            0xFC, 0xFD,
+            0xFC, 0xFD, 0xCC,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

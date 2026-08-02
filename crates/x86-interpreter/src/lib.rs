@@ -449,6 +449,12 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
             cpu.set_ip16(next_ip);
         }
+        0xCC => {
+            // INT3 — one-byte breakpoint; vector 3 via IVT (real-address mode).
+            // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §6.4.
+            // Unsupported here: ICEBP/INT1 (F1); protected-mode privilege checks.
+            real_mode_software_interrupt(cpu, bus, 3, next_ip)?;
+        }
         0xCD => {
             // INT imm8 — real-address mode via IVT / IDTR base.
             // Spec: Intel SDM Vol. 2 "INT n", Vol. 3 §6.4 (real-address mode).
@@ -1158,6 +1164,39 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8E)));
         assert_eq!(cpu.cs.selector, 0); // unchanged
+    }
+
+    /// INT3 delivers vector 3 through the IVT like INT 3 (SDM Vol. 2 INT3; Vol. 3 §6.4).
+    #[test]
+    fn int3_real_mode_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[3] at linear 0x0C: offset 0x0900, segment 0x0000
+        mem[0x0C] = 0x00;
+        mem[0x0D] = 0x09;
+        mem[0x0E] = 0x00;
+        mem[0x0F] = 0x00;
+        mem[0] = 0xCC; // INT3
+        mem[0x900] = 0xF4; // handler HLT
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        let saved_flags = cpu.rflags as u16;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0900);
+        assert!(!cpu.interrupt_flag());
+        // Stack top→: return IP (=1 after CC), CS, FLAGS
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 1);
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
     }
 
     /// CLC/STC toggle CF only; CLD/STD toggle DF only (SDM Vol. 2).
