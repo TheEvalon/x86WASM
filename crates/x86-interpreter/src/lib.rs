@@ -59,6 +59,16 @@ fn set_logic_flags_u16(cpu: &mut CpuState, result: u16) {
     cpu.set_pf(parity_even(result as u8));
 }
 
+fn set_add_flags_u8(cpu: &mut CpuState, a: u8, b: u8, result: u8) {
+    cpu.set_cf((u16::from(a) + u16::from(b)) > 0xFF);
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x80 != 0);
+    cpu.set_pf(parity_even(result));
+    cpu.set_af(((a ^ b ^ result) & 0x10) != 0);
+    let of = (!(a ^ b) & (a ^ result) & 0x80) != 0;
+    cpu.set_of(of);
+}
+
 fn set_add_flags_u16(cpu: &mut CpuState, a: u16, b: u16, result: u16) {
     cpu.set_cf((a as u32) + (b as u32) > 0xFFFF);
     cpu.set_zf(result == 0);
@@ -87,6 +97,147 @@ fn set_sub_flags_u8(cpu: &mut CpuState, a: u8, b: u8, result: u8) {
     cpu.set_af(((a ^ b ^ result) & 0x10) != 0);
     let of = ((a ^ b) & (a ^ result) & 0x80) != 0;
     cpu.set_of(of);
+}
+
+fn set_adc_flags_u8(cpu: &mut CpuState, a: u8, b: u8, cf_in: bool, result: u8) {
+    let cf = u8::from(cf_in);
+    let sum = u16::from(a) + u16::from(b) + u16::from(cf);
+    cpu.set_cf(sum > 0xFF);
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x80 != 0);
+    cpu.set_pf(parity_even(result));
+    cpu.set_af((u16::from(a & 0xF) + u16::from(b & 0xF) + u16::from(cf)) > 0xF);
+    let of = (!(a ^ b) & (a ^ result) & 0x80) != 0;
+    cpu.set_of(of);
+}
+
+fn set_adc_flags_u16(cpu: &mut CpuState, a: u16, b: u16, cf_in: bool, result: u16) {
+    let cf = u16::from(cf_in);
+    let sum = u32::from(a) + u32::from(b) + u32::from(cf);
+    cpu.set_cf(sum > 0xFFFF);
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x8000 != 0);
+    cpu.set_pf(parity_even(result as u8));
+    cpu.set_af(((a & 0xF) + (b & 0xF) + cf) > 0xF);
+    let of = (!(a ^ b) & (a ^ result) & 0x8000) != 0;
+    cpu.set_of(of);
+}
+
+fn set_sbb_flags_u8(cpu: &mut CpuState, a: u8, b: u8, cf_in: bool, result: u8) {
+    let cf = u8::from(cf_in);
+    cpu.set_cf(u16::from(a) < u16::from(b) + u16::from(cf));
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x80 != 0);
+    cpu.set_pf(parity_even(result));
+    cpu.set_af((a & 0xF) < ((b & 0xF) + cf));
+    let of = ((a ^ b) & (a ^ result) & 0x80) != 0;
+    cpu.set_of(of);
+}
+
+fn set_sbb_flags_u16(cpu: &mut CpuState, a: u16, b: u16, cf_in: bool, result: u16) {
+    let cf = u16::from(cf_in);
+    cpu.set_cf(u32::from(a) < u32::from(b) + u32::from(cf));
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x8000 != 0);
+    cpu.set_pf(parity_even(result as u8));
+    cpu.set_af((a & 0xF) < ((b & 0xF) + cf));
+    let of = ((a ^ b) & (a ^ result) & 0x8000) != 0;
+    cpu.set_of(of);
+}
+
+/// Group 1 ALU on 8-bit operands. Spec: Intel SDM Vol. 2 opcode map (80 /r).
+/// Returns `Some(result)` to write back, or `None` for CMP.
+fn grp1_u8(cpu: &mut CpuState, op: u8, a: u8, b: u8) -> Result<Option<u8>, ExecError> {
+    let cf_in = cpu.rflags & 1 != 0;
+    match op {
+        0 => {
+            let r = a.wrapping_add(b);
+            set_add_flags_u8(cpu, a, b, r);
+            Ok(Some(r))
+        }
+        1 => {
+            let r = a | b;
+            set_logic_flags_u8(cpu, r);
+            Ok(Some(r))
+        }
+        2 => {
+            let r = a.wrapping_add(b).wrapping_add(u8::from(cf_in));
+            set_adc_flags_u8(cpu, a, b, cf_in, r);
+            Ok(Some(r))
+        }
+        3 => {
+            let r = a.wrapping_sub(b).wrapping_sub(u8::from(cf_in));
+            set_sbb_flags_u8(cpu, a, b, cf_in, r);
+            Ok(Some(r))
+        }
+        4 => {
+            let r = a & b;
+            set_logic_flags_u8(cpu, r);
+            Ok(Some(r))
+        }
+        5 => {
+            let r = a.wrapping_sub(b);
+            set_sub_flags_u8(cpu, a, b, r);
+            Ok(Some(r))
+        }
+        6 => {
+            let r = a ^ b;
+            set_logic_flags_u8(cpu, r);
+            Ok(Some(r))
+        }
+        7 => {
+            set_sub_flags_u8(cpu, a, b, a.wrapping_sub(b));
+            Ok(None)
+        }
+        _ => Err(ExecError::Unsupported(0x80)),
+    }
+}
+
+/// Group 1 ALU on 16-bit operands. Spec: Intel SDM Vol. 2 opcode map (81/83 /r).
+fn grp1_u16(cpu: &mut CpuState, op: u8, a: u16, b: u16) -> Result<Option<u16>, ExecError> {
+    let cf_in = cpu.rflags & 1 != 0;
+    match op {
+        0 => {
+            let r = a.wrapping_add(b);
+            set_add_flags_u16(cpu, a, b, r);
+            Ok(Some(r))
+        }
+        1 => {
+            let r = a | b;
+            set_logic_flags_u16(cpu, r);
+            Ok(Some(r))
+        }
+        2 => {
+            let r = a.wrapping_add(b).wrapping_add(u16::from(cf_in));
+            set_adc_flags_u16(cpu, a, b, cf_in, r);
+            Ok(Some(r))
+        }
+        3 => {
+            let r = a.wrapping_sub(b).wrapping_sub(u16::from(cf_in));
+            set_sbb_flags_u16(cpu, a, b, cf_in, r);
+            Ok(Some(r))
+        }
+        4 => {
+            let r = a & b;
+            set_logic_flags_u16(cpu, r);
+            Ok(Some(r))
+        }
+        5 => {
+            let r = a.wrapping_sub(b);
+            set_sub_flags_u16(cpu, a, b, r);
+            Ok(Some(r))
+        }
+        6 => {
+            let r = a ^ b;
+            set_logic_flags_u16(cpu, r);
+            Ok(Some(r))
+        }
+        7 => {
+            set_sub_flags_u16(cpu, a, b, a.wrapping_sub(b));
+            Ok(None)
+        }
+        _ => Err(ExecError::Unsupported(0x81)),
+    }
 }
 
 /// 16-bit effective address from ModRM (real-mode / 16-bit address size).
@@ -807,6 +958,39 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let v = read_rm_u16(cpu, bus, &insn)?;
             let r = grp2_u16(cpu, m.reg, v, 1)?;
             write_rm_u16(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
+        }
+        0x80 => {
+            // Group 1 r/m8, imm8 — Spec: Intel SDM Vol. 2 opcode map / ADD…CMP.
+            // Unsupported here: opcode 82 alias; AH/CH/DH/BH high-byte rm; LOCK.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = read_rm_u8(cpu, bus, &insn)?;
+            let b = insn.immediate as u8;
+            if let Some(r) = grp1_u8(cpu, m.reg, a, b)? {
+                write_rm_u8(cpu, bus, &insn, r)?;
+            }
+            cpu.set_ip16(next_ip);
+        }
+        0x81 => {
+            // Group 1 r/m16, imm16 — Spec: Intel SDM Vol. 2.
+            // Unsupported here: opsize 32 (imm32); LOCK.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = read_rm_u16(cpu, bus, &insn)?;
+            let b = insn.immediate as u16;
+            if let Some(r) = grp1_u16(cpu, m.reg, a, b)? {
+                write_rm_u16(cpu, bus, &insn, r)?;
+            }
+            cpu.set_ip16(next_ip);
+        }
+        0x83 => {
+            // Group 1 r/m16, imm8 (sign-extended) — Spec: Intel SDM Vol. 2.
+            // Unsupported here: opsize 32; LOCK.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = read_rm_u16(cpu, bus, &insn)?;
+            let b = insn.immediate as i8 as i16 as u16;
+            if let Some(r) = grp1_u16(cpu, m.reg, a, b)? {
+                write_rm_u16(cpu, bus, &insn, r)?;
+            }
             cpu.set_ip16(next_ip);
         }
         0xC0 => {
@@ -2244,6 +2428,111 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ax(), 0x2000);
         assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1000);
+    }
+
+    /// Group 1 80/81/83 imm ALU — results and flags (SDM Vol. 2).
+    #[test]
+    fn grp1_imm_alu() {
+        let mut mem = vec![0u8; 0x10000];
+        // 80 C0 01 = ADD AL,1
+        // 80 E0 0F = AND AL,0x0F
+        // 80 F8 05 = CMP AL,5
+        // 81 C3 00 10 = ADD BX,0x1000
+        // 83 EB 01 = SUB BX,1 (imm8 sign-ext)
+        // 83 D8 FF = SBB AX,-1 with CF
+        mem[0] = 0x80;
+        mem[1] = 0xC0;
+        mem[2] = 0x01;
+        mem[3] = 0x80;
+        mem[4] = 0xE0;
+        mem[5] = 0x0F;
+        mem[6] = 0x80;
+        mem[7] = 0xF8;
+        mem[8] = 0x05;
+        mem[9] = 0x81;
+        mem[10] = 0xC3;
+        mem[11] = 0x00;
+        mem[12] = 0x10;
+        mem[13] = 0x83;
+        mem[14] = 0xEB;
+        mem[15] = 0x01;
+        mem[16] = 0x83;
+        mem[17] = 0xD8;
+        mem[18] = 0xFF;
+        mem[19] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_al(0x10);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // ADD AL,1
+        assert_eq!(cpu.al(), 0x11);
+        assert_eq!(cpu.rflags & 1, 0);
+
+        step(&mut cpu, &mut bus).unwrap(); // AND AL,0x0F
+        assert_eq!(cpu.al(), 0x01);
+        assert_eq!(cpu.rflags & 1, 0); // logic clears CF
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0
+
+        let al_before = cpu.al();
+        step(&mut cpu, &mut bus).unwrap(); // CMP AL,5 → 1-5
+        assert_eq!(cpu.al(), al_before); // CMP no write
+        assert_ne!(cpu.rflags & 1, 0); // CF=1 (borrow)
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0
+
+        cpu.set_gpr_u16(CpuState::RBX, 0x0200);
+        step(&mut cpu, &mut bus).unwrap(); // ADD BX,0x1000
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1200);
+
+        step(&mut cpu, &mut bus).unwrap(); // SUB BX,1
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x11FF);
+
+        cpu.set_ax(0x0001);
+        cpu.set_cf(true);
+        step(&mut cpu, &mut bus).unwrap(); // SBB AX, -1 (=0xFFFF): 1 - (-1) - 1 = 1
+        assert_eq!(cpu.ax(), 0x0001);
+    }
+
+    #[test]
+    fn grp1_adc_or_xor_mem() {
+        // 80 06 00 40 7F = ADD byte [0x4000], 0x7F
+        // 80 0E 00 40 01 = OR  byte [0x4000], 1
+        // 80 36 00 40 FF = XOR byte [0x4000], 0xFF
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x80;
+        mem[1] = 0x06;
+        mem[2] = 0x00;
+        mem[3] = 0x40;
+        mem[4] = 0x7F;
+        mem[5] = 0x80;
+        mem[6] = 0x0E;
+        mem[7] = 0x00;
+        mem[8] = 0x40;
+        mem[9] = 0x01;
+        mem[10] = 0x80;
+        mem[11] = 0x36;
+        mem[12] = 0x00;
+        mem[13] = 0x40;
+        mem[14] = 0xFF;
+        mem[0x4000] = 0x01;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0x80);
+        assert_ne!(cpu.rflags & (1 << 11), 0); // OF: 0x01+0x7F → 0x80
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0x81);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0x7E);
     }
 
     /// LOOP/LOOPcc decrement CX then branch; JCXZ tests CX (SDM Vol. 2).

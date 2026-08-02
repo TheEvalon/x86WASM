@@ -17,6 +17,8 @@ pub enum Encoding {
     /// Opcode encodes register in low 3 bits (e.g. `B8+rw`).
     OpcodeReg,
     ModrmImm8,
+    /// ModRM plus imm16 (e.g. Group 1 `81 /r iw`).
+    ModrmImm16,
     /// `OUT imm8, AL` / `IN AL, imm8`
     Imm8Port,
 }
@@ -490,6 +492,28 @@ pub const M1_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "IRET",
     },
+    // Group 1: ALU imm — ModRM.reg selects op (SDM Vol. 2 opcode map).
+    InstrDef {
+        mnemonic: "GRP1",
+        opcode: 0x80,
+        encoding: Encoding::ModrmImm8,
+        width: Width::W8,
+        sdm: "ADD/OR/ADC/SBB/AND/SUB/XOR/CMP",
+    },
+    InstrDef {
+        mnemonic: "GRP1",
+        opcode: 0x81,
+        encoding: Encoding::ModrmImm16,
+        width: Width::OsZ,
+        sdm: "ADD/OR/ADC/SBB/AND/SUB/XOR/CMP",
+    },
+    InstrDef {
+        mnemonic: "GRP1",
+        opcode: 0x83,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "ADD/OR/ADC/SBB/AND/SUB/XOR/CMP",
+    },
     // Group 2: shift/rotate — ModRM.reg selects op (SDM Vol. 2 opcode map).
     InstrDef {
         mnemonic: "GRP2",
@@ -723,8 +747,8 @@ mod tests {
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
             0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0xF8, 0xF9,
             0xFC, 0xFD, 0xCC, 0x70, 0x71, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D,
-            0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0x8D, 0x86, 0x87, 0x91, 0x97, 0x98, 0x99, 0xC0, 0xC1,
-            0xD0, 0xD1, 0xD2, 0xD3, 0xE0, 0xE1, 0xE2, 0xE3, 0xF6, 0xF7,
+            0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0x8D, 0x86, 0x87, 0x91, 0x97, 0x98, 0x99, 0x80, 0x81,
+            0x83, 0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3, 0xE0, 0xE1, 0xE2, 0xE3, 0xF6, 0xF7,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

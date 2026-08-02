@@ -97,24 +97,26 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
     let mut displacement = 0i32;
     let mut immediate = 0i32;
 
-    let needs_modrm = matches!(def.encoding, Encoding::Modrm | Encoding::ModrmImm8)
-        || matches!(
-            opcode,
-            0x01 | 0x03
-                | 0x09
-                | 0x29
-                | 0x2B
-                | 0x31
-                | 0x33
-                | 0x39
-                | 0x3B
-                | 0x84
-                | 0x85
-                | 0x88
-                | 0x89
-                | 0x8A
-                | 0x8B
-        );
+    let needs_modrm = matches!(
+        def.encoding,
+        Encoding::Modrm | Encoding::ModrmImm8 | Encoding::ModrmImm16
+    ) || matches!(
+        opcode,
+        0x01 | 0x03
+            | 0x09
+            | 0x29
+            | 0x2B
+            | 0x31
+            | 0x33
+            | 0x39
+            | 0x3B
+            | 0x84
+            | 0x85
+            | 0x88
+            | 0x89
+            | 0x8A
+            | 0x8B
+    );
 
     if needs_modrm {
         if i >= bytes.len() {
@@ -210,6 +212,13 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 immediate = i32::from(bytes[i]);
                 i += 1;
             }
+            Encoding::ModrmImm16 => {
+                if i + 1 >= bytes.len() {
+                    return Err(DecodeError::Truncated);
+                }
+                immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                i += 2;
+            }
             Encoding::Rel8 => {
                 if i >= bytes.len() {
                     return Err(DecodeError::Truncated);
@@ -249,8 +258,20 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         return Err(DecodeError::TooLong);
     }
 
-    // Group 2 / Group 3: mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
-    let mnemonic = if matches!(opcode, 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xC0 | 0xC1) {
+    // Group 1 / 2 / 3: mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
+    let mnemonic = if matches!(opcode, 0x80 | 0x81 | 0x83) {
+        match modrm.map(|m| m.reg) {
+            Some(0) => "ADD",
+            Some(1) => "OR",
+            Some(2) => "ADC",
+            Some(3) => "SBB",
+            Some(4) => "AND",
+            Some(5) => "SUB",
+            Some(6) => "XOR",
+            Some(7) => "CMP",
+            _ => def.mnemonic,
+        }
+    } else if matches!(opcode, 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xC0 | 0xC1) {
         match modrm.map(|m| m.reg) {
             Some(0) => "ROL",
             Some(1) => "ROR",
@@ -518,6 +539,24 @@ mod tests {
         assert_eq!(d.length, 2);
         assert_eq!(decode(&[0xD3, 0xE8]).unwrap().mnemonic, "SHR");
         assert_eq!(decode(&[0xD2]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_grp1_imm() {
+        // Intel SDM Vol. 2 Group 1: 80/81/83 — /r selects ALU op
+        assert_eq!(decode(&[0x80, 0xC0, 0x01]).unwrap().mnemonic, "ADD"); // ADD AL,1
+        assert_eq!(decode(&[0x80, 0xE0, 0x0F]).unwrap().mnemonic, "AND"); // AND AL,0x0F
+        assert_eq!(decode(&[0x80, 0xF8, 0x00]).unwrap().mnemonic, "CMP"); // CMP AL,0
+        let d = decode(&[0x81, 0xC3, 0x34, 0x12]).unwrap(); // ADD BX, 0x1234
+        assert_eq!(d.mnemonic, "ADD");
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 4);
+        let d = decode(&[0x83, 0xE8, 0xFF]).unwrap(); // SUB AX, -1 (sign-ext)
+        assert_eq!(d.mnemonic, "SUB");
+        assert_eq!(d.immediate, 0xFF);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0x81, 0xC0]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x80, 0xC0]), Err(DecodeError::Truncated));
     }
 
     #[test]
