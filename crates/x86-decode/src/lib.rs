@@ -265,7 +265,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
     }
 
     // Group 3 TEST (F6/F7 /0 and /1) takes an immediate; other /r forms do not.
-    // Spec: Intel SDM Vol. 2 opcode map — F6 /0,/1 ib; F7 /0,/1 iw.
+    // Spec: Intel SDM Vol. 2 opcode map — F6 /0,/1 ib; F7 /0,/1 iw|id (OsZ).
     let grp3_test_imm =
         matches!(opcode, 0xF6 | 0xF7) && matches!(modrm.map(|m| m.reg), Some(0) | Some(1));
 
@@ -296,8 +296,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             }
             immediate = i32::from(bytes[i]);
             i += 1;
+        } else if prefixes.op_size_override {
+            // F7 /0,/1 id — OsZ32. Spec: Intel SDM Vol. 2 Ch. 2 (66H); opcode map.
+            if i + 3 >= bytes.len() {
+                return Err(DecodeError::Truncated);
+            }
+            immediate = i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+            i += 4;
         } else {
-            // F7 /0,/1 iw — opsize-16 path (opsize 32 out of scope).
+            // F7 /0,/1 iw — default 16-bit operand size.
             if i + 1 >= bytes.len() {
                 return Err(DecodeError::Truncated);
             }
@@ -1604,6 +1611,17 @@ mod tests {
         assert!(d.prefixes.op_size_override);
         assert_eq!(d.immediate, 4);
         assert_eq!(d.length, 4);
+
+        // Group 3 TEST r/m32, imm32 — 66 F7 /0 id
+        // Spec: Intel SDM Vol. 2 opcode map F7 /0 id; Ch. 2 (66H).
+        let d = decode(&[0x66, 0xF7, 0xC0, 0xEF, 0xBE, 0xAD, 0xDE]).unwrap();
+        assert!(d.prefixes.op_size_override);
+        assert_eq!(d.immediate as u32, 0xDEAD_BEEF);
+        assert_eq!(d.length, 7);
+        assert_eq!(
+            decode(&[0x66, 0xF7, 0xC0, 0x00, 0x00]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     /// Address-size override 0x67: 32-bit ModRM displacement / SIB forms.

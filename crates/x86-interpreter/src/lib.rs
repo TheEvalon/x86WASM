@@ -78,8 +78,7 @@ pub trait Bus {
 /// - `MemoryFault`: bus errors that could not be classified as `#GP`/`#SS`
 ///   (code fetch, IVT delivery failure)
 /// - `Unsupported`: valid-but-unimplemented forms reached after decode
-///   (remaining opsize-32: MOV moffs EAX A1/A3, POP r/m32 8F, MOV r32←Sreg
-///   zero-extend 8C, Group2/3 opsize-32 D1/C1/F7, …)
+///   (remaining opsize-32: Group2 D3 CL forms, IMUL 69/6B imm opsize-32, …)
 /// - `ArchFault`: internal only — converted to IVT delivery inside [`step`];
 ///   never returned to callers of [`step`]/[`run`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -1676,6 +1675,12 @@ fn set_shift_result_flags_u16(cpu: &mut CpuState, result: u16) {
     cpu.set_pf(parity_even(result as u8));
 }
 
+fn set_shift_result_flags_u32(cpu: &mut CpuState, result: u32) {
+    cpu.set_zf(result == 0);
+    cpu.set_sf(result & 0x8000_0000 != 0);
+    cpu.set_pf(parity_even(result as u8));
+}
+
 /// Group 2 byte ops (D0/C0/D2). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
 /// `raw_count` is masked to 5 bits; count 0 leaves dest and flags unchanged.
 fn grp2_u8(cpu: &mut CpuState, reg: u8, mut val: u8, raw_count: u8) -> Result<u8, ExecError> {
@@ -1866,6 +1871,103 @@ fn grp2_u16(cpu: &mut CpuState, reg: u8, mut val: u16, raw_count: u8) -> Result<
                 cpu.set_of(false);
             }
             set_shift_result_flags_u16(cpu, val);
+            Ok(val)
+        }
+        _ => Err(ExecError::Unsupported(0xD1)),
+    }
+}
+
+/// Group 2 dword ops (D1/C1 under OsZ32). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
+/// COUNT masked to 5 bits; RCL/RCR use COUNT mod 33.
+fn grp2_u32(cpu: &mut CpuState, reg: u8, mut val: u32, raw_count: u8) -> Result<u32, ExecError> {
+    let count = raw_count & 0x1F;
+    if count == 0 {
+        return Ok(val);
+    }
+    match reg {
+        0 => {
+            let n = count % 32;
+            if n != 0 {
+                val = val.rotate_left(u32::from(n));
+            }
+            let new_cf = (val & 1) != 0;
+            cpu.set_cf(new_cf);
+            if count == 1 {
+                cpu.set_of(((val & 0x8000_0000) != 0) ^ new_cf);
+            }
+            Ok(val)
+        }
+        1 => {
+            let n = count % 32;
+            if n != 0 {
+                val = val.rotate_right(u32::from(n));
+            }
+            let new_cf = (val & 0x8000_0000) != 0;
+            cpu.set_cf(new_cf);
+            if count == 1 {
+                cpu.set_of(((val ^ (val << 1)) & 0x8000_0000) != 0);
+            }
+            Ok(val)
+        }
+        2 => {
+            let n = count % 33;
+            for _ in 0..n {
+                let new_cf = (val & 0x8000_0000) != 0;
+                val = (val << 1) | u32::from(cpu.rflags & 1 != 0);
+                cpu.set_cf(new_cf);
+            }
+            if count == 1 {
+                let cf = cpu.rflags & 1 != 0;
+                cpu.set_of(((val & 0x8000_0000) != 0) ^ cf);
+            }
+            Ok(val)
+        }
+        3 => {
+            let n = count % 33;
+            for _ in 0..n {
+                let new_cf = (val & 1) != 0;
+                val = (val >> 1) | (u32::from(cpu.rflags & 1 != 0) << 31);
+                cpu.set_cf(new_cf);
+            }
+            if count == 1 {
+                cpu.set_of(((val ^ (val << 1)) & 0x8000_0000) != 0);
+            }
+            Ok(val)
+        }
+        4 => {
+            for _ in 0..count {
+                cpu.set_cf((val & 0x8000_0000) != 0);
+                val <<= 1;
+            }
+            if count == 1 {
+                let cf = cpu.rflags & 1 != 0;
+                cpu.set_of(((val & 0x8000_0000) != 0) ^ cf);
+            }
+            set_shift_result_flags_u32(cpu, val);
+            Ok(val)
+        }
+        5 => {
+            let orig = val;
+            for _ in 0..count {
+                cpu.set_cf((val & 1) != 0);
+                val >>= 1;
+            }
+            if count == 1 {
+                cpu.set_of((orig & 0x8000_0000) != 0);
+            }
+            set_shift_result_flags_u32(cpu, val);
+            Ok(val)
+        }
+        6 => Err(ExecError::Unsupported(0xD1)),
+        7 => {
+            for _ in 0..count {
+                cpu.set_cf((val & 1) != 0);
+                val = ((val as i32) >> 1) as u32;
+            }
+            if count == 1 {
+                cpu.set_of(false);
+            }
+            set_shift_result_flags_u32(cpu, val);
             Ok(val)
         }
         _ => Err(ExecError::Unsupported(0xD1)),
@@ -2602,15 +2704,21 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xD1 => {
-            // Group 2 r/m16, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
-            // Unsupported here: opsize 32. /6 reserved → #UD (Vol. 3 §6.15).
+            // Group 2 r/m16|32, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR; Ch. 2.
+            // /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg == 6 {
                 return real_mode_ud(cpu, bus);
             }
-            let v = read_rm_u16(cpu, bus, &insn)?;
-            let r = grp2_u16(cpu, m.reg, v, 1)?;
-            write_rm_u16(cpu, bus, &insn, r)?;
+            if opsz32(&insn) {
+                let v = read_rm_u32(cpu, bus, &insn)?;
+                let r = grp2_u32(cpu, m.reg, v, 1)?;
+                write_rm_u32(cpu, bus, &insn, r)?;
+            } else {
+                let v = read_rm_u16(cpu, bus, &insn)?;
+                let r = grp2_u16(cpu, m.reg, v, 1)?;
+                write_rm_u16(cpu, bus, &insn, r)?;
+            }
             cpu.set_ip16(next_ip);
         }
         0x80 => {
@@ -2675,15 +2783,21 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xC1 => {
-            // Group 2 r/m16, imm8 — Spec: Intel SDM Vol. 2 (COUNT masked to 5 bits).
-            // Unsupported here: opsize 32. /6 reserved → #UD (Vol. 3 §6.15).
+            // Group 2 r/m16|32, imm8 — Spec: Intel SDM Vol. 2 (COUNT masked to 5 bits); Ch. 2.
+            // /6 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg == 6 {
                 return real_mode_ud(cpu, bus);
             }
-            let v = read_rm_u16(cpu, bus, &insn)?;
-            let r = grp2_u16(cpu, m.reg, v, insn.immediate as u8)?;
-            write_rm_u16(cpu, bus, &insn, r)?;
+            if opsz32(&insn) {
+                let v = read_rm_u32(cpu, bus, &insn)?;
+                let r = grp2_u32(cpu, m.reg, v, insn.immediate as u8)?;
+                write_rm_u32(cpu, bus, &insn, r)?;
+            } else {
+                let v = read_rm_u16(cpu, bus, &insn)?;
+                let r = grp2_u16(cpu, m.reg, v, insn.immediate as u8)?;
+                write_rm_u16(cpu, bus, &insn, r)?;
+            }
             cpu.set_ip16(next_ip);
         }
         0xD2 => {
@@ -2700,10 +2814,13 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xD3 => {
             // Group 2 r/m16, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits).
-            // Unsupported here: opsize 32. /6 reserved → #UD (Vol. 3 §6.15).
+            // Unsupported here: opsize 32 (tranche-4 covers D1/C1 only). /6 → #UD.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg == 6 {
                 return real_mode_ud(cpu, bus);
+            }
+            if opsz32(&insn) {
+                return Err(ExecError::Unsupported(op));
             }
             let v = read_rm_u16(cpu, bus, &insn)?;
             let r = grp2_u16(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
@@ -2782,75 +2899,135 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xF7 => {
-            // Group 3 r/m16 — TEST/NOT/NEG/MUL/IMUL/DIV/IDIV (/0–/7).
-            // Spec: Intel SDM Vol. 2 "TEST"/"NOT"/"NEG"/"MUL"/"IMUL"/"DIV"/"IDIV"; opcode map Group 3.
-            // Unsupported here: opsize 32.
+            // Group 3 r/m16|32 — TEST/NOT/NEG/MUL/IMUL/DIV/IDIV (/0–/7).
+            // Spec: Intel SDM Vol. 2 "TEST"/"NOT"/"NEG"/"MUL"/"IMUL"/"DIV"/"IDIV"; Ch. 2 (66H).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
-            let v = read_rm_u16(cpu, bus, &insn)?;
-            match m.reg {
-                0 | 1 => {
-                    // TEST r/m16, imm16 — AND; result discarded. Flags like AND.
-                    set_logic_flags_u16(cpu, v & (insn.immediate as u16));
-                }
-                2 => {
-                    write_rm_u16(cpu, bus, &insn, !v)?;
-                }
-                3 => {
-                    let r = v.wrapping_neg();
-                    write_rm_u16(cpu, bus, &insn, r)?;
-                    set_sub_flags_u16(cpu, 0, v, r);
-                }
-                4 => {
-                    // MUL r/m16 — DX:AX = AX * r/m16. CF=OF=1 iff DX != 0; SF/ZF/AF/PF undefined.
-                    let prod = u32::from(cpu.ax()).wrapping_mul(u32::from(v));
-                    cpu.set_ax(prod as u16);
-                    cpu.set_gpr_u16(CpuState::RDX, (prod >> 16) as u16);
-                    let hi_nz = (prod >> 16) != 0;
-                    cpu.set_cf(hi_nz);
-                    cpu.set_of(hi_nz);
-                }
-                5 => {
-                    // IMUL r/m16 — DX:AX = AX * r/m16 (signed). CF=OF=1 iff result not in AX.
-                    let prod = i32::from(cpu.ax() as i16).wrapping_mul(i32::from(v as i16));
-                    cpu.set_ax(prod as u16);
-                    cpu.set_gpr_u16(CpuState::RDX, (prod >> 16) as u16);
-                    set_imul_flags_i16(cpu, prod);
-                }
-                6 => {
-                    // DIV r/m16 — DX:AX / r/m16 → AX=quot, DX=rem. #DE if divisor=0 or quot>0xFFFF.
-                    if v == 0 {
-                        return real_mode_exception(cpu, bus, 0);
+            if opsz32(&insn) {
+                let v = read_rm_u32(cpu, bus, &insn)?;
+                match m.reg {
+                    0 | 1 => {
+                        set_logic_flags_u32(cpu, v & (insn.immediate as u32));
                     }
-                    let dividend =
-                        (u32::from(cpu.gpr_u16(CpuState::RDX)) << 16) | u32::from(cpu.ax());
-                    let quot = dividend / u32::from(v);
-                    let rem = dividend % u32::from(v);
-                    if quot > 0xFFFF {
-                        return real_mode_exception(cpu, bus, 0);
+                    2 => {
+                        write_rm_u32(cpu, bus, &insn, !v)?;
                     }
-                    cpu.set_ax(quot as u16);
-                    cpu.set_gpr_u16(CpuState::RDX, rem as u16);
+                    3 => {
+                        let r = v.wrapping_neg();
+                        write_rm_u32(cpu, bus, &insn, r)?;
+                        set_sub_flags_u32(cpu, 0, v, r);
+                    }
+                    4 => {
+                        // MUL r/m32 — EDX:EAX = EAX * r/m32. CF=OF=1 iff EDX != 0.
+                        let prod = u64::from(cpu.eax()).wrapping_mul(u64::from(v));
+                        cpu.set_eax(prod as u32);
+                        cpu.set_gpr_u32(CpuState::RDX, (prod >> 32) as u32);
+                        let hi_nz = (prod >> 32) != 0;
+                        cpu.set_cf(hi_nz);
+                        cpu.set_of(hi_nz);
+                    }
+                    5 => {
+                        // IMUL r/m32 — EDX:EAX = EAX * r/m32 (signed). CF=OF=1 iff not in EAX.
+                        let prod = i64::from(cpu.eax() as i32).wrapping_mul(i64::from(v as i32));
+                        cpu.set_eax(prod as u32);
+                        cpu.set_gpr_u32(CpuState::RDX, (prod >> 32) as u32);
+                        set_imul_flags_i32(cpu, prod);
+                    }
+                    6 => {
+                        // DIV r/m32 — EDX:EAX / r/m32 → EAX=quot, EDX=rem. #DE on 0 or quot>u32::MAX.
+                        if v == 0 {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        let dividend =
+                            (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32) | u64::from(cpu.eax());
+                        let quot = dividend / u64::from(v);
+                        let rem = dividend % u64::from(v);
+                        if quot > u64::from(u32::MAX) {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        cpu.set_eax(quot as u32);
+                        cpu.set_gpr_u32(CpuState::RDX, rem as u32);
+                    }
+                    7 => {
+                        // IDIV r/m32 — signed EDX:EAX / r/m32 → EAX=quot, EDX=rem.
+                        if v == 0 {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        let dividend = ((u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
+                            | u64::from(cpu.eax())) as i64;
+                        let divisor = i64::from(v as i32);
+                        let Some(quot) = dividend.checked_div(divisor) else {
+                            return real_mode_exception(cpu, bus, 0);
+                        };
+                        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&quot) {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        let rem = dividend.wrapping_rem(divisor);
+                        cpu.set_eax(quot as u32);
+                        cpu.set_gpr_u32(CpuState::RDX, rem as u32);
+                    }
+                    _ => return Err(ExecError::Unsupported(op)),
                 }
-                7 => {
-                    // IDIV r/m16 — signed DX:AX / r/m16 → AX=quot, DX=rem. #DE on 0 or quot∉i16.
-                    if v == 0 {
-                        return real_mode_exception(cpu, bus, 0);
+            } else {
+                let v = read_rm_u16(cpu, bus, &insn)?;
+                match m.reg {
+                    0 | 1 => {
+                        set_logic_flags_u16(cpu, v & (insn.immediate as u16));
                     }
-                    let dividend = ((u32::from(cpu.gpr_u16(CpuState::RDX)) << 16)
-                        | u32::from(cpu.ax())) as i32;
-                    let divisor = i32::from(v as i16);
-                    let Some(quot) = dividend.checked_div(divisor) else {
-                        return real_mode_exception(cpu, bus, 0);
-                    };
-                    if !(i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&quot) {
-                        return real_mode_exception(cpu, bus, 0);
+                    2 => {
+                        write_rm_u16(cpu, bus, &insn, !v)?;
                     }
-                    // Safe: checked_div already rejected i32::MIN / -1.
-                    let rem = dividend.wrapping_rem(divisor);
-                    cpu.set_ax(quot as u16);
-                    cpu.set_gpr_u16(CpuState::RDX, rem as u16);
+                    3 => {
+                        let r = v.wrapping_neg();
+                        write_rm_u16(cpu, bus, &insn, r)?;
+                        set_sub_flags_u16(cpu, 0, v, r);
+                    }
+                    4 => {
+                        let prod = u32::from(cpu.ax()).wrapping_mul(u32::from(v));
+                        cpu.set_ax(prod as u16);
+                        cpu.set_gpr_u16(CpuState::RDX, (prod >> 16) as u16);
+                        let hi_nz = (prod >> 16) != 0;
+                        cpu.set_cf(hi_nz);
+                        cpu.set_of(hi_nz);
+                    }
+                    5 => {
+                        let prod = i32::from(cpu.ax() as i16).wrapping_mul(i32::from(v as i16));
+                        cpu.set_ax(prod as u16);
+                        cpu.set_gpr_u16(CpuState::RDX, (prod >> 16) as u16);
+                        set_imul_flags_i16(cpu, prod);
+                    }
+                    6 => {
+                        if v == 0 {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        let dividend =
+                            (u32::from(cpu.gpr_u16(CpuState::RDX)) << 16) | u32::from(cpu.ax());
+                        let quot = dividend / u32::from(v);
+                        let rem = dividend % u32::from(v);
+                        if quot > 0xFFFF {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        cpu.set_ax(quot as u16);
+                        cpu.set_gpr_u16(CpuState::RDX, rem as u16);
+                    }
+                    7 => {
+                        if v == 0 {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        let dividend = ((u32::from(cpu.gpr_u16(CpuState::RDX)) << 16)
+                            | u32::from(cpu.ax())) as i32;
+                        let divisor = i32::from(v as i16);
+                        let Some(quot) = dividend.checked_div(divisor) else {
+                            return real_mode_exception(cpu, bus, 0);
+                        };
+                        if !(i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&quot) {
+                            return real_mode_exception(cpu, bus, 0);
+                        }
+                        let rem = dividend.wrapping_rem(divisor);
+                        cpu.set_ax(quot as u16);
+                        cpu.set_gpr_u16(CpuState::RDX, rem as u16);
+                    }
+                    _ => return Err(ExecError::Unsupported(op)),
                 }
-                _ => return Err(ExecError::Unsupported(op)),
             }
             cpu.set_ip16(next_ip);
         }
@@ -3184,15 +3361,20 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x8F => {
-            // POP r/m16 — Group /0 only.
-            // Spec: Intel SDM Vol. 2 "POP".
-            // /1–/7 reserved → #UD (Vol. 3 §6.15). Unsupported here: opsize 32.
+            // POP r/m16|32 — Group /0 only.
+            // Spec: Intel SDM Vol. 2 "POP"; Ch. 2 (66H).
+            // /1–/7 reserved → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.reg != 0 {
                 return real_mode_ud(cpu, bus);
             }
-            let v = pop16(cpu, bus)?;
-            write_rm_u16(cpu, bus, &insn, v)?;
+            if opsz32(&insn) {
+                let v = pop32(cpu, bus)?;
+                write_rm_u32(cpu, bus, &insn, v)?;
+            } else {
+                let v = pop16(cpu, bus)?;
+                write_rm_u16(cpu, bus, &insn, v)?;
+            }
             cpu.set_ip16(next_ip);
         }
         0x68 => {
@@ -3432,19 +3614,24 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xA1 => {
-            // MOV AX, moffs16 — Spec: Intel SDM Vol. 2 "MOV".
-            // Unsupported here: opsize 32 (MOV EAX, moffs).
-            if opsz32(&insn) {
-                return Err(ExecError::Unsupported(op));
-            }
+            // MOV AX/EAX, moffs — Spec: Intel SDM Vol. 2 "MOV"; Ch. 2 (66H).
+            // Address-size selects moffs16/moffs32; operand-size selects AX/EAX.
             let off = moffs_offset(&insn);
             let seg = data_seg_for_string_src(cpu, &insn);
             let uses_ss = string_src_uses_ss(&insn);
-            let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
-            let v = bus
-                .read_u16(addr)
-                .map_err(|e| classify_mem_fault(e, uses_ss))?;
-            cpu.set_ax(v);
+            if opsz32(&insn) {
+                let addr = seg_linear_checked(seg, off, 4, uses_ss)?;
+                let v = bus
+                    .read_u32(addr)
+                    .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                cpu.set_eax(v);
+            } else {
+                let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
+                let v = bus
+                    .read_u16(addr)
+                    .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                cpu.set_ax(v);
+            }
             cpu.set_ip16(next_ip);
         }
         0xA2 => {
@@ -3458,17 +3645,19 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xA3 => {
-            // MOV moffs16, AX — Spec: Intel SDM Vol. 2 "MOV".
-            // Unsupported here: opsize 32 (MOV moffs, EAX).
-            if opsz32(&insn) {
-                return Err(ExecError::Unsupported(op));
-            }
+            // MOV moffs, AX/EAX — Spec: Intel SDM Vol. 2 "MOV"; Ch. 2 (66H).
             let off = moffs_offset(&insn);
             let seg = data_seg_for_string_src(cpu, &insn);
             let uses_ss = string_src_uses_ss(&insn);
-            let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
-            bus.write_u16(addr, cpu.ax())
-                .map_err(|e| classify_mem_fault(e, uses_ss))?;
+            if opsz32(&insn) {
+                let addr = seg_linear_checked(seg, off, 4, uses_ss)?;
+                bus.write_u32(addr, cpu.eax())
+                    .map_err(|e| classify_mem_fault(e, uses_ss))?;
+            } else {
+                let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
+                bus.write_u16(addr, cpu.ax())
+                    .map_err(|e| classify_mem_fault(e, uses_ss))?;
+            }
             cpu.set_ip16(next_ip);
         }
         0xA8 => {
@@ -3564,16 +3753,21 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x8C => {
-            // MOV r/m16, Sreg — real-address mode, 16-bit opsize.
-            // Spec: Intel SDM Vol. 2 "MOV" (r/m16, Sreg).
+            // MOV r/m16|r32, Sreg — Spec: Intel SDM Vol. 2 "MOV" (r/m16, Sreg); Ch. 2.
+            // OsZ32 + register dest: zero-extend selector into r32.
+            // Memory dest always stores 16 bits (selector width), even with 0x66.
             // Reserved Sreg encodings (reg=6,7) → #UD (Vol. 3 §6.15).
-            // Unsupported here: opsize 32 (zero-extend to r32); protected-mode side effects.
+            // Unsupported here: protected-mode side effects.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let Some(sreg) = sreg_from_modrm_reg(m.reg) else {
                 return real_mode_ud(cpu, bus);
             };
             let v = read_sreg_selector(cpu, sreg);
-            write_rm_u16(cpu, bus, &insn, v)?;
+            if opsz32(&insn) && m.mod_ == 3 {
+                cpu.set_gpr_u32(m.rm as usize, u32::from(v));
+            } else {
+                write_rm_u16(cpu, bus, &insn, v)?;
+            }
             cpu.set_ip16(next_ip);
         }
         0x8D => {
@@ -10158,6 +10352,245 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap(); // RETF
         assert_eq!(cpu.cs.selector, 0);
         assert_eq!(cpu.ip16(), 0x35);
+    }
+
+    /// 0x66 tranche-4: MOV moffs EAX (A1/A3), POP r/m32 (8F), MOV r32←Sreg (8C).
+    /// Spec: Intel SDM Vol. 2 MOV/POP; Ch. 2 (66H); Vol. 1 §3.6.
+    #[test]
+    fn opsize32_moffs_eax_pop_rm32_mov_sreg_r32() {
+        let mut mem = vec![0u8; 0x10000];
+        // moffs dword at DS:0x3000
+        mem[0x3000] = 0x78;
+        mem[0x3001] = 0x56;
+        mem[0x3002] = 0x34;
+        mem[0x3003] = 0x12;
+        // 66 A1 00 30 = MOV EAX, moffs16 0x3000
+        mem[0] = 0x66;
+        mem[1] = 0xA1;
+        mem[2] = 0x00;
+        mem[3] = 0x30;
+        // 66 A3 00 40 = MOV moffs16 0x4000, EAX
+        mem[4] = 0x66;
+        mem[5] = 0xA3;
+        mem[6] = 0x00;
+        mem[7] = 0x40;
+        // 66 8C D8 = MOV EAX, DS (zero-extend selector)
+        mem[8] = 0x66;
+        mem[9] = 0x8C;
+        mem[10] = 0xD8;
+        // 66 8C 06 00 50 = MOV [0x5000], ES — memory dest still 16-bit store
+        mem[11] = 0x66;
+        mem[12] = 0x8C;
+        mem[13] = 0x06;
+        mem[14] = 0x00;
+        mem[15] = 0x50;
+        // 66 8F C3 = POP EBX
+        mem[16] = 0x66;
+        mem[17] = 0x8F;
+        mem[18] = 0xC3;
+        // 66 8F 06 00 60 = POP dword [0x6000]
+        mem[19] = 0x66;
+        mem[20] = 0x8F;
+        mem[21] = 0x06;
+        mem[22] = 0x00;
+        mem[23] = 0x60;
+        mem[24] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0xABCD);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFA);
+        // Stack: dword 0x11111111 at SP=0xFFFA; dword 0x22222222 at SP=0xFFF6
+        mem[0xFFFA] = 0x11;
+        mem[0xFFFB] = 0x11;
+        mem[0xFFFC] = 0x11;
+        mem[0xFFFD] = 0x11;
+        mem[0xFFF6] = 0x22;
+        mem[0xFFF7] = 0x22;
+        mem[0xFFF8] = 0x22;
+        mem[0xFFF9] = 0x22;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV EAX, moffs
+        assert_eq!(cpu.eax(), 0x1234_5678);
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV moffs, EAX
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0x1234_5678);
+
+        cpu.set_eax(0xDEAD_BEEF);
+        cpu.ds = x86_core::SegmentReg::real_mode(0x1234);
+        step(&mut cpu, &mut bus).unwrap(); // MOV EAX, DS
+        assert_eq!(cpu.eax(), 0x0000_1234);
+
+        // Poison high word of memory so 16-bit store is observable.
+        bus.mem[0x5000] = 0xFF;
+        bus.mem[0x5001] = 0xFF;
+        bus.mem[0x5002] = 0xEE;
+        bus.mem[0x5003] = 0xEE;
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        step(&mut cpu, &mut bus).unwrap(); // MOV [0x5000], ES
+        assert_eq!(bus.read_u16(0x5000).unwrap(), 0xABCD);
+        assert_eq!(bus.mem[0x5002], 0xEE); // upper bytes untouched
+        assert_eq!(bus.mem[0x5003], 0xEE);
+
+        step(&mut cpu, &mut bus).unwrap(); // POP EBX
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x1111_1111);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFF6);
+        step(&mut cpu, &mut bus).unwrap(); // POP dword [0x6000]
+        assert_eq!(bus.read_u32(0x6000).unwrap(), 0x2222_2222);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFA);
+    }
+
+    /// 0x66 Group 2 D1/C1 and Group 3 F7 dword forms.
+    /// Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR; TEST/NOT/NEG/MUL/IMUL/DIV/IDIV; Ch. 2.
+    #[test]
+    fn opsize32_grp2_d1_c1_and_grp3_f7() {
+        let mut mem = vec![0u8; 0x10000];
+        // 66 D1 E0       = SHL EAX, 1
+        mem[0] = 0x66;
+        mem[1] = 0xD1;
+        mem[2] = 0xE0;
+        // 66 C1 E8 04    = SHR EAX, 4
+        mem[3] = 0x66;
+        mem[4] = 0xC1;
+        mem[5] = 0xE8;
+        mem[6] = 0x04;
+        // 66 D1 C0       = ROL EAX, 1
+        mem[7] = 0x66;
+        mem[8] = 0xD1;
+        mem[9] = 0xC0;
+        // 66 F7 D0       = NOT EAX
+        mem[10] = 0x66;
+        mem[11] = 0xF7;
+        mem[12] = 0xD0;
+        // 66 F7 D8       = NEG EAX
+        mem[13] = 0x66;
+        mem[14] = 0xF7;
+        mem[15] = 0xD8;
+        // 66 F7 C0 EF BE AD DE = TEST EAX, 0xDEADBEEF
+        mem[16] = 0x66;
+        mem[17] = 0xF7;
+        mem[18] = 0xC0;
+        mem[19] = 0xEF;
+        mem[20] = 0xBE;
+        mem[21] = 0xAD;
+        mem[22] = 0xDE;
+        // 66 F7 E3       = MUL EBX
+        mem[23] = 0x66;
+        mem[24] = 0xF7;
+        mem[25] = 0xE3;
+        // 66 F7 EB       = IMUL EBX
+        mem[26] = 0x66;
+        mem[27] = 0xF7;
+        mem[28] = 0xEB;
+        // 66 F7 F3       = DIV EBX
+        mem[29] = 0x66;
+        mem[30] = 0xF7;
+        mem[31] = 0xF3;
+        // 66 F7 FB       = IDIV EBX
+        mem[32] = 0x66;
+        mem[33] = 0xF7;
+        mem[34] = 0xFB;
+        // 66 F7 06 00 40 = NOT dword [0x4000]
+        mem[35] = 0x66;
+        mem[36] = 0xF7;
+        mem[37] = 0x16;
+        mem[38] = 0x00;
+        mem[39] = 0x40; // /2 NOT mem — ModRM 0x16 = mod=00 reg=2 rm=6 → [disp16]
+        mem[40] = 0xF4;
+        mem[0x4000] = 0x0F;
+        mem[0x4001] = 0x0F;
+        mem[0x4002] = 0x0F;
+        mem[0x4003] = 0x0F;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        cpu.set_eax(0x4000_0000);
+        step(&mut cpu, &mut bus).unwrap(); // SHL EAX,1
+        assert_eq!(cpu.eax(), 0x8000_0000);
+        assert_eq!(cpu.rflags & 1, 0); // CF
+        assert_ne!(cpu.rflags & (1 << 11), 0); // OF
+        assert_ne!(cpu.rflags & (1 << 7), 0); // SF
+
+        step(&mut cpu, &mut bus).unwrap(); // SHR EAX,4
+        assert_eq!(cpu.eax(), 0x0800_0000);
+
+        cpu.set_eax(0x8000_0000);
+        step(&mut cpu, &mut bus).unwrap(); // ROL EAX,1
+        assert_eq!(cpu.eax(), 0x0000_0001);
+        assert_ne!(cpu.rflags & 1, 0); // CF=1
+
+        cpu.set_eax(0x0F0F_0F0F);
+        let flags_before = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap(); // NOT EAX
+        assert_eq!(cpu.eax(), 0xF0F0_F0F0);
+        assert_eq!(cpu.rflags, flags_before);
+
+        cpu.set_eax(1);
+        step(&mut cpu, &mut bus).unwrap(); // NEG EAX
+        assert_eq!(cpu.eax(), 0xFFFF_FFFF);
+        assert_ne!(cpu.rflags & 1, 0); // CF
+        assert_ne!(cpu.rflags & (1 << 7), 0); // SF
+
+        // Imm high half must participate: 0x12345678 & 0xFFFF0000 = 0x12340000 (ZF clear).
+        // A mistaken imm16 decode (0x0000) would yield ZF set — catch length too (IP += 7).
+        cpu.set_eax(0x1234_5678);
+        let ip_before_test = cpu.ip16();
+        step(&mut cpu, &mut bus).unwrap(); // TEST EAX, 0xDEADBEEF
+        assert_eq!(cpu.ip16(), ip_before_test + 7);
+        assert_eq!(cpu.eax(), 0x1234_5678); // unchanged
+        assert_eq!(cpu.rflags & 1, 0); // CF
+        assert_eq!(cpu.rflags & (1 << 11), 0); // OF
+                                               // Result 0x12341668: ZF clear, SF clear.
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF
+        assert_eq!(cpu.rflags & (1 << 7), 0); // SF
+
+        // MUL EBX: EAX=2, EBX=3 → EDX:EAX = 0:6; CF=OF=0
+        cpu.set_eax(2);
+        cpu.set_gpr_u32(CpuState::RBX, 3);
+        cpu.set_gpr_u32(CpuState::RDX, 0xFFFF_FFFF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 6);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // IMUL EBX: EAX=-2, EBX=-3 → 6; fits in i32 → CF=OF=0
+        cpu.set_eax(0xFFFF_FFFE);
+        cpu.set_gpr_u32(CpuState::RBX, 0xFFFF_FFFD);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 6);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0);
+        assert_eq!(cpu.rflags & 1, 0);
+        assert_eq!(cpu.rflags & (1 << 11), 0);
+
+        // DIV EBX: EDX:EAX = 0:100 / 7 → quot=14 rem=2
+        cpu.set_eax(100);
+        cpu.set_gpr_u32(CpuState::RDX, 0);
+        cpu.set_gpr_u32(CpuState::RBX, 7);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 14);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 2);
+
+        // IDIV EBX: EDX:EAX = -20 / 3 → quot=-6 rem=-2
+        cpu.set_eax((-20i32) as u32);
+        cpu.set_gpr_u32(CpuState::RDX, 0xFFFF_FFFF); // sign-extend
+        cpu.set_gpr_u32(CpuState::RBX, 3);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), (-6i32) as u32);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), (-2i32) as u32);
+
+        step(&mut cpu, &mut bus).unwrap(); // NOT dword [0x4000]
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0xF0F0_F0F0);
     }
 
     /// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
