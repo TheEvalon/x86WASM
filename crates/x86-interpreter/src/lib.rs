@@ -1331,10 +1331,11 @@ fn real_mode_software_interrupt(
     Ok(())
 }
 
-/// Real-mode exception fault delivery (#DE, #UD, …) through the IVT.
+/// Real-mode exception fault delivery (#DE, #UD, #BR, …) through the IVT.
 ///
 /// Saved IP is the faulting instruction address (instruction start).
 /// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.15 (exception reference).
+/// Note: #OF from INTO is a trap (use [`real_mode_software_interrupt`] with next IP).
 fn real_mode_exception(cpu: &mut CpuState, bus: &mut dyn Bus, vector: u8) -> Result<(), ExecError> {
     real_mode_software_interrupt(cpu, bus, vector, cpu.ip16())
 }
@@ -1710,6 +1711,17 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // INT imm8 — real-address mode via IVT / IDTR base.
             // Spec: Intel SDM Vol. 2 "INT n", Vol. 3 §6.4 (real-address mode).
             real_mode_software_interrupt(cpu, bus, insn.immediate as u8, next_ip)?;
+        }
+        0xCE => {
+            // INTO — if OF=1, #OF (vector 4) trap via IVT; else fall through.
+            // Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1"; Vol. 3 §6.15 (#OF — trap).
+            // Saved IP is the following instruction (trap class).
+            // Unsupported here: 64-bit mode (#UD); protected-mode privilege checks.
+            if cpu.rflags & (1 << 11) != 0 {
+                real_mode_software_interrupt(cpu, bus, 4, next_ip)?;
+            } else {
+                cpu.set_ip16(next_ip);
+            }
         }
         0xCF => {
             // IRET — real-address mode (16-bit stack frame).
@@ -2207,6 +2219,27 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_gpr_u16(CpuState::RDX, dx);
             cpu.set_gpr_u16(CpuState::RCX, cx);
             cpu.set_gpr_u16(CpuState::RAX, ax);
+            cpu.set_ip16(next_ip);
+        }
+        0x62 => {
+            // BOUND r16, m16&16 — signed index in reg vs lower/upper bounds in memory.
+            // Spec: Intel SDM Vol. 2 "BOUND"; Vol. 3 §6.15 (#BR — fault, vector 5).
+            // Register form (mod=11) → #UD. #BR saved IP = BOUND instruction.
+            // Unsupported here: opsize 32 (BOUND r32, m32&32); protected mode; 64-bit (#UD).
+            if opsz32(&insn) {
+                return Err(ExecError::Unsupported(op));
+            }
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.mod_ == 3 {
+                return real_mode_ud(cpu, bus);
+            }
+            let (addr, _) = ea_16(cpu, &insn)?;
+            let lower = bus.read_u16(addr)? as i16;
+            let upper = bus.read_u16(addr.wrapping_add(2))? as i16;
+            let index = cpu.gpr_u16(m.reg as usize) as i16;
+            if index < lower || index > upper {
+                return real_mode_exception(cpu, bus, 5);
+            }
             cpu.set_ip16(next_ip);
         }
         0x8F => {
@@ -4796,6 +4829,150 @@ mod tests {
         assert_eq!(bus.read_u16(0xFFF8).unwrap(), 1);
         assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0);
         assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+    }
+
+    /// INTO: OF=0 falls through; OF=1 delivers #OF (vector 4) as a trap (return IP = next).
+    /// Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1"; Vol. 3 §6.15 (#OF — trap).
+    #[test]
+    fn into_overflow_trap_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[4] → 0000:0A00
+        mem[0x10] = 0x00;
+        mem[0x11] = 0x0A;
+        mem[0x12] = 0x00;
+        mem[0x13] = 0x00;
+        mem[0] = 0xCE; // INTO
+        mem[1] = 0xF4; // fall-through HLT when OF clear
+        mem[0xA00] = 0xF4; // #OF handler
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_of(false);
+        cpu.set_interrupt_flag(true);
+        let flags_clear = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // OF clear → no vectoring; IP advances past INTO
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 1);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+        assert_eq!(cpu.rflags, flags_clear);
+        assert!(cpu.interrupt_flag());
+
+        // OF set → vector 4; saved IP = next (trap), IF cleared
+        cpu.rip = 0;
+        cpu.set_of(true);
+        cpu.set_interrupt_flag(true);
+        let saved_flags = cpu.rflags as u16;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0A00);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 1); // return IP after INTO
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+    }
+
+    /// BOUND checks signed index against m16&16; #BR (vector 5) is a fault (IP = BOUND).
+    /// Spec: Intel SDM Vol. 2 "BOUND"; Vol. 3 §6.15 (#BR — fault).
+    #[test]
+    fn bound_index_check_and_br_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[5] → 0000:0B00
+        mem[0x14] = 0x00;
+        mem[0x15] = 0x0B;
+        mem[0x16] = 0x00;
+        mem[0x17] = 0x00;
+        // Bounds at DS:0x2000 — lower=0x0010, upper=0x0020 (signed)
+        mem[0x2000] = 0x10;
+        mem[0x2001] = 0x00;
+        mem[0x2002] = 0x20;
+        mem[0x2003] = 0x00;
+        // 62 06 00 20 = BOUND AX, [0x2000]
+        mem[0] = 0x62;
+        mem[1] = 0x06;
+        mem[2] = 0x00;
+        mem[3] = 0x20;
+        mem[4] = 0xF4;
+        mem[0xB00] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_ax(0x0015); // inside [0x10, 0x20]
+        cpu.rflags = 0x246;
+        let flags_before = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 4);
+        assert_eq!(cpu.ax(), 0x0015);
+        assert_eq!(cpu.rflags, flags_before);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+
+        // Below lower bound → #BR; fault IP = 0
+        cpu.rip = 0;
+        cpu.set_ax(0x000F);
+        cpu.set_interrupt_flag(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
+        assert_eq!(cpu.ax(), 0x000F); // index unchanged
+
+        // Above upper bound → #BR
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_ax(0x0021);
+        cpu.set_interrupt_flag(true);
+        cpu.halted = false;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
+
+        // Inclusive endpoints succeed
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_ax(0x0010);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 4);
+        cpu.rip = 0;
+        cpu.set_ax(0x0020);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 4);
+    }
+
+    /// BOUND register form is #UD via IVT (SDM Vol. 2 BOUND; Vol. 3 §6.15).
+    #[test]
+    fn bound_register_source_ud_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[6] → 0000:0C00
+        mem[24] = 0x00;
+        mem[25] = 0x0C;
+        mem[26] = 0x00;
+        mem[27] = 0x00;
+        mem[0] = 0x62;
+        mem[1] = 0xC0; // BOUND AX, AX — mod=11 → #UD
+        mem[0xC00] = 0xF4;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0C00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // fault IP
     }
 
     /// CLC/STC toggle CF only; CLD/STD toggle DF only (SDM Vol. 2).

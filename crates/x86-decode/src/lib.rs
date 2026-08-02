@@ -593,6 +593,24 @@ mod tests {
     }
 
     #[test]
+    fn decode_into_bound() {
+        // Intel SDM Vol. 2: INTO — CE; BOUND r16, m16&16 — 62 /r
+        let into = decode(&[0xCE]).unwrap();
+        assert_eq!(into.mnemonic, "INTO");
+        assert_eq!(into.length, 1);
+        assert!(into.modrm.is_none());
+
+        // 62 06 00 20 = BOUND AX, [0x2000]
+        let bound = decode(&[0x62, 0x06, 0x00, 0x20]).unwrap();
+        assert_eq!(bound.mnemonic, "BOUND");
+        assert_eq!(bound.modrm.unwrap().reg, 0);
+        assert_eq!(bound.displacement, 0x2000);
+        assert_eq!(bound.length, 4);
+
+        assert_eq!(decode(&[0x62]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_jcc_short_rel8() {
         // Intel SDM Vol. 2: Jcc — 70..7F cb
         assert_eq!(decode(&[0x70, 0x05]).unwrap().mnemonic, "JO");
