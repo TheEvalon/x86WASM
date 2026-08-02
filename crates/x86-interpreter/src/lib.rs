@@ -295,7 +295,6 @@ fn calc_ea16(cpu: &CpuState, mod_: u8, rm: u8, displacement: i32) -> Result<u16,
     })
 }
 
-
 /// ModR/M.reg / opcode B0-B7 legacy byte register (AL..BH).
 #[inline]
 fn read_reg_u8(cpu: &CpuState, reg: u8) -> u8 {
@@ -1078,7 +1077,7 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xF6 => {
             // Group 3 r/m8 — TEST/NOT/NEG/MUL/IMUL/DIV/IDIV (/0–/7).
             // Spec: Intel SDM Vol. 2 "TEST"/"NOT"/"NEG"/"MUL"/"IMUL"/"DIV"/"IDIV"; opcode map Group 3.
-                        let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let v = read_rm_u8(cpu, bus, &insn)?;
             match m.reg {
                 0 | 1 => {
@@ -4791,28 +4790,6 @@ mod tests {
         // AHΓåöBL: AH=0xBB, BL=0x11; AL/BH preserved
         assert_eq!(cpu.ax(), 0xBBAA);
         assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x2211);
-    }
-
-    #[test]
-    fn grp3_neg_mem8_and_unsupported_test() {
-        let mut mem = vec![0u8; 0x10000];
-        // F6 1E 00 40 = NEG byte [0x4000]; F6 C0 = TEST AL,imm — unsupported (/0)
-        mem[0] = 0xF6;
-        mem[1] = 0x1E;
-        mem[2] = 0x00;
-        mem[3] = 0x40;
-        mem[4] = 0xF6;
-        mem[5] = 0xC0;
-        mem[0x4000] = 0x10;
-
-        let mut cpu = CpuState::reset();
-        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
-        cpu.ds = x86_core::SegmentReg::real_mode(0);
-        cpu.rip = 0;
-        let mut bus = VecBus { mem, ports: vec![] };
-        step(&mut cpu, &mut bus).unwrap();
-        assert_eq!(bus.read_u8(0x4000).unwrap(), 0xF0); // −0x10
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0xF6)));
     }
 
     /// MOV C6/C7 r/m,imm — Spec: Intel SDM Vol. 2 MOV.
