@@ -766,6 +766,24 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             write_rm_u16(cpu, bus, &insn, r)?;
             cpu.set_ip16(next_ip);
         }
+        0xD2 => {
+            // Group 2 r/m8, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits).
+            // Unsupported here: /6 reserved; AH/CH/DH/BH high-byte rm.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u8(cpu, bus, &insn)?;
+            let r = grp2_u8(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
+            write_rm_u8(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
+        }
+        0xD3 => {
+            // Group 2 r/m16, CL — Spec: Intel SDM Vol. 2 (COUNT = CL, masked to 5 bits).
+            // Unsupported here: opsize 32; /6 reserved.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let v = read_rm_u16(cpu, bus, &insn)?;
+            let r = grp2_u16(cpu, m.reg, v, cpu.gpr_u8_low(CpuState::RCX))?;
+            write_rm_u16(cpu, bus, &insn, r)?;
+            cpu.set_ip16(next_ip);
+        }
         0x70..=0x7F => {
             // Jcc rel8 — Spec: Intel SDM Vol. 2 "Jcc".
             // Unsupported here: near rel16/rel32 forms (0F 8x); JCXZ/JECXZ (E3).
@@ -1856,5 +1874,33 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x80);
+    }
+
+    /// Group 2 D2/D3 count = CL (SDM Vol. 2).
+    #[test]
+    fn grp2_cl_shl_sar() {
+        let mut mem = vec![0u8; 0x10000];
+        // D2 E0 = SHL AL, CL; D3 F8 = SAR AX, CL
+        mem[0] = 0xD2;
+        mem[1] = 0xE0;
+        mem[2] = 0xD3;
+        mem[3] = 0xF8;
+        mem[4] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_al(0x01);
+        cpu.set_gpr_u8_low(CpuState::RCX, 3);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x08);
+
+        cpu.set_ax(0x8000);
+        cpu.set_gpr_u8_low(CpuState::RCX, 4);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0xF800); // SAR sign-extends
+        assert_eq!(cpu.rflags & 1, 0); // last shifted bit was 0
     }
 }

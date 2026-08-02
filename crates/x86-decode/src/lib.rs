@@ -249,8 +249,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         return Err(DecodeError::TooLong);
     }
 
-    // Group 2 (D0/D1/C0/C1): mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
-    let mnemonic = if matches!(opcode, 0xD0 | 0xD1 | 0xC0 | 0xC1) {
+    // Group 2 (D0–D3/C0/C1): mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
+    let mnemonic = if matches!(opcode, 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xC0 | 0xC1) {
         match modrm.map(|m| m.reg) {
             Some(0) => "ROL",
             Some(1) => "ROR",
@@ -501,5 +501,15 @@ mod tests {
         assert_eq!(d.immediate, 4);
         assert_eq!(d.length, 3);
         assert_eq!(decode(&[0xC0, 0xE0]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn decode_grp2_cl() {
+        // Intel SDM Vol. 2 Group 2: D2/D3 /r (count = CL)
+        let d = decode(&[0xD2, 0xE0]).unwrap();
+        assert_eq!(d.mnemonic, "SHL");
+        assert_eq!(d.length, 2);
+        assert_eq!(decode(&[0xD3, 0xE8]).unwrap().mnemonic, "SHR");
+        assert_eq!(decode(&[0xD2]), Err(DecodeError::Truncated));
     }
 }
