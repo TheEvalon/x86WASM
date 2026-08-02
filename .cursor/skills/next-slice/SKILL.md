@@ -19,7 +19,7 @@ Produce one small, executable Cursor task — not a milestone rewrite.
 Reset vector → decoder → interpreter → port I/O → serial/debug → CLI + browser output
 ```
 
-4. Prefer Epic order A→G in `plan.md` §25 until Milestone 1 exits.
+4. Until Milestone 1 exits, prefer Epic order A→G in `plan.md` §25. After M1 HELLO exit, pick the first incomplete Milestone 2 foundation item in §21 (real-mode interrupts/exceptions before SeaBIOS/devices epics).
 5. Draft a slice with hard boundaries:
 
 ```markdown

@@ -295,4 +295,26 @@ mod tests {
             Err(DecodeError::UnsupportedOpcode(0x0F))
         ));
     }
+
+    #[test]
+    fn decode_int_imm8() {
+        // Intel SDM Vol. 2: INT imm8 — opcode CD ib
+        let d = decode(&[0xCD, 0x21]).unwrap();
+        assert_eq!(d.mnemonic, "INT");
+        assert_eq!(d.immediate, 0x21);
+        assert_eq!(d.length, 2);
+    }
+
+    #[test]
+    fn decode_iret() {
+        // Intel SDM Vol. 2: IRET — opcode CF
+        let d = decode(&[0xCF]).unwrap();
+        assert_eq!(d.mnemonic, "IRET");
+        assert_eq!(d.length, 1);
+    }
+
+    #[test]
+    fn truncated_int() {
+        assert_eq!(decode(&[0xCD]), Err(DecodeError::Truncated));
+    }
 }

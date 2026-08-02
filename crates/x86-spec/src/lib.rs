@@ -1,4 +1,4 @@
-//! Instruction metadata schema and Milestone 1 subset table.
+//! Instruction metadata schema and primary-opcode subset table.
 //!
 //! Spec authority: Intel SDM Vol. 2. Do not invent encodings.
 
@@ -37,7 +37,7 @@ pub struct InstrDef {
     pub sdm: &'static str,
 }
 
-/// Milestone 1 executable subset (primary opcodes, no escape maps).
+/// Executable primary-opcode subset (M1 HELLO path + early M2 real-mode INT).
 pub const M1_SUBSET: &[InstrDef] = &[
     InstrDef {
         mnemonic: "ADD",
@@ -222,6 +222,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "RET",
     },
     InstrDef {
+        mnemonic: "INT",
+        opcode: 0xCD,
+        encoding: Encoding::Imm8,
+        width: Width::W8,
+        sdm: "INT n",
+    },
+    InstrDef {
+        mnemonic: "IRET",
+        opcode: 0xCF,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "IRET",
+    },
+    InstrDef {
         mnemonic: "IN_imm8",
         opcode: 0xE4,
         encoding: Encoding::Imm8Port,
@@ -326,7 +340,9 @@ mod tests {
 
     #[test]
     fn subset_includes_hello_opcodes() {
-        for op in [0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9] {
+        for op in [
+            0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF,
+        ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
     }

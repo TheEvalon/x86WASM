@@ -25,6 +25,21 @@ impl SegmentReg {
             flags: 0x0093,
         }
     }
+
+    /// Real-address mode segment: `base = selector << 4` (Intel SDM Vol. 3 §3.4.2).
+    pub const fn real_mode(selector: u16) -> Self {
+        Self::flat_real(selector, (selector as u64) << 4)
+    }
+
+    /// Real-address mode code segment (same base rule; code access rights).
+    pub const fn real_mode_code(selector: u16) -> Self {
+        Self {
+            selector,
+            base: (selector as u64) << 4,
+            limit: 0xFFFF,
+            flags: 0x009B,
+        }
+    }
 }
 
 /// GDTR / IDTR.
@@ -255,6 +270,15 @@ impl CpuState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_mode_segment_base_is_selector_shifted() {
+        let s = SegmentReg::real_mode(0x1234);
+        assert_eq!(s.base, 0x1234u64 << 4);
+        let c = SegmentReg::real_mode_code(0xF000);
+        assert_eq!(c.base, 0xF000u64 << 4);
+        assert_eq!(c.flags, 0x009B);
+    }
 
     #[test]
     fn reset_vector_matches_docs() {

@@ -1,6 +1,6 @@
-//! Reference interpreter for the Milestone 1 opcode subset.
+//! Reference interpreter for the lab opcode subset (M1 + early M2).
 //!
-//! Semantics follow Intel SDM Vol. 2 for the implemented forms only.
+//! Semantics follow Intel SDM Vol. 2 / Vol. 3 for the implemented forms only.
 
 #![forbid(unsafe_code)]
 
@@ -219,6 +219,29 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
     }
 }
 
+/// Real-mode software interrupt delivery through the IVT at `IDTR.base`.
+///
+/// Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1"; Vol. 3 §6.4.
+fn real_mode_software_interrupt(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    return_ip: u16,
+) -> Result<(), ExecError> {
+    let flags16 = cpu.rflags as u16;
+    push16(cpu, bus, flags16)?;
+    push16(cpu, bus, cpu.cs.selector)?;
+    push16(cpu, bus, return_ip)?;
+    // Clear IF and TF (Vol. 2 INT n Operation, real-address mode).
+    cpu.rflags &= !((1 << 9) | (1 << 8));
+    let entry = cpu.idtr.base.wrapping_add(u64::from(vector) * 4);
+    let offset = bus.read_u16(entry)?;
+    let selector = bus.read_u16(entry.wrapping_add(2))?;
+    cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+    cpu.set_ip16(offset);
+    Ok(())
+}
+
 /// Execute a single instruction at CS:IP.
 pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     if cpu.halted {
@@ -285,6 +308,22 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xC3 => {
             let ip = pop16(cpu, bus)?;
             cpu.set_ip16(ip);
+        }
+        0xCD => {
+            // INT imm8 — real-address mode via IVT / IDTR base.
+            // Spec: Intel SDM Vol. 2 "INT n", Vol. 3 §6.4 (real-address mode).
+            real_mode_software_interrupt(cpu, bus, insn.immediate as u8, next_ip)?;
+        }
+        0xCF => {
+            // IRET — real-address mode (16-bit stack frame).
+            // Spec: Intel SDM Vol. 2 "IRET/IRETD/IRETQ".
+            let ip = pop16(cpu, bus)?;
+            let cs_sel = pop16(cpu, bus)?;
+            let flags = pop16(cpu, bus)?;
+            cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+            cpu.set_ip16(ip);
+            // Preserve high RFLAGS; bit 1 of FLAGS is reserved-1.
+            cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
         }
         0x74 => {
             // JZ
@@ -543,5 +582,109 @@ mod tests {
         };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.ports, b"Z");
+    }
+
+    /// INT n: push FLAGS/CS/IP, clear IF+TF, load IVT[vector] (SDM Vol. 2 / Vol. 3 §6.4).
+    #[test]
+    fn int_imm8_real_mode_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[0x21] at 0x84: offset 0x2000, segment 0x1000 → linear 0x12000 (out of this bus).
+        // Use segment 0x0000 offset 0x0800 so handler is in the same 64 KiB image.
+        mem[0x84] = 0x00;
+        mem[0x85] = 0x08; // offset 0x0800
+        mem[0x86] = 0x00;
+        mem[0x87] = 0x00; // segment 0x0000
+                          // Code at CS:IP = 0:0 — INT 21h
+        mem[0] = 0xCD;
+        mem[1] = 0x21;
+        // Handler at 0x800: HLT
+        mem[0x800] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        cpu.rflags |= 1 << 8; // TF set so we can observe clear
+        cpu.rflags |= 1; // CF sticky so FLAGS round-trip is visible
+        let saved_flags = cpu.rflags as u16;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0800);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(cpu.rflags & (1 << 8), 0);
+        // Stack: FLAGS, CS, IP (top)
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 2); // return IP after INT
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0); // CS
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+    }
+
+    /// IRET restores IP/CS/FLAGS from the 16-bit real-mode interrupt frame.
+    #[test]
+    fn iret_restores_real_mode_frame() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0x100] = 0xCF; // IRET
+                           // Pre-built frame at SS:SP = 0:0xFFF8 — IP, CS, FLAGS
+        mem[0xFFF8] = 0x34;
+        mem[0xFFF9] = 0x12; // IP 0x1234
+        mem[0xFFFA] = 0x00;
+        mem[0xFFFB] = 0x20; // CS 0x2000
+        mem[0xFFFC] = 0x03; // FLAGS: CF+reserved1 (IF clear)
+        mem[0xFFFD] = 0x00;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0x100;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFF8);
+        cpu.set_interrupt_flag(true);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), 0x1234);
+        assert_eq!(cpu.cs.selector, 0x2000);
+        assert_eq!(cpu.cs.base, 0x2000u64 << 4);
+        assert!(!cpu.interrupt_flag());
+        assert_ne!(cpu.rflags & 1, 0); // CF restored
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    #[test]
+    fn int_then_iret_round_trip() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[0x10] → handler at 0000:0900
+        mem[0x40] = 0x00;
+        mem[0x41] = 0x09;
+        mem[0x42] = 0x00;
+        mem[0x43] = 0x00;
+        // 0: INT 10h; HLT (return target)
+        mem[0] = 0xCD;
+        mem[1] = 0x10;
+        mem[2] = 0xF4;
+        // Handler: IRET
+        mem[0x900] = 0xCF;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        let flags_before = cpu.rflags;
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap(); // INT
+        step(&mut cpu, &mut bus).unwrap(); // IRET
+
+        assert_eq!(cpu.ip16(), 2);
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.rflags & 0xFFFF, flags_before & 0xFFFF);
+        assert!(cpu.interrupt_flag());
     }
 }
