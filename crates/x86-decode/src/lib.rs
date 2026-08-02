@@ -521,6 +521,18 @@ mod tests {
     }
 
     #[test]
+    fn decode_lea() {
+        // Intel SDM Vol. 2: LEA r16, m — 8D /r
+        // 8D 06 34 12 = LEA AX, [0x1234]
+        let d = decode(&[0x8D, 0x06, 0x34, 0x12]).unwrap();
+        assert_eq!(d.mnemonic, "LEA");
+        assert_eq!(d.modrm.unwrap().reg, 0);
+        assert_eq!(d.displacement, 0x1234);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0x8D]), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn decode_grp3_not_neg() {
         // Intel SDM Vol. 2 Group 3: F6/F7 /2 NOT, /3 NEG
         assert_eq!(decode(&[0xF6, 0xD0]).unwrap().mnemonic, "NOT"); // NOT AL

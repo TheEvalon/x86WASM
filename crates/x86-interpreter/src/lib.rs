@@ -943,6 +943,18 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             write_rm_u16(cpu, bus, &insn, v)?;
             cpu.set_ip16(next_ip);
         }
+        0x8D => {
+            // LEA r16, m — load 16-bit effective address (offset only; no memory read).
+            // Spec: Intel SDM Vol. 2 "LEA".
+            // Unsupported here: opsize 32; address-size 32; register source (#UD).
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.mod_ == 3 {
+                return Err(ExecError::Unsupported(op));
+            }
+            let off = calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?;
+            cpu.set_gpr_u16(m.reg as usize, off);
+            cpu.set_ip16(next_ip);
+        }
         0x8E => {
             // MOV Sreg, r/m16 — real-address mode load (base = selector << 4).
             // Spec: Intel SDM Vol. 2 "MOV" (Sreg, r/m16); Vol. 3 §3.4.2.
@@ -1922,6 +1934,47 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x80);
+    }
+
+    /// LEA loads 16-bit EA offset into reg (SDM Vol. 2 LEA).
+    #[test]
+    fn lea_disp16_and_bx_si() {
+        let mut mem = vec![0u8; 0x10000];
+        // 8D 06 34 12 = LEA AX, [0x1234]
+        // 8D 18 = LEA BX, [BX+SI]  (mod=00 rm=000)
+        mem[0] = 0x8D;
+        mem[1] = 0x06;
+        mem[2] = 0x34;
+        mem[3] = 0x12;
+        mem[4] = 0x8D;
+        mem[5] = 0x18;
+        mem[6] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0x9999); // must not affect LEA
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RBX, 0x0100);
+        cpu.set_gpr_u16(CpuState::RSI, 0x0020);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x1234);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x0120);
+    }
+
+    #[test]
+    fn lea_register_source_unsupported() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x8D;
+        mem[1] = 0xC0; // LEA AX, AX — mod=11 → #UD
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8D)));
     }
 
     /// Group 3 NOT/NEG (F6/F7 /2 /3). Spec: SDM Vol. 2 NOT/NEG.
