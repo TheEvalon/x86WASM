@@ -439,4 +439,12 @@ mod tests {
         assert_eq!(d.immediate, 0x10);
         assert_eq!(d.length, 2);
     }
+
+    #[test]
+    fn decode_string_byte_ops() {
+        // Intel SDM Vol. 2: MOVSB/STOSB/LODSB — A4/AA/AC
+        assert_eq!(decode(&[0xA4]).unwrap().mnemonic, "MOVSB");
+        assert_eq!(decode(&[0xAA]).unwrap().mnemonic, "STOSB");
+        assert_eq!(decode(&[0xAC]).unwrap().mnemonic, "LODSB");
+    }
 }

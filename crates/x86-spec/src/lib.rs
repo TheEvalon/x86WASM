@@ -294,6 +294,27 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "ADD",
     },
     InstrDef {
+        mnemonic: "MOVSB",
+        opcode: 0xA4,
+        encoding: Encoding::None,
+        width: Width::W8,
+        sdm: "MOVS",
+    },
+    InstrDef {
+        mnemonic: "STOSB",
+        opcode: 0xAA,
+        encoding: Encoding::None,
+        width: Width::W8,
+        sdm: "STOS",
+    },
+    InstrDef {
+        mnemonic: "LODSB",
+        opcode: 0xAC,
+        encoding: Encoding::None,
+        width: Width::W8,
+        sdm: "LODS",
+    },
+    InstrDef {
         mnemonic: "TEST",
         opcode: 0x84,
         encoding: Encoding::Modrm,
@@ -570,7 +591,7 @@ mod tests {
             0x8Au8, 0x84, 0x74, 0xBA, 0xEE, 0x43, 0xEB, 0xF4, 0xFA, 0xE9, 0xCD, 0xCF, 0x9C, 0x9D,
             0x9A, 0xCB, 0xEA, 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x8C, 0x8E, 0xF8, 0xF9,
             0xFC, 0xFD, 0xCC, 0x70, 0x71, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D,
-            0x7E, 0x7F,
+            0x7E, 0x7F, 0xA4, 0xAA, 0xAC,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

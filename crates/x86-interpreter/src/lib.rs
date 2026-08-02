@@ -239,6 +239,27 @@ fn write_sreg_real_mode(cpu: &mut CpuState, sreg: u8, selector: u16) -> Result<(
     Ok(())
 }
 
+/// SI/DI step for string ops: +size if DF=0, −size if DF=1 (SDM Vol. 1 §3.4.3).
+fn string_index_delta(cpu: &CpuState, size: u16) -> u16 {
+    if cpu.direction_flag() {
+        size.wrapping_neg()
+    } else {
+        size
+    }
+}
+
+fn data_seg_for_string_src<'a>(cpu: &'a CpuState, insn: &DecodedInsn) -> &'a x86_core::SegmentReg {
+    match insn.prefixes.segment_override {
+        Some(0x26) => &cpu.es,
+        Some(0x2E) => &cpu.cs,
+        Some(0x36) => &cpu.ss,
+        Some(0x64) => &cpu.fs,
+        Some(0x65) => &cpu.gs,
+        Some(0x3E) | None => &cpu.ds,
+        _ => &cpu.ds,
+    }
+}
+
 /// Short Jcc condition for opcodes 0x70–0x7F (Intel SDM Vol. 2, Jcc).
 fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
     let cf = cpu.rflags & 1 != 0;
@@ -528,6 +549,41 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let idx = (op - 0x58) as usize;
             let v = pop16(cpu, bus)?;
             cpu.set_gpr_u16(idx, v);
+            cpu.set_ip16(next_ip);
+        }
+        0xA4 => {
+            // MOVSB — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ".
+            // Unsupported here: MOVSW/D/Q; REP/REPE/REPNE prefixes.
+            let si = cpu.gpr_u16(CpuState::RSI);
+            let di = cpu.gpr_u16(CpuState::RDI);
+            let src = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(si));
+            let dst = linear_addr(&cpu.es, u64::from(di));
+            let v = bus.read_u8(src)?;
+            bus.write_u8(dst, v)?;
+            let d = string_index_delta(cpu, 1);
+            cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+            cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+            cpu.set_ip16(next_ip);
+        }
+        0xAA => {
+            // STOSB — Spec: Intel SDM Vol. 2 "STOS/STOSB/STOSW/STOSD/STOSQ".
+            // Unsupported here: STOSW/D/Q; REP prefix.
+            let di = cpu.gpr_u16(CpuState::RDI);
+            let dst = linear_addr(&cpu.es, u64::from(di));
+            bus.write_u8(dst, cpu.al())?;
+            let d = string_index_delta(cpu, 1);
+            cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+            cpu.set_ip16(next_ip);
+        }
+        0xAC => {
+            // LODSB — Spec: Intel SDM Vol. 2 "LODS/LODSB/LODSW/LODSD/LODSQ".
+            // Unsupported here: LODSW/D/Q; REP prefix.
+            let si = cpu.gpr_u16(CpuState::RSI);
+            let src = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(si));
+            let v = bus.read_u8(src)?;
+            cpu.set_al(v);
+            let d = string_index_delta(cpu, 1);
+            cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
             cpu.set_ip16(next_ip);
         }
         0xB0..=0xB7 => {
@@ -1179,6 +1235,62 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x8E)));
         assert_eq!(cpu.cs.selector, 0); // unchanged
+    }
+
+    /// LODSB/STOSB/MOVSB advance SI/DI by DF (SDM Vol. 2 LODS/STOS/MOVS).
+    #[test]
+    fn string_byte_ops_df_forward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xAC; // LODSB
+        mem[1] = 0xAA; // STOSB
+        mem[2] = 0xA4; // MOVSB
+        mem[3] = 0xF4;
+        mem[0x1000] = b'X';
+        mem[0x1001] = b'Y';
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_direction_flag(false);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1000);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2000);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap(); // LODSB
+        assert_eq!(cpu.al(), b'X');
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x1001);
+
+        step(&mut cpu, &mut bus).unwrap(); // STOSB
+        assert_eq!(bus.read_u8(0x2000).unwrap(), b'X');
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2001);
+
+        // MOVSB: DS:[SI]=Y → ES:[DI]
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x2001).unwrap(), b'Y');
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x1002);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2002);
+    }
+
+    #[test]
+    fn lodsb_df_backward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xAC;
+        mem[1] = 0xF4;
+        mem[0x1000] = 0xAB;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_direction_flag(true);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1000);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xAB);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x0FFF);
     }
 
     /// Short Jcc take/not-take for unsigned and signed conditions (SDM Vol. 2 Jcc).
