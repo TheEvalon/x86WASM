@@ -654,4 +654,23 @@ mod tests {
         assert_eq!(decode(&[0xF6, 0xC0]).unwrap().mnemonic, "GRP3"); // /0 TEST — not this slice
         assert_eq!(decode(&[0xF6]), Err(DecodeError::Truncated));
     }
+
+    #[test]
+    fn decode_and_or_modrm() {
+        // Intel SDM Vol. 2: OR/AND r/m,r and r,r/m (08–0B, 20–23).
+        assert_eq!(decode(&[0x08, 0xC3]).unwrap().mnemonic, "OR"); // OR BL, AL
+        assert_eq!(decode(&[0x09, 0xC3]).unwrap().mnemonic, "OR"); // OR BX, AX
+        assert_eq!(decode(&[0x0A, 0xC3]).unwrap().mnemonic, "OR"); // OR AL, BL
+        assert_eq!(decode(&[0x0B, 0xC3]).unwrap().mnemonic, "OR"); // OR AX, BX
+        assert_eq!(decode(&[0x20, 0xC3]).unwrap().mnemonic, "AND"); // AND BL, AL
+        assert_eq!(decode(&[0x21, 0xC3]).unwrap().mnemonic, "AND"); // AND BX, AX
+        assert_eq!(decode(&[0x22, 0xC3]).unwrap().mnemonic, "AND"); // AND AL, BL
+        assert_eq!(decode(&[0x23, 0xC3]).unwrap().mnemonic, "AND"); // AND AX, BX
+        let d = decode(&[0x21, 0x06, 0x00, 0x30]).unwrap(); // AND [0x3000], AX
+        assert_eq!(d.mnemonic, "AND");
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 4);
+        assert_eq!(decode(&[0x08]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x23]), Err(DecodeError::Truncated));
+    }
 }

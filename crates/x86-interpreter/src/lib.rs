@@ -1370,12 +1370,78 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_pf(parity_even(r));
             cpu.set_ip16(next_ip);
         }
+        // OR/AND ModRM — Spec: Intel SDM Vol. 2 "OR" / "AND".
+        // Flags: CF=OF=0; SF/ZF/PF from result; AF undefined (cleared here).
+        // Unsupported here: opsize 32; LOCK; segment-limit faults.
+        0x08 => {
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = read_rm_u8(cpu, bus, &insn)?;
+            let b = cpu.gpr_u8_low(m.reg as usize);
+            let r = a | b;
+            write_rm_u8(cpu, bus, &insn, r)?;
+            set_logic_flags_u8(cpu, r);
+            cpu.set_ip16(next_ip);
+        }
         0x09 => {
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let a = read_rm_u16(cpu, bus, &insn)?;
             let b = cpu.gpr_u16(m.reg as usize);
             let r = a | b;
             write_rm_u16(cpu, bus, &insn, r)?;
+            set_logic_flags_u16(cpu, r);
+            cpu.set_ip16(next_ip);
+        }
+        0x0A => {
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = cpu.gpr_u8_low(m.reg as usize);
+            let b = read_rm_u8(cpu, bus, &insn)?;
+            let r = a | b;
+            cpu.set_gpr_u8_low(m.reg as usize, r);
+            set_logic_flags_u8(cpu, r);
+            cpu.set_ip16(next_ip);
+        }
+        0x0B => {
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = cpu.gpr_u16(m.reg as usize);
+            let b = read_rm_u16(cpu, bus, &insn)?;
+            let r = a | b;
+            cpu.set_gpr_u16(m.reg as usize, r);
+            set_logic_flags_u16(cpu, r);
+            cpu.set_ip16(next_ip);
+        }
+        0x20 => {
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = read_rm_u8(cpu, bus, &insn)?;
+            let b = cpu.gpr_u8_low(m.reg as usize);
+            let r = a & b;
+            write_rm_u8(cpu, bus, &insn, r)?;
+            set_logic_flags_u8(cpu, r);
+            cpu.set_ip16(next_ip);
+        }
+        0x21 => {
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = read_rm_u16(cpu, bus, &insn)?;
+            let b = cpu.gpr_u16(m.reg as usize);
+            let r = a & b;
+            write_rm_u16(cpu, bus, &insn, r)?;
+            set_logic_flags_u16(cpu, r);
+            cpu.set_ip16(next_ip);
+        }
+        0x22 => {
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = cpu.gpr_u8_low(m.reg as usize);
+            let b = read_rm_u8(cpu, bus, &insn)?;
+            let r = a & b;
+            cpu.set_gpr_u8_low(m.reg as usize, r);
+            set_logic_flags_u8(cpu, r);
+            cpu.set_ip16(next_ip);
+        }
+        0x23 => {
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let a = cpu.gpr_u16(m.reg as usize);
+            let b = read_rm_u16(cpu, bus, &insn)?;
+            let r = a & b;
+            cpu.set_gpr_u16(m.reg as usize, r);
             set_logic_flags_u16(cpu, r);
             cpu.set_ip16(next_ip);
         }
@@ -2781,5 +2847,119 @@ mod tests {
         cpu.set_gpr_u16(CpuState::RCX, 1);
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 14);
+    }
+
+    /// OR/AND ModRM 08–0B / 20–23 — results and logic flags (SDM Vol. 2 OR/AND).
+    #[test]
+    fn and_or_modrm_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // 08 D8 = OR  AL, BL
+        // 0A C3 = OR  AL, BL  (reg ← r/m; same regs after first)
+        // 09 D8 = OR  AX, BX
+        // 0B C3 = OR  AX, BX
+        // 20 D8 = AND AL, BL
+        // 22 C3 = AND AL, BL
+        // 21 D8 = AND AX, BX
+        // 23 C3 = AND AX, BX
+        // 09 06 00 40 = OR  word [0x4000], AX
+        // 23 06 00 40 = AND AX, word [0x4000]
+        mem[0] = 0x08;
+        mem[1] = 0xD8;
+        mem[2] = 0x0A;
+        mem[3] = 0xC3;
+        mem[4] = 0x09;
+        mem[5] = 0xD8;
+        mem[6] = 0x0B;
+        mem[7] = 0xC3;
+        mem[8] = 0x20;
+        mem[9] = 0xD8;
+        mem[10] = 0x22;
+        mem[11] = 0xC3;
+        mem[12] = 0x21;
+        mem[13] = 0xD8;
+        mem[14] = 0x23;
+        mem[15] = 0xC3;
+        mem[16] = 0x09;
+        mem[17] = 0x06;
+        mem[18] = 0x00;
+        mem[19] = 0x40;
+        mem[20] = 0x23;
+        mem[21] = 0x06;
+        mem[22] = 0x00;
+        mem[23] = 0x40;
+        mem[24] = 0xF4;
+        mem[0x4000] = 0x0F;
+        mem[0x4001] = 0xF0;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_al(0xF0);
+        cpu.set_gpr_u8_low(CpuState::RBX, 0x0F);
+        cpu.set_cf(true);
+        cpu.set_of(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        // OR AL, BL (08): r/m ← r/m | reg → AL |= BL
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xFF);
+        assert_eq!(cpu.rflags & 1, 0); // CF cleared
+        assert_eq!(cpu.rflags & (1 << 11), 0); // OF cleared
+        assert_ne!(cpu.rflags & (1 << 7), 0); // SF
+
+        // OR AL, BL (0A): reg ← reg | r/m
+        cpu.set_al(0x10);
+        cpu.set_gpr_u8_low(CpuState::RBX, 0x01);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x11);
+
+        // OR AX, BX (09): r/m ← r/m | reg
+        cpu.set_ax(0xF000);
+        cpu.set_gpr_u16(CpuState::RBX, 0x0FFF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0xFFFF);
+
+        // OR AX, BX (0B): reg ← reg | r/m
+        cpu.set_ax(0x1000);
+        cpu.set_gpr_u16(CpuState::RBX, 0x0200);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x1200);
+
+        // AND AL, BL (20)
+        cpu.set_al(0xF3);
+        cpu.set_gpr_u8_low(CpuState::RBX, 0x0F);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x03);
+        assert_eq!(cpu.rflags & 1, 0);
+
+        // AND AL, BL (22)
+        cpu.set_al(0xAA);
+        cpu.set_gpr_u8_low(CpuState::RBX, 0xF0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xA0);
+
+        // AND AX, BX (21)
+        cpu.set_ax(0xFF00);
+        cpu.set_gpr_u16(CpuState::RBX, 0x0FF0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x0F00);
+
+        // AND AX, BX (23)
+        cpu.set_ax(0x1234);
+        cpu.set_gpr_u16(CpuState::RBX, 0x00FF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x0034);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0
+
+        // OR [0x4000], AX — mem destination
+        cpu.set_ax(0x00F0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 0xF0FF);
+
+        // AND AX, [0x4000]
+        cpu.set_ax(0xFFFF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0xF0FF);
     }
 }

@@ -1320,7 +1320,38 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
-Implement:
+Status (2026-08-02, branch `feat/real-mode-int-iret` / PR #1): **in progress** — early real-mode foundation only. M2 exit criteria are not met.
+
+Progress against implement list:
+
+- [x] Partial real-mode foundation (software INT/IRET/INT3, PUSHF/POPF, far CALL/RETF/JMP, segment MOV/PUSH/POP, Jcc, XCHG, LOOP/JCXZ, Group 1/2/3 subset, string byte ops without REP, LEA, CBW/CWD, flag ops, PUSH imm, SAHF/LAHF, INC/DEC r16, AND/OR ModRM 08–0B/20–23, and related ALU ModRM forms) — still incomplete vs BIOS needs
+- [ ] Complete real-mode foundation (remaining opcodes, exception delivery beyond software INT, REP strings, etc.)
+- [ ] Protected mode
+- [ ] Segmentation (beyond real-mode base<<4)
+- [ ] GDT
+- [ ] IDT (beyond real-mode IVT via IDTR.base)
+- [ ] LDT
+- [ ] TSS
+- [ ] Exceptions (fault/trap delivery beyond INT/INT3)
+- [ ] Interrupts (hardware / PIC-driven)
+- [ ] 32-bit paging
+- [ ] 8259 PIC
+- [ ] 8254 PIT
+- [ ] RTC
+- [ ] DMA
+- [ ] PS/2 controller
+- [ ] PCI configuration space
+- [ ] PIIX IDE
+- [ ] ATAPI
+- [ ] VGA text mode
+- [ ] Initial VGA graphics
+- [ ] Initial VBE
+- [ ] SeaBIOS integration
+- [ ] Floppy boot
+- [ ] Hard-disk boot
+- [ ] CD-ROM boot
+
+Implement (full M2 deliverables):
 
 - Complete real-mode foundation
 - Protected mode

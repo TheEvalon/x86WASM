@@ -41,7 +41,7 @@ pub struct InstrDef {
     pub sdm: &'static str,
 }
 
-/// Executable primary-opcode subset (M1 HELLO path + early M2 real-mode INT).
+/// Executable primary-opcode subset (M1 HELLO path + early M2 real-mode foundation).
 pub const M1_SUBSET: &[InstrDef] = &[
     InstrDef {
         mnemonic: "PUSH_ES",
@@ -108,10 +108,59 @@ pub const M1_SUBSET: &[InstrDef] = &[
     },
     InstrDef {
         mnemonic: "OR",
+        opcode: 0x08,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "OR",
+    },
+    InstrDef {
+        mnemonic: "OR",
         opcode: 0x09,
         encoding: Encoding::Modrm,
         width: Width::OsZ,
         sdm: "OR",
+    },
+    InstrDef {
+        mnemonic: "OR",
+        opcode: 0x0A,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "OR",
+    },
+    InstrDef {
+        mnemonic: "OR",
+        opcode: 0x0B,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "OR",
+    },
+    InstrDef {
+        mnemonic: "AND",
+        opcode: 0x20,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "AND",
+    },
+    InstrDef {
+        mnemonic: "AND",
+        opcode: 0x21,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "AND",
+    },
+    InstrDef {
+        mnemonic: "AND",
+        opcode: 0x22,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "AND",
+    },
+    InstrDef {
+        mnemonic: "AND",
+        opcode: 0x23,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "AND",
     },
     InstrDef {
         mnemonic: "SUB",
@@ -787,7 +836,7 @@ mod tests {
             0x68, 0x6A, 0x8C, 0x8E, 0xF8, 0xF9, 0xFC, 0xFD, 0xCC, 0x70, 0x71, 0x73, 0x76, 0x77,
             0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0xA4, 0xAA, 0xAC, 0x8D, 0x86, 0x87,
             0x91, 0x97, 0x98, 0x99, 0x80, 0x81, 0x83, 0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3, 0xE0,
-            0xE1, 0xE2, 0xE3, 0xF6, 0xF7,
+            0xE1, 0xE2, 0xE3, 0xF6, 0xF7, 0x08, 0x09, 0x0A, 0x0B, 0x20, 0x21, 0x22, 0x23,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

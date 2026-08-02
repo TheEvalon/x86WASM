@@ -4,7 +4,7 @@ Browser-capable full-system x86/x64 PC emulator (Rust core → WebAssembly) aime
 
 ## Status
 
-Milestone 0–1 bootstrap: repository, CPU laboratory, buses, decoder framework, minimal interpreter, and a serial HELLO ROM.
+Milestone 0–1 (HELLO ROM) complete on `main`. Milestone 2 in progress: early real-mode foundation on `feat/real-mode-int-iret` — see `plan.md` §21 checkboxes. SeaBIOS/FreeDOS/devices exit criteria not met.
 
 CI: see GitHub Actions on `main`.
 
