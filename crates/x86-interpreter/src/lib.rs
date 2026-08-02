@@ -611,6 +611,20 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x90 => cpu.set_ip16(next_ip),
+        0x98 => {
+            // CBW — sign-extend AL into AX. Spec: Intel SDM Vol. 2 "CBW/CWDE/CDQE".
+            // Unsupported here: CWDE (opsize 32), CDQE (REX.W).
+            let al = cpu.al() as i8 as i16 as u16;
+            cpu.set_ax(al);
+            cpu.set_ip16(next_ip);
+        }
+        0x99 => {
+            // CWD — sign-extend AX into DX:AX. Spec: Intel SDM Vol. 2 "CWD/CDQ/CQO".
+            // Unsupported here: CDQ (opsize 32), CQO (REX.W).
+            let dx = if cpu.ax() & 0x8000 != 0 { 0xFFFFu16 } else { 0 };
+            cpu.set_gpr_u16(CpuState::RDX, dx);
+            cpu.set_ip16(next_ip);
+        }
         0xF5 => {
             let cf = cpu.rflags & 1 != 0;
             cpu.set_cf(!cf);
@@ -1934,6 +1948,35 @@ mod tests {
         let mut bus = VecBus { mem, ports: vec![] };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x80);
+    }
+
+    /// CBW/CWD sign-extend AL→AX and AX→DX:AX (SDM Vol. 2).
+    #[test]
+    fn cbw_cwd_sign_extend() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x98; // CBW
+        mem[1] = 0x99; // CWD
+        mem[2] = 0x98;
+        mem[3] = 0x99;
+        mem[4] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.set_ax(0x0080); // AL negative as i8
+        cpu.set_gpr_u16(CpuState::RDX, 0x1234);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // CBW → AX=0xFF80
+        assert_eq!(cpu.ax(), 0xFF80);
+        step(&mut cpu, &mut bus).unwrap(); // CWD → DX=0xFFFF
+        assert_eq!(cpu.gpr_u16(CpuState::RDX), 0xFFFF);
+
+        cpu.set_ax(0x007F);
+        step(&mut cpu, &mut bus).unwrap(); // CBW → 0x007F
+        assert_eq!(cpu.ax(), 0x007F);
+        step(&mut cpu, &mut bus).unwrap(); // CWD → DX=0
+        assert_eq!(cpu.gpr_u16(CpuState::RDX), 0);
     }
 
     /// LEA loads 16-bit EA offset into reg (SDM Vol. 2 LEA).

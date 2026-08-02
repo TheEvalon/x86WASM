@@ -521,6 +521,13 @@ mod tests {
     }
 
     #[test]
+    fn decode_cbw_cwd() {
+        // Intel SDM Vol. 2: CBW (98), CWD (99) — 16-bit forms
+        assert_eq!(decode(&[0x98]).unwrap().mnemonic, "CBW");
+        assert_eq!(decode(&[0x99]).unwrap().mnemonic, "CWD");
+    }
+
+    #[test]
     fn decode_lea() {
         // Intel SDM Vol. 2: LEA r16, m — 8D /r
         // 8D 06 34 12 = LEA AX, [0x1234]
