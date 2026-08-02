@@ -549,6 +549,24 @@ where
     Ok(())
 }
 
+/// Read far pointer `m16:16` (offset then selector) for LES/LDS.
+/// Spec: Intel SDM Vol. 2 LES/LDS — memory operand only (mod=11 is #UD).
+fn read_far_ptr16(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+) -> Result<(u16, u16), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        // Caller should deliver #UD; keep helper defensive.
+        return Err(ExecError::Unsupported(insn.opcode));
+    }
+    let (addr, _) = ea_16(cpu, insn)?;
+    let offset = bus.read_u16(addr)?;
+    let selector = bus.read_u16(addr.wrapping_add(2))?;
+    Ok((offset, selector))
+}
+
 /// SF/ZF/PF for shift results (SHL/SHR/SAR). AF undefined — left unchanged.
 /// Spec: Intel SDM Vol. 2 SAL/SAR/SHL/SHR — Flags Affected.
 fn set_shift_result_flags_u8(cpu: &mut CpuState, result: u8) {
@@ -1038,6 +1056,34 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             let ip = pop16(cpu, bus)?;
             cpu.set_ip16(ip);
         }
+        0xC4 => {
+            // LES r16, m16:16 — load offset into r16 and selector into ES.
+            // Spec: Intel SDM Vol. 2 "LES".
+            // Register form (mod=11) → #UD (Vol. 3 §6.15).
+            // Unsupported here: opsize 32 (LES r32); protected-mode descriptor checks.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.mod_ == 3 {
+                return real_mode_ud(cpu, bus);
+            }
+            let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
+            cpu.set_gpr_u16(m.reg as usize, offset);
+            cpu.es = x86_core::SegmentReg::real_mode(selector);
+            cpu.set_ip16(next_ip);
+        }
+        0xC5 => {
+            // LDS r16, m16:16 — load offset into r16 and selector into DS.
+            // Spec: Intel SDM Vol. 2 "LDS".
+            // Register form (mod=11) → #UD (Vol. 3 §6.15).
+            // Unsupported here: opsize 32 (LDS r32); protected-mode descriptor checks.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            if m.mod_ == 3 {
+                return real_mode_ud(cpu, bus);
+            }
+            let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
+            cpu.set_gpr_u16(m.reg as usize, offset);
+            cpu.ds = x86_core::SegmentReg::real_mode(selector);
+            cpu.set_ip16(next_ip);
+        }
         0x9A => {
             // CALL far ptr16:16 — real-address mode.
             // Spec: Intel SDM Vol. 2 "CALL" (ptr16:16). Push CS then return IP; load CS:IP.
@@ -1162,6 +1208,17 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(ip);
             // Preserve high RFLAGS; bit 1 of FLAGS is reserved-1.
             cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
+        }
+        0xD7 => {
+            // XLAT/XLATB — AL ← DS:[BX + AL] (segment overrideable); 16-bit address size.
+            // Spec: Intel SDM Vol. 2 "XLAT/XLATB".
+            // Unsupported here: address-size 32 (EBX); opsize does not apply.
+            let bx = cpu.gpr_u16(CpuState::RBX);
+            let off = bx.wrapping_add(u16::from(cpu.al()));
+            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+            let v = bus.read_u8(addr)?;
+            cpu.set_al(v);
+            cpu.set_ip16(next_ip);
         }
         0xD0 => {
             // Group 2 r/m8, 1 — Spec: Intel SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
@@ -5688,5 +5745,118 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u16(0x4000).unwrap(), 0xBBBB);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFC);
+    }
+
+    /// LES/LDS load m16:16 into r16 + ES/DS (SDM Vol. 2 LES/LDS). Real mode only.
+    #[test]
+    fn les_lds_load_far_pointer() {
+        let mut mem = vec![0u8; 0x10000];
+        // Far pointer at DS:0x2000 — offset 0x5678, segment 0x1234
+        mem[0x2000] = 0x78;
+        mem[0x2001] = 0x56;
+        mem[0x2002] = 0x34;
+        mem[0x2003] = 0x12;
+        // Far pointer at DS:0x3000 — offset 0xABCD, segment 0xF000
+        mem[0x3000] = 0xCD;
+        mem[0x3001] = 0xAB;
+        mem[0x3002] = 0x00;
+        mem[0x3003] = 0xF0;
+        // C4 06 00 20 = LES AX, [0x2000]
+        // C5 1E 00 30 = LDS BX, [0x3000]
+        mem[0] = 0xC4;
+        mem[1] = 0x06;
+        mem[2] = 0x00;
+        mem[3] = 0x20;
+        mem[4] = 0xC5;
+        mem[5] = 0x1E;
+        mem[6] = 0x00;
+        mem[7] = 0x30;
+        mem[8] = 0xF4;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0x9999);
+        cpu.rip = 0;
+        cpu.rflags = 0x246; // IF+reserved; sticky pattern for "flags unchanged"
+        let flags_before = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x5678);
+        assert_eq!(cpu.es.selector, 0x1234);
+        assert_eq!(cpu.es.base, 0x1234u64 << 4);
+        assert_eq!(cpu.rflags, flags_before);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0xABCD);
+        assert_eq!(cpu.ds.selector, 0xF000);
+        assert_eq!(cpu.ds.base, 0xF000u64 << 4);
+        assert_eq!(cpu.rflags, flags_before);
+    }
+
+    /// LES/LDS register form is #UD via IVT (SDM Vol. 2 LES/LDS; Vol. 3 §6.15).
+    #[test]
+    fn les_lds_register_source_ud_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[6] → 0000:0B00
+        mem[24] = 0x00;
+        mem[25] = 0x0B;
+        mem[26] = 0x00;
+        mem[27] = 0x00;
+        mem[0] = 0xC4;
+        mem[1] = 0xC0; // LES AX, AX — mod=11 → #UD
+        mem[2] = 0xC5;
+        mem[3] = 0xDB; // LDS BX, BX — mod=11 → #UD
+        mem[0xB00] = 0xF4;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
+        // Second case after returning to next insn via fresh RIP setup
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 2;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(true);
+        cpu.halted = false;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 2);
+    }
+
+    /// XLATB: AL ← DS:[BX+AL] (SDM Vol. 2 XLAT/XLATB); segment override honored.
+    #[test]
+    fn xlat_table_lookup_and_segment_override() {
+        let mut mem = vec![0u8; 0x20000];
+        // DS=0 table at BX=0x1000: index AL=0x05 → 0xAB
+        mem[0x1005] = 0xAB;
+        // ES=0x1000 table at BX=0x0200: index AL=0x03 → linear 0x10203
+        mem[0x10203] = 0xCD;
+        // D7; 26 D7; F4
+        mem[0] = 0xD7;
+        mem[1] = 0x26;
+        mem[2] = 0xD7;
+        mem[3] = 0xF4;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0x1000);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RBX, 0x1000);
+        cpu.set_al(0x05);
+        cpu.rflags = 0x246;
+        let flags_before = cpu.rflags;
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xAB);
+        assert_eq!(cpu.rflags, flags_before);
+        cpu.set_gpr_u16(CpuState::RBX, 0x0200);
+        cpu.set_al(0x03);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xCD);
+        assert_eq!(cpu.rflags, flags_before);
     }
 }

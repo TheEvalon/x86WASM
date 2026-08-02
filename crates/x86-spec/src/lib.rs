@@ -883,6 +883,20 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "RET",
     },
     InstrDef {
+        mnemonic: "LES",
+        opcode: 0xC4,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LES",
+    },
+    InstrDef {
+        mnemonic: "LDS",
+        opcode: 0xC5,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LDS",
+    },
+    InstrDef {
         mnemonic: "INT3",
         opcode: 0xCC,
         encoding: Encoding::None,
@@ -939,6 +953,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
         encoding: Encoding::ModrmImm8,
         width: Width::OsZ,
         sdm: "SAL/SAR/SHL/SHR/ROL/ROR/RCL/RCR",
+    },
+    InstrDef {
+        mnemonic: "XLAT",
+        opcode: 0xD7,
+        encoding: Encoding::None,
+        width: Width::W8,
+        sdm: "XLAT/XLATB",
     },
     InstrDef {
         mnemonic: "GRP2",
@@ -1197,6 +1218,7 @@ mod tests {
             0x23, 0x24, 0x25, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x28, 0x29, 0x2A, 0x2B, 0x2C,
             0x2D, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0xA0,
             0xA1, 0xA2, 0xA3, 0xA8, 0xA9, 0xC6, 0xC7, 0x60, 0x61, 0x8F, 0xC2, 0xC8, 0xC9, 0xCA,
+            0xC4, 0xC5, 0xD7,
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }

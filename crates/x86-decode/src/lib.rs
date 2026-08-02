@@ -1187,4 +1187,35 @@ mod tests {
         assert_eq!(decode(&[0x8F, 0xC8]).unwrap().mnemonic, "GRP_POP"); // /1 reserved
         assert_eq!(decode(&[0x8F]), Err(DecodeError::Truncated));
     }
+
+    #[test]
+    fn decode_les_lds_xlat() {
+        // Intel SDM Vol. 2: LES r16, m16:16 (C4 /r); LDS r16, m16:16 (C5 /r); XLAT/XLATB (D7).
+        // C4 06 00 20 = LES AX, [0x2000]
+        let les = decode(&[0xC4, 0x06, 0x00, 0x20]).unwrap();
+        assert_eq!(les.mnemonic, "LES");
+        assert_eq!(les.modrm.unwrap().reg, 0);
+        assert_eq!(les.displacement, 0x2000);
+        assert_eq!(les.length, 4);
+
+        // C5 1E 34 12 = LDS BX, [0x1234]
+        let lds = decode(&[0xC5, 0x1E, 0x34, 0x12]).unwrap();
+        assert_eq!(lds.mnemonic, "LDS");
+        assert_eq!(lds.modrm.unwrap().reg, 3);
+        assert_eq!(lds.displacement, 0x1234);
+        assert_eq!(lds.length, 4);
+
+        let xlat = decode(&[0xD7]).unwrap();
+        assert_eq!(xlat.mnemonic, "XLAT");
+        assert_eq!(xlat.length, 1);
+        assert!(xlat.modrm.is_none());
+
+        assert_eq!(decode(&[0xC4]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0xC5]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x26, 0xD7]).unwrap().mnemonic, "XLAT");
+        assert_eq!(
+            decode(&[0x26, 0xD7]).unwrap().prefixes.segment_override,
+            Some(0x26)
+        );
+    }
 }
