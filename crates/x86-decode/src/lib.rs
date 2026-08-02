@@ -615,6 +615,21 @@ mod tests {
     }
 
     #[test]
+    fn decode_string_word_ops() {
+        // Intel SDM Vol. 2: MOVSW/STOSW/LODSW/CMPSW/SCASW — A5/AB/AD/A7/AF
+        // (under 0x66 these are dword forms MOVSD/…; mnemonic stays *W in this decoder)
+        assert_eq!(decode(&[0xA5]).unwrap().mnemonic, "MOVSW");
+        assert_eq!(decode(&[0xAB]).unwrap().mnemonic, "STOSW");
+        assert_eq!(decode(&[0xAD]).unwrap().mnemonic, "LODSW");
+        assert_eq!(decode(&[0xA7]).unwrap().mnemonic, "CMPSW");
+        assert_eq!(decode(&[0xAF]).unwrap().mnemonic, "SCASW");
+        let opsz = decode(&[0x66, 0xA5]).unwrap();
+        assert!(opsz.prefixes.op_size_override);
+        assert_eq!(opsz.mnemonic, "MOVSW");
+        assert_eq!(opsz.length, 2);
+    }
+
+    #[test]
     fn decode_rep_prefixes_on_string_ops() {
         // Intel SDM Vol. 2: REP/REPE = F3, REPNE = F2 (legacy prefixes).
         let rep_stos = decode(&[0xF3, 0xAA]).unwrap();
@@ -630,6 +645,17 @@ mod tests {
         let repne_cmps = decode(&[0xF2, 0xA6]).unwrap();
         assert!(repne_cmps.prefixes.repne);
         assert!(!repne_cmps.prefixes.rep);
+
+        // Word forms accept the same REP prefixes.
+        let rep_movsw = decode(&[0xF3, 0xA5]).unwrap();
+        assert!(rep_movsw.prefixes.rep);
+        assert_eq!(rep_movsw.mnemonic, "MOVSW");
+        let repe_scasw = decode(&[0xF3, 0xAF]).unwrap();
+        assert!(repe_scasw.prefixes.rep);
+        assert_eq!(repe_scasw.mnemonic, "SCASW");
+        let repne_cmpsw = decode(&[0xF2, 0xA7]).unwrap();
+        assert!(repne_cmpsw.prefixes.repne);
+        assert_eq!(repne_cmpsw.mnemonic, "CMPSW");
 
         // Last F2/F3 wins (mutually exclusive).
         let last_f2 = decode(&[0xF3, 0xF2, 0xA4]).unwrap();

@@ -675,6 +675,134 @@ fn cmpsb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     Ok(())
 }
 
+/// One MOVSW iteration (no IP update). Spec: SDM Vol. 2 MOVS/MOVSW.
+fn movsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let v = bus.read_u16(src)?;
+    bus.write_u16(dst, v)?;
+    let d = string_index_delta(cpu, 2);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One MOVSD iteration (no IP update). Spec: SDM Vol. 2 MOVS/MOVSD (opsize 32).
+fn movsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let v = bus.read_u32(src)?;
+    bus.write_u32(dst, v)?;
+    let d = string_index_delta(cpu, 4);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One STOSW iteration (no IP update). Spec: SDM Vol. 2 STOS/STOSW.
+fn stosw_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    bus.write_u16(dst, cpu.ax())?;
+    let d = string_index_delta(cpu, 2);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One STOSD iteration (no IP update). Spec: SDM Vol. 2 STOS/STOSD (opsize 32).
+fn stosd_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    bus.write_u32(dst, cpu.eax())?;
+    let d = string_index_delta(cpu, 4);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One LODSW iteration (no IP update). Spec: SDM Vol. 2 LODS/LODSW.
+fn lodsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let v = bus.read_u16(src)?;
+    cpu.set_ax(v);
+    let d = string_index_delta(cpu, 2);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    Ok(())
+}
+
+/// One LODSD iteration (no IP update). Spec: SDM Vol. 2 LODS/LODSD (opsize 32).
+fn lodsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let v = bus.read_u32(src)?;
+    cpu.set_eax(v);
+    let d = string_index_delta(cpu, 4);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    Ok(())
+}
+
+/// One SCASW iteration (no IP update). Spec: SDM Vol. 2 SCAS/SCASW.
+fn scasw_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let addr = linear_addr(&cpu.es, u64::from(di));
+    let mem = bus.read_u16(addr)?;
+    let ax = cpu.ax();
+    let result = ax.wrapping_sub(mem);
+    set_sub_flags_u16(cpu, ax, mem, result);
+    let d = string_index_delta(cpu, 2);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One SCASD iteration (no IP update). Spec: SDM Vol. 2 SCAS/SCASD (opsize 32).
+fn scasd_once(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let addr = linear_addr(&cpu.es, u64::from(di));
+    let mem = bus.read_u32(addr)?;
+    let eax = cpu.eax();
+    let result = eax.wrapping_sub(mem);
+    set_sub_flags_u32(cpu, eax, mem, result);
+    let d = string_index_delta(cpu, 4);
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One CMPSW iteration (no IP update). Spec: SDM Vol. 2 CMPS/CMPSW.
+fn cmpsw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let a = bus.read_u16(src)?;
+    let b = bus.read_u16(dst)?;
+    let result = a.wrapping_sub(b);
+    set_sub_flags_u16(cpu, a, b, result);
+    let d = string_index_delta(cpu, 2);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
+/// One CMPSD iteration (no IP update). Spec: SDM Vol. 2 CMPS/CMPSD (opsize 32).
+fn cmpsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    let si = cpu.gpr_u16(CpuState::RSI);
+    let di = cpu.gpr_u16(CpuState::RDI);
+    let src = linear_addr(data_seg_for_string_src(cpu, insn), u64::from(si));
+    let dst = linear_addr(&cpu.es, u64::from(di));
+    let a = bus.read_u32(src)?;
+    let b = bus.read_u32(dst)?;
+    let result = a.wrapping_sub(b);
+    set_sub_flags_u32(cpu, a, b, result);
+    let d = string_index_delta(cpu, 4);
+    cpu.set_gpr_u16(CpuState::RSI, si.wrapping_add(d));
+    cpu.set_gpr_u16(CpuState::RDI, di.wrapping_add(d));
+    Ok(())
+}
+
 /// REP / REPE / REPNE wrapper for address-size 16 (count = CX).
 ///
 /// Spec: Intel SDM Vol. 2 "REP/REPE/REPNE/REPZ/REPNZ".
@@ -1916,36 +2044,81 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xA4 => {
             // MOVSB — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: MOVSW/D/Q; interruptible REP; asize 32/64.
+            // Unsupported here: MOVSQ; interruptible REP; asize 32/64.
             // F2/F3 both act as unconditional REP for MOVS (count = CX).
             exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                 movsb_once(cpu, bus, insn)
             })?;
             cpu.set_ip16(next_ip);
         }
+        0xA5 => {
+            // MOVSW/MOVSD — Spec: Intel SDM Vol. 2 "MOVS/MOVSB/MOVSW/MOVSD/MOVSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Operand-size 16 → word; 0x66 → dword. Unsupported: MOVSQ; interruptible REP; asize 32/64.
+            if opsz32(&insn) {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    movsd_once(cpu, bus, insn)
+                })?;
+            } else {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    movsw_once(cpu, bus, insn)
+                })?;
+            }
+            cpu.set_ip16(next_ip);
+        }
         0xAA => {
             // STOSB — Spec: Intel SDM Vol. 2 "STOS/STOSB/STOSW/STOSD/STOSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: STOSW/D/Q; interruptible REP; asize 32/64.
+            // Unsupported here: STOSQ; interruptible REP; asize 32/64.
             exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| {
                 stosb_once(cpu, bus)
             })?;
             cpu.set_ip16(next_ip);
         }
+        0xAB => {
+            // STOSW/STOSD — Spec: Intel SDM Vol. 2 "STOS/STOSB/STOSW/STOSD/STOSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Unsupported here: STOSQ; interruptible REP; asize 32/64.
+            if opsz32(&insn) {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| {
+                    stosd_once(cpu, bus)
+                })?;
+            } else {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, _insn| {
+                    stosw_once(cpu, bus)
+                })?;
+            }
+            cpu.set_ip16(next_ip);
+        }
         0xAC => {
             // LODSB — Spec: Intel SDM Vol. 2 "LODS/LODSB/LODSW/LODSD/LODSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
-            // Unsupported here: LODSW/D/Q; interruptible REP; asize 32/64.
+            // Unsupported here: LODSQ; interruptible REP; asize 32/64.
             exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
                 lodsb_once(cpu, bus, insn)
             })?;
+            cpu.set_ip16(next_ip);
+        }
+        0xAD => {
+            // LODSW/LODSD — Spec: Intel SDM Vol. 2 "LODS/LODSB/LODSW/LODSD/LODSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // Unsupported here: LODSQ; interruptible REP; asize 32/64.
+            if opsz32(&insn) {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    lodsd_once(cpu, bus, insn)
+                })?;
+            } else {
+                exec_string_with_rep(cpu, bus, &insn, None, |cpu, bus, insn| {
+                    lodsw_once(cpu, bus, insn)
+                })?;
+            }
             cpu.set_ip16(next_ip);
         }
         0xA6 => {
             // CMPSB — Spec: Intel SDM Vol. 2 "CMPS/CMPSB/CMPSW/CMPSD/CMPSQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
             // F3 = REPE (while ZF=1); F2 = REPNE (while ZF=0).
-            // Unsupported here: CMPSW/D/Q; interruptible REP; asize 32/64.
+            // Unsupported here: CMPSQ; interruptible REP; asize 32/64.
             let zf_term = if insn.prefixes.repne {
                 Some(false)
             } else if insn.prefixes.rep {
@@ -1958,11 +2131,33 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             })?;
             cpu.set_ip16(next_ip);
         }
+        0xA7 => {
+            // CMPSW/CMPSD — Spec: Intel SDM Vol. 2 "CMPS/CMPSB/CMPSW/CMPSD/CMPSQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // F3 = REPE; F2 = REPNE. Unsupported: CMPSQ; interruptible REP; asize 32/64.
+            let zf_term = if insn.prefixes.repne {
+                Some(false)
+            } else if insn.prefixes.rep {
+                Some(true)
+            } else {
+                None
+            };
+            if opsz32(&insn) {
+                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, insn| {
+                    cmpsd_once(cpu, bus, insn)
+                })?;
+            } else {
+                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, insn| {
+                    cmpsw_once(cpu, bus, insn)
+                })?;
+            }
+            cpu.set_ip16(next_ip);
+        }
         0xAE => {
             // SCASB — Spec: Intel SDM Vol. 2 "SCAS/SCASB/SCASW/SCASD/SCASQ"
             // and "REP/REPE/REPNE/REPZ/REPNZ".
             // F3 = REPE (while ZF=1); F2 = REPNE (while ZF=0).
-            // Unsupported here: SCASW/D/Q; interruptible REP; asize 32/64.
+            // Unsupported here: SCASQ; interruptible REP; asize 32/64.
             let zf_term = if insn.prefixes.repne {
                 Some(false)
             } else if insn.prefixes.rep {
@@ -1973,6 +2168,28 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, _insn| {
                 scasb_once(cpu, bus)
             })?;
+            cpu.set_ip16(next_ip);
+        }
+        0xAF => {
+            // SCASW/SCASD — Spec: Intel SDM Vol. 2 "SCAS/SCASB/SCASW/SCASD/SCASQ"
+            // and "REP/REPE/REPNE/REPZ/REPNZ".
+            // F3 = REPE; F2 = REPNE. Unsupported: SCASQ; interruptible REP; asize 32/64.
+            let zf_term = if insn.prefixes.repne {
+                Some(false)
+            } else if insn.prefixes.rep {
+                Some(true)
+            } else {
+                None
+            };
+            if opsz32(&insn) {
+                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, _insn| {
+                    scasd_once(cpu, bus)
+                })?;
+            } else {
+                exec_string_with_rep(cpu, bus, &insn, zf_term, |cpu, bus, _insn| {
+                    scasw_once(cpu, bus)
+                })?;
+            }
             cpu.set_ip16(next_ip);
         }
         0xA0 => {
@@ -3529,6 +3746,313 @@ mod tests {
         assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x7003);
         assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x8003);
         assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0 after mismatch
+    }
+
+    /// LODSW/STOSW/MOVSW advance SI/DI by ±2 per DF (SDM Vol. 2 LODS/STOS/MOVS).
+    #[test]
+    fn string_word_ops_df_forward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xAD; // LODSW
+        mem[1] = 0xAB; // STOSW
+        mem[2] = 0xA5; // MOVSW
+        mem[3] = 0xF4;
+        // little-endian words at DS:1000
+        mem[0x1000] = 0x34;
+        mem[0x1001] = 0x12; // 0x1234
+        mem[0x1002] = 0x78;
+        mem[0x1003] = 0x56; // 0x5678
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_direction_flag(false);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1000);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2000);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap(); // LODSW
+        assert_eq!(cpu.ax(), 0x1234);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x1002);
+
+        step(&mut cpu, &mut bus).unwrap(); // STOSW
+        assert_eq!(bus.read_u16(0x2000).unwrap(), 0x1234);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2002);
+
+        // MOVSW: DS:[SI]=0x5678 → ES:[DI]
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x2002).unwrap(), 0x5678);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x1004);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2004);
+    }
+
+    #[test]
+    fn lodsw_df_backward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xAD;
+        mem[1] = 0xF4;
+        mem[0x1000] = 0xCD;
+        mem[0x1001] = 0xAB; // 0xABCD
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_direction_flag(true);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1000);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0xABCD);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x0FFE);
+    }
+
+    #[test]
+    fn rep_stosw_fills_and_clears_cx() {
+        // Spec: Intel SDM Vol. 2 STOS + REP/REPE/REPNE
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xAB; // REP STOSW
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_ax(0xBEEF);
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RDI, 0x3000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x3000).unwrap(), 0xBEEF);
+        assert_eq!(bus.read_u16(0x3002).unwrap(), 0xBEEF);
+        assert_eq!(bus.read_u16(0x3004).unwrap(), 0xBEEF);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x3006);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    #[test]
+    fn rep_movsw_df_backward() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xA5; // REP MOVSW
+        mem[2] = 0xF4;
+        // Words at SI=0x1010, 0x100E, 0x100C (DF=1 steps −2).
+        mem[0x1010] = 0xAA;
+        mem[0x1011] = 0x11; // 0x11AA
+        mem[0x100E] = 0xBB;
+        mem[0x100F] = 0x22; // 0x22BB
+        mem[0x100C] = 0xCC;
+        mem[0x100D] = 0x33; // 0x33CC
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RSI, 0x1010);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2010);
+        cpu.set_direction_flag(true);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x2010).unwrap(), 0x11AA);
+        assert_eq!(bus.read_u16(0x200E).unwrap(), 0x22BB);
+        assert_eq!(bus.read_u16(0x200C).unwrap(), 0x33CC);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x100A);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x200A);
+    }
+
+    #[test]
+    fn rep_lodsw_loads_last_word_into_ax() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xAD; // REP LODSW
+        mem[2] = 0xF4;
+        mem[0x4000] = 0x11;
+        mem[0x4001] = 0x11;
+        mem[0x4002] = 0x22;
+        mem[0x4003] = 0x22;
+        mem[0x4004] = 0x33;
+        mem[0x4005] = 0x33;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RSI, 0x4000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 0x3333);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x4006);
+    }
+
+    #[test]
+    fn repe_scasw_stops_on_mismatch() {
+        // Spec: Intel SDM Vol. 2 SCAS + REPE
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xAF; // REPE SCASW
+        mem[2] = 0xF4;
+        mem[0x5000] = 0x78;
+        mem[0x5001] = 0x56; // 0x5678 match
+        mem[0x5002] = 0x78;
+        mem[0x5003] = 0x56; // match
+        mem[0x5004] = 0x00;
+        mem[0x5005] = 0x00; // mismatch
+        mem[0x5006] = 0x78;
+        mem[0x5007] = 0x56;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_ax(0x5678);
+        cpu.set_gpr_u16(CpuState::RCX, 4);
+        cpu.set_gpr_u16(CpuState::RDI, 0x5000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 1);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x5006);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0
+    }
+
+    #[test]
+    fn repne_scasw_stops_on_match() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF2;
+        mem[1] = 0xAF; // REPNE SCASW
+        mem[2] = 0xF4;
+        mem[0x6000] = 0x01;
+        mem[0x6001] = 0x00;
+        mem[0x6002] = 0x02;
+        mem[0x6003] = 0x00;
+        mem[0x6004] = 0x51;
+        mem[0x6005] = 0x51; // match AX
+        mem[0x6006] = 0x03;
+        mem[0x6007] = 0x00;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_ax(0x5151);
+        cpu.set_gpr_u16(CpuState::RCX, 4);
+        cpu.set_gpr_u16(CpuState::RDI, 0x6000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 1);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x6006);
+        assert_ne!(cpu.rflags & (1 << 6), 0); // ZF=1
+    }
+
+    #[test]
+    fn repe_cmpsw_compares_words() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0xA7; // REPE CMPSW
+        mem[2] = 0xF4;
+        mem[0x7000] = 0x01;
+        mem[0x7001] = 0x00;
+        mem[0x7002] = 0x02;
+        mem[0x7003] = 0x00;
+        mem[0x7004] = 0x03;
+        mem[0x7005] = 0x00;
+        mem[0x8000] = 0x01;
+        mem[0x8001] = 0x00;
+        mem[0x8002] = 0x02;
+        mem[0x8003] = 0x00;
+        mem[0x8004] = 0x09;
+        mem[0x8005] = 0x00; // mismatch
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 3);
+        cpu.set_gpr_u16(CpuState::RSI, 0x7000);
+        cpu.set_gpr_u16(CpuState::RDI, 0x8000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x7006);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x8006);
+        assert_eq!(cpu.rflags & (1 << 6), 0); // ZF=0 after mismatch
+    }
+
+    /// 0x66 A5 = MOVSD — dword element, SI/DI ±4 (SDM Vol. 2 MOVS + opsize).
+    #[test]
+    fn rep_movsd_opsize32() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0xF3;
+        mem[1] = 0x66;
+        mem[2] = 0xA5; // REP MOVSD
+        mem[3] = 0xF4;
+        // two dwords at 0x4000
+        mem[0x4000] = 0x01;
+        mem[0x4001] = 0x02;
+        mem[0x4002] = 0x03;
+        mem[0x4003] = 0x04; // 0x04030201
+        mem[0x4004] = 0x11;
+        mem[0x4005] = 0x22;
+        mem[0x4006] = 0x33;
+        mem[0x4007] = 0x44; // 0x44332211
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RCX, 2);
+        cpu.set_gpr_u16(CpuState::RSI, 0x4000);
+        cpu.set_gpr_u16(CpuState::RDI, 0x5000);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x5000).unwrap(), 0x0403_0201);
+        assert_eq!(bus.read_u32(0x5004).unwrap(), 0x4433_2211);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0);
+        assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x4008);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x5008);
+    }
+
+    #[test]
+    fn stosd_opsize32_writes_eax() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0] = 0x66;
+        mem[1] = 0xAB; // STOSD
+        mem[2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_eax(0xDEAD_BEEF);
+        cpu.set_gpr_u16(CpuState::RDI, 0x2100);
+        cpu.set_direction_flag(false);
+
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x2100).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(cpu.gpr_u16(CpuState::RDI), 0x2104);
     }
 
     /// Short Jcc take/not-take for unsigned and signed conditions (SDM Vol. 2 Jcc).
