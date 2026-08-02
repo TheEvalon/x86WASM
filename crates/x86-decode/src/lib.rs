@@ -379,15 +379,21 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             Encoding::Moffs => {
                 // Absolute moffs — address-size attribute; real-mode default is 16-bit.
                 // Spec: Intel SDM Vol. 2, MOV AL/AX/EAX/RAX, moffs / moffs, AL/AX/….
-                // Unsupported here: address-size 32/64 (0x67 / long mode).
+                // 0x67 → moffs32 (unreal-mode high offsets). Unsupported: moffs64 / long mode.
                 if prefixes.addr_size_override {
-                    return Err(DecodeError::UnsupportedOpcode(opcode));
+                    if i + 3 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate =
+                        i32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    i += 4;
+                } else {
+                    if i + 1 >= bytes.len() {
+                        return Err(DecodeError::Truncated);
+                    }
+                    immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+                    i += 2;
                 }
-                if i + 1 >= bytes.len() {
-                    return Err(DecodeError::Truncated);
-                }
-                immediate = i32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
-                i += 2;
             }
             Encoding::Imm16Imm8 => {
                 // ENTER iw, ib — Spec: Intel SDM Vol. 2 "ENTER".
@@ -1402,6 +1408,15 @@ mod tests {
         assert_eq!(d.length, 4);
         assert_eq!(decode(&[0xA0]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0xA1, 0x00]), Err(DecodeError::Truncated));
+        // 0x67 → moffs32 (SDM Vol. 2 MOV address-size attribute).
+        let d = decode(&[0x67, 0xA0, 0x00, 0x00, 0x01, 0x00]).unwrap();
+        assert!(d.prefixes.addr_size_override);
+        assert_eq!(d.immediate, 0x0001_0000);
+        assert_eq!(d.length, 6);
+        assert_eq!(
+            decode(&[0x67, 0xA0, 0x00, 0x00]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     #[test]

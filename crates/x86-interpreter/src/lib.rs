@@ -7,7 +7,7 @@
 use thiserror::Error;
 use x86_core::CpuState;
 use x86_decode::{decode, DecodeError, DecodedInsn};
-use x86_mmu::linear_addr;
+use x86_mmu::{checked_linear_addr, linear_addr};
 
 /// Memory + port callbacks supplied by `machine-pc`.
 pub trait Bus {
@@ -523,23 +523,32 @@ fn asize32(insn: &DecodedInsn) -> bool {
 
 /// Effective address from ModRM using the instruction address-size attribute.
 /// Returns `(linear, is_register, uses_ss)` — `uses_ss` selects `#SS` vs `#GP`
-/// when a bus `MemoryFault` is classified (SDM Vol. 3 §6.15).
+/// when a bus `MemoryFault` is classified or a segment-limit fault is raised
+/// (SDM Vol. 3 §5.3, §6.15).
 /// Real-mode segmentation remains `selector << 4` (base + offset).
-fn ea(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecError> {
+fn ea(
+    cpu: &CpuState,
+    insn: &DecodedInsn,
+    access_size: u64,
+) -> Result<(u64, bool, bool), ExecError> {
     if asize32(insn) {
-        ea_32(cpu, insn)
+        ea_32(cpu, insn, access_size)
     } else {
-        ea_16(cpu, insn)
+        ea_16(cpu, insn, access_size)
     }
 }
 
 /// 16-bit effective address from ModRM (real-mode / 16-bit address size).
-fn ea_16(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecError> {
+fn ea_16(
+    cpu: &CpuState,
+    insn: &DecodedInsn,
+    access_size: u64,
+) -> Result<(u64, bool, bool), ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     if m.mod_ == 3 {
         return Ok((0, true, false));
     }
-    let off = calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?;
+    let off = u64::from(calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?);
     let (seg, uses_ss) = match insn.prefixes.segment_override {
         Some(0x2E) => (&cpu.cs, false),
         Some(0x36) => (&cpu.ss, true),
@@ -556,17 +565,45 @@ fn ea_16(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecEr
         }
         _ => (&cpu.ds, false),
     };
-    Ok((linear_addr(seg, u64::from(off)), false, uses_ss))
+    let addr = checked_linear_addr(seg, off, access_size)
+        .map_err(|_| ExecError::ArchFault(if uses_ss { 12 } else { 13 }))?;
+    Ok((addr, false, uses_ss))
+}
+
+/// Linear address for a data/stack access with cached segment-limit enforcement.
+/// Spec: Intel SDM Vol. 3 §5.3; Vol. 2 MOV real-address `#GP`/`#SS`.
+fn seg_linear_checked(
+    seg: &x86_core::SegmentReg,
+    offset: u64,
+    size: u64,
+    uses_ss: bool,
+) -> Result<u64, ExecError> {
+    checked_linear_addr(seg, offset, size)
+        .map_err(|_| ExecError::ArchFault(if uses_ss { 12 } else { 13 }))
+}
+
+/// Absolute moffs offset from address-size attribute.
+/// Spec: Intel SDM Vol. 2 MOV (moffs16 / moffs32).
+fn moffs_offset(insn: &DecodedInsn) -> u64 {
+    if insn.prefixes.addr_size_override {
+        insn.immediate as u32 as u64
+    } else {
+        u64::from(insn.immediate as u16)
+    }
 }
 
 /// 32-bit effective address from ModRM/SIB (real-mode with 0x67).
 /// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (32-bit addressing forms).
-fn ea_32(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecError> {
+fn ea_32(
+    cpu: &CpuState,
+    insn: &DecodedInsn,
+    access_size: u64,
+) -> Result<(u64, bool, bool), ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     if m.mod_ == 3 {
         return Ok((0, true, false));
     }
-    let off = calc_ea32(cpu, insn)?;
+    let off = u64::from(calc_ea32(cpu, insn)?);
     let (seg, uses_ss) = match insn.prefixes.segment_override {
         Some(0x2E) => (&cpu.cs, false),
         Some(0x36) => (&cpu.ss, true),
@@ -590,7 +627,9 @@ fn ea_32(cpu: &CpuState, insn: &DecodedInsn) -> Result<(u64, bool, bool), ExecEr
         }
         _ => (&cpu.ds, false),
     };
-    Ok((linear_addr(seg, u64::from(off)), false, uses_ss))
+    let addr = checked_linear_addr(seg, off, access_size)
+        .map_err(|_| ExecError::ArchFault(if uses_ss { 12 } else { 13 }))?;
+    Ok((addr, false, uses_ss))
 }
 
 /// Map a bus `MemoryFault` to `#SS` (vector 12) or `#GP` (vector 13).
@@ -689,8 +728,7 @@ fn read_rm_u8(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<u
         // Legacy byte r/m: 0-3 AL/CL/DL/BL, 4-7 AH/CH/DH/BH (SDM Vol. 2 App. B).
         Ok(read_reg_u8(cpu, m.rm))
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn)?;
-        bus.read_u8(addr)
+        let (addr, _, uses_ss) = ea(cpu, insn, 1)?;        bus.read_u8(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -706,8 +744,7 @@ fn write_rm_u8(
         write_reg_u8(cpu, m.rm, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn)?;
-        bus.write_u8(addr, val)
+        let (addr, _, uses_ss) = ea(cpu, insn, 1)?;        bus.write_u8(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -717,8 +754,7 @@ fn read_rm_u16(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u16(m.rm as usize))
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn)?;
-        bus.read_u16(addr)
+        let (addr, _, uses_ss) = ea(cpu, insn, 2)?;        bus.read_u16(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -734,8 +770,7 @@ fn write_rm_u16(
         cpu.set_gpr_u16(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn)?;
-        bus.write_u16(addr, val)
+        let (addr, _, uses_ss) = ea(cpu, insn, 2)?;        bus.write_u16(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -745,8 +780,7 @@ fn read_rm_u32(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<
     if m.mod_ == 3 {
         Ok(cpu.gpr_u32(m.rm as usize))
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn)?;
-        bus.read_u32(addr)
+        let (addr, _, uses_ss) = ea(cpu, insn, 4)?;        bus.read_u32(addr)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -762,8 +796,7 @@ fn write_rm_u32(
         cpu.set_gpr_u32(m.rm as usize, val);
         Ok(())
     } else {
-        let (addr, _, uses_ss) = ea(cpu, insn)?;
-        bus.write_u32(addr, val)
+        let (addr, _, uses_ss) = ea(cpu, insn, 4)?;        bus.write_u32(addr, val)
             .map_err(|e| classify_mem_fault(e, uses_ss))
     }
 }
@@ -784,12 +817,24 @@ fn push16_unchecked(cpu: &mut CpuState, bus: &mut dyn Bus, val: u16) -> Result<(
 }
 
 fn push16(cpu: &mut CpuState, bus: &mut dyn Bus, val: u16) -> Result<(), ExecError> {
-    push16_unchecked(cpu, bus, val).map_err(|e| classify_mem_fault(e, true))
+    let old_sp = cpu.gpr_u16(CpuState::RSP);
+    let sp = old_sp.wrapping_sub(2);
+    // Limit check before mutating SP (SDM Vol. 3 §5.3 / §6.15 #SS).
+    seg_linear_checked(&cpu.ss, u64::from(sp), 2, true)?;
+    cpu.set_gpr_u16(CpuState::RSP, sp);
+    let addr = linear_addr(&cpu.ss, u64::from(sp));
+    match bus.write_u16(addr, val) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            cpu.set_gpr_u16(CpuState::RSP, old_sp);
+            Err(classify_mem_fault(e, true))
+        }
+    }
 }
 
 fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
     let sp = cpu.gpr_u16(CpuState::RSP);
-    let addr = linear_addr(&cpu.ss, u64::from(sp));
+    let addr = seg_linear_checked(&cpu.ss, u64::from(sp), 2, true)?;
     let v = bus
         .read_u16(addr)
         .map_err(|e| classify_mem_fault(e, true))?;
@@ -802,6 +847,7 @@ fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
 fn push32(cpu: &mut CpuState, bus: &mut dyn Bus, val: u32) -> Result<(), ExecError> {
     let old_sp = cpu.gpr_u16(CpuState::RSP);
     let sp = old_sp.wrapping_sub(4);
+    seg_linear_checked(&cpu.ss, u64::from(sp), 4, true)?;
     cpu.set_gpr_u16(CpuState::RSP, sp);
     let addr = linear_addr(&cpu.ss, u64::from(sp));
     match bus.write_u32(addr, val) {
@@ -815,7 +861,7 @@ fn push32(cpu: &mut CpuState, bus: &mut dyn Bus, val: u32) -> Result<(), ExecErr
 
 fn pop32(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u32, ExecError> {
     let sp = cpu.gpr_u16(CpuState::RSP);
-    let addr = linear_addr(&cpu.ss, u64::from(sp));
+    let addr = seg_linear_checked(&cpu.ss, u64::from(sp), 4, true)?;
     let v = bus
         .read_u32(addr)
         .map_err(|e| classify_mem_fault(e, true))?;
@@ -846,13 +892,13 @@ fn read_sreg_selector(cpu: &CpuState, sreg: u8) -> u16 {
 
 fn write_sreg_real_mode(cpu: &mut CpuState, sreg: u8, selector: u16) -> Result<(), ExecError> {
     // Caller must reject MOV CS and reserved Sreg encodings (#UD) before calling.
-    let seg = x86_core::SegmentReg::real_mode(selector);
+    // Sticky limit/AR: SDM Vol. 3 §3.4.2–§3.4.3 (unreal-mode descriptor cache).
     match sreg {
-        0 => cpu.es = seg,
-        2 => cpu.ss = seg,
-        3 => cpu.ds = seg,
-        4 => cpu.fs = seg,
-        5 => cpu.gs = seg,
+        0 => cpu.es.load_real_mode_selector(selector),
+        2 => cpu.ss.load_real_mode_selector(selector),
+        3 => cpu.ds.load_real_mode_selector(selector),
+        4 => cpu.fs.load_real_mode_selector(selector),
+        5 => cpu.gs.load_real_mode_selector(selector),
         _ => return Err(ExecError::Unsupported(0x8E)),
     }
     Ok(())
@@ -1557,8 +1603,7 @@ fn read_far_ptr16(
         // Caller should deliver #UD; keep helper defensive.
         return Err(ExecError::Unsupported(insn.opcode));
     }
-    let (addr, _, uses_ss) = ea(cpu, insn)?;
-    let offset = bus
+    let (addr, _, uses_ss) = ea(cpu, insn, 4)?;    let offset = bus
         .read_u16(addr)
         .map_err(|e| classify_mem_fault(e, uses_ss))?;
     let selector = bus
@@ -1946,7 +1991,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x07 => {
             // POP ES — Spec: Intel SDM Vol. 2 "POP".
             let sel = pop16(cpu, bus)?;
-            cpu.es = x86_core::SegmentReg::real_mode(sel);
+            cpu.es.load_real_mode_selector(sel);
             cpu.set_ip16(next_ip);
         }
         0x0E => {
@@ -1963,7 +2008,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // POP SS — Spec: Intel SDM Vol. 2 "POP".
             // Unsupported here: one-instruction interrupt inhibit after POP SS (Vol. 2).
             let sel = pop16(cpu, bus)?;
-            cpu.ss = x86_core::SegmentReg::real_mode(sel);
+            cpu.ss.load_real_mode_selector(sel);
             cpu.set_ip16(next_ip);
         }
         0x1E => {
@@ -1974,7 +2019,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x1F => {
             // POP DS — Spec: Intel SDM Vol. 2 "POP".
             let sel = pop16(cpu, bus)?;
-            cpu.ds = x86_core::SegmentReg::real_mode(sel);
+            cpu.ds.load_real_mode_selector(sel);
             cpu.set_ip16(next_ip);
         }
         0xF4 => {
@@ -2163,7 +2208,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
             let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
             cpu.set_gpr_u16(m.reg as usize, offset);
-            cpu.es = x86_core::SegmentReg::real_mode(selector);
+            cpu.es.load_real_mode_selector(selector);
             cpu.set_ip16(next_ip);
         }
         0xC5 => {
@@ -2177,7 +2222,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
             let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
             cpu.set_gpr_u16(m.reg as usize, offset);
-            cpu.ds = x86_core::SegmentReg::real_mode(selector);
+            cpu.ds.load_real_mode_selector(selector);
             cpu.set_ip16(next_ip);
         }
         0x9A => {
@@ -2216,8 +2261,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // ENTER/ENTERD iw, ib — nesting level = imm8 mod 32.
             // Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5 / §3.6; Ch. 2 (66H).
             // Address-size 16: SP/BP used for stack walks; opsize selects word vs dword.
-            // Unsupported here: address-size 32/64; stack-limit #SS beyond bus faults;
-            // protected-mode.
+            // Unsupported here: address-size 32/64; protected-mode.
             let alloc = insn.immediate as u16;
             let nesting = (insn.displacement as u8) & 0x1F;
             if opsz32(&insn) {
@@ -2227,7 +2271,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     for _ in 1..nesting {
                         let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(4);
                         cpu.set_gpr_u16(CpuState::RBP, bp);
-                        let addr = linear_addr(&cpu.ss, u64::from(bp));
+                        let addr = seg_linear_checked(&cpu.ss, u64::from(bp), 4, true)?;
                         let display = bus
                             .read_u32(addr)
                             .map_err(|e| classify_mem_fault(e, true))?;
@@ -2247,7 +2291,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     for _ in 1..nesting {
                         let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(2);
                         cpu.set_gpr_u16(CpuState::RBP, bp);
-                        let addr = linear_addr(&cpu.ss, u64::from(bp));
+                        let addr = seg_linear_checked(&cpu.ss, u64::from(bp), 2, true)?;
                         let display = bus
                             .read_u16(addr)
                             .map_err(|e| classify_mem_fault(e, true))?;
@@ -2399,8 +2443,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // Unsupported here: address-size 32 (EBX); opsize does not apply.
             let bx = cpu.gpr_u16(CpuState::RBX);
             let off = bx.wrapping_add(u16::from(cpu.al()));
-            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
-            let v = bus.read_u8(addr)?;
+            let seg = data_seg_for_string_src(cpu, &insn);
+            let uses_ss = matches!(insn.prefixes.segment_override, Some(0x36));
+            let addr = seg_linear_checked(seg, u64::from(off), 1, uses_ss)?;
+            let v = bus
+                .read_u8(addr)
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;
             cpu.set_al(v);
             cpu.set_ip16(next_ip);
         }
@@ -2728,8 +2776,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea(cpu, &insn)?;
-                    let offset = bus
+                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;                    let offset = bus
                         .read_u16(addr)
                         .map_err(|e| classify_mem_fault(e, uses_ss))?;
                     let selector = bus
@@ -2752,8 +2799,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    let (addr, _, uses_ss) = ea(cpu, &insn)?;
-                    let offset = bus
+                    let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;                    let offset = bus
                         .read_u16(addr)
                         .map_err(|e| classify_mem_fault(e, uses_ss))?;
                     let selector = bus
@@ -2907,8 +2953,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
-            let (addr, _, uses_ss) = ea(cpu, &insn)?;
-            let lower = bus
+            let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;            let lower = bus
                 .read_u16(addr)
                 .map_err(|e| classify_mem_fault(e, uses_ss))? as i16;
             let upper = bus
@@ -3157,42 +3202,52 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xA0 => {
             // MOV AL, moffs8 — Spec: Intel SDM Vol. 2 "MOV".
-            // Unsupported here: address-size 32/64.
-            let off = insn.immediate as u16;
-            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+// Address-size 16 → moffs16; 0x67 → moffs32 (unreal high offsets).
+            let off = moffs_offset(&insn);
+            let seg = data_seg_for_string_src(cpu, &insn);
+            let uses_ss = string_src_uses_ss(&insn);
+            let addr = seg_linear_checked(seg, off, 1, uses_ss)?;
             let v = bus
                 .read_u8(addr)
-                .map_err(|e| classify_mem_fault(e, string_src_uses_ss(&insn)))?;
-            cpu.set_al(v);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_al(v);
             cpu.set_ip16(next_ip);
         }
         0xA1 => {
             // MOV AX, moffs16 — Spec: Intel SDM Vol. 2 "MOV".
-            // Unsupported here: opsize 32; address-size 32/64.
-            let off = insn.immediate as u16;
-            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+// Unsupported here: opsize 32 (MOV EAX, moffs).
+            if opsz32(&insn) {
+                return Err(ExecError::Unsupported(op));
+            }
+            let off = moffs_offset(&insn);
+            let seg = data_seg_for_string_src(cpu, &insn);
+            let uses_ss = string_src_uses_ss(&insn);
+            let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
             let v = bus
                 .read_u16(addr)
-                .map_err(|e| classify_mem_fault(e, string_src_uses_ss(&insn)))?;
-            cpu.set_ax(v);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_ax(v);
             cpu.set_ip16(next_ip);
         }
         0xA2 => {
             // MOV moffs8, AL — Spec: Intel SDM Vol. 2 "MOV".
-            let off = insn.immediate as u16;
-            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+let off = moffs_offset(&insn);
+            let seg = data_seg_for_string_src(cpu, &insn);
+            let uses_ss = string_src_uses_ss(&insn);
+            let addr = seg_linear_checked(seg, off, 1, uses_ss)?;
             bus.write_u8(addr, cpu.al())
-                .map_err(|e| classify_mem_fault(e, string_src_uses_ss(&insn)))?;
-            cpu.set_ip16(next_ip);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_ip16(next_ip);
         }
         0xA3 => {
             // MOV moffs16, AX — Spec: Intel SDM Vol. 2 "MOV".
-            // Unsupported here: opsize 32; address-size 32/64.
-            let off = insn.immediate as u16;
-            let addr = linear_addr(data_seg_for_string_src(cpu, &insn), u64::from(off));
+// Unsupported here: opsize 32 (MOV moffs, EAX).
+            if opsz32(&insn) {
+                return Err(ExecError::Unsupported(op));
+            }
+            let off = moffs_offset(&insn);
+            let seg = data_seg_for_string_src(cpu, &insn);
+            let uses_ss = string_src_uses_ss(&insn);
+            let addr = seg_linear_checked(seg, off, 2, uses_ss)?;
             bus.write_u16(addr, cpu.ax())
-                .map_err(|e| classify_mem_fault(e, string_src_uses_ss(&insn)))?;
-            cpu.set_ip16(next_ip);
+                .map_err(|e| classify_mem_fault(e, uses_ss))?;            cpu.set_ip16(next_ip);
         }
         0xA8 => {
             // TEST AL, imm8 — Spec: Intel SDM Vol. 2 "TEST".
@@ -9602,7 +9657,7 @@ mod tests {
         assert_eq!(cpu.eax(), 1);
     }
 
-    /// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
+/// Real-mode 0x67: 32-bit ModRM effective addresses (selector<<4 + EA32).
     /// Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (address-size attribute).
     #[test]
     fn asize32_modrm_ea_mov_and_lea() {
@@ -9710,5 +9765,152 @@ mod tests {
         assert_eq!(cpu.gpr_u32(CpuState::RSI), 0x5003);
         assert_eq!(cpu.gpr_u32(CpuState::RDI), 0x6003);
         assert_eq!(cpu.gpr_u32(CpuState::RCX), 0);
+    }
+
+    /// Default real-mode DS limit 64KiB: accesses within 0..=FFFF succeed; 16-bit EA wrap.
+    /// Spec: SDM Vol. 3 §3.4.2–§3.4.3, §5.3; docs/cpu-profile-core2.md.
+    #[test]
+    fn real_mode_default_segment_limit_unchanged() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[0x1234] = 0xAB;
+        mem[0x2000] = 0x5A;
+        // A0 34 12 = MOV AL, [0x1234]
+        mem[0] = 0xA0;
+        mem[1] = 0x34;
+        mem[2] = 0x12;
+        // 8A 87 FE 1F = MOV AL, [BX+0x1FFE] with BX=2 → EA 0x2000 (16-bit wrap add)
+        mem[3] = 0x8A;
+        mem[4] = 0x87;
+        mem[5] = 0xFE;
+        mem[6] = 0x1F;
+        mem[7] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        assert_eq!(cpu.ds.limit, 0xFFFF);
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RBX, 2);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xAB);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x5A);
+        assert_eq!(cpu.ds.limit, 0xFFFF);
+    }
+
+    /// Expanded DS limit (unreal): moffs32 beyond 64KiB succeeds; beyond limit → #GP via IVT.
+    /// Spec: SDM Vol. 3 §3.4.3 (cached limit), §5.3, §6.15 (#GP); Vol. 2 MOV moffs.
+    #[test]
+    fn unreal_expanded_ds_limit_moffs32_and_gp() {
+        // --- success path: limit=4GiB-1, read [0x10000] ---
+        {
+            let mut mem = vec![0u8; 0x20000];
+            mem[0x10000] = 0xC3;
+            // 67 A0 00 00 01 00 = MOV AL, moffs32 0x10000
+            mem[0] = 0x67;
+            mem[1] = 0xA0;
+            mem[2] = 0x00;
+            mem[3] = 0x00;
+            mem[4] = 0x01;
+            mem[5] = 0x00;
+            mem[6] = 0xF4;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ds = x86_core::SegmentReg::real_mode(0);
+            cpu.ds.limit = 0xFFFF_FFFF;
+            cpu.rip = 0;
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.al(), 0xC3);
+            assert_eq!(cpu.ip16(), 6);
+        }
+
+        // --- #GP when offset past cached limit (still >64KiB) ---
+        {
+            let mut mem = vec![0u8; 0x20000];
+            // IVT[13] → 0000:0D00
+            mem[13 * 4] = 0x00;
+            mem[13 * 4 + 1] = 0x0D;
+            mem[13 * 4 + 2] = 0x00;
+            mem[13 * 4 + 3] = 0x00;
+            mem[0xD00] = 0xF4;
+            // 67 A0 00 80 01 00 = MOV AL, [0x18000]
+            mem[0] = 0x67;
+            mem[1] = 0xA0;
+            mem[2] = 0x00;
+            mem[3] = 0x80;
+            mem[4] = 0x01;
+            mem[5] = 0x00;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.ds = x86_core::SegmentReg::real_mode(0);
+            cpu.ds.limit = 0x1_7FFF; // allows 0x10000, not 0x18000
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+            cpu.set_interrupt_flag(true);
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 0x0D00);
+            assert!(!cpu.interrupt_flag());
+            assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0); // faulting IP
+        }
+    }
+
+    /// Real-mode MOV DS keeps expanded cached limit (sticky unreal descriptor cache).
+    /// Spec: SDM Vol. 3 §3.4.2–§3.4.3.
+    #[test]
+    fn unreal_mov_ds_preserves_expanded_limit() {
+        let mut mem = vec![0u8; 0x10000];
+        // B8 34 12 = MOV AX, 0x1234; 8E D8 = MOV DS, AX
+        mem[0] = 0xB8;
+        mem[1] = 0x34;
+        mem[2] = 0x12;
+        mem[3] = 0x8E;
+        mem[4] = 0xD8;
+        mem[5] = 0xF4;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ds.limit = 0xFFFF_FFFF;
+        cpu.ds.flags = 0x0093;
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(cpu.ds.base, 0x1234u64 << 4);
+        assert_eq!(cpu.ds.limit, 0xFFFF_FFFF);
+        assert_eq!(cpu.ds.flags, 0x0093);
+    }
+
+    /// Reduced limit with 16-bit ModRM EA → #GP via IVT (no asize32 required).
+    /// Spec: SDM Vol. 3 §5.3, §6.15 (#GP); Vol. 2 MOV.
+    #[test]
+    fn segment_limit_gp_modrm_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+        mem[0xD00] = 0xF4;
+        // 8A 87 00 90 = MOV AL, [BX+0x9000] with BX=0
+        mem[0] = 0x8A;
+        mem[1] = 0x87;
+        mem[2] = 0x00;
+        mem[3] = 0x90;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ds.limit = 0x7FFF;
+        cpu.rip = 0;
+        cpu.set_gpr_u16(CpuState::RBX, 0);
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0);
     }
 }

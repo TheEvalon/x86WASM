@@ -6,13 +6,18 @@
 #![forbid(unsafe_code)]
 
 /// Segment register selector + hidden descriptor cache.
+///
+/// Spec: Intel SDM Vol. 3 §3.4.2–§3.4.3 (visible selector; cached base/limit/AR).
+/// `limit` is the effective inclusive max offset (G-bit already applied if set by a
+/// prior protected-mode load). Unreal/"big real" keeps an expanded data-segment
+/// limit after returning to real-address mode (SeaBIOS flat 4GiB DS/ES/…).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SegmentReg {
     pub selector: u16,
     pub base: u64,
     pub limit: u32,
-    /// Access rights / attributes (opaque to M1 beyond present defaults).
+    /// Access rights / attributes (opaque beyond present defaults).
     pub flags: u16,
 }
 
@@ -39,6 +44,16 @@ impl SegmentReg {
             limit: 0xFFFF,
             flags: 0x009B,
         }
+    }
+
+    /// Real-address mode data/stack segment load: update selector and base only.
+    ///
+    /// Cached `limit` and `flags` are retained so an expanded unreal-mode limit
+    /// survives `MOV/POP/LDS/LES` of DS/ES/SS/FS/GS. Spec: SDM Vol. 3 §3.4.2
+    /// (`base = selector << 4`); §3.4.3 (descriptor cache).
+    pub fn load_real_mode_selector(&mut self, selector: u16) {
+        self.selector = selector;
+        self.base = (selector as u64) << 4;
     }
 }
 
