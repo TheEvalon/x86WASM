@@ -10150,7 +10150,10 @@ mod tests {
 
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.gdtr.limit, 0x0027);
-        assert_eq!(cpu.gdtr.base, 0x00AB_CDEF, "16-bit opsize truncates base to 24 bits");
+        assert_eq!(
+            cpu.gdtr.base, 0x00AB_CDEF,
+            "16-bit opsize truncates base to 24 bits"
+        );
 
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u16(0x5000).unwrap(), 0x0027);

@@ -351,7 +351,11 @@ mod tests {
     #[test]
     fn sense_interrupt_status_result_and_clears_irq() {
         let mut f = Fdc82077::new();
-        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01));
+        f.port_write(
+            FDC_DOR,
+            1,
+            u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01),
+        );
         f.pcn = 0x12;
         f.assert_irq6();
         assert!(f.irq_line());
