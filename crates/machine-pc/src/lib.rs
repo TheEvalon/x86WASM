@@ -293,9 +293,24 @@ impl Machine {
     /// Whether the platform NMI delivery path is unmasked.
     ///
     /// Spec: IBM PC/AT — CMOS index port `0x70` bit7 = 1 disables NMI.
-    /// Stub: returns `!cmos.nmi_masked()` only; CPU `#NMI` inject is not wired.
     pub fn nmi_delivery_enabled(&self) -> bool {
         !self.cmos.nmi_masked()
+    }
+
+    /// Inject a platform `#NMI` (IVT vector 2) if CMOS NMI mask is clear.
+    ///
+    /// Returns `true` when latched on the CPU; `false` when dropped because
+    /// port `0x70` bit7 masks NMI. Delivery occurs on the next [`Self::step`] /
+    /// [`Self::run`] (not gated by `RFLAGS.IF`).
+    ///
+    /// Spec: IBM PC/AT CMOS NMI disable; Intel SDM Vol. 3 §6.3.3 / §6.7 (`#NMI`).
+    /// Stub: no SMRAM/SMI, no post-delivery NMI blocking window.
+    pub fn inject_nmi(&mut self) -> bool {
+        if !self.nmi_delivery_enabled() {
+            return false;
+        }
+        self.cpu.request_nmi();
+        true
     }
 }
 
@@ -901,6 +916,52 @@ mod tests {
         }
         assert!(!m.cmos.nmi_masked());
         assert!(m.nmi_delivery_enabled());
+    }
+
+    /// Spec: SDM Vol. 3 §6.3.3 / §6.7 — `#NMI` → IVT[2]; CMOS bit7 clear allows inject.
+    #[test]
+    fn inject_nmi_delivers_vector_2_via_ivt() {
+        let mut m = Machine::new(64 * 1024);
+        // IVT[2] at phys 8: handler 0000:0x0800
+        m.mem.write_u8(8, 0x00).unwrap();
+        m.mem.write_u8(9, 0x08).unwrap();
+        m.mem.write_u8(10, 0x00).unwrap();
+        m.mem.write_u8(11, 0x00).unwrap();
+        m.mem.write_u8(0x800, 0xF4).unwrap(); // HLT
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        m.cpu.ss = x86_core::SegmentReg::real_mode(0);
+        m.cpu.rip = 0x1000;
+        m.cpu.set_gpr_u16(x86_core::CpuState::RSP, 0xFFFE);
+        m.cpu.set_interrupt_flag(false); // NMI must ignore IF
+        assert!(m.inject_nmi());
+        assert!(m.cpu.pending_nmi);
+        m.step().unwrap();
+        assert!(!m.cpu.pending_nmi);
+        assert_eq!(m.cpu.cs.selector, 0);
+        assert_eq!(m.cpu.ip16(), 0x0800);
+        assert!(!m.cpu.interrupt_flag());
+    }
+
+    /// Spec: IBM PC/AT — CMOS `0x70` bit7 = 1 drops platform NMI (CPU unchanged).
+    #[test]
+    fn inject_nmi_dropped_when_cmos_masked() {
+        let mut m = Machine::new(64 * 1024);
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        m.cpu.ss = x86_core::SegmentReg::real_mode(0);
+        m.cpu.rip = 0x1234;
+        m.cpu.set_gpr_u16(x86_core::CpuState::RSP, 0xFFFE);
+        let rip_before = m.cpu.rip;
+        let rsp_before = m.cpu.gpr_u16(x86_core::CpuState::RSP);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(CMOS_INDEX, 0x80).unwrap();
+        }
+        assert!(!m.nmi_delivery_enabled());
+        assert!(!m.inject_nmi());
+        assert!(!m.cpu.pending_nmi);
+        assert_eq!(m.cpu.rip, rip_before);
+        assert_eq!(m.cpu.gpr_u16(x86_core::CpuState::RSP), rsp_before);
+        assert_eq!(m.cpu.cs.selector, 0);
     }
 
     /// Guest OUT/IN through interpreter → MachineBus programs PIC, PIT, CMOS.
