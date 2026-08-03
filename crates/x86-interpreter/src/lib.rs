@@ -1511,6 +1511,24 @@ fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     Ok(())
 }
 
+/// Real-mode `#NMI` vector (Intel SDM Vol. 3 §6.3.3 / §6.15).
+const VECTOR_NMI: u8 = 2;
+
+/// Service a latched platform `#NMI` if pending.
+///
+/// Not gated by `RFLAGS.IF`. Clears `halted` so NMI can wake `HLT`.
+/// Spec: Intel SDM Vol. 3 §6.3.3, §6.7 (NMI); §6.4 (real-address delivery).
+/// Stub: no SMRAM/SMI, no NMI blocking window after delivery.
+fn service_pending_nmi(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<bool, ExecError> {
+    if !cpu.pending_nmi {
+        return Ok(false);
+    }
+    cpu.pending_nmi = false;
+    cpu.halted = false;
+    real_mode_software_interrupt(cpu, bus, VECTOR_NMI, cpu.ip16())?;
+    Ok(true)
+}
+
 /// Service a latched maskable external IRQ if `IF=1`.
 ///
 /// Pulls [`Bus::poll_external_irq`] into [`CpuState::pending_irq`], then
@@ -1577,6 +1595,10 @@ where
             }
         }
         // SDM: service pending interrupts before each string iteration.
+        // `#NMI` outranks maskable IRQs (Vol. 3 §6.7).
+        if service_pending_nmi(cpu, bus)? {
+            return Ok(true);
+        }
         if service_pending_external_interrupt(cpu, bus)? {
             return Ok(true);
         }
@@ -2121,10 +2143,15 @@ fn step_two_byte(
 
 /// Execute a single instruction at CS:IP.
 ///
-/// When `IF=1`, services a latched/polled external IRQ before fetch/decode so
-/// non-REP instructions are interruptible (REP also polls between iterations).
-/// Spec: Intel SDM Vol. 3 §6.8.1 (maskable interrupts when IF=1).
+/// Services latched `#NMI` (vector 2, not gated by `IF`) before maskable IRQs,
+/// then when `IF=1` services a latched/polled external IRQ before fetch/decode
+/// so non-REP instructions are interruptible (REP also polls between iterations).
+/// Spec: Intel SDM Vol. 3 §6.3.3 / §6.7 (NMI); §6.8.1 (maskable when IF=1).
 pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    // Platform `#NMI` outranks maskable IRQs and can wake HLT.
+    if service_pending_nmi(cpu, bus)? {
+        return Ok(());
+    }
     if cpu.halted {
         return Ok(());
     }
@@ -4624,6 +4651,33 @@ mod tests {
         };
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.ports, b"Z");
+    }
+
+    /// `#NMI` vector 2 via IVT; not gated by IF (SDM Vol. 3 §6.3.3 / §6.7 / §6.4).
+    #[test]
+    fn nmi_delivers_vector_2_ignoring_if() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT[2] at offset 8 → handler 0000:0x0800
+        mem[8] = 0x00;
+        mem[9] = 0x08;
+        mem[10] = 0x00;
+        mem[11] = 0x00;
+        mem[0x800] = 0xF4; // HLT
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0x1000;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_interrupt_flag(false);
+        cpu.request_nmi();
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(!cpu.pending_nmi);
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0800);
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), 0x1000); // return IP
     }
 
     /// INT n: push FLAGS/CS/IP, clear IF+TF, load IVT[vector] (SDM Vol. 2 / Vol. 3 §6.4).

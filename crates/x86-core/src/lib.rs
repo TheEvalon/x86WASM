@@ -97,6 +97,13 @@ pub struct CpuState {
     /// iterations). Use [`Self::request_interrupt`]. Full 8259 is out of scope.
     #[cfg_attr(feature = "serde", serde(default))]
     pub pending_irq: Option<u8>,
+    /// Latched non-maskable interrupt request (platform `#NMI` pin stub).
+    ///
+    /// Delivered at interpreter poll points as IVT vector 2; **not** gated by
+    /// `RFLAGS.IF`. Platform CMOS `0x70` bit7 masking is enforced by the machine
+    /// before calling [`Self::request_nmi`]. No SMRAM/SMI nesting in this stub.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_nmi: bool,
 }
 
 impl Default for CpuState {
@@ -145,6 +152,7 @@ impl CpuState {
             efer: 0,
             halted: false,
             pending_irq: None,
+            pending_nmi: false,
         }
     }
 
@@ -154,6 +162,15 @@ impl CpuState {
     /// implement 8259 priority, IRR/ISR, or spurious IRQ semantics.
     pub fn request_interrupt(&mut self, vector: u8) {
         self.pending_irq = Some(vector);
+    }
+
+    /// Latch a platform `#NMI` request (IVT vector 2).
+    ///
+    /// Spec: Intel SDM Vol. 3 §6.3.3 / §6.7 — NMI is not maskable by `IF`.
+    /// Callers that model IBM PC/AT CMOS index bit7 must drop the request
+    /// before calling this when NMI is masked.
+    pub fn request_nmi(&mut self) {
+        self.pending_nmi = true;
     }
 
     pub fn gpr_u16(&self, idx: usize) -> u16 {
@@ -364,6 +381,9 @@ impl CpuState {
         }
         if self.pending_irq != other.pending_irq {
             out.push("pending_irq");
+        }
+        if self.pending_nmi != other.pending_nmi {
+            out.push("pending_nmi");
         }
         out
     }

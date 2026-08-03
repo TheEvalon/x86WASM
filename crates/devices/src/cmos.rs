@@ -16,12 +16,13 @@
 //! PF/UF (and AF on alarm match), IRQF → IRQ line for MachineBus → DualPic
 //! IRQ8, plus a simple `tick_second` update cycle (Status A UIP + BCD seconds
 //! cascade). Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
-//! `Machine::nmi_delivery_enabled` expose the latch for a future CPU NMI path.
+//! `Machine::nmi_delivery_enabled` / `Machine::inject_nmi` gate CPU `#NMI`.
 //!
 //! # Unsupported (explicit)
 //!
 //! - Host wall-clock sync / NTP-style host time
-//! - CPU NMI pin / `#NMI` delivery (mask is stored + queried; no inject path yet)
+//! - Full NMI nesting / SMRAM/SMI / post-delivery NMI blocking window
+//!   (`Machine::inject_nmi` + interpreter vector-2 stub covers the pin path)
 //! - Exact crystal divider / UIP pulse width (UIP is set for the duration of
 //!   the modeled update call, or until `end_update_for_test`)
 //! - Full calendar BCD (day/month/year/century); only sec→min→hour cascade
@@ -96,7 +97,7 @@ pub struct CmosRtc {
     /// NMI-disable latch from index-port bit7 (PC/AT: 1 = NMI masked).
     ///
     /// Spec: IBM PC/AT — writing `0x70` bit7 disables NMI; this stub stores the
-    /// bit and exposes it via [`Self::nmi_masked`]. CPU NMI delivery is not wired.
+    /// bit and exposes it via [`Self::nmi_masked`] for `Machine::inject_nmi`.
     pub nmi_disabled: bool,
 }
 
