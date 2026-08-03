@@ -4,12 +4,14 @@
 //! 8237A DMA register/page stubs (no transfer engine);
 //! VGA text frame buffer MMIO stub at 0xB8000;
 //! PCI configuration mechanism #1 stub (0xCF8/0xCFC) + PIIX3 ISA/IDE functions;
-//! Primary IDE IDENTIFY + READ SECTORS PIO + IRQ14 stub (1F0–1F7/3F6).
+//! Primary IDE IDENTIFY + READ SECTORS PIO + IRQ14 stub (1F0–1F7/3F6);
+//! 82077AA FDC port stub (0x3F0–0x3F5/0x3F7; no media engine).
 
 #![forbid(unsafe_code)]
 
 mod cmos;
 mod dma;
+mod fdc;
 mod i8042;
 mod ide;
 mod pci;
@@ -25,6 +27,10 @@ pub use cmos::{
 pub use dma::{
     Dma8237, DmaChannel, DmaController, DMA_MASTER_BASE, DMA_PAGE_CH0, DMA_PAGE_CH1, DMA_PAGE_CH2,
     DMA_PAGE_CH3, DMA_PAGE_CH4, DMA_PAGE_CH5, DMA_PAGE_CH6, DMA_PAGE_CH7, DMA_SLAVE_BASE,
+};
+pub use fdc::{
+    Fdc82077, FDC_DIR_CCR, FDC_DOR, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_RQM, FDC_SRA,
+    FDC_SRB, FDC_TDR,
 };
 pub use i8042::{
     CFG_INT1, CFG_INT12, CFG_KBD_CLOCK_DISABLE, CFG_TRANSLATE, CMD_DISABLE_KBD, CMD_ENABLE_KBD,

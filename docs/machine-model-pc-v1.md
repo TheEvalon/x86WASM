@@ -35,10 +35,11 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0xCFC`–`0xCFF` | PCI `CONFIG_DATA` (byte/word/dword lanes) |
 | `0x1F0`–`0x1F7` | Primary IDE command block — IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO stub |
 | `0x3F6` | Primary IDE alternate status (R) / device control (W; SRST/nIEN) |
+| `0x3F0`–`0x3F5`, `0x3F7` | 82077AA FDC — SRA/SRB/DOR/TDR/MSR\|DSR/FIFO/DIR\|CCR stub (no media) |
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled). Unused page holes (`0x84`–`0x86`, `0x88`, `0x8C`–`0x8E`) stay open-bus.
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO), `devices::PciConfig` (`pci.rs`, field `Machine::pci`), `devices::IdePrimary` (`ide.rs`, field `Machine::ide`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE like serial (IDE keeps attached image). No snapshot schema for these devices yet (serial has none either).
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO), `devices::PciConfig` (`pci.rs`, field `Machine::pci`), `devices::IdePrimary` (`ide.rs`, field `Machine::ide`), `devices::Fdc82077` (`fdc.rs`, field `Machine::fdc`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE/FDC like serial (IDE keeps attached image). No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
@@ -67,3 +68,4 @@ Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices
 - VGA text: IBM VGA / OSDev Text UI — `0xB8000` char+attr plane on `MachineBus`; no CRTC port model yet.
 - PCI config: PCI Local Bus Mechanism #1 + OSDev PCI — `0xCF8`/`0xCFC` on `MachineBus`; host bridge `00:00.0` identity `8086:1237` (i440FX-class stub), class host bridge, header type 0; PIIX3-style stubs at `00:01.0` ISA bridge `8086:7000` (multi-function, class `0x0601`) and `00:01.1` IDE `8086:7010` (class `0x0101`, prog IF `0x80`); absent devices and enable-bit-clear data reads return `0xFFFFFFFF`. **Not yet:** USB/ACPI PIIX functions, BAR MMIO decode, bus mastering, caps/MSI/PCIe.
 - Primary IDE: ATA/ATAPI + OSDev ATA PIO — `IdePrimary` on `0x1F0`–`0x1F7`/`0x3F6`; IDENTIFY DEVICE + READ SECTORS (LBA28) PIO; DRQ/BSY/DRDY/ERR; backing `Vec<u8>` image; IRQ14 via `irq_line()` → `DualPic` when nIEN=0 (status read clears; alt status does not). **Not yet:** ATAPI, WRITE, DMA, slave, secondary, LBA48, SeaBIOS boot.
+- FDC: Intel 82077AA + OSDev FDC — `Fdc82077` on `0x3F0`–`0x3F5`/`0x3F7` (not `0x3F6`); DOR/MSR/FIFO/DIR/CCR accept; MSR RQM when DOR nRESET set. **Not yet:** command engine, media image, DMA ch2, IRQ6, disk-change timing.

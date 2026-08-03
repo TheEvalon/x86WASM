@@ -24,6 +24,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - OSDev Wiki ISA DMA — AT port map and page registers (not port `0x80`)
 - IBM VGA / classic PC color text frame buffer at physical `0xB8000` (80×25, char+attr)
 - OSDev Text UI — VGA text-mode memory layout
+- Intel 82077AA CHMOS Single-Chip Floppy Disk Controller — DOR/MSR/FIFO/DIR/CCR
+- OSDev Wiki Floppy Disk Controller — ports `0x3F0`–`0x3F7` excluding `0x3F6` (IDE)
 
 ## Firmware
 

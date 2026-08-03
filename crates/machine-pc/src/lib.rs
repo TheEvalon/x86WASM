@@ -1,4 +1,4 @@
-//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE wiring.
+//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE/FDC wiring.
 
 #![forbid(unsafe_code)]
 
@@ -10,10 +10,11 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DualPic, IdePrimary, PciConfig, Pit8254, PortDevice,
-    Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD,
-    PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    CmosRtc, DebugConsole, Dma8237, DualPic, Fdc82077, IdePrimary, PciConfig, Pit8254, PortDevice,
+    Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, FDC_DOR, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR,
+    FDC_MSR_RQM, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
+    PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -50,6 +51,8 @@ pub struct Machine {
     pub pci: PciConfig,
     /// Primary IDE — IDENTIFY + READ SECTORS PIO (ports 0x1F0–0x1F7 / 0x3F6).
     pub ide: IdePrimary,
+    /// 82077AA FDC — port stub (0x3F0–0x3F5 / 0x3F7; no media engine).
+    pub fdc: Fdc82077,
     ports: PortBus,
 }
 
@@ -68,6 +71,7 @@ impl Machine {
             vga: VgaText::new(),
             pci: PciConfig::new(),
             ide: IdePrimary::new(),
+            fdc: Fdc82077::new(),
             ports: PortBus::new(),
         }
     }
@@ -106,6 +110,7 @@ impl Machine {
         self.vga.reset();
         self.pci.reset();
         self.ide.reset();
+        self.fdc.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
@@ -125,6 +130,7 @@ impl Machine {
             vga: &mut self.vga,
             pci: &mut self.pci,
             ide: &mut self.ide,
+            fdc: &mut self.fdc,
             ports: &mut self.ports,
         }
     }
@@ -148,6 +154,7 @@ impl Machine {
             vga: &mut self.vga,
             pci: &mut self.pci,
             ide: &mut self.ide,
+            fdc: &mut self.fdc,
             ports: &mut self.ports,
         };
         step(&mut self.cpu, &mut view)?;
@@ -167,6 +174,7 @@ impl Machine {
             vga: &mut self.vga,
             pci: &mut self.pci,
             ide: &mut self.ide,
+            fdc: &mut self.fdc,
             ports: &mut self.ports,
         };
         Ok(run(&mut self.cpu, &mut view, max_steps)?)
@@ -296,6 +304,7 @@ struct MachineBus<'a> {
     vga: &'a mut VgaText,
     pci: &'a mut PciConfig,
     ide: &'a mut IdePrimary,
+    fdc: &'a mut Fdc82077,
     ports: &'a mut PortBus,
 }
 
@@ -304,6 +313,9 @@ impl MachineBus<'_> {
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
             return self.ide.port_read(port, size);
+        }
+        if Fdc82077::owns_port(port) {
+            return self.fdc.port_read(port, size);
         }
         if Dma8237::owns_port(port) {
             return self.dma.port_read(port, size);
@@ -330,6 +342,10 @@ impl MachineBus<'_> {
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
         if IdePrimary::owns_port(port) {
             self.ide.port_write(port, size, value);
+            return;
+        }
+        if Fdc82077::owns_port(port) {
+            self.fdc.port_write(port, size, value);
             return;
         }
         if Dma8237::owns_port(port) {
@@ -1368,5 +1384,27 @@ mod tests {
             let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), None);
         }
+    }
+
+    /// Spec: OSDev FDC / Intel 82077AA — DOR release + MSR RQM via MachineBus.
+    #[test]
+    fn machine_bus_fdc_dor_msr_fifo() {
+        let mut m = Machine::new(64 * 1024);
+        assert!(!Fdc82077::owns_port(0x3F6)); // IDE alt/control, not FDC
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.port_in_u8(FDC_MSR).unwrap(), 0);
+            bus.port_out_u8(FDC_DOR, FDC_DOR_RESET_N).unwrap();
+            assert_eq!(bus.port_in_u8(FDC_MSR).unwrap(), FDC_MSR_RQM);
+            bus.port_out_u8(FDC_FIFO, 0x08).unwrap();
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x08);
+            // 0x3F6 remains IDE (write device control); must not disturb FDC DOR.
+            bus.port_out_u8(0x3F6, 0x02).unwrap();
+        }
+        assert_eq!(m.fdc.dor, FDC_DOR_RESET_N);
+        assert_eq!(m.fdc.fifo_latched, 0x08);
+        m.reset();
+        assert_eq!(m.fdc.dor, 0);
+        assert_eq!(m.fdc.fifo_latched, 0);
     }
 }

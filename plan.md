@@ -1347,7 +1347,7 @@ Progress against implement list:
 - [ ] Initial VGA graphics
 - [ ] Initial VBE
 - [ ] SeaBIOS integration
-- [ ] Floppy boot
+- [ ] Floppy boot — **partial:** `devices::Fdc82077` port stub `0x3F0`–`0x3F5`/`0x3F7` (DOR/MSR/FIFO/DIR/CCR accept; MSR RQM when out of DOR reset); **not** media engine/DMA ch2/IRQ6/command execution/SeaBIOS floppy path
 - [ ] Hard-disk boot
 - [ ] CD-ROM boot
 
