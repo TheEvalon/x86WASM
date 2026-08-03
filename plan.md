@@ -1333,9 +1333,9 @@ Progress against implement list:
 - [ ] LDT
 - [ ] TSS
 - [x] Exceptions (real-mode IVT fault delivery for #DE/#UD/#BR/#GP/#SS; #OF trap via INTO; software INT/INT3/INTO) â€” protected-mode / full fault taxonomy still open
-- [ ] Interrupts (hardware / PIC-driven) — stub: `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; no 8259 yet
+- [ ] Interrupts (hardware / PIC-driven) — stub: `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; 8259 ICW1–ICW4 unit model present, no OCW/EOI/IRQ delivery yet
 - [ ] 32-bit paging
-- [ ] 8259 PIC
+- [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 init only (single/cascade, vector base, ICW3 wiring, ICW4 8086-mode); **not** OCW/EOI/IRR/ISR, IRQ assert, or `MachineBus` wiring
 - [ ] 8254 PIT
 - [ ] RTC
 - [ ] DMA
