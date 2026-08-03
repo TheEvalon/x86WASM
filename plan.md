@@ -1343,7 +1343,7 @@ Progress against implement list:
 - [ ] PCI configuration space
 - [ ] PIIX IDE
 - [ ] ATAPI
-- [ ] VGA text mode
+- [ ] VGA text mode — **partial:** `devices::VgaText` 32 KiB plane at `0xB8000` on `MachineBus` (80×25 reset fill); **not** CRTC/sequencer/graphics/VBE/host render
 - [ ] Initial VGA graphics
 - [ ] Initial VBE
 - [ ] SeaBIOS integration

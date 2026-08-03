@@ -1,6 +1,7 @@
 //! Device models. Milestone 1: COM1 data port + debug port 0x402.
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
-//! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20).
+//! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
+//! VGA text frame buffer MMIO stub at 0xB8000.
 
 #![forbid(unsafe_code)]
 
@@ -9,6 +10,7 @@ mod i8042;
 mod pic;
 mod pit;
 mod serial;
+mod vga;
 
 pub use cmos::{
     CmosRtc, CMOS_DATA, CMOS_INDEX, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, REG_STATUS_D,
@@ -26,6 +28,10 @@ pub use pit::{
     PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL,
 };
 pub use serial::{DebugConsole, Serial16550, SerialOutput};
+pub use vga::{
+    VgaText, VGA_CELL_BYTES, VGA_DEFAULT_ATTR, VGA_DEFAULT_CHAR, VGA_TEXT_BASE, VGA_TEXT_COLS,
+    VGA_TEXT_END, VGA_TEXT_ROWS, VGA_TEXT_SIZE,
+};
 
 /// Port I/O sink shared by CLI and browser.
 pub trait PortDevice {

@@ -16,6 +16,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
 - Intel 8254 Programmable Interval Timer datasheet
 - Motorola MC146818 / IBM PC AT CMOS RTC register map (ports `0x70`/`0x71`)
+- IBM VGA / classic PC color text frame buffer at physical `0xB8000` (80×25, char+attr)
+- OSDev Text UI — VGA text-mode memory layout
 
 ## Firmware
 

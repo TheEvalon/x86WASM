@@ -29,11 +29,12 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled).
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`). Reset clears PIC/PIT/CMOS/8042 like serial. No snapshot schema for these devices yet (serial has none either).
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO). Reset clears PIC/PIT/CMOS/8042/VGA like serial. No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
-Stub dispatcher in M1; no VGA/IDE BARs yet.
+- VGA color text plane: physical `0xB8000`–`0xBFFFF` (32 KiB) owned by `devices::VgaText` on the CPU data bus (`MachineBus` intercepts before `PhysMem`). Reset fills 80×25 with space + attribute `0x07`. **Not yet:** CRTC/sequencer/GC/ATC ports, planar graphics, VBE, host rendering.
+- No IDE BARs yet.
 
 ## Interrupts
 
@@ -53,3 +54,4 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - 8254: Intel 8254 PIT datasheet — channel 0/2 control word, lo/hi access, latch, modes 0/2/3 OUT + GATE; ch0 OUT → IRQ0 via `Machine::tick_pit` / `poll_external_irq` level follow; ch2 GATE/OUT via port `0x61`. No host audio / DRAM-refresh / host-real-time claims.
 - CMOS/RTC: Motorola MC146818 / IBM PC AT — 128-byte register file at `0x70`/`0x71`; NMI bit stored only; status A UIP (read-only to guest); status B PIE/AIE/UIE/SET; status C PF/AF/UF/IRQF read-to-clear; second update stub + periodic tick; IRQ → ISA IRQ8.
 - 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — port-wired; config INT1 + OBF → ISA IRQ1; make-code inject → OBF (clock-disable respected; translation passthrough); output-port bit1 → A20; see `devices::I8042` / `Machine::kbd`.
+- VGA text: IBM VGA / OSDev Text UI — `0xB8000` char+attr plane on `MachineBus`; no CRTC port model yet.
