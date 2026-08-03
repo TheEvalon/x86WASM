@@ -504,12 +504,13 @@ mod tests {
     use devices::{
         CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, CFG_INT1, CFG_TRANSLATE, CMD_ENABLE_KBD,
         CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA,
-        CMOS_INDEX, FDC_CMD_SENSE_INT, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO,
-        FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS,
-        PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-        PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA,
-        PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF,
-        STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX,
+        CMOS_INDEX, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N,
+        FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, I8042, I8042_DATA, I8042_STATUS_CMD,
+        PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+        PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2,
+        PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C,
+        SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
+        VGA_CRTC_INDEX,
     };
 
     #[test]
@@ -1679,6 +1680,23 @@ mod tests {
         assert_eq!(m.fdc.dor, FDC_DOR_RESET_N);
         m.reset();
         assert_eq!(m.fdc.dor, 0);
+    }
+
+    /// Spec: Intel 82077AA Specify — two params via MachineBus; no result phase.
+    #[test]
+    fn machine_bus_fdc_specify() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(FDC_DOR, FDC_DOR_RESET_N).unwrap();
+            bus.port_out_u8(FDC_FIFO, FDC_CMD_SPECIFY).unwrap();
+            assert_eq!(bus.port_in_u8(FDC_MSR).unwrap(), FDC_MSR_RQM);
+            bus.port_out_u8(FDC_FIFO, 0xCF).unwrap();
+            bus.port_out_u8(FDC_FIFO, 0x02).unwrap();
+            assert_eq!(bus.port_in_u8(FDC_MSR).unwrap(), FDC_MSR_RQM);
+        }
+        assert_eq!(m.fdc.specify_srt_hut, 0xCF);
+        assert_eq!(m.fdc.specify_hlt_nd, 0x02);
     }
 
     /// Spec: Intel 82077AA + OSDev FDC + IBM PC AT — assert_irq6 → IRQ6 → vector 0x0E.

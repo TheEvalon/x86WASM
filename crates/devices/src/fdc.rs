@@ -1,4 +1,4 @@
-//! Intel 82077AA floppy disk controller — port stub + Sense Interrupt + IRQ6.
+//! Intel 82077AA floppy disk controller — port stub + Specify/Sense Int + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -6,10 +6,11 @@
 //! # Spec refs
 //!
 //! - Intel 82077AA CHMOS Single-Chip Floppy Disk Controller — DOR, MSR, FIFO,
-//!   DIR/CCR; Sense Interrupt Status command (`0x08`) result ST0+PCN; DOR bit3
+//!   DIR/CCR; Specify (`0x03`) two parameter bytes (SRT|HUT, HLT|ND), no result
+//!   phase / no IRQ; Sense Interrupt Status (`0x08`) result ST0+PCN; DOR bit3
 //!   DMA/IRQ enable; IRQ6 on command / reset completion.
-//! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Sense Interrupt
-//!   clears IRQ; post-reset Sense Interrupt polling.
+//! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
+//!   params; Sense Interrupt clears IRQ; post-reset Sense Interrupt polling.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -18,18 +19,20 @@
 //! - Accept R/W on SRA/SRB/DOR/TDR/MSR|DSR/FIFO/DIR|CCR with stored values
 //! - Reset defaults: MSR = RQM (`0x80`), DOR = `0x00` (controller held in reset)
 //! - IRQ6 stub: `assert_irq6` / `clear_irq6` + `irq_line` gated by DOR nRESET∧DMA/IRQ
+//! - Specify (`0x03`): command byte → two parameter bytes (stored); no result;
+//!   does not assert or clear IRQ; MSR RQM (!DIO) during parameter phase
 //! - Sense Interrupt Status (`0x08`): command byte → 2-byte result (ST0, PCN);
 //!   clears latched IRQ; MSR RQM|DIO during result phase
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - Other commands (Specify/Recalibrate/Seek/READ/WRITE/FORMAT/VERSION/…)
+//! - Other commands (Recalibrate/Seek/READ/WRITE/FORMAT/VERSION/…)
 //! - Media image, seek/format/read/write transfers
-//! - DMA channel 2 transfers
+//! - DMA channel 2 transfers (ND bit stored only; not enforced)
 //! - Automatic IRQ on real media command completion (host may still use assert API)
 //! - Drive sensing, disk-change edge timing, perpendicular mode
-//! - Non-DMA / FIFO threshold / implied seek
+//! - FIFO threshold / implied seek
 
 use crate::PortDevice;
 
@@ -57,6 +60,8 @@ pub const FDC_DOR_RESET_N: u8 = 0x04;
 /// DOR bit3 — DMA and IRQ enable. Spec: Intel 82077AA / OSDev FDC.
 pub const FDC_DOR_DMA_IRQ: u8 = 0x08;
 
+/// Specify command opcode. Spec: Intel 82077AA / OSDev FDC — 2 parameter bytes.
+pub const FDC_CMD_SPECIFY: u8 = 0x03;
 /// Sense Interrupt Status command opcode. Spec: Intel 82077AA / OSDev FDC.
 pub const FDC_CMD_SENSE_INT: u8 = 0x08;
 
@@ -64,11 +69,13 @@ pub const FDC_CMD_SENSE_INT: u8 = 0x08;
 enum Phase {
     /// Idle / accept command byte when RQM && !DIO.
     Command,
+    /// Specify parameters: byte0 = SRT|HUT, byte1 = HLT|ND.
+    SpecifyParams { index: u8 },
     /// Sense Interrupt result: ST0 then PCN.
     SenseIntResult { index: u8 },
 }
 
-/// 82077AA-class FDC port stub with Sense Interrupt + IRQ6 assert API.
+/// 82077AA-class FDC port stub with Specify + Sense Interrupt + IRQ6 assert API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -87,6 +94,10 @@ pub struct Fdc82077 {
     pub dir: u8,
     /// Present cylinder number stub (Sense Interrupt result byte 2).
     pub pcn: u8,
+    /// Specify parameter 1: SRT (bits 7–4) | HUT (bits 3–0). Spec: 82077AA.
+    pub specify_srt_hut: u8,
+    /// Specify parameter 2: HLT (bits 7–1) | ND (bit 0). Spec: 82077AA.
+    pub specify_hlt_nd: u8,
     /// Latched IRQ request (command-complete / reset stub). Spec: 82077AA → ISA IRQ6.
     irq_pending: bool,
     phase: Phase,
@@ -114,6 +125,8 @@ impl Fdc82077 {
             srb: 0x00,
             dir: 0x00,
             pcn: 0x00,
+            specify_srt_hut: 0x00,
+            specify_hlt_nd: 0x00,
             irq_pending: false,
             phase: Phase::Command,
             sense_st0: 0,
@@ -143,7 +156,8 @@ impl Fdc82077 {
             0
         } else {
             match self.phase {
-                Phase::Command => FDC_MSR_RQM,
+                // Spec: 82077AA — command/parameter phases are host→FDC (DIO=0).
+                Phase::Command | Phase::SpecifyParams { .. } => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
             }
         }
@@ -174,6 +188,11 @@ impl Fdc82077 {
         self.sense_st0 = 0;
     }
 
+    /// Begin Specify parameter phase (2 bytes). Spec: Intel 82077AA Specify.
+    fn start_specify(&mut self) {
+        self.phase = Phase::SpecifyParams { index: 0 };
+    }
+
     /// Begin Sense Interrupt Status result phase.
     ///
     /// Spec: Intel 82077AA Sense Interrupt Status — no parameters; result ST0,
@@ -187,7 +206,8 @@ impl Fdc82077 {
 
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
-            Phase::Command => 0xFF, // no result pending — open-bus style
+            // Spec: Specify has no result phase; open-bus style when idle/params.
+            Phase::Command | Phase::SpecifyParams { .. } => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
@@ -210,10 +230,26 @@ impl Fdc82077 {
         }
         match self.phase {
             Phase::Command => {
-                if v == FDC_CMD_SENSE_INT {
+                if v == FDC_CMD_SPECIFY {
+                    // Spec: Intel 82077AA Specify — no IRQ; expect two params.
+                    self.start_specify();
+                } else if v == FDC_CMD_SENSE_INT {
                     self.start_sense_interrupt();
                 }
                 // Other opcodes: accept/drop until a command engine exists.
+            }
+            Phase::SpecifyParams { index } => {
+                // Spec: Intel 82077AA Specify — param0 = SRT|HUT, param1 = HLT|ND.
+                match index {
+                    0 => {
+                        self.specify_srt_hut = v;
+                        self.phase = Phase::SpecifyParams { index: 1 };
+                    }
+                    _ => {
+                        self.specify_hlt_nd = v;
+                        self.phase = Phase::Command;
+                    }
+                }
             }
             Phase::SenseIntResult { .. } => {
                 // Host must not write during result phase (stub ignores).
@@ -395,5 +431,85 @@ mod tests {
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
         // DOR write while leaving reset does not auto-run Sense Interrupt.
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA Specify — opcode `0x03`, two params, no result, no IRQ.
+    #[test]
+    fn specify_accepts_two_params_returns_to_command() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SPECIFY));
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "param phase: RQM, DIO clear"
+        );
+        assert!(f.irq_line(), "Specify must not clear IRQ latch");
+
+        // Typical BIOS values: SRT=0xC, HUT=0xF → 0xCF; HLT=0x01<<1 | ND=0 → 0x02.
+        f.port_write(FDC_FIFO, 1, 0xCF);
+        assert_eq!(f.specify_srt_hut, 0xCF);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "still param phase after first byte"
+        );
+        f.port_write(FDC_FIFO, 1, 0x02);
+        assert_eq!(f.specify_hlt_nd, 0x02);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "idle command phase after Specify"
+        );
+        assert_eq!(f.phase, Phase::Command);
+        assert!(f.irq_line(), "Specify must not assert/clear IRQ");
+
+        // No result bytes — FIFO read stays open-bus style.
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0xFF);
+    }
+
+    #[test]
+    fn specify_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SPECIFY));
+        f.port_write(FDC_FIFO, 1, 0xCF);
+        f.port_write(FDC_FIFO, 1, 0x02);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.specify_srt_hut, 0);
+        assert_eq!(f.specify_hlt_nd, 0);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    #[test]
+    fn dor_reset_aborts_specify_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SPECIFY));
+        f.port_write(FDC_FIFO, 1, 0xAB);
+        assert_eq!(f.specify_srt_hut, 0xAB);
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        // Stored params survive soft DOR reset (full `reset()` clears); phase aborts.
+        assert_eq!(f.specify_srt_hut, 0xAB);
+    }
+
+    #[test]
+    fn reset_clears_specify_params() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SPECIFY));
+        f.port_write(FDC_FIFO, 1, 0xCF);
+        f.port_write(FDC_FIFO, 1, 0x02);
+        f.reset();
+        assert_eq!(f.specify_srt_hut, 0);
+        assert_eq!(f.specify_hlt_nd, 0);
+        assert_eq!(f.phase, Phase::Command);
     }
 }
