@@ -24,6 +24,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - OSDev Wiki ISA DMA — AT port map and page registers (not port `0x80`)
 - IBM VGA / classic PC color text frame buffer at physical `0xB8000` (80×25, char+attr)
 - OSDev Text UI — VGA text-mode memory layout
+- OSDev VGA Hardware / FreeVGA CRT Controller — color CRTC Address `0x3D4`, Data `0x3D5`, indexes `0x00`–`0x18`
 
 ## Firmware
 
