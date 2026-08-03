@@ -20,10 +20,12 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x41` | 8254 PIT channel 1 data — stub accept (not fully supported) |
 | `0x42` | 8254 PIT channel 2 data — stub accept (not fully supported) |
 | `0x43` | 8254 PIT control word |
+| `0x70` | CMOS/RTC index (bits 6:0 = register; bit7 = NMI disable latch) |
+| `0x71` | CMOS/RTC data |
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled).
 
-PIC unit model lives in `devices::DualPic` (`crates/devices/src/pic.rs`). PIT unit model lives in `devices::Pit8254` (`crates/devices/src/pit.rs`). Neither is yet wired into `machine-pc` / `MachineBus`.
+Unit models: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`). None are yet wired into `machine-pc` / `MachineBus`.
 
 ## MMIO
 
@@ -35,6 +37,7 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - Hardware IRQ path: CPU stub `pending_irq` / `Bus::poll_external_irq` exists; **no** PIC→CPU delivery yet.
 - 8259A dual PIC: **ICW1–ICW4 initialization only** (vector base, cascade ICW3, ICW4 8086-mode bit). **Not yet:** OCW1–OCW3, EOI, IRR/ISR, priority, IRQ assertion, or `MachineBus` integration.
 - 8254 PIT: channel-0 programming only; does **not** raise IRQ0 in this slice (no gate/OUT→PIC wiring).
+- CMOS/RTC: index/data bank only; does **not** raise IRQ8 (no PIE/AIE/UIE delivery) and does not sync to host wall-clock yet.
 - APIC deferred to later milestones.
 
 ## Spec / oracle notes
@@ -43,3 +46,4 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - Debug port `0x402`: widely used by SeaBIOS/QEMU guests for early console; treat as write-only byte sink for M1.
 - 8259A: Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4); classic PC cascade on IRQ2.
 - 8254: Intel 8254 PIT datasheet — channel 0 control word, lo/hi access, latch; no IRQ0 pulse / speaker / DRAM-refresh claims yet.
+- CMOS/RTC: Motorola MC146818 / IBM PC AT — 128-byte register file at `0x70`/`0x71`; NMI bit stored only; status C read-to-clear modeled with sticky-zero flags.
