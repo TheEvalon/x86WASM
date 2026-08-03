@@ -17,18 +17,20 @@
 //! Channel 0 control-word programming (modes 0, 2, 3 required; other mode bits
 //! stored), access-mode count load, counter-latch read-back, counting-element
 //! (`ce`) advancement via [`Pit8254::tick_ch0`], and OUT pin level / rising-edge
-//! reporting for IRQ0. Channels 1/2 accept control words and byte I/O but are
-//! **not** claimed as fully supported.
+//! reporting for IRQ0. Channel 2: GATE via port `0x61` bit0, OUT readback on
+//! bit5, speaker-data latch bit1 (no host audio), and [`Pit8254::tick_ch2`].
+//! Channel 1 accepts control words and byte I/O but is **not** fully supported.
 //!
 //! # Unsupported (explicit)
 //!
-//! - Gate input (assumed always high)
-//! - Modes 1 / 4 / 5 OUT/IRQ claims — programmed/stored; `tick_ch0` is a no-op
+//! - Channel 0/1 gate input (assumed always high)
+//! - Modes 1 / 4 / 5 OUT/IRQ claims — programmed/stored; tick is a no-op
 //! - Mode 3 exact 50% duty cycle (simplified: one rising OUT edge per period)
 //! - BCD counting during tick (BCD flag stored; tick uses binary)
 //! - Read-back command (`SC=11`) status/count latches (ignored)
-//! - Channel 1 DRAM refresh and channel 2 PC speaker semantics
+//! - Channel 1 DRAM refresh; host PC-speaker audio output
 //! - Host-real-time wall-clock rate (callers choose tick quantum)
+//! - Port `0x61` NMI/parity/refresh toggle side effects (bits other than 0/1/5)
 
 use crate::PortDevice;
 
@@ -40,6 +42,15 @@ pub const PIT_CH1_DATA: u16 = 0x41;
 pub const PIT_CH2_DATA: u16 = 0x42;
 /// Control-word / read-back port.
 pub const PIT_CONTROL: u16 = 0x43;
+/// System control port B (PPI) — speaker GATE2 / SPKR_EN / OUT2 readback.
+pub const PORT_SYSTEM_CONTROL: u16 = 0x61;
+
+/// Port `0x61` bit0: PIT channel 2 GATE (speaker timer).
+pub const PORT61_GATE2: u8 = 1 << 0;
+/// Port `0x61` bit1: speaker data enable (latched; no host audio).
+pub const PORT61_SPKR_DATA: u8 = 1 << 1;
+/// Port `0x61` bit5: PIT channel 2 OUT (read).
+pub const PORT61_OUT2: u8 = 1 << 5;
 
 /// Control-word SC field: select channel / latch / read-back.
 const CW_SC_SHIFT: u8 = 6;
@@ -115,6 +126,8 @@ pub struct PitChannel {
     latched: Option<u16>,
     /// Whether a full count has been written since the last mode program.
     pub count_loaded: bool,
+    /// GATE input. Ch0/ch1 assumed high; ch2 driven by port `0x61` bit0.
+    pub gate: bool,
 }
 
 impl PitChannel {
@@ -133,6 +146,7 @@ impl PitChannel {
             mode2_out_low: false,
             latched: None,
             count_loaded: false,
+            gate: true,
         }
     }
 
@@ -207,8 +221,45 @@ impl PitChannel {
         // Spec: Intel 8254 — full count load arms CE; 0 encodes 65536.
         self.ce = self.reload_ce();
         self.mode2_out_low = false;
-        // Modes 0/2/3: start counting (GATE always high). Modes 1/4/5: store only.
-        self.counting = matches!(self.mode, 0 | 2 | 3);
+        // Modes 0/2/3: start counting when GATE high. Modes 1/4/5: store only.
+        self.counting = matches!(self.mode, 0 | 2 | 3) && self.gate;
+    }
+
+    /// Update GATE. Spec: Intel 8254 — mode 0 GATE enables/disables counting;
+    /// modes 2/3 GATE low forces OUT high and disables counting; rising GATE
+    /// reloads CE for modes 2/3.
+    fn set_gate(&mut self, high: bool) {
+        let was = self.gate;
+        if was == high {
+            return;
+        }
+        self.gate = high;
+        if !high {
+            if matches!(self.mode, 2 | 3) {
+                self.out_level = true;
+                self.mode2_out_low = false;
+            }
+            // Mode 0: OUT unchanged; tick paused while GATE low.
+            return;
+        }
+        // Rising edge.
+        if !self.count_loaded {
+            return;
+        }
+        match self.mode {
+            0 => {
+                if self.ce > 0 {
+                    self.counting = true;
+                }
+            }
+            2 | 3 => {
+                self.ce = self.reload_ce();
+                self.mode2_out_low = false;
+                self.out_level = true;
+                self.counting = true;
+            }
+            _ => {}
+        }
     }
 
     fn write_data(&mut self, value: u8) {
@@ -266,9 +317,9 @@ impl PitChannel {
 
     /// Advance one model CLK. Returns true if OUT had a rising edge this clock.
     ///
-    /// Spec: Intel 8254 modes 0 / 2 / 3 OUT (GATE high). Modes 1/4/5: no-op.
+    /// Spec: Intel 8254 modes 0 / 2 / 3 OUT (requires GATE high). Modes 1/4/5: no-op.
     fn tick_one(&mut self) -> bool {
-        if !self.counting {
+        if !self.gate || !self.counting {
             return false;
         }
         match self.mode {
@@ -324,32 +375,81 @@ impl PitChannel {
     }
 }
 
-/// 8254 PIT with three channels; channel 0 is the supported programming + OUT surface.
+/// 8254 PIT with three channels; ch0 IRQ0 + ch2 speaker GATE/OUT via port `0x61`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pit8254 {
     pub channels: [PitChannel; 3],
+    /// Port `0x61` bits 1:0 — GATE2 + speaker data enable (no host audio).
+    port61_lo: u8,
 }
 
 impl Pit8254 {
     pub fn new() -> Self {
-        Self {
+        let mut s = Self {
             channels: [PitChannel::new(), PitChannel::new(), PitChannel::new()],
-        }
+            port61_lo: 0,
+        };
+        // Ch2 GATE follows port 0x61 bit0 (cleared at reset → GATE low).
+        s.channels[2].gate = false;
+        s
     }
 
     pub fn reset(&mut self) {
         for ch in &mut self.channels {
             ch.reset();
         }
+        self.port61_lo = 0;
+        self.channels[2].gate = false;
     }
 
     pub fn channel0(&self) -> &PitChannel {
         &self.channels[0]
     }
 
+    pub fn channel2(&self) -> &PitChannel {
+        &self.channels[2]
+    }
+
     /// Channel 0 OUT pin level (Intel 8254 OUT → PC IRQ0 when wired).
     pub fn out_ch0(&self) -> bool {
         self.channels[0].out_level
+    }
+
+    /// Channel 2 OUT pin level (PC speaker timer; read via port `0x61` bit5).
+    pub fn out_ch2(&self) -> bool {
+        self.channels[2].out_level
+    }
+
+    /// Speaker data enable latch (port `0x61` bit1). No host audio side effect.
+    pub fn speaker_data_enabled(&self) -> bool {
+        self.port61_lo & PORT61_SPKR_DATA != 0
+    }
+
+    /// Set channel 2 GATE (also updated by [`Pit8254::port61_write`]).
+    pub fn set_gate_ch2(&mut self, high: bool) {
+        self.channels[2].set_gate(high);
+        if high {
+            self.port61_lo |= PORT61_GATE2;
+        } else {
+            self.port61_lo &= !PORT61_GATE2;
+        }
+    }
+
+    /// Read system control port B subset: bits 1:0 latched + bit5 = ch2 OUT.
+    ///
+    /// Spec: IBM PC/AT PPI port B — bit0 GATE2, bit1 speaker data, bit5 OUT2.
+    pub fn port61_read(&self) -> u8 {
+        let mut v = self.port61_lo & (PORT61_GATE2 | PORT61_SPKR_DATA);
+        if self.out_ch2() {
+            v |= PORT61_OUT2;
+        }
+        v
+    }
+
+    /// Write system control port B subset (bits 1:0). Updates ch2 GATE.
+    pub fn port61_write(&mut self, value: u8) {
+        self.port61_lo = value & (PORT61_GATE2 | PORT61_SPKR_DATA);
+        self.channels[2].set_gate(self.port61_lo & PORT61_GATE2 != 0);
     }
 
     /// Advance channel 0 by `clocks` model ticks.
@@ -360,6 +460,19 @@ impl Pit8254 {
         let mut rising = false;
         for _ in 0..clocks {
             if self.channels[0].tick_one() {
+                rising = true;
+            }
+        }
+        rising
+    }
+
+    /// Advance channel 2 by `clocks` model ticks (GATE-gated).
+    ///
+    /// Returns `true` if OUT had at least one rising edge during the quantum.
+    pub fn tick_ch2(&mut self, clocks: u64) -> bool {
+        let mut rising = false;
+        for _ in 0..clocks {
+            if self.channels[2].tick_one() {
                 rising = true;
             }
         }
@@ -563,19 +676,83 @@ mod tests {
     }
 
     #[test]
-    fn channels_1_and_2_accept_but_undocumented_as_full() {
-        // Honest stub: control + data accepted; no IRQ/speaker claims.
+    fn channel1_accept_but_undocumented_as_full() {
+        // Honest stub: ch1 control + data accepted; no DRAM-refresh claims.
         let mut pit = Pit8254::new();
         pit.port_write(PIT_CONTROL, 1, 0x76); // ch1 mode 3 lohi
         pit.port_write(PIT_CH1_DATA, 1, 0x01);
         pit.port_write(PIT_CH1_DATA, 1, 0x00);
         assert!(pit.channels[1].count_loaded);
         assert_eq!(pit.channels[1].count, 0x0001);
+    }
 
-        pit.port_write(PIT_CONTROL, 1, 0xB6); // ch2 mode 3 lohi
-        pit.port_write(PIT_CH2_DATA, 1, 0xFF);
+    /// Spec: IBM PC/AT port 0x61 — bit0 GATE2, bit1 speaker data, bit5 OUT2.
+    #[test]
+    fn port61_gate_speaker_and_out2_readback() {
+        let mut pit = Pit8254::new();
+        assert_eq!(pit.port61_read() & (PORT61_GATE2 | PORT61_SPKR_DATA), 0);
+        assert!(!pit.channel2().gate);
+
+        // Program ch2 mode 0, count=3; GATE still low → not counting.
+        pit.port_write(PIT_CONTROL, 1, 0xB0); // ch2 lohi mode 0
+        pit.port_write(PIT_CH2_DATA, 1, 0x03);
         pit.port_write(PIT_CH2_DATA, 1, 0x00);
-        assert_eq!(pit.channels[2].count, 0x00FF);
+        assert!(!pit.channel2().counting);
+        assert!(!pit.out_ch2());
+        assert!(!pit.tick_ch2(10));
+        assert!(!pit.out_ch2());
+
+        // Enable GATE2 + speaker data.
+        pit.port61_write(PORT61_GATE2 | PORT61_SPKR_DATA);
+        assert!(pit.speaker_data_enabled());
+        assert!(pit.channel2().gate);
+        assert!(pit.channel2().counting);
+        assert_eq!(pit.port61_read() & (PORT61_GATE2 | PORT61_SPKR_DATA), 0x03);
+
+        assert!(!pit.tick_ch2(2));
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1)); // 3rd clock → OUT rising
+        assert!(pit.out_ch2());
+        assert_ne!(pit.port61_read() & PORT61_OUT2, 0);
+
+        // GATE low pauses; OUT2 stays high (mode 0).
+        pit.port61_write(PORT61_SPKR_DATA);
+        assert!(!pit.channel2().gate);
+        assert!(pit.out_ch2());
+        assert_ne!(pit.port61_read() & PORT61_OUT2, 0);
+        assert_eq!(pit.port61_read() & PORT61_GATE2, 0);
+    }
+
+    /// Spec: Intel 8254 mode 2 — GATE low forces OUT high and stops counting.
+    #[test]
+    fn ch2_mode2_gate_low_forces_out_high() {
+        let mut pit = Pit8254::new();
+        pit.port61_write(PORT61_GATE2);
+        pit.port_write(PIT_CONTROL, 1, 0xB4); // ch2 lohi mode 2
+        pit.port_write(PIT_CH2_DATA, 1, 0x04);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00);
+        assert!(pit.out_ch2());
+        assert!(pit.channel2().counting);
+
+        // Advance near terminal so OUT may go low.
+        let _ = pit.tick_ch2(4);
+        pit.port61_write(0); // GATE low
+        assert!(!pit.channel2().gate);
+        assert!(pit.out_ch2()); // forced high
+        assert!(!pit.tick_ch2(10));
+    }
+
+    #[test]
+    fn reset_clears_port61_and_ch2_gate() {
+        let mut pit = Pit8254::new();
+        pit.port61_write(PORT61_GATE2 | PORT61_SPKR_DATA);
+        pit.port_write(PIT_CONTROL, 1, 0xB6);
+        pit.port_write(PIT_CH2_DATA, 1, 0x10);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00);
+        pit.reset();
+        assert_eq!(pit, Pit8254::new());
+        assert!(!pit.channel2().gate);
+        assert_eq!(pit.port61_read(), 0);
     }
 
     #[test]

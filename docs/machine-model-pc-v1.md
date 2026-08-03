@@ -18,8 +18,9 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0xA0` / `0xA1` | 8259A slave PIC (command / data) — ICW + OCW1/EOI/IRR/ISR |
 | `0x40` | 8254 PIT channel 0 data — programming + CE/OUT tick (IRQ0) |
 | `0x41` | 8254 PIT channel 1 data — stub accept (not fully supported) |
-| `0x42` | 8254 PIT channel 2 data — stub accept (not fully supported) |
+| `0x42` | 8254 PIT channel 2 data — speaker timer (GATE via `0x61`) |
 | `0x43` | 8254 PIT control word |
+| `0x61` | System control port B subset — bit0 GATE2, bit1 speaker data, bit5 OUT2 (read) |
 | `0x70` | CMOS/RTC index (bits 6:0 = register; bit7 = NMI disable latch) |
 | `0x71` | CMOS/RTC data |
 | `0x60` | 8042 / PS/2 data — OBF∧config INT1 → IRQ1 |
@@ -38,7 +39,7 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - Software INT/IRET and real-mode IVT fault delivery: see interpreter / M2 CPU work.
 - Hardware IRQ path: `MachineBus::poll_external_irq` syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, and CMOS IRQF → IRQ8 then `DualPic::poll_irq` (INTA-style acknowledge + vector). CPU still delivers via `pending_irq` when `IF=1`.
 - 8259A dual PIC: port-wired on `MachineBus`; ICW1–ICW4, OCW1 IMR, OCW2 non-specific/specific EOI, OCW3 IRR/ISR read select, edge IR assert, fully nested priority, cascade on IR2. **Not yet:** Auto-EOI, rotate, special mask, OCW3 poll command, level-triggered runtime.
-- 8254 PIT: port-wired on `MachineBus`; channel-0 programming + `ce`/OUT tick (`Pit8254::tick_ch0`, `Machine::tick_pit`). Modes 0/2/3 OUT rising edges drive IRQ0 (8259A master IR0). GATE assumed high. Guest wall-clock rate is **not** host-real-time (explicit tick quantum). **Not yet:** speaker, ch1/ch2 full semantics, modes 1/4/5 OUT claims, mode 3 exact 50% duty.
+- 8254 PIT: port-wired on `MachineBus`; channel-0 programming + `ce`/OUT tick (`Pit8254::tick_ch0`, `Machine::tick_pit` also ticks ch2). Modes 0/2/3 OUT rising edges drive IRQ0 (8259A master IR0). Ch0/ch1 GATE assumed high. Channel 2 GATE + speaker-data latch + OUT2 readback via port `0x61` bits 0/1/5 (no host audio). Guest wall-clock rate is **not** host-real-time (explicit tick quantum). **Not yet:** host speaker audio, ch1 DRAM refresh, modes 1/4/5 OUT claims, mode 3 exact 50% duty, port `0x61` NMI/parity/refresh bits.
 - CMOS/RTC: port-wired on `MachineBus`; status B PIE/AIE/UIE + status C PF/AF/UF/IRQF (read-to-clear); `CmosRtc::tick` / `Machine::tick_cmos` → IRQ8 (8259A slave IR0). Guest period quantum is **not** host-real-time. **Not yet:** wall-clock sync, NMI delivery, UIP/crystal model.
 - 8042 / PS/2: port-wired on `MachineBus` (`0x60`/`0x64`); self-test / config / enable-disable; OBF + config bit0 (INT1) → IRQ1 via `Machine::kbd_place_output` / `poll_external_irq`. **Not yet:** IRQ12/mouse, scancode device protocol, A20 side effects.
 - APIC deferred to later milestones.
@@ -48,6 +49,6 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - Serial: 16550-compatible programming model (subset).
 - Debug port `0x402`: widely used by SeaBIOS/QEMU guests for early console; treat as write-only byte sink for M1.
 - 8259A: Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4, OCW1–OCW3 EOI/IMR/IRR/ISR); classic PC cascade on IRQ2.
-- 8254: Intel 8254 PIT datasheet — channel 0 control word, lo/hi access, latch, modes 0/2/3 OUT; ch0 OUT → IRQ0 via `Machine::tick_pit` / `poll_external_irq` level follow. No speaker / DRAM-refresh / host-real-time claims.
+- 8254: Intel 8254 PIT datasheet — channel 0/2 control word, lo/hi access, latch, modes 0/2/3 OUT + GATE; ch0 OUT → IRQ0 via `Machine::tick_pit` / `poll_external_irq` level follow; ch2 GATE/OUT via port `0x61`. No host audio / DRAM-refresh / host-real-time claims.
 - CMOS/RTC: Motorola MC146818 / IBM PC AT — 128-byte register file at `0x70`/`0x71`; NMI bit stored only; status B PIE/AIE/UIE; status C PF/AF/UF/IRQF read-to-clear; IRQ → ISA IRQ8.
 - 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — port-wired; config INT1 + OBF → ISA IRQ1; see `devices::I8042` / `Machine::kbd`.

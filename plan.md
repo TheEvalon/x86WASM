@@ -1336,7 +1336,7 @@ Progress against implement list:
 - [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `MachineBus::poll_external_irq` syncs PIT ch0 OUT→IRQ0 + 8042 OBF∧INT1→IRQ1 + CMOS IRQF→IRQ8 then `DualPic::poll_irq`
 - [ ] 32-bit paging
 - [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 + OCW1 IMR + OCW2 EOI + OCW3 IRR/ISR read + edge IRQ assert + cascade + `MachineBus` ports / `poll_external_irq`; **not** Auto-EOI/rotate/special-mask/OCW3 poll/level-triggered runtime
-- [ ] 8254 PIT — **partial:** `devices::Pit8254` ch0 programming + `ce`/OUT tick (modes 0/2/3) + `Machine::tick_pit` → IRQ0→PIC; ch1/ch2 stub accept; **not** speaker / host-real-time / modes 1/4/5 OUT
+- [ ] 8254 PIT — **partial:** `devices::Pit8254` ch0 programming + `ce`/OUT tick (modes 0/2/3) + `Machine::tick_pit` → IRQ0→PIC; ch2 GATE/OUT + port `0x61` speaker bits (no host audio); ch1 stub accept; **not** host-real-time / modes 1/4/5 OUT / host speaker audio
 - [ ] RTC — **partial:** `devices::CmosRtc` index/data + PIE/AIE/UIE + status C read-to-clear + `Machine::tick_cmos` → IRQ8→PIC; **not** wall-clock sync / NMI delivery / UIP crystal model
 - [ ] DMA
 - [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test/config/enable + OBF∧INT1→IRQ1); **not** mouse/IRQ12, scancode device, or A20

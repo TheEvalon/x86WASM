@@ -12,7 +12,7 @@ pub use mem::PhysMem;
 use devices::{
     CmosRtc, DebugConsole, DualPic, Pit8254, PortDevice, Serial16550, CMOS_DATA, CMOS_INDEX, I8042,
     I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-    PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
+    PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -134,7 +134,8 @@ impl Machine {
         self.load_rom(&rom)
     }
 
-    /// Advance PIT channel 0 by `clocks` model ticks and sync OUT → PIC IRQ0.
+    /// Advance PIT channel 0 (and ch2 speaker timer) by `clocks` model ticks
+    /// and sync ch0 OUT → PIC IRQ0.
     ///
     /// Spec: Intel 8254 ch0 OUT; Intel 8259A edge IR (low→high latches IRR).
     /// Guest wall-clock rate is **not** host-real-time — callers choose the quantum.
@@ -144,6 +145,7 @@ impl Machine {
     // --- PIT→IRQ0 (slice/device-pit-irq0); keep MachineBus edits minimal for 8042 merge ---
     pub fn tick_pit(&mut self, clocks: u64) {
         let rising = self.pit.tick_ch0(clocks);
+        let _ = self.pit.tick_ch2(clocks);
         if rising {
             self.pic.set_irq_line(0, false);
             self.pic.set_irq_line(0, true);
@@ -221,6 +223,7 @@ impl MachineBus<'_> {
             PIT_CH0_DATA | PIT_CH1_DATA | PIT_CH2_DATA | PIT_CONTROL => {
                 self.pit.port_read(port, size)
             }
+            PORT_SYSTEM_CONTROL => u32::from(self.pit.port61_read()),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
             0x3F8..0x400 => self.com1.port_read(port, size),
@@ -237,6 +240,7 @@ impl MachineBus<'_> {
             PIT_CH0_DATA | PIT_CH1_DATA | PIT_CH2_DATA | PIT_CONTROL => {
                 self.pit.port_write(port, size, value);
             }
+            PORT_SYSTEM_CONTROL => self.pit.port61_write(value as u8),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_write(port, size, value),
             0x3F8..0x400 => self.com1.port_write(port, size, value),
@@ -307,7 +311,8 @@ mod tests {
     use devices::{
         CmosRtc, DualPic, Pit8254, CFG_INT1, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG,
         CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
-        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A,
+        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL,
+        PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A,
         REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
         STC_PF,
     };
@@ -914,6 +919,79 @@ mod tests {
         assert!(steps > 0);
         assert!(m.cpu.halted);
         assert_eq!(m.cpu.al(), SELF_TEST_OK);
+    }
+
+    /// Spec: IBM PC/AT port 0x61 — GATE2 + speaker data + ch2 OUT readback on MachineBus.
+    #[test]
+    fn machine_bus_port61_speaker_gate_and_out2() {
+        let mut m = Machine::new(64 * 1024);
+        m.pit.port_write(PIT_CONTROL, 1, 0xB0); // ch2 mode 0 lohi
+        m.pit.port_write(PIT_CH2_DATA, 1, 0x02);
+        m.pit.port_write(PIT_CH2_DATA, 1, 0x00);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & 0x03, 0);
+            bus.port_out_u8(PORT_SYSTEM_CONTROL, PORT61_GATE2 | PORT61_SPKR_DATA)
+                .unwrap();
+            assert_eq!(
+                bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & (PORT61_GATE2 | PORT61_SPKR_DATA),
+                PORT61_GATE2 | PORT61_SPKR_DATA
+            );
+        }
+        assert!(m.pit.channel2().gate);
+        assert!(m.pit.speaker_data_enabled());
+        m.tick_pit(2);
+        assert!(m.pit.out_ch2());
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            assert_ne!(
+                bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & PORT61_OUT2,
+                0
+            );
+        }
+    }
+
+    /// Guest OUT/IN port 0x61 speaker bits through interpreter.
+    #[test]
+    fn guest_out_in_port61_speaker_bits() {
+        let mut m = Machine::new(64 * 1024);
+        let prog: &[u8] = &[
+            0xB0, 0x03, // mov al, 3 (GATE2|SPKR)
+            0xE6, 0x61, // out 0x61, al
+            0xE4, 0x61, // in al, 0x61
+            0xF4, // hlt
+        ];
+        for (i, b) in prog.iter().enumerate() {
+            m.mem.write_u8(i as u64, *b).unwrap();
+        }
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.halted = false;
+        let steps = m.run(100).unwrap();
+        assert!(steps > 0);
+        assert!(m.cpu.halted);
+        assert_eq!(m.cpu.al() & 0x03, 0x03);
+        assert!(m.pit.channel2().gate);
+        assert!(m.pit.speaker_data_enabled());
     }
 
     /// Reset clears PIC/PIT/CMOS/8042 device state like serial recreation.
