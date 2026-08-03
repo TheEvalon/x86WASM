@@ -1,4 +1,4 @@
-//! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Sense Int + IRQ6.
+//! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/Sense Int + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -8,11 +8,12 @@
 //! - Intel 82077AA CHMOS Single-Chip Floppy Disk Controller — DOR, MSR, FIFO,
 //!   DIR/CCR; Specify (`0x03`) two parameter bytes (SRT|HUT, HLT|ND), no result
 //!   phase / no IRQ; Recalibrate (`0x07`) one unit-select parameter, Seek End
-//!   ST0 + PCN=0 + IRQ; Sense Interrupt Status (`0x08`) result ST0+PCN; DOR bit3
-//!   DMA/IRQ enable; IRQ6 on command / reset completion.
+//!   ST0 + PCN=0 + IRQ; Seek (`0x0F`) HD|US + NCN, Seek End ST0 + PCN=NCN + IRQ;
+//!   Sense Interrupt Status (`0x08`) result ST0+PCN; DOR bit3 DMA/IRQ enable;
+//!   IRQ6 on command / reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
-//!   params; Recalibrate → IRQ then Sense Interrupt; Sense Interrupt clears IRQ;
-//!   post-reset Sense Interrupt polling.
+//!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
+//!   IRQ; post-reset Sense Interrupt polling.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -26,15 +27,17 @@
 //! - Recalibrate (`0x07`): command byte → one unit-select parameter (bits 1:0);
 //!   sets `pcn = 0`, latches ST0 Seek End (`0x20 | unit`) for Sense Interrupt,
 //!   asserts IRQ; MSR RQM (!DIO) during parameter phase; no result phase
+//! - Seek (`0x0F`): command byte → HD|US + NCN; sets `pcn = NCN`, latches ST0
+//!   Seek End (`0x20 | unit`; H bit always 0 per 82077AA), asserts IRQ; no result
 //! - Sense Interrupt Status (`0x08`): command byte → 2-byte result (ST0, PCN);
-//!   returns latched Recalibrate ST0 when present, else post-reset/`assert_irq6`
+//!   returns latched Recalibrate/Seek ST0 when present, else post-reset/`assert_irq6`
 //!   stub `0xC0 | DOR[1:0]`; clears latched IRQ; MSR RQM|DIO during result phase
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - Other commands (Seek/READ/WRITE/FORMAT/VERSION/…)
-//! - Media image, seek timing, format/read/write transfers
+//! - Other commands (READ/WRITE/FORMAT/VERSION/Relative Seek/…)
+//! - Media image, seek step timing, format/read/write transfers
 //! - DMA channel 2 transfers (ND bit stored only; not enforced)
 //! - Automatic IRQ on real media command completion (host may still use assert API)
 //! - Drive sensing, disk-change edge timing, perpendicular mode
@@ -72,6 +75,8 @@ pub const FDC_CMD_SPECIFY: u8 = 0x03;
 pub const FDC_CMD_RECALIBRATE: u8 = 0x07;
 /// Sense Interrupt Status command opcode. Spec: Intel 82077AA / OSDev FDC.
 pub const FDC_CMD_SENSE_INT: u8 = 0x08;
+/// Seek command opcode. Spec: Intel 82077AA / OSDev FDC — HD|US + NCN.
+pub const FDC_CMD_SEEK: u8 = 0x0F;
 /// ST0 Seek End (SE) bit. Spec: Intel 82077AA status register 0.
 pub const FDC_ST0_SEEK_END: u8 = 0x20;
 /// ST0 Interrupt Code = 11 (abnormal/ready-line-changed stub). Spec: 82077AA / OSDev.
@@ -85,11 +90,13 @@ enum Phase {
     SpecifyParams { index: u8 },
     /// Recalibrate parameter: unit select bits 1:0.
     RecalibrateParams,
+    /// Seek parameters: byte0 = HD|US, byte1 = NCN.
+    SeekParams { index: u8 },
     /// Sense Interrupt result: ST0 then PCN.
     SenseIntResult { index: u8 },
 }
 
-/// 82077AA-class FDC port stub with Specify + Recalibrate + Sense Interrupt + IRQ6.
+/// 82077AA-class FDC port stub with Specify + Recalibrate + Seek + Sense Interrupt + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -115,8 +122,10 @@ pub struct Fdc82077 {
     /// Latched IRQ request (command-complete / reset stub). Spec: 82077AA → ISA IRQ6.
     irq_pending: bool,
     phase: Phase,
-    /// Command-completion ST0 for Sense Interrupt (Recalibrate Seek End); consumed once.
+    /// Command-completion ST0 for Sense Interrupt (Recalibrate/Seek Seek End); consumed once.
     pending_sense_st0: Option<u8>,
+    /// Seek param0 (HD|US) latched between the two Seek parameter bytes.
+    seek_head_unit: u8,
     /// Sense Interrupt ST0 result byte (set when entering result phase).
     sense_st0: u8,
 }
@@ -146,6 +155,7 @@ impl Fdc82077 {
             irq_pending: false,
             phase: Phase::Command,
             pending_sense_st0: None,
+            seek_head_unit: 0,
             sense_st0: 0,
         }
     }
@@ -174,9 +184,10 @@ impl Fdc82077 {
         } else {
             match self.phase {
                 // Spec: 82077AA — command/parameter phases are host→FDC (DIO=0).
-                Phase::Command | Phase::SpecifyParams { .. } | Phase::RecalibrateParams => {
-                    FDC_MSR_RQM
-                }
+                Phase::Command
+                | Phase::SpecifyParams { .. }
+                | Phase::RecalibrateParams
+                | Phase::SeekParams { .. } => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
             }
         }
@@ -205,6 +216,7 @@ impl Fdc82077 {
         self.irq_pending = false;
         self.phase = Phase::Command;
         self.pending_sense_st0 = None;
+        self.seek_head_unit = 0;
         self.sense_st0 = 0;
     }
 
@@ -231,12 +243,31 @@ impl Fdc82077 {
         self.phase = Phase::Command;
     }
 
+    /// Begin Seek parameter phase (2 bytes). Spec: Intel 82077AA Seek.
+    fn start_seek(&mut self) {
+        self.seek_head_unit = 0;
+        self.phase = Phase::SeekParams { index: 0 };
+    }
+
+    /// Complete Seek after NCN parameter.
+    ///
+    /// Spec: Intel 82077AA Seek — steps to NCN; on completion PCN=NCN, ST0
+    /// SE|US (`0x20 | unit`; H in ST0 always 0), interrupt asserted; host uses
+    /// Sense Interrupt Status (no Seek result phase). OSDev: param0 = (HD<<2)|US.
+    fn finish_seek(&mut self, ncn: u8) {
+        let unit = self.seek_head_unit & 0x03;
+        self.pcn = ncn;
+        self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | unit);
+        self.irq_pending = true;
+        self.phase = Phase::Command;
+    }
+
     /// Begin Sense Interrupt Status result phase.
     ///
     /// Spec: Intel 82077AA Sense Interrupt Status — no parameters; result ST0,
-    /// PCN; clears interrupt. When a seek-class command latched ST0 (Recalibrate),
-    /// return that value; otherwise ST0 IC=11 (`0xC0`) models post-reset “ready
-    /// line changed” / `assert_irq6`-only status; unit select from DOR[1:0].
+    /// PCN; clears interrupt. When a seek-class command latched ST0 (Recalibrate
+    /// / Seek), return that value; otherwise ST0 IC=11 (`0xC0`) models post-reset
+    /// “ready line changed” / `assert_irq6`-only status; unit select from DOR[1:0].
     fn start_sense_interrupt(&mut self) {
         self.sense_st0 = self
             .pending_sense_st0
@@ -248,8 +279,11 @@ impl Fdc82077 {
 
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
-            // Spec: Specify/Recalibrate have no result phase; open-bus when idle/params.
-            Phase::Command | Phase::SpecifyParams { .. } | Phase::RecalibrateParams => 0xFF,
+            // Spec: Specify/Recalibrate/Seek have no result phase; open-bus when idle/params.
+            Phase::Command
+            | Phase::SpecifyParams { .. }
+            | Phase::RecalibrateParams
+            | Phase::SeekParams { .. } => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
@@ -280,6 +314,9 @@ impl Fdc82077 {
                     self.start_recalibrate();
                 } else if v == FDC_CMD_SENSE_INT {
                     self.start_sense_interrupt();
+                } else if v == FDC_CMD_SEEK {
+                    // Spec: Intel 82077AA Seek — expect HD|US then NCN.
+                    self.start_seek();
                 }
                 // Other opcodes: accept/drop until a command engine exists.
             }
@@ -299,6 +336,18 @@ impl Fdc82077 {
             Phase::RecalibrateParams => {
                 // Spec: Intel 82077AA Recalibrate — bits 1:0 = unit select.
                 self.finish_recalibrate(v);
+            }
+            Phase::SeekParams { index } => {
+                // Spec: Intel 82077AA / OSDev — param0 = (HD<<2)|US, param1 = NCN.
+                match index {
+                    0 => {
+                        self.seek_head_unit = v;
+                        self.phase = Phase::SeekParams { index: 1 };
+                    }
+                    _ => {
+                        self.finish_seek(v);
+                    }
+                }
             }
             Phase::SenseIntResult { .. } => {
                 // Host must not write during result phase (stub ignores).
@@ -668,6 +717,107 @@ mod tests {
         assert!(!f.irq_line());
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
         // Aborted: no Seek End latch — Sense Interrupt uses ready-change stub.
+        f.assert_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_READY_CHANGE);
+        let _ = f.port_read(FDC_FIFO, 1);
+    }
+
+    /// Spec: Intel 82077AA Seek — opcode `0x0F`, HD|US + NCN, PCN=NCN, SE ST0, IRQ.
+    #[test]
+    fn seek_sets_pcn_to_ncn_seek_end_st0_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(
+            FDC_DOR,
+            1,
+            u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01),
+        );
+        f.pcn = 0x00;
+        assert!(!f.irq_line());
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "param phase: RQM, DIO clear"
+        );
+        assert!(!f.irq_line(), "IRQ only after both parameters");
+        assert_eq!(f.phase, Phase::SeekParams { index: 0 });
+
+        // Param0: head=1 (bit2) | unit=2 (bits1:0) → 0x06; ST0 H always 0 per 82077AA.
+        f.port_write(FDC_FIFO, 1, 0x06);
+        assert_eq!(f.phase, Phase::SeekParams { index: 1 });
+        assert_eq!(f.pcn, 0x00, "PCN unchanged until NCN");
+        assert!(!f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, 0x28); // NCN
+        assert_eq!(f.pcn, 0x28, "Seek sets PCN = NCN");
+        assert_eq!(f.phase, Phase::Command);
+        assert!(f.irq_line(), "Seek asserts IRQ on completion");
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "no result phase after Seek"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0xFF);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert!(!f.irq_line(), "Sense Interrupt clears IRQ");
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0, FDC_ST0_SEEK_END | 0x02, "ST0 = SE | unit; H=0");
+        let pcn = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(pcn, 0x28);
+    }
+
+    /// Spec: after Seek ST0 is consumed, a later Sense Interrupt falls back to 0xC0|US.
+    #[test]
+    fn sense_interrupt_consumes_seek_st0_latch() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x01);
+        f.port_write(FDC_FIFO, 1, 0x10);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END | 0x01);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x10);
+
+        f.assert_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST0_IC_READY_CHANGE,
+            "no pending command ST0 after first Sense"
+        );
+        let _ = f.port_read(FDC_FIFO, 1);
+    }
+
+    #[test]
+    fn seek_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        f.pcn = 0x05;
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x01);
+        f.port_write(FDC_FIFO, 1, 0x20);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.pcn, 0x05, "ignored while reset");
+        assert!(!f.irq_line());
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    #[test]
+    fn dor_reset_aborts_seek_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x01);
+        assert_eq!(f.phase, Phase::SeekParams { index: 1 });
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.phase, Phase::Command);
+        assert!(!f.irq_line());
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
         f.assert_irq6();
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_READY_CHANGE);
