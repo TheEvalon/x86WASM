@@ -566,10 +566,31 @@ mod tests {
     fn unsupported_opcode() {
         // Lone 0F waits for secondary; unknown secondary is unsupported.
         assert_eq!(decode(&[0x0F]), Err(DecodeError::Truncated));
+        // 0F 01 is GRP7 (needs ModRM); truncated without ModRM.
+        assert_eq!(decode(&[0x0F, 0x01]), Err(DecodeError::Truncated));
         assert!(matches!(
-            decode(&[0x0F, 0x01]),
-            Err(DecodeError::UnsupportedOpcode(0x01))
+            decode(&[0x0F, 0x02]),
+            Err(DecodeError::UnsupportedOpcode(0x02))
         ));
+    }
+
+    #[test]
+    fn decode_lgdt_sgdt_m16() {
+        // Spec: Intel SDM Vol. 2 LGDT/SGDT — 0F 01 /2 and /0, memory form.
+        let sgdt = decode(&[0x0F, 0x01, 0x06, 0x00, 0x20]).unwrap(); // SGDT [0x2000]
+        assert_eq!(sgdt.mnemonic, "GRP7");
+        assert!(sgdt.two_byte);
+        assert_eq!(sgdt.opcode, 0x01);
+        assert_eq!(sgdt.modrm.unwrap().reg, 0);
+        assert_eq!(sgdt.length, 5);
+
+        let lgdt = decode(&[0x0F, 0x01, 0x16, 0x00, 0x20]).unwrap(); // LGDT [0x2000]
+        assert_eq!(lgdt.modrm.unwrap().reg, 2);
+        assert_eq!(lgdt.length, 5);
+
+        let lgdt32 = decode(&[0x66, 0x0F, 0x01, 0x16, 0x00, 0x20]).unwrap();
+        assert!(lgdt32.prefixes.op_size_override);
+        assert_eq!(lgdt32.length, 6);
     }
 
     #[test]

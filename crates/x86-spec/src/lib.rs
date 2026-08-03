@@ -1310,13 +1310,24 @@ pub const M1_SUBSET: &[InstrDef] = &[
 
 /// Two-byte opcode map entries (primary escape `0F`).
 /// Spec: Intel SDM Vol. 2 Chapter 2; opcode map 2.
-pub const M1_0F_SUBSET: &[InstrDef] = &[InstrDef {
-    mnemonic: "IMUL",
-    opcode: 0xAF,
-    encoding: Encoding::Modrm,
-    width: Width::OsZ,
-    sdm: "IMUL",
-}];
+pub const M1_0F_SUBSET: &[InstrDef] = &[
+    // Group 7: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 01).
+    // This slice implements /0 SGDT and /2 LGDT only.
+    InstrDef {
+        mnemonic: "GRP7",
+        opcode: 0x01,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "SGDT/LGDT",
+    },
+    InstrDef {
+        mnemonic: "IMUL",
+        opcode: 0xAF,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "IMUL",
+    },
+];
 
 pub fn lookup_0f(opcode: u8) -> Option<&'static InstrDef> {
     M1_0F_SUBSET.iter().find(|d| d.opcode == opcode)
@@ -1370,6 +1381,7 @@ mod tests {
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
+        assert!(lookup_0f(0x01).is_some(), "missing 0F 01 GRP7 SGDT/LGDT");
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
     }
 }

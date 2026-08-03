@@ -2108,7 +2108,51 @@ fn real_mode_ud(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> 
     real_mode_exception(cpu, bus, 6)
 }
 
-/// Two-byte opcode map (0F xx). Spec: Intel SDM Vol. 2 Chapter 2; "IMUL".
+/// Load/store GDTR pseudo-descriptor `m16&32` (limit16 + base32).
+/// Spec: Intel SDM Vol. 2 "LGDT/SGDT"; Vol. 3 §2.4.1 (GDTR).
+///
+/// Operand-size 16: base uses bits 23:0 (bits 31:24 ignored on LGDT; stored 0 on SGDT).
+/// Operand-size 32 (`0x66`): full 32-bit base. Memory form only (mod=11 → `#UD`).
+fn gdtr_pseudo_desc(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    load: bool,
+) -> Result<(), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(0x01))?;
+    if m.mod_ == 3 {
+        return Err(ExecError::ArchFault(6)); // #UD — Spec: SDM Vol. 2 LGDT/SGDT
+    }
+    let (addr, _, uses_ss) = ea(cpu, insn, 6)?;
+    if load {
+        let limit = bus
+            .read_u16(addr)
+            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+        let mut base = u64::from(
+            bus.read_u32(addr.wrapping_add(2))
+                .map_err(|e| classify_mem_fault(e, uses_ss))?,
+        );
+        if !opsz32(insn) {
+            // Spec: SDM Vol. 2 LGDT — 16-bit operand-size uses 24-bit base.
+            base &= 0x00FF_FFFF;
+        }
+        cpu.gdtr.limit = limit;
+        cpu.gdtr.base = base;
+    } else {
+        bus.write_u16(addr, cpu.gdtr.limit)
+            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+        let mut base = cpu.gdtr.base as u32;
+        if !opsz32(insn) {
+            // Spec: SDM Vol. 2 SGDT — 16-bit operand-size stores base[31:24]=0.
+            base &= 0x00FF_FFFF;
+        }
+        bus.write_u32(addr.wrapping_add(2), base)
+            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    }
+    Ok(())
+}
+
+/// Two-byte opcode map (0F xx). Spec: Intel SDM Vol. 2 Chapter 2; "LGDT"/"SGDT"/"IMUL".
 fn step_two_byte(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -2116,6 +2160,26 @@ fn step_two_byte(
     next_ip: u16,
 ) -> Result<(), ExecError> {
     match insn.opcode {
+        0x01 => {
+            // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2; "SGDT"/"LGDT".
+            // Unsupported here: SIDT/LIDT/SMSW/LMSW/INVLPG (/1,/3–/7); PE side effects.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0x01))?;
+            match m.reg {
+                0 => {
+                    // SGDT m16&32
+                    gdtr_pseudo_desc(cpu, bus, insn, false)?;
+                    cpu.set_ip16(next_ip);
+                    Ok(())
+                }
+                2 => {
+                    // LGDT m16&32
+                    gdtr_pseudo_desc(cpu, bus, insn, true)?;
+                    cpu.set_ip16(next_ip);
+                    Ok(())
+                }
+                _ => Err(ExecError::Unsupported(0x01)),
+            }
+        }
         0xAF => {
             // IMUL r16, r/m16 / IMUL r32, r/m32 — Spec: Intel SDM Vol. 2 "IMUL".
             // Dest = ModRM.reg := ModRM.reg * r/m (signed).
@@ -10014,6 +10078,96 @@ mod tests {
         assert_eq!(cpu.gpr_u32(CpuState::RAX), 0);
         assert_ne!(cpu.rflags & 1, 0);
         assert_ne!(cpu.rflags & (1 << 11), 0);
+    }
+
+    /// LGDT/SGDT m16&32 — opcode 0F 01 /2 and /0 (SDM Vol. 2 LGDT/SGDT; Vol. 3 §2.4.1).
+    /// Real-mode opsize-16 uses 24-bit base; 0x66 uses full 32-bit base. mod=11 → #UD.
+    #[test]
+    fn lgdt_sgdt_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT #UD vector 6 → handler at 0x0B00 (keep code out of IVT bytes 0..0x400)
+        mem[6 * 4] = 0x00;
+        mem[6 * 4 + 1] = 0x0B;
+        mem[6 * 4 + 2] = 0x00;
+        mem[6 * 4 + 3] = 0x00;
+        let code = 0x1000usize;
+        // +0: 0F 01 16 00 40    LGDT [0x4000]  (opsize 16 → 24-bit base)
+        // +5: 0F 01 06 00 50    SGDT [0x5000]
+        // +A: 66 0F 01 16 00 60 LGDT [0x6000] (opsize 32 → 32-bit base)
+        // +10: 66 0F 01 06 00 70 SGDT [0x7000]
+        // +16: 0F 01 C0         SGDT EAX (mod=11) → #UD
+        // +19: F4               HLT
+        mem[code] = 0x0F;
+        mem[code + 1] = 0x01;
+        mem[code + 2] = 0x16;
+        mem[code + 3] = 0x00;
+        mem[code + 4] = 0x40;
+        mem[code + 5] = 0x0F;
+        mem[code + 6] = 0x01;
+        mem[code + 7] = 0x06;
+        mem[code + 8] = 0x00;
+        mem[code + 9] = 0x50;
+        mem[code + 10] = 0x66;
+        mem[code + 11] = 0x0F;
+        mem[code + 12] = 0x01;
+        mem[code + 13] = 0x16;
+        mem[code + 14] = 0x00;
+        mem[code + 15] = 0x60;
+        mem[code + 16] = 0x66;
+        mem[code + 17] = 0x0F;
+        mem[code + 18] = 0x01;
+        mem[code + 19] = 0x06;
+        mem[code + 20] = 0x00;
+        mem[code + 21] = 0x70;
+        mem[code + 22] = 0x0F;
+        mem[code + 23] = 0x01;
+        mem[code + 24] = 0xC0; // mod=11, reg=0 (SGDT r/m) — #UD
+        mem[code + 25] = 0xF4;
+
+        // Pseudo-descriptor at 0x4000: limit=0x0027, base=0x12ABCDEF (high byte ignored)
+        mem[0x4000] = 0x27;
+        mem[0x4001] = 0x00;
+        mem[0x4002] = 0xEF;
+        mem[0x4003] = 0xCD;
+        mem[0x4004] = 0xAB;
+        mem[0x4005] = 0x12;
+
+        // Pseudo-descriptor at 0x6000: limit=0xFFFF, base=0xDEADBEEF
+        mem[0x6000] = 0xFF;
+        mem[0x6001] = 0xFF;
+        mem[0x6002] = 0xEF;
+        mem[0x6003] = 0xBE;
+        mem[0x6004] = 0xAD;
+        mem[0x6005] = 0xDE;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gdtr.limit, 0x0027);
+        assert_eq!(cpu.gdtr.base, 0x00AB_CDEF, "16-bit opsize truncates base to 24 bits");
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x5000).unwrap(), 0x0027);
+        assert_eq!(bus.read_u32(0x5002).unwrap(), 0x00AB_CDEF);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gdtr.limit, 0xFFFF);
+        assert_eq!(cpu.gdtr.base, 0xDEAD_BEEF);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x7000).unwrap(), 0xFFFF);
+        assert_eq!(bus.read_u32(0x7002).unwrap(), 0xDEAD_BEEF);
+
+        // Register form → #UD via IVT
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(cpu.cs.selector, 0);
     }
 
     /// Operand-size override 0x66: MOV/PUSH/POP/ALU 32-bit in real mode.
