@@ -5,9 +5,10 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 ## CPU and architecture
 
 - Intel 64 and IA-32 Architectures Software Developer's Manual (SDM), Volumes 1–4
-- Intel SDM Vol. 2 — LGDT/SGDT (`0F 01 /2`, `/0`); LIDT/SIDT (`0F 01 /3`, `/1`); m16&32 pseudo-descriptor; register form `#UD`
+- Intel SDM Vol. 2 — LGDT/SGDT (`0F 01 /2`, `/0`); LIDT/SIDT (`0F 01 /3`, `/1`); SMSW/LMSW (`0F 01 /4`, `/6`); m16&32 pseudo-descriptor; LGDT/LIDT register form `#UD`
 - Intel SDM Vol. 3 §2.4.1 — GDTR base/limit
 - Intel SDM Vol. 3 §2.4.3 — IDTR base/limit
+- Intel SDM Vol. 3 §2.5 — CR0 / machine status word (PE sticky under LMSW)
 - Intel processor datasheets relevant to Core 2 Conroe/Penryn CPUID presentation
 
 ## Platform and devices
