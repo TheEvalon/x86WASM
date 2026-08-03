@@ -422,14 +422,15 @@ impl Bus for MachineBus<'_> {
 
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
-    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, and CMOS IRQF → IRQ8
-    /// (level follow) before acknowledge so edges from prior
-    /// [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
-    /// [`Machine::tick_cmos`] are visible.
+    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, CMOS IRQF → IRQ8, and
+    /// primary IDE INTRQ∧¬nIEN → IRQ14 (level follow) before acknowledge so
+    /// edges from prior [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
+    /// [`Machine::tick_cmos`] / IDE command completion are visible.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());
         self.pic.set_irq_line(8, self.cmos.irq_line());
+        self.pic.set_irq_line(14, self.ide.irq_line());
         self.pic.poll_irq()
     }
 }
@@ -560,6 +561,20 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFD); // unmask IR1
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR2 and slave IR6 (IRQ14).
+    fn init_at_pic_unmask_irq14(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0xBF); // unmask slave IR6 (IRQ14)
     }
 
     /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
@@ -1266,5 +1281,57 @@ mod tests {
         assert!(m.ide.present);
         assert_eq!(m.ide.image.len(), 512);
         assert_eq!(m.ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    /// Spec: ATA + OSDev ATA PIO + IBM PC AT — IDENTIFY → IRQ14 → vector 0x76.
+    #[test]
+    fn ide_identify_asserts_irq14_via_poll_external_irq() {
+        use devices::{
+            ATA_CMD_IDENTIFY, ATA_SR_DRQ, IDE_PRIMARY_CTRL, IDE_PRIMARY_DRIVE, IDE_PRIMARY_STATUS,
+        };
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq14(&mut m);
+        m.ide.attach_image(vec![0u8; 512]);
+        // Clear nIEN so INTRQ is driven.
+        m.ide.port_write(IDE_PRIMARY_CTRL, 1, 0);
+        m.ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        m.ide
+            .port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert!(m.ide.irq_line());
+        assert_ne!(m.ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        {
+            let mut bus = m.bus_mut();
+            // Spec: AT slave ICW2 base 0x70 → IRQ14 vector 0x76.
+            assert_eq!(bus.poll_external_irq(), Some(0x76));
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        // Status read clears IDE INTRQ; EOI already done by poll path.
+        let _ = m.ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert!(!m.ide.irq_line());
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
+    }
+
+    /// Spec: ATA nIEN=1 — IDENTIFY sets DRQ but does not deliver IRQ14.
+    #[test]
+    fn ide_nien_masks_irq14_on_machine_bus() {
+        use devices::{
+            ATA_CMD_IDENTIFY, ATA_DC_NIEN, ATA_SR_DRQ, IDE_PRIMARY_CTRL, IDE_PRIMARY_DRIVE,
+            IDE_PRIMARY_STATUS,
+        };
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq14(&mut m);
+        m.ide.attach_image(vec![0u8; 512]);
+        m.ide
+            .port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        m.ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        m.ide
+            .port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_ne!(m.ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!m.ide.irq_line());
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), None);
+        }
     }
 }

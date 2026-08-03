@@ -4,7 +4,7 @@
 //! 8237A DMA register/page stubs (no transfer engine);
 //! VGA text frame buffer MMIO stub at 0xB8000;
 //! PCI configuration mechanism #1 stub (0xCF8/0xCFC);
-//! Primary IDE IDENTIFY + READ SECTORS PIO stub (1F0–1F7/3F6).
+//! Primary IDE IDENTIFY + READ SECTORS PIO + IRQ14 stub (1F0–1F7/3F6).
 
 #![forbid(unsafe_code)]
 

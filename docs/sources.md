@@ -13,8 +13,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - OSDev Wiki PCI — configuration space access mechanism #1; absent device → `0xFFFFFFFF`
 - Intel 440FX (i440FX) host-bridge identity (`vendor 0x8086`, `device 0x1237`) as classic QEMU/SeaBIOS-compatible stub ID (behavior from specs/oracles, not copied source)
 - ACPI specifications (for later machine/firmware work)
-- ATA / ATAPI specifications (IDENTIFY DEVICE `0xEC`, READ SECTORS `0x20`, task-file / status bits, LBA28 PIO)
-- OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6`, IDENTIFY/READ polling
+- ATA / ATAPI specifications (IDENTIFY DEVICE `0xEC`, READ SECTORS `0x20`, task-file / status bits, LBA28 PIO, device-control nIEN / INTRQ)
+- OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6`, IDENTIFY/READ polling and IRQ14 (status clears IRQ; alt status does not)
 - PS/2 and 8042 controller references
 - Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
 - Intel 8254 Programmable Interval Timer datasheet

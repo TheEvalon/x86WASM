@@ -1333,7 +1333,7 @@ Progress against implement list:
 - [ ] LDT
 - [ ] TSS
 - [x] Exceptions (real-mode IVT fault delivery for #DE/#UD/#BR/#GP/#SS; #OF trap via INTO; software INT/INT3/INTO) â€” protected-mode / full fault taxonomy still open
-- [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `MachineBus::poll_external_irq` syncs PIT ch0 OUT→IRQ0 + 8042 OBF∧INT1→IRQ1 + CMOS IRQF→IRQ8 then `DualPic::poll_irq`
+- [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `MachineBus::poll_external_irq` syncs PIT ch0 OUT→IRQ0 + 8042 OBF∧INT1→IRQ1 + CMOS IRQF→IRQ8 + IDE INTRQ∧¬nIEN→IRQ14 then `DualPic::poll_irq`
 - [ ] 32-bit paging
 - [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 + OCW1 IMR + OCW2 EOI + OCW3 IRR/ISR read + edge IRQ assert + cascade + `MachineBus` ports / `poll_external_irq`; **not** Auto-EOI/rotate/special-mask/OCW3 poll/level-triggered runtime
 - [ ] 8254 PIT — **partial:** `devices::Pit8254` ch0 programming + `ce`/OUT tick (modes 0/2/3) + `Machine::tick_pit` → IRQ0→PIC; ch2 GATE/OUT + port `0x61` speaker bits (no host audio); ch1 stub accept; **not** host-real-time / modes 1/4/5 OUT / host speaker audio
@@ -1341,7 +1341,7 @@ Progress against implement list:
 - [ ] DMA — **partial:** `devices::Dma8237` dual 8237A addr/count/mode/mask + AT page regs on `MachineBus`; **not** transfer engine / DREQ/DACK/TC / device integration
 - [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test/config/enable + OBF∧INT1→IRQ1 + make-code inject stub + `0xD0`/`0xD1` output-port A20 → `PhysMem`); **not** mouse/IRQ12, full AT keyboard protocol / Set2↔Set1 translation, or pulse-reset
 - [ ] PCI configuration space — **partial:** `devices::PciConfig` Mechanism #1 (`0xCF8`/`0xCFC`) + host bridge `00:00.0` `8086:1237` stub on `MachineBus`; **not** PIIX tree / BAR MMIO / bus mastering / caps/MSI/PCIe
-- [ ] PIIX IDE — **partial:** `devices::IdePrimary` IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO on ports `0x1F0`–`0x1F7`/`0x3F6` with backing image + DRQ/BSY/DRDY; **not** ATAPI/WRITE/DMA/IRQ14/slave/secondary/PCI BARs/SeaBIOS
+- [ ] PIIX IDE — **partial:** `devices::IdePrimary` IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO on ports `0x1F0`–`0x1F7`/`0x3F6` with backing image + DRQ/BSY/DRDY + IRQ14→`DualPic` when nIEN=0; **not** ATAPI/WRITE/DMA/slave/secondary/PCI BARs/SeaBIOS
 - [ ] ATAPI
 - [ ] VGA text mode — **partial:** `devices::VgaText` 32 KiB plane at `0xB8000` on `MachineBus` (80×25 reset fill); **not** CRTC/sequencer/graphics/VBE/host render
 - [ ] Initial VGA graphics

@@ -1,29 +1,34 @@
-//! Primary ATA IDE channel — IDENTIFY + READ SECTORS PIO stub.
+//! Primary ATA IDE channel — IDENTIFY + READ SECTORS PIO + IRQ14 stub.
 //!
 //! Classic PC primary command block `0x1F0`–`0x1F7` and control block `0x3F6`.
 //!
 //! # Spec refs
 //!
 //! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
-//!   task-file registers, status bits BSY/DRDY/DRQ/ERR, LBA28 addressing.
-//! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ polling sequence,
-//!   256-word PIO transfers, sector-count `0` = 256 sectors.
-//! - IBM PC/AT IDE — alternate status / device control at `0x3F6`.
+//!   task-file registers, status bits BSY/DRDY/DRQ/ERR, LBA28 addressing;
+//!   device control nIEN; INTRQ when drive needs attention.
+//! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ IRQ+PIO sequence,
+//!   status read clears IRQ / alternate status does not, 256-word PIO,
+//!   sector-count `0` = 256 sectors; primary channel → ISA IRQ14.
+//! - IBM PC/AT IDE — alternate status / device control at `0x3F6`; IRQ14.
+//! - Intel 8259A — DualPic IR14 (slave IR6) vectoring via MachineBus.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.5 / §21 PIIX IDE.
 //!
 //! # Scope (this slice)
 //!
 //! - Primary channel master only; optional backing image (`Vec<u8>`)
 //! - Commands: IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`) PIO
-//! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ side effects)
-//! - Device control: SRST (bit2) software reset; nIEN stored
+//! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
+//! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
+//! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
+//!   status register read clears pending IRQ; `irq_line()` for MachineBus
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
 //! - ATAPI PACKET / IDENTIFY PACKET DEVICE
 //! - WRITE SECTORS, DMA IDE (UDMA/MDMA), LBA48
-//! - Slave drive, secondary channel (`0x170`), IRQ14 delivery
+//! - Slave drive, secondary channel (`0x170`), IRQ15
 //! - SeaBIOS / PCI IDE BAR remapping
 
 use crate::PortDevice;
@@ -65,7 +70,7 @@ pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
 
 /// Device control: software reset.
 pub const ATA_DC_SRST: u8 = 0x04;
-/// Device control: nIEN (1 = IRQ disabled). Stored only; IRQ14 unsupported.
+/// Device control: nIEN (1 = IRQ disabled / INTRQ not driven).
 pub const ATA_DC_NIEN: u8 = 0x02;
 
 /// Drive/head: LBA mode bit.
@@ -92,6 +97,8 @@ pub struct IdePrimary {
     drive_head: u8,
     status: u8,
     dev_ctrl: u8,
+    /// Latched INTRQ request (gated by nIEN on [`Self::irq_line`]).
+    irq_pending: bool,
     /// Current PIO sector payload (512 bytes).
     pio: [u8; SECTOR_SIZE],
     pio_off: usize,
@@ -124,6 +131,7 @@ impl IdePrimary {
             drive_head: 0xA0,
             status: 0,
             dev_ctrl: ATA_DC_NIEN,
+            irq_pending: false,
             pio: [0; SECTOR_SIZE],
             pio_off: 0,
             sectors_left: 0,
@@ -168,6 +176,7 @@ impl IdePrimary {
         self.lba_hi = 0;
         self.drive_head = 0xA0;
         self.dev_ctrl = ATA_DC_NIEN;
+        self.irq_pending = false;
         self.pio = [0; SECTOR_SIZE];
         self.pio_off = 0;
         self.sectors_left = 0;
@@ -183,6 +192,22 @@ impl IdePrimary {
     /// True if this device owns the I/O port.
     pub fn owns_port(port: u16) -> bool {
         matches!(port, 0x1F0..=0x1F7 | IDE_PRIMARY_CTRL)
+    }
+
+    /// ISA IRQ14 line level (INTRQ ∧ ¬nIEN).
+    ///
+    /// Spec: ATA device control nIEN; OSDev ATA PIO — primary → IRQ14.
+    pub fn irq_line(&self) -> bool {
+        self.irq_pending && (self.dev_ctrl & ATA_DC_NIEN == 0)
+    }
+
+    fn raise_irq(&mut self) {
+        // Spec: ATA — INTRQ asserted when drive needs attention; nIEN gates pin.
+        self.irq_pending = true;
+    }
+
+    fn clear_irq(&mut self) {
+        self.irq_pending = false;
     }
 
     fn is_slave_selected(&self) -> bool {
@@ -250,6 +275,8 @@ impl IdePrimary {
         self.transferring = true;
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
         self.error = 0;
+        // Spec: OSDev ATA PIO — IRQ when data ready (DRQ) if nIEN clear.
+        self.raise_irq();
     }
 
     fn load_sector_into_pio(&mut self, lba: u32) -> bool {
@@ -272,6 +299,8 @@ impl IdePrimary {
         self.transferring = false;
         self.sectors_left = 0;
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_ERR;
+        // Spec: ATA — INTRQ on error completion when interrupts enabled.
+        self.raise_irq();
     }
 
     fn exec_identify(&mut self) {
@@ -279,6 +308,7 @@ impl IdePrimary {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
             self.transferring = false;
+            self.clear_irq();
             return;
         }
         self.fill_identify();
@@ -291,6 +321,7 @@ impl IdePrimary {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
             self.transferring = false;
+            self.clear_irq();
             return;
         }
         // Require LBA bit for this stub (CHS not implemented).
@@ -348,6 +379,8 @@ impl IdePrimary {
             self.pio_off = 0;
             self.status = ATA_SR_DRDY | ATA_SR_DSC;
             self.sector_count = 0;
+            // Spec: ATA — INTRQ on command completion after final sector.
+            self.raise_irq();
             return;
         }
         // Multi-sector READ: present next sector.
@@ -362,6 +395,8 @@ impl IdePrimary {
         if self.sector_count != 0 {
             self.sector_count = self.sector_count.wrapping_sub(1);
         }
+        // Spec: OSDev ATA PIO — IRQ again when next sector DRQ ready.
+        self.raise_irq();
     }
 
     fn write_dev_ctrl(&mut self, value: u8) {
@@ -373,11 +408,13 @@ impl IdePrimary {
             if self.present && !self.is_slave_selected() {
                 self.status = ATA_SR_BSY;
             }
+            self.clear_irq();
         } else if prev & ATA_DC_SRST != 0 && value & ATA_DC_SRST == 0 {
             if self.present {
                 self.reset_ready();
             } else {
                 self.status = 0;
+                self.clear_irq();
             }
         }
     }
@@ -388,6 +425,12 @@ impl IdePrimary {
             return 0;
         }
         self.status
+    }
+
+    fn read_status_clear_irq(&mut self) -> u8 {
+        // Spec: OSDev ATA PIO — reading Status (not alt) clears IRQ.
+        self.clear_irq();
+        self.status_byte()
     }
 }
 
@@ -401,8 +444,9 @@ impl PortDevice for IdePrimary {
             IDE_PRIMARY_LBA_MID => u32::from(self.lba_mid),
             IDE_PRIMARY_LBA_HI => u32::from(self.lba_hi),
             IDE_PRIMARY_DRIVE => u32::from(self.drive_head),
-            IDE_PRIMARY_STATUS => u32::from(self.status_byte()),
-            IDE_PRIMARY_CTRL => u32::from(self.status_byte()), // alt status
+            IDE_PRIMARY_STATUS => u32::from(self.read_status_clear_irq()),
+            // Spec: alt status mirrors status without clearing IRQ.
+            IDE_PRIMARY_CTRL => u32::from(self.status_byte()),
             _ => 0xFFFF_FFFF,
         }
     }
@@ -442,6 +486,10 @@ mod tests {
     fn identify_word(pio: &[u8; SECTOR_SIZE], idx: usize) -> u16 {
         let off = idx * 2;
         u16::from(pio[off]) | (u16::from(pio[off + 1]) << 8)
+    }
+
+    fn clear_nien(ide: &mut IdePrimary) {
+        ide.port_write(IDE_PRIMARY_CTRL, 1, 0);
     }
 
     #[test]
@@ -590,5 +638,94 @@ mod tests {
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
         assert_eq!(identify_word(&ide.pio, 60), 0x0001);
         assert_eq!(identify_word(&ide.pio, 61), 0x0001);
+    }
+
+    #[test]
+    fn identify_asserts_irq14_when_nien_clear() {
+        // Spec: ATA + OSDev ATA PIO — INTRQ when DRQ ready if nIEN=0.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn nien_set_masks_irq_line() {
+        // Spec: ATA device control — nIEN=1 disables INTRQ pin.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        // Default reset leaves nIEN set.
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn status_read_clears_irq_alt_does_not() {
+        // Spec: OSDev ATA PIO — Status clears IRQ; alternate status does not.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_CTRL, 1);
+        assert!(ide.irq_line(), "alt status must not clear IRQ");
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn read_sectors_asserts_irq_on_drq() {
+        // Spec: ATA READ SECTORS — IRQ when sector data ready (DRQ).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn error_completion_asserts_irq_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn multi_sector_raises_irq_per_drq_block() {
+        // Spec: OSDev ATA PIO — IRQ for each sector DRQ when interrupts enabled.
+        let mut img = vec![0u8; SECTOR_SIZE * 2];
+        img[0] = 0x11;
+        img[SECTOR_SIZE] = 0x22;
+        let mut ide = IdePrimary::with_image(img);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1); // ack first IRQ
+        assert!(!ide.irq_line());
+        for _ in 0..256 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        // Second sector under DRQ → IRQ again.
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
     }
 }
