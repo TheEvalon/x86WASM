@@ -613,6 +613,23 @@ mod tests {
     }
 
     #[test]
+    fn decode_smsw_lmsw() {
+        // Spec: Intel SDM Vol. 2 SMSW/LMSW — 0F 01 /4 and /6.
+        let smsw_ax = decode(&[0x0F, 0x01, 0xE0]).unwrap(); // SMSW AX
+        assert_eq!(smsw_ax.modrm.unwrap().reg, 4);
+        assert_eq!(smsw_ax.modrm.unwrap().rm, 0);
+        assert_eq!(smsw_ax.length, 3);
+
+        let smsw_m = decode(&[0x0F, 0x01, 0x26, 0x00, 0x20]).unwrap(); // SMSW [0x2000]
+        assert_eq!(smsw_m.modrm.unwrap().reg, 4);
+        assert_eq!(smsw_m.length, 5);
+
+        let lmsw_ax = decode(&[0x0F, 0x01, 0xF0]).unwrap(); // LMSW AX
+        assert_eq!(lmsw_ax.modrm.unwrap().reg, 6);
+        assert_eq!(lmsw_ax.length, 3);
+    }
+
+    #[test]
     fn decode_int_imm8() {
         // Intel SDM Vol. 2: INT imm8 — opcode CD ib
         let d = decode(&[0xCD, 0x21]).unwrap();

@@ -2164,8 +2164,9 @@ fn step_two_byte(
 ) -> Result<(), ExecError> {
     match insn.opcode {
         0x01 => {
-            // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2; "SGDT"/"SIDT"/"LGDT"/"LIDT".
-            // Unsupported here: SMSW/LMSW/INVLPG (/4–/7); PE side effects.
+            // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2;
+            // "SGDT"/"SIDT"/"LGDT"/"LIDT"/"SMSW"/"LMSW".
+            // Unsupported here: INVLPG (/7); protected-mode entry from PE.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x01))?;
             match m.reg {
                 0 => {
@@ -2189,6 +2190,33 @@ fn step_two_byte(
                 3 => {
                     // LIDT m16&32
                     dtr_pseudo_desc(cpu, bus, insn, true, true)?;
+                    cpu.set_ip16(next_ip);
+                    Ok(())
+                }
+                4 => {
+                    // SMSW r/m16 — Spec: SDM Vol. 2 "SMSW"; stores CR0[15:0].
+                    // Memory destination is always 16-bit; register + opsize32
+                    // zero-extends into r32 (deterministic; upper bits undefined in SDM).
+                    let msw = cpu.cr0 as u16;
+                    if m.mod_ == 3 && opsz32(insn) {
+                        cpu.set_gpr_u32(m.rm as usize, u32::from(msw));
+                    } else {
+                        write_rm_u16(cpu, bus, insn, msw)?;
+                    }
+                    cpu.set_ip16(next_ip);
+                    Ok(())
+                }
+                6 => {
+                    // LMSW r/m16 — Spec: SDM Vol. 2 "LMSW"; loads CR0[15:0].
+                    // Cannot clear PE once set. Does not enter protected-mode
+                    // execution in this emulator (segment model stays real-mode).
+                    let src = read_rm_u16(cpu, bus, insn)?;
+                    let pe_was = cpu.cr0 & 1 != 0;
+                    let mut low = u64::from(src);
+                    if pe_was {
+                        low |= 1; // Spec: LMSW cannot clear PE
+                    }
+                    cpu.cr0 = (cpu.cr0 & !0xFFFF) | low;
                     cpu.set_ip16(next_ip);
                     Ok(())
                 }
@@ -10093,6 +10121,90 @@ mod tests {
         assert_eq!(cpu.gpr_u32(CpuState::RAX), 0);
         assert_ne!(cpu.rflags & 1, 0);
         assert_ne!(cpu.rflags & (1 << 11), 0);
+    }
+
+    /// SMSW/LMSW — opcode 0F 01 /4 and /6 (SDM Vol. 2 SMSW/LMSW; Vol. 3 CR0).
+    /// SMSW stores CR0[15:0]; LMSW loads CR0[15:0] and cannot clear PE.
+    /// PE bit updates do not enter protected-mode execution here.
+    #[test]
+    fn smsw_lmsw_real_mode() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        // +0: 0F 01 E0         SMSW AX          (mod=11, /4, rm=AX)
+        // +3: 0F 01 26 00 40   SMSW [0x4000]    (mem always 16-bit)
+        // +8: 66 0F 01 E3      SMSW EBX         (opsize32 zero-extend)
+        // +C: B8 01 00         MOV AX, 1        (PE=1)
+        // +F: 0F 01 F0         LMSW AX
+        // +12: B8 00 00        MOV AX, 0
+        // +15: 0F 01 F0        LMSW AX          (must not clear PE)
+        // +18: B8 10 00        MOV AX, 0x10     (ET)
+        // +1B: 0F 01 F0        LMSW AX          (from CR0 with PE still set → PE stays)
+        // +1E: F4              HLT
+        mem[code] = 0x0F;
+        mem[code + 1] = 0x01;
+        mem[code + 2] = 0xE0; // 11_100_000 SMSW AX
+        mem[code + 3] = 0x0F;
+        mem[code + 4] = 0x01;
+        mem[code + 5] = 0x26; // 00_100_110 SMSW [disp16]
+        mem[code + 6] = 0x00;
+        mem[code + 7] = 0x40;
+        mem[code + 8] = 0x66;
+        mem[code + 9] = 0x0F;
+        mem[code + 10] = 0x01;
+        mem[code + 11] = 0xE3; // SMSW EBX
+        mem[code + 12] = 0xB8;
+        mem[code + 13] = 0x01;
+        mem[code + 14] = 0x00;
+        mem[code + 15] = 0x0F;
+        mem[code + 16] = 0x01;
+        mem[code + 17] = 0xF0; // 11_110_000 LMSW AX
+        mem[code + 18] = 0xB8;
+        mem[code + 19] = 0x00;
+        mem[code + 20] = 0x00;
+        mem[code + 21] = 0x0F;
+        mem[code + 22] = 0x01;
+        mem[code + 23] = 0xF0;
+        mem[code + 24] = 0xB8;
+        mem[code + 25] = 0x10;
+        mem[code + 26] = 0x00;
+        mem[code + 27] = 0x0F;
+        mem[code + 28] = 0x01;
+        mem[code + 29] = 0xF0;
+        mem[code + 30] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        // Reset CR0 low = 0x0010 (ET). Spec: typical real-mode after RESET.
+        assert_eq!(cpu.cr0 as u16, 0x0010);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x0010);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 0x0010);
+
+        cpu.set_gpr_u32(CpuState::RBX, 0xFFFF_FFFF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x0000_0010);
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX,1
+        step(&mut cpu, &mut bus).unwrap(); // LMSW AX → set PE
+        assert_eq!(cpu.cr0 & 0xFFFF, 0x0001);
+        assert_eq!(cpu.cr0 & 1, 1, "PE set in CR0");
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX,0
+        step(&mut cpu, &mut bus).unwrap(); // LMSW AX — must not clear PE
+        assert_eq!(cpu.cr0 & 1, 1, "LMSW cannot clear PE");
+        assert_eq!(cpu.cr0 & 0xFFFF, 0x0001);
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX,0x10
+        step(&mut cpu, &mut bus).unwrap(); // LMSW AX with PE sticky
+        assert_eq!(cpu.cr0 & 0xFFFF, 0x0011, "ET loaded; PE remains set");
     }
 
     /// LIDT/SIDT m16&32 — opcode 0F 01 /3 and /1 (SDM Vol. 2 LIDT/SIDT; Vol. 3 §2.4.3).

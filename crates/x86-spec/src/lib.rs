@@ -1312,13 +1312,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
 /// Spec: Intel SDM Vol. 2 Chapter 2; opcode map 2.
 pub const M1_0F_SUBSET: &[InstrDef] = &[
     // Group 7: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 01).
-    // This slice implements /0 SGDT, /1 SIDT, /2 LGDT, /3 LIDT.
+    // Implemented: /0 SGDT, /1 SIDT, /2 LGDT, /3 LIDT, /4 SMSW, /6 LMSW.
     InstrDef {
         mnemonic: "GRP7",
         opcode: 0x01,
         encoding: Encoding::Modrm,
         width: Width::OsZ,
-        sdm: "SGDT/SIDT/LGDT/LIDT",
+        sdm: "SGDT/SIDT/LGDT/LIDT/SMSW/LMSW",
     },
     InstrDef {
         mnemonic: "IMUL",
