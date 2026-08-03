@@ -1338,7 +1338,7 @@ Progress against implement list:
 - [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 + OCW1 IMR + OCW2 EOI + OCW3 IRR/ISR read + edge IRQ assert + cascade + `MachineBus` ports / `poll_external_irq`; **not** Auto-EOI/rotate/special-mask/OCW3 poll/level-triggered runtime
 - [ ] 8254 PIT — **partial:** `devices::Pit8254` ch0 programming + `ce`/OUT tick (modes 0/2/3) + `Machine::tick_pit` → IRQ0→PIC; ch2 GATE/OUT + port `0x61` speaker bits (no host audio); ch1 stub accept; **not** host-real-time / modes 1/4/5 OUT / host speaker audio
 - [ ] RTC — **partial:** `devices::CmosRtc` index/data + PIE/AIE/UIE + status C read-to-clear + Status A UIP + `tick_second` BCD sec stub + `Machine::tick_cmos`/`tick_cmos_second` → IRQ8→PIC; **not** host wall-clock/NTP sync / NMI delivery / exact crystal UIP width / full calendar
-- [ ] DMA
+- [ ] DMA — **partial:** `devices::Dma8237` dual 8237A addr/count/mode/mask + AT page regs on `MachineBus`; **not** transfer engine / DREQ/DACK/TC / device integration
 - [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test/config/enable + OBF∧INT1→IRQ1 + make-code inject stub + `0xD0`/`0xD1` output-port A20 → `PhysMem`); **not** mouse/IRQ12, full AT keyboard protocol / Set2↔Set1 translation, or pulse-reset
 - [ ] PCI configuration space
 - [ ] PIIX IDE

@@ -1,10 +1,12 @@
 //! Device models. Milestone 1: COM1 data port + debug port 0x402.
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
-//! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20).
+//! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
+//! 8237A DMA register/page stubs (no transfer engine).
 
 #![forbid(unsafe_code)]
 
 mod cmos;
+mod dma;
 mod i8042;
 mod pic;
 mod pit;
@@ -13,6 +15,10 @@ mod serial;
 pub use cmos::{
     CmosRtc, CMOS_DATA, CMOS_INDEX, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, REG_STATUS_D,
     STATUS_A_UIP, STB_AIE, STB_PIE, STB_SET, STB_UIE, STC_AF, STC_IRQF, STC_PF, STC_UF,
+};
+pub use dma::{
+    Dma8237, DmaChannel, DmaController, DMA_MASTER_BASE, DMA_PAGE_CH0, DMA_PAGE_CH1, DMA_PAGE_CH2,
+    DMA_PAGE_CH3, DMA_PAGE_CH4, DMA_PAGE_CH5, DMA_PAGE_CH6, DMA_PAGE_CH7, DMA_SLAVE_BASE,
 };
 pub use i8042::{
     CFG_INT1, CFG_INT12, CFG_KBD_CLOCK_DISABLE, CFG_TRANSLATE, CMD_DISABLE_KBD, CMD_ENABLE_KBD,

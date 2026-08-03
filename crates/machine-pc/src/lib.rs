@@ -1,4 +1,4 @@
-//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042 port wiring.
+//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA port wiring.
 
 #![forbid(unsafe_code)]
 
@@ -10,9 +10,10 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, DualPic, Pit8254, PortDevice, Serial16550, CMOS_DATA, CMOS_INDEX, I8042,
-    I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-    PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    CmosRtc, DebugConsole, Dma8237, DualPic, Pit8254, PortDevice, Serial16550, CMOS_DATA,
+    CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
+    PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -41,6 +42,8 @@ pub struct Machine {
     pub cmos: CmosRtc,
     /// 8042 / PS/2 controller (ports 0x60/0x64); OBF+INT1 → IRQ1.
     pub kbd: I8042,
+    /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
+    pub dma: Dma8237,
     ports: PortBus,
 }
 
@@ -55,6 +58,7 @@ impl Machine {
             pit: Pit8254::new(),
             cmos: CmosRtc::new(),
             kbd: I8042::new(),
+            dma: Dma8237::new(),
             ports: PortBus::new(),
         }
     }
@@ -89,6 +93,7 @@ impl Machine {
         self.pit.reset();
         self.cmos.reset();
         self.kbd.reset();
+        self.dma.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
@@ -107,6 +112,7 @@ impl Machine {
             pit: &mut self.pit,
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
+            dma: &mut self.dma,
             ports: &mut self.ports,
         };
         step(&mut self.cpu, &mut view)?;
@@ -122,6 +128,7 @@ impl Machine {
             pit: &mut self.pit,
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
+            dma: &mut self.dma,
             ports: &mut self.ports,
         };
         Ok(run(&mut self.cpu, &mut view, max_steps)?)
@@ -247,12 +254,16 @@ struct MachineBus<'a> {
     pit: &'a mut Pit8254,
     cmos: &'a mut CmosRtc,
     kbd: &'a mut I8042,
+    dma: &'a mut Dma8237,
     ports: &'a mut PortBus,
 }
 
 impl MachineBus<'_> {
     /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        if Dma8237::owns_port(port) {
+            return self.dma.port_read(port, size);
+        }
         match port {
             PIC_MASTER_CMD | PIC_MASTER_DATA | PIC_SLAVE_CMD | PIC_SLAVE_DATA => {
                 self.pic.port_read(port, size)
@@ -270,6 +281,10 @@ impl MachineBus<'_> {
     }
 
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
+        if Dma8237::owns_port(port) {
+            self.dma.port_write(port, size, value);
+            return;
+        }
         match port {
             PIC_MASTER_CMD | PIC_MASTER_DATA | PIC_SLAVE_CMD | PIC_SLAVE_DATA => {
                 self.pic.port_write(port, size, value);
@@ -392,6 +407,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             // Cascaded AT init: master 0x11/0x08/0x04/0x01, slave 0x11/0x70/0x02/0x01.
@@ -430,6 +446,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(PIC_MASTER_CMD, 0x11).unwrap();
@@ -452,6 +469,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -522,6 +540,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ0 vector 0x08.
@@ -551,6 +570,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -577,6 +597,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -605,6 +626,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             // Spec: AT slave ICW2 base 0x70 → IRQ8 vector 0x70.
@@ -640,6 +662,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -666,6 +689,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
@@ -702,6 +726,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
@@ -734,6 +759,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -757,6 +783,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -816,6 +843,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             // Mode 3 square wave, lo/hi access: control 0x36, count 0x1000.
@@ -844,6 +872,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(CMOS_INDEX).unwrap() & 0x7F, 0);
@@ -924,6 +953,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             // 8042 empty output buffer: data read 0; status has no OBF/IBF.
@@ -958,6 +988,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
@@ -981,6 +1012,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_READ_CONFIG).unwrap();
@@ -1039,6 +1071,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & 0x03, 0);
@@ -1062,6 +1095,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             assert_ne!(
@@ -1141,6 +1175,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
@@ -1160,6 +1195,7 @@ mod tests {
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
+                dma: &mut m.dma,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
@@ -1200,5 +1236,51 @@ mod tests {
         assert!(m.cpu.halted);
         assert!(!m.mem.a20_enabled());
         assert_eq!(m.mem.read_u8(MARK | (1 << 20)).unwrap(), 0xAA);
+    }
+
+    /// Spec: OSDev ISA DMA / Intel 8237A — MachineBus routes master addr + page; 0x80 stays POST.
+    #[test]
+    fn machine_bus_dma_addr_and_page_preserves_post_80() {
+        use devices::DMA_PAGE_CH2;
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                dma: &mut m.dma,
+                ports: &mut m.ports,
+            };
+            bus.port_out_u8(0x00, 0xCD).unwrap();
+            bus.port_out_u8(0x00, 0xAB).unwrap();
+            // Flip-flop advanced; clear via 0x0C then read back.
+            bus.port_out_u8(0x0C, 0x00).unwrap();
+            assert_eq!(bus.port_in_u8(0x00).unwrap(), 0xCD);
+            assert_eq!(bus.port_in_u8(0x00).unwrap(), 0xAB);
+            bus.port_out_u8(DMA_PAGE_CH2, 0x55).unwrap();
+            assert_eq!(bus.port_in_u8(DMA_PAGE_CH2).unwrap(), 0x55);
+            // IBM PC/AT POST port remains open-bus (not a DMA page).
+            assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF);
+            bus.port_out_u8(0x80, 0x11).unwrap();
+            assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF);
+        }
+        assert_eq!(m.dma.master.channels[0].addr, 0xABCD);
+        assert_eq!(m.dma.page[2], 0x55);
+    }
+
+    #[test]
+    fn machine_reset_clears_dma() {
+        let mut m = Machine::new(64 * 1024);
+        m.dma.port_write(0x00, 1, 0x11);
+        m.dma.port_write(0x00, 1, 0x22);
+        m.dma.page[2] = 0x99;
+        m.reset();
+        assert_eq!(m.dma.master.channels[0].addr, 0);
+        assert_eq!(m.dma.page[2], 0);
+        assert_eq!(m.dma.master.mask, 0x0F);
     }
 }

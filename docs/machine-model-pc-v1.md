@@ -26,10 +26,15 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x71` | CMOS/RTC data |
 | `0x60` | 8042 / PS/2 data — OBF∧config INT1 → IRQ1 |
 | `0x64` | 8042 / PS/2 status (read) / command (write) |
+| `0x00`–`0x0F` | 8237A DMA master (ch0–3) — addr/count/mode/mask stubs |
+| `0xC0`–`0xDE` (even) | 8237A DMA slave (ch4–7) — same programming model |
+| `0x87`/`0x83`/`0x81`/`0x82` | DMA page registers ch0–3 |
+| `0x8F`/`0x8B`/`0x89`/`0x8A` | DMA page registers ch4–7 |
+| `0x80` | POST/diagnostic (open-bus read `0xFF`; **not** a DMA page) |
 
-Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled).
+Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled). Unused page holes (`0x84`–`0x86`, `0x88`, `0x8C`–`0x8E`) stay open-bus.
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`). Reset clears PIC/PIT/CMOS/8042 like serial. No snapshot schema for these devices yet (serial has none either).
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`). Reset clears PIC/PIT/CMOS/8042/DMA like serial. No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
@@ -53,3 +58,4 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - 8254: Intel 8254 PIT datasheet — channel 0/2 control word, lo/hi access, latch, modes 0/2/3 OUT + GATE; ch0 OUT → IRQ0 via `Machine::tick_pit` / `poll_external_irq` level follow; ch2 GATE/OUT via port `0x61`. No host audio / DRAM-refresh / host-real-time claims.
 - CMOS/RTC: Motorola MC146818 / IBM PC AT — 128-byte register file at `0x70`/`0x71`; NMI bit stored only; status A UIP (read-only to guest); status B PIE/AIE/UIE/SET; status C PF/AF/UF/IRQF read-to-clear; second update stub + periodic tick; IRQ → ISA IRQ8.
 - 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — port-wired; config INT1 + OBF → ISA IRQ1; make-code inject → OBF (clock-disable respected; translation passthrough); output-port bit1 → A20; see `devices::I8042` / `Machine::kbd`.
+- 8237A DMA: Intel 8237A + OSDev ISA DMA — dual controllers + AT page regs on `MachineBus`; programming accepted (flip-flop/addr/count/mode/mask); **no** memory transfer engine / DREQ/DACK/TC. Port `0x80` remains POST.

@@ -16,6 +16,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
 - Intel 8254 Programmable Interval Timer datasheet
 - Motorola MC146818 / IBM PC AT CMOS RTC register map (ports `0x70`/`0x71`)
+- Intel 8237A Programmable DMA Controller datasheet (addr/count/mode/mask/flip-flop)
+- OSDev Wiki ISA DMA — AT port map and page registers (not port `0x80`)
 
 ## Firmware
 
