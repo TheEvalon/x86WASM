@@ -1,4 +1,4 @@
-//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA port wiring.
+//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA wiring.
 
 #![forbid(unsafe_code)]
 
@@ -10,7 +10,7 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DualPic, Pit8254, PortDevice, Serial16550, CMOS_DATA,
+    CmosRtc, DebugConsole, Dma8237, DualPic, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA,
     CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
     PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
     PORT_SYSTEM_CONTROL,
@@ -44,6 +44,8 @@ pub struct Machine {
     pub kbd: I8042,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
+    /// VGA color text plane at 0xB8000 (32 KiB stub; no CRTC).
+    pub vga: VgaText,
     ports: PortBus,
 }
 
@@ -59,6 +61,7 @@ impl Machine {
             cmos: CmosRtc::new(),
             kbd: I8042::new(),
             dma: Dma8237::new(),
+            vga: VgaText::new(),
             ports: PortBus::new(),
         }
     }
@@ -94,6 +97,7 @@ impl Machine {
         self.cmos.reset();
         self.kbd.reset();
         self.dma.reset();
+        self.vga.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
@@ -113,6 +117,7 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             dma: &mut self.dma,
+            vga: &mut self.vga,
             ports: &mut self.ports,
         };
         step(&mut self.cpu, &mut view)?;
@@ -129,6 +134,7 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             dma: &mut self.dma,
+            vga: &mut self.vga,
             ports: &mut self.ports,
         };
         Ok(run(&mut self.cpu, &mut view, max_steps)?)
@@ -255,6 +261,7 @@ struct MachineBus<'a> {
     cmos: &'a mut CmosRtc,
     kbd: &'a mut I8042,
     dma: &'a mut Dma8237,
+    vga: &'a mut VgaText,
     ports: &'a mut PortBus,
 }
 
@@ -308,12 +315,30 @@ impl MachineBus<'_> {
 
 impl Bus for MachineBus<'_> {
     fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        // Spec: IBM VGA text — 0xB8000 plane overlays RAM on the CPU bus.
+        // A20 mask matches PhysMem before VGA vs RAM decode.
+        let effective = if self.mem.a20_enabled() {
+            addr
+        } else {
+            addr & !(1u64 << 20)
+        };
+        if let Some(b) = self.vga.read_u8(effective) {
+            return Ok(b);
+        }
         self.mem
             .read_u8(addr)
             .map_err(|_| ExecError::MemoryFault(addr))
     }
 
     fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        let effective = if self.mem.a20_enabled() {
+            addr
+        } else {
+            addr & !(1u64 << 20)
+        };
+        if self.vga.write_u8(effective, val) {
+            return Ok(());
+        }
         self.mem
             .write_u8(addr, val)
             .map_err(|_| ExecError::MemoryFault(addr))
@@ -408,6 +433,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             // Cascaded AT init: master 0x11/0x08/0x04/0x01, slave 0x11/0x70/0x02/0x01.
@@ -447,6 +473,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(PIC_MASTER_CMD, 0x11).unwrap();
@@ -470,6 +497,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -541,6 +569,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ0 vector 0x08.
@@ -571,6 +600,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -598,6 +628,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -627,6 +658,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             // Spec: AT slave ICW2 base 0x70 → IRQ8 vector 0x70.
@@ -663,6 +695,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -690,6 +723,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
@@ -727,6 +761,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
@@ -760,6 +795,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -784,6 +820,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -844,6 +881,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             // Mode 3 square wave, lo/hi access: control 0x36, count 0x1000.
@@ -873,6 +911,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(CMOS_INDEX).unwrap() & 0x7F, 0);
@@ -954,6 +993,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             // 8042 empty output buffer: data read 0; status has no OBF/IBF.
@@ -989,6 +1029,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
@@ -1013,6 +1054,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_READ_CONFIG).unwrap();
@@ -1072,6 +1114,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & 0x03, 0);
@@ -1096,6 +1139,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             assert_ne!(
@@ -1176,6 +1220,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
@@ -1196,6 +1241,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
@@ -1253,6 +1299,7 @@ mod tests {
                 cmos: &mut m.cmos,
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
+                vga: &mut m.vga,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(0x00, 0xCD).unwrap();
@@ -1282,5 +1329,50 @@ mod tests {
         assert_eq!(m.dma.master.channels[0].addr, 0);
         assert_eq!(m.dma.page[2], 0);
         assert_eq!(m.dma.master.mask, 0x0F);
+    }
+
+    /// Spec: IBM VGA text — MachineBus overlays 0xB8000 plane (not PhysMem RAM).
+    #[test]
+    fn machine_bus_vga_text_mmio_overlay() {
+        use devices::VGA_TEXT_BASE;
+        let mut m = Machine::new(1024 * 1024);
+        // Poison underlying RAM at the same physical address.
+        m.mem.write_u8(VGA_TEXT_BASE, 0xEE).unwrap();
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                dma: &mut m.dma,
+                vga: &mut m.vga,
+                ports: &mut m.ports,
+            };
+            // Reset default is space, not the RAM poison.
+            assert_eq!(bus.read_u8(VGA_TEXT_BASE).unwrap(), b' ');
+            bus.write_u8(VGA_TEXT_BASE, b'X').unwrap();
+            bus.write_u8(VGA_TEXT_BASE + 1, 0x1F).unwrap();
+            assert_eq!(bus.read_u8(VGA_TEXT_BASE).unwrap(), b'X');
+            assert_eq!(bus.read_u8(VGA_TEXT_BASE + 1).unwrap(), 0x1F);
+            // Outside VGA window still uses PhysMem / open-bus path.
+            bus.write_u8(0xA0000, 0x5A).unwrap();
+            assert_eq!(bus.read_u8(0xA0000).unwrap(), 0x5A);
+        }
+        assert_eq!(m.vga.char_at(0, 0), Some(b'X'));
+        assert_eq!(m.vga.attr_at(0, 0), Some(0x1F));
+        // Overlay did not write through to RAM.
+        assert_eq!(m.mem.read_u8(VGA_TEXT_BASE).unwrap(), 0xEE);
+    }
+
+    #[test]
+    fn machine_reset_clears_vga_text() {
+        let mut m = Machine::new(1024 * 1024);
+        m.vga.put_char(0, 0, b'Z', 0x4E);
+        m.reset();
+        assert_eq!(m.vga.char_at(0, 0), Some(b' '));
+        assert_eq!(m.vga.attr_at(0, 0), Some(0x07));
     }
 }
