@@ -11,13 +11,13 @@
 //!
 //! # Scope (this slice)
 //!
-//! Unit-model register bank only: status bits useful for firmware polling, a
-//! small documented command subset, and an output-buffer data path. Instant
-//! command completion (IBF never stays set across a status poll).
+//! Register bank wired onto `machine-pc::MachineBus` at ports `0x60`/`0x64`:
+//! status bits useful for firmware polling, a small documented command subset,
+//! and an output-buffer data path. Instant command completion (IBF never stays
+//! set across a status poll). No IRQ1 delivery.
 //!
 //! # Unsupported (explicit)
 //!
-//! - MachineBus / `machine-pc` port wiring (this module is not attached yet)
 //! - IRQ1 / IRQ12 delivery
 //! - PS/2 keyboard or mouse device protocol (no scancodes, no `0xFA` ACK)
 //! - Second PS/2 port (`0xA7`/`0xA8`/`0xA9`/`0xD4`)

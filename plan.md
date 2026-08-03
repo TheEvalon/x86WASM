@@ -1339,7 +1339,7 @@ Progress against implement list:
 - [ ] 8254 PIT — **partial:** `devices::Pit8254` channel-0 programming + `MachineBus` ports 0x40–0x43; ch1/ch2 stub accept; **not** IRQ0/OUT→PIC or speaker
 - [ ] RTC — **partial:** `devices::CmosRtc` index/data bank + `MachineBus` ports 0x70/0x71 (NMI latch bit stored; status C read-to-clear); **not** IRQ8/PIE/AIE/UIE or wall-clock sync
 - [ ] DMA
-- [ ] PS/2 controller — **partial:** `devices::I8042` unit model ports `0x60`/`0x64` (self-test `0xAA`→`0x55`, config byte `0x20`/`0x60`, disable/enable `0xAD`/`0xAE`, status OBF/IBF); **not** MachineBus-wired, IRQ1, mouse, or A20
+- [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test `0xAA`→`0x55`, config byte `0x20`/`0x60`, disable/enable `0xAD`/`0xAE`, status OBF/IBF); **not** IRQ1, mouse, or A20
 - [ ] PCI configuration space
 - [ ] PIIX IDE
 - [ ] ATAPI
