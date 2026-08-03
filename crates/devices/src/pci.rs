@@ -63,6 +63,17 @@ pub const PCI_HEADER_MULTIFUNCTION: u8 = 0x80;
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
 
+/// Type-0 config header identity fields written at reset.
+struct PciHeaderId {
+    vendor: u16,
+    device: u16,
+    revision: u8,
+    prog_if: u8,
+    subclass: u8,
+    class: u8,
+    header_type: u8,
+}
+
 /// PCI configuration mechanism #1 controller stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PciConfig {
@@ -97,13 +108,15 @@ impl PciConfig {
         // Spec: PCI config header type 0 — vendor/device little-endian at 0x00.
         Self::write_id(
             &mut cfg,
-            PCI_VENDOR_INTEL,
-            PCI_DEVICE_I440FX,
-            0x02,
-            0x00,
-            PCI_SUBCLASS_HOST_BRIDGE,
-            PCI_CLASS_BRIDGE,
-            0x00,
+            PciHeaderId {
+                vendor: PCI_VENDOR_INTEL,
+                device: PCI_DEVICE_I440FX,
+                revision: 0x02,
+                prog_if: 0x00,
+                subclass: PCI_SUBCLASS_HOST_BRIDGE,
+                class: PCI_CLASS_BRIDGE,
+                header_type: 0x00,
+            },
         );
         cfg
     }
@@ -114,13 +127,15 @@ impl PciConfig {
         // Public PIIX3 (82371SB) ISA function ID 8086:7000.
         Self::write_id(
             &mut cfg,
-            PCI_VENDOR_INTEL,
-            PCI_DEVICE_PIIX3_ISA,
-            0x00,
-            0x00,
-            PCI_SUBCLASS_ISA_BRIDGE,
-            PCI_CLASS_BRIDGE,
-            PCI_HEADER_MULTIFUNCTION,
+            PciHeaderId {
+                vendor: PCI_VENDOR_INTEL,
+                device: PCI_DEVICE_PIIX3_ISA,
+                revision: 0x00,
+                prog_if: 0x00,
+                subclass: PCI_SUBCLASS_ISA_BRIDGE,
+                class: PCI_CLASS_BRIDGE,
+                header_type: PCI_HEADER_MULTIFUNCTION,
+            },
         );
         cfg
     }
@@ -132,36 +147,29 @@ impl PciConfig {
         // Public PIIX3 IDE function ID 8086:7010.
         Self::write_id(
             &mut cfg,
-            PCI_VENDOR_INTEL,
-            PCI_DEVICE_PIIX3_IDE,
-            0x00,
-            0x80,
-            PCI_SUBCLASS_IDE,
-            PCI_CLASS_STORAGE,
-            0x00,
+            PciHeaderId {
+                vendor: PCI_VENDOR_INTEL,
+                device: PCI_DEVICE_PIIX3_IDE,
+                revision: 0x00,
+                prog_if: 0x80,
+                subclass: PCI_SUBCLASS_IDE,
+                class: PCI_CLASS_STORAGE,
+                header_type: 0x00,
+            },
         );
         cfg
     }
 
-    fn write_id(
-        cfg: &mut [u8; 256],
-        vendor: u16,
-        device: u16,
-        revision: u8,
-        prog_if: u8,
-        subclass: u8,
-        class: u8,
-        header_type: u8,
-    ) {
-        cfg[0] = (vendor & 0xFF) as u8;
-        cfg[1] = (vendor >> 8) as u8;
-        cfg[2] = (device & 0xFF) as u8;
-        cfg[3] = (device >> 8) as u8;
-        cfg[8] = revision;
-        cfg[9] = prog_if;
-        cfg[10] = subclass;
-        cfg[11] = class;
-        cfg[0x0E] = header_type;
+    fn write_id(cfg: &mut [u8; 256], id: PciHeaderId) {
+        cfg[0] = (id.vendor & 0xFF) as u8;
+        cfg[1] = (id.vendor >> 8) as u8;
+        cfg[2] = (id.device & 0xFF) as u8;
+        cfg[3] = (id.device >> 8) as u8;
+        cfg[8] = id.revision;
+        cfg[9] = id.prog_if;
+        cfg[10] = id.subclass;
+        cfg[11] = id.class;
+        cfg[0x0E] = id.header_type;
     }
 
     pub fn reset(&mut self) {
