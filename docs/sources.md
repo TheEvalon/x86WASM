@@ -12,6 +12,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - PCI Local Bus Specification — Configuration Mechanism #1 (`CONFIG_ADDRESS` `0xCF8`, `CONFIG_DATA` `0xCFC`, Type 1 address, enable bit 31)
 - OSDev Wiki PCI — configuration space access mechanism #1; absent device → `0xFFFFFFFF`
 - Intel 440FX (i440FX) host-bridge identity (`vendor 0x8086`, `device 0x1237`) as classic QEMU/SeaBIOS-compatible stub ID (behavior from specs/oracles, not copied source)
+- Intel 82371SB (PIIX3) public PCI IDs — ISA bridge `8086:7000`, IDE `8086:7010` (config-space identity stubs only; no copied implementation)
 - ACPI specifications (for later machine/firmware work)
 - ATA / ATAPI specifications (IDENTIFY DEVICE `0xEC`, READ SECTORS `0x20`, task-file / status bits, LBA28 PIO, device-control nIEN / INTRQ)
 - OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6`, IDENTIFY/READ polling and IRQ14 (status clears IRQ; alt status does not)

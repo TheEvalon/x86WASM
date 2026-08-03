@@ -3,7 +3,7 @@
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! 8237A DMA register/page stubs (no transfer engine);
 //! VGA text frame buffer MMIO stub at 0xB8000;
-//! PCI configuration mechanism #1 stub (0xCF8/0xCFC);
+//! PCI configuration mechanism #1 stub (0xCF8/0xCFC) + PIIX3 ISA/IDE functions;
 //! Primary IDE IDENTIFY + READ SECTORS PIO + IRQ14 stub (1F0–1F7/3F6).
 
 #![forbid(unsafe_code)]
@@ -39,8 +39,9 @@ pub use ide::{
     IDE_PRIMARY_LBA_MID, IDE_PRIMARY_SECCOUNT, IDE_PRIMARY_STATUS,
 };
 pub use pci::{
-    PciConfig, PCI_CLASS_BRIDGE, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PCI_DEVICE_I440FX,
-    PCI_SUBCLASS_HOST_BRIDGE, PCI_VENDOR_INTEL,
+    PciConfig, PCI_CLASS_BRIDGE, PCI_CLASS_STORAGE, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
+    PCI_DEVICE_I440FX, PCI_DEVICE_PIIX3_IDE, PCI_DEVICE_PIIX3_ISA, PCI_HEADER_MULTIFUNCTION,
+    PCI_SUBCLASS_HOST_BRIDGE, PCI_SUBCLASS_IDE, PCI_SUBCLASS_ISA_BRIDGE, PCI_VENDOR_INTEL,
 };
 pub use pic::{DualPic, Pic8259, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA};
 pub use pit::{

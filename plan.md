@@ -1340,7 +1340,7 @@ Progress against implement list:
 - [ ] RTC — **partial:** `devices::CmosRtc` index/data + PIE/AIE/UIE + status C read-to-clear + Status A UIP + `tick_second` BCD sec stub + `Machine::tick_cmos`/`tick_cmos_second` → IRQ8→PIC; **not** host wall-clock/NTP sync / NMI delivery / exact crystal UIP width / full calendar
 - [ ] DMA — **partial:** `devices::Dma8237` dual 8237A addr/count/mode/mask + AT page regs on `MachineBus`; **not** transfer engine / DREQ/DACK/TC / device integration
 - [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test/config/enable + OBF∧INT1→IRQ1 + make-code inject stub + `0xD0`/`0xD1` output-port A20 → `PhysMem`); **not** mouse/IRQ12, full AT keyboard protocol / Set2↔Set1 translation, or pulse-reset
-- [ ] PCI configuration space — **partial:** `devices::PciConfig` Mechanism #1 (`0xCF8`/`0xCFC`) + host bridge `00:00.0` `8086:1237` stub on `MachineBus`; **not** PIIX tree / BAR MMIO / bus mastering / caps/MSI/PCIe
+- [ ] PCI configuration space — **partial:** `devices::PciConfig` Mechanism #1 (`0xCF8`/`0xCFC`) + host bridge `00:00.0` `8086:1237` + PIIX3 stubs `00:01.0` ISA `8086:7000` / `00:01.1` IDE `8086:7010` on `MachineBus`; **not** USB/ACPI PIIX funcs / BAR MMIO / bus mastering / caps/MSI/PCIe
 - [ ] PIIX IDE — **partial:** `devices::IdePrimary` IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO on ports `0x1F0`–`0x1F7`/`0x3F6` with backing image + DRQ/BSY/DRDY + IRQ14→`DualPic` when nIEN=0; **not** ATAPI/WRITE/DMA/slave/secondary/PCI BARs/SeaBIOS
 - [ ] ATAPI
 - [ ] VGA text mode — **partial:** `devices::VgaText` 32 KiB plane at `0xB8000` on `MachineBus` (80×25 reset fill); **not** CRTC/sequencer/graphics/VBE/host render
