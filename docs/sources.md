@@ -13,7 +13,9 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - ACPI specifications (for later machine/firmware work)
 - ATA / ATAPI specifications
 - PS/2 and 8042 controller references
-- 8259 PIC and 8254 PIT references
+- Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
+- Intel 8254 Programmable Interval Timer datasheet
+- Motorola MC146818 / IBM PC AT CMOS RTC register map (ports `0x70`/`0x71`)
 
 ## Firmware
 
