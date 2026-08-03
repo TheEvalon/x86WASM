@@ -1327,6 +1327,25 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "IMUL",
     },
+    // MOV r32, CR0 / MOV CR0, r32 — Spec: Intel SDM Vol. 2 "MOV—Move to/from
+    // Control Registers". ModRM.reg selects the control register (0=CR0;
+    // 1=CR1 is #UD; 2/3/4 = CR2/CR3/CR4, out of scope for this slice).
+    // The mod field is architecturally ignored (always register-direct); the
+    // decoder special-cases these two opcodes to avoid consuming SIB/disp.
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0x20,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "MOV r32,CRn",
+    },
+    InstrDef {
+        mnemonic: "MOV",
+        opcode: 0x22,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "MOV CRn,r32",
+    },
 ];
 
 pub fn lookup_0f(opcode: u8) -> Option<&'static InstrDef> {
@@ -1386,5 +1405,7 @@ mod tests {
             "missing 0F 01 GRP7 SGDT/SIDT/LGDT/LIDT"
         );
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
+        assert!(lookup_0f(0x20).is_some(), "missing 0F 20 MOV r32,CRn");
+        assert!(lookup_0f(0x22).is_some(), "missing 0F 22 MOV CRn,r32");
     }
 }

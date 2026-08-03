@@ -152,10 +152,19 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         }
         let m = Modrm::decode(bytes[i]);
         i += 1;
+        // MOV to/from control registers (0F 20/22): the mod field is
+        // architecturally ignored — the operand is always register-direct
+        // and no SIB byte or displacement follows the ModR/M byte, even when
+        // the raw mod bits are not 11. Spec: Intel SDM Vol. 2 "MOV—Move
+        // to/from Control Registers" ("The 2 bits in the mod field ... are
+        // ignored").
+        let mov_crn = two_byte && matches!(opcode, 0x20 | 0x22);
         // Address-size attribute: real-mode default 16; 0x67 → 32.
         // Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (ModR/M, SIB, displacement).
         let addr16 = !prefixes.addr_size_override;
-        if addr16 {
+        if mov_crn {
+            // No SIB/displacement bytes for MOV CRn — see comment above.
+        } else if addr16 {
             match (m.mod_, m.rm) {
                 (0, 6) => {
                     if i + 1 >= bytes.len() {
@@ -627,6 +636,37 @@ mod tests {
         let lmsw_ax = decode(&[0x0F, 0x01, 0xF0]).unwrap(); // LMSW AX
         assert_eq!(lmsw_ax.modrm.unwrap().reg, 6);
         assert_eq!(lmsw_ax.length, 3);
+    }
+
+    #[test]
+    fn decode_mov_cr0() {
+        // Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers" — 0F 20/22 /r.
+        let mov_eax_cr0 = decode(&[0x0F, 0x20, 0xC0]).unwrap(); // MOV EAX, CR0
+        assert!(mov_eax_cr0.two_byte);
+        assert_eq!(mov_eax_cr0.opcode, 0x20);
+        assert_eq!(mov_eax_cr0.modrm.unwrap().reg, 0); // CR0
+        assert_eq!(mov_eax_cr0.modrm.unwrap().rm, 0); // EAX
+        assert_eq!(mov_eax_cr0.length, 3);
+
+        let mov_cr0_ebx = decode(&[0x0F, 0x22, 0xC3]).unwrap(); // MOV CR0, EBX
+        assert!(mov_cr0_ebx.two_byte);
+        assert_eq!(mov_cr0_ebx.opcode, 0x22);
+        assert_eq!(mov_cr0_ebx.modrm.unwrap().reg, 0); // CR0
+        assert_eq!(mov_cr0_ebx.modrm.unwrap().rm, 3); // EBX
+        assert_eq!(mov_cr0_ebx.length, 3);
+
+        // CR1 selector (ModRM.reg == 1) still decodes; #UD is an interpreter concern.
+        let mov_eax_cr1 = decode(&[0x0F, 0x20, 0xC8]).unwrap(); // MOV EAX, CR1 (reg=1)
+        assert_eq!(mov_eax_cr1.modrm.unwrap().reg, 1);
+
+        // Spec: mod field is ignored for MOV to/from control registers — the CPU
+        // always treats the operand as register-direct and does not consume a
+        // SIB byte or displacement even when mod != 11. A non-3 mod byte here
+        // (0x40 = mod=01, reg=0, rm=0) must decode as if mod were 3, leaving the
+        // trailing byte (0xFD = STD) as the *next* instruction.
+        let ignored_mod = decode(&[0x0F, 0x20, 0x40, 0xFD]).unwrap(); // MOV EAX, CR0; STD follows
+        assert_eq!(ignored_mod.modrm.unwrap().rm, 0); // EAX, not [EAX+disp8]
+        assert_eq!(ignored_mod.length, 3, "mod/disp8 byte must not be consumed");
     }
 
     #[test]
