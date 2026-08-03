@@ -15,14 +15,16 @@
 //!
 //! Register bank wired onto `machine-pc::MachineBus` at ports `0x60`/`0x64`:
 //! status bits useful for firmware polling, a small documented command subset,
-//! output-buffer data path, and IRQ1 when config bit0 is set and OBF is set.
+//! output-buffer data path, IRQ1 when config bit0 is set and OBF is set, and a
+//! make-code inject stub (`inject_scancode`) that respects keyboard clock disable.
 //! Instant command completion (IBF never stays set across a status poll).
 //!
 //! # Unsupported (explicit)
 //!
 //! - IRQ12 / second PS/2 port (`0xA7`/`0xA8`/`0xA9`/`0xD4`)
-//! - PS/2 keyboard or mouse device protocol (no scancodes, no `0xFA` ACK)
-//! - Pulse/reset lines (`0xFE` / output-port bit0 system-reset side effects)
+//! - Full AT keyboard protocol (no host→device commands, no `0xFA` ACK, no break codes)
+//! - Set2↔Set1 translation table (config bit6 is stored; inject is passthrough)
+//! - Mouse device / pulse-reset lines (`0xFE` / output-port bit0 system-reset)
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
 
 use crate::PortDevice;
@@ -70,9 +72,11 @@ pub const CFG_INT1: u8 = 1 << 0;
 /// Configuration bit 1: second PS/2 port interrupt (IRQ12) — not delivered here.
 pub const CFG_INT12: u8 = 1 << 1;
 /// Configuration bit 4: first PS/2 port clock disabled when set.
-const CFG_KBD_CLOCK_DISABLE: u8 = 1 << 4;
+pub const CFG_KBD_CLOCK_DISABLE: u8 = 1 << 4;
 /// Configuration bit 6: first PS/2 port translation enabled when set.
-const CFG_TRANSLATE: u8 = 1 << 6;
+///
+/// Stored and readable; this stub does **not** remap Set2↔Set1 bytes.
+pub const CFG_TRANSLATE: u8 = 1 << 6;
 
 /// Reset default configuration: keyboard clock disabled, translation on.
 /// IRQ enables clear until firmware writes the config byte.
@@ -177,12 +181,32 @@ impl I8042 {
 
     /// Place a byte in the output buffer (device/controller → host).
     ///
-    /// Used by tests and future keyboard device path. Returns true if IRQ1 had
-    /// a rising edge (false→true) as a result.
+    /// Used by tests and controller responses. Returns true if IRQ1 had a
+    /// rising edge (false→true) as a result.
     pub fn place_output(&mut self, value: u8) -> bool {
         let prev = self.irq1_line();
         self.push_output(value);
         !prev && self.irq1_line()
+    }
+
+    /// Inject a keyboard make-code into the output buffer (device → host).
+    ///
+    /// Spec: OSDev I8042 / IBM PC AT — when the first-port clock is disabled
+    /// (config bit4), the keyboard interface ignores device traffic. When
+    /// enabled, a make-code is placed in the output buffer (OBF) and may raise
+    /// IRQ1 if config INT1 is set.
+    ///
+    /// Translation (config bit6): passthrough stub only — no Set2↔Set1 remap.
+    /// Callers should supply already-Set1 codes when translation is on (the
+    /// firmware default); when translation is off the same raw byte is placed.
+    ///
+    /// Returns true if IRQ1 had a rising edge (same as [`Self::place_output`]).
+    pub fn inject_scancode(&mut self, make_code: u8) -> bool {
+        if self.keyboard_clock_disabled() {
+            return false;
+        }
+        // Translation bit is stored only; no Set2↔Set1 table in this slice.
+        self.place_output(make_code)
     }
 
     fn push_output(&mut self, value: u8) {
@@ -453,5 +477,64 @@ mod tests {
         k.port_write(0x3F8, 1, 0x10);
         assert_eq!(k, I8042::new());
         assert_eq!(k.port_read(0x3F8, 1), 0xFFFF_FFFF);
+    }
+
+    /// Spec: OSDev I8042 — keyboard clock disabled (config bit4) drops device data.
+    #[test]
+    fn inject_scancode_dropped_when_clock_disabled() {
+        let mut k = I8042::new();
+        assert!(k.keyboard_clock_disabled());
+        assert!(!k.inject_scancode(0x1C));
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.output_buffer(), None);
+        assert!(!k.irq1_line());
+    }
+
+    /// Spec: OSDev I8042 / IBM PC AT — enabled first port accepts make-code → OBF.
+    #[test]
+    fn inject_scancode_sets_obf_when_kbd_enabled() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        assert!(!k.keyboard_clock_disabled());
+        // INT1 clear: inject still fills OBF; no IRQ rising edge.
+        assert!(!k.inject_scancode(0x1C)); // Set1 make-code 'A'
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1C);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OBF ∧ config INT1 → IRQ1; reading 0x60 clears OBF / IRQ1.
+    #[test]
+    fn inject_scancode_with_int1_asserts_irq1_cleared_by_read() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        // Clock enabled (bit4 clear), INT1 + translate (firmware-like).
+        k.port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_TRANSLATE));
+        assert!(k.inject_scancode(0x1C));
+        assert!(k.irq1_line());
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1C);
+        assert!(!k.irq1_line());
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Translation bit is passthrough: raw make-code placed whether on or off.
+    #[test]
+    fn inject_scancode_passthrough_regardless_of_translate() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        // Translate off.
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, 0x00);
+        assert_eq!(k.config & CFG_TRANSLATE, 0);
+        k.inject_scancode(0x1E);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E);
+
+        // Translate on — still no Set2↔Set1 remap in this stub.
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, u32::from(CFG_TRANSLATE));
+        k.inject_scancode(0x1E);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E);
     }
 }

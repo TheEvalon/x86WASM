@@ -203,6 +203,22 @@ impl Machine {
         rising
     }
 
+    /// Inject a keyboard make-code via the 8042 and sync OBF∧INT1 → PIC IRQ1.
+    ///
+    /// Spec: OSDev I8042 / IBM PC AT — device make-code → output buffer when the
+    /// keyboard clock is enabled; IRQ1 when config INT1 is set. Dropped when
+    /// clock disabled. Returns true on IRQ1 rising edge.
+    pub fn kbd_inject_scancode(&mut self, make_code: u8) -> bool {
+        let rising = self.kbd.inject_scancode(make_code);
+        if rising {
+            self.pic.set_irq_line(1, false);
+            self.pic.set_irq_line(1, true);
+        } else {
+            self.sync_kbd_irq1();
+        }
+        rising
+    }
+
     /// Drive PIC IRQ1 from the current 8042 IRQ1 line (level follow).
     pub fn sync_kbd_irq1(&mut self) {
         self.pic.set_irq_line(1, self.kbd.irq1_line());
@@ -320,12 +336,12 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        CmosRtc, DualPic, Pit8254, CFG_INT1, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG,
-        CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD,
-        PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA,
-        PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL,
-        REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE,
-        STC_IRQF, STC_PF,
+        CmosRtc, DualPic, Pit8254, CFG_INT1, CFG_TRANSLATE, CMD_ENABLE_KBD, CMD_READ_CONFIG,
+        CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, I8042,
+        I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+        PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2,
+        PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C,
+        SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF,
     };
 
     #[test]
@@ -647,6 +663,67 @@ mod tests {
         }
         assert_eq!(m.pic.master.isr, 0);
         assert!(!m.kbd.irq1_line());
+    }
+
+    /// Spec: OSDev I8042 — make-code inject → OBF → IRQ1 → vector 0x09; EOI + read clears.
+    #[test]
+    fn kbd_inject_scancode_asserts_irq1_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq1(&mut m);
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        // Clock enabled, INT1 + translate (passthrough stub).
+        m.kbd
+            .port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_TRANSLATE));
+        assert!(m.kbd_inject_scancode(0x1C));
+        assert!(m.kbd.irq1_line());
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
+            assert_eq!(bus.poll_external_irq(), Some(0x09));
+            assert_eq!(bus.poll_external_irq(), None);
+            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), 0x1C);
+            assert!(!bus.kbd.irq1_line());
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap(); // EOI
+        }
+        assert_eq!(m.pic.master.isr, 0);
+        assert!(!m.kbd.irq1_line());
+    }
+
+    /// Spec: keyboard clock disabled drops inject; no OBF / IRQ1.
+    #[test]
+    fn kbd_inject_scancode_dropped_when_clock_disabled() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq1(&mut m);
+        // Default reset: clock disabled.
+        assert!(m.kbd.keyboard_clock_disabled());
+        assert!(!m.kbd_inject_scancode(0x1C));
+        assert!(!m.kbd.irq1_line());
+        assert_eq!(m.kbd.status() & STATUS_OBF, 0);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.poll_external_irq(), None);
+        }
     }
 
     /// Spec: OBF without config INT1 does not deliver IRQ1.
