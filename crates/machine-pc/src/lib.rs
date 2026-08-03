@@ -39,7 +39,7 @@ pub struct Machine {
     pub pit: Pit8254,
     /// MC146818 CMOS/RTC (ports 0x70/0x71); PIE/AIE/UIE → IRQ8.
     pub cmos: CmosRtc,
-    /// 8042 / PS/2 controller (ports 0x60/0x64) — no IRQ1.
+    /// 8042 / PS/2 controller (ports 0x60/0x64); OBF+INT1 → IRQ1.
     pub kbd: I8042,
     ports: PortBus,
 }
@@ -178,6 +178,26 @@ impl Machine {
     pub fn sync_cmos_irq8(&mut self) {
         self.pic.set_irq_line(8, self.cmos.irq_line());
     }
+
+    /// Place a byte in the 8042 output buffer and sync OBF∧INT1 → PIC IRQ1.
+    ///
+    /// Spec: OSDev I8042 / IBM PC AT — keyboard IRQ1 when output buffer full and
+    /// configuration bit0 (INT1) is set. Returns true on IRQ1 rising edge.
+    pub fn kbd_place_output(&mut self, value: u8) -> bool {
+        let rising = self.kbd.place_output(value);
+        if rising {
+            self.pic.set_irq_line(1, false);
+            self.pic.set_irq_line(1, true);
+        } else {
+            self.sync_kbd_irq1();
+        }
+        rising
+    }
+
+    /// Drive PIC IRQ1 from the current 8042 IRQ1 line (level follow).
+    pub fn sync_kbd_irq1(&mut self) {
+        self.pic.set_irq_line(1, self.kbd.irq1_line());
+    }
 }
 
 struct MachineBus<'a> {
@@ -269,11 +289,13 @@ impl Bus for MachineBus<'_> {
 
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
-    /// Syncs PIT ch0 OUT → IRQ0 and CMOS IRQF → IRQ8 (level follow) before
-    /// acknowledge so edges from prior [`Machine::tick_pit`] /
+    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, and CMOS IRQF → IRQ8
+    /// (level follow) before acknowledge so edges from prior
+    /// [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
     /// [`Machine::tick_cmos`] are visible.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
+        self.pic.set_irq_line(1, self.kbd.irq1_line());
         self.pic.set_irq_line(8, self.cmos.irq_line());
         self.pic.poll_irq()
     }
@@ -283,10 +305,11 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        CmosRtc, DualPic, Pit8254, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMOS_DATA,
-        CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A, REG_STATUS_B,
-        REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF,
+        CmosRtc, DualPic, Pit8254, CFG_INT1, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG,
+        CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
+        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A,
+        REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
+        STC_PF,
     };
 
     #[test]
@@ -416,6 +439,19 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0xFE); // unmask slave IR0 (IRQ8)
+    }
+
+    /// Helper: classic AT DualPic cascade init + unmask master IR1 (IRQ1).
+    fn init_at_pic_unmask_irq1(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFD); // unmask IR1
     }
 
     /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
@@ -549,6 +585,62 @@ mod tests {
         init_at_pic_unmask_irq8(&mut m);
         m.tick_cmos(1);
         assert!(!m.cmos.irq_line());
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+    }
+
+    /// Spec: 8042 OBF + INT1 → IRQ1 → vector 0x09; EOI + read 0x60 clears path.
+    #[test]
+    fn kbd_obf_irq_enable_asserts_irq1_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq1(&mut m);
+        // Enable keyboard IRQ in 8042 config (bit0).
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        m.kbd.port_write(I8042_DATA, 1, u32::from(CFG_INT1));
+        assert!(m.kbd_place_output(0x1C));
+        assert!(m.kbd.irq1_line());
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
+            assert_eq!(bus.poll_external_irq(), Some(0x09));
+            assert_eq!(bus.poll_external_irq(), None);
+            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), 0x1C);
+            assert!(!bus.kbd.irq1_line());
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap(); // EOI
+        }
+        assert_eq!(m.pic.master.isr, 0);
+        assert!(!m.kbd.irq1_line());
+    }
+
+    /// Spec: OBF without config INT1 does not deliver IRQ1.
+    #[test]
+    fn kbd_obf_without_irq_enable_no_irq1() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq1(&mut m);
+        // Default config: INT1 clear.
+        assert!(!m.kbd_place_output(0xAA));
+        assert!(!m.kbd.irq1_line());
         {
             let mut bus = MachineBus {
                 mem: &mut m.mem,

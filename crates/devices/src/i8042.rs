@@ -4,8 +4,10 @@
 //!
 //! - OSDev Wiki: [I8042 PS/2 Controller](https://wiki.osdev.org/I8042_PS/2_Controller)
 //!   — data/status/command ports, status OBF/IBF, controller self-test `0xAA`→`0x55`,
-//!   configuration byte via `0x20`/`0x60`, disable/enable first port `0xAD`/`0xAE`.
-//! - IBM PC/AT 8042 keyboard-controller programming model (command/status/data).
+//!   configuration byte via `0x20`/`0x60` (bit0 = first-port IRQ enable → IRQ1),
+//!   disable/enable first port `0xAD`/`0xAE`.
+//! - IBM PC/AT 8042 keyboard-controller programming model (command/status/data);
+//!   output-buffer-full with IRQ enable → ISA IRQ1 (8259A master IR1).
 //! - `docs/sources.md` (PS/2 and 8042 references), `docs/machine-model-pc-v1.md`,
 //!   `plan.md` §15.4.
 //!
@@ -13,14 +15,13 @@
 //!
 //! Register bank wired onto `machine-pc::MachineBus` at ports `0x60`/`0x64`:
 //! status bits useful for firmware polling, a small documented command subset,
-//! and an output-buffer data path. Instant command completion (IBF never stays
-//! set across a status poll). No IRQ1 delivery.
+//! output-buffer data path, and IRQ1 when config bit0 is set and OBF is set.
+//! Instant command completion (IBF never stays set across a status poll).
 //!
 //! # Unsupported (explicit)
 //!
-//! - IRQ1 / IRQ12 delivery
+//! - IRQ12 / second PS/2 port (`0xA7`/`0xA8`/`0xA9`/`0xD4`)
 //! - PS/2 keyboard or mouse device protocol (no scancodes, no `0xFA` ACK)
-//! - Second PS/2 port (`0xA7`/`0xA8`/`0xA9`/`0xD4`)
 //! - A20 gate / output-port / pulse-reset (`0xD0`/`0xD1`/`0xFE`, …) — accepted
 //!   as documented no-ops where noted; no A20 side effects
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
@@ -55,13 +56,17 @@ pub const CMD_ENABLE_KBD: u8 = 0xAE;
 /// Self-test passed response (OSDev / IBM AT).
 pub const SELF_TEST_OK: u8 = 0x55;
 
+/// Configuration bit 0: first PS/2 port interrupt (IRQ1) enable when set.
+pub const CFG_INT1: u8 = 1 << 0;
+/// Configuration bit 1: second PS/2 port interrupt (IRQ12) — not delivered here.
+pub const CFG_INT12: u8 = 1 << 1;
 /// Configuration bit 4: first PS/2 port clock disabled when set.
 const CFG_KBD_CLOCK_DISABLE: u8 = 1 << 4;
 /// Configuration bit 6: first PS/2 port translation enabled when set.
 const CFG_TRANSLATE: u8 = 1 << 6;
 
 /// Reset default configuration: keyboard clock disabled, translation on.
-/// IRQ enables clear (honest: no IRQ delivery in this slice).
+/// IRQ enables clear until firmware writes the config byte.
 const DEFAULT_CONFIG: u8 = CFG_KBD_CLOCK_DISABLE | CFG_TRANSLATE; // 0x50
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +141,29 @@ impl I8042 {
 
     pub fn keyboard_clock_disabled(&self) -> bool {
         self.config & CFG_KBD_CLOCK_DISABLE != 0
+    }
+
+    /// First-port interrupt enable (config bit 0).
+    pub fn irq1_enabled(&self) -> bool {
+        self.config & CFG_INT1 != 0
+    }
+
+    /// ISA IRQ1 line level: OBF ∧ config INT1 enable.
+    ///
+    /// Spec: OSDev I8042 / IBM PC AT — keyboard IRQ when output buffer full and
+    /// interrupt enabled in the controller configuration byte.
+    pub fn irq1_line(&self) -> bool {
+        self.output.is_some() && self.irq1_enabled()
+    }
+
+    /// Place a byte in the output buffer (device/controller → host).
+    ///
+    /// Used by tests and future keyboard device path. Returns true if IRQ1 had
+    /// a rising edge (false→true) as a result.
+    pub fn place_output(&mut self, value: u8) -> bool {
+        let prev = self.irq1_line();
+        self.push_output(value);
+        !prev && self.irq1_line()
     }
 
     fn push_output(&mut self, value: u8) {
@@ -231,6 +259,7 @@ mod tests {
         assert!(k.keyboard_clock_disabled());
         assert_eq!(k.config, DEFAULT_CONFIG);
         assert_eq!(k.output_buffer(), None);
+        assert!(!k.irq1_line());
 
         let mut k2 = I8042::new();
         k2.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
@@ -287,6 +316,49 @@ mod tests {
         // Empty buffer: OBF clear; read returns 0.
         assert_eq!(k.status() & STATUS_OBF, 0);
         assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0);
+    }
+
+    /// Spec: OBF + config INT1 → IRQ1; reading 0x60 clears OBF / IRQ1.
+    #[test]
+    fn place_output_with_irq_enable_asserts_irq1() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_TRANSLATE));
+        assert!(!k.irq1_line());
+        assert!(k.place_output(0x1C)); // make code 'A' (test payload)
+        assert!(k.irq1_line());
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1C);
+        assert!(!k.irq1_line());
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OBF without INT1 enable does not assert IRQ1.
+    #[test]
+    fn place_output_without_irq_enable_no_irq1() {
+        let mut k = I8042::new();
+        // Default config: INT1 clear.
+        assert!(!k.irq1_enabled());
+        assert!(!k.place_output(0xAA));
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        assert!(!k.irq1_line());
+    }
+
+    /// Spec: clearing INT1 while OBF set deasserts IRQ1; re-enable restores level.
+    #[test]
+    fn disable_int1_while_obf_deasserts_irq1() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, u32::from(CFG_INT1));
+        k.place_output(0x02);
+        assert!(k.irq1_line());
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, 0x00); // INT1 off
+        assert!(!k.irq1_line());
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, u32::from(CFG_INT1));
+        assert!(k.irq1_line());
     }
 
     #[test]
