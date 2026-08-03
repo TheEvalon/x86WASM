@@ -14,12 +14,23 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 |---|---|
 | `0x3F8`–`0x3FF` | COM1 (THR write emits guest serial bytes) |
 | `0x402` | Debug console (Bochs/QEMU-style; write = one output byte) |
+<<<<<<< HEAD
 | `0x20` / `0x21` | 8259A master PIC (command / data) — **ICW1–ICW4 only** |
 | `0xA0` / `0xA1` | 8259A slave PIC (command / data) — **ICW1–ICW4 only** |
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled).
 
 PIC unit model lives in `devices::DualPic` (`crates/devices/src/pic.rs`). It is **not** yet wired into `machine-pc` / `MachineBus`.
+=======
+| `0x40` | 8254 PIT channel 0 data — **programming only** |
+| `0x41` | 8254 PIT channel 1 data — stub accept (not fully supported) |
+| `0x42` | 8254 PIT channel 2 data — stub accept (not fully supported) |
+| `0x43` | 8254 PIT control word |
+
+Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled).
+
+PIT unit model lives in `devices::Pit8254` (`crates/devices/src/pit.rs`). It is **not** yet wired into `machine-pc` / `MachineBus`.
+>>>>>>> slice/device-pit-ch0
 
 ## MMIO
 
@@ -27,13 +38,21 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 
 ## Interrupts
 
+<<<<<<< HEAD
 - Software INT/IRET and real-mode IVT fault delivery: see interpreter / M2 CPU work.
 - Hardware IRQ path: CPU stub `pending_irq` / `Bus::poll_external_irq` exists; **no** PIC→CPU delivery yet.
 - 8259A dual PIC: **ICW1–ICW4 initialization only** (vector base, cascade ICW3, ICW4 8086-mode bit). **Not yet:** OCW1–OCW3, EOI, IRR/ISR, priority, IRQ assertion, or `MachineBus` integration.
 - APIC deferred to later milestones.
+=======
+Not required for HELLO ROM. PIC/APIC deferred to later milestones. PIT does **not** raise IRQ0 in this slice (no gate/OUT→PIC wiring).
+>>>>>>> slice/device-pit-ch0
 
 ## Spec / oracle notes
 
 - Serial: 16550-compatible programming model (subset).
 - Debug port `0x402`: widely used by SeaBIOS/QEMU guests for early console; treat as write-only byte sink for M1.
+<<<<<<< HEAD
 - 8259A: Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4); classic PC cascade on IRQ2.
+=======
+- 8254: Intel 8254 PIT datasheet — channel 0 control word, lo/hi access, latch; no IRQ0 pulse / speaker / DRAM-refresh claims yet.
+>>>>>>> slice/device-pit-ch0
