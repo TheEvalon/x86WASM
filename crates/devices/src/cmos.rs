@@ -19,7 +19,7 @@
 //! - Host wall-clock sync / automatic time progression
 //! - NMI signal delivery (bit7 on `0x70` is stored only)
 //! - Century byte / ACPI extended CMOS beyond 128 bytes
-//! - Wiring into `machine-pc` / `MachineBus`
+//! - (Port decode is owned by `machine-pc`; this module remains the unit model.)
 
 use crate::PortDevice;
 

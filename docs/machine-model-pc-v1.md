@@ -25,7 +25,7 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled).
 
-Unit models: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`). None are yet wired into `machine-pc` / `MachineBus`.
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`). Reset clears PIC/PIT/CMOS like serial. No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
@@ -35,9 +35,9 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 
 - Software INT/IRET and real-mode IVT fault delivery: see interpreter / M2 CPU work.
 - Hardware IRQ path: CPU stub `pending_irq` / `Bus::poll_external_irq` exists; **no** PIC→CPU delivery yet.
-- 8259A dual PIC: **ICW1–ICW4 initialization only** (vector base, cascade ICW3, ICW4 8086-mode bit). **Not yet:** OCW1–OCW3, EOI, IRR/ISR, priority, IRQ assertion, or `MachineBus` integration.
-- 8254 PIT: channel-0 programming only; does **not** raise IRQ0 in this slice (no gate/OUT→PIC wiring).
-- CMOS/RTC: index/data bank only; does **not** raise IRQ8 (no PIE/AIE/UIE delivery) and does not sync to host wall-clock yet.
+- 8259A dual PIC: port-wired on `MachineBus`; **ICW1–ICW4 initialization only** (vector base, cascade ICW3, ICW4 8086-mode bit). **Not yet:** OCW1–OCW3, EOI, IRR/ISR, priority, or IRQ assertion to the CPU.
+- 8254 PIT: port-wired on `MachineBus`; channel-0 programming only; does **not** raise IRQ0 (no gate/OUT→PIC wiring).
+- CMOS/RTC: port-wired on `MachineBus`; index/data bank only; does **not** raise IRQ8 (no PIE/AIE/UIE delivery) and does not sync to host wall-clock yet.
 - APIC deferred to later milestones.
 
 ## Spec / oracle notes

@@ -20,7 +20,7 @@
 //!
 //! - OCW1–OCW3 (IMR, EOI, rotate, IRR/ISR read select)
 //! - IRQ assertion, priority, Auto-EOI runtime delivery
-//! - Wiring into `machine-pc` / `MachineBus` / `poll_external_irq`
+//! - `poll_external_irq` / PIC→CPU delivery (port decode is owned by `machine-pc`)
 //!
 //! # Invalid / incomplete init (documented behavior)
 //!

@@ -18,7 +18,7 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - IRQ0 pulse / wiring to PIC / `MachineBus` / `poll_external_irq`
+//! - IRQ0 pulse / wiring to PIC / `poll_external_irq` (port decode is owned by `machine-pc`)
 //! - Gate input, OUT pin sampling beyond stored count
 //! - Read-back command (`SC=11`) status/count latches (ignored)
 //! - Channel 1 DRAM refresh and channel 2 PC speaker semantics
