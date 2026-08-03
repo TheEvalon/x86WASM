@@ -1298,12 +1298,13 @@ mod tests {
         assert_eq!(m.pci.address & (1 << 31), 0);
     }
 
-    /// Spec: PCI + PIIX3 public IDs — MachineBus enumerates 00:01.0 / 00:01.1 / 00:01.2.
+    /// Spec: PCI + PIIX public IDs — MachineBus enumerates 00:01.0..00:01.3.
     #[test]
     fn machine_bus_pci_piix_isa_and_ide() {
         use devices::{
-            PCI_CLASS_SERIAL_BUS, PCI_DEVICE_PIIX3_IDE, PCI_DEVICE_PIIX3_ISA, PCI_DEVICE_PIIX3_USB,
-            PCI_HEADER_MULTIFUNCTION, PCI_PROG_IF_UHCI, PCI_SUBCLASS_USB,
+            PCI_CLASS_BRIDGE, PCI_CLASS_SERIAL_BUS, PCI_DEVICE_PIIX3_IDE, PCI_DEVICE_PIIX3_ISA,
+            PCI_DEVICE_PIIX3_USB, PCI_DEVICE_PIIX_ACPI, PCI_HEADER_MULTIFUNCTION, PCI_PROG_IF_UHCI,
+            PCI_SUBCLASS_OTHER_BRIDGE, PCI_SUBCLASS_USB,
         };
         let mut m = Machine::new(64 * 1024);
         let mut bus = m.bus_mut();
@@ -1352,6 +1353,23 @@ mod tests {
         assert_eq!((usb_class >> 24) as u8, PCI_CLASS_SERIAL_BUS);
         assert_eq!((usb_class >> 16) as u8, PCI_SUBCLASS_USB);
         assert_eq!((usb_class >> 8) as u8, PCI_PROG_IF_UHCI);
+        bus.port_out_u32(
+            PCI_CONFIG_ADDRESS,
+            PciConfig::make_address(0, 1, 3, 0x00, true),
+        )
+        .unwrap();
+        assert_eq!(
+            bus.port_in_u32(PCI_CONFIG_DATA).unwrap(),
+            (u32::from(PCI_DEVICE_PIIX_ACPI) << 16) | 0x8086
+        );
+        bus.port_out_u32(
+            PCI_CONFIG_ADDRESS,
+            PciConfig::make_address(0, 1, 3, 0x08, true),
+        )
+        .unwrap();
+        let acpi_class = bus.port_in_u32(PCI_CONFIG_DATA).unwrap();
+        assert_eq!((acpi_class >> 24) as u8, PCI_CLASS_BRIDGE);
+        assert_eq!((acpi_class >> 16) as u8, PCI_SUBCLASS_OTHER_BRIDGE);
     }
 
     /// Spec: ATA/ATAPI + OSDev ATA PIO — MachineBus primary IDE IDENTIFY + READ/WRITE SECTORS.
