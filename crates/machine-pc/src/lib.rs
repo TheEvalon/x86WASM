@@ -289,6 +289,14 @@ impl Machine {
     pub fn sync_kbd_irq1(&mut self) {
         self.pic.set_irq_line(1, self.kbd.irq1_line());
     }
+
+    /// Whether the platform NMI delivery path is unmasked.
+    ///
+    /// Spec: IBM PC/AT — CMOS index port `0x70` bit7 = 1 disables NMI.
+    /// Stub: returns `!cmos.nmi_masked()` only; CPU `#NMI` inject is not wired.
+    pub fn nmi_delivery_enabled(&self) -> bool {
+        !self.cmos.nmi_masked()
+    }
 }
 
 struct MachineBus<'a> {
@@ -857,6 +865,27 @@ mod tests {
         }
         assert!(!m.cmos.nmi_disabled);
         assert_eq!(m.cmos.read_reg(0x10), 0x5A);
+    }
+
+    /// Spec: IBM PC/AT — port 0x70 bit7 masks NMI; Machine exposes delivery stub.
+    #[test]
+    fn machine_cmos_nmi_mask_gates_delivery_stub() {
+        let mut m = Machine::new(64 * 1024);
+        assert!(m.nmi_delivery_enabled());
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(CMOS_INDEX, 0x80 | 0x0B).unwrap();
+            assert_eq!(bus.port_in_u8(CMOS_INDEX).unwrap(), 0x80 | 0x0B);
+        }
+        assert!(m.cmos.nmi_masked());
+        assert!(!m.nmi_delivery_enabled());
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(CMOS_INDEX, 0x0B).unwrap();
+            assert_eq!(bus.port_in_u8(CMOS_INDEX).unwrap(), 0x0B);
+        }
+        assert!(!m.cmos.nmi_masked());
+        assert!(m.nmi_delivery_enabled());
     }
 
     /// Guest OUT/IN through interpreter → MachineBus programs PIC, PIT, CMOS.

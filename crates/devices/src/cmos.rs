@@ -11,15 +11,17 @@
 //!
 //! # Scope (this slice)
 //!
-//! 128-byte register bank with index/data port access, NMI-mask bit tracking,
-//! status B PIE/AIE/UIE subset, model `tick` that sets PF/UF (and AF on alarm
-//! match), IRQF → IRQ line for MachineBus → DualPic IRQ8, plus a simple
-//! `tick_second` update cycle (Status A UIP + BCD seconds cascade).
+//! 128-byte register bank with index/data port access, NMI-mask bit tracking
+//! (port `0x70` bit7), status B PIE/AIE/UIE subset, model `tick` that sets
+//! PF/UF (and AF on alarm match), IRQF → IRQ line for MachineBus → DualPic
+//! IRQ8, plus a simple `tick_second` update cycle (Status A UIP + BCD seconds
+//! cascade). Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
+//! `Machine::nmi_delivery_enabled` expose the latch for a future CPU NMI path.
 //!
 //! # Unsupported (explicit)
 //!
 //! - Host wall-clock sync / NTP-style host time
-//! - NMI signal delivery (bit7 on `0x70` is stored only)
+//! - CPU NMI pin / `#NMI` delivery (mask is stored + queried; no inject path yet)
 //! - Exact crystal divider / UIP pulse width (UIP is set for the duration of
 //!   the modeled update call, or until `end_update_for_test`)
 //! - Full calendar BCD (day/month/year/century); only sec→min→hour cascade
@@ -91,7 +93,10 @@ pub struct CmosRtc {
     pub ram: [u8; 128],
     /// Last index written (low 7 bits); bit7 tracks NMI disable separately.
     index: u8,
-    /// NMI-disable latch from index-port bit7 (not delivered as NMI).
+    /// NMI-disable latch from index-port bit7 (PC/AT: 1 = NMI masked).
+    ///
+    /// Spec: IBM PC/AT — writing `0x70` bit7 disables NMI; this stub stores the
+    /// bit and exposes it via [`Self::nmi_masked`]. CPU NMI delivery is not wired.
     pub nmi_disabled: bool,
 }
 
@@ -122,6 +127,13 @@ impl CmosRtc {
 
     pub fn selected_index(&self) -> u8 {
         self.index & INDEX_MASK
+    }
+
+    /// True when port `0x70` bit7 last wrote NMI disable.
+    ///
+    /// Spec: IBM PC/AT Technical Reference — CMOS index bit7 masks NMI.
+    pub fn nmi_masked(&self) -> bool {
+        self.nmi_disabled
     }
 
     pub fn read_reg(&self, index: u8) -> u8 {
@@ -387,13 +399,37 @@ mod tests {
         let mut c = CmosRtc::new();
         c.port_write(CMOS_INDEX, 1, 0x80 | 0x0B);
         assert!(c.nmi_disabled);
+        assert!(c.nmi_masked());
         assert_eq!(c.selected_index(), REG_STATUS_B);
         c.port_write(CMOS_DATA, 1, 0x06);
         assert_eq!(c.read_reg(REG_STATUS_B), 0x06);
 
         c.port_write(CMOS_INDEX, 1, 0x0B); // clear NMI disable
         assert!(!c.nmi_disabled);
+        assert!(!c.nmi_masked());
         assert_eq!(c.selected_index(), REG_STATUS_B);
+    }
+
+    /// Spec: IBM PC/AT — index port write/read preserves NMI bit with register index.
+    #[test]
+    fn index_port_rw_preserves_nmi_bit() {
+        let mut c = CmosRtc::new();
+        // Enable NMI mask + select 0x10.
+        c.port_write(CMOS_INDEX, 1, 0x80 | 0x10);
+        assert_eq!(c.port_read(CMOS_INDEX, 1) as u8, 0x80 | 0x10);
+        assert!(c.nmi_masked());
+        c.port_write(CMOS_DATA, 1, 0xA5);
+        assert_eq!(c.port_read(CMOS_DATA, 1) as u8, 0xA5);
+        // Re-select with NMI clear; data still at 0x10.
+        c.port_write(CMOS_INDEX, 1, 0x10);
+        assert_eq!(c.port_read(CMOS_INDEX, 1) as u8, 0x10);
+        assert!(!c.nmi_masked());
+        assert_eq!(c.port_read(CMOS_DATA, 1) as u8, 0xA5);
+        // NMI mask alone (index 0) then enable again with different index.
+        c.port_write(CMOS_INDEX, 1, 0x80);
+        assert_eq!(c.port_read(CMOS_INDEX, 1) as u8, 0x80);
+        assert!(c.nmi_masked());
+        assert_eq!(c.selected_index(), 0);
     }
 
     #[test]
