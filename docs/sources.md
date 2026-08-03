@@ -16,7 +16,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - Intel 82371AB (PIIX4) ACPI function public ID `8086:7113` (classic pc `00:01.3` config-space identity stub; class `0x0680`; no PM I/O / SMI)
 - ACPI specifications (for later machine/firmware work)
 - ATA / ATAPI specifications (IDENTIFY DEVICE `0xEC`, IDENTIFY PACKET DEVICE `0xA1`, READ SECTORS `0x20`, WRITE SECTORS `0x30`, task-file / status bits, error ABRT, LBA28 PIO, device-control nIEN / INTRQ)
-- OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6`, IDENTIFY/READ/WRITE polling and IRQ14 (status clears IRQ; alt status does not); ATAPI probe via `0xA1`
+- OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6` (IRQ14), secondary `0x170`–`0x177` / `0x376` (IRQ15), IDENTIFY/READ/WRITE polling (status clears IRQ; alt status does not); ATAPI probe via `0xA1`
 - PS/2 and 8042 controller references
 - Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
 - Intel 8254 Programmable Interval Timer datasheet

@@ -32,8 +32,11 @@
 //!
 //! - ATAPI PACKET command (`0xA0`) / CD-ROM media / slave ATAPI identify buffer
 //! - DMA IDE (UDMA/MDMA), WRITE DMA, LBA48
-//! - Slave drive, secondary channel (`0x170`), IRQ15
+//! - Slave drive on either channel
 //! - SeaBIOS / PCI IDE BAR remapping
+//!
+//! Secondary channel (`IdeSecondary`) remaps the same ATA PIO stub to ports
+//! `0x170`–`0x177` / `0x376` and ISA IRQ15 (see below).
 
 use crate::PortDevice;
 
@@ -55,6 +58,25 @@ pub const IDE_PRIMARY_DRIVE: u16 = 0x1F6;
 pub const IDE_PRIMARY_STATUS: u16 = 0x1F7;
 /// Alternate status (R) / Device control (W).
 pub const IDE_PRIMARY_CTRL: u16 = 0x3F6;
+
+/// Secondary ATA data port (16-bit PIO).
+pub const IDE_SECONDARY_DATA: u16 = 0x170;
+/// Secondary error (R) / Features (W).
+pub const IDE_SECONDARY_ERROR: u16 = 0x171;
+/// Secondary sector count.
+pub const IDE_SECONDARY_SECCOUNT: u16 = 0x172;
+/// Secondary LBA 7:0.
+pub const IDE_SECONDARY_LBA_LO: u16 = 0x173;
+/// Secondary LBA 15:8.
+pub const IDE_SECONDARY_LBA_MID: u16 = 0x174;
+/// Secondary LBA 23:16.
+pub const IDE_SECONDARY_LBA_HI: u16 = 0x175;
+/// Secondary drive/head select.
+pub const IDE_SECONDARY_DRIVE: u16 = 0x176;
+/// Secondary status (R) / Command (W).
+pub const IDE_SECONDARY_STATUS: u16 = 0x177;
+/// Secondary alternate status (R) / Device control (W).
+pub const IDE_SECONDARY_CTRL: u16 = 0x376;
 
 /// Status: busy.
 pub const ATA_SR_BSY: u8 = 0x80;
@@ -616,6 +638,83 @@ impl PortDevice for IdePrimary {
     }
 }
 
+/// Secondary ATA IDE channel — thin port remap of [`IdePrimary`] to `0x170`/`0x376`.
+///
+/// # Spec refs
+///
+/// - OSDev ATA PIO Mode — secondary command block `0x170`–`0x177`, control `0x376`;
+///   secondary channel → ISA IRQ15.
+/// - ATA / ATAPI — same IDENTIFY / READ / WRITE PIO semantics as primary.
+/// - Intel 8259A — DualPic IR15 (slave IR7) via MachineBus.
+///
+/// # Scope
+///
+/// - Master only; IDENTIFY / READ / WRITE / 0xA1 ABRT via inner [`IdePrimary`]
+/// - IRQ15 when INTRQ ∧ ¬nIEN (`irq_line`)
+///
+/// # Unsupported
+///
+/// - Slave drive, DMA, LBA48, PACKET media, PCI BAR remap
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct IdeSecondary {
+    /// Shared ATA PIO engine (ports remapped in [`PortDevice`]).
+    pub inner: IdePrimary,
+}
+
+impl IdeSecondary {
+    /// Empty secondary channel (no drive) — status reads `0`.
+    pub fn new() -> Self {
+        Self {
+            inner: IdePrimary::new(),
+        }
+    }
+
+    pub fn with_image(image: Vec<u8>) -> Self {
+        Self {
+            inner: IdePrimary::with_image(image),
+        }
+    }
+
+    pub fn attach_image(&mut self, image: Vec<u8>) {
+        self.inner.attach_image(image);
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// True if this device owns the secondary I/O port.
+    pub fn owns_port(port: u16) -> bool {
+        matches!(port, 0x170..=0x177 | IDE_SECONDARY_CTRL)
+    }
+
+    /// ISA IRQ15 line level (INTRQ ∧ ¬nIEN).
+    ///
+    /// Spec: ATA device control nIEN; OSDev ATA PIO — secondary → IRQ15.
+    pub fn irq_line(&self) -> bool {
+        self.inner.irq_line()
+    }
+
+    /// Map secondary ports onto the primary register file used by [`IdePrimary`].
+    fn map_port(port: u16) -> u16 {
+        match port {
+            0x170..=0x177 => port - IDE_SECONDARY_DATA + IDE_PRIMARY_DATA,
+            IDE_SECONDARY_CTRL => IDE_PRIMARY_CTRL,
+            _ => port,
+        }
+    }
+}
+
+impl PortDevice for IdeSecondary {
+    fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        self.inner.port_read(Self::map_port(port), size)
+    }
+
+    fn port_write(&mut self, port: u16, size: u8, value: u32) {
+        self.inner.port_write(Self::map_port(port), size, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1118,61 @@ mod tests {
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY_PACKET));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    #[test]
+    fn secondary_absent_drive_status_is_zero() {
+        // Spec: OSDev ATA PIO — secondary missing drive → status 0.
+        let mut ide = IdeSecondary::new();
+        assert!(IdeSecondary::owns_port(IDE_SECONDARY_STATUS));
+        assert!(IdeSecondary::owns_port(IDE_SECONDARY_CTRL));
+        assert!(!IdeSecondary::owns_port(IDE_PRIMARY_STATUS));
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
+    }
+
+    #[test]
+    fn secondary_identify_and_read_sectors() {
+        // Spec: ATA IDENTIFY + READ on secondary ports 0x170–0x177.
+        let mut sector = vec![0u8; SECTOR_SIZE];
+        sector[0] = 0x11;
+        sector[1] = 0x22;
+        let mut ide = IdeSecondary::with_image(sector);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0); // clear nIEN
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        // Alt status does not clear IRQ15.
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1); // ack IRQ
+        assert!(!ide.irq_line());
+        for _ in 0..256 {
+            let _ = ide.port_read(IDE_SECONDARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_SECONDARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_SECONDARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_SECONDARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_SECONDARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0x2211);
+    }
+
+    #[test]
+    fn secondary_alt_status_does_not_clear_irq() {
+        // Spec: OSDev ATA PIO — alt status at 0x376 does not clear IRQ15.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_SECONDARY_CTRL, 1);
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1);
+        assert!(!ide.irq_line());
     }
 }
