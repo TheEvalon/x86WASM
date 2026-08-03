@@ -12,23 +12,25 @@
 //!   reads return `0xFFFFFFFF`.
 //! - Intel 440FX (i440FX) host bridge identity (`vendor 0x8086`, `device 0x1237`).
 //! - Intel 82371SB (PIIX3) PCI function IDs used as classic pc-i440fx-compatible
-//!   stubs: ISA bridge `8086:7000`, IDE `8086:7010` at `00:01.0` / `00:01.1`
-//!   (behavior from public device IDs / PCI class codes — not copied source).
+//!   stubs: ISA bridge `8086:7000`, IDE `8086:7010`, USB UHCI `8086:7020` at
+//!   `00:01.0` / `00:01.1` / `00:01.2` (behavior from public device IDs / PCI
+//!   class codes — not copied source).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.2 / §21 PCI.
 //!
 //! # Scope (this slice)
 //!
 //! - Type 1 address latch (enable / bus / device / function / register).
 //! - Host bridge at `00:00.0` with Intel-style vendor/device/class/header type 0.
-//! - PIIX3-style stubs: `00:01.0` ISA bridge (multi-function), `00:01.1` IDE.
+//! - PIIX3-style stubs: `00:01.0` ISA bridge (multi-function), `00:01.1` IDE,
+//!   `00:01.2` USB UHCI identity only.
 //! - Absent devices: `0xFFFFFFFF` when enable is set.
 //! - Enable bit clear: data-port reads return `0xFFFFFFFF` (open-bus style).
 //! - Byte/word/dword access via `0xCFC` + offset.
 //!
 //! # Unsupported (explicit)
 //!
-//! - BAR MMIO decode, bus mastering, INTx routing tables
-//! - USB / ACPI / PMI PIIX functions beyond identity stubs
+//! - BAR MMIO/IO decode, bus mastering, INTx routing tables
+//! - USB host controller (UHCI frame list / ports / IRQ), ACPI / PMI PIIX funcs
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
 
@@ -47,6 +49,8 @@ pub const PCI_DEVICE_I440FX: u16 = 0x1237;
 pub const PCI_DEVICE_PIIX3_ISA: u16 = 0x7000;
 /// PIIX3 IDE controller device ID (82371SB).
 pub const PCI_DEVICE_PIIX3_IDE: u16 = 0x7010;
+/// PIIX3 USB UHCI controller device ID (82371SB).
+pub const PCI_DEVICE_PIIX3_USB: u16 = 0x7020;
 /// PCI class: Bridge device.
 pub const PCI_CLASS_BRIDGE: u8 = 0x06;
 /// PCI subclass: Host/PCI bridge.
@@ -57,6 +61,12 @@ pub const PCI_SUBCLASS_ISA_BRIDGE: u8 = 0x01;
 pub const PCI_CLASS_STORAGE: u8 = 0x01;
 /// PCI subclass: IDE controller.
 pub const PCI_SUBCLASS_IDE: u8 = 0x01;
+/// PCI class: Serial bus controller.
+pub const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
+/// PCI subclass: USB controller.
+pub const PCI_SUBCLASS_USB: u8 = 0x03;
+/// UHCI programming interface (PCI class code prog IF).
+pub const PCI_PROG_IF_UHCI: u8 = 0x00;
 /// Header type multi-function bit.
 pub const PCI_HEADER_MULTIFUNCTION: u8 = 0x80;
 
@@ -85,6 +95,8 @@ pub struct PciConfig {
     piix_isa: [u8; 256],
     /// PIIX3 IDE at `00:01.1`.
     piix_ide: [u8; 256],
+    /// PIIX3 USB UHCI at `00:01.2` (identity stub only).
+    piix_usb: [u8; 256],
 }
 
 impl Default for PciConfig {
@@ -100,6 +112,7 @@ impl PciConfig {
             host_bridge: Self::init_host_bridge(),
             piix_isa: Self::init_piix_isa(),
             piix_ide: Self::init_piix_ide(),
+            piix_usb: Self::init_piix_usb(),
         }
     }
 
@@ -160,6 +173,25 @@ impl PciConfig {
         cfg
     }
 
+    fn init_piix_usb() -> [u8; 256] {
+        let mut cfg = [0u8; 256];
+        // Spec: PCI class serial-bus / USB (0x0C03); prog IF 0x00 = UHCI.
+        // Public PIIX3 USB function ID 8086:7020 — config identity only.
+        Self::write_id(
+            &mut cfg,
+            PciHeaderId {
+                vendor: PCI_VENDOR_INTEL,
+                device: PCI_DEVICE_PIIX3_USB,
+                revision: 0x00,
+                prog_if: PCI_PROG_IF_UHCI,
+                subclass: PCI_SUBCLASS_USB,
+                class: PCI_CLASS_SERIAL_BUS,
+                header_type: 0x00,
+            },
+        );
+        cfg
+    }
+
     fn write_id(cfg: &mut [u8; 256], id: PciHeaderId) {
         cfg[0] = (id.vendor & 0xFF) as u8;
         cfg[1] = (id.vendor >> 8) as u8;
@@ -210,6 +242,7 @@ impl PciConfig {
             (0, 0) => Some(&self.host_bridge),
             (1, 0) => Some(&self.piix_isa),
             (1, 1) => Some(&self.piix_ide),
+            (1, 2) => Some(&self.piix_usb),
             _ => None,
         }
     }
@@ -222,6 +255,7 @@ impl PciConfig {
             (0, 0) => Some(&mut self.host_bridge),
             (1, 0) => Some(&mut self.piix_isa),
             (1, 1) => Some(&mut self.piix_ide),
+            (1, 2) => Some(&mut self.piix_usb),
             _ => None,
         }
     }
@@ -412,11 +446,11 @@ mod tests {
             PciConfig::make_address(0, 0x1F, 0, 0x00, true),
         );
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0xFFFF_FFFF);
-        // 00:01.2 (PIIX USB) not stubbed yet.
+        // 00:01.3 (PIIX ACPI) not stubbed yet.
         pci.port_write(
             PCI_CONFIG_ADDRESS,
             4,
-            PciConfig::make_address(0, 1, 2, 0x00, true),
+            PciConfig::make_address(0, 1, 3, 0x00, true),
         );
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0xFFFF_FFFF);
     }
@@ -553,5 +587,27 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    #[test]
+    fn piix_usb_identity_at_00_01_2() {
+        // Spec: PCI header + public PIIX3 USB ID 8086:7020; class USB UHCI 0x0C0300.
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, 0x00, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7020_8086);
+
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, 0x08, true),
+        );
+        let class_dword = pci.port_read(PCI_CONFIG_DATA, 4);
+        assert_eq!((class_dword >> 24) as u8, PCI_CLASS_SERIAL_BUS);
+        assert_eq!((class_dword >> 16) as u8, PCI_SUBCLASS_USB);
+        assert_eq!((class_dword >> 8) as u8, PCI_PROG_IF_UHCI);
     }
 }
