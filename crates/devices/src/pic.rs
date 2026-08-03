@@ -1,34 +1,31 @@
-//! Dual Intel 8259A Programmable Interrupt Controllers — ICW1–ICW4 only.
+//! Dual Intel 8259A Programmable Interrupt Controllers — ICW + OCW runtime.
 //!
 //! Classic PC ports: master `0x20`/`0x21`, slave `0xA0`/`0xA1`, cascade on IRQ2.
 //!
 //! # Spec refs
 //!
-//! - Intel 8259A Programmable Interrupt Controller datasheet — Initialization
-//!   Command Words ICW1–ICW4 programming sequence (A0/D4 decode; SNGL; IC4;
-//!   master/slave ICW3; µPM / 8086 mode in ICW4).
+//! - Intel 8259A Programmable Interrupt Controller datasheet — ICW1–ICW4;
+//!   OCW1 (IMR); OCW2 non-specific / specific EOI; OCW3 IRR/ISR read select;
+//!   IRR/ISR; fully nested priority; cascade EOI (master + slave).
 //! - Classic IBM PC/AT: master at `0x20`/`0x21`, slave at `0xA0`/`0xA1`, slave
 //!   cascaded on master IR2.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 / §21 / §23.3.
 //!
 //! # Scope (this slice)
 //!
-//! Accepts ICW1–ICW4 initialization for single and cascaded configurations.
-//! Records vector base (ICW2), cascade wiring (ICW3), and ICW4 8086-mode bit.
+//! - ICW1–ICW4 initialization (single and cascaded)
+//! - OCW1 IMR read/write on data port after init
+//! - OCW2 non-specific EOI (`R=0,SL=0,EOI=1`) and specific EOI (`R=0,SL=1,EOI=1`)
+//! - OCW3 read-register select (`RR`/`RIS`) for IRR/ISR on command-port reads
+//! - Edge-triggered IR line assert, IRR→ISR on acknowledge, vector selection
+//! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
 //!
 //! # Unsupported (explicit)
 //!
-//! - OCW1–OCW3 (IMR, EOI, rotate, IRR/ISR read select)
-//! - IRQ assertion, priority, Auto-EOI runtime delivery
-//! - `poll_external_irq` / PIC→CPU delivery (port decode is owned by `machine-pc`)
-//!
-//! # Invalid / incomplete init (documented behavior)
-//!
-//! - Command-port writes with D4=0 are OCW2/OCW3: **ignored** (no OCW state).
-//! - Data-port writes outside an active ICW sequence are OCW1: **ignored**.
-//! - Incomplete sequences leave `initialized == false`; prior completed state is
-//!   cleared when a new ICW1 restarts the sequence.
-//! - A new ICW1 (A0=0, D4=1) always restarts initialization on that chip.
+//! - Auto-EOI (ICW4.AEOI), rotate modes (OCW2 `R=1`), special mask mode
+//! - OCW3 poll command (`P=1`)
+//! - Level-triggered delivery beyond storing ICW1.LTIM (runtime uses edge model)
+//! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
 use crate::PortDevice;
 
@@ -50,13 +47,32 @@ const ICW1_LTIM: u8 = 1 << 3;
 /// ICW4 bit0: 8086/8088 mode (µPM).
 const ICW4_UPM: u8 = 1 << 0;
 
+/// OCW2/OCW3: D4 must be 0 (else ICW1).
+/// OCW2: D3=0; OCW3: D3=1 (datasheet Operation Command Word format).
+const OCW_D3: u8 = 1 << 3;
+/// OCW2 bits.
+const OCW2_EOI: u8 = 1 << 5;
+const OCW2_SL: u8 = 1 << 6;
+const OCW2_R: u8 = 1 << 7;
+/// OCW3 bits.
+const OCW3_RIS: u8 = 1 << 0;
+const OCW3_RR: u8 = 1 << 1;
+const OCW3_P: u8 = 1 << 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InitPhase {
-    /// Not in an ICW sequence (ready for OCW — ignored here — or a new ICW1).
+    /// Not in an ICW sequence (ready for OCW or a new ICW1).
     Idle,
     ExpectIcw2,
     ExpectIcw3,
     ExpectIcw4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadReg {
+    /// Default after init (Intel 8259A: IRR selected until OCW3 changes it).
+    Irr,
+    Isr,
 }
 
 /// One 8259A controller (master or slave role for ICW3 interpretation).
@@ -71,7 +87,7 @@ pub struct Pic8259 {
     pub expect_icw4: bool,
     /// ICW1.SNGL — single (no cascade / no ICW3).
     pub single: bool,
-    /// ICW1.LTIM — level-triggered when true.
+    /// ICW1.LTIM — level-triggered when true (stored; runtime uses edge model).
     pub level_triggered: bool,
     /// Raw ICW1 byte from the last started sequence (0 after reset).
     pub icw1: u8,
@@ -83,6 +99,16 @@ pub struct Pic8259 {
     pub icw4: u8,
     /// ICW4.µPM — 8086/8088 mode.
     pub mode_8086: bool,
+    /// Interrupt Mask Register (OCW1). Bit=1 masks that IR. Reset: all masked.
+    pub imr: u8,
+    /// Interrupt Request Register.
+    pub irr: u8,
+    /// In-Service Register.
+    pub isr: u8,
+    /// Latched IR line levels (bit N = IRN high) for edge detection.
+    ir_level: u8,
+    /// OCW3 read-register selection for command-port reads.
+    read_reg: ReadReg,
 }
 
 impl Pic8259 {
@@ -107,6 +133,11 @@ impl Pic8259 {
             icw3: 0,
             icw4: 0,
             mode_8086: false,
+            imr: 0xFF,
+            irr: 0,
+            isr: 0,
+            ir_level: 0,
+            read_reg: ReadReg::Irr,
         }
     }
 
@@ -142,12 +173,70 @@ impl Pic8259 {
         Some((self.vector_base & 0xF8) | (irq & 0x07))
     }
 
-    fn write_cmd(&mut self, value: u8) {
-        if value & ICW1_D4 == 0 {
-            // OCW2 / OCW3 — out of scope for this slice.
+    /// Drive IR`irq` (0–7). Edge-triggered: low→high sets IRR (Intel 8259A).
+    pub fn set_irq_line(&mut self, irq: u8, high: bool) {
+        if irq > 7 {
             return;
         }
-        self.begin_icw1(value);
+        let bit = 1u8 << irq;
+        let was_high = self.ir_level & bit != 0;
+        if high {
+            self.ir_level |= bit;
+            if !was_high {
+                // Edge sense: rising edge latches IRR (datasheet ICW1 / edge mode).
+                self.irr |= bit;
+            }
+        } else {
+            self.ir_level &= !bit;
+        }
+    }
+
+    /// Highest-priority unmasked IRR request not blocked by fully-nested ISR.
+    /// Spec: Intel 8259A fully nested mode — IR0 highest … IR7 lowest.
+    fn highest_priority_request(&self) -> Option<u8> {
+        if !self.initialized {
+            return None;
+        }
+        let limit = if self.isr == 0 {
+            8u8
+        } else {
+            // Only IR lines strictly higher priority than the top ISR bit.
+            self.isr.trailing_zeros() as u8
+        };
+        for ir in 0..limit {
+            let bit = 1u8 << ir;
+            if self.irr & bit != 0 && self.imr & bit == 0 {
+                return Some(ir);
+            }
+        }
+        None
+    }
+
+    /// True if this chip would assert INT (unmasked request not nested-blocked).
+    pub fn int_pending(&self) -> bool {
+        self.highest_priority_request().is_some()
+    }
+
+    fn ack_ir(&mut self, ir: u8) {
+        let bit = 1u8 << ir;
+        self.irr &= !bit;
+        self.isr |= bit;
+    }
+
+    fn write_cmd(&mut self, value: u8) {
+        if value & ICW1_D4 != 0 {
+            self.begin_icw1(value);
+            return;
+        }
+        // OCW only after init sequence is idle (incomplete ICW ignores OCW).
+        if self.phase != InitPhase::Idle {
+            return;
+        }
+        if value & OCW_D3 == 0 {
+            self.write_ocw2(value);
+        } else {
+            self.write_ocw3(value);
+        }
     }
 
     fn begin_icw1(&mut self, value: u8) {
@@ -160,13 +249,19 @@ impl Pic8259 {
         self.icw3 = 0;
         self.icw4 = 0;
         self.mode_8086 = false;
+        // Datasheet ICW1: edge sense circuit is reset; clear request state.
+        self.irr = 0;
+        self.isr = 0;
+        self.ir_level = 0;
+        self.read_reg = ReadReg::Irr;
         self.phase = InitPhase::ExpectIcw2;
     }
 
     fn write_data(&mut self, value: u8) {
         match self.phase {
             InitPhase::Idle => {
-                // OCW1 (IMR) — out of scope; ignore.
+                // OCW1 — IMR (Intel 8259A OCW1).
+                self.imr = value;
             }
             InitPhase::ExpectIcw2 => {
                 self.vector_base = value;
@@ -197,6 +292,55 @@ impl Pic8259 {
     fn finish_init(&mut self) {
         self.phase = InitPhase::Idle;
         self.initialized = true;
+        self.read_reg = ReadReg::Irr;
+    }
+
+    /// OCW2: non-specific / specific EOI only (`R=0`). Rotate unsupported.
+    fn write_ocw2(&mut self, value: u8) {
+        if value & OCW2_R != 0 {
+            // Rotate / set-priority forms — unsupported this slice.
+            return;
+        }
+        if value & OCW2_EOI == 0 {
+            return;
+        }
+        if value & OCW2_SL != 0 {
+            // Specific EOI: clear ISR bit L2–L0.
+            let level = value & 0x07;
+            self.isr &= !(1u8 << level);
+        } else {
+            // Non-specific EOI: clear highest-priority (lowest index) ISR bit.
+            if self.isr != 0 {
+                let level = self.isr.trailing_zeros() as u8;
+                self.isr &= !(1u8 << level);
+            }
+        }
+    }
+
+    /// OCW3: IRR/ISR read select. Poll / special-mask unsupported.
+    fn write_ocw3(&mut self, value: u8) {
+        if value & OCW3_P != 0 {
+            // Poll command — unsupported.
+            return;
+        }
+        if value & OCW3_RR != 0 {
+            self.read_reg = if value & OCW3_RIS != 0 {
+                ReadReg::Isr
+            } else {
+                ReadReg::Irr
+            };
+        }
+    }
+
+    fn read_cmd(&self) -> u8 {
+        match self.read_reg {
+            ReadReg::Irr => self.irr,
+            ReadReg::Isr => self.isr,
+        }
+    }
+
+    fn read_data(&self) -> u8 {
+        self.imr
     }
 }
 
@@ -220,12 +364,76 @@ impl DualPic {
         self.slave.reset();
     }
 
+    /// Assert/deassert a global ISA IRQ line (0–15). IRQ8–15 → slave IR0–7.
+    pub fn set_irq_line(&mut self, irq: u8, high: bool) {
+        if irq < 8 {
+            self.master.set_irq_line(irq, high);
+        } else if irq < 16 {
+            self.slave.set_irq_line(irq - 8, high);
+            self.sync_cascade();
+        }
+    }
+
+    /// Drive master's cascade IR from slave INT (PC AT: slave on IR2).
+    ///
+    /// Spec: Intel 8259A cascade — slave INT feeds the master's cascaded IR.
+    fn sync_cascade(&mut self) {
+        if !self.master.initialized || self.master.single {
+            return;
+        }
+        if !self.slave.initialized || self.slave.single {
+            return;
+        }
+        let cascade_ir = self.slave.slave_id();
+        if self.master.slave_ir_mask() & (1 << cascade_ir) == 0 {
+            return;
+        }
+        // Slave INT high when slave has a deliverable request (fully nested).
+        let slave_int = self.slave.int_pending();
+        self.master.set_irq_line(cascade_ir, slave_int);
+    }
+
+    /// INTA-style acknowledge: move IRR→ISR and return 8086 vector, or `None`.
+    ///
+    /// Spec: Intel 8259A interrupt sequence / cascade — slave vector when master
+    /// selects a cascaded IR; EOI must later clear both slave and master ISR bits.
+    pub fn acknowledge(&mut self) -> Option<u8> {
+        self.sync_cascade();
+        let ir = self.master.highest_priority_request()?;
+        let bit = 1u8 << ir;
+        if !self.master.single && (self.master.slave_ir_mask() & bit) != 0 {
+            let slave_ir = self.slave.highest_priority_request()?;
+            self.slave.ack_ir(slave_ir);
+            self.master.ack_ir(ir);
+            let vec = self.slave.irq_vector(slave_ir);
+            self.sync_cascade();
+            return vec;
+        }
+        self.master.ack_ir(ir);
+        self.master.irq_vector(ir)
+    }
+
+    /// Vector for `Bus::poll_external_irq` (acknowledge on poll).
+    pub fn poll_irq(&mut self) -> Option<u8> {
+        self.acknowledge()
+    }
+
     fn chip_mut(&mut self, port: u16) -> Option<(&mut Pic8259, bool)> {
         match port {
             PIC_MASTER_CMD => Some((&mut self.master, false)),
             PIC_MASTER_DATA => Some((&mut self.master, true)),
             PIC_SLAVE_CMD => Some((&mut self.slave, false)),
             PIC_SLAVE_DATA => Some((&mut self.slave, true)),
+            _ => None,
+        }
+    }
+
+    fn chip(&self, port: u16) -> Option<(&Pic8259, bool)> {
+        match port {
+            PIC_MASTER_CMD => Some((&self.master, false)),
+            PIC_MASTER_DATA => Some((&self.master, true)),
+            PIC_SLAVE_CMD => Some((&self.slave, false)),
+            PIC_SLAVE_DATA => Some((&self.slave, true)),
             _ => None,
         }
     }
@@ -239,15 +447,14 @@ impl Default for DualPic {
 
 impl PortDevice for DualPic {
     fn port_read(&mut self, port: u16, _size: u8) -> u32 {
-        // IRR/ISR/IMR reads require OCW3/OCW1 — unsupported; open-bus style.
-        if matches!(
-            port,
-            PIC_MASTER_CMD | PIC_MASTER_DATA | PIC_SLAVE_CMD | PIC_SLAVE_DATA
-        ) {
-            0xFF
+        let Some((chip, is_data)) = self.chip(port) else {
+            return 0xFFFF_FFFF;
+        };
+        u32::from(if is_data {
+            chip.read_data()
         } else {
-            0xFFFF_FFFF
-        }
+            chip.read_cmd()
+        })
     }
 
     fn port_write(&mut self, port: u16, _size: u8, value: u32) {
@@ -260,12 +467,27 @@ impl PortDevice for DualPic {
         } else {
             chip.write_cmd(v);
         }
+        // Cascade line may change after OCW1 unmask / EOI on slave.
+        self.sync_cascade();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_at_cascade(pic: &mut DualPic) {
+        // Master: ICW1=0x11, ICW2=0x08, ICW3=0x04, ICW4=0x01
+        pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        // Slave: ICW1=0x11, ICW2=0x70, ICW3=0x02, ICW4=0x01
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+    }
 
     /// Spec: reset leaves both PICs uninitialized (Intel 8259A; PC cold start).
     #[test]
@@ -283,9 +505,11 @@ mod tests {
         assert!(!pic.slave.mode_8086);
         assert!(pic.master.is_master);
         assert!(!pic.slave.is_master);
+        assert_eq!(pic.master.imr, 0xFF);
+        assert_eq!(pic.master.irr, 0);
+        assert_eq!(pic.master.isr, 0);
 
         let mut pic2 = DualPic::new();
-        // Pollute then reset.
         pic2.port_write(PIC_MASTER_CMD, 1, 0x11);
         pic2.reset();
         assert_eq!(pic2, DualPic::new());
@@ -295,12 +519,11 @@ mod tests {
     #[test]
     fn single_mode_icw_sequence() {
         let mut pic = DualPic::new();
-        // ICW1: D4=1, SNGL=1, IC4=1 → 0x13
         pic.port_write(PIC_MASTER_CMD, 1, 0x13);
         assert!(!pic.master.initialized);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x08); // ICW2
+        pic.port_write(PIC_MASTER_DATA, 1, 0x08);
         assert!(!pic.master.initialized);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x01); // ICW4 8086
+        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
         assert!(pic.master.initialized);
         assert!(pic.master.single);
         assert!(pic.master.expect_icw4);
@@ -316,12 +539,7 @@ mod tests {
     #[test]
     fn cascaded_master_slave_with_vector_offsets() {
         let mut pic = DualPic::new();
-
-        // Master: ICW1=0x11 (cascade, need ICW4), ICW2=0x08, ICW3=0x04, ICW4=0x01
-        pic.port_write(PIC_MASTER_CMD, 1, 0x11);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x08);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x04);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        init_at_cascade(&mut pic);
         assert!(pic.master.initialized);
         assert!(!pic.master.single);
         assert_eq!(pic.master.vector_base, 0x08);
@@ -329,12 +547,6 @@ mod tests {
         assert!(pic.master.mode_8086);
         assert_eq!(pic.master.irq_vector(0), Some(0x08));
         assert_eq!(pic.master.irq_vector(2), Some(0x0A));
-
-        // Slave: ICW1=0x11, ICW2=0x70, ICW3=0x02, ICW4=0x01
-        pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
-        pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
-        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
-        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         assert!(pic.slave.initialized);
         assert_eq!(pic.slave.vector_base, 0x70);
         assert_eq!(pic.slave.slave_id(), 2);
@@ -347,38 +559,36 @@ mod tests {
     #[test]
     fn vector_base_masks_low_bits() {
         let mut chip = Pic8259::new_master();
-        chip.write_cmd(0x13); // single + ICW4
-        chip.write_data(0x28 | 0x03); // base 0x28 with junk in 2:0
+        chip.write_cmd(0x13);
+        chip.write_data(0x28 | 0x03);
         chip.write_data(0x01);
         assert!(chip.initialized);
         assert_eq!(chip.irq_vector(0), Some(0x28));
         assert_eq!(chip.irq_vector(5), Some(0x2D));
     }
 
-    /// Incomplete init stays uninitialized; OCW-looking writes do not complete it.
+    /// Incomplete init stays uninitialized; OCW during ICW must not complete it.
     #[test]
     fn invalid_incomplete_init_stays_uninitialized() {
         let mut pic = DualPic::new();
-
-        // Start ICW1 cascade+ICW4 but stop after ICW2.
         pic.port_write(PIC_MASTER_CMD, 1, 0x11);
         pic.port_write(PIC_MASTER_DATA, 1, 0x20);
         assert!(!pic.master.initialized);
         assert_eq!(pic.master.phase, InitPhase::ExpectIcw3);
 
         // OCW2-style write on command port (D4=0) must not finish init.
-        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // nonspecific EOI pattern
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
         assert!(!pic.master.initialized);
         assert_eq!(pic.master.phase, InitPhase::ExpectIcw3);
 
-        // Fresh DualPic: data write before ICW1 is OCW1 → ignored.
         let mut pic2 = DualPic::new();
         pic2.port_write(PIC_MASTER_DATA, 1, 0xFF);
         assert!(!pic2.master.initialized);
         assert_eq!(pic2.master.phase, InitPhase::Idle);
+        // Before init, OCW1 still updates IMR (Idle phase).
+        assert_eq!(pic2.master.imr, 0xFF);
 
-        // New ICW1 restarts and clears prior partial state.
-        pic.port_write(PIC_MASTER_CMD, 1, 0x13); // restart as single+ICW4
+        pic.port_write(PIC_MASTER_CMD, 1, 0x13);
         assert!(!pic.master.initialized);
         assert_eq!(pic.master.vector_base, 0);
         assert_eq!(pic.master.phase, InitPhase::ExpectIcw2);
@@ -388,44 +598,26 @@ mod tests {
     #[test]
     fn master_slave_icw3_wiring() {
         let mut pic = DualPic::new();
-        for (cmd, data, icw2, icw3) in [
-            (PIC_MASTER_CMD, PIC_MASTER_DATA, 0x20u8, 0x04u8),
-            (PIC_SLAVE_CMD, PIC_SLAVE_DATA, 0x28u8, 0x02u8),
-        ] {
-            pic.port_write(cmd, 1, 0x11);
-            pic.port_write(data, 1, u32::from(icw2));
-            pic.port_write(data, 1, u32::from(icw3));
-            pic.port_write(data, 1, 0x01);
-        }
+        init_at_cascade(&mut pic);
         assert_eq!(pic.master.slave_ir_mask(), 1 << 2);
         assert_eq!(pic.slave.slave_id(), 2);
-        // Classic PC: slave identity matches master's IR2 bit.
         assert_ne!(pic.master.slave_ir_mask() & (1 << pic.slave.slave_id()), 0);
     }
 
-    /// Clone / PartialEq round-trip of architectural ICW state.
+    /// Clone / PartialEq round-trip of architectural state.
     #[test]
     fn state_clone_equality_round_trip() {
         let mut pic = DualPic::new();
-        pic.port_write(PIC_MASTER_CMD, 1, 0x11);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x20);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x04);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
-        pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
-        pic.port_write(PIC_SLAVE_DATA, 1, 0x28);
-        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
-        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // OCW1 unmask all
 
         let cloned = pic.clone();
         assert_eq!(pic, cloned);
         assert!(cloned.master.initialized);
         assert!(cloned.slave.initialized);
-        assert_eq!(cloned.master.vector_base, 0x20);
-        assert_eq!(cloned.slave.vector_base, 0x28);
-        assert_eq!(cloned.master.icw3, 0x04);
-        assert_eq!(cloned.slave.icw3, 0x02);
-        assert!(cloned.master.mode_8086);
-        assert!(cloned.slave.mode_8086);
+        assert_eq!(cloned.master.vector_base, 0x08);
+        assert_eq!(cloned.slave.vector_base, 0x70);
+        assert_eq!(cloned.master.imr, 0x00);
     }
 
     #[test]
@@ -434,14 +626,13 @@ mod tests {
         pic.port_write(0x3F8, 1, 0x11);
         assert!(!pic.master.initialized);
         assert_eq!(pic.port_read(0x3F8, 1), 0xFFFF_FFFF);
-        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0xFF);
     }
 
     /// Cascade without ICW4 (IC4=0) completes after ICW3.
     #[test]
     fn cascade_without_icw4_completes_after_icw3() {
         let mut chip = Pic8259::new_master();
-        chip.write_cmd(0x10); // D4=1, SNGL=0, IC4=0
+        chip.write_cmd(0x10);
         chip.write_data(0x08);
         assert!(!chip.initialized);
         chip.write_data(0x04);
@@ -449,5 +640,116 @@ mod tests {
         assert!(!chip.expect_icw4);
         assert!(!chip.mode_8086);
         assert_eq!(chip.icw4, 0);
+    }
+
+    /// Spec: OCW1 programs IMR; data-port read returns IMR (Intel 8259A OCW1).
+    #[test]
+    fn ocw1_imr_read_write() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        assert_eq!(pic.port_read(PIC_MASTER_DATA, 1), 0xFF);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
+        assert_eq!(pic.master.imr, 0xFE);
+        assert_eq!(pic.port_read(PIC_MASTER_DATA, 1), 0xFE);
+    }
+
+    /// Spec: OCW3 RR/RIS selects IRR vs ISR on next command-port reads.
+    #[test]
+    fn ocw3_irr_isr_read_select() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.master.irr, 0x01);
+        // Default after ICW: IRR.
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x01);
+        // OCW3: RR=1, RIS=1 → ISR (0x0B)
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0B);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x00);
+        let v = pic.poll_irq().unwrap();
+        assert_eq!(v, 0x08);
+        assert_eq!(pic.master.isr, 0x01);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x01);
+        // OCW3: RR=1, RIS=0 → IRR (0x0A)
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0A);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x00);
+    }
+
+    /// Spec: edge assert + unmask → acknowledge returns vector; nonspecific EOI clears ISR.
+    #[test]
+    fn irq0_acknowledge_and_nonspecific_eoi() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0 only
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.irr, 0);
+        assert_eq!(pic.master.isr, 0x01);
+        // Second poll: still in service, no new edge → None
+        assert_eq!(pic.poll_irq(), None);
+        // Non-specific EOI (OCW2 0x20)
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.master.isr, 0);
+        // Need a new edge for another delivery
+        pic.set_irq_line(0, false);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+    }
+
+    /// Spec: specific EOI clears the named ISR bit (OCW2 EOI=1, SL=1).
+    #[test]
+    fn specific_eoi_clears_named_isr_bit() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+        assert_eq!(pic.master.isr, 1 << 3);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x60 | 3); // specific EOI IR3
+        assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: masked IR does not deliver (OCW1 / IMR).
+    #[test]
+    fn masked_irq_does_not_deliver() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        // IMR still 0xFF
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.master.irr, 0x01);
+        assert_eq!(pic.poll_irq(), None);
+    }
+
+    /// Spec: cascade — slave IRQ9 (IR1) → vector base|1; EOI slave then master.
+    #[test]
+    fn cascade_slave_irq_vector_and_dual_eoi() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask master IR2 (cascade)
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+        pic.set_irq_line(9, true); // slave IR1
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        assert_eq!(pic.slave.isr, 1 << 1);
+        assert_eq!(pic.master.isr, 1 << 2);
+        // Non-specific EOI slave then master (PC AT convention).
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.slave.isr, 0);
+        assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: fully nested — in-service IR0 blocks lower-priority IR1 until EOI.
+    #[test]
+    fn fully_nested_blocks_lower_priority() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        pic.set_irq_line(1, true);
+        assert_eq!(pic.master.irr & 0x02, 0x02);
+        assert_eq!(pic.poll_irq(), None); // IR1 blocked while IR0 in service
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // EOI IR0
+        assert_eq!(pic.poll_irq(), Some(0x09));
     }
 }

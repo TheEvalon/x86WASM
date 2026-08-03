@@ -1333,9 +1333,9 @@ Progress against implement list:
 - [ ] LDT
 - [ ] TSS
 - [x] Exceptions (real-mode IVT fault delivery for #DE/#UD/#BR/#GP/#SS; #OF trap via INTO; software INT/INT3/INTO) â€” protected-mode / full fault taxonomy still open
-- [ ] Interrupts (hardware / PIC-driven) — stub: `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; 8259 ICW1–ICW4 unit model present, no OCW/EOI/IRQ delivery yet
+- [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `MachineBus::poll_external_irq` → `DualPic::poll_irq` (OCW/EOI/IRR/ISR + edge assert); **not** PIT IRQ0 / CMOS IRQ8 / 8042 IRQ1 device wiring yet
 - [ ] 32-bit paging
-- [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 + `MachineBus` ports 0x20/0x21/0xA0/0xA1; **not** OCW/EOI/IRR/ISR or IRQ assert→CPU
+- [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 + OCW1 IMR + OCW2 EOI + OCW3 IRR/ISR read + edge IRQ assert + cascade + `MachineBus` ports / `poll_external_irq`; **not** Auto-EOI/rotate/special-mask/OCW3 poll/level-triggered runtime
 - [ ] 8254 PIT — **partial:** `devices::Pit8254` channel-0 programming + `MachineBus` ports 0x40–0x43; ch1/ch2 stub accept; **not** IRQ0/OUT→PIC or speaker
 - [ ] RTC — **partial:** `devices::CmosRtc` index/data bank + `MachineBus` ports 0x70/0x71 (NMI latch bit stored; status C read-to-clear); **not** IRQ8/PIE/AIE/UIE or wall-clock sync
 - [ ] DMA

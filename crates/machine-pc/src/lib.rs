@@ -33,7 +33,7 @@ pub struct Machine {
     pub mem: PhysMem,
     pub com1: Serial16550,
     pub debug: DebugConsole,
-    /// Dual 8259A — ICW1–ICW4 only (ports 0x20/0x21/0xA0/0xA1).
+    /// Dual 8259A — ICW + OCW/IRQ (ports 0x20/0x21/0xA0/0xA1).
     pub pic: DualPic,
     /// 8254 PIT — channel-0 programming (ports 0x40–0x43).
     pub pit: Pit8254,
@@ -212,6 +212,11 @@ impl Bus for MachineBus<'_> {
         self.port_write(port, 4, val);
         Ok(())
     }
+
+    /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
+    fn poll_external_irq(&mut self) -> Option<u8> {
+        self.pic.poll_irq()
+    }
 }
 
 #[cfg(test)]
@@ -266,8 +271,8 @@ mod tests {
             bus.port_out_u8(PIC_SLAVE_DATA, 0x70).unwrap();
             bus.port_out_u8(PIC_SLAVE_DATA, 0x02).unwrap();
             bus.port_out_u8(PIC_SLAVE_DATA, 0x01).unwrap();
-            // Reads still open-bus style until OCW (device unit model).
-            assert_eq!(bus.port_in_u8(PIC_MASTER_CMD).unwrap(), 0xFF);
+            // After init: command port = IRR (0), data port = IMR (all masked).
+            assert_eq!(bus.port_in_u8(PIC_MASTER_CMD).unwrap(), 0x00);
             assert_eq!(bus.port_in_u8(PIC_MASTER_DATA).unwrap(), 0xFF);
         }
         assert!(m.pic.master.initialized);
@@ -278,6 +283,87 @@ mod tests {
         assert_eq!(m.pic.slave.slave_id(), 2);
         assert!(m.pic.master.mode_8086);
         assert!(m.pic.slave.mode_8086);
+    }
+
+    /// Spec: DualPic assert → MachineBus::poll_external_irq returns 8259 vector.
+    #[test]
+    fn machine_bus_poll_external_irq_from_pic() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                ports: &mut m.ports,
+            };
+            bus.port_out_u8(PIC_MASTER_CMD, 0x11).unwrap();
+            bus.port_out_u8(PIC_MASTER_DATA, 0x08).unwrap();
+            bus.port_out_u8(PIC_MASTER_DATA, 0x04).unwrap();
+            bus.port_out_u8(PIC_MASTER_DATA, 0x01).unwrap();
+            bus.port_out_u8(PIC_SLAVE_CMD, 0x11).unwrap();
+            bus.port_out_u8(PIC_SLAVE_DATA, 0x70).unwrap();
+            bus.port_out_u8(PIC_SLAVE_DATA, 0x02).unwrap();
+            bus.port_out_u8(PIC_SLAVE_DATA, 0x01).unwrap();
+            bus.port_out_u8(PIC_MASTER_DATA, 0xFE).unwrap(); // unmask IR0
+        }
+        m.pic.set_irq_line(0, true);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.poll_external_irq(), Some(0x08));
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        assert_eq!(m.pic.master.isr, 0x01);
+    }
+
+    /// Guest STI + PIC IRQ0 → IVT delivery via poll_external_irq.
+    /// Spec: SDM Vol. 3 §6.8.1; Intel 8259A vector = ICW2 base | IR.
+    #[test]
+    fn guest_sti_delivers_pic_irq0_via_ivt() {
+        let mut m = Machine::new(64 * 1024);
+        // IVT[0x08] → 0000:0E00; handler HLT.
+        m.mem.write_u8(0x08 * 4, 0x00).unwrap();
+        m.mem.write_u8(0x08 * 4 + 1, 0x0E).unwrap();
+        m.mem.write_u8(0x08 * 4 + 2, 0x00).unwrap();
+        m.mem.write_u8(0x08 * 4 + 3, 0x00).unwrap();
+        m.mem.write_u8(0x0E00, 0xF4).unwrap();
+        // Program: NOP then HLT; IRQ delivered before NOP when IF=1.
+        m.mem.write_u8(0, 0x90).unwrap(); // NOP
+        m.mem.write_u8(1, 0xF4).unwrap(); // HLT
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.ss = x86_core::SegmentReg::real_mode(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        m.cpu.halted = false;
+        m.cpu.set_interrupt_flag(true);
+
+        // Init PIC + unmask IRQ0
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFE);
+        m.pic.set_irq_line(0, true);
+
+        m.step().unwrap();
+        assert_eq!(m.cpu.ip16(), 0x0E00);
+        assert!(!m.cpu.interrupt_flag());
+        assert_eq!(m.pic.master.isr, 0x01);
     }
 
     /// Spec: 8254 channel-0 programming via MachineBus ports 0x40/0x43.

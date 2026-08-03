@@ -1,5 +1,5 @@
 //! Device models. Milestone 1: COM1 data port + debug port 0x402.
-//! Milestone 2 (partial): 8259 PIC ICW1–ICW4; 8254 PIT channel-0; CMOS/RTC 0x70/0x71.
+//! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT channel-0; CMOS/RTC 0x70/0x71.
 
 #![forbid(unsafe_code)]
 
