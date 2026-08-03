@@ -27,8 +27,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - IBM VGA / classic PC color text frame buffer at physical `0xB8000` (80×25, char+attr)
 - OSDev Text UI — VGA text-mode memory layout
 - OSDev VGA Hardware / FreeVGA CRT Controller — color CRTC Address `0x3D4`, Data `0x3D5`, indexes `0x00`–`0x18`
-- Intel 82077AA CHMOS Single-Chip Floppy Disk Controller — DOR/MSR/FIFO/DIR/CCR; DOR bit3 DMA/IRQ enable; IRQ on command complete
-- OSDev Wiki Floppy Disk Controller — ports `0x3F0`–`0x3F7` excluding `0x3F6` (IDE); ISA IRQ6
+- Intel 82077AA CHMOS Single-Chip Floppy Disk Controller — DOR/MSR/FIFO/DIR/CCR; Sense Interrupt Status (`0x08`) ST0+PCN; DOR bit3 DMA/IRQ enable; IRQ on command complete
+- OSDev Wiki Floppy Disk Controller — ports `0x3F0`–`0x3F7` excluding `0x3F6` (IDE); MSR RQM/DIO; Sense Interrupt clears IRQ; ISA IRQ6
 - IBM PC/AT IRQ assignment — floppy disk controller → IRQ6 (8259 master IR6)
 
 ## Firmware
