@@ -1,5 +1,5 @@
 //! Device models. Milestone 1: COM1 data port + debug port 0x402.
-//! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT channel-0; CMOS/RTC 0x70/0x71;
+//! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT channel-0; CMOS/RTC IRQ8;
 //! 8042/PS2 controller on MachineBus ports 0x60/0x64 (no IRQ1).
 
 #![forbid(unsafe_code)]
@@ -12,6 +12,7 @@ mod serial;
 
 pub use cmos::{
     CmosRtc, CMOS_DATA, CMOS_INDEX, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, REG_STATUS_D,
+    STB_AIE, STB_PIE, STB_SET, STB_UIE, STC_AF, STC_IRQF, STC_PF, STC_UF,
 };
 pub use i8042::{
     CMD_DISABLE_KBD, CMD_ENABLE_KBD, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, I8042,

@@ -37,7 +37,7 @@ pub struct Machine {
     pub pic: DualPic,
     /// 8254 PIT — channel-0 programming + OUT tick (ports 0x40–0x43); OUT → IRQ0.
     pub pit: Pit8254,
-    /// MC146818 CMOS/RTC register bank (ports 0x70/0x71).
+    /// MC146818 CMOS/RTC (ports 0x70/0x71); PIE/AIE/UIE → IRQ8.
     pub cmos: CmosRtc,
     /// 8042 / PS/2 controller (ports 0x60/0x64) — no IRQ1.
     pub kbd: I8042,
@@ -156,6 +156,28 @@ impl Machine {
     pub fn sync_pit_irq0(&mut self) {
         self.pic.set_irq_line(0, self.pit.out_ch0());
     }
+
+    /// Advance CMOS/RTC by `periods` model quanta and sync IRQF → PIC IRQ8.
+    ///
+    /// Spec: MC146818 IRQ pin; IBM PC AT → 8259A slave IR0 (ISA IRQ8).
+    /// Guest wall-clock rate is **not** host-real-time — callers choose the quantum.
+    ///
+    /// When `tick` reports a rising IRQ edge, IR8 is pulsed (deassert then assert)
+    /// so a still-asserted line after EOI can re-latch IRR on the next period.
+    pub fn tick_cmos(&mut self, periods: u64) {
+        let rising = self.cmos.tick(periods);
+        if rising {
+            self.pic.set_irq_line(8, false);
+            self.pic.set_irq_line(8, true);
+        } else {
+            self.sync_cmos_irq8();
+        }
+    }
+
+    /// Drive PIC IRQ8 from the current CMOS IRQ pin (level follow).
+    pub fn sync_cmos_irq8(&mut self) {
+        self.pic.set_irq_line(8, self.cmos.irq_line());
+    }
 }
 
 struct MachineBus<'a> {
@@ -247,11 +269,12 @@ impl Bus for MachineBus<'_> {
 
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
-    /// Syncs PIT ch0 OUT → IRQ0 (level follow) before acknowledge so edges from
-    /// prior [`Machine::tick_pit`] / [`devices::Pit8254::tick_ch0`] are visible.
-    // --- PIT→IRQ0 (slice/device-pit-irq0); keep MachineBus edits minimal for 8042 merge ---
+    /// Syncs PIT ch0 OUT → IRQ0 and CMOS IRQF → IRQ8 (level follow) before
+    /// acknowledge so edges from prior [`Machine::tick_pit`] /
+    /// [`Machine::tick_cmos`] are visible.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
+        self.pic.set_irq_line(8, self.cmos.irq_line());
         self.pic.poll_irq()
     }
 }
@@ -262,8 +285,8 @@ mod tests {
     use devices::{
         CmosRtc, DualPic, Pit8254, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMOS_DATA,
         CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A, SELF_TEST_OK,
-        STATUS_IBF, STATUS_OBF,
+        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A, REG_STATUS_B,
+        REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF,
     };
 
     #[test]
@@ -381,6 +404,20 @@ mod tests {
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
     }
 
+    /// Helper: classic AT DualPic cascade + unmask master IR2 (cascade) and slave IR0 (IRQ8).
+    fn init_at_pic_unmask_irq8(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0xFE); // unmask slave IR0 (IRQ8)
+    }
+
     /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
     #[test]
     fn pit_mode0_tick_asserts_irq0_eoi_clears() {
@@ -464,6 +501,67 @@ mod tests {
             bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
         }
         assert_eq!(m.pic.master.isr, 0);
+    }
+
+    /// Spec: MC146818 PIE + tick → IRQ8 → 8259A slave vector 0x70; EOI clears ISR.
+    #[test]
+    fn cmos_pie_tick_asserts_irq8_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq8(&mut m);
+        m.cmos.port_write(CMOS_INDEX, 1, u32::from(REG_STATUS_B));
+        m.cmos.port_write(CMOS_DATA, 1, u32::from(0x02 | STB_PIE)); // 24h + PIE
+        assert!(!m.cmos.irq_line());
+
+        m.tick_cmos(1);
+        assert!(m.cmos.irq_line());
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            // Spec: AT slave ICW2 base 0x70 → IRQ8 vector 0x70.
+            assert_eq!(bus.poll_external_irq(), Some(0x70));
+            assert_eq!(bus.poll_external_irq(), None);
+            // Status C read-to-clear deasserts CMOS IRQ pin.
+            bus.port_out_u8(CMOS_INDEX, REG_STATUS_C).unwrap();
+            let stc = bus.port_in_u8(CMOS_DATA).unwrap();
+            assert_ne!(stc & STC_PF, 0);
+            assert_ne!(stc & STC_IRQF, 0);
+            assert!(!bus.cmos.irq_line());
+            // Non-specific EOI slave then master (PC AT cascade convention).
+            bus.port_out_u8(PIC_SLAVE_CMD, 0x20).unwrap();
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.slave.isr, 0);
+        assert_eq!(m.pic.master.isr, 0);
+    }
+
+    /// Spec: without PIE, tick does not deliver IRQ8 via poll_external_irq.
+    #[test]
+    fn cmos_tick_without_pie_no_irq8() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq8(&mut m);
+        m.tick_cmos(1);
+        assert!(!m.cmos.irq_line());
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.poll_external_irq(), None);
+        }
     }
 
     /// Guest STI + PIC IRQ0 → IVT delivery via poll_external_irq.

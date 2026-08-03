@@ -1333,11 +1333,11 @@ Progress against implement list:
 - [ ] LDT
 - [ ] TSS
 - [x] Exceptions (real-mode IVT fault delivery for #DE/#UD/#BR/#GP/#SS; #OF trap via INTO; software INT/INT3/INTO) â€” protected-mode / full fault taxonomy still open
-- [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `MachineBus::poll_external_irq` syncs PIT ch0 OUT→IRQ0 then `DualPic::poll_irq`; **not** CMOS IRQ8 / 8042 IRQ1 device wiring yet
+- [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `MachineBus::poll_external_irq` syncs PIT ch0 OUT→IRQ0 + CMOS IRQF→IRQ8 then `DualPic::poll_irq`; **not** 8042 IRQ1 device wiring yet
 - [ ] 32-bit paging
 - [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 + OCW1 IMR + OCW2 EOI + OCW3 IRR/ISR read + edge IRQ assert + cascade + `MachineBus` ports / `poll_external_irq`; **not** Auto-EOI/rotate/special-mask/OCW3 poll/level-triggered runtime
 - [ ] 8254 PIT — **partial:** `devices::Pit8254` ch0 programming + `ce`/OUT tick (modes 0/2/3) + `Machine::tick_pit` → IRQ0→PIC; ch1/ch2 stub accept; **not** speaker / host-real-time / modes 1/4/5 OUT
-- [ ] RTC — **partial:** `devices::CmosRtc` index/data bank + `MachineBus` ports 0x70/0x71 (NMI latch bit stored; status C read-to-clear); **not** IRQ8/PIE/AIE/UIE or wall-clock sync
+- [ ] RTC — **partial:** `devices::CmosRtc` index/data + PIE/AIE/UIE + status C read-to-clear + `Machine::tick_cmos` → IRQ8→PIC; **not** wall-clock sync / NMI delivery / UIP crystal model
 - [ ] DMA
 - [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test `0xAA`→`0x55`, config byte `0x20`/`0x60`, disable/enable `0xAD`/`0xAE`, status OBF/IBF); **not** IRQ1, mouse, or A20
 - [ ] PCI configuration space
