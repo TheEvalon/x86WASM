@@ -1333,7 +1333,7 @@ Progress against implement list:
 - [ ] LDT
 - [ ] TSS
 - [x] Exceptions (real-mode IVT fault delivery for #DE/#UD/#BR/#GP/#SS; #OF trap via INTO; software INT/INT3/INTO) â€” protected-mode / full fault taxonomy still open
-- [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `CpuState::pending_nmi` / `request_nmi` + `Machine::inject_nmi` (CMOS-gated `#NMI` vector 2, IF-independent); `MachineBus::poll_external_irq` syncs PIT ch0 OUT→IRQ0 + 8042 OBF∧INT1→IRQ1 + CMOS IRQF→IRQ8 + IDE INTRQ∧¬nIEN→IRQ14 then `DualPic::poll_irq`
+- [ ] Interrupts (hardware / PIC-driven) — **partial:** `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; `CpuState::pending_nmi` / `request_nmi` + `Machine::inject_nmi` (CMOS-gated `#NMI` vector 2, IF-independent); `MachineBus::poll_external_irq` syncs PIT ch0 OUT→IRQ0 + 8042 OBF∧INT1→IRQ1 + FDC IRQ6 + CMOS IRQF→IRQ8 + primary IDE→IRQ14 + secondary IDE→IRQ15 then `DualPic::poll_irq`
 - [ ] 32-bit paging
 - [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 + OCW1 IMR + OCW2 EOI + OCW3 IRR/ISR read + edge IRQ assert + cascade + `MachineBus` ports / `poll_external_irq`; **not** Auto-EOI/rotate/special-mask/OCW3 poll/level-triggered runtime
 - [ ] 8254 PIT — **partial:** `devices::Pit8254` ch0 programming + `ce`/OUT tick (modes 0/2/3) + `Machine::tick_pit` → IRQ0→PIC; ch2 GATE/OUT + port `0x61` speaker bits (no host audio); ch1 stub accept; **not** host-real-time / modes 1/4/5 OUT / host speaker audio
