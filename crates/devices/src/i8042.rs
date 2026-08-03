@@ -22,8 +22,7 @@
 //!
 //! - IRQ12 / second PS/2 port (`0xA7`/`0xA8`/`0xA9`/`0xD4`)
 //! - PS/2 keyboard or mouse device protocol (no scancodes, no `0xFA` ACK)
-//! - A20 gate / output-port / pulse-reset (`0xD0`/`0xD1`/`0xFE`, …) — accepted
-//!   as documented no-ops where noted; no A20 side effects
+//! - Pulse/reset lines (`0xFE` / output-port bit0 system-reset side effects)
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
 
 use crate::PortDevice;
@@ -52,9 +51,19 @@ pub const CMD_SELF_TEST: u8 = 0xAA;
 pub const CMD_DISABLE_KBD: u8 = 0xAD;
 /// Controller command: enable first PS/2 port.
 pub const CMD_ENABLE_KBD: u8 = 0xAE;
+/// Controller command: read output port → response on data port.
+pub const CMD_READ_OUTPUT_PORT: u8 = 0xD0;
+/// Controller command: write next data-port byte to output port (A20 bit1).
+pub const CMD_WRITE_OUTPUT_PORT: u8 = 0xD1;
 
 /// Self-test passed response (OSDev / IBM AT).
 pub const SELF_TEST_OK: u8 = 0x55;
+
+/// Output-port bit 1: A20 gate enable (1 = A20 line high / unmasked).
+pub const OUTPUT_PORT_A20: u8 = 1 << 1;
+/// Power-on / reset default output port: A20 enabled (classic AT open gate).
+/// Other bits are stored but not claimed (system-reset / clock / IRQ lines).
+const DEFAULT_OUTPUT_PORT: u8 = 0xDF;
 
 /// Configuration bit 0: first PS/2 port interrupt (IRQ1) enable when set.
 pub const CFG_INT1: u8 = 1 << 0;
@@ -74,9 +83,8 @@ enum PendingWrite {
     None,
     /// Next `0x60` write updates the controller configuration byte (`0x60` cmd).
     ConfigByte,
-    /// Next `0x60` write is a no-op payload for an unsupported two-byte command
-    /// (e.g. A20 / output-port write `0xD1`).
-    DiscardData,
+    /// Next `0x60` write updates the controller output port (`0xD1` cmd).
+    OutputPort,
 }
 
 /// Minimal IBM PC AT 8042-compatible controller state.
@@ -84,6 +92,8 @@ enum PendingWrite {
 pub struct I8042 {
     /// Controller configuration byte (RAM byte 0; commands `0x20` / `0x60`).
     pub config: u8,
+    /// Controller output port (commands `0xD0` / `0xD1`); bit1 = A20 gate.
+    pub output_port: u8,
     /// One-byte output buffer (device/controller → host).
     output: Option<u8>,
     /// Status bit 3: last host write targeted the command port.
@@ -97,6 +107,7 @@ impl I8042 {
     pub fn new() -> Self {
         let mut s = Self {
             config: DEFAULT_CONFIG,
+            output_port: DEFAULT_OUTPUT_PORT,
             output: None,
             last_write_was_cmd: false,
             pending: PendingWrite::None,
@@ -108,6 +119,7 @@ impl I8042 {
 
     fn apply_reset_defaults(&mut self) {
         self.config = DEFAULT_CONFIG;
+        self.output_port = DEFAULT_OUTPUT_PORT;
         self.output = None;
         self.last_write_was_cmd = false;
         self.pending = PendingWrite::None;
@@ -156,6 +168,13 @@ impl I8042 {
         self.output.is_some() && self.irq1_enabled()
     }
 
+    /// A20 gate from output-port bit 1 (1 = enabled / unmasked).
+    ///
+    /// Spec: IBM PC AT 8042 output port — bit1 gates address line A20.
+    pub fn a20_enabled(&self) -> bool {
+        self.output_port & OUTPUT_PORT_A20 != 0
+    }
+
     /// Place a byte in the output buffer (device/controller → host).
     ///
     /// Used by tests and future keyboard device path. Returns true if IRQ1 had
@@ -189,10 +208,11 @@ impl I8042 {
             CMD_ENABLE_KBD => {
                 self.config &= !CFG_KBD_CLOCK_DISABLE;
             }
-            // A20 / output-port write: accept command; next data byte discarded.
-            0xD1 => {
-                self.pending = PendingWrite::DiscardData;
-                self.unsupported_commands = self.unsupported_commands.saturating_add(1);
+            CMD_READ_OUTPUT_PORT => {
+                self.push_output(self.output_port);
+            }
+            CMD_WRITE_OUTPUT_PORT => {
+                self.pending = PendingWrite::OutputPort;
             }
             _ => {
                 self.unsupported_commands = self.unsupported_commands.saturating_add(1);
@@ -229,8 +249,9 @@ impl PortDevice for I8042 {
                         self.config = v;
                         self.pending = PendingWrite::None;
                     }
-                    PendingWrite::DiscardData => {
-                        // No-op payload (e.g. A20 bit in output-port write).
+                    PendingWrite::OutputPort => {
+                        // Spec: IBM PC AT — output port bit1 = A20 gate.
+                        self.output_port = v;
                         self.pending = PendingWrite::None;
                     }
                     PendingWrite::None => {
@@ -380,18 +401,39 @@ mod tests {
         assert_eq!(k.status() & STATUS_CMD, 0);
     }
 
-    /// A20 / output-port write `0xD1`: command accepted; data byte discarded; no A20 effect.
+    /// Spec: IBM PC AT — `0xD1` writes output port; bit1 = A20; `0xD0` reads it back.
     #[test]
-    fn a20_write_output_port_is_documented_noop() {
+    fn a20_output_port_d1_d0() {
         let mut k = I8042::new();
-        let cfg = k.config;
-        k.port_write(I8042_STATUS_CMD, 1, 0xD1);
-        k.port_write(I8042_DATA, 1, 0xDF); // classic "A20 on" payload on real HW
-        assert_eq!(k.config, cfg);
-        assert!(k.unsupported_commands >= 1);
-        // Still accepts a subsequent real command.
+        assert!(k.a20_enabled());
+        assert_eq!(k.output_port, DEFAULT_OUTPUT_PORT);
+
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_OUTPUT_PORT));
+        k.port_write(I8042_DATA, 1, 0xDD); // classic "A20 off" (bit1 clear)
+        assert!(!k.a20_enabled());
+        assert_eq!(k.output_port, 0xDD);
+        assert_eq!(k.unsupported_commands, 0);
+
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_READ_OUTPUT_PORT));
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0xDD);
+
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_OUTPUT_PORT));
+        k.port_write(I8042_DATA, 1, 0xDF); // A20 on
+        assert!(k.a20_enabled());
+
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
         assert_eq!(k.port_read(I8042_DATA, 1) as u8, SELF_TEST_OK);
+    }
+
+    #[test]
+    fn reset_restores_a20_enabled() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_OUTPUT_PORT));
+        k.port_write(I8042_DATA, 1, 0xDD);
+        assert!(!k.a20_enabled());
+        k.reset();
+        assert!(k.a20_enabled());
+        assert_eq!(k.output_port, DEFAULT_OUTPUT_PORT);
     }
 
     #[test]

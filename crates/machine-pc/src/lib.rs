@@ -89,6 +89,13 @@ impl Machine {
         self.pit.reset();
         self.cmos.reset();
         self.kbd.reset();
+        // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
+        self.mem.set_a20_enabled(self.kbd.a20_enabled());
+    }
+
+    /// Sync [`PhysMem`] A20 mask from the 8042 output-port bit1.
+    pub fn sync_a20_from_kbd(&mut self) {
+        self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
 
     pub fn step(&mut self) -> Result<(), MachineError> {
@@ -238,7 +245,11 @@ impl MachineBus<'_> {
                 self.pit.port_write(port, size, value);
             }
             CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
-            I8042_DATA | I8042_STATUS_CMD => self.kbd.port_write(port, size, value),
+            I8042_DATA | I8042_STATUS_CMD => {
+                self.kbd.port_write(port, size, value);
+                // Spec: IBM PC AT 8042 output port bit1 → A20 gate on phys mem.
+                self.mem.set_a20_enabled(self.kbd.a20_enabled());
+            }
             0x3F8..0x400 => self.com1.port_write(port, size, value),
             0x402 => self.debug.port_write(port, size, value),
             _ => self.ports.port_write(port, size, value),
@@ -306,10 +317,10 @@ mod tests {
     use super::*;
     use devices::{
         CmosRtc, DualPic, Pit8254, CFG_INT1, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG,
-        CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
-        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A,
-        REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
-        STC_PF,
+        CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD,
+        PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL,
+        REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE,
+        STC_IRQF, STC_PF,
     };
 
     #[test]
@@ -940,7 +951,85 @@ mod tests {
         assert_eq!(m.pit, Pit8254::new());
         assert_eq!(m.cmos, CmosRtc::new());
         assert_eq!(m.kbd, I8042::new());
+        assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
         assert_eq!(m.debug_text(), "");
+    }
+
+    /// Spec: IBM PC AT — OUT 0x64,0xD1 / OUT 0x60,data updates A20 on PhysMem.
+    #[test]
+    fn machine_bus_8042_a20_gate_masks_phys_bit20() {
+        let mut m = Machine::new(2 * 1024 * 1024);
+        assert!(m.mem.a20_enabled());
+        m.mem.write_u8(0, 0x11).unwrap();
+        m.mem.write_u8(1 << 20, 0x22).unwrap();
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
+                .unwrap();
+            bus.port_out_u8(I8042_DATA, 0xDD).unwrap(); // A20 off
+        }
+        assert!(!m.kbd.a20_enabled());
+        assert!(!m.mem.a20_enabled());
+        assert_eq!(m.mem.read_u8(1 << 20).unwrap(), 0x11);
+
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
+                .unwrap();
+            bus.port_out_u8(I8042_DATA, 0xDF).unwrap(); // A20 on
+        }
+        assert!(m.mem.a20_enabled());
+        assert_eq!(m.mem.read_u8(1 << 20).unwrap(), 0x22);
+    }
+
+    /// Guest OUT path: 8042 `0xD1` disables A20; mem alias observable via PhysMem.
+    #[test]
+    fn guest_out_8042_disables_a20() {
+        let mut m = Machine::new(2 * 1024 * 1024);
+        const MARK: u64 = 0x1000;
+        m.mem.write_u8(MARK, 0xAA).unwrap();
+        m.mem.write_u8(MARK | (1 << 20), 0xBB).unwrap();
+        let prog: &[u8] = &[
+            0xB0,
+            CMD_WRITE_OUTPUT_PORT, // mov al, 0xD1
+            0xE6,
+            0x64, // out 0x64, al
+            0xB0,
+            0xDD, // mov al, 0xDD (A20 off)
+            0xE6,
+            0x60, // out 0x60, al
+            0xF4, // hlt
+        ];
+        for (i, b) in prog.iter().enumerate() {
+            m.mem.write_u8(i as u64, *b).unwrap();
+        }
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.halted = false;
+        let steps = m.run(100).unwrap();
+        assert!(steps > 0);
+        assert!(m.cpu.halted);
+        assert!(!m.mem.a20_enabled());
+        assert_eq!(m.mem.read_u8(MARK | (1 << 20)).unwrap(), 0xAA);
     }
 }

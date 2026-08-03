@@ -1339,7 +1339,7 @@ Progress against implement list:
 - [ ] 8254 PIT — **partial:** `devices::Pit8254` ch0 programming + `ce`/OUT tick (modes 0/2/3) + `Machine::tick_pit` → IRQ0→PIC; ch1/ch2 stub accept; **not** speaker / host-real-time / modes 1/4/5 OUT
 - [ ] RTC — **partial:** `devices::CmosRtc` index/data + PIE/AIE/UIE + status C read-to-clear + `Machine::tick_cmos` → IRQ8→PIC; **not** wall-clock sync / NMI delivery / UIP crystal model
 - [ ] DMA
-- [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test/config/enable + OBF∧INT1→IRQ1); **not** mouse/IRQ12, scancode device, or A20
+- [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test/config/enable + OBF∧INT1→IRQ1 + `0xD0`/`0xD1` output-port A20 → `PhysMem`); **not** mouse/IRQ12, scancode device, or pulse-reset
 - [ ] PCI configuration space
 - [ ] PIIX IDE
 - [ ] ATAPI
