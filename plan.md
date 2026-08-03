@@ -1343,7 +1343,7 @@ Progress against implement list:
 - [ ] PCI configuration space — **partial:** `devices::PciConfig` Mechanism #1 (`0xCF8`/`0xCFC`) + host bridge `00:00.0` `8086:1237` + PIIX3 stubs `00:01.0` ISA `8086:7000` / `00:01.1` IDE `8086:7010` on `MachineBus`; **not** USB/ACPI PIIX funcs / BAR MMIO / bus mastering / caps/MSI/PCIe
 - [ ] PIIX IDE — **partial:** `devices::IdePrimary` IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO on ports `0x1F0`–`0x1F7`/`0x3F6` with backing image + DRQ/BSY/DRDY + IRQ14→`DualPic` when nIEN=0; **not** ATAPI/WRITE/DMA/slave/secondary/PCI BARs/SeaBIOS
 - [ ] ATAPI
-- [ ] VGA text mode — **partial:** `devices::VgaText` 32 KiB plane at `0xB8000` on `MachineBus` (80×25 reset fill); **not** CRTC/sequencer/graphics/VBE/host render
+- [ ] VGA text mode — **partial:** `devices::VgaText` 32 KiB plane at `0xB8000` + CRTC index/data `0x3D4`/`0x3D5` noop register file on `MachineBus` (80×25 reset fill); **not** sequencer/GC/ATC/timing/graphics/VBE/host render
 - [ ] Initial VGA graphics
 - [ ] Initial VBE
 - [ ] SeaBIOS integration

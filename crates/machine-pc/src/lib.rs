@@ -13,7 +13,7 @@ use devices::{
     CmosRtc, DebugConsole, Dma8237, DualPic, IdePrimary, PciConfig, Pit8254, PortDevice,
     Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD,
     PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, VGA_CRTC_DATA, VGA_CRTC_INDEX,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -44,7 +44,7 @@ pub struct Machine {
     pub kbd: I8042,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
-    /// VGA color text plane at 0xB8000 (32 KiB stub; no CRTC).
+    /// VGA color text plane at 0xB8000 + CRTC index/data `0x3D4`/`0x3D5` noop.
     pub vga: VgaText,
     /// PCI configuration mechanism #1 (ports 0xCF8 / 0xCFC–0xCFF).
     pub pci: PciConfig,
@@ -311,6 +311,9 @@ impl MachineBus<'_> {
         if PciConfig::owns_port(port) {
             return self.pci.port_read(port, size);
         }
+        if VgaText::owns_port(port) {
+            return self.vga.port_read(port, size);
+        }
         match port {
             PIC_MASTER_CMD | PIC_MASTER_DATA | PIC_SLAVE_CMD | PIC_SLAVE_DATA => {
                 self.pic.port_read(port, size)
@@ -338,6 +341,10 @@ impl MachineBus<'_> {
         }
         if PciConfig::owns_port(port) {
             self.pci.port_write(port, size, value);
+            return;
+        }
+        if VgaText::owns_port(port) {
+            self.vga.port_write(port, size, value);
             return;
         }
         match port {
@@ -1191,6 +1198,23 @@ mod tests {
         m.reset();
         assert_eq!(m.vga.char_at(0, 0), Some(b' '));
         assert_eq!(m.vga.attr_at(0, 0), Some(0x07));
+    }
+
+    /// Spec: OSDev VGA Hardware — CRTC index/data via MachineBus `0x3D4`/`0x3D5`.
+    #[test]
+    fn machine_bus_vga_crtc_index_data() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(VGA_CRTC_INDEX, 0x0E).unwrap();
+            bus.port_out_u8(VGA_CRTC_DATA, 0x12).unwrap();
+            bus.port_out_u8(VGA_CRTC_INDEX, 0x0E).unwrap();
+            assert_eq!(bus.port_in_u8(VGA_CRTC_DATA).unwrap(), 0x12);
+            assert_eq!(bus.port_in_u8(VGA_CRTC_INDEX).unwrap(), 0x0E);
+        }
+        assert_eq!(m.vga.crtc_regs[0x0E], 0x12);
+        m.reset();
+        assert_eq!(m.vga.crtc_regs[0x0E], 0);
     }
 
     /// Spec: PCI Local Bus Mechanism #1 — host bridge vendor/device via MachineBus.

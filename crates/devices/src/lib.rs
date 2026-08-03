@@ -2,7 +2,7 @@
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! 8237A DMA register/page stubs (no transfer engine);
-//! VGA text frame buffer MMIO stub at 0xB8000;
+//! VGA text frame buffer MMIO stub at 0xB8000 + CRTC 0x3D4/0x3D5 noop;
 //! PCI configuration mechanism #1 stub (0xCF8/0xCFC) + PIIX3 ISA/IDE functions;
 //! Primary IDE IDENTIFY + READ SECTORS PIO + IRQ14 stub (1F0–1F7/3F6).
 
@@ -50,8 +50,8 @@ pub use pit::{
 };
 pub use serial::{DebugConsole, Serial16550, SerialOutput};
 pub use vga::{
-    VgaText, VGA_CELL_BYTES, VGA_DEFAULT_ATTR, VGA_DEFAULT_CHAR, VGA_TEXT_BASE, VGA_TEXT_COLS,
-    VGA_TEXT_END, VGA_TEXT_ROWS, VGA_TEXT_SIZE,
+    VgaText, VGA_CELL_BYTES, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_CRTC_REG_COUNT, VGA_DEFAULT_ATTR,
+    VGA_DEFAULT_CHAR, VGA_TEXT_BASE, VGA_TEXT_COLS, VGA_TEXT_END, VGA_TEXT_ROWS, VGA_TEXT_SIZE,
 };
 
 /// Port I/O sink shared by CLI and browser.

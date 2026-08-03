@@ -35,14 +35,15 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0xCFC`–`0xCFF` | PCI `CONFIG_DATA` (byte/word/dword lanes) |
 | `0x1F0`–`0x1F7` | Primary IDE command block — IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO stub |
 | `0x3F6` | Primary IDE alternate status (R) / device control (W; SRST/nIEN) |
+| `0x3D4` / `0x3D5` | VGA color CRTC index / data — noop register file (indexes `0x00`–`0x18`) |
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled). Unused page holes (`0x84`–`0x86`, `0x88`, `0x8C`–`0x8E`) stay open-bus.
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO), `devices::PciConfig` (`pci.rs`, field `Machine::pci`), `devices::IdePrimary` (`ide.rs`, field `Machine::ide`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE like serial (IDE keeps attached image). No snapshot schema for these devices yet (serial has none either).
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO + CRTC ports), `devices::PciConfig` (`pci.rs`, field `Machine::pci`), `devices::IdePrimary` (`ide.rs`, field `Machine::ide`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE like serial (IDE keeps attached image). No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
-- VGA color text plane: physical `0xB8000`–`0xBFFFF` (32 KiB) owned by `devices::VgaText` on the CPU data bus (`MachineBus` intercepts before `PhysMem`). Reset fills 80×25 with space + attribute `0x07`. **Not yet:** CRTC/sequencer/GC/ATC ports, planar graphics, VBE, host rendering.
+- VGA color text plane: physical `0xB8000`–`0xBFFFF` (32 KiB) owned by `devices::VgaText` on the CPU data bus (`MachineBus` intercepts before `PhysMem`). Reset fills 80×25 with space + attribute `0x07`. Color CRTC index/data ports `0x3D4`/`0x3D5` accept R/W into a 25-register noop file (no timing/cursor render). **Not yet:** sequencer/GC/ATC, mono CRTC map, protect-bit enforcement, planar graphics, VBE, host rendering.
 - IDE: legacy primary ports only (no PCI BARs / secondary channel).
 
 ## Interrupts
@@ -64,6 +65,6 @@ Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices
 - CMOS/RTC: Motorola MC146818 / IBM PC AT — 128-byte register file at `0x70`/`0x71`; NMI bit stored only; status A UIP (read-only to guest); status B PIE/AIE/UIE/SET; status C PF/AF/UF/IRQF read-to-clear; second update stub + periodic tick; IRQ → ISA IRQ8.
 - 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — port-wired; config INT1 + OBF → ISA IRQ1; make-code inject → OBF (clock-disable respected; translation passthrough); output-port bit1 → A20; see `devices::I8042` / `Machine::kbd`.
 - 8237A DMA: Intel 8237A + OSDev ISA DMA — dual controllers + AT page regs on `MachineBus`; programming accepted (flip-flop/addr/count/mode/mask); **no** memory transfer engine / DREQ/DACK/TC. Port `0x80` remains POST.
-- VGA text: IBM VGA / OSDev Text UI — `0xB8000` char+attr plane on `MachineBus`; no CRTC port model yet.
+- VGA text: IBM VGA / OSDev Text UI / OSDev VGA Hardware — `0xB8000` char+attr plane + CRTC `0x3D4`/`0x3D5` noop on `MachineBus`; **not** sequencer/GC/ATC/timing/render.
 - PCI config: PCI Local Bus Mechanism #1 + OSDev PCI — `0xCF8`/`0xCFC` on `MachineBus`; host bridge `00:00.0` identity `8086:1237` (i440FX-class stub), class host bridge, header type 0; PIIX3-style stubs at `00:01.0` ISA bridge `8086:7000` (multi-function, class `0x0601`) and `00:01.1` IDE `8086:7010` (class `0x0101`, prog IF `0x80`); absent devices and enable-bit-clear data reads return `0xFFFFFFFF`. **Not yet:** USB/ACPI PIIX functions, BAR MMIO decode, bus mastering, caps/MSI/PCIe.
 - Primary IDE: ATA/ATAPI + OSDev ATA PIO — `IdePrimary` on `0x1F0`–`0x1F7`/`0x3F6`; IDENTIFY DEVICE + READ SECTORS (LBA28) PIO; DRQ/BSY/DRDY/ERR; backing `Vec<u8>` image; IRQ14 via `irq_line()` → `DualPic` when nIEN=0 (status read clears; alt status does not). **Not yet:** ATAPI, WRITE, DMA, slave, secondary, LBA48, SeaBIOS boot.
