@@ -183,6 +183,20 @@ impl Machine {
         }
     }
 
+    /// One CMOS second update cycle (UIP + BCD seconds) → IRQ8 on rising edge.
+    ///
+    /// Spec: MC146818 update cycle; IBM PC AT → ISA IRQ8. Independent of
+    /// [`Self::tick_cmos`] periodic quantum. Not host-real-time.
+    pub fn tick_cmos_second(&mut self) {
+        let rising = self.cmos.tick_second();
+        if rising {
+            self.pic.set_irq_line(8, false);
+            self.pic.set_irq_line(8, true);
+        } else {
+            self.sync_cmos_irq8();
+        }
+    }
+
     /// Drive PIC IRQ8 from the current CMOS IRQ pin (level follow).
     pub fn sync_cmos_irq8(&mut self) {
         self.pic.set_irq_line(8, self.cmos.irq_line());
