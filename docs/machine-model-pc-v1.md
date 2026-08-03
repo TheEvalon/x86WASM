@@ -27,6 +27,12 @@ Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabl
 
 Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`). Reset clears PIC/PIT/CMOS like serial. No snapshot schema for these devices yet (serial has none either).
 
+### Unit models not yet on MachineBus
+
+| Port | Device | Notes |
+|---|---|---|
+| `0x60` / `0x64` | 8042 / PS/2 controller (`devices::I8042`, `i8042.rs`) | **Unit model only** — self-test `0xAA`→`0x55`, config byte `0x20`/`0x60`, disable/enable `0xAD`/`0xAE`, status OBF/IBF. **Not** decoded on `MachineBus` yet. No IRQ1, mouse, or A20 side effects. |
+
 ## MMIO
 
 Stub dispatcher in M1; no VGA/IDE BARs yet.
@@ -47,3 +53,4 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - 8259A: Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4); classic PC cascade on IRQ2.
 - 8254: Intel 8254 PIT datasheet — channel 0 control word, lo/hi access, latch; no IRQ0 pulse / speaker / DRAM-refresh claims yet.
 - CMOS/RTC: Motorola MC146818 / IBM PC AT — 128-byte register file at `0x70`/`0x71`; NMI bit stored only; status C read-to-clear modeled with sticky-zero flags.
+- 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — unit stub only; see `devices::I8042`.
