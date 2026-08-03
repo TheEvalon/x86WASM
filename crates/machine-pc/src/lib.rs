@@ -402,6 +402,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ0 vector 0x08.
@@ -430,6 +431,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -455,6 +457,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
