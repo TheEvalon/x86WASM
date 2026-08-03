@@ -1,4 +1,4 @@
-//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS port wiring.
+//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042 port wiring.
 
 #![forbid(unsafe_code)]
 
@@ -10,9 +10,9 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, DualPic, Pit8254, PortDevice, Serial16550, CMOS_DATA, CMOS_INDEX,
-    PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL,
+    CmosRtc, DebugConsole, DualPic, Pit8254, PortDevice, Serial16550, CMOS_DATA, CMOS_INDEX, I8042,
+    I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+    PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -39,6 +39,8 @@ pub struct Machine {
     pub pit: Pit8254,
     /// MC146818 CMOS/RTC register bank (ports 0x70/0x71).
     pub cmos: CmosRtc,
+    /// 8042 / PS/2 controller (ports 0x60/0x64) — no IRQ1.
+    pub kbd: I8042,
     ports: PortBus,
 }
 
@@ -52,6 +54,7 @@ impl Machine {
             pic: DualPic::new(),
             pit: Pit8254::new(),
             cmos: CmosRtc::new(),
+            kbd: I8042::new(),
             ports: PortBus::new(),
         }
     }
@@ -85,6 +88,7 @@ impl Machine {
         self.pic.reset();
         self.pit.reset();
         self.cmos.reset();
+        self.kbd.reset();
     }
 
     pub fn step(&mut self) -> Result<(), MachineError> {
@@ -95,6 +99,7 @@ impl Machine {
             pic: &mut self.pic,
             pit: &mut self.pit,
             cmos: &mut self.cmos,
+            kbd: &mut self.kbd,
             ports: &mut self.ports,
         };
         step(&mut self.cpu, &mut view)?;
@@ -109,6 +114,7 @@ impl Machine {
             pic: &mut self.pic,
             pit: &mut self.pit,
             cmos: &mut self.cmos,
+            kbd: &mut self.kbd,
             ports: &mut self.ports,
         };
         Ok(run(&mut self.cpu, &mut view, max_steps)?)
@@ -136,6 +142,7 @@ struct MachineBus<'a> {
     pic: &'a mut DualPic,
     pit: &'a mut Pit8254,
     cmos: &'a mut CmosRtc,
+    kbd: &'a mut I8042,
     ports: &'a mut PortBus,
 }
 
@@ -150,6 +157,7 @@ impl MachineBus<'_> {
                 self.pit.port_read(port, size)
             }
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
+            I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
             0x3F8..0x400 => self.com1.port_read(port, size),
             0x402 => self.debug.port_read(port, size),
             _ => self.ports.port_read(port, size),
@@ -165,6 +173,7 @@ impl MachineBus<'_> {
                 self.pit.port_write(port, size, value);
             }
             CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
+            I8042_DATA | I8042_STATUS_CMD => self.kbd.port_write(port, size, value),
             0x3F8..0x400 => self.com1.port_write(port, size, value),
             0x402 => self.debug.port_write(port, size, value),
             _ => self.ports.port_write(port, size, value),
@@ -223,8 +232,10 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        CmosRtc, DualPic, Pit8254, CMOS_DATA, CMOS_INDEX, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A,
+        CmosRtc, DualPic, Pit8254, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMOS_DATA,
+        CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CONTROL, REG_STATUS_A, SELF_TEST_OK,
+        STATUS_IBF, STATUS_OBF,
     };
 
     #[test]
@@ -260,6 +271,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             // Cascaded AT init: master 0x11/0x08/0x04/0x01, slave 0x11/0x70/0x02/0x01.
@@ -297,6 +309,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(PIC_MASTER_CMD, 0x11).unwrap();
@@ -318,6 +331,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -378,6 +392,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             // Mode 3 square wave, lo/hi access: control 0x36, count 0x1000.
@@ -405,6 +420,7 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(CMOS_INDEX).unwrap() & 0x7F, 0);
@@ -472,6 +488,7 @@ mod tests {
     }
 
     /// Unrelated ports stay open-bus; COM1 / debug port 0x402 unchanged.
+    /// Spec: 0x60 is owned by I8042 — empty-buffer read returns 0, status OBF/IBF clear.
     #[test]
     fn unrelated_ports_open_bus_serial_unchanged() {
         let mut m = Machine::new(64 * 1024);
@@ -483,9 +500,15 @@ mod tests {
                 pic: &mut m.pic,
                 pit: &mut m.pit,
                 cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
                 ports: &mut m.ports,
             };
-            assert_eq!(bus.port_in_u8(0x60).unwrap(), 0xFF); // keyboard — unimplemented
+            // 8042 empty output buffer: data read 0; status has no OBF/IBF.
+            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), 0);
+            assert_eq!(
+                bus.port_in_u8(I8042_STATUS_CMD).unwrap() & (STATUS_OBF | STATUS_IBF),
+                0
+            );
             assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF); // POST — unimplemented
             bus.port_out_u8(0x80, 0xAA).unwrap(); // ignored
             bus.port_out_u8(0x3F8, b'Z').unwrap();
@@ -499,9 +522,87 @@ mod tests {
         assert!(!m.pit.channel0().count_loaded);
     }
 
-    /// Reset clears PIC/PIT/CMOS device state like serial recreation.
+    /// Spec: OSDev I8042 — OUT 0x64,0xAA → IN 0x60 == 0x55; OBF around the path.
     #[test]
-    fn reset_clears_pic_pit_cmos() {
+    fn machine_bus_i8042_self_test() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_SELF_TEST).unwrap();
+            assert_ne!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
+            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), SELF_TEST_OK);
+            assert_eq!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
+        }
+    }
+
+    /// Spec: OSDev I8042 — config byte via commands 0x20 (read) / 0x60 (write).
+    #[test]
+    fn machine_bus_i8042_config_read_write() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                ports: &mut m.ports,
+            };
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_READ_CONFIG).unwrap();
+            let default_cfg = bus.port_in_u8(I8042_DATA).unwrap();
+            assert_eq!(default_cfg, 0x50); // clock disable + translate
+
+            let new_cfg = 0x45;
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_CONFIG).unwrap();
+            bus.port_out_u8(I8042_DATA, new_cfg).unwrap();
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_READ_CONFIG).unwrap();
+            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), new_cfg);
+        }
+        assert_eq!(m.kbd.config, 0x45);
+    }
+
+    /// Guest OUT/IN through interpreter → MachineBus 8042 self-test.
+    /// Spec: SDM Vol. 2 OUT/IN imm8; OSDev I8042 self-test 0xAA→0x55.
+    #[test]
+    fn guest_out_in_i8042_self_test() {
+        let mut m = Machine::new(64 * 1024);
+        let prog: &[u8] = &[
+            0xB0,
+            CMD_SELF_TEST, // mov al, 0xAA
+            0xE6,
+            0x64, // out 0x64, al
+            0xE4,
+            0x60, // in al, 0x60
+            0xF4, // hlt
+        ];
+        for (i, b) in prog.iter().enumerate() {
+            m.mem.write_u8(i as u64, *b).unwrap();
+        }
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.halted = false;
+        let steps = m.run(100).unwrap();
+        assert!(steps > 0);
+        assert!(m.cpu.halted);
+        assert_eq!(m.cpu.al(), SELF_TEST_OK);
+    }
+
+    /// Reset clears PIC/PIT/CMOS/8042 device state like serial recreation.
+    #[test]
+    fn reset_clears_pic_pit_cmos_kbd() {
         let mut m = Machine::new(64 * 1024);
         m.pic.port_write(PIC_MASTER_CMD, 1, 0x13);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
@@ -511,12 +612,18 @@ mod tests {
         m.pit.port_write(PIT_CH0_DATA, 1, 0x10);
         m.cmos.port_write(CMOS_INDEX, 1, 0x10);
         m.cmos.port_write(CMOS_DATA, 1, 0xAB);
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        m.kbd.port_write(I8042_DATA, 1, 0x45);
         m.com1.port_write(0x3F8, 1, u32::from(b'X'));
 
         m.reset();
         assert_eq!(m.pic, DualPic::new());
         assert_eq!(m.pit, Pit8254::new());
         assert_eq!(m.cmos, CmosRtc::new());
+        assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.com1_text(), "");
         assert_eq!(m.debug_text(), "");
     }

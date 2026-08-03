@@ -22,16 +22,12 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x43` | 8254 PIT control word |
 | `0x70` | CMOS/RTC index (bits 6:0 = register; bit7 = NMI disable latch) |
 | `0x71` | CMOS/RTC data |
+| `0x60` | 8042 / PS/2 data — **no IRQ1** |
+| `0x64` | 8042 / PS/2 status (read) / command (write) — **no IRQ1** |
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled).
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`). Reset clears PIC/PIT/CMOS like serial. No snapshot schema for these devices yet (serial has none either).
-
-### Unit models not yet on MachineBus
-
-| Port | Device | Notes |
-|---|---|---|
-| `0x60` / `0x64` | 8042 / PS/2 controller (`devices::I8042`, `i8042.rs`) | **Unit model only** — self-test `0xAA`→`0x55`, config byte `0x20`/`0x60`, disable/enable `0xAD`/`0xAE`, status OBF/IBF. **Not** decoded on `MachineBus` yet. No IRQ1, mouse, or A20 side effects. |
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`). Reset clears PIC/PIT/CMOS/8042 like serial. No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
@@ -44,6 +40,7 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - 8259A dual PIC: port-wired on `MachineBus`; ICW1–ICW4, OCW1 IMR, OCW2 non-specific/specific EOI, OCW3 IRR/ISR read select, edge IR assert, fully nested priority, cascade on IR2. **Not yet:** Auto-EOI, rotate, special mask, OCW3 poll command, level-triggered runtime, PIT/CMOS→PIC wiring.
 - 8254 PIT: port-wired on `MachineBus`; channel-0 programming only; does **not** raise IRQ0 (no gate/OUT→PIC wiring).
 - CMOS/RTC: port-wired on `MachineBus`; index/data bank only; does **not** raise IRQ8 (no PIE/AIE/UIE delivery) and does not sync to host wall-clock yet.
+- 8042 / PS/2: port-wired on `MachineBus` (`0x60`/`0x64`); self-test / config / enable-disable stub only; does **not** raise IRQ1 (or IRQ12), no keyboard/mouse protocol, no A20 side effects.
 - APIC deferred to later milestones.
 
 ## Spec / oracle notes
@@ -53,4 +50,4 @@ Stub dispatcher in M1; no VGA/IDE BARs yet.
 - 8259A: Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4, OCW1–OCW3 EOI/IMR/IRR/ISR); classic PC cascade on IRQ2.
 - 8254: Intel 8254 PIT datasheet — channel 0 control word, lo/hi access, latch; no IRQ0 pulse / speaker / DRAM-refresh claims yet.
 - CMOS/RTC: Motorola MC146818 / IBM PC AT — 128-byte register file at `0x70`/`0x71`; NMI bit stored only; status C read-to-clear modeled with sticky-zero flags.
-- 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — unit stub only; see `devices::I8042`.
+- 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — port-wired stub; see `devices::I8042` / `Machine::kbd`.
