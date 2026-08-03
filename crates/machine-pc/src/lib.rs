@@ -452,13 +452,15 @@ impl Bus for MachineBus<'_> {
 
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
-    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, CMOS IRQF → IRQ8, and
-    /// primary IDE INTRQ∧¬nIEN → IRQ14 (level follow) before acknowledge so
+    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, FDC IRQ6, CMOS IRQF → IRQ8,
+    /// and primary IDE INTRQ∧¬nIEN → IRQ14 (level follow) before acknowledge so
     /// edges from prior [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
-    /// [`Machine::tick_cmos`] / IDE command completion are visible.
+    /// [`Machine::tick_cmos`] / FDC [`Fdc82077::assert_irq6`] / IDE completion
+    /// are visible.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());
+        self.pic.set_irq_line(6, self.fdc.irq_line());
         self.pic.set_irq_line(8, self.cmos.irq_line());
         self.pic.set_irq_line(14, self.ide.irq_line());
         self.pic.poll_irq()
@@ -471,12 +473,12 @@ mod tests {
     use devices::{
         CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, CFG_INT1, CFG_TRANSLATE, CMD_ENABLE_KBD,
         CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA,
-        CMOS_INDEX, FDC_DOR, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_RQM, I8042, I8042_DATA,
-        I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
-        PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B,
-        REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF,
-        VGA_CRTC_DATA, VGA_CRTC_INDEX,
+        CMOS_INDEX, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_RQM,
+        I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD,
+        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL,
+        PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A,
+        REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
+        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX,
     };
 
     #[test]
@@ -606,6 +608,19 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0xBF); // unmask slave IR6 (IRQ14)
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR6 (IRQ6 / FDC).
+    fn init_at_pic_unmask_irq6(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xBF); // unmask IR6 (IRQ6)
     }
 
     /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
@@ -1510,5 +1525,39 @@ mod tests {
         m.reset();
         assert_eq!(m.fdc.dor, 0);
         assert_eq!(m.fdc.fifo_latched, 0);
+    }
+
+    /// Spec: Intel 82077AA + OSDev FDC + IBM PC AT — assert_irq6 → IRQ6 → vector 0x0E.
+    #[test]
+    fn fdc_assert_irq6_via_poll_external_irq() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq6(&mut m);
+        m.fdc
+            .port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        m.fdc.assert_irq6();
+        assert!(m.fdc.irq_line());
+        {
+            let mut bus = m.bus_mut();
+            // Spec: AT master ICW2 base 0x08 → IRQ6 vector 0x0E.
+            assert_eq!(bus.poll_external_irq(), Some(0x0E));
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        m.fdc.clear_irq6();
+        assert!(!m.fdc.irq_line());
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+    }
+
+    /// Spec: Intel 82077AA DOR bit3 — without DMA/IRQ enable, assert does not deliver IRQ6.
+    #[test]
+    fn fdc_dor_dma_irq_masks_irq6_on_machine_bus() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq6(&mut m);
+        m.fdc.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N)); // no DMA/IRQ bit
+        m.fdc.assert_irq6();
+        assert!(!m.fdc.irq_line());
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), None);
+        }
     }
 }
