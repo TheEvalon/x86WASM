@@ -1336,8 +1336,8 @@ Progress against implement list:
 - [ ] Interrupts (hardware / PIC-driven) — stub: `CpuState::pending_irq` / `request_interrupt` + per-instruction + REP poll when IF=1; 8259 ICW1–ICW4 unit model present, no OCW/EOI/IRQ delivery yet
 - [ ] 32-bit paging
 - [ ] 8259 PIC — **partial:** `devices::DualPic` ICW1–ICW4 init only (single/cascade, vector base, ICW3 wiring, ICW4 8086-mode); **not** OCW/EOI/IRR/ISR, IRQ assert, or `MachineBus` wiring
-- [ ] 8254 PIT — **partial:** devices::Pit8254 channel-0 programming (control word, lo/hi, latch); ch1/ch2 stub accept; **not** IRQ0/OUT→PIC, speaker, or MachineBus wiring
-- [ ] RTC — **partial:** devices::CmosRtc index/data bank at 0x70/0x71 (NMI latch bit stored; status C read-to-clear); **not** IRQ8/PIE/AIE/UIE, wall-clock sync, or MachineBus wiring
+- [ ] 8254 PIT — **partial:** `devices::Pit8254` channel-0 programming (control word, lo/hi, latch); ch1/ch2 stub accept; **not** IRQ0/OUT→PIC, speaker, or `MachineBus` wiring
+- [ ] RTC — **partial:** `devices::CmosRtc` index/data bank at 0x70/0x71 (NMI latch bit stored; status C read-to-clear); **not** IRQ8/PIE/AIE/UIE, wall-clock sync, or `MachineBus` wiring
 - [ ] DMA
 - [ ] PS/2 controller
 - [ ] PCI configuration space
