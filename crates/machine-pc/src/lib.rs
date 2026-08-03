@@ -1,4 +1,4 @@
-//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA wiring.
+//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA/PCI wiring.
 
 #![forbid(unsafe_code)]
 
@@ -10,8 +10,8 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DualPic, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA,
-    CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    CmosRtc, DebugConsole, Dma8237, DualPic, PciConfig, Pit8254, PortDevice, Serial16550, VgaText,
+    CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
     PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
     PORT_SYSTEM_CONTROL,
 };
@@ -46,6 +46,8 @@ pub struct Machine {
     pub dma: Dma8237,
     /// VGA color text plane at 0xB8000 (32 KiB stub; no CRTC).
     pub vga: VgaText,
+    /// PCI configuration mechanism #1 (ports 0xCF8 / 0xCFC–0xCFF).
+    pub pci: PciConfig,
     ports: PortBus,
 }
 
@@ -62,6 +64,7 @@ impl Machine {
             kbd: I8042::new(),
             dma: Dma8237::new(),
             vga: VgaText::new(),
+            pci: PciConfig::new(),
             ports: PortBus::new(),
         }
     }
@@ -98,8 +101,27 @@ impl Machine {
         self.kbd.reset();
         self.dma.reset();
         self.vga.reset();
+        self.pci.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
+    }
+
+    /// Borrow the decode view for tests (`step`/`run` keep split borrows of `cpu`).
+    #[cfg(test)]
+    fn bus_mut(&mut self) -> MachineBus<'_> {
+        MachineBus {
+            mem: &mut self.mem,
+            com1: &mut self.com1,
+            debug: &mut self.debug,
+            pic: &mut self.pic,
+            pit: &mut self.pit,
+            cmos: &mut self.cmos,
+            kbd: &mut self.kbd,
+            dma: &mut self.dma,
+            vga: &mut self.vga,
+            pci: &mut self.pci,
+            ports: &mut self.ports,
+        }
     }
 
     /// Sync [`PhysMem`] A20 mask from the 8042 output-port bit1.
@@ -108,6 +130,7 @@ impl Machine {
     }
 
     pub fn step(&mut self) -> Result<(), MachineError> {
+        // Constructed inline so `cpu` stays independently borrowable from the bus view.
         let mut view = MachineBus {
             mem: &mut self.mem,
             com1: &mut self.com1,
@@ -118,6 +141,7 @@ impl Machine {
             kbd: &mut self.kbd,
             dma: &mut self.dma,
             vga: &mut self.vga,
+            pci: &mut self.pci,
             ports: &mut self.ports,
         };
         step(&mut self.cpu, &mut view)?;
@@ -135,6 +159,7 @@ impl Machine {
             kbd: &mut self.kbd,
             dma: &mut self.dma,
             vga: &mut self.vga,
+            pci: &mut self.pci,
             ports: &mut self.ports,
         };
         Ok(run(&mut self.cpu, &mut view, max_steps)?)
@@ -262,6 +287,7 @@ struct MachineBus<'a> {
     kbd: &'a mut I8042,
     dma: &'a mut Dma8237,
     vga: &'a mut VgaText,
+    pci: &'a mut PciConfig,
     ports: &'a mut PortBus,
 }
 
@@ -270,6 +296,9 @@ impl MachineBus<'_> {
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if Dma8237::owns_port(port) {
             return self.dma.port_read(port, size);
+        }
+        if PciConfig::owns_port(port) {
+            return self.pci.port_read(port, size);
         }
         match port {
             PIC_MASTER_CMD | PIC_MASTER_DATA | PIC_SLAVE_CMD | PIC_SLAVE_DATA => {
@@ -290,6 +319,10 @@ impl MachineBus<'_> {
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
         if Dma8237::owns_port(port) {
             self.dma.port_write(port, size, value);
+            return;
+        }
+        if PciConfig::owns_port(port) {
+            self.pci.port_write(port, size, value);
             return;
         }
         match port {
@@ -390,12 +423,13 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        CmosRtc, DualPic, Pit8254, CFG_INT1, CFG_TRANSLATE, CMD_ENABLE_KBD, CMD_READ_CONFIG,
-        CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, I8042,
-        I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
-        PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2,
-        PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C,
-        SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF,
+        CmosRtc, DualPic, PciConfig, Pit8254, CFG_INT1, CFG_TRANSLATE, CMD_ENABLE_KBD,
+        CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA,
+        CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
+        PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA,
+        PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL,
+        REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE,
+        STC_IRQF, STC_PF,
     };
 
     #[test]
@@ -424,18 +458,7 @@ mod tests {
     fn machine_bus_programs_dual_pic_icw() {
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // Cascaded AT init: master 0x11/0x08/0x04/0x01, slave 0x11/0x70/0x02/0x01.
             bus.port_out_u8(PIC_MASTER_CMD, 0x11).unwrap();
             bus.port_out_u8(PIC_MASTER_DATA, 0x08).unwrap();
@@ -464,18 +487,7 @@ mod tests {
     fn machine_bus_poll_external_irq_from_pic() {
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             bus.port_out_u8(PIC_MASTER_CMD, 0x11).unwrap();
             bus.port_out_u8(PIC_MASTER_DATA, 0x08).unwrap();
             bus.port_out_u8(PIC_MASTER_DATA, 0x04).unwrap();
@@ -488,18 +500,7 @@ mod tests {
         }
         m.pic.set_irq_line(0, true);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), Some(0x08));
             assert_eq!(bus.poll_external_irq(), None);
         }
@@ -560,18 +561,7 @@ mod tests {
         m.tick_pit(4);
         assert!(m.pit.out_ch0());
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // Spec: AT master ICW2 base 0x08 → IRQ0 vector 0x08.
             assert_eq!(bus.poll_external_irq(), Some(0x08));
             assert_eq!(bus.poll_external_irq(), None);
@@ -591,18 +581,7 @@ mod tests {
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 3
         m.tick_pit(4);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), Some(0x08));
             bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
         }
@@ -619,18 +598,7 @@ mod tests {
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 4
         m.tick_pit(5);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), Some(0x08));
             bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
         }
@@ -649,18 +617,7 @@ mod tests {
         m.tick_cmos(1);
         assert!(m.cmos.irq_line());
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // Spec: AT slave ICW2 base 0x70 → IRQ8 vector 0x70.
             assert_eq!(bus.poll_external_irq(), Some(0x70));
             assert_eq!(bus.poll_external_irq(), None);
@@ -686,18 +643,7 @@ mod tests {
         m.tick_cmos(1);
         assert!(!m.cmos.irq_line());
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), None);
         }
     }
@@ -714,18 +660,7 @@ mod tests {
         assert!(m.kbd_place_output(0x1C));
         assert!(m.kbd.irq1_line());
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
             assert_eq!(bus.poll_external_irq(), Some(0x09));
             assert_eq!(bus.poll_external_irq(), None);
@@ -752,18 +687,7 @@ mod tests {
         assert!(m.kbd_inject_scancode(0x1C));
         assert!(m.kbd.irq1_line());
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
             assert_eq!(bus.poll_external_irq(), Some(0x09));
             assert_eq!(bus.poll_external_irq(), None);
@@ -786,18 +710,7 @@ mod tests {
         assert!(!m.kbd.irq1_line());
         assert_eq!(m.kbd.status() & STATUS_OBF, 0);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), None);
         }
     }
@@ -811,18 +724,7 @@ mod tests {
         assert!(!m.kbd_place_output(0xAA));
         assert!(!m.kbd.irq1_line());
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), None);
         }
     }
@@ -872,18 +774,7 @@ mod tests {
     fn machine_bus_programs_pit_channel0() {
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // Mode 3 square wave, lo/hi access: control 0x36, count 0x1000.
             bus.port_out_u8(PIT_CONTROL, 0x36).unwrap();
             bus.port_out_u8(PIT_CH0_DATA, 0x00).unwrap();
@@ -902,18 +793,7 @@ mod tests {
     fn machine_bus_cmos_index_data() {
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.port_in_u8(CMOS_INDEX).unwrap() & 0x7F, 0);
             bus.port_out_u8(CMOS_INDEX, 0x80 | 0x10).unwrap(); // NMI disable + index 0x10
             bus.port_out_u8(CMOS_DATA, 0x5A).unwrap();
@@ -984,18 +864,7 @@ mod tests {
     fn unrelated_ports_open_bus_serial_unchanged() {
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // 8042 empty output buffer: data read 0; status has no OBF/IBF.
             assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), 0);
             assert_eq!(
@@ -1020,18 +889,7 @@ mod tests {
     fn machine_bus_i8042_self_test() {
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
             bus.port_out_u8(I8042_STATUS_CMD, CMD_SELF_TEST).unwrap();
             assert_ne!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
@@ -1045,18 +903,7 @@ mod tests {
     fn machine_bus_i8042_config_read_write() {
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             bus.port_out_u8(I8042_STATUS_CMD, CMD_READ_CONFIG).unwrap();
             let default_cfg = bus.port_in_u8(I8042_DATA).unwrap();
             assert_eq!(default_cfg, 0x50); // clock disable + translate
@@ -1105,18 +952,7 @@ mod tests {
         m.pit.port_write(PIT_CH2_DATA, 1, 0x02);
         m.pit.port_write(PIT_CH2_DATA, 1, 0x00);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_eq!(bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & 0x03, 0);
             bus.port_out_u8(PORT_SYSTEM_CONTROL, PORT61_GATE2 | PORT61_SPKR_DATA)
                 .unwrap();
@@ -1130,18 +966,7 @@ mod tests {
         m.tick_pit(2);
         assert!(m.pit.out_ch2());
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             assert_ne!(
                 bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & PORT61_OUT2,
                 0
@@ -1174,7 +999,7 @@ mod tests {
         assert!(m.pit.speaker_data_enabled());
     }
 
-    /// Reset clears PIC/PIT/CMOS/8042 device state like serial recreation.
+    /// Reset clears PIC/PIT/CMOS/8042/PCI device state like serial recreation.
     #[test]
     fn reset_clears_pic_pit_cmos_kbd() {
         let mut m = Machine::new(64 * 1024);
@@ -1191,6 +1016,11 @@ mod tests {
         m.kbd
             .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
         m.kbd.port_write(I8042_DATA, 1, 0x45);
+        m.pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, 0x00, true),
+        );
         m.com1.port_write(0x3F8, 1, u32::from(b'X'));
 
         m.reset();
@@ -1198,6 +1028,7 @@ mod tests {
         assert_eq!(m.pit, Pit8254::new());
         assert_eq!(m.cmos, CmosRtc::new());
         assert_eq!(m.kbd, I8042::new());
+        assert_eq!(m.pci, PciConfig::new());
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
         assert_eq!(m.debug_text(), "");
@@ -1211,18 +1042,7 @@ mod tests {
         m.mem.write_u8(0, 0x11).unwrap();
         m.mem.write_u8(1 << 20, 0x22).unwrap();
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
                 .unwrap();
             bus.port_out_u8(I8042_DATA, 0xDD).unwrap(); // A20 off
@@ -1232,18 +1052,7 @@ mod tests {
         assert_eq!(m.mem.read_u8(1 << 20).unwrap(), 0x11);
 
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
                 .unwrap();
             bus.port_out_u8(I8042_DATA, 0xDF).unwrap(); // A20 on
@@ -1290,18 +1099,7 @@ mod tests {
         use devices::DMA_PAGE_CH2;
         let mut m = Machine::new(64 * 1024);
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             bus.port_out_u8(0x00, 0xCD).unwrap();
             bus.port_out_u8(0x00, 0xAB).unwrap();
             // Flip-flop advanced; clear via 0x0C then read back.
@@ -1339,18 +1137,7 @@ mod tests {
         // Poison underlying RAM at the same physical address.
         m.mem.write_u8(VGA_TEXT_BASE, 0xEE).unwrap();
         {
-            let mut bus = MachineBus {
-                mem: &mut m.mem,
-                com1: &mut m.com1,
-                debug: &mut m.debug,
-                pic: &mut m.pic,
-                pit: &mut m.pit,
-                cmos: &mut m.cmos,
-                kbd: &mut m.kbd,
-                dma: &mut m.dma,
-                vga: &mut m.vga,
-                ports: &mut m.ports,
-            };
+            let mut bus = m.bus_mut();
             // Reset default is space, not the RAM poison.
             assert_eq!(bus.read_u8(VGA_TEXT_BASE).unwrap(), b' ');
             bus.write_u8(VGA_TEXT_BASE, b'X').unwrap();
@@ -1374,5 +1161,41 @@ mod tests {
         m.reset();
         assert_eq!(m.vga.char_at(0, 0), Some(b' '));
         assert_eq!(m.vga.attr_at(0, 0), Some(0x07));
+    }
+
+    /// Spec: PCI Local Bus Mechanism #1 — host bridge vendor/device via MachineBus.
+    #[test]
+    fn machine_bus_pci_host_bridge_vendor() {
+        let mut m = Machine::new(64 * 1024);
+        let mut bus = m.bus_mut();
+        bus.port_out_u32(
+            PCI_CONFIG_ADDRESS,
+            PciConfig::make_address(0, 0, 0, 0x00, true),
+        )
+        .unwrap();
+        assert_eq!(bus.port_in_u32(PCI_CONFIG_DATA).unwrap(), 0x1237_8086);
+        assert_eq!(bus.port_in_u8(PCI_CONFIG_DATA).unwrap(), 0x86);
+    }
+
+    /// Spec: OSDev PCI — absent slot reads 0xFFFFFFFF; enable-clear open-bus.
+    #[test]
+    fn machine_bus_pci_absent_and_enable_clear() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 0x1F, 0, 0x00, true),
+            )
+            .unwrap();
+            assert_eq!(bus.port_in_u32(PCI_CONFIG_DATA).unwrap(), 0xFFFF_FFFF);
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 0, 0, 0x00, false),
+            )
+            .unwrap();
+            assert_eq!(bus.port_in_u32(PCI_CONFIG_DATA).unwrap(), 0xFFFF_FFFF);
+        }
+        assert_eq!(m.pci.address & (1 << 31), 0);
     }
 }

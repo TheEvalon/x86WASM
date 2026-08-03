@@ -31,10 +31,12 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x87`/`0x83`/`0x81`/`0x82` | DMA page registers ch0–3 |
 | `0x8F`/`0x8B`/`0x89`/`0x8A` | DMA page registers ch4–7 |
 | `0x80` | POST/diagnostic (open-bus read `0xFF`; **not** a DMA page) |
+| `0xCF8`–`0xCFB` | PCI `CONFIG_ADDRESS` (Type 1 latch; bits 1:0 hardwired 0) |
+| `0xCFC`–`0xCFF` | PCI `CONFIG_DATA` (byte/word/dword lanes) |
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled). Unused page holes (`0x84`–`0x86`, `0x88`, `0x8C`–`0x8E`) stay open-bus.
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO). Reset clears PIC/PIT/CMOS/8042/DMA/VGA like serial. No snapshot schema for these devices yet (serial has none either).
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO), `devices::PciConfig` (`pci.rs`, field `Machine::pci`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/PCI like serial. No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
@@ -61,3 +63,4 @@ Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices
 - 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — port-wired; config INT1 + OBF → ISA IRQ1; make-code inject → OBF (clock-disable respected; translation passthrough); output-port bit1 → A20; see `devices::I8042` / `Machine::kbd`.
 - 8237A DMA: Intel 8237A + OSDev ISA DMA — dual controllers + AT page regs on `MachineBus`; programming accepted (flip-flop/addr/count/mode/mask); **no** memory transfer engine / DREQ/DACK/TC. Port `0x80` remains POST.
 - VGA text: IBM VGA / OSDev Text UI — `0xB8000` char+attr plane on `MachineBus`; no CRTC port model yet.
+- PCI config: PCI Local Bus Mechanism #1 + OSDev PCI — `0xCF8`/`0xCFC` on `MachineBus`; host bridge `00:00.0` identity `8086:1237` (i440FX-class stub), class host bridge, header type 0; absent devices and enable-bit-clear data reads return `0xFFFFFFFF`. **Not yet:** PIIX device tree, BAR MMIO decode, bus mastering, caps/MSI/PCIe.
