@@ -1214,6 +1214,41 @@ mod tests {
         assert_eq!(m.pci.address & (1 << 31), 0);
     }
 
+    /// Spec: PCI + PIIX3 public IDs — MachineBus enumerates 00:01.0 / 00:01.1.
+    #[test]
+    fn machine_bus_pci_piix_isa_and_ide() {
+        use devices::{PCI_DEVICE_PIIX3_IDE, PCI_DEVICE_PIIX3_ISA, PCI_HEADER_MULTIFUNCTION};
+        let mut m = Machine::new(64 * 1024);
+        let mut bus = m.bus_mut();
+        bus.port_out_u32(
+            PCI_CONFIG_ADDRESS,
+            PciConfig::make_address(0, 1, 0, 0x00, true),
+        )
+        .unwrap();
+        assert_eq!(
+            bus.port_in_u32(PCI_CONFIG_DATA).unwrap(),
+            (u32::from(PCI_DEVICE_PIIX3_ISA) << 16) | 0x8086
+        );
+        bus.port_out_u32(
+            PCI_CONFIG_ADDRESS,
+            PciConfig::make_address(0, 1, 0, 0x0C, true),
+        )
+        .unwrap();
+        assert_eq!(
+            ((bus.port_in_u32(PCI_CONFIG_DATA).unwrap() >> 16) & 0xFF) as u8,
+            PCI_HEADER_MULTIFUNCTION
+        );
+        bus.port_out_u32(
+            PCI_CONFIG_ADDRESS,
+            PciConfig::make_address(0, 1, 1, 0x00, true),
+        )
+        .unwrap();
+        assert_eq!(
+            bus.port_in_u32(PCI_CONFIG_DATA).unwrap(),
+            (u32::from(PCI_DEVICE_PIIX3_IDE) << 16) | 0x8086
+        );
+    }
+
     /// Spec: ATA/ATAPI + OSDev ATA PIO — MachineBus primary IDE IDENTIFY + READ SECTORS.
     #[test]
     fn machine_bus_ide_identify_and_read_sectors() {
