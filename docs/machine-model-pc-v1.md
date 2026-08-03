@@ -33,7 +33,7 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x80` | POST/diagnostic (open-bus read `0xFF`; **not** a DMA page) |
 | `0xCF8`–`0xCFB` | PCI `CONFIG_ADDRESS` (Type 1 latch; bits 1:0 hardwired 0) |
 | `0xCFC`–`0xCFF` | PCI `CONFIG_DATA` (byte/word/dword lanes) |
-| `0x1F0`–`0x1F7` | Primary IDE command block — IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO stub |
+| `0x1F0`–`0x1F7` | Primary IDE command block — IDENTIFY (`0xEC`) + READ (`0x20`) + WRITE (`0x30`) SECTORS PIO stub |
 | `0x3F6` | Primary IDE alternate status (R) / device control (W; SRST/nIEN) |
 | `0x3D4` / `0x3D5` | VGA color CRTC index / data — noop register file (indexes `0x00`–`0x18`) |
 | `0x3F0`–`0x3F5`, `0x3F7` | 82077AA FDC — SRA/SRB/DOR/TDR/MSR\|DSR/FIFO/DIR\|CCR stub (no media) |
@@ -68,5 +68,5 @@ Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices
 - 8237A DMA: Intel 8237A + OSDev ISA DMA — dual controllers + AT page regs on `MachineBus`; programming accepted (flip-flop/addr/count/mode/mask); **no** memory transfer engine / DREQ/DACK/TC. Port `0x80` remains POST.
 - VGA text: IBM VGA / OSDev Text UI / OSDev VGA Hardware — `0xB8000` char+attr plane + CRTC `0x3D4`/`0x3D5` noop on `MachineBus`; **not** sequencer/GC/ATC/timing/render.
 - PCI config: PCI Local Bus Mechanism #1 + OSDev PCI — `0xCF8`/`0xCFC` on `MachineBus`; host bridge `00:00.0` identity `8086:1237` (i440FX-class stub), class host bridge, header type 0; PIIX3-style stubs at `00:01.0` ISA bridge `8086:7000` (multi-function, class `0x0601`) and `00:01.1` IDE `8086:7010` (class `0x0101`, prog IF `0x80`); absent devices and enable-bit-clear data reads return `0xFFFFFFFF`. **Not yet:** USB/ACPI PIIX functions, BAR MMIO decode, bus mastering, caps/MSI/PCIe.
-- Primary IDE: ATA/ATAPI + OSDev ATA PIO — `IdePrimary` on `0x1F0`–`0x1F7`/`0x3F6`; IDENTIFY DEVICE + READ SECTORS (LBA28) PIO; DRQ/BSY/DRDY/ERR; backing `Vec<u8>` image; IRQ14 via `irq_line()` → `DualPic` when nIEN=0 (status read clears; alt status does not). **Not yet:** ATAPI, WRITE, DMA, slave, secondary, LBA48, SeaBIOS boot.
+- Primary IDE: ATA/ATAPI + OSDev ATA PIO — `IdePrimary` on `0x1F0`–`0x1F7`/`0x3F6`; IDENTIFY DEVICE + READ/WRITE SECTORS (LBA28) PIO; DRQ/BSY/DRDY/ERR; backing `Vec<u8>` image; IRQ14 via `irq_line()` → `DualPic` when nIEN=0 (status read clears; alt status does not). **Not yet:** ATAPI, DMA, slave, secondary, LBA48, SeaBIOS boot.
 - FDC: Intel 82077AA + OSDev FDC — `Fdc82077` on `0x3F0`–`0x3F5`/`0x3F7` (not `0x3F6`); DOR/MSR/FIFO/DIR/CCR accept; MSR RQM when DOR nRESET set. **Not yet:** command engine, media image, DMA ch2, IRQ6, disk-change timing.

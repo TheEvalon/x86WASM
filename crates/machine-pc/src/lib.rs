@@ -1304,13 +1304,13 @@ mod tests {
         );
     }
 
-    /// Spec: ATA/ATAPI + OSDev ATA PIO — MachineBus primary IDE IDENTIFY + READ SECTORS.
+    /// Spec: ATA/ATAPI + OSDev ATA PIO — MachineBus primary IDE IDENTIFY + READ/WRITE SECTORS.
     #[test]
     fn machine_bus_ide_identify_and_read_sectors() {
         use devices::{
-            ATA_CMD_IDENTIFY, ATA_CMD_READ_SECTORS, ATA_DRIVE_LBA, ATA_SR_DRQ, IDE_PRIMARY_DATA,
-            IDE_PRIMARY_DRIVE, IDE_PRIMARY_LBA_HI, IDE_PRIMARY_LBA_LO, IDE_PRIMARY_LBA_MID,
-            IDE_PRIMARY_SECCOUNT, IDE_PRIMARY_STATUS,
+            ATA_CMD_IDENTIFY, ATA_CMD_READ_SECTORS, ATA_CMD_WRITE_SECTORS, ATA_DRIVE_LBA,
+            ATA_SR_DRQ, IDE_PRIMARY_DATA, IDE_PRIMARY_DRIVE, IDE_PRIMARY_LBA_HI,
+            IDE_PRIMARY_LBA_LO, IDE_PRIMARY_LBA_MID, IDE_PRIMARY_SECCOUNT, IDE_PRIMARY_STATUS,
         };
         let mut img = vec![0u8; 512 * 2];
         img[0] = 0xDE;
@@ -1340,7 +1340,37 @@ mod tests {
                 .unwrap();
             assert_ne!(bus.port_in_u8(IDE_PRIMARY_STATUS).unwrap() & ATA_SR_DRQ, 0);
             assert_eq!(bus.port_in_u16(IDE_PRIMARY_DATA).unwrap(), 0xADDE);
+            for _ in 1..256 {
+                let _ = bus.port_in_u16(IDE_PRIMARY_DATA).unwrap();
+            }
+
+            // WRITE SECTORS LBA1 then READ back.
+            bus.port_out_u8(IDE_PRIMARY_DRIVE, 0xA0 | ATA_DRIVE_LBA)
+                .unwrap();
+            bus.port_out_u8(IDE_PRIMARY_SECCOUNT, 1).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_LO, 1).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_MID, 0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_HI, 0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_STATUS, ATA_CMD_WRITE_SECTORS)
+                .unwrap();
+            assert_ne!(bus.port_in_u8(IDE_PRIMARY_STATUS).unwrap() & ATA_SR_DRQ, 0);
+            bus.port_out_u16(IDE_PRIMARY_DATA, 0x55AA).unwrap();
+            for _ in 1..256 {
+                bus.port_out_u16(IDE_PRIMARY_DATA, 0).unwrap();
+            }
+            assert_eq!(bus.port_in_u8(IDE_PRIMARY_STATUS).unwrap() & ATA_SR_DRQ, 0);
+            bus.port_out_u8(IDE_PRIMARY_DRIVE, 0xA0 | ATA_DRIVE_LBA)
+                .unwrap();
+            bus.port_out_u8(IDE_PRIMARY_SECCOUNT, 1).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_LO, 1).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_MID, 0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_HI, 0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_STATUS, ATA_CMD_READ_SECTORS)
+                .unwrap();
+            assert_eq!(bus.port_in_u16(IDE_PRIMARY_DATA).unwrap(), 0x55AA);
         }
+        assert_eq!(m.ide.image[512], 0xAA);
+        assert_eq!(m.ide.image[513], 0x55);
     }
 
     #[test]

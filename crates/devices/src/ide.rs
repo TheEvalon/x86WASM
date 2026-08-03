@@ -1,15 +1,16 @@
-//! Primary ATA IDE channel — IDENTIFY + READ SECTORS PIO + IRQ14 stub.
+//! Primary ATA IDE channel — IDENTIFY + READ/WRITE SECTORS PIO + IRQ14 stub.
 //!
 //! Classic PC primary command block `0x1F0`–`0x1F7` and control block `0x3F6`.
 //!
 //! # Spec refs
 //!
 //! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
-//!   task-file registers, status bits BSY/DRDY/DRQ/ERR, LBA28 addressing;
-//!   device control nIEN; INTRQ when drive needs attention.
-//! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ IRQ+PIO sequence,
+//!   WRITE SECTORS (`0x30`), task-file registers, status bits BSY/DRDY/DRQ/ERR,
+//!   LBA28 addressing; device control nIEN; INTRQ when drive needs attention.
+//! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ/WRITE IRQ+PIO sequence,
 //!   status read clears IRQ / alternate status does not, 256-word PIO,
-//!   sector-count `0` = 256 sectors; primary channel → ISA IRQ14.
+//!   sector-count `0` = 256 sectors; primary channel → ISA IRQ14;
+//!   WRITE: host fills data port after DRQ.
 //! - IBM PC/AT IDE — alternate status / device control at `0x3F6`; IRQ14.
 //! - Intel 8259A — DualPic IR14 (slave IR6) vectoring via MachineBus.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.5 / §21 PIIX IDE.
@@ -17,7 +18,7 @@
 //! # Scope (this slice)
 //!
 //! - Primary channel master only; optional backing image (`Vec<u8>`)
-//! - Commands: IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`) PIO
+//! - Commands: IDENTIFY (`0xEC`), READ SECTORS (`0x20`), WRITE SECTORS (`0x30`) PIO
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
@@ -27,7 +28,7 @@
 //! # Unsupported (explicit)
 //!
 //! - ATAPI PACKET / IDENTIFY PACKET DEVICE
-//! - WRITE SECTORS, DMA IDE (UDMA/MDMA), LBA48
+//! - DMA IDE (UDMA/MDMA), WRITE DMA, LBA48
 //! - Slave drive, secondary channel (`0x170`), IRQ15
 //! - SeaBIOS / PCI IDE BAR remapping
 
@@ -67,6 +68,8 @@ pub const ATA_SR_ERR: u8 = 0x01;
 pub const ATA_CMD_IDENTIFY: u8 = 0xEC;
 /// READ SECTORS (with retry) — LBA28 PIO.
 pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
+/// WRITE SECTORS (with retry) — LBA28 PIO.
+pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
 
 /// Device control: software reset.
 pub const ATA_DC_SRST: u8 = 0x04;
@@ -102,12 +105,14 @@ pub struct IdePrimary {
     /// Current PIO sector payload (512 bytes).
     pio: [u8; SECTOR_SIZE],
     pio_off: usize,
-    /// Sectors still to present after the current PIO block (incl. current).
+    /// Sectors still to present/accept after the current PIO block (incl. current).
     sectors_left: u32,
-    /// Next LBA to load when advancing multi-sector READ.
+    /// Next LBA to load (READ) or LBA of current PIO block (WRITE).
     next_lba: u32,
     /// True while host must drain/fill the data port under DRQ.
     transferring: bool,
+    /// True = host→device WRITE PIO; false = device→host READ/IDENTIFY PIO.
+    pio_in: bool,
 }
 
 impl Default for IdePrimary {
@@ -137,6 +142,7 @@ impl IdePrimary {
             sectors_left: 0,
             next_lba: 0,
             transferring: false,
+            pio_in: false,
         }
     }
 
@@ -182,6 +188,7 @@ impl IdePrimary {
         self.sectors_left = 0;
         self.next_lba = 0;
         self.transferring = false;
+        self.pio_in = false;
         self.status = if self.present {
             ATA_SR_DRDY | ATA_SR_DSC
         } else {
@@ -272,10 +279,22 @@ impl IdePrimary {
 
     fn begin_pio_out(&mut self) {
         self.pio_off = 0;
+        self.pio_in = false;
         self.transferring = true;
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
         self.error = 0;
         // Spec: OSDev ATA PIO — IRQ when data ready (DRQ) if nIEN clear.
+        self.raise_irq();
+    }
+
+    fn begin_pio_in(&mut self) {
+        self.pio_off = 0;
+        self.pio.fill(0);
+        self.pio_in = true;
+        self.transferring = true;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        self.error = 0;
+        // Spec: OSDev ATA PIO WRITE — IRQ when DRQ set (host may fill data).
         self.raise_irq();
     }
 
@@ -294,9 +313,24 @@ impl IdePrimary {
         true
     }
 
+    fn store_sector_from_pio(&mut self, lba: u32) -> bool {
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            return false;
+        }
+        let start = (lba as usize) * SECTOR_SIZE;
+        let end = start + SECTOR_SIZE;
+        if end > self.image.len() {
+            self.image.resize(end, 0);
+        }
+        self.image[start..end].copy_from_slice(&self.pio);
+        true
+    }
+
     fn abort_command(&mut self, error: u8) {
         self.error = error;
         self.transferring = false;
+        self.pio_in = false;
         self.sectors_left = 0;
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_ERR;
         // Spec: ATA — INTRQ on error completion when interrupts enabled.
@@ -340,16 +374,42 @@ impl IdePrimary {
         self.begin_pio_out();
     }
 
+    fn exec_write_sectors(&mut self) {
+        // Spec: ATA WRITE SECTORS (0x30) — LBA28 PIO; host fills 256 words/sector.
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(0x04); // ABRT — CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.sectors_left = count;
+        self.next_lba = lba;
+        self.begin_pio_in();
+    }
+
     fn exec_command(&mut self, cmd: u8) {
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
+            ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
             _ => self.abort_command(0x04), // ABRT — unsupported command
         }
     }
 
     fn read_data(&mut self, size: u8) -> u32 {
-        if !self.transferring || self.status & ATA_SR_DRQ == 0 {
+        if !self.transferring || self.pio_in || self.status & ATA_SR_DRQ == 0 {
             return 0xFFFF_FFFF;
         }
         let mut val = 0u32;
@@ -365,17 +425,38 @@ impl IdePrimary {
             }
         }
         if self.pio_off >= SECTOR_SIZE {
-            self.finish_sector_pio();
+            self.finish_sector_pio_out();
         }
         val
     }
 
-    fn finish_sector_pio(&mut self) {
+    fn write_data(&mut self, size: u8, value: u32) {
+        if !self.transferring || !self.pio_in || self.status & ATA_SR_DRQ == 0 {
+            return;
+        }
+        let nbytes = match size {
+            4 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        for i in 0..nbytes {
+            if self.pio_off < SECTOR_SIZE {
+                self.pio[self.pio_off] = ((value >> (8 * i)) & 0xFF) as u8;
+                self.pio_off += 1;
+            }
+        }
+        if self.pio_off >= SECTOR_SIZE {
+            self.finish_sector_pio_in();
+        }
+    }
+
+    fn finish_sector_pio_out(&mut self) {
         if self.sectors_left > 0 {
             self.sectors_left -= 1;
         }
         if self.sectors_left == 0 {
             self.transferring = false;
+            self.pio_in = false;
             self.pio_off = 0;
             self.status = ATA_SR_DRDY | ATA_SR_DSC;
             self.sector_count = 0;
@@ -396,6 +477,41 @@ impl IdePrimary {
             self.sector_count = self.sector_count.wrapping_sub(1);
         }
         // Spec: OSDev ATA PIO — IRQ again when next sector DRQ ready.
+        self.raise_irq();
+    }
+
+    fn finish_sector_pio_in(&mut self) {
+        // Spec: ATA WRITE SECTORS — commit filled sector, then next DRQ or complete.
+        let lba = self.next_lba;
+        if !self.store_sector_from_pio(lba) {
+            self.abort_command(0x10);
+            return;
+        }
+        if self.sectors_left > 0 {
+            self.sectors_left -= 1;
+        }
+        if self.sectors_left == 0 {
+            self.transferring = false;
+            self.pio_in = false;
+            self.pio_off = 0;
+            self.status = ATA_SR_DRDY | ATA_SR_DSC;
+            self.sector_count = 0;
+            // Spec: ATA — INTRQ on WRITE command completion.
+            self.raise_irq();
+            return;
+        }
+        self.next_lba = lba.wrapping_add(1);
+        if self.next_lba >= self.total_sectors() {
+            self.abort_command(0x10);
+            return;
+        }
+        self.pio_off = 0;
+        self.pio.fill(0);
+        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        if self.sector_count != 0 {
+            self.sector_count = self.sector_count.wrapping_sub(1);
+        }
+        // Spec: OSDev ATA PIO WRITE — IRQ when next sector DRQ ready.
         self.raise_irq();
     }
 
@@ -453,10 +569,7 @@ impl PortDevice for IdePrimary {
 
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
         match port {
-            IDE_PRIMARY_DATA => {
-                // Writes unsupported in this slice (no WRITE SECTORS).
-                let _ = (size, value);
-            }
+            IDE_PRIMARY_DATA => self.write_data(size, value),
             IDE_PRIMARY_ERROR => self.features = value as u8,
             IDE_PRIMARY_SECCOUNT => self.sector_count = value as u8,
             IDE_PRIMARY_LBA_LO => self.lba_lo = value as u8,
@@ -727,5 +840,125 @@ mod tests {
         // Second sector under DRQ → IRQ again.
         assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
         assert!(ide.irq_line());
+    }
+
+    fn write_sector_words(ide: &mut IdePrimary, first: u16, last: u16) {
+        ide.port_write(IDE_PRIMARY_DATA, 2, u32::from(first));
+        for _ in 1..255 {
+            ide.port_write(IDE_PRIMARY_DATA, 2, 0);
+        }
+        ide.port_write(IDE_PRIMARY_DATA, 2, u32::from(last));
+    }
+
+    #[test]
+    fn write_sectors_lba28_pio() {
+        // Spec: ATA WRITE SECTORS (0x30) — LBA28, 256 words/sector into media.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 3]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(ide.image[SECTOR_SIZE], 0xAA);
+        assert_eq!(ide.image[SECTOR_SIZE + 1], 0x55);
+        assert_eq!(ide.image[SECTOR_SIZE + 511], 0xC3);
+    }
+
+    #[test]
+    fn write_sectors_multi_two() {
+        // Spec: ATA WRITE SECTORS — multi-sector PIO commits each sector in order.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words(&mut ide, 0x0011, 0);
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words(&mut ide, 0x0022, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        assert_eq!(ide.image[0], 0x11);
+        assert_eq!(ide.image[SECTOR_SIZE], 0x22);
+    }
+
+    #[test]
+    fn write_oob_sets_err() {
+        // Spec: ATA — out-of-range LBA → ERR (IDNF-style).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn write_sectors_asserts_irq_on_drq_and_complete() {
+        // Spec: ATA WRITE + OSDev — IRQ at DRQ and again at command complete.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1); // ack DRQ IRQ
+        assert!(!ide.irq_line());
+        write_sector_words(&mut ide, 0xBEEF, 0);
+        // Completion IRQ after final sector commit.
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_nien_masks_irq_line() {
+        // Spec: ATA device control — nIEN=1 disables INTRQ during WRITE.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_then_read_round_trip() {
+        // Spec: WRITE then READ SECTORS see committed media.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0xC300);
     }
 }
