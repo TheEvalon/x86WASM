@@ -2,13 +2,15 @@
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! 8237A DMA register/page stubs (no transfer engine);
-//! VGA text frame buffer MMIO stub at 0xB8000.
+//! VGA text frame buffer MMIO stub at 0xB8000;
+//! Primary IDE IDENTIFY + READ SECTORS PIO stub (1F0–1F7/3F6).
 
 #![forbid(unsafe_code)]
 
 mod cmos;
 mod dma;
 mod i8042;
+mod ide;
 mod pic;
 mod pit;
 mod serial;
@@ -27,6 +29,12 @@ pub use i8042::{
     CMD_READ_CONFIG, CMD_READ_OUTPUT_PORT, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT,
     I8042, I8042_DATA, I8042_STATUS_CMD, OUTPUT_PORT_A20, SELF_TEST_OK, STATUS_CMD, STATUS_IBF,
     STATUS_OBF, STATUS_SYS,
+};
+pub use ide::{
+    IdePrimary, ATA_CMD_IDENTIFY, ATA_CMD_READ_SECTORS, ATA_DC_NIEN, ATA_DC_SRST, ATA_DRIVE_LBA,
+    ATA_DRIVE_SLAVE, ATA_SR_BSY, ATA_SR_DRDY, ATA_SR_DRQ, ATA_SR_DSC, ATA_SR_ERR, IDE_PRIMARY_CTRL,
+    IDE_PRIMARY_DATA, IDE_PRIMARY_DRIVE, IDE_PRIMARY_ERROR, IDE_PRIMARY_LBA_HI, IDE_PRIMARY_LBA_LO,
+    IDE_PRIMARY_LBA_MID, IDE_PRIMARY_SECCOUNT, IDE_PRIMARY_STATUS,
 };
 pub use pic::{DualPic, Pic8259, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA};
 pub use pit::{

@@ -11,7 +11,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 
 - PCI specifications (as needed for the classic PC subset)
 - ACPI specifications (for later machine/firmware work)
-- ATA / ATAPI specifications
+- ATA / ATAPI specifications (IDENTIFY DEVICE `0xEC`, READ SECTORS `0x20`, task-file / status bits, LBA28 PIO)
+- OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6`, IDENTIFY/READ polling
 - PS/2 and 8042 controller references
 - Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
 - Intel 8254 Programmable Interval Timer datasheet

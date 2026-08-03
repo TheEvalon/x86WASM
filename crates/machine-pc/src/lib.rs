@@ -1,4 +1,4 @@
-//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA wiring.
+//! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA/IDE wiring.
 
 #![forbid(unsafe_code)]
 
@@ -10,8 +10,8 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DualPic, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA,
-    CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    CmosRtc, DebugConsole, Dma8237, DualPic, IdePrimary, Pit8254, PortDevice, Serial16550, VgaText,
+    CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
     PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
     PORT_SYSTEM_CONTROL,
 };
@@ -46,6 +46,8 @@ pub struct Machine {
     pub dma: Dma8237,
     /// VGA color text plane at 0xB8000 (32 KiB stub; no CRTC).
     pub vga: VgaText,
+    /// Primary IDE — IDENTIFY + READ SECTORS PIO (ports 0x1F0–0x1F7 / 0x3F6).
+    pub ide: IdePrimary,
     ports: PortBus,
 }
 
@@ -62,6 +64,7 @@ impl Machine {
             kbd: I8042::new(),
             dma: Dma8237::new(),
             vga: VgaText::new(),
+            ide: IdePrimary::new(),
             ports: PortBus::new(),
         }
     }
@@ -98,6 +101,7 @@ impl Machine {
         self.kbd.reset();
         self.dma.reset();
         self.vga.reset();
+        self.ide.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
@@ -118,6 +122,7 @@ impl Machine {
             kbd: &mut self.kbd,
             dma: &mut self.dma,
             vga: &mut self.vga,
+            ide: &mut self.ide,
             ports: &mut self.ports,
         };
         step(&mut self.cpu, &mut view)?;
@@ -135,6 +140,7 @@ impl Machine {
             kbd: &mut self.kbd,
             dma: &mut self.dma,
             vga: &mut self.vga,
+            ide: &mut self.ide,
             ports: &mut self.ports,
         };
         Ok(run(&mut self.cpu, &mut view, max_steps)?)
@@ -262,12 +268,16 @@ struct MachineBus<'a> {
     kbd: &'a mut I8042,
     dma: &'a mut Dma8237,
     vga: &'a mut VgaText,
+    ide: &'a mut IdePrimary,
     ports: &'a mut PortBus,
 }
 
 impl MachineBus<'_> {
     /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        if IdePrimary::owns_port(port) {
+            return self.ide.port_read(port, size);
+        }
         if Dma8237::owns_port(port) {
             return self.dma.port_read(port, size);
         }
@@ -288,6 +298,10 @@ impl MachineBus<'_> {
     }
 
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
+        if IdePrimary::owns_port(port) {
+            self.ide.port_write(port, size, value);
+            return;
+        }
         if Dma8237::owns_port(port) {
             self.dma.port_write(port, size, value);
             return;
@@ -434,6 +448,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // Cascaded AT init: master 0x11/0x08/0x04/0x01, slave 0x11/0x70/0x02/0x01.
@@ -474,6 +489,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(PIC_MASTER_CMD, 0x11).unwrap();
@@ -498,6 +514,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -570,6 +587,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ0 vector 0x08.
@@ -601,6 +619,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -629,6 +648,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -659,6 +679,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // Spec: AT slave ICW2 base 0x70 → IRQ8 vector 0x70.
@@ -696,6 +717,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -724,6 +746,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
@@ -762,6 +785,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
@@ -796,6 +820,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -821,6 +846,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.poll_external_irq(), None);
@@ -882,6 +908,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // Mode 3 square wave, lo/hi access: control 0x36, count 0x1000.
@@ -912,6 +939,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(CMOS_INDEX).unwrap() & 0x7F, 0);
@@ -994,6 +1022,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // 8042 empty output buffer: data read 0; status has no OBF/IBF.
@@ -1030,6 +1059,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(I8042_STATUS_CMD).unwrap() & STATUS_OBF, 0);
@@ -1055,6 +1085,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_READ_CONFIG).unwrap();
@@ -1115,6 +1146,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_eq!(bus.port_in_u8(PORT_SYSTEM_CONTROL).unwrap() & 0x03, 0);
@@ -1140,6 +1172,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             assert_ne!(
@@ -1221,6 +1254,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
@@ -1242,6 +1276,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
@@ -1300,6 +1335,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             bus.port_out_u8(0x00, 0xCD).unwrap();
@@ -1349,6 +1385,7 @@ mod tests {
                 kbd: &mut m.kbd,
                 dma: &mut m.dma,
                 vga: &mut m.vga,
+                ide: &mut m.ide,
                 ports: &mut m.ports,
             };
             // Reset default is space, not the RAM poison.
@@ -1374,5 +1411,71 @@ mod tests {
         m.reset();
         assert_eq!(m.vga.char_at(0, 0), Some(b' '));
         assert_eq!(m.vga.attr_at(0, 0), Some(0x07));
+    }
+
+    /// Spec: ATA/ATAPI + OSDev ATA PIO — MachineBus primary IDE IDENTIFY + READ SECTORS.
+    #[test]
+    fn machine_bus_ide_identify_and_read_sectors() {
+        use devices::{
+            ATA_CMD_IDENTIFY, ATA_CMD_READ_SECTORS, ATA_DRIVE_LBA, ATA_SR_DRQ, IDE_PRIMARY_DATA,
+            IDE_PRIMARY_DRIVE, IDE_PRIMARY_LBA_HI, IDE_PRIMARY_LBA_LO, IDE_PRIMARY_LBA_MID,
+            IDE_PRIMARY_SECCOUNT, IDE_PRIMARY_STATUS,
+        };
+        let mut img = vec![0u8; 512 * 2];
+        img[0] = 0xDE;
+        img[1] = 0xAD;
+        let mut m = Machine::new(64 * 1024);
+        m.ide.attach_image(img);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                kbd: &mut m.kbd,
+                dma: &mut m.dma,
+                vga: &mut m.vga,
+                ide: &mut m.ide,
+                ports: &mut m.ports,
+            };
+            bus.port_out_u8(IDE_PRIMARY_DRIVE, 0xA0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_STATUS, ATA_CMD_IDENTIFY)
+                .unwrap();
+            assert_ne!(bus.port_in_u8(IDE_PRIMARY_STATUS).unwrap() & ATA_SR_DRQ, 0);
+            let w0 = bus.port_in_u16(IDE_PRIMARY_DATA).unwrap();
+            assert_eq!(w0, 0x0040);
+            for _ in 1..256 {
+                let _ = bus.port_in_u16(IDE_PRIMARY_DATA).unwrap();
+            }
+            assert_eq!(bus.port_in_u8(IDE_PRIMARY_STATUS).unwrap() & ATA_SR_DRQ, 0);
+
+            bus.port_out_u8(IDE_PRIMARY_DRIVE, 0xA0 | ATA_DRIVE_LBA)
+                .unwrap();
+            bus.port_out_u8(IDE_PRIMARY_SECCOUNT, 1).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_LO, 0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_MID, 0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_LBA_HI, 0).unwrap();
+            bus.port_out_u8(IDE_PRIMARY_STATUS, ATA_CMD_READ_SECTORS)
+                .unwrap();
+            assert_ne!(bus.port_in_u8(IDE_PRIMARY_STATUS).unwrap() & ATA_SR_DRQ, 0);
+            assert_eq!(bus.port_in_u16(IDE_PRIMARY_DATA).unwrap(), 0xADDE);
+        }
+    }
+
+    #[test]
+    fn machine_reset_preserves_ide_image_and_clears_drq() {
+        use devices::{ATA_CMD_IDENTIFY, ATA_SR_DRQ, IDE_PRIMARY_DRIVE, IDE_PRIMARY_STATUS};
+        let mut m = Machine::new(64 * 1024);
+        m.ide.attach_image(vec![0u8; 512]);
+        m.ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        m.ide
+            .port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_ne!(m.ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        m.reset();
+        assert!(m.ide.present);
+        assert_eq!(m.ide.image.len(), 512);
+        assert_eq!(m.ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
     }
 }

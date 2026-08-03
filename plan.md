@@ -1341,7 +1341,7 @@ Progress against implement list:
 - [ ] DMA — **partial:** `devices::Dma8237` dual 8237A addr/count/mode/mask + AT page regs on `MachineBus`; **not** transfer engine / DREQ/DACK/TC / device integration
 - [ ] PS/2 controller — **partial:** `devices::I8042` + `Machine::kbd` on `MachineBus` ports `0x60`/`0x64` (self-test/config/enable + OBF∧INT1→IRQ1 + make-code inject stub + `0xD0`/`0xD1` output-port A20 → `PhysMem`); **not** mouse/IRQ12, full AT keyboard protocol / Set2↔Set1 translation, or pulse-reset
 - [ ] PCI configuration space
-- [ ] PIIX IDE
+- [ ] PIIX IDE — **partial:** `devices::IdePrimary` IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO on ports `0x1F0`–`0x1F7`/`0x3F6` with backing image + DRQ/BSY/DRDY; **not** ATAPI/WRITE/DMA/IRQ14/slave/secondary/PCI BARs/SeaBIOS
 - [ ] ATAPI
 - [ ] VGA text mode — **partial:** `devices::VgaText` 32 KiB plane at `0xB8000` on `MachineBus` (80×25 reset fill); **not** CRTC/sequencer/graphics/VBE/host render
 - [ ] Initial VGA graphics

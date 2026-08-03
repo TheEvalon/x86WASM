@@ -31,15 +31,17 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x87`/`0x83`/`0x81`/`0x82` | DMA page registers ch0–3 |
 | `0x8F`/`0x8B`/`0x89`/`0x8A` | DMA page registers ch4–7 |
 | `0x80` | POST/diagnostic (open-bus read `0xFF`; **not** a DMA page) |
+| `0x1F0`–`0x1F7` | Primary IDE command block — IDENTIFY (`0xEC`) + READ SECTORS (`0x20`) PIO stub |
+| `0x3F6` | Primary IDE alternate status (R) / device control (W; SRST/nIEN) |
 
 Unimplemented ports: read `0xFF…`, write ignored (traced when tracing is enabled). Unused page holes (`0x84`–`0x86`, `0x88`, `0x8C`–`0x8E`) stay open-bus.
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO). Reset clears PIC/PIT/CMOS/8042/DMA/VGA like serial. No snapshot schema for these devices yet (serial has none either).
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO), `devices::IdePrimary` (`ide.rs`, field `Machine::ide`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/IDE task-file state like serial (IDE keeps attached image). No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
 - VGA color text plane: physical `0xB8000`–`0xBFFFF` (32 KiB) owned by `devices::VgaText` on the CPU data bus (`MachineBus` intercepts before `PhysMem`). Reset fills 80×25 with space + attribute `0x07`. **Not yet:** CRTC/sequencer/GC/ATC ports, planar graphics, VBE, host rendering.
-- No IDE BARs yet.
+- IDE: legacy primary ports only (no PCI BARs / secondary channel).
 
 ## Interrupts
 
@@ -61,3 +63,4 @@ Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices
 - 8042: OSDev I8042 PS/2 Controller + IBM PC AT 8042 programming model — port-wired; config INT1 + OBF → ISA IRQ1; make-code inject → OBF (clock-disable respected; translation passthrough); output-port bit1 → A20; see `devices::I8042` / `Machine::kbd`.
 - 8237A DMA: Intel 8237A + OSDev ISA DMA — dual controllers + AT page regs on `MachineBus`; programming accepted (flip-flop/addr/count/mode/mask); **no** memory transfer engine / DREQ/DACK/TC. Port `0x80` remains POST.
 - VGA text: IBM VGA / OSDev Text UI — `0xB8000` char+attr plane on `MachineBus`; no CRTC port model yet.
+- Primary IDE: ATA/ATAPI + OSDev ATA PIO — `IdePrimary` on `0x1F0`–`0x1F7`/`0x3F6`; IDENTIFY DEVICE + READ SECTORS (LBA28) PIO; DRQ/BSY/DRDY/ERR; backing `Vec<u8>` image. **Not yet:** ATAPI, WRITE, DMA, IRQ14, slave, secondary, LBA48, SeaBIOS boot.
