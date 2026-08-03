@@ -10,10 +10,10 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DualPic, Fdc82077, IdePrimary, PciConfig, Pit8254, PortDevice,
-    Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA, I8042_STATUS_CMD,
-    PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    CmosRtc, DebugConsole, Dma8237, DualPic, Fdc82077, IdePrimary, IdeSecondary, PciConfig,
+    Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA,
+    I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA,
+    PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -50,6 +50,8 @@ pub struct Machine {
     pub pci: PciConfig,
     /// Primary IDE — IDENTIFY + READ SECTORS PIO (ports 0x1F0–0x1F7 / 0x3F6).
     pub ide: IdePrimary,
+    /// Secondary IDE — same PIO stub remapped (ports 0x170–0x177 / 0x376); IRQ15.
+    pub ide_secondary: IdeSecondary,
     /// 82077AA FDC — port stub (0x3F0–0x3F5 / 0x3F7; no media engine).
     pub fdc: Fdc82077,
     ports: PortBus,
@@ -70,6 +72,7 @@ impl Machine {
             vga: VgaText::new(),
             pci: PciConfig::new(),
             ide: IdePrimary::new(),
+            ide_secondary: IdeSecondary::new(),
             fdc: Fdc82077::new(),
             ports: PortBus::new(),
         }
@@ -109,6 +112,7 @@ impl Machine {
         self.vga.reset();
         self.pci.reset();
         self.ide.reset();
+        self.ide_secondary.reset();
         self.fdc.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
@@ -129,6 +133,7 @@ impl Machine {
             vga: &mut self.vga,
             pci: &mut self.pci,
             ide: &mut self.ide,
+            ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
             ports: &mut self.ports,
         }
@@ -153,6 +158,7 @@ impl Machine {
             vga: &mut self.vga,
             pci: &mut self.pci,
             ide: &mut self.ide,
+            ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
             ports: &mut self.ports,
         };
@@ -173,6 +179,7 @@ impl Machine {
             vga: &mut self.vga,
             pci: &mut self.pci,
             ide: &mut self.ide,
+            ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
             ports: &mut self.ports,
         };
@@ -311,6 +318,7 @@ struct MachineBus<'a> {
     vga: &'a mut VgaText,
     pci: &'a mut PciConfig,
     ide: &'a mut IdePrimary,
+    ide_secondary: &'a mut IdeSecondary,
     fdc: &'a mut Fdc82077,
     ports: &'a mut PortBus,
 }
@@ -320,6 +328,9 @@ impl MachineBus<'_> {
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
             return self.ide.port_read(port, size);
+        }
+        if IdeSecondary::owns_port(port) {
+            return self.ide_secondary.port_read(port, size);
         }
         if Fdc82077::owns_port(port) {
             return self.fdc.port_read(port, size);
@@ -352,6 +363,10 @@ impl MachineBus<'_> {
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
         if IdePrimary::owns_port(port) {
             self.ide.port_write(port, size, value);
+            return;
+        }
+        if IdeSecondary::owns_port(port) {
+            self.ide_secondary.port_write(port, size, value);
             return;
         }
         if Fdc82077::owns_port(port) {
@@ -453,16 +468,17 @@ impl Bus for MachineBus<'_> {
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
     /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, FDC IRQ6, CMOS IRQF → IRQ8,
-    /// and primary IDE INTRQ∧¬nIEN → IRQ14 (level follow) before acknowledge so
-    /// edges from prior [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
-    /// [`Machine::tick_cmos`] / FDC [`Fdc82077::assert_irq6`] / IDE completion
-    /// are visible.
+    /// primary IDE INTRQ∧¬nIEN → IRQ14, and secondary IDE → IRQ15 (level follow)
+    /// before acknowledge so edges from prior [`Machine::tick_pit`] /
+    /// [`Machine::kbd_place_output`] / [`Machine::tick_cmos`] / FDC
+    /// [`Fdc82077::assert_irq6`] / IDE completion are visible.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());
         self.pic.set_irq_line(6, self.fdc.irq_line());
         self.pic.set_irq_line(8, self.cmos.irq_line());
         self.pic.set_irq_line(14, self.ide.irq_line());
+        self.pic.set_irq_line(15, self.ide_secondary.irq_line());
         self.pic.poll_irq()
     }
 }
@@ -608,6 +624,20 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0xBF); // unmask slave IR6 (IRQ14)
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR2 and slave IR7 (IRQ15).
+    fn init_at_pic_unmask_irq15(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x7F); // unmask slave IR7 (IRQ15)
     }
 
     /// Helper: classic AT DualPic cascade + unmask master IR6 (IRQ6 / FDC).
@@ -1520,6 +1550,49 @@ mod tests {
         {
             let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), None);
+        }
+    }
+
+    /// Spec: ATA + OSDev ATA PIO + IBM PC AT — secondary IDENTIFY → IRQ15 → vector 0x77.
+    #[test]
+    fn ide_secondary_identify_asserts_irq15_via_poll_external_irq() {
+        use devices::{
+            ATA_CMD_IDENTIFY, ATA_SR_DRQ, IDE_SECONDARY_CTRL, IDE_SECONDARY_DRIVE,
+            IDE_SECONDARY_STATUS,
+        };
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq15(&mut m);
+        m.ide_secondary.attach_image(vec![0u8; 512]);
+        m.ide_secondary.port_write(IDE_SECONDARY_CTRL, 1, 0);
+        m.ide_secondary.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        m.ide_secondary
+            .port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert!(m.ide_secondary.irq_line());
+        assert_ne!(
+            m.ide_secondary.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ,
+            0
+        );
+        {
+            let mut bus = m.bus_mut();
+            // Spec: AT slave ICW2 base 0x70 → IRQ15 vector 0x77.
+            assert_eq!(bus.poll_external_irq(), Some(0x77));
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        let _ = m.ide_secondary.port_read(IDE_SECONDARY_STATUS, 1);
+        assert!(!m.ide_secondary.irq_line());
+    }
+
+    /// Spec: OSDev ATA PIO — secondary ports decode on MachineBus; absent → status 0.
+    #[test]
+    fn machine_bus_ide_secondary_absent_status_zero() {
+        use devices::IDE_SECONDARY_STATUS;
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.port_in_u8(IDE_SECONDARY_STATUS).unwrap(), 0);
+            bus.port_out_u8(0x176, 0xA0).unwrap();
+            bus.port_out_u8(IDE_SECONDARY_STATUS, 0xEC).unwrap();
+            assert_eq!(bus.port_in_u8(IDE_SECONDARY_STATUS).unwrap(), 0);
         }
     }
 
