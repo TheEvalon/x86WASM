@@ -35,7 +35,7 @@ pub struct Machine {
     pub debug: DebugConsole,
     /// Dual 8259A — ICW + OCW/IRQ (ports 0x20/0x21/0xA0/0xA1).
     pub pic: DualPic,
-    /// 8254 PIT — channel-0 programming (ports 0x40–0x43).
+    /// 8254 PIT — channel-0 programming + OUT tick (ports 0x40–0x43); OUT → IRQ0.
     pub pit: Pit8254,
     /// MC146818 CMOS/RTC register bank (ports 0x70/0x71).
     pub cmos: CmosRtc,
@@ -133,6 +133,29 @@ impl Machine {
         let rom = build_hello_rom();
         self.load_rom(&rom)
     }
+
+    /// Advance PIT channel 0 by `clocks` model ticks and sync OUT → PIC IRQ0.
+    ///
+    /// Spec: Intel 8254 ch0 OUT; Intel 8259A edge IR (low→high latches IRR).
+    /// Guest wall-clock rate is **not** host-real-time — callers choose the quantum.
+    ///
+    /// When `tick_ch0` reports a rising OUT edge, IR0 is pulsed (deassert then
+    /// assert) so modes 2/3 (OUT already high between periods) still latch IRR.
+    // --- PIT→IRQ0 (slice/device-pit-irq0); keep MachineBus edits minimal for 8042 merge ---
+    pub fn tick_pit(&mut self, clocks: u64) {
+        let rising = self.pit.tick_ch0(clocks);
+        if rising {
+            self.pic.set_irq_line(0, false);
+            self.pic.set_irq_line(0, true);
+        } else {
+            self.sync_pit_irq0();
+        }
+    }
+
+    /// Drive PIC IRQ0 from the current PIT ch0 OUT level (level follow).
+    pub fn sync_pit_irq0(&mut self) {
+        self.pic.set_irq_line(0, self.pit.out_ch0());
+    }
 }
 
 struct MachineBus<'a> {
@@ -223,7 +246,12 @@ impl Bus for MachineBus<'_> {
     }
 
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
+    ///
+    /// Syncs PIT ch0 OUT → IRQ0 (level follow) before acknowledge so edges from
+    /// prior [`Machine::tick_pit`] / [`devices::Pit8254::tick_ch0`] are visible.
+    // --- PIT→IRQ0 (slice/device-pit-irq0); keep MachineBus edits minimal for 8042 merge ---
     fn poll_external_irq(&mut self) -> Option<u8> {
+        self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.poll_irq()
     }
 }
@@ -338,6 +366,101 @@ mod tests {
             assert_eq!(bus.poll_external_irq(), None);
         }
         assert_eq!(m.pic.master.isr, 0x01);
+    }
+
+    /// Helper: classic AT DualPic cascade init + unmask master IR0.
+    fn init_at_pic_unmask_irq0(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
+    }
+
+    /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
+    #[test]
+    fn pit_mode0_tick_asserts_irq0_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        // Program PIT ch0 mode 0, count = 4.
+        m.pit.port_write(PIT_CONTROL, 1, 0x30);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x04);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        assert!(!m.pit.out_ch0());
+
+        m.tick_pit(4);
+        assert!(m.pit.out_ch0());
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                ports: &mut m.ports,
+            };
+            // Spec: AT master ICW2 base 0x08 → IRQ0 vector 0x08.
+            assert_eq!(bus.poll_external_irq(), Some(0x08));
+            assert_eq!(bus.poll_external_irq(), None);
+            // Non-specific EOI (OCW2 0x20) clears ISR.
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 8254 mode 2 rate-generator OUT edge → IRQ0 → vector 0x08.
+    #[test]
+    fn pit_mode2_tick_asserts_irq0() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        m.pit.port_write(PIT_CONTROL, 1, 0x34);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x03);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 3
+        m.tick_pit(4);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.poll_external_irq(), Some(0x08));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 8254 mode 3 square-wave OUT edge → IRQ0 → vector 0x08.
+    #[test]
+    fn pit_mode3_tick_asserts_irq0() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        m.pit.port_write(PIT_CONTROL, 1, 0x36);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x04);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 4
+        m.tick_pit(5);
+        {
+            let mut bus = MachineBus {
+                mem: &mut m.mem,
+                com1: &mut m.com1,
+                debug: &mut m.debug,
+                pic: &mut m.pic,
+                pit: &mut m.pit,
+                cmos: &mut m.cmos,
+                ports: &mut m.ports,
+            };
+            assert_eq!(bus.poll_external_irq(), Some(0x08));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.master.isr, 0);
     }
 
     /// Guest STI + PIC IRQ0 → IVT delivery via poll_external_irq.
