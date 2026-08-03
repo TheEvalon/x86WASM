@@ -3,13 +3,15 @@
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! 8237A DMA register/page stubs (no transfer engine);
 //! VGA text frame buffer MMIO stub at 0xB8000;
-//! PCI configuration mechanism #1 stub (0xCF8/0xCFC).
+//! PCI configuration mechanism #1 stub (0xCF8/0xCFC);
+//! Primary IDE IDENTIFY + READ SECTORS PIO stub (1F0–1F7/3F6).
 
 #![forbid(unsafe_code)]
 
 mod cmos;
 mod dma;
 mod i8042;
+mod ide;
 mod pci;
 mod pic;
 mod pit;
@@ -29,6 +31,12 @@ pub use i8042::{
     CMD_READ_CONFIG, CMD_READ_OUTPUT_PORT, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT,
     I8042, I8042_DATA, I8042_STATUS_CMD, OUTPUT_PORT_A20, SELF_TEST_OK, STATUS_CMD, STATUS_IBF,
     STATUS_OBF, STATUS_SYS,
+};
+pub use ide::{
+    IdePrimary, ATA_CMD_IDENTIFY, ATA_CMD_READ_SECTORS, ATA_DC_NIEN, ATA_DC_SRST, ATA_DRIVE_LBA,
+    ATA_DRIVE_SLAVE, ATA_SR_BSY, ATA_SR_DRDY, ATA_SR_DRQ, ATA_SR_DSC, ATA_SR_ERR, IDE_PRIMARY_CTRL,
+    IDE_PRIMARY_DATA, IDE_PRIMARY_DRIVE, IDE_PRIMARY_ERROR, IDE_PRIMARY_LBA_HI, IDE_PRIMARY_LBA_LO,
+    IDE_PRIMARY_LBA_MID, IDE_PRIMARY_SECCOUNT, IDE_PRIMARY_STATUS,
 };
 pub use pci::{
     PciConfig, PCI_CLASS_BRIDGE, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PCI_DEVICE_I440FX,
