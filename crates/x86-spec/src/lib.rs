@@ -1312,13 +1312,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
 /// Spec: Intel SDM Vol. 2 Chapter 2; opcode map 2.
 pub const M1_0F_SUBSET: &[InstrDef] = &[
     // Group 7: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 01).
-    // This slice implements /0 SGDT and /2 LGDT only.
+    // This slice implements /0 SGDT, /1 SIDT, /2 LGDT, /3 LIDT.
     InstrDef {
         mnemonic: "GRP7",
         opcode: 0x01,
         encoding: Encoding::Modrm,
         width: Width::OsZ,
-        sdm: "SGDT/LGDT",
+        sdm: "SGDT/SIDT/LGDT/LIDT",
     },
     InstrDef {
         mnemonic: "IMUL",
@@ -1381,7 +1381,10 @@ mod tests {
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
-        assert!(lookup_0f(0x01).is_some(), "missing 0F 01 GRP7 SGDT/LGDT");
+        assert!(
+            lookup_0f(0x01).is_some(),
+            "missing 0F 01 GRP7 SGDT/SIDT/LGDT/LIDT"
+        );
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
     }
 }

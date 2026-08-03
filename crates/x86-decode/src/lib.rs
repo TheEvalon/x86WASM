@@ -594,6 +594,25 @@ mod tests {
     }
 
     #[test]
+    fn decode_lidt_sidt_m16() {
+        // Spec: Intel SDM Vol. 2 LIDT/SIDT — 0F 01 /3 and /1, memory form.
+        let sidt = decode(&[0x0F, 0x01, 0x0E, 0x00, 0x20]).unwrap(); // SIDT [0x2000]
+        assert_eq!(sidt.mnemonic, "GRP7");
+        assert!(sidt.two_byte);
+        assert_eq!(sidt.opcode, 0x01);
+        assert_eq!(sidt.modrm.unwrap().reg, 1);
+        assert_eq!(sidt.length, 5);
+
+        let lidt = decode(&[0x0F, 0x01, 0x1E, 0x00, 0x20]).unwrap(); // LIDT [0x2000]
+        assert_eq!(lidt.modrm.unwrap().reg, 3);
+        assert_eq!(lidt.length, 5);
+
+        let lidt32 = decode(&[0x66, 0x0F, 0x01, 0x1E, 0x00, 0x20]).unwrap();
+        assert!(lidt32.prefixes.op_size_override);
+        assert_eq!(lidt32.length, 6);
+    }
+
+    #[test]
     fn decode_int_imm8() {
         // Intel SDM Vol. 2: INT imm8 — opcode CD ib
         let d = decode(&[0xCD, 0x21]).unwrap();
