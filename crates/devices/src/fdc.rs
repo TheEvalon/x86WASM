@@ -1,5 +1,5 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
-//! Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
+//! Relative Seek/Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
 //! READ DATA (media single-sector + no-media ND) / READ ID (media sector-ID
 //! stub + no-media ND) / READ DELETED DATA / WRITE DATA / WRITE DELETED DATA /
 //! VERIFY / FORMAT TRACK (no-media stubs) + IRQ6.
@@ -13,7 +13,9 @@
 //!   DIR/CCR; Specify (`0x03`) two parameter bytes (SRT|HUT, HLT|ND), no result
 //!   phase / no IRQ; Recalibrate (`0x07`) one unit-select parameter, Seek End
 //!   ST0 + PCN=0 + IRQ; Seek (`0x0F`) HD|US + NCN, Seek End ST0 + PCN=NCN + IRQ;
-//!   Sense Interrupt Status (`0x08`) result ST0+PCN; Sense Drive Status
+//!   Relative Seek (`0x8F`/`0xCF`, §5.2.9) DIR in cmd bit6 + HD|US + RCN,
+//!   PCN ±= RCN (clamp `0..=255`), Seek End ST0 + IRQ; Sense Interrupt Status
+//!   (`0x08`) result ST0+PCN; Sense Drive Status
 //!   (`0x04`, §5.2.5) HD|US parameter, no execution phase, result ST3 (§6.4:
 //!   bit7 unused=0, bit6 WP, bit5 unused=1, bit4 T0, bit3 unused=1, bit2 HD,
 //!   bits1:0 DS1/DS0), no IRQ; Version (`0x10`) no parameters, 1-byte result
@@ -66,8 +68,12 @@
 //! - Seek (`0x0F`): command byte → HD|US + NCN; sets `pcn[unit] = NCN`, latches
 //!   ST0 Seek End (`0x20 | unit`; H bit always 0 per 82077AA), asserts IRQ; no
 //!   result
+//! - Relative Seek (`0x8F` DIR=0 out / `0xCF` DIR=1 in, §5.2.9 / Table 5-1):
+//!   command byte → HD|US + RCN; updates `pcn[unit]` by ±RCN (DIR selects
+//!   sign; stub clamps to `0..=255`; ST0 EC beyond track 0 deferred), latches
+//!   ST0 Seek End (`0x20 | unit`; H always 0), asserts IRQ; no result
 //! - Sense Interrupt Status (`0x08`): command byte → 2-byte result (ST0, PCN);
-//!   returns latched Recalibrate/Seek ST0 when present, else post-reset/`assert_irq6`
+//!   returns latched Recalibrate/Seek/Relative Seek ST0 when present, else post-reset/`assert_irq6`
 //!   stub `0xC0 | DOR[1:0]`; PCN is Present Cylinder Number for ST0 US bits
 //!   (`pcn[ST0[1:0]]`); clears latched IRQ; MSR RQM|DIO during result phase
 //! - Sense Drive Status (`0x04`): command byte → one HD|US parameter (same
@@ -162,7 +168,9 @@
 //!   media/deleted-address-mark engine; FORMAT TRACK media write / per-sector
 //!   ID DMA
 //! - Multi-sector / full MT engine; DREQ/DACK cycle timing; FORMAT media
-//! - Seek step timing; real DIR disk-change edge timing (DSKCHG stub only)
+//! - Seek / Relative Seek step timing; Relative Seek ST0 EC when stepping out
+//!   beyond track 0 (PCN clamp only this slice); real DIR disk-change edge
+//!   timing (DSKCHG stub only)
 //! - Implied seek from Configure EIS; multi-sector TC termination
 //! - WRITE DATA / FORMAT ST1 NW from WP pin (Sense Drive ST3 WP only this slice)
 //! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
@@ -316,6 +324,15 @@ pub const FDC_CMD_DUMPREG: u8 = 0x0E;
 pub const FDC_DUMPREG_RESULT_LEN: u8 = 10;
 /// Seek command opcode. Spec: Intel 82077AA / OSDev FDC — HD|US + NCN.
 pub const FDC_CMD_SEEK: u8 = 0x0F;
+/// Relative Seek base opcode (DIR=0 / step out). Spec: Intel 82077AA Table 5-1 /
+/// §5.2.9 — command byte is `1|DIR|0 0 1 1 1 1` (`0x8F` out, `0xCF` in);
+/// match with [`Fdc82077::is_relative_seek_command`].
+pub const FDC_CMD_RELATIVE_SEEK: u8 = 0x8F;
+/// Relative Seek DIR bit in the command byte (bit6). Spec: 82077AA §5.2.9 —
+/// DIR=0 step out (toward lower cylinders), DIR=1 step in (toward higher).
+pub const FDC_CMD_RELATIVE_SEEK_DIR: u8 = 0x40;
+/// Relative Seek with DIR=1 (step in). Spec: Intel 82077AA Table 5-1 / §5.2.9.
+pub const FDC_CMD_RELATIVE_SEEK_IN: u8 = FDC_CMD_RELATIVE_SEEK | FDC_CMD_RELATIVE_SEEK_DIR;
 /// Version command opcode. Spec: Intel 82077AA / OSDev FDC — no parameters,
 /// 1-byte result identifying the controller class.
 pub const FDC_CMD_VERSION: u8 = 0x10;
@@ -378,6 +395,8 @@ enum Phase {
     RecalibrateParams,
     /// Seek parameters: byte0 = HD|US, byte1 = NCN.
     SeekParams { index: u8 },
+    /// Relative Seek parameters: byte0 = HD|US, byte1 = RCN.
+    RelativeSeekParams { index: u8 },
     /// Sense Interrupt result: ST0 then PCN.
     SenseIntResult { index: u8 },
     /// Sense Drive Status parameter: byte0 = HD|US.
@@ -429,7 +448,7 @@ enum Phase {
     ReadIdResult { index: u8 },
 }
 
-/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/
+/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Relative Seek/Sense/Version/
 /// Configure/LOCK/PERPENDICULAR/DUMPREG/READ·READ DELETED·WRITE DATA/FORMAT
 /// TRACK (no-media) + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -486,8 +505,10 @@ pub struct Fdc82077 {
     phase: Phase,
     /// Command-completion ST0 for Sense Interrupt (Recalibrate/Seek Seek End); consumed once.
     pending_sense_st0: Option<u8>,
-    /// Seek param0 (HD|US) latched between the two Seek parameter bytes.
+    /// Seek / Relative Seek param0 (HD|US) latched between the two parameter bytes.
     seek_head_unit: u8,
+    /// Relative Seek DIR from command bit6: true = step in (+RCN), false = step out (−RCN).
+    relative_seek_dir_in: bool,
     /// Sense Interrupt ST0 result byte (set when entering result phase).
     sense_st0: u8,
     /// Sense Interrupt PCN result byte (PCN of unit in `sense_st0` US bits).
@@ -567,6 +588,7 @@ impl Fdc82077 {
             phase: Phase::Command,
             pending_sense_st0: None,
             seek_head_unit: 0,
+            relative_seek_dir_in: false,
             sense_st0: 0,
             sense_pcn: 0,
             sense_st3: 0,
@@ -794,6 +816,7 @@ impl Fdc82077 {
                 | Phase::SpecifyParams { .. }
                 | Phase::RecalibrateParams
                 | Phase::SeekParams { .. }
+                | Phase::RelativeSeekParams { .. }
                 | Phase::SenseDriveStatusParam
                 | Phase::ConfigureParams { .. }
                 | Phase::PerpendicularParam
@@ -844,6 +867,7 @@ impl Fdc82077 {
         self.phase = Phase::Command;
         self.pending_sense_st0 = None;
         self.seek_head_unit = 0;
+        self.relative_seek_dir_in = false;
         self.sense_st0 = 0;
         self.sense_st3 = 0;
         // Spec: Intel 82077AA §5.3.2 — soft DOR reset does not clear LOCK; when
@@ -900,13 +924,45 @@ impl Fdc82077 {
         self.phase = Phase::Command;
     }
 
+    /// True when `v` is Relative Seek (`1 DIR 0 0 1 1 1 1`). Spec: 82077AA Table 5-1.
+    pub fn is_relative_seek_command(v: u8) -> bool {
+        (v & !FDC_CMD_RELATIVE_SEEK_DIR) == FDC_CMD_RELATIVE_SEEK
+    }
+
+    /// Begin Relative Seek parameter phase (2 bytes). Spec: Intel 82077AA §5.2.9.
+    fn start_relative_seek(&mut self, cmd: u8) {
+        self.seek_head_unit = 0;
+        self.relative_seek_dir_in = cmd & FDC_CMD_RELATIVE_SEEK_DIR != 0;
+        self.phase = Phase::RelativeSeekParams { index: 0 };
+    }
+
+    /// Complete Relative Seek after RCN parameter.
+    ///
+    /// Spec: Intel 82077AA §5.2.9 / Table 5-1 — steps selected unit by ±RCN
+    /// (DIR=1 in / +, DIR=0 out / −); this stub clamps PCN to `0..=255` (no ST0
+    /// EC latch yet); on completion latches ST0 SE|US (`0x20 | unit`; H always 0)
+    /// and asserts IRQ like Seek; host uses Sense Interrupt Status (no result phase).
+    fn finish_relative_seek(&mut self, rcn: u8) {
+        let unit = (self.seek_head_unit & 0x03) as usize;
+        let cur = self.pcn[unit];
+        self.pcn[unit] = if self.relative_seek_dir_in {
+            cur.saturating_add(rcn)
+        } else {
+            cur.saturating_sub(rcn)
+        };
+        self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | (unit as u8));
+        self.irq_pending = true;
+        self.phase = Phase::Command;
+    }
+
     /// Begin Sense Interrupt Status result phase.
     ///
     /// Spec: Intel 82077AA Sense Interrupt Status — no parameters; result ST0,
     /// PCN; clears interrupt. When a seek-class command latched ST0 (Recalibrate
-    /// / Seek), return that value; otherwise ST0 IC=11 (`0xC0`) models post-reset
-    /// “ready line changed” / `assert_irq6`-only status; unit select from DOR[1:0].
-    /// PCN is the Present Cylinder Number for the unit in ST0 bits 1:0.
+    /// / Seek / Relative Seek), return that value; otherwise ST0 IC=11 (`0xC0`)
+    /// models post-reset “ready line changed” / `assert_irq6`-only status; unit
+    /// select from DOR[1:0]. PCN is the Present Cylinder Number for the unit in
+    /// ST0 bits 1:0.
     fn start_sense_interrupt(&mut self) {
         self.sense_st0 = self
             .pending_sense_st0
@@ -1431,12 +1487,13 @@ impl Fdc82077 {
 
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
-            // Spec: Specify/Recalibrate/Seek/Configure/PERPENDICULAR have no result
-            // phase; open-bus when idle/params.
+            // Spec: Specify/Recalibrate/Seek/Relative Seek/Configure/PERPENDICULAR
+            // have no result phase; open-bus when idle/params.
             Phase::Command
             | Phase::SpecifyParams { .. }
             | Phase::RecalibrateParams
             | Phase::SeekParams { .. }
+            | Phase::RelativeSeekParams { .. }
             | Phase::SenseDriveStatusParam
             | Phase::ConfigureParams { .. }
             | Phase::PerpendicularParam
@@ -1597,6 +1654,9 @@ impl Fdc82077 {
                 } else if v == FDC_CMD_SEEK {
                     // Spec: Intel 82077AA Seek — expect HD|US then NCN.
                     self.start_seek();
+                } else if Self::is_relative_seek_command(v) {
+                    // Spec: Intel 82077AA §5.2.9 — DIR in cmd bit6; HD|US then RCN.
+                    self.start_relative_seek(v);
                 } else if v == FDC_CMD_SENSE_DRIVE_STATUS {
                     // Spec: Intel 82077AA §5.2.5 — expect HD|US param; no IRQ.
                     self.start_sense_drive_status();
@@ -1668,6 +1728,18 @@ impl Fdc82077 {
                     }
                     _ => {
                         self.finish_seek(v);
+                    }
+                }
+            }
+            Phase::RelativeSeekParams { index } => {
+                // Spec: Intel 82077AA §5.2.9 — param0 = HD|US, param1 = RCN.
+                match index {
+                    0 => {
+                        self.seek_head_unit = v;
+                        self.phase = Phase::RelativeSeekParams { index: 1 };
+                    }
+                    _ => {
+                        self.finish_relative_seek(v);
                     }
                 }
             }
@@ -2187,6 +2259,100 @@ mod tests {
         assert_eq!(st0, FDC_ST0_SEEK_END | 0x02, "ST0 = SE | unit; H=0");
         let pcn = f.port_read(FDC_FIFO, 1) as u8;
         assert_eq!(pcn, 0x28);
+    }
+
+    /// Spec: Intel 82077AA §5.2.9 Relative Seek — opcode `1|DIR|001111`
+    /// (`0x8F` out / `0xCF` in), HD|US + RCN; PCN ±= RCN; Seek End ST0 + IRQ.
+    #[test]
+    fn relative_seek_out_decrements_pcn_seek_end_st0_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(
+            FDC_DOR,
+            1,
+            u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01),
+        );
+        f.pcn = [0x00, 0x00, 0x28, 0x00];
+        assert!(!f.irq_line());
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RELATIVE_SEEK)); // DIR=0 out
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "param phase: RQM, DIO clear"
+        );
+        assert!(!f.irq_line(), "IRQ only after both parameters");
+        assert_eq!(f.phase, Phase::RelativeSeekParams { index: 0 });
+
+        // Param0: head=1 (bit2) | unit=2 → 0x06; ST0 H always 0 per 82077AA.
+        f.port_write(FDC_FIFO, 1, 0x06);
+        assert_eq!(f.phase, Phase::RelativeSeekParams { index: 1 });
+        assert_eq!(f.pcn[2], 0x28, "PCN unchanged until RCN");
+        assert!(!f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, 0x08); // RCN
+        assert_eq!(f.pcn[2], 0x20, "DIR=0 out: PCN -= RCN");
+        assert_eq!(f.pcn[0], 0x00, "other units' PCN unchanged");
+        assert_eq!(f.phase, Phase::Command);
+        assert!(f.irq_line(), "Relative Seek asserts IRQ on completion");
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "no result phase after Relative Seek"
+        );
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert!(!f.irq_line(), "Sense Interrupt clears IRQ");
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0, FDC_ST0_SEEK_END | 0x02, "ST0 = SE | unit; H=0");
+        let pcn = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(pcn, 0x20);
+    }
+
+    /// Spec: Intel 82077AA §5.2.9 — DIR=1 (`0xCF`) steps in: PCN += RCN.
+    #[test]
+    fn relative_seek_in_increments_pcn_seek_end_st0_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.pcn[1] = 0x10;
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RELATIVE_SEEK_IN)); // DIR=1 in
+        f.port_write(FDC_FIFO, 1, 0x01); // unit 1
+        f.port_write(FDC_FIFO, 1, 0x05); // RCN
+        assert_eq!(f.pcn[1], 0x15, "DIR=1 in: PCN += RCN");
+        assert_eq!(f.pcn[0], 0x00);
+        assert!(f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END | 0x01);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x15);
+    }
+
+    /// Spec: stub clamps PCN to `0..=255` (ST0 EC beyond track 0 deferred).
+    #[test]
+    fn relative_seek_clamps_pcn_to_0_255() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.pcn[0] = 0x05;
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RELATIVE_SEEK)); // out
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x10); // RCN > PCN
+        assert_eq!(f.pcn[0], 0x00, "out clamp at 0");
+        assert!(f.irq_line());
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END);
+        let _ = f.port_read(FDC_FIFO, 1);
+
+        f.pcn[0] = 0xF0;
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RELATIVE_SEEK_IN)); // in
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x20); // would exceed 255
+        assert_eq!(f.pcn[0], 0xFF, "in clamp at 255");
+        assert!(f.irq_line());
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0xFF);
     }
 
     /// Spec: Intel 82077AA Sense Drive Status — opcode `0x04`, HD|US param, ST3
