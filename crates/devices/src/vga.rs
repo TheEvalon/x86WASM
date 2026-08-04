@@ -18,9 +18,13 @@
 //!   standard VGA has 25 CRTC registers (indexes `0x00`–`0x18`). Cursor Start
 //!   `0x0A` (bits 4:0 scanline start; bit5 Cursor Disable), Cursor End `0x0B`
 //!   (bits 4:0 scanline end), Cursor Location High `0x0E` / Low `0x0F` (16-bit
-//!   character address into the refresh buffer). Vertical Retrace End `0x11`
-//!   bit7 Protect: when set, writes to indexes `0x00`–`0x07` are ignored except
-//!   Overflow (`0x07`) bit4 (Line Compare bit8).
+//!   character address into the refresh buffer). Maximum Scan Line `0x09`
+//!   (bits 4:0 = character cell height − 1; bit5 Start Vertical Blanking bit9;
+//!   bit6 Line Compare bit9; bit7 Scan Doubling; mode-03h reset default `0x0F`
+//!   for 16 scanlines). Vertical Retrace End `0x11` bit7 Protect: when set,
+//!   writes to indexes `0x00`–`0x07` are ignored except Overflow (`0x07`) bit4
+//!   (Line Compare bit8); indexes `>= 0x08` (including Maximum Scan Line) remain
+//!   writable.
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode).
@@ -59,9 +63,11 @@
 //! - CRTC index/data: latch index / store/read register file on the IOAS-selected
 //!   map (`0x3D4`/`0x3D5` color or `0x3B4`/`0x3B5` mono; shared file); cursor
 //!   registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback plus helpers for
-//!   text-mode cursor character offset / row-col; Vertical Retrace End `0x11`
-//!   bit7 Protect blocks writes to indexes `0x00`–`0x07` (Overflow bit4 still
-//!   writable; no host cursor glyph render or CRTC timing)
+//!   text-mode cursor character offset / row-col; Maximum Scan Line `0x09`
+//!   store/readback with mode-03h reset default `0x0F` (Protect does not block);
+//!   Vertical Retrace End `0x11` bit7 Protect blocks writes to indexes
+//!   `0x00`–`0x07` (Overflow bit4 still writable; no host cursor glyph render,
+//!   max-scan glyph height, or CRTC timing)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults (no timing/plane side effects)
 //! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
@@ -91,7 +97,8 @@
 //!   deferred until host render; hidden-DAC unlock via repeated `0x3C6` reads
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
-//! - Full CRTC timing/blanking (Protect write-gate only; no scanline counters)
+//! - Full CRTC timing/blanking / Maximum Scan Line glyph-height side effects
+//!   (Protect write-gate + Max Scan store/readback only; no scanline counters)
 //! - Misc Output clock-select / polarity side effects (RAM Enable bit1 enforced
 //!   on CPU text-plane helpers)
 //! - Planar graphics, VBE, host canvas rendering, dirty tracking
@@ -173,6 +180,36 @@ pub const VGA_CRTC_VERTICAL_RETRACE_END: u8 = 0x11;
 /// Spec: FreeVGA / IBM VGA — when set, writes to CRTC indexes `0x00`–`0x07`
 /// are ignored (except Overflow bit4 / Line Compare bit8).
 pub const VGA_CRTC_PROTECT: u8 = 0x80;
+/// CRTC Maximum Scan Line Register index.
+///
+/// Spec: FreeVGA CRT Controller Registers / IBM VGA — index `0x09`. Bits 4:0 =
+/// Maximum Scan Line (character cell height − 1); bit5 = Start Vertical
+/// Blanking bit9; bit6 = Line Compare bit9; bit7 = Scan Doubling. Protect
+/// (Vertical Retrace End bit7) does **not** block this index (`>= 0x08`).
+pub const VGA_CRTC_MAX_SCAN_LINE: u8 = 0x09;
+/// Maximum Scan Line field mask (bits 4:0). Spec: FreeVGA.
+pub const VGA_CRTC_MAX_SCAN_MASK: u8 = 0x1F;
+/// Maximum Scan Line bit5 — Start Vertical Blanking bit9. Spec: FreeVGA.
+pub const VGA_CRTC_MAX_SCAN_START_VBLANK_BIT9: u8 = 0x20;
+/// Maximum Scan Line bit6 — Line Compare bit9. Spec: FreeVGA.
+pub const VGA_CRTC_MAX_SCAN_LINE_COMPARE_BIT9: u8 = 0x40;
+/// Maximum Scan Line bit7 — Scan Doubling. Spec: FreeVGA.
+pub const VGA_CRTC_MAX_SCAN_DOUBLING: u8 = 0x80;
+/// Mode-03h-class Maximum Scan Line reset default (`0x0F` = 16 scanlines − 1).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — 8×16 character cell uses
+/// Maximum Scan Line bits 4:0 = `0x0F`; Start Vertical Blanking / Line Compare
+/// high bits and Scan Doubling clear. Other CRTC indexes remain `0` on reset
+/// until programmed (store/readback only; no glyph-height side effects).
+pub const VGA_CRTC_MAX_SCAN_LINE_DEFAULT: u8 = 0x0F;
+const _: () = assert!(
+    (VGA_CRTC_MAX_SCAN_LINE_DEFAULT & VGA_CRTC_MAX_SCAN_MASK) == 0x0F
+        && (VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+            & (VGA_CRTC_MAX_SCAN_START_VBLANK_BIT9
+                | VGA_CRTC_MAX_SCAN_LINE_COMPARE_BIT9
+                | VGA_CRTC_MAX_SCAN_DOUBLING))
+            == 0
+);
 
 /// Sequencer Address (index) Register.
 ///
@@ -470,13 +507,15 @@ impl VgaText {
         v
     }
 
-    /// Reset text plane: 80×25 → space/`0x07`; remainder cleared; CRTC cleared;
-    /// Sequencer restored to [`VGA_SEQ_DEFAULTS`]; Graphics Controller restored
-    /// to [`VGA_GC_DEFAULTS`]; Attribute Controller restored to
-    /// [`VGA_ATC_DEFAULTS`] with flip-flop in address state; Input Status #1
-    /// phase cleared; Misc Output restored to [`VGA_MISC_OUTPUT_DEFAULT`]; PEL
-    /// Mask restored to [`VGA_DAC_PEL_MASK_DEFAULT`]; DAC RAM restored to
-    /// mode-03h-ish defaults ([`vga_dac_default_ram`]).
+    /// Reset text plane: 80×25 → space/`0x07`; remainder cleared; CRTC cleared
+    /// except Maximum Scan Line [`VGA_CRTC_MAX_SCAN_LINE`] =
+    /// [`VGA_CRTC_MAX_SCAN_LINE_DEFAULT`]; Sequencer restored to
+    /// [`VGA_SEQ_DEFAULTS`]; Graphics Controller restored to [`VGA_GC_DEFAULTS`];
+    /// Attribute Controller restored to [`VGA_ATC_DEFAULTS`] with flip-flop in
+    /// address state; Input Status #1 phase cleared; Misc Output restored to
+    /// [`VGA_MISC_OUTPUT_DEFAULT`]; PEL Mask restored to
+    /// [`VGA_DAC_PEL_MASK_DEFAULT`]; DAC RAM restored to mode-03h-ish defaults
+    /// ([`vga_dac_default_ram`]).
     ///
     /// Spec: IBM VGA text — cells are (char, attr) pairs starting at `0xB8000`.
     pub fn reset(&mut self) {
@@ -489,6 +528,7 @@ impl VgaText {
         }
         self.crtc_index = 0;
         self.crtc_regs = [0; VGA_CRTC_REG_COUNT];
+        self.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)] = VGA_CRTC_MAX_SCAN_LINE_DEFAULT;
         self.seq_index = 0;
         self.seq_regs = VGA_SEQ_DEFAULTS;
         self.gc_index = 0;
@@ -1037,7 +1077,10 @@ mod tests {
         // Beyond 80×25 within the 32 KiB plane remains 0 after reset.
         assert_eq!(v.mem[80 * 25 * 2], 0);
         assert_eq!(v.crtc_index, 0);
-        assert_eq!(v.crtc_regs, [0; VGA_CRTC_REG_COUNT]);
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
+            VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
         assert_eq!(v.seq_regs, VGA_SEQ_DEFAULTS);
         assert_eq!(v.gc_regs, VGA_GC_DEFAULTS);
         assert_eq!(v.atc_index, VGA_ATC_INDEX_DEFAULT);
@@ -1122,8 +1165,18 @@ mod tests {
         let mut v = VgaText::new();
         v.port_write(VGA_CRTC_INDEX, 1, 0x20);
         v.port_write(VGA_CRTC_DATA, 1, 0x55);
-        assert_eq!(v.crtc_regs, [0; VGA_CRTC_REG_COUNT]);
+        // Index 0x20 is beyond the 25 standard registers; data write ignored.
+        // In-range mode-03h Max Scan Line default is unchanged.
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
+            VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
         assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
+        assert_eq!(
+            v.port_read(VGA_CRTC_DATA, 1) as u8,
+            VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
     }
 
     #[test]
@@ -1131,9 +1184,50 @@ mod tests {
         let mut v = VgaText::new();
         v.port_write(VGA_CRTC_INDEX, 1, 0x07);
         v.port_write(VGA_CRTC_DATA, 1, 0x99);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
+        v.port_write(VGA_CRTC_DATA, 1, 0x55);
         v.reset();
         assert_eq!(v.crtc_index, 0);
         assert_eq!(v.crtc_regs[0x07], 0);
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
+            VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
+    }
+
+    /// Spec: FreeVGA CRT Controller — Maximum Scan Line (index `0x09`)
+    /// store/readback; Protect does not cover indexes `>= 0x08`. Mode-03h reset
+    /// default is [`VGA_CRTC_MAX_SCAN_LINE_DEFAULT`] (`0x0F`).
+    #[test]
+    fn crtc_max_scan_line_store_readback_with_protect() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
+            VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
+        assert_eq!(
+            v.port_read(VGA_CRTC_DATA, 1) as u8,
+            VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
+
+        // Protect set — index 0x09 must still accept writes.
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_VERTICAL_RETRACE_END));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_PROTECT));
+        let programmed = VGA_CRTC_MAX_SCAN_MASK // MaxScan = 0x1F
+            | VGA_CRTC_MAX_SCAN_START_VBLANK_BIT9
+            | VGA_CRTC_MAX_SCAN_LINE_COMPARE_BIT9
+            | VGA_CRTC_MAX_SCAN_DOUBLING;
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(programmed));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, programmed);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)], programmed);
+
+        // Word write path (lo=index, hi=data) also updates Max Scan under Protect.
+        v.port_write(VGA_CRTC_INDEX, 2, 0x4E_09); // index 0x09, data 0x4E
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)], 0x4E);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x4E);
     }
 
     #[test]
