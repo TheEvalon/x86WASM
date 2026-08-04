@@ -68,8 +68,10 @@
 //! - Sense Drive Status (`0x04`): command byte → one HD|US parameter (same
 //!   packing as Seek param0) → 1-byte ST3 result; no execution phase, no IRQ
 //!   assert/clear; T0 stub reflects `pcn[unit] == 0` for the selected unit;
-//!   WP stub always 0 (no media); reserved bits 3/5 always 1 per 82077AA §6.4;
-//!   MSR RQM during parameter, RQM|DIO during result phase
+//!   WP (ST3 bit6) set when media attached and [`Self::write_protected`] is
+//!   true (via [`Self::set_write_protected`]; default clear); without media WP
+//!   stays 0; reserved bits 3/5 always 1 per 82077AA §6.4; MSR RQM during
+//!   parameter, RQM|DIO during result phase
 //! - Version (`0x10`): command byte → 1-byte result `0x90` (82077AA id); no
 //!   parameters, no IRQ assert/clear; MSR RQM|DIO during result phase
 //! - Configure (`0x13`): command byte → three parameter bytes stored
@@ -132,12 +134,14 @@
 //!   SC latched into `sc_eot`.
 //! - 1.44MB media image attach/eject + CHS→offset/`read_sector`/
 //!   `write_sector` helpers (PC MFM geometry); DIR bit7 DSKCHG stub on
-//!   attach/eject; `reset()` preserves media like IDE. READ DATA success path
-//!   latches one sector in `last_sector` and arms `dma_read_pending` when DOR
-//!   bit3 is set for MachineBus auto DMA ch2 Write (device→memory). WRITE DATA
-//!   success path accepts one sector via `latch_write_sector` → `last_write` /
-//!   `write_sector`, or arms `dma_write_pending` for MachineBus ISA DMA ch2
-//!   Read (memory→device) when no pre-latch and DOR bit3 is set.
+//!   attach/eject; `write_protected` / [`Self::set_write_protected`] for ST3
+//!   WP; `reset()` preserves media and write-protect flag like IDE. READ DATA
+//!   success path latches one sector in `last_sector` and arms
+//!   `dma_read_pending` when DOR bit3 is set for MachineBus auto DMA ch2 Write
+//!   (device→memory). WRITE DATA success path accepts one sector via
+//!   `latch_write_sector` → `last_write` / `write_sector`, or arms
+//!   `dma_write_pending` for MachineBus ISA DMA ch2 Read (memory→device) when
+//!   no pre-latch and DOR bit3 is set.
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
@@ -148,7 +152,7 @@
 //! - Multi-sector / full MT engine; DREQ/DACK cycle timing; FORMAT media
 //! - Seek step timing; real DIR disk-change edge timing (DSKCHG stub only)
 //! - Implied seek from Configure EIS; multi-sector TC termination
-//! - Drive sensing beyond DSKCHG attach/eject stub
+//! - WRITE DATA / FORMAT ST1 NW from WP pin (Sense Drive ST3 WP only this slice)
 //! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
 //! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
 //!   implied seek, poll disable enforcement); DSR software-reset path
@@ -489,6 +493,13 @@ pub struct Fdc82077 {
     /// Attached 1.44MB raw floppy image (`None` = no media). Preserved across
     /// [`Self::reset`] like [`crate::IdePrimary`]'s backing image.
     image: Option<Vec<u8>>,
+    /// Write-protect pin / media flag for Sense Drive Status ST3 WP (bit6).
+    ///
+    /// Spec: Intel 82077AA §6.4 — ST3 bit6 reflects the WP pin. Default `false`.
+    /// When media is attached and this is set, Sense Drive Status reports WP=1;
+    /// without media WP stays 0. Preserved across [`Self::reset`]. Does not yet
+    /// force WRITE DATA ST1 NW from the pin.
+    pub write_protected: bool,
     /// Last sector bytes transferred by a successful READ DATA (single-sector
     /// slice). Cleared on ND/abnormal completion. Inspect via [`Self::last_sector`];
     /// Machine DMA consumes a one-shot pending arm via [`Self::take_pending_dma_sector`].
@@ -550,6 +561,7 @@ impl Fdc82077 {
             read_params: [0; FDC_READ_DATA_PARAM_LEN as usize],
             read_result: [0; FDC_READ_DATA_RESULT_LEN as usize],
             image: None,
+            write_protected: false,
             last_sector: None,
             dma_read_pending: false,
             dma_write_pending: false,
@@ -560,7 +572,8 @@ impl Fdc82077 {
     /// Attach a raw 1.44MB floppy image (exact [`FDC_1440_IMAGE_SIZE`] bytes).
     ///
     /// Rejects other sizes. Clears DIR DSKCHG (stub). Spec: IBM PC 1.44MB MFM;
-    /// DIR bit7 semantics are stubbed (see [`FDC_DIR_DSKCHG`]).
+    /// DIR bit7 semantics are stubbed (see [`FDC_DIR_DSKCHG`]). Does not change
+    /// [`Self::write_protected`].
     pub fn attach_image(&mut self, image: Vec<u8>) -> Result<(), &'static str> {
         if image.len() != FDC_1440_IMAGE_SIZE {
             return Err("FDC attach_image requires exact 1.44MB (1_474_560) image");
@@ -568,6 +581,15 @@ impl Fdc82077 {
         self.image = Some(image);
         self.dir &= !FDC_DIR_DSKCHG;
         Ok(())
+    }
+
+    /// Set the media write-protect flag (Sense Drive Status ST3 WP pin).
+    ///
+    /// Spec: Intel 82077AA §6.4 — ST3 bit6 WP. With media attached and
+    /// `protected == true`, Sense Drive Status returns WP=1; default and
+    /// no-media cases report WP=0. WRITE DATA ST1 NW from this pin is deferred.
+    pub fn set_write_protected(&mut self, protected: bool) {
+        self.write_protected = protected;
     }
 
     /// Construct an FDC with a 1.44MB image already attached.
@@ -719,12 +741,15 @@ impl Fdc82077 {
     }
 
     /// Hardware reset: clears programmed controller state; preserves attached
-    /// media (and DSKCHG when ejected), matching [`crate::IdePrimary::reset`].
+    /// media, write-protect flag, and DSKCHG when ejected, matching
+    /// [`crate::IdePrimary::reset`].
     pub fn reset(&mut self) {
         let image = self.image.take();
+        let write_protected = self.write_protected;
         let dskchg = self.dir & FDC_DIR_DSKCHG;
         *self = Self::new();
         self.image = image;
+        self.write_protected = write_protected;
         if self.has_media() {
             self.dir &= !FDC_DIR_DSKCHG;
         } else {
@@ -889,14 +914,18 @@ impl Fdc82077 {
     ///
     /// Spec: Intel 82077AA §5.2.5/§6.4 — no execution phase, goes directly to
     /// the result phase; ST3 bits 2:0 echo the HD|US parameter, T0 stub
-    /// reflects `pcn[unit] == 0` for the selected unit, WP stub always 0 (no
-    /// media), reserved bits 3/5 always 1. No IRQ.
+    /// reflects `pcn[unit] == 0` for the selected unit, WP set when media is
+    /// attached and [`Self::write_protected`] is true (else 0), reserved bits
+    /// 3/5 always 1. No IRQ.
     fn finish_sense_drive_status(&mut self, param: u8) {
         let head_unit = param & (FDC_ST3_HEAD | FDC_ST3_UNIT_MASK);
         let unit = (param & FDC_ST3_UNIT_MASK) as usize;
         let mut st3 = head_unit | FDC_ST3_RESERVED_BIT3 | FDC_ST3_RESERVED_BIT5;
         if self.pcn[unit] == 0 {
             st3 |= FDC_ST3_TRACK0;
+        }
+        if self.has_media() && self.write_protected {
+            st3 |= FDC_ST3_WRITE_PROTECT;
         }
         self.sense_st3 = st3;
         self.phase = Phase::SenseDriveStatusResult;
@@ -2169,19 +2198,78 @@ mod tests {
         assert_eq!(f.phase, Phase::Command);
     }
 
-    /// Spec: WP reflects the WP pin; stub has no media, so always 0.
+    /// Spec: Intel 82077AA §6.4 — ST3 WP reflects the WP pin. No media → WP=0
+    /// even if the host flag is set (honest empty-drive stub).
     #[test]
-    fn sense_drive_status_write_protect_stub_always_clear() {
+    fn sense_drive_status_write_protect_clear_without_media() {
         let mut f = Fdc82077::new();
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.set_write_protected(true);
+        assert!(!f.has_media());
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
         f.port_write(FDC_FIFO, 1, 0x00);
         let st3 = f.port_read(FDC_FIFO, 1) as u8;
         assert_eq!(
             st3 & FDC_ST3_WRITE_PROTECT,
             0,
-            "no media in stub: WP always clear"
+            "no media: WP stays clear even when write_protected set"
         );
+    }
+
+    /// Spec: Intel 82077AA §6.4 — with media, WP defaults clear; set_write_protected
+    /// asserts ST3 bit6; clearing the flag clears WP again.
+    #[test]
+    fn sense_drive_status_write_protect_reflects_media_flag() {
+        let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(f.has_media());
+        assert!(!f.write_protected, "default WP flag clear");
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        let st3_default = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st3_default & FDC_ST3_WRITE_PROTECT,
+            0,
+            "media attached, default: WP clear"
+        );
+
+        f.set_write_protected(true);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        let st3_wp = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st3_wp & FDC_ST3_WRITE_PROTECT,
+            FDC_ST3_WRITE_PROTECT,
+            "media + write_protected: ST3 WP set"
+        );
+
+        f.set_write_protected(false);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        let st3_clear = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st3_clear & FDC_ST3_WRITE_PROTECT,
+            0,
+            "clearing write_protected clears ST3 WP"
+        );
+    }
+
+    /// Spec: write-protect is a media property; hardware reset preserves it
+    /// with the attached image (same policy as IDE backing media).
+    #[test]
+    fn reset_preserves_write_protected_with_media() {
+        let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
+        f.set_write_protected(true);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.reset();
+        assert!(f.has_media());
+        assert!(f.write_protected);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        let st3 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st3 & FDC_ST3_WRITE_PROTECT, FDC_ST3_WRITE_PROTECT);
     }
 
     /// Spec: T0 bit reflects TRK0 pin state (stub: `pcn[unit]==0`); clear when
