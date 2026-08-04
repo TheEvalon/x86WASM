@@ -2163,6 +2163,15 @@ fn step_two_byte(
     next_ip: u16,
 ) -> Result<(), ExecError> {
     match insn.opcode {
+        0x06 => {
+            // CLTS — Spec: Intel SDM Vol. 2 "CLTS—Clear Task-Switched Flag in
+            // CR0"; Vol. 3 §2.5 (CR0.TS = bit 3). Clears TS only; all other
+            // CR0 bits (including PE) are unchanged. Real-mode path only —
+            // protected-mode CPL=0 / #GP(0) checks are out of scope here.
+            cpu.cr0 &= !(1u64 << 3);
+            cpu.set_ip16(next_ip);
+            Ok(())
+        }
         0x01 => {
             // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2;
             // "SGDT"/"SIDT"/"LGDT"/"LIDT"/"SMSW"/"LMSW".
@@ -10244,6 +10253,40 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap(); // MOV AX,0x10
         step(&mut cpu, &mut bus).unwrap(); // LMSW AX with PE sticky
         assert_eq!(cpu.cr0 & 0xFFFF, 0x0011, "ET loaded; PE remains set");
+    }
+
+    /// CLTS — opcode 0F 06. Clears CR0.TS (bit 3) only; all other CR0 bits preserved.
+    /// Spec: Intel SDM Vol. 2 "CLTS—Clear Task-Switched Flag in CR0"; Vol. 3 §2.5 (CR0.TS).
+    /// Real-mode only here; PM CPL/#GP checks are out of scope.
+    #[test]
+    fn clts_clears_only_cr0_ts() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        // +0: 0F 06   CLTS
+        // +2: F4      HLT
+        mem[code] = 0x0F;
+        mem[code + 1] = 0x06;
+        mem[code + 2] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        // CD|NW|ET|TS|PE — TS (bit 3) and PE (bit 0) both set; CLTS must clear only TS.
+        // Spec: CR0.TS = bit 3; CLTS clears TS without modifying other CR0 bits.
+        cpu.cr0 = 0x6000_0019;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // CLTS
+        assert_eq!(cpu.cr0 & (1 << 3), 0, "CR0.TS must be cleared");
+        assert_eq!(cpu.cr0 & 1, 1, "PE must be preserved");
+        assert_eq!(
+            cpu.cr0, 0x6000_0011,
+            "only TS (bit 3) cleared; CD|NW|ET|PE remain"
+        );
+        assert_eq!(cpu.rip, (code + 2) as u64);
     }
 
     /// MOV r32, CR0 — opcode 0F 20 /r (SDM Vol. 2 "MOV—Move to/from Control
