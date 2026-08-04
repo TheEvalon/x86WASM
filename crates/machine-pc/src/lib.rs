@@ -12,8 +12,9 @@ pub use mem::PhysMem;
 use devices::{
     CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, IdePrimary, IdeSecondary,
     PciConfig, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, FDC_DOR_DMA_IRQ,
-    I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
-    PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    FDC_SECTOR_SIZE, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
+    PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -349,8 +350,9 @@ impl Machine {
     /// `(page << 16) | addr`, Single+Increment+Read/Write mode subset. Memory
     /// callbacks use [`PhysMem::read_u8`] / [`PhysMem::write_u8`] (A20 applied).
     ///
-    /// Used by [`Self::fdc_dma_read_sector`] / MachineBus FDC auto-wire (ISA ch2
-    /// Write = device→memory). **Not** DREQ/DACK cycle timing or IDE BM-DMA.
+    /// Used by [`Self::fdc_dma_read_sector`] / [`Self::fdc_dma_write_sector`] /
+    /// MachineBus FDC auto-wire (ISA ch2 Write = device→memory, Read =
+    /// memory→device). **Not** DREQ/DACK cycle timing or IDE BM-DMA.
     pub fn dma_transfer(
         &mut self,
         isa_channel: usize,
@@ -387,6 +389,33 @@ impl Machine {
         }
         let mut buf = self.fdc.take_pending_dma_sector()?;
         Some(self.dma_transfer(2, &mut buf))
+    }
+
+    /// If FDC has a pending WRITE DATA DMA arm (DOR DMA/IRQ at command complete),
+    /// fill a sector buffer through ISA DMA channel 2 in Read mode
+    /// (memory → I/O device) and commit it into the floppy image.
+    ///
+    /// Spec: Intel 82077AA DMA mode; Intel 8237A Read transfer; OSDev ISA DMA
+    /// floppy channel 2. Prefer the MachineBus auto-wire after FDC FIFO writes.
+    ///
+    /// Returns `None` when nothing is pending; `Some(Ok(n))` / `Some(Err(_))`
+    /// from [`Self::dma_transfer`]. On transfer error the pending arm is still
+    /// consumed and the image is left unchanged.
+    pub fn fdc_dma_write_sector(&mut self) -> Option<Result<usize, DmaTransferError>> {
+        if self.fdc.dor & FDC_DOR_DMA_IRQ == 0 {
+            return None;
+        }
+        if !self.fdc.take_pending_dma_write() {
+            return None;
+        }
+        let mut buf = [0u8; FDC_SECTOR_SIZE];
+        match self.dma_transfer(2, &mut buf) {
+            Ok(n) => {
+                let _ = self.fdc.commit_dma_write_sector(buf);
+                Some(Ok(n))
+            }
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -445,6 +474,27 @@ impl MachineBus<'_> {
         let _ = self.dma_transfer(2, &mut buf);
     }
 
+    /// Auto-wire: pending FDC WRITE DATA → ISA DMA ch2 Read → sector buffer → image.
+    ///
+    /// Spec: Intel 82077AA DMA mode + 8237A Read + OSDev ISA DMA floppy ch2.
+    /// Invoked after every FDC `port_write` so WRITE DATA FIFO completion with
+    /// media + DOR DMA/IRQ (no device pre-latch) pulls 512 bytes from PhysMem
+    /// and commits via [`Fdc82077::commit_dma_write_sector`].
+    fn try_fdc_dma_ch2_read(&mut self) {
+        if self.fdc.dor & FDC_DOR_DMA_IRQ == 0 {
+            return;
+        }
+        if !self.fdc.take_pending_dma_write() {
+            return;
+        }
+        let mut buf = [0u8; FDC_SECTOR_SIZE];
+        // Guest must have programmed ch2 (page/addr/count/mode Read|Single).
+        // Errors leave the image unchanged; pending arm already consumed.
+        if self.dma_transfer(2, &mut buf).is_ok() {
+            let _ = self.fdc.commit_dma_write_sector(buf);
+        }
+    }
+
     /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
@@ -495,6 +545,9 @@ impl MachineBus<'_> {
             // Spec: 82077AA DMA mode — after READ DATA FIFO completion latches a
             // sector with DOR DMA/IRQ enable, copy via ISA DMA ch2 Write (I/O→mem).
             self.try_fdc_dma_ch2_write();
+            // Spec: 82077AA DMA mode — after WRITE DATA FIFO completion with media
+            // + DOR DMA/IRQ, pull via ISA DMA ch2 Read (mem→I/O) into the image.
+            self.try_fdc_dma_ch2_read();
             return;
         }
         if Dma8237::owns_port(port) {
@@ -617,14 +670,14 @@ mod tests {
         CMD_ENABLE_KBD, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT,
         CMOS_DATA, CMOS_INDEX, FDC_1440_IMAGE_SIZE, FDC_CMD_CONFIGURE, FDC_CMD_MFM,
         FDC_CMD_READ_DATA, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK, FDC_CMD_SENSE_DRIVE_STATUS,
-        FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO,
-        FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, FDC_SECTOR_SIZE, FDC_ST0_SEEK_END,
-        FDC_ST3_RESERVED_BIT3, FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042, I8042_DATA,
-        I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
-        PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B,
-        REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
-        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
+        FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA, FDC_DOR, FDC_DOR_DMA_IRQ,
+        FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, FDC_SECTOR_SIZE,
+        FDC_ST0_SEEK_END, FDC_ST3_RESERVED_BIT3, FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042,
+        I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD,
+        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL,
+        PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A,
+        REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE,
+        STC_IRQF, STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
         VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
@@ -1544,6 +1597,20 @@ mod tests {
         m.dma.port_write(0x0A, 1, 0x02); // unmask ch2
     }
 
+    /// Program master ch2: page, addr, count=N−1, Single+Inc+Read (`0x4A`), unmasked.
+    fn program_dma_ch2_read(m: &mut Machine, page: u8, addr: u16, count_minus_one: u16) {
+        use devices::DMA_PAGE_CH2;
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x04, 1, u32::from(addr & 0xFF));
+        m.dma.port_write(0x04, 1, u32::from(addr >> 8));
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x05, 1, u32::from(count_minus_one & 0xFF));
+        m.dma.port_write(0x05, 1, u32::from(count_minus_one >> 8));
+        m.dma.port_write(DMA_PAGE_CH2, 1, u32::from(page));
+        m.dma.port_write(0x0B, 1, 0x4A); // Single | Inc | Read | ch2
+        m.dma.port_write(0x0A, 1, 0x02); // unmask ch2
+    }
+
     /// Spec: Intel 8237A + OSDev ISA DMA — `Machine::dma_transfer` Write moves
     /// I/O buffer into PhysMem at `(page<<16)|addr` and latches TC.
     #[test]
@@ -2277,6 +2344,94 @@ mod tests {
         }
         assert!(m.fdc.last_sector().is_none());
         // Channel still programmed / unmasked — TC not latched (no transfer).
+        assert_eq!(m.dma.master.status & 0x0F, 0);
+        assert_eq!(m.dma.master.channels[2].count, 511);
+    }
+
+    /// Spec: Intel 82077AA DMA mode + 8237A Read + OSDev ISA DMA floppy ch2 —
+    /// MachineBus FDC FIFO WRITE DATA completion with media auto-wires
+    /// `dma_transfer(2)` Read (memory→device): 512 PhysMem bytes land in the
+    /// floppy image via `write_sector` / `last_write` and TC latches.
+    #[test]
+    fn machine_bus_fdc_write_data_dma_ch2_reads_sector_from_physmem() {
+        let mut m = Machine::new(256 * 1024);
+        m.fdc
+            .attach_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE])
+            .expect("1.44MB image");
+        // Program ISA DMA ch2: page/addr, count=511 (512 bytes), Read|Single|Inc.
+        program_dma_ch2_read(&mut m, 0x01, 0x1000, 511); // @ phys 0x1_1000
+        for i in 0..FDC_SECTOR_SIZE {
+            m.mem
+                .write_u8(0x1_1000 + i as u64, (i & 0xFF) as u8)
+                .unwrap();
+        }
+
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(FDC_DOR, FDC_DOR_MOTOR0_DMA).unwrap();
+            // WRITE DATA MFM: C/H/R/N = 0/0/1/2 — no device pre-latch.
+            bus.port_out_u8(FDC_FIFO, FDC_CMD_MFM | FDC_CMD_WRITE_DATA)
+                .unwrap();
+            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+                bus.port_out_u8(FDC_FIFO, p).unwrap();
+            }
+        }
+
+        let written = *m
+            .fdc
+            .last_write()
+            .expect("Machine DMA commit latches last_write");
+        for (i, b) in written.iter().enumerate() {
+            assert_eq!(*b, (i & 0xFF) as u8, "last_write[{i}]");
+        }
+        let image_sector = m
+            .fdc
+            .read_sector(0, 0, 1)
+            .expect("image must contain DMA-written sector");
+        assert_eq!(image_sector, written);
+        assert_eq!(m.dma.master.channels[2].count, 0xFFFF);
+        assert_eq!(
+            m.dma.port_read(0x08, 1) as u8 & 0x0F,
+            0x04,
+            "TC latched for ch2"
+        );
+        assert!(
+            !m.fdc.take_pending_dma_write(),
+            "pending arm consumed by auto-wire"
+        );
+    }
+
+    /// Spec: 82077AA — no media → NW result, no `last_write`, MachineBus must
+    /// not DMA-read / must leave PhysMem at the DMA address unchanged and must
+    /// not latch TC.
+    #[test]
+    fn machine_bus_fdc_write_data_no_media_skips_dma_ch2() {
+        let mut m = Machine::new(256 * 1024);
+        assert!(!m.fdc.has_media());
+        program_dma_ch2_read(&mut m, 0x01, 0x2000, 511); // @ phys 0x1_2000
+        for i in 0..FDC_SECTOR_SIZE {
+            m.mem.write_u8(0x1_2000 + i as u64, 0x5A).unwrap();
+        }
+
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(FDC_DOR, FDC_DOR_MOTOR0_DMA).unwrap();
+            bus.port_out_u8(FDC_FIFO, FDC_CMD_MFM | FDC_CMD_WRITE_DATA)
+                .unwrap();
+            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+                bus.port_out_u8(FDC_FIFO, p).unwrap();
+            }
+        }
+
+        for i in 0..FDC_SECTOR_SIZE {
+            assert_eq!(
+                m.mem.read_u8(0x1_2000 + i as u64).unwrap(),
+                0x5A,
+                "no-media must not consume DMA source buffer"
+            );
+        }
+        assert!(m.fdc.last_write().is_none());
+        assert!(!m.fdc.take_pending_dma_write());
         assert_eq!(m.dma.master.status & 0x0F, 0);
         assert_eq!(m.dma.master.channels[2].count, 511);
     }
