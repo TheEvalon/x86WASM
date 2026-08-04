@@ -6,9 +6,10 @@
 //!
 //! - Intel 8259A Programmable Interrupt Controller datasheet — ICW1–ICW4
 //!   (incl. ICW4.AEOI Automatic EOI); OCW1 (IMR); OCW2 non-specific / specific
-//!   EOI; OCW3 IRR/ISR read select; OCW3 poll command (`P=1`); OCW3 Special
-//!   Mask Mode (`ESMM`/`SMM`); IRR/ISR; fully nested priority; cascade EOI
-//!   (master + slave).
+//!   EOI; OCW2 Automatic Rotation (Rotate on Non-Specific EOI + Rotate in
+//!   Automatic EOI Mode); OCW3 IRR/ISR read select; OCW3 poll command (`P=1`);
+//!   OCW3 Special Mask Mode (`ESMM`/`SMM`); IRR/ISR; fully nested priority;
+//!   cascade EOI (master + slave).
 //! - Classic IBM PC/AT: master at `0x20`/`0x21`, slave at `0xA0`/`0xA1`, slave
 //!   cascaded on master IR2.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 / §21 / §23.3.
@@ -18,6 +19,8 @@
 //! - ICW1–ICW4 initialization (single and cascaded)
 //! - OCW1 IMR read/write on data port after init
 //! - OCW2 non-specific EOI (`R=0,SL=0,EOI=1`) and specific EOI (`R=0,SL=1,EOI=1`)
+//! - OCW2 Automatic Rotation: Rotate on Non-Specific EOI (`R=1,SL=0,EOI=1`) and
+//!   Rotate in Automatic EOI Mode set/clear (`R=1,SL=0,EOI=0` / `R=0,SL=0,EOI=0`)
 //! - OCW3 read-register select (`RR`/`RIS`) for IRR/ISR on command-port reads
 //! - OCW3 poll command (`P=1`): one-shot acknowledging command-port read
 //!   returning `0x80 | level`, including software-sequenced cascaded polling
@@ -32,7 +35,8 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - Rotate modes (OCW2 `R=1`), special fully-nested mode
+//! - Specific Rotation (OCW2 Set Priority `R=1,SL=1,EOI=0` / Rotate on Specific
+//!   EOI `R=1,SL=1,EOI=1`), special fully-nested mode
 //! - Level-triggered delivery beyond storing ICW1.LTIM (runtime uses edge model)
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
@@ -141,6 +145,16 @@ pub struct Pic8259 {
     /// lower priority) that fully-nested mode would otherwise block. Cleared
     /// when `ESMM=1,SMM=0`; unchanged when `ESMM=0`.
     pub special_mask_mode: bool,
+    /// IR line currently assigned lowest priority (0–7).
+    ///
+    /// Spec: Intel 8259A — after init IR0 is highest and IR7 lowest
+    /// (`lowest_priority = 7`). Automatic Rotation assigns the just-serviced IR
+    /// as the new bottom; the next IR (mod 8) becomes highest.
+    pub lowest_priority: u8,
+    /// Rotate in Automatic EOI Mode (OCW2 `R=1,SL=0,EOI=0` set /
+    /// `R=0,SL=0,EOI=0` clear). When set with ICW4.AEOI, each acknowledge
+    /// rotates so the serviced IR becomes lowest priority.
+    pub rotate_on_auto_eoi: bool,
 }
 
 impl Pic8259 {
@@ -173,6 +187,8 @@ impl Pic8259 {
             read_reg: ReadReg::Irr,
             poll_command_armed: false,
             special_mask_mode: false,
+            lowest_priority: 7,
+            rotate_on_auto_eoi: false,
         }
     }
 
@@ -226,16 +242,27 @@ impl Pic8259 {
         }
     }
 
+    /// Priority rank of `ir`: 0 = highest … 7 = lowest (rotated).
+    ///
+    /// Spec: Intel 8259A — with bottom priority `lowest_priority`, the next IR
+    /// (mod 8) has highest priority.
+    fn priority_rank(&self, ir: u8) -> u8 {
+        ir.wrapping_sub(self.lowest_priority.wrapping_add(1)) & 7
+    }
+
     /// Highest-priority unmasked IRR request not blocked by nested ISR rules.
     ///
-    /// Spec: Intel 8259A fully nested mode — IR0 highest … IR7 lowest. With
-    /// Special Mask Mode, an in-service IR whose IMR bit is set does not block
-    /// lower-priority unmasked requests (IMR still masks its own level).
+    /// Spec: Intel 8259A fully nested mode — default IR0 highest … IR7 lowest;
+    /// Automatic Rotation reassigns the bottom. With Special Mask Mode, an
+    /// in-service IR whose IMR bit is set does not block lower-priority
+    /// unmasked requests (IMR still masks its own level).
     fn highest_priority_request(&self) -> Option<u8> {
         if !self.initialized {
             return None;
         }
-        for ir in 0u8..8 {
+        let highest = self.lowest_priority.wrapping_add(1) & 7;
+        for offset in 0u8..8 {
+            let ir = highest.wrapping_add(offset) & 7;
             let bit = 1u8 << ir;
             if self.irr & bit == 0 || self.imr & bit != 0 {
                 continue;
@@ -253,20 +280,59 @@ impl Pic8259 {
         if self.isr == 0 {
             return false;
         }
+        let ir_rank = self.priority_rank(ir);
         if self.special_mask_mode {
             // SMM: a higher-or-equal priority IS bit blocks only while unmasked.
-            for hp in 0u8..=ir {
+            for hp in 0u8..8 {
                 let hp_bit = 1u8 << hp;
-                if self.isr & hp_bit != 0 && self.imr & hp_bit == 0 {
+                if self.isr & hp_bit == 0 || self.imr & hp_bit != 0 {
+                    continue;
+                }
+                if self.priority_rank(hp) <= ir_rank {
                     return true;
                 }
             }
             false
         } else {
-            // Fully nested: only IR lines strictly higher priority than the
-            // top (lowest-index) ISR bit may be recognized.
-            ir >= self.isr.trailing_zeros() as u8
+            // Fully nested: only IR lines strictly higher priority than every
+            // in-service bit may be recognized.
+            for hp in 0u8..8 {
+                let hp_bit = 1u8 << hp;
+                if self.isr & hp_bit == 0 {
+                    continue;
+                }
+                if self.priority_rank(hp) <= ir_rank {
+                    return true;
+                }
+            }
+            false
         }
+    }
+
+    /// Highest-priority (best rank) ISR bit, optionally skipping IMR-masked bits
+    /// (Special Mask Mode non-specific EOI).
+    fn highest_priority_isr_bit(&self, skip_masked: bool) -> Option<u8> {
+        if self.isr == 0 {
+            return None;
+        }
+        let highest = self.lowest_priority.wrapping_add(1) & 7;
+        for offset in 0u8..8 {
+            let ir = highest.wrapping_add(offset) & 7;
+            let bit = 1u8 << ir;
+            if self.isr & bit == 0 {
+                continue;
+            }
+            if skip_masked && self.imr & bit != 0 {
+                continue;
+            }
+            return Some(ir);
+        }
+        None
+    }
+
+    /// Assign `ir` as lowest priority (Automatic / Specific Rotation).
+    fn rotate_lowest_to(&mut self, ir: u8) {
+        self.lowest_priority = ir & 7;
     }
 
     /// True if this chip would assert INT (unmasked request not nested-blocked).
@@ -276,12 +342,16 @@ impl Pic8259 {
 
     /// Acknowledge IR`ir`: clear IRR, set ISR; with AEOI, clear that ISR bit
     /// at the end of the acknowledge sequence (Intel 8259A Automatic EOI).
+    /// With Rotate in Automatic EOI Mode, also assign `ir` lowest priority.
     fn ack_ir(&mut self, ir: u8) {
         let bit = 1u8 << ir;
         self.irr &= !bit;
         self.isr |= bit;
         if self.auto_eoi {
             self.isr &= !bit;
+            if self.rotate_on_auto_eoi {
+                self.rotate_lowest_to(ir);
+            }
         }
     }
 
@@ -320,6 +390,8 @@ impl Pic8259 {
         self.read_reg = ReadReg::Irr;
         self.poll_command_armed = false;
         self.special_mask_mode = false;
+        self.lowest_priority = 7;
+        self.rotate_on_auto_eoi = false;
         self.phase = InitPhase::ExpectIcw2;
     }
 
@@ -362,35 +434,50 @@ impl Pic8259 {
         self.read_reg = ReadReg::Irr;
     }
 
-    /// OCW2: non-specific / specific EOI only (`R=0`). Rotate unsupported.
+    /// OCW2: EOI and Automatic Rotation commands.
+    ///
+    /// Spec: Intel 8259A OCW2 (`R`/`SL`/`EOI` / L2–L0):
+    /// - `R=0,SL=0,EOI=1` — non-specific EOI
+    /// - `R=0,SL=1,EOI=1` — specific EOI
+    /// - `R=1,SL=0,EOI=1` — Rotate on Non-Specific EOI
+    /// - `R=1,SL=0,EOI=0` — Rotate in Automatic EOI Mode (set)
+    /// - `R=0,SL=0,EOI=0` — Rotate in Automatic EOI Mode (clear)
+    /// - `R=0,SL=1,EOI=0` — no operation
+    /// - `R=1,SL=1,*` — Specific Rotation (unsupported this slice)
     fn write_ocw2(&mut self, value: u8) {
-        if value & OCW2_R != 0 {
-            // Rotate / set-priority forms — unsupported this slice.
+        let r = value & OCW2_R != 0;
+        let sl = value & OCW2_SL != 0;
+        let eoi = value & OCW2_EOI != 0;
+
+        if r && sl {
+            // Specific Rotation (Set Priority / Rotate on Specific EOI) — out.
             return;
         }
-        if value & OCW2_EOI == 0 {
+
+        if !eoi {
+            if !sl {
+                // Rotate in Automatic EOI Mode set (`R=1`) / clear (`R=0`).
+                self.rotate_on_auto_eoi = r;
+            }
+            // `R=0,SL=1,EOI=0` = nop; `R=1,SL=1` already returned.
             return;
         }
-        if value & OCW2_SL != 0 {
+
+        if sl {
             // Specific EOI: clear ISR bit L2–L0.
             let level = value & 0x07;
             self.isr &= !(1u8 << level);
-        } else if self.special_mask_mode {
-            // Non-specific EOI under SMM: skip IS bits masked by IMR.
-            // Spec: Intel 8259A — "an IS bit that is masked by an IMR bit will
-            // not be cleared by a non-specific EOI if the 8259A is in the
-            // Special Mask Mode."
-            for level in 0u8..8 {
-                let bit = 1u8 << level;
-                if self.isr & bit != 0 && self.imr & bit == 0 {
-                    self.isr &= !bit;
-                    break;
-                }
-            }
-        } else if self.isr != 0 {
-            // Non-specific EOI: clear highest-priority (lowest index) ISR bit.
-            let level = self.isr.trailing_zeros() as u8;
+            return;
+        }
+
+        // Non-specific EOI (± rotate): clear highest-priority IS bit.
+        let skip_masked = self.special_mask_mode;
+        if let Some(level) = self.highest_priority_isr_bit(skip_masked) {
             self.isr &= !(1u8 << level);
+            if r {
+                // Rotate on Non-Specific EOI: that level becomes lowest priority.
+                self.rotate_lowest_to(level);
+            }
         }
     }
 
@@ -644,6 +731,10 @@ mod tests {
         assert!(!pic.slave.auto_eoi);
         assert!(!pic.master.special_mask_mode);
         assert!(!pic.slave.special_mask_mode);
+        assert_eq!(pic.master.lowest_priority, 7);
+        assert_eq!(pic.slave.lowest_priority, 7);
+        assert!(!pic.master.rotate_on_auto_eoi);
+        assert!(!pic.slave.rotate_on_auto_eoi);
         assert!(pic.master.is_master);
         assert!(!pic.slave.is_master);
         assert_eq!(pic.master.imr, 0xFF);
@@ -1227,5 +1318,145 @@ mod tests {
         pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // OCW3 P=1
         assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 5);
         assert_eq!(pic.master.isr & (1 << 5), 1 << 5);
+    }
+
+    /// Spec: Intel 8259A Automatic Rotation — Rotate on Non-Specific EOI
+    /// (`OCW2 R=1,SL=0,EOI=1` = `0xA0`): after clearing the highest-priority
+    /// IS bit, that IR level is assigned lowest priority (next IR becomes
+    /// highest).
+    #[test]
+    fn rotate_on_nonspecific_eoi_assigns_lowest_priority() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // unmask all
+        assert_eq!(pic.master.lowest_priority, 7);
+
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.isr, 1 << 0);
+
+        // Rotate on non-specific EOI: clear IS0, IR0 becomes lowest → IR1 highest.
+        pic.port_write(PIC_MASTER_CMD, 1, 0xA0);
+        assert_eq!(pic.master.isr, 0);
+        assert_eq!(pic.master.lowest_priority, 0);
+
+        pic.set_irq_line(0, false);
+        pic.set_irq_line(0, true);
+        pic.set_irq_line(1, true);
+        // With IR0 lowest, IR1 outranks IR0.
+        assert_eq!(pic.poll_irq(), Some(0x09));
+        assert_eq!(pic.master.isr, 1 << 1);
+        assert_eq!(pic.master.irr, 1 << 0);
+    }
+
+    /// Spec: plain non-specific EOI (`R=0`) does not rotate priorities.
+    #[test]
+    fn nonspecific_eoi_without_r_does_not_rotate() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // non-specific EOI, no rotate
+        assert_eq!(pic.master.lowest_priority, 7);
+
+        pic.set_irq_line(0, false);
+        pic.set_irq_line(0, true);
+        pic.set_irq_line(1, true);
+        // Default fully nested: IR0 still highest.
+        assert_eq!(pic.poll_irq(), Some(0x08));
+    }
+
+    /// Spec: Intel 8259A — Rotate in Automatic EOI Mode set (`OCW2 R=1,SL=0,EOI=0`
+    /// = `0x80`): after AEOI acknowledge, the serviced IR becomes lowest priority.
+    #[test]
+    fn rotate_in_aeoi_mode_rotates_after_acknowledge() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4(&mut pic, 0x03); // µPM | AEOI
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        assert!(!pic.master.rotate_on_auto_eoi);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x80); // set Rotate in AEOI Mode
+        assert!(pic.master.rotate_on_auto_eoi);
+
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+        assert_eq!(pic.master.isr, 0); // AEOI cleared ISR
+        assert_eq!(pic.master.lowest_priority, 3); // IR3 now lowest → IR4 highest
+
+        pic.set_irq_line(3, false);
+        pic.set_irq_line(3, true);
+        pic.set_irq_line(4, true);
+        assert_eq!(pic.poll_irq(), Some(0x0C)); // IR4 before IR3
+        assert_eq!(pic.master.lowest_priority, 4);
+        assert_eq!(pic.master.irr, 1 << 3);
+    }
+
+    /// Spec: Intel 8259A — Rotate in Automatic EOI Mode clear (`OCW2 R=0,SL=0,EOI=0`
+    /// = `0x00`): further AEOI acknowledges do not rotate.
+    #[test]
+    fn rotate_in_aeoi_mode_clear_stops_rotation() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4(&mut pic, 0x03);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x80); // set
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.lowest_priority, 0);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x00); // clear Rotate in AEOI Mode
+        assert!(!pic.master.rotate_on_auto_eoi);
+
+        pic.set_irq_line(1, true);
+        assert_eq!(pic.poll_irq(), Some(0x09));
+        // Cleared: AEOI must not rotate further (lowest stays IR0).
+        assert_eq!(pic.master.lowest_priority, 0);
+        assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: ICW1 resets Automatic Rotation state (lowest = IR7, rotate-in-AEOI off).
+    #[test]
+    fn icw1_clears_rotate_state() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x80);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        // Use IR3 (not cascade IR2) so DualPic acknowledge stays on the master.
+        pic.set_irq_line(3, true);
+        // Without AEOI, 0x80 only arms the mode flag; force a rotate via 0xA0 path.
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+        pic.port_write(PIC_MASTER_CMD, 1, 0xA0);
+        assert_eq!(pic.master.lowest_priority, 3);
+        assert!(pic.master.rotate_on_auto_eoi);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x11); // ICW1
+        assert_eq!(pic.master.lowest_priority, 7);
+        assert!(!pic.master.rotate_on_auto_eoi);
+    }
+
+    /// Spec: after rotate, fully nested blocking follows the rotated priority order.
+    #[test]
+    fn rotated_priority_nested_blocking() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+
+        // Make IR0 lowest (IR1 highest) via rotate on non-specific EOI.
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        pic.port_write(PIC_MASTER_CMD, 1, 0xA0);
+        assert_eq!(pic.master.lowest_priority, 0);
+
+        // Avoid cascade IR2 — exercise master-only lines IR3/IR1/IR4.
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+        // IR1 is higher priority than IR3 after rotation and may nest.
+        pic.set_irq_line(1, true);
+        assert_eq!(pic.poll_irq(), Some(0x09));
+        // IR4 is lower than IR3 and stays blocked while IR3 remains in service.
+        pic.set_irq_line(4, true);
+        assert_eq!(pic.poll_irq(), None);
+        assert_eq!(pic.master.irr & (1 << 4), 1 << 4);
     }
 }
