@@ -12,7 +12,7 @@
 //!   Keyboard ID (ACK then ID bytes, typically `0xAB` `0x83` for MF2), `0xF4`/
 //!   `0xF5` Enable/Disable Scanning (ACK `0xFA`), `0xED` Set LEDs (+ LED mask),
 //!   `0xF3` Set Typematic Rate/Delay (+ rate/delay byte), `0xF0` Get/Set
-//!   Scancode Set (+ sub-command), `0xEE` Echo.
+//!   Scancode Set (+ sub-command), `0xEE` Echo, `0xFE` Resend (last byte).
 //! - OSDev Wiki: [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) — host→device
 //!   commands `0xFF` Reset (ACK `0xFA`, BAT `0xAA`, ID `0x00`), `0xF2` Get Device
 //!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF3` Set
@@ -47,11 +47,11 @@
 //! ACK `0xFA`, Get Keyboard ID (`0xF2`) with ACK + MF2 ID `0xAB` `0x83`, Reset
 //! (`0xFF`) with ACK + BAT `0xAA`, Set LEDs (`0xED` + mask), Set Typematic
 //! Rate/Delay (`0xF3` + byte), and Get/Set Scancode Set (`0xF0` + sub-command)
-//! with ACK per byte and stored state, plus Echo (`0xEE` → `0xEE`), on the
-//! keyboard OBF (not AUX) → IRQ1 when config bit 0 is set. Multi-byte responses
-//! queue like the mouse stub; keyboard clock disable (config bit4) holds
-//! presentation until `0xAE`. Other host→kbd bytes (resend, set defaults, …)
-//! are accepted and left unanswered.
+//! with ACK per byte and stored state, plus Echo (`0xEE` → `0xEE`) and Resend
+//! (`0xFE` → requeue last keyboard OBF byte), on the keyboard OBF (not AUX) →
+//! IRQ1 when config bit 0 is set. Multi-byte responses queue like the mouse
+//! stub; keyboard clock disable (config bit4) holds presentation until `0xAE`.
+//! Other host→kbd bytes (set defaults, …) are accepted and left unanswered.
 //!
 //! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xA9`
 //! answers `0x00` on the normal output buffer, `0xD4` routes the next data-port
@@ -76,11 +76,12 @@
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
-//! - Full AT keyboard protocol beyond the ACK/param subset above (resend,
-//!   set-default, set-3 key-type cmds, … unanswered; LED mask / scancode-set /
+//! - Full AT keyboard protocol beyond the ACK/param/Resend subset above
+//!   (set-default, set-3 key-type cmds, … unanswered; LED mask / scancode-set /
 //!   typematic are stored only — no host-visible LED hardware; inject still
 //!   emits the existing Set2-oriented stream regardless of stored set)
-//! - Pulse-reset lines (`0xFE` / output-port bit0 system-reset)
+//! - Pulse-reset lines (controller command `0xFE` on `0x64` / output-port bit0
+//!   system-reset) — distinct from keyboard Resend `0xFE` on data port `0x60`
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
 
 use crate::PortDevice;
@@ -164,6 +165,8 @@ pub const KBD_CMD_ECHO: u8 = 0xEE;
 pub const KBD_CMD_SET_SCANCODE_SET: u8 = 0xF0;
 /// PS/2 keyboard command: Set Typematic Rate/Delay → ACK; next byte is the value.
 pub const KBD_CMD_SET_TYPEMATIC: u8 = 0xF3;
+/// PS/2 keyboard command: Resend → requeue the last keyboard OBF byte.
+pub const KBD_CMD_RESEND: u8 = 0xFE;
 
 /// Echo response byte (same value as [`KBD_CMD_ECHO`]).
 pub const KBD_ECHO: u8 = 0xEE;
@@ -387,6 +390,13 @@ pub struct I8042 {
     /// (and an enabled keyboard clock) before presentation on keyboard OBF.
     kbd_resp: [u8; KBD_RESP_QUEUE_CAP],
     kbd_resp_len: u8,
+    /// Last byte presented on the keyboard OBF path (ACK/ID/Echo/BAT/scancode).
+    ///
+    /// Spec: OSDev PS/2 Keyboard — Resend (`0xFE`) requeues this byte. Starts at
+    /// `0` until the first keyboard-path presentation; keyboard Reset / controller
+    /// reset clears it back to `0`. Controller responses via [`Self::push_output`]
+    /// (self-test, read-config, …) do **not** update this field.
+    kbd_last_byte: u8,
     /// Set 2 break prefix (`0xF0`) seen while config bit6 translation is on;
     /// the next keyboard byte is translated then OR'd with `0x80` (Set 1 break).
     translate_pending_break: bool,
@@ -418,6 +428,7 @@ impl I8042 {
             kbd_pending_param: KbdPendingParam::None,
             kbd_resp: [0; KBD_RESP_QUEUE_CAP],
             kbd_resp_len: 0,
+            kbd_last_byte: 0,
             translate_pending_break: false,
         };
         s.apply_reset_defaults();
@@ -447,13 +458,15 @@ impl I8042 {
     ///
     /// Spec: OSDev PS/2 Keyboard — Reset returns the keyboard to power-on
     /// defaults with scanning enabled, LEDs off, default typematic rate/delay,
-    /// and scancode set 2.
+    /// and scancode set 2. Also clears last-byte tracking used by Resend
+    /// (`0xFE`); subsequent ACK/BAT presentation updates it again.
     fn reset_kbd_defaults(&mut self) {
         self.kbd_scanning = true;
         self.kbd_leds = 0;
         self.kbd_typematic = KBD_DEFAULT_TYPEMATIC;
         self.kbd_scancode_set = KBD_DEFAULT_SCANCODE_SET;
         self.kbd_pending_param = KbdPendingParam::None;
+        self.kbd_last_byte = 0;
     }
 
     /// Restore mouse stub defaults (sample rate / resolution / scaling / reporting).
@@ -549,12 +562,18 @@ impl I8042 {
 
     /// Place a byte in the output buffer (device/controller → host).
     ///
-    /// Used by tests and controller responses. Returns true if IRQ1 had a
-    /// rising edge (false→true) as a result.
+    /// Used by tests and keyboard inject. Tracks the byte as the last keyboard
+    /// OBF response for Resend (`0xFE`). Returns true if IRQ1 had a rising
+    /// edge (false→true) as a result.
     pub fn place_output(&mut self, value: u8) -> bool {
         let prev = self.irq1_line();
-        self.push_output(value);
+        self.present_kbd_byte(value);
         !prev && self.irq1_line()
+    }
+
+    /// Last byte presented on the keyboard OBF path (for Resend / tests).
+    pub fn kbd_last_byte(&self) -> u8 {
+        self.kbd_last_byte
     }
 
     /// Inject a keyboard scan-code byte into the host output buffer (device → host).
@@ -746,6 +765,17 @@ impl I8042 {
         self.output_from_aux = false;
     }
 
+    /// Present a keyboard-path byte on OBF and record it for Resend (`0xFE`).
+    ///
+    /// Spec: OSDev PS/2 Keyboard — Resend requeues the last byte delivered on
+    /// the keyboard output path (ACK, ID, Echo, BAT, inject scancodes, …).
+    /// Controller-only responses use [`Self::push_output`] and do not update
+    /// [`Self::kbd_last_byte`].
+    fn present_kbd_byte(&mut self, value: u8) {
+        self.kbd_last_byte = value;
+        self.push_output(value);
+    }
+
     /// Pop the output buffer, clearing OBF and AUX OBF (`0x60` read), then
     /// present the next queued keyboard or mouse response byte if any.
     fn take_output(&mut self) -> Option<u8> {
@@ -793,7 +823,7 @@ impl I8042 {
             return;
         }
         if let Some(b) = self.pop_kbd_response() {
-            self.push_output(b);
+            self.present_kbd_byte(b);
         }
     }
 
@@ -922,6 +952,8 @@ impl I8042 {
     /// ACK/`0xFA` (and BAT/ID/set number where required) on keyboard OBF.
     /// `0xED` / `0xF3` / `0xF0` arm a one-byte parameter expected on the next
     /// data-port write. Echo (`0xEE`) answers with `0xEE` (no separate ACK).
+    /// Resend (`0xFE`) requeues [`Self::kbd_last_byte`] (honest default `0`
+    /// until the first keyboard OBF presentation).
     fn handle_kbd_device_byte(&mut self, cmd: u8) {
         match self.kbd_pending_param {
             KbdPendingParam::Leds => {
@@ -993,6 +1025,12 @@ impl I8042 {
             KBD_CMD_ECHO => {
                 // Spec: Echo — respond with Echo `0xEE` (not a separate ACK).
                 self.begin_kbd_response(&[KBD_ECHO]);
+            }
+            KBD_CMD_RESEND => {
+                // Spec: OSDev PS/2 Keyboard — Resend last byte on keyboard OBF.
+                // Distinct from controller pulse-reset `0xFE` on port `0x64`.
+                let last = self.kbd_last_byte;
+                self.begin_kbd_response(&[last]);
             }
             _ => {
                 // Unsupported keyboard command: accepted, no ACK (see module docs).
@@ -1253,17 +1291,103 @@ mod tests {
         assert!(k.irq1_line());
     }
 
-    /// Spec: unsupported host→keyboard commands (e.g. Resend `0xFE`) are accepted
-    /// with no ACK; controller config/output buffer unchanged.
+    /// Spec: unsupported host→keyboard commands (e.g. Set Default `0xF6`) are
+    /// accepted with no ACK; controller config/output buffer unchanged.
     #[test]
     fn data_write_unsupported_kbd_command_no_ack() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         let before = k.clone();
-        k.port_write(I8042_DATA, 1, 0xFE); // Resend — not implemented
+        k.port_write(I8042_DATA, 1, 0xF6); // Set Default — not implemented
         assert_eq!(k.config, before.config);
         assert_eq!(k.output_buffer(), None);
         assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Resend (`0xFE`) requeues the last keyboard
+    /// OBF byte. After Get ID, `kbd_last_byte` updates as each response byte is
+    /// presented on OBF (FA on OBF → last FA; reading FA auto-presents AB →
+    /// last AB; reading AB presents 83 → last 83).
+    #[test]
+    fn kbd_resend_fe_requeues_last_get_id_byte() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_GET_ID);
+        // FA presented on OBF — last is ACK before host read.
+        assert_eq!(k.kbd_last_byte(), KBD_ACK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        // Reading FA presents AB → last updates to first ID byte.
+        assert_eq!(k.kbd_last_byte(), KBD_ID_MF2_0);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ID_MF2_0);
+        assert_eq!(k.kbd_last_byte(), KBD_ID_MF2_1);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ID_MF2_1);
+        assert_eq!(k.kbd_last_byte(), KBD_ID_MF2_1);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+
+        // Resend requeues the last presented ID byte (`0x83`).
+        write_kbd(&mut k, KBD_CMD_RESEND);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ID_MF2_1);
+
+        // After a one-byte ACK response, Resend returns FA again.
+        write_kbd(&mut k, KBD_CMD_ENABLE_SCANNING);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.kbd_last_byte(), KBD_ACK);
+        write_kbd(&mut k, KBD_CMD_RESEND);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — after Echo (`0xEE`), Resend returns `0xEE`
+    /// again. With no prior keyboard OBF byte, Resend honestly requeues `0x00`.
+    #[test]
+    fn kbd_resend_fe_after_echo_and_default_zero() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        assert_eq!(k.kbd_last_byte(), 0);
+        k.port_write(I8042_DATA, 1, u32::from(KBD_CMD_RESEND));
+        assert_eq!(read_kbd_byte(&mut k), 0x00);
+
+        write_kbd(&mut k, KBD_CMD_ECHO);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
+        assert_eq!(k.kbd_last_byte(), KBD_ECHO);
+        write_kbd(&mut k, KBD_CMD_RESEND);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
+        write_kbd(&mut k, KBD_CMD_RESEND);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
+    }
+
+    /// Spec: OSDev I8042 — controller command `0xFE` on port `0x64` is pulse-
+    /// reset (unsupported here), not keyboard Resend on `0x60`.
+    #[test]
+    fn controller_cmd_fe_on_64_still_unsupported() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        write_kbd(&mut k, KBD_CMD_ECHO);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
+        let before_unsup = k.unsupported_commands;
+        k.port_write(I8042_STATUS_CMD, 1, 0xFE); // pulse-reset — not implemented
+        assert_eq!(k.unsupported_commands, before_unsup + 1);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.kbd_last_byte(), KBD_ECHO); // keyboard last byte untouched
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Reset (`0xFF`) clears last-byte tracking to
+    /// `0`, then ACK/BAT presentation updates it (after ACK last=`FA`, after
+    /// BAT last=`AA`).
+    #[test]
+    fn kbd_reset_ff_clears_last_byte_then_bat_updates() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_ECHO);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
+        assert_eq!(k.kbd_last_byte(), KBD_ECHO);
+
+        write_kbd(&mut k, KBD_CMD_RESET);
+        // Reset cleared last to 0; ACK presentation sets it to FA.
+        assert_eq!(k.kbd_last_byte(), KBD_ACK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_BAT_OK);
+        assert_eq!(k.kbd_last_byte(), KBD_BAT_OK);
+        write_kbd(&mut k, KBD_CMD_RESEND);
+        assert_eq!(read_kbd_byte(&mut k), KBD_BAT_OK);
     }
 
     /// Spec: OSDev PS/2 Keyboard — Echo (`0xEE`) → Echo response `0xEE`.
@@ -1731,10 +1855,10 @@ mod tests {
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
 
-        // Next data byte is keyboard-bound again: aux state untouched; Resend
-        // (`0xFE`) remains an unsupported kbd command (no ACK / no OBF).
+        // Next data byte is keyboard-bound again: aux state untouched; Set
+        // Default (`0xF6`) remains an unsupported kbd command (no ACK / no OBF).
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
-        k.port_write(I8042_DATA, 1, 0xFE);
+        k.port_write(I8042_DATA, 1, 0xF6);
         assert_eq!(k.aux_device_writes, 1);
         assert_eq!(k.last_aux_device_write, Some(0xF0));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
