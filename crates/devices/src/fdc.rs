@@ -1,6 +1,7 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
 //! Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
-//! READ DATA / READ DELETED DATA / WRITE DATA / WRITE DELETED DATA / VERIFY / FORMAT TRACK (no-media stubs) + IRQ6.
+//! READ DATA (media single-sector + no-media ND) / READ DELETED DATA / WRITE DATA /
+//! WRITE DELETED DATA / VERIFY / FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -23,8 +24,9 @@
 //!   §5.2.10 / §5.3.3) no params, 10-byte result (PCN0–3, SRT|HUT, HLT|ND,
 //!   SC/EOT, LOCK|perp, Configure, PRETRK), no IRQ; READ DATA (`0x06` with
 //!   optional MT/MFM/SK in bits 7:5, §5.1.1 / Table 5-1) eight parameter
-//!   bytes then 7-byte result; no-media stub completes with ST0 IC=01 +
-//!   ST1 ND + C/H/R/N ENDaddress and IRQ6; READ DELETED DATA (`0x0C` with
+//!   bytes then 7-byte result; with media + N=2 + valid CHS → ST0 IC=00 +
+//!   ST1=0 + single-sector `last_sector` latch + IRQ6; else no-media/wrong-N/
+//!   OOR → ST0 IC=01 + ST1 ND + C/H/R/N ENDaddress and IRQ6; READ DELETED DATA (`0x0C` with
 //!   optional MT/MFM/SK in bits 7:5, §5.1.3 / Table 5-1) same 8-param /
 //!   7-result shape as READ DATA; no-media stub completes with ST0 IC=01 +
 //!   ST1 ND + C/H/R/N ENDaddress and IRQ6; WRITE DATA (`0x05` with optional
@@ -92,11 +94,14 @@
 //!   byte7 bits 5:0 reflect stored PERPENDICULAR D3–D0|GAP|WGATE (OW not returned).
 //! - READ DATA (`0x06` | MT/MFM/SK): Spec Intel 82077AA §5.1.1 / Table 5-1 —
 //!   command byte lower 5 bits `00110`; optional MT (`0x80`)/MFM (`0x40`)/
-//!   SK (`0x20`); eight params (HD|US, C, H, R, N, EOT, GPL, DTL); no media
-//!   image → skip execution/DMA, immediate result ST0 (IC=01 abnormal | H |
-//!   US), ST1 ND (No Data / sector not found), ST2=0, C/H/R/N = command
-//!   ENDaddress; asserts IRQ6 (cleared on first result byte); MSR RQM during
-//!   params, RQM|DIO during result. No DMA channel 2 transfer engine.
+//!   SK (`0x20`); eight params (HD|US, C, H, R, N, EOT, GPL, DTL). With
+//!   attached 1.44MB media, `N=2`, and C/H/R in geometry: transfer **one**
+//!   sector only (MT ignored this slice), latch bytes in `last_sector` for a
+//!   future DMA wire, result ST0 (IC=00 normal | H | US), ST1=0, ST2=0,
+//!   C/H/R/N = command ENDaddress. No media / wrong N / OOR CHS → ST0 IC=01
+//!   abnormal | H | US, ST1 ND, ST2=0. Asserts IRQ6 (cleared on first result
+//!   byte); EOT→`sc_eot`; MSR RQM during params, RQM|DIO during result. No
+//!   Machine/`dma_transfer` ch2 wiring in this slice.
 //! - READ DELETED DATA (`0x0C` | MT/MFM/SK): Spec Intel 82077AA §5.1.3 /
 //!   Table 5-1 — command byte lower 5 bits `01100`; optional MT/MFM/SK; same
 //!   eight params and 7-byte result as READ DATA; no media image → skip
@@ -119,8 +124,8 @@
 //!   SC latched into `sc_eot`.
 //! - 1.44MB media image attach/eject + CHS→offset/`read_sector` helpers (PC
 //!   MFM geometry); DIR bit7 DSKCHG stub on attach/eject; `reset()` preserves
-//!   media like IDE. READ DATA command path still uses the no-media ND stub
-//!   (no DMA/success transfer yet).
+//!   media like IDE. READ DATA success path latches one sector in
+//!   `last_sector` (Machine DMA ch2 not wired yet).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
@@ -128,8 +133,8 @@
 //! - WRITE DELETED DATA / READ TRACK / READ ID / VERIFY and other transfer
 //!   commands; READ DELETED DATA media/deleted-address-mark engine; FORMAT
 //!   TRACK media write / per-sector ID DMA
-//! - READ/WRITE DATA success path with media; DMA channel 2 transfers
-//!   (ND bit / Specify stored only; not enforced)
+//! - WRITE DATA success path with media; multi-sector / full MT engine;
+//!   Machine/`dma_transfer` ch2 wiring (sector latch only)
 //! - Seek step timing; real DIR disk-change edge timing (DSKCHG stub only)
 //! - Implied seek from Configure EIS; multi-sector TC termination
 //! - Drive sensing beyond DSKCHG attach/eject stub
@@ -306,6 +311,8 @@ pub const FDC_LOCK_RESULT_SHIFT: u8 = 4;
 pub const FDC_VERSION_82077AA: u8 = 0x90;
 /// ST0 Seek End (SE) bit. Spec: Intel 82077AA status register 0.
 pub const FDC_ST0_SEEK_END: u8 = 0x20;
+/// ST0 Interrupt Code = 00 (normal termination). Spec: Intel 82077AA §6.1.
+pub const FDC_ST0_IC_NORMAL: u8 = 0x00;
 /// ST0 Interrupt Code = 01 (abnormal termination). Spec: Intel 82077AA §6.1.
 pub const FDC_ST0_IC_ABNORMAL: u8 = 0x40;
 /// ST0 Interrupt Code = 11 (abnormal/ready-line-changed stub). Spec: 82077AA / OSDev.
@@ -471,6 +478,10 @@ pub struct Fdc82077 {
     /// Attached 1.44MB raw floppy image (`None` = no media). Preserved across
     /// [`Self::reset`] like [`crate::IdePrimary`]'s backing image.
     image: Option<Vec<u8>>,
+    /// Last sector bytes transferred by a successful READ DATA (single-sector
+    /// slice). Exposed so Machine can DMA later — not wired to
+    /// `dma_transfer` in this slice. Cleared on ND/abnormal completion.
+    last_sector: Option<[u8; FDC_SECTOR_SIZE]>,
 }
 
 impl Default for Fdc82077 {
@@ -512,6 +523,7 @@ impl Fdc82077 {
             read_params: [0; FDC_READ_DATA_PARAM_LEN as usize],
             read_result: [0; FDC_READ_DATA_RESULT_LEN as usize],
             image: None,
+            last_sector: None,
         }
     }
 
@@ -549,6 +561,13 @@ impl Fdc82077 {
     /// True when a 1.44MB image is attached.
     pub fn has_media(&self) -> bool {
         self.image.is_some()
+    }
+
+    /// Bytes of the last successful READ DATA sector transfer (512 bytes), if any.
+    ///
+    /// Device-only latch for a future Machine DMA ch2 wire — not consumed here.
+    pub fn last_sector(&self) -> Option<&[u8; FDC_SECTOR_SIZE]> {
+        self.last_sector.as_ref()
     }
 
     /// CHS → byte offset in a linear 1.44MB image. `r` is 1-based (sector ID).
@@ -821,14 +840,21 @@ impl Fdc82077 {
         self.phase = Phase::ReadDataParams { index: 0 };
     }
 
-    /// Complete READ DATA after eight parameters — no-media stub.
+    /// Complete READ DATA after eight parameters.
     ///
-    /// Spec: Intel 82077AA §5.1.1 / §6.1 / §6.2 — with no media image this stub
-    /// skips the execution/DMA transfer phase and enters result immediately:
-    /// ST0 IC=01 (abnormal termination) | H | US; ST1 ND (sector not found);
-    /// ST2=0; C/H/R/N reflect command ENDaddress (sector ID after command);
-    /// latches EOT into `sc_eot` (DUMPREG Table 5-1); asserts IRQ (cleared
-    /// when the host reads the first result byte). No Sense Interrupt.
+    /// Spec: Intel 82077AA §5.1.1 / §6.1 / §6.2 / IBM 1.44MB geometry:
+    ///
+    /// - With media, `N == 2` (512-byte sectors), and C/H/R in range: transfer
+    ///   **one** sector (MT ignored this slice), latch bytes in
+    ///   [`Self::last_sector`], result ST0 IC=00 (normal) | H | US, ST1=0,
+    ///   ST2=0, C/H/R/N = command ENDaddress.
+    /// - Otherwise (no media / wrong N / out-of-range CHS): skip execution,
+    ///   ST0 IC=01 (abnormal) | H | US, ST1 ND, ST2=0, C/H/R/N ENDaddress;
+    ///   clear `last_sector`.
+    ///
+    /// Latches EOT into `sc_eot` (DUMPREG Table 5-1); asserts IRQ (cleared
+    /// when the host reads the first result byte). No Sense Interrupt. No
+    /// Machine/`dma_transfer` wiring in this slice.
     fn finish_read_data(&mut self) {
         let head_unit = self.read_params[0];
         let unit = head_unit & 0x03;
@@ -838,10 +864,24 @@ impl Fdc82077 {
         let r = self.read_params[3];
         let n = self.read_params[4];
         let eot = self.read_params[5];
-        // GPL (params[6]) and DTL (params[7]) accepted; unused without media.
+        // GPL (params[6]) and DTL (params[7]) accepted; multi-sector MT ignored.
 
         self.sc_eot = eot;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+
+        // Single-sector success: media + N=2 + valid CHS (R 1-based).
+        if n == FDC_SECTOR_N {
+            if let Some(sector) = self.read_sector(c, h, r) {
+                self.last_sector = Some(sector);
+                self.read_result = [FDC_ST0_IC_NORMAL | st0_head | unit, 0x00, 0x00, c, h, r, n];
+                self.irq_pending = true;
+                self.phase = Phase::ReadDataResult { index: 0 };
+                return;
+            }
+        }
+
+        // No media / wrong N / OOR CHS → honest ND abnormal (existing stub).
+        self.last_sector = None;
         self.read_result = [
             FDC_ST0_IC_ABNORMAL | st0_head | unit,
             FDC_ST1_ND,
@@ -3812,6 +3852,89 @@ mod tests {
         let st0 = f.port_read(FDC_FIFO, 1) as u8;
         assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        assert!(
+            f.last_sector().is_none(),
+            "no-media ND path must not latch sector bytes"
+        );
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA §5.1.1 READ DATA result — with media + N=2 + valid
+    /// CHS, normal termination (IC=00 | H | US), ST1=ST2=0, C/H/R/N ENDaddress,
+    /// EOT→`sc_eot`, IRQ6; latches one 512-byte sector for later DMA (this
+    /// slice does not wire Machine::dma_transfer). Multi-sector MT ignored —
+    /// one sector only. Spec: IBM 1.44MB geometry.
+    #[test]
+    fn read_data_with_media_normal_result_and_last_sector() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // READ DATA MFM: C=0,H=0,R=1,N=2 — first sector of the image.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(
+            f.irq_line(),
+            "READ DATA asserts IRQ6 on media success completion"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0, FDC_ST0_IC_NORMAL,
+            "ST0 = IC=00 | H=0 | US=0 (normal termination)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST1 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12, "EOT latched for DUMPREG");
+
+        let sector = f.last_sector().expect("media READ DATA latches sector");
+        assert_eq!(sector.len(), FDC_SECTOR_SIZE);
+        for (i, &b) in sector.iter().enumerate() {
+            assert_eq!(b, (i & 0xFF) as u8, "last_sector[{i}]");
+        }
+    }
+
+    /// Spec: Intel 82077AA §5.1.1 / §6.2 — out-of-range sector ID (R>18 on
+    /// 1.44MB) with media attached still completes as ND abnormal (no sector
+    /// latch). IBM 1.44MB SPT=18.
+    #[test]
+    fn read_data_with_media_oor_r_nd_abnormal() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        // C=0,H=0,R=19 (OOR), N=2
+        for p in [0x00u8, 0x00, 0x00, 0x13, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        assert!(
+            f.last_sector().is_none(),
+            "OOR CHS must not latch sector bytes"
+        );
         for _ in 0..5 {
             let _ = f.port_read(FDC_FIFO, 1);
         }
