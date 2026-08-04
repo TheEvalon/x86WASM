@@ -10,7 +10,8 @@
 //!   Automatic EOI Mode); OCW2 Specific Rotation (Set Priority Command +
 //!   Rotate on Specific EOI); OCW3 IRR/ISR read select; OCW3 poll command
 //!   (`P=1`); OCW3 Special Mask Mode (`ESMM`/`SMM`); IRR/ISR; fully nested
-//!   priority; cascade EOI (master + slave).
+//!   priority; Special Fully Nested Mode (ICW4.SFNM on master); cascade EOI
+//!   (master + slave).
 //! - Classic IBM PC/AT: master at `0x20`/`0x21`, slave at `0xA0`/`0xA1`, slave
 //!   cascaded on master IR2.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 / §21 / §23.3.
@@ -33,12 +34,14 @@
 //! - Special Mask Mode (OCW3 `ESMM`/`SMM`): when active, a masked in-service IR
 //!   does not block lower-priority unmasked recognition (IMR still applies);
 //!   non-specific EOI skips masked IS bits
+//! - Special Fully Nested Mode (ICW4.SFNM on master): a slave-connected in-service
+//!   IR does not lock that cascade line out of the master's priority logic, so a
+//!   higher-priority IR on the same slave can be delivered without a master EOI
 //! - Edge-triggered IR line assert, IRR→ISR on acknowledge, vector selection
 //! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
 //!
 //! # Unsupported (explicit)
 //!
-//! - Special fully-nested mode
 //! - Level-triggered delivery beyond storing ICW1.LTIM (runtime uses edge model)
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
@@ -63,6 +66,8 @@ const ICW1_LTIM: u8 = 1 << 3;
 const ICW4_UPM: u8 = 1 << 0;
 /// ICW4 bit1: Automatic EOI (AEOI).
 const ICW4_AEOI: u8 = 1 << 1;
+/// ICW4 bit4: Special Fully Nested Mode (SFNM) — programmed on the master.
+const ICW4_SFNM: u8 = 1 << 4;
 
 /// OCW2/OCW3: D4 must be 0 (else ICW1).
 /// OCW2: D3=0; OCW3: D3=1 (datasheet Operation Command Word format).
@@ -125,6 +130,17 @@ pub struct Pic8259 {
     /// sequence (no OCW2 EOI required). Applies to hardware INTA and to the
     /// OCW3 poll-command acknowledge path (shared [`Pic8259::ack_ir`]).
     pub auto_eoi: bool,
+    /// ICW4.SFNM — Special Fully Nested Mode (meaningful on the master).
+    ///
+    /// Spec: Intel 8259A datasheet — when SFNM is programmed on the master in a
+    /// cascade configuration, a slave whose request is in service is not locked
+    /// out of the master's priority logic: further interrupt requests from
+    /// higher-priority IRs within that slave are recognized (the master's
+    /// slave-connected IS bit blocks only strictly lower-priority master IRs,
+    /// not equal-priority re-entry on the cascade line). Cleared by ICW1 / reset.
+    /// Software should EOI the slave, read slave ISR, and only EOI the master
+    /// when the slave ISR is empty.
+    pub special_fully_nested: bool,
     /// Interrupt Mask Register (OCW1). Bit=1 masks that IR. Reset: all masked.
     pub imr: u8,
     /// Interrupt Request Register.
@@ -182,6 +198,7 @@ impl Pic8259 {
             icw4: 0,
             mode_8086: false,
             auto_eoi: false,
+            special_fully_nested: false,
             imr: 0xFF,
             irr: 0,
             isr: 0,
@@ -257,7 +274,9 @@ impl Pic8259 {
     /// Spec: Intel 8259A fully nested mode — default IR0 highest … IR7 lowest;
     /// Automatic Rotation reassigns the bottom. With Special Mask Mode, an
     /// in-service IR whose IMR bit is set does not block lower-priority
-    /// unmasked requests (IMR still masks its own level).
+    /// unmasked requests (IMR still masks its own level). With Special Fully
+    /// Nested Mode on a master, a slave-connected IS bit does not lock out
+    /// equal-priority re-entry on that cascade IR.
     fn highest_priority_request(&self) -> Option<u8> {
         if !self.initialized {
             return None;
@@ -277,7 +296,7 @@ impl Pic8259 {
         None
     }
 
-    /// Whether fully-nested / special-mask ISR state blocks recognizing `ir`.
+    /// Whether fully-nested / special-mask / SFNM ISR state blocks recognizing `ir`.
     fn isr_blocks(&self, ir: u8) -> bool {
         if self.isr == 0 {
             return false;
@@ -296,14 +315,24 @@ impl Pic8259 {
             }
             false
         } else {
-            // Fully nested: only IR lines strictly higher priority than every
-            // in-service bit may be recognized.
+            // Fully nested: in-service bits block equal-or-lower priority IRs.
+            // Special Fully Nested Mode (master): a slave-connected IS bit does
+            // not lock that cascade IR out — it blocks only strictly lower
+            // priority (Intel 8259A SFNM: slave not locked out of master logic).
             for hp in 0u8..8 {
                 let hp_bit = 1u8 << hp;
                 if self.isr & hp_bit == 0 {
                     continue;
                 }
-                if self.priority_rank(hp) <= ir_rank {
+                let hp_rank = self.priority_rank(hp);
+                let sfnm_slave_is = self.special_fully_nested
+                    && self.is_master
+                    && (self.slave_ir_mask() & hp_bit) != 0;
+                if sfnm_slave_is {
+                    if hp_rank < ir_rank {
+                        return true;
+                    }
+                } else if hp_rank <= ir_rank {
                     return true;
                 }
             }
@@ -384,6 +413,7 @@ impl Pic8259 {
         self.icw4 = 0;
         self.mode_8086 = false;
         self.auto_eoi = false;
+        self.special_fully_nested = false;
         // Datasheet ICW1: edge sense circuit is reset; clear request state;
         // Special Mask Mode is cleared and Status Read is set to IRR.
         self.irr = 0;
@@ -425,6 +455,9 @@ impl Pic8259 {
                 self.icw4 = value;
                 self.mode_8086 = value & ICW4_UPM != 0;
                 self.auto_eoi = value & ICW4_AEOI != 0;
+                // SFNM is specified for the master in cascade configurations;
+                // store the bit only when this chip is the master.
+                self.special_fully_nested = self.is_master && value & ICW4_SFNM != 0;
                 self.finish_init();
             }
         }
@@ -709,18 +742,23 @@ mod tests {
         init_at_cascade_icw4(pic, 0x01);
     }
 
-    /// PC AT cascade init with an explicit ICW4 byte (µPM / AEOI / …).
+    /// PC AT cascade init with an explicit ICW4 byte (µPM / AEOI / SFNM / …).
     fn init_at_cascade_icw4(pic: &mut DualPic, icw4: u8) {
-        // Master: ICW1=0x11, ICW2=0x08, ICW3=0x04, ICW4=`icw4`
+        init_at_cascade_icw4_roles(pic, icw4, icw4);
+    }
+
+    /// PC AT cascade with distinct master/slave ICW4 (SFNM is master-only).
+    fn init_at_cascade_icw4_roles(pic: &mut DualPic, master_icw4: u8, slave_icw4: u8) {
+        // Master: ICW1=0x11, ICW2=0x08, ICW3=0x04, ICW4=`master_icw4`
         pic.port_write(PIC_MASTER_CMD, 1, 0x11);
         pic.port_write(PIC_MASTER_DATA, 1, 0x08);
         pic.port_write(PIC_MASTER_DATA, 1, 0x04);
-        pic.port_write(PIC_MASTER_DATA, 1, u32::from(icw4));
-        // Slave: ICW1=0x11, ICW2=0x70, ICW3=0x02, ICW4=`icw4`
+        pic.port_write(PIC_MASTER_DATA, 1, u32::from(master_icw4));
+        // Slave: ICW1=0x11, ICW2=0x70, ICW3=0x02, ICW4=`slave_icw4`
         pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
         pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
         pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
-        pic.port_write(PIC_SLAVE_DATA, 1, u32::from(icw4));
+        pic.port_write(PIC_SLAVE_DATA, 1, u32::from(slave_icw4));
     }
 
     /// Spec: reset leaves both PICs uninitialized (Intel 8259A; PC cold start).
@@ -739,6 +777,8 @@ mod tests {
         assert!(!pic.slave.mode_8086);
         assert!(!pic.master.auto_eoi);
         assert!(!pic.slave.auto_eoi);
+        assert!(!pic.master.special_fully_nested);
+        assert!(!pic.slave.special_fully_nested);
         assert!(!pic.master.special_mask_mode);
         assert!(!pic.slave.special_mask_mode);
         assert_eq!(pic.master.lowest_priority, 7);
@@ -1578,5 +1618,113 @@ mod tests {
         assert_eq!(pic.slave.isr, 0);
         assert_eq!(pic.slave.lowest_priority, 3);
         pic.port_write(PIC_MASTER_CMD, 1, 0x20); // master non-specific EOI
+    }
+
+    /// Spec: Intel 8259A ICW4 bit4 (SFNM) — Special Fully Nested Mode is
+    /// programmed on the master; slave ICW4.SFNM is not applied to cascade
+    /// nesting (datasheet: SFNM for the master in cascade configurations).
+    #[test]
+    fn icw4_sfnm_sets_special_fully_nested_on_master() {
+        let mut pic = DualPic::new();
+        // Master ICW4 = 0x11: µPM | SFNM; slave µPM only.
+        init_at_cascade_icw4_roles(&mut pic, 0x11, 0x01);
+        assert!(pic.master.special_fully_nested);
+        assert!(!pic.slave.special_fully_nested);
+        assert_eq!(pic.master.icw4, 0x11);
+        assert!(!pic.master.auto_eoi);
+    }
+
+    /// Spec: Intel 8259A Special Fully Nested Mode — while a slave interrupt is
+    /// in service (master cascade ISR bit set), the slave is not locked out of
+    /// the master's priority logic; a higher-priority IR on the same slave is
+    /// recognized and delivered without a master EOI first.
+    #[test]
+    fn sfnm_allows_higher_priority_slave_irq_while_cascade_in_service() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4_roles(&mut pic, 0x11, 0x01);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask master IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x00); // unmask all slave IRs
+
+        // Lower-priority slave IR1 (IRQ9) enters service first.
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        assert_eq!(pic.master.isr, 1 << 2);
+        assert_eq!(pic.slave.isr, 1 << 1);
+
+        // Higher-priority slave IR0 (IRQ8) while cascade still in service.
+        pic.set_irq_line(8, true);
+        assert_eq!(pic.poll_irq(), Some(0x70));
+        assert_eq!(pic.master.isr, 1 << 2); // cascade IS bit remains
+        assert_eq!(pic.slave.isr, (1 << 1) | (1 << 0));
+    }
+
+    /// Spec: without SFNM, a master cascade ISR bit locks out further requests
+    /// from that slave until the master receives EOI (normal fully nested).
+    #[test]
+    fn without_sfnm_cascade_isr_blocks_further_slave_until_master_eoi() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4_roles(&mut pic, 0x01, 0x01);
+        assert!(!pic.master.special_fully_nested);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x00);
+
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        pic.set_irq_line(8, true);
+        // Master IS2 still set → cascade IR locked out (equal priority).
+        assert_eq!(pic.poll_irq(), None);
+
+        // Slave EOI clears IR1; master EOI unlocks cascade for the pending IR0.
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
+        assert_eq!(pic.slave.isr, 0);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.master.isr, 0);
+        assert_eq!(pic.poll_irq(), Some(0x70));
+    }
+
+    /// Spec: SFNM still nested-blocks master's own lower-priority IRs while the
+    /// cascade line is in service (only equal-priority slave re-entry is opened).
+    #[test]
+    fn sfnm_still_nested_blocks_lower_priority_master_ir() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4_roles(&mut pic, 0x11, 0x01);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // unmask all master
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        assert_eq!(pic.master.isr, 1 << 2);
+
+        pic.set_irq_line(3, true); // master IR3 — lower than cascade IR2
+        assert_eq!(pic.poll_irq(), None);
+    }
+
+    /// Spec: SFNM does not relax the slave chip's own fully nested rules — a
+    /// lower-priority IR on the slave stays blocked while a higher slave IS bit
+    /// is set (master SFNM only unlocks equal-priority cascade recognition).
+    #[test]
+    fn sfnm_slave_still_fully_nested_blocks_lower_on_slave() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4_roles(&mut pic, 0x11, 0x01);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x00);
+
+        pic.set_irq_line(9, true); // slave IR1
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        pic.set_irq_line(10, true); // slave IR2 — lower than IR1 in service
+                                    // Slave INT stays low (nested-blocked) → master has nothing to deliver.
+        assert_eq!(pic.poll_irq(), None);
+        assert_eq!(pic.slave.irr & (1 << 2), 1 << 2);
+    }
+
+    /// Spec: ICW1 clears Special Fully Nested Mode (along with other ICW4 state).
+    #[test]
+    fn icw1_clears_special_fully_nested() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4_roles(&mut pic, 0x11, 0x01);
+        assert!(pic.master.special_fully_nested);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x11); // new ICW1
+        assert!(!pic.master.special_fully_nested);
+        assert!(!pic.master.initialized);
     }
 }
