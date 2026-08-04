@@ -639,6 +639,23 @@ mod tests {
     }
 
     #[test]
+    fn decode_invlpg() {
+        // Spec: Intel SDM Vol. 2 INVLPG — 0F 01 /7, memory form (register form #UD at execute).
+        let mem = decode(&[0x0F, 0x01, 0x3E, 0x00, 0x20]).unwrap(); // INVLPG [0x2000]
+        assert_eq!(mem.mnemonic, "GRP7");
+        assert!(mem.two_byte);
+        assert_eq!(mem.opcode, 0x01);
+        assert_eq!(mem.modrm.unwrap().reg, 7);
+        assert_ne!(mem.modrm.unwrap().mod_, 3);
+        assert_eq!(mem.length, 5);
+
+        let reg = decode(&[0x0F, 0x01, 0xF8]).unwrap(); // INVLPG EAX (mod=11) — decodes; #UD later
+        assert_eq!(reg.modrm.unwrap().reg, 7);
+        assert_eq!(reg.modrm.unwrap().mod_, 3);
+        assert_eq!(reg.length, 3);
+    }
+
+    #[test]
     fn decode_clts() {
         // Spec: Intel SDM Vol. 2 "CLTS—Clear Task-Switched Flag in CR0" — 0F 06.
         let clts = decode(&[0x0F, 0x06]).unwrap();

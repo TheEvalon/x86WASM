@@ -1312,13 +1312,14 @@ pub const M1_SUBSET: &[InstrDef] = &[
 /// Spec: Intel SDM Vol. 2 Chapter 2; opcode map 2.
 pub const M1_0F_SUBSET: &[InstrDef] = &[
     // Group 7: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 01).
-    // Implemented: /0 SGDT, /1 SIDT, /2 LGDT, /3 LIDT, /4 SMSW, /6 LMSW.
+    // Implemented: /0 SGDT, /1 SIDT, /2 LGDT, /3 LIDT, /4 SMSW, /6 LMSW,
+    // /7 INVLPG (real-mode NOP; mod=11 #UD). /5 extensions unsupported.
     InstrDef {
         mnemonic: "GRP7",
         opcode: 0x01,
         encoding: Encoding::Modrm,
         width: Width::OsZ,
-        sdm: "SGDT/SIDT/LGDT/LIDT/SMSW/LMSW",
+        sdm: "SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG",
     },
     // CLTS — Spec: Intel SDM Vol. 2 "CLTS—Clear Task-Switched Flag in CR0"
     // (opcode map 2 — 0F 06). No ModR/M. Clears CR0.TS (bit 3) only.
