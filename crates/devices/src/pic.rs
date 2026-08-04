@@ -6,8 +6,9 @@
 //!
 //! - Intel 8259A Programmable Interrupt Controller datasheet — ICW1–ICW4
 //!   (incl. ICW4.AEOI Automatic EOI); OCW1 (IMR); OCW2 non-specific / specific
-//!   EOI; OCW3 IRR/ISR read select; OCW3 poll command (`P=1`); IRR/ISR; fully
-//!   nested priority; cascade EOI (master + slave).
+//!   EOI; OCW3 IRR/ISR read select; OCW3 poll command (`P=1`); OCW3 Special
+//!   Mask Mode (`ESMM`/`SMM`); IRR/ISR; fully nested priority; cascade EOI
+//!   (master + slave).
 //! - Classic IBM PC/AT: master at `0x20`/`0x21`, slave at `0xA0`/`0xA1`, slave
 //!   cascaded on master IR2.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 / §21 / §23.3.
@@ -23,12 +24,15 @@
 //! - Automatic EOI (ICW4.AEOI): after INTA / OCW3-poll acknowledge sets an ISR
 //!   bit, that bit is cleared at the end of the acknowledge sequence (no OCW2
 //!   EOI required)
+//! - Special Mask Mode (OCW3 `ESMM`/`SMM`): when active, a masked in-service IR
+//!   does not block lower-priority unmasked recognition (IMR still applies);
+//!   non-specific EOI skips masked IS bits
 //! - Edge-triggered IR line assert, IRR→ISR on acknowledge, vector selection
 //! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
 //!
 //! # Unsupported (explicit)
 //!
-//! - Rotate modes (OCW2 `R=1`), special mask mode, special fully-nested mode
+//! - Rotate modes (OCW2 `R=1`), special fully-nested mode
 //! - Level-triggered delivery beyond storing ICW1.LTIM (runtime uses edge model)
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
@@ -61,10 +65,12 @@ const OCW_D3: u8 = 1 << 3;
 const OCW2_EOI: u8 = 1 << 5;
 const OCW2_SL: u8 = 1 << 6;
 const OCW2_R: u8 = 1 << 7;
-/// OCW3 bits.
+/// OCW3 bits (Intel 8259A: `D7=0, ESMM, SMM, D4=0, D3=1, P, RR, RIS`).
 const OCW3_RIS: u8 = 1 << 0;
 const OCW3_RR: u8 = 1 << 1;
 const OCW3_P: u8 = 1 << 2;
+const OCW3_SMM: u8 = 1 << 5;
+const OCW3_ESMM: u8 = 1 << 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InitPhase {
@@ -128,6 +134,13 @@ pub struct Pic8259 {
     /// This is the 8259A software *poll command*, not to be confused with
     /// [`DualPic::poll_irq`], which samples an INTA vector for the machine bus.
     poll_command_armed: bool,
+    /// OCW3 Special Mask Mode (`ESMM`/`SMM`). Cleared by ICW1 / reset.
+    ///
+    /// Spec: Intel 8259A datasheet — when SMM is set, masking an in-service IR
+    /// via OCW1 inhibits that level but enables other unmasked levels (including
+    /// lower priority) that fully-nested mode would otherwise block. Cleared
+    /// when `ESMM=1,SMM=0`; unchanged when `ESMM=0`.
+    pub special_mask_mode: bool,
 }
 
 impl Pic8259 {
@@ -159,6 +172,7 @@ impl Pic8259 {
             ir_level: 0,
             read_reg: ReadReg::Irr,
             poll_command_armed: false,
+            special_mask_mode: false,
         }
     }
 
@@ -212,25 +226,47 @@ impl Pic8259 {
         }
     }
 
-    /// Highest-priority unmasked IRR request not blocked by fully-nested ISR.
-    /// Spec: Intel 8259A fully nested mode — IR0 highest … IR7 lowest.
+    /// Highest-priority unmasked IRR request not blocked by nested ISR rules.
+    ///
+    /// Spec: Intel 8259A fully nested mode — IR0 highest … IR7 lowest. With
+    /// Special Mask Mode, an in-service IR whose IMR bit is set does not block
+    /// lower-priority unmasked requests (IMR still masks its own level).
     fn highest_priority_request(&self) -> Option<u8> {
         if !self.initialized {
             return None;
         }
-        let limit = if self.isr == 0 {
-            8u8
-        } else {
-            // Only IR lines strictly higher priority than the top ISR bit.
-            self.isr.trailing_zeros() as u8
-        };
-        for ir in 0..limit {
+        for ir in 0u8..8 {
             let bit = 1u8 << ir;
-            if self.irr & bit != 0 && self.imr & bit == 0 {
-                return Some(ir);
+            if self.irr & bit == 0 || self.imr & bit != 0 {
+                continue;
             }
+            if self.isr_blocks(ir) {
+                continue;
+            }
+            return Some(ir);
         }
         None
+    }
+
+    /// Whether fully-nested / special-mask ISR state blocks recognizing `ir`.
+    fn isr_blocks(&self, ir: u8) -> bool {
+        if self.isr == 0 {
+            return false;
+        }
+        if self.special_mask_mode {
+            // SMM: a higher-or-equal priority IS bit blocks only while unmasked.
+            for hp in 0u8..=ir {
+                let hp_bit = 1u8 << hp;
+                if self.isr & hp_bit != 0 && self.imr & hp_bit == 0 {
+                    return true;
+                }
+            }
+            false
+        } else {
+            // Fully nested: only IR lines strictly higher priority than the
+            // top (lowest-index) ISR bit may be recognized.
+            ir >= self.isr.trailing_zeros() as u8
+        }
     }
 
     /// True if this chip would assert INT (unmasked request not nested-blocked).
@@ -276,12 +312,14 @@ impl Pic8259 {
         self.icw4 = 0;
         self.mode_8086 = false;
         self.auto_eoi = false;
-        // Datasheet ICW1: edge sense circuit is reset; clear request state.
+        // Datasheet ICW1: edge sense circuit is reset; clear request state;
+        // Special Mask Mode is cleared and Status Read is set to IRR.
         self.irr = 0;
         self.isr = 0;
         self.ir_level = 0;
         self.read_reg = ReadReg::Irr;
         self.poll_command_armed = false;
+        self.special_mask_mode = false;
         self.phase = InitPhase::ExpectIcw2;
     }
 
@@ -337,23 +375,37 @@ impl Pic8259 {
             // Specific EOI: clear ISR bit L2–L0.
             let level = value & 0x07;
             self.isr &= !(1u8 << level);
-        } else {
-            // Non-specific EOI: clear highest-priority (lowest index) ISR bit.
-            if self.isr != 0 {
-                let level = self.isr.trailing_zeros() as u8;
-                self.isr &= !(1u8 << level);
+        } else if self.special_mask_mode {
+            // Non-specific EOI under SMM: skip IS bits masked by IMR.
+            // Spec: Intel 8259A — "an IS bit that is masked by an IMR bit will
+            // not be cleared by a non-specific EOI if the 8259A is in the
+            // Special Mask Mode."
+            for level in 0u8..8 {
+                let bit = 1u8 << level;
+                if self.isr & bit != 0 && self.imr & bit == 0 {
+                    self.isr &= !bit;
+                    break;
+                }
             }
+        } else if self.isr != 0 {
+            // Non-specific EOI: clear highest-priority (lowest index) ISR bit.
+            let level = self.isr.trailing_zeros() as u8;
+            self.isr &= !(1u8 << level);
         }
     }
 
-    /// OCW3: poll command (`P=1`) and IRR/ISR read select. Special-mask
-    /// (`ESMM`/`SMM`) unsupported.
+    /// OCW3: Special Mask Mode (`ESMM`/`SMM`), poll command (`P=1`), and
+    /// IRR/ISR read select (`RR`/`RIS`).
     ///
-    /// Spec: Intel 8259A datasheet — OCW3 format / Poll Command. Model choice:
-    /// `P=1` arms the poll for the next command-port read and leaves the
-    /// `RR`/`RIS` selection untouched (the datasheet does not define combining
-    /// a poll with a read-register select).
+    /// Spec: Intel 8259A datasheet — OCW3 format / Special Mask Mode / Poll
+    /// Command. Model choice: `P=1` arms the poll for the next command-port
+    /// read and leaves the `RR`/`RIS` selection untouched (the datasheet does
+    /// not define combining a poll with a read-register select). `ESMM`/`SMM`
+    /// are still applied when combined with `P=1`.
     fn write_ocw3(&mut self, value: u8) {
+        if value & OCW3_ESMM != 0 {
+            self.special_mask_mode = value & OCW3_SMM != 0;
+        }
         if value & OCW3_P != 0 {
             self.poll_command_armed = true;
             return;
@@ -590,6 +642,8 @@ mod tests {
         assert!(!pic.slave.mode_8086);
         assert!(!pic.master.auto_eoi);
         assert!(!pic.slave.auto_eoi);
+        assert!(!pic.master.special_mask_mode);
+        assert!(!pic.slave.special_mask_mode);
         assert!(pic.master.is_master);
         assert!(!pic.slave.is_master);
         assert_eq!(pic.master.imr, 0xFF);
@@ -1044,5 +1098,134 @@ mod tests {
         pic.set_irq_line(9, false);
         pic.set_irq_line(9, true);
         assert_eq!(pic.poll_irq(), Some(0x71));
+    }
+
+    /// Spec: Intel 8259A OCW3 — ESMM=1,SMM=1 sets Special Mask Mode; ESMM=1,SMM=0
+    /// clears it; ESMM=0 leaves SMM unchanged (SMM is don't-care).
+    #[test]
+    fn ocw3_sets_and_clears_special_mask_mode() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        assert!(!pic.master.special_mask_mode);
+
+        // OCW3: ESMM=1, SMM=1, D3=1 → 0x68
+        pic.port_write(PIC_MASTER_CMD, 1, 0x68);
+        assert!(pic.master.special_mask_mode);
+        assert!(!pic.slave.special_mask_mode);
+
+        // ESMM=0, SMM=1 (0x28): SMM bit is don't-care — state unchanged.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x28);
+        assert!(pic.master.special_mask_mode);
+
+        // OCW3: ESMM=1, SMM=0, D3=1 → 0x48
+        pic.port_write(PIC_MASTER_CMD, 1, 0x48);
+        assert!(!pic.master.special_mask_mode);
+
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x68);
+        assert!(pic.slave.special_mask_mode);
+    }
+
+    /// Spec: Intel 8259A Special Mask Mode — with SMM active, masking the
+    /// in-service IR (OCW1) does not block lower-priority unmasked requests the
+    /// normal fully-nested way.
+    #[test]
+    fn special_mask_mode_allows_lower_priority_when_servicing_ir_masked() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // unmask all
+
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x08 | 3));
+        assert_eq!(pic.master.isr, 1 << 3);
+
+        // Without SMM, lower-priority IR6 stays nested-blocked.
+        pic.set_irq_line(6, true);
+        assert_eq!(pic.poll_irq(), None);
+
+        // Enter SMM and mask the in-service level (IR3).
+        pic.port_write(PIC_MASTER_CMD, 1, 0x68); // ESMM|SMM
+        pic.port_write(PIC_MASTER_DATA, 1, 1 << 3); // mask IR3 only
+        assert_eq!(pic.poll_irq(), Some(0x08 | 6));
+        assert_eq!(pic.master.isr & (1 << 6), 1 << 6);
+    }
+
+    /// Spec: with SMM on but the in-service IR left unmasked, fully-nested
+    /// blocking of lower-priority requests still applies.
+    #[test]
+    fn special_mask_mode_still_nested_blocks_when_servicing_unmasked() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x68); // SMM on
+
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x08 | 3));
+        pic.set_irq_line(6, true);
+        // IR3 still in service and unmasked → IR6 blocked.
+        assert_eq!(pic.poll_irq(), None);
+    }
+
+    /// Spec: Special Mask Mode still applies IMR — a masked IR never delivers.
+    #[test]
+    fn special_mask_mode_still_respects_imr() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x68);
+        pic.port_write(PIC_MASTER_DATA, 1, 1 << 1); // mask IR1
+        pic.set_irq_line(1, true);
+        assert_eq!(pic.poll_irq(), None);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        assert_eq!(pic.poll_irq(), Some(0x08 | 1));
+    }
+
+    /// Spec: Intel 8259A — an IS bit masked by IMR is not cleared by a
+    /// non-specific EOI while Special Mask Mode is active.
+    #[test]
+    fn special_mask_nonspecific_eoi_skips_masked_isr_bit() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x08 | 3));
+        pic.port_write(PIC_MASTER_CMD, 1, 0x68); // SMM
+        pic.port_write(PIC_MASTER_DATA, 1, 1 << 3); // mask in-service IR3
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // non-specific EOI
+        assert_eq!(pic.master.isr, 1 << 3); // masked IS bit retained
+
+        // Specific EOI still clears the named bit.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x63); // EOI|SL|L=3
+        assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 8259A ICW1 — Special Mask Mode is cleared on initialization.
+    #[test]
+    fn icw1_clears_special_mask_mode() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x68);
+        assert!(pic.master.special_mask_mode);
+        // Re-init master ICW sequence.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        assert!(!pic.master.special_mask_mode);
+    }
+
+    /// Spec: OCW3 poll + SMM share priority resolution — masking an in-service
+    /// IR under SMM lets poll acknowledge a lower-priority request.
+    #[test]
+    fn special_mask_mode_applies_to_ocw3_poll_command() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        pic.set_irq_line(1, true);
+        assert_eq!(pic.poll_irq(), Some(0x09));
+        pic.port_write(PIC_MASTER_CMD, 1, 0x68);
+        pic.port_write(PIC_MASTER_DATA, 1, 1 << 1);
+        pic.set_irq_line(5, true);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // OCW3 P=1
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 5);
+        assert_eq!(pic.master.isr & (1 << 5), 1 << 5);
     }
 }
