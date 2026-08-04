@@ -22,19 +22,21 @@
 //!   (Intel 8237A programming model).
 //! - Status register TC bits (3:0) clear-on-read + `latch_tc` device/test API.
 //! - `transfer_block` software helper for 8-bit channels 0–3: length `count+1`,
-//!   Single + Increment/Decrement + Read/Write, Autoinitialize optional,
-//!   `mem_read` / `mem_write` callbacks. With Autoinitialize, after TC Current
-//!   is reloaded from Base and the channel stays unmasked/ready for another
-//!   helper call. Without Autoinitialize, after TC the channel mask bit is set
-//!   (Intel 8237A hardware auto-mask). Address decrement (mode bit 5) steps
-//!   Current Address by −1 per byte within the 64 KiB page.
+//!   Single + Increment/Decrement + Verify/Read/Write, Autoinitialize optional.
+//!   Read/Write use `mem_read` / `mem_write` callbacks; Verify advances
+//!   address/count and latches TC without memory R/W (`io_buf` length still
+//!   checked; payload bytes left untouched). With Autoinitialize, after TC
+//!   Current is reloaded from Base and the channel stays unmasked/ready for
+//!   another helper call. Without Autoinitialize, after TC the channel mask
+//!   bit is set (Intel 8237A hardware auto-mask). Address decrement (mode bit
+//!   5) steps Current Address by −1 per byte within the 64 KiB page.
 //! - Page address register R/W for the eight AT channels above.
 //! - `PortDevice` for MachineBus wiring.
 //!
 //! # Unsupported (explicit)
 //!
 //! - Hardware DREQ/DACK handshake / cycle-accurate bus timing
-//! - Demand/block/cascade/verify modes
+//! - Demand/block/cascade modes
 //! - 16-bit channels 4–7 word addressing / transfers
 //! - Floppy / IDE automatic DMA engine / DREQ path (Machine PhysMem wiring lives in
 //!   `machine-pc::Machine::dma_transfer`; no SeaBIOS floppy DMA)
@@ -48,7 +50,7 @@ pub enum DmaTransferError {
     BadChannel,
     /// Channel mask bit is set (masked channels do not transfer).
     Masked,
-    /// Mode register outside Single + Inc/Dec + Read/Write (+ optional Autoinitialize).
+    /// Mode register outside Single + Inc/Dec + Verify/Read/Write (+ optional Autoinitialize).
     UnsupportedMode,
     /// `io_buf` shorter than programmed `count + 1`.
     BufferTooShort,
@@ -300,11 +302,12 @@ impl Dma8237 {
     /// - bits 7:6 = Single mode (`01`)
     /// - bit 5 = address increment (`0`) or decrement (`1`)
     /// - bit 4 = Autoinitialize enable (`0` or `1`)
-    /// - bits 3:2 = Write (`01`, I/O→memory from `io_buf` via `mem_write`) or
+    /// - bits 3:2 = Verify (`00`, no memory R/W; `io_buf` length still checked),
+    ///   Write (`01`, I/O→memory from `io_buf` via `mem_write`), or
     ///   Read (`10`, memory→I/O into `io_buf` via `mem_read`)
     /// - bits 1:0 must match the controller channel index
     ///
-    /// Demand/block/cascade/verify and ISA channels 4–7 return
+    /// Demand/block/cascade and ISA channels 4–7 return
     /// [`DmaTransferError::UnsupportedMode`] / [`BadChannel`].
     ///
     /// This is a software helper for device/unit tests — **not** DREQ/DACK timing.
@@ -334,16 +337,21 @@ impl Dma8237 {
             return Err(DmaTransferError::BufferTooShort);
         }
         let page = self.page[isa_channel];
-        let write_to_mem = ((mode >> 2) & 0x03) == 0b01;
+        let xfer = (mode >> 2) & 0x03;
+        // Spec: Intel 8237A mode bits 3:2 — Verify (00) / Write (01) / Read (10).
+        let verify = xfer == 0b00;
+        let write_to_mem = xfer == 0b01;
         let auto_init = (mode >> 4) & 1 != 0;
         let decrement = (mode >> 5) & 1 != 0;
         let mut addr = self.master.channels[isa_channel].addr;
         for byte in io_buf.iter_mut().take(len) {
-            let phys = (u32::from(page) << 16) | u32::from(addr);
-            if write_to_mem {
-                mem_write(phys, *byte);
-            } else {
-                *byte = mem_read(phys);
+            if !verify {
+                let phys = (u32::from(page) << 16) | u32::from(addr);
+                if write_to_mem {
+                    mem_write(phys, *byte);
+                } else {
+                    *byte = mem_read(phys);
+                }
             }
             // Spec: Intel 8237A mode bit 5 — address increment (0) / decrement (1).
             addr = if decrement {
@@ -369,12 +377,12 @@ impl Dma8237 {
         Ok(len)
     }
 
-    /// Single + Inc/Dec + Read/Write, Autoinitialize optional, channel matches.
+    /// Single + Inc/Dec + Verify/Read/Write, Autoinitialize optional, channel matches.
     fn mode_supports_transfer_block(mode: u8, ctrl_channel: usize) -> bool {
         let sel = (mode & 0x03) as usize;
         let xfer = (mode >> 2) & 0x03;
         let mode_sel = (mode >> 6) & 0x03;
-        sel == ctrl_channel && mode_sel == 0b01 && (xfer == 0b01 || xfer == 0b10)
+        sel == ctrl_channel && mode_sel == 0b01 && (xfer == 0b00 || xfer == 0b01 || xfer == 0b10)
     }
 
     fn page_channel(port: u16) -> Option<usize> {
@@ -1079,5 +1087,167 @@ mod tests {
         assert_eq!(mem.borrow()[0x1_1000], 0x44);
         assert_eq!(d.master.channels[2].addr, 0x1003);
         assert_eq!(d.master.channels[2].count, 3);
+    }
+
+    /// Program master ch2: Single+Inc+Verify (`0x42`).
+    fn program_ch2_verify(d: &mut Dma8237, page: u8, addr: u16, count_minus_one: u16) {
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, (addr & 0xFF) as u32);
+        d.port_write(0x04, 1, (addr >> 8) as u32);
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, (count_minus_one & 0xFF) as u32);
+        d.port_write(0x05, 1, (count_minus_one >> 8) as u32);
+        d.port_write(DMA_PAGE_CH2, 1, u32::from(page));
+        d.port_write(0x0B, 1, 0x42); // Single | Inc | Verify | ch2
+        d.port_write(0x0A, 1, 0x02); // unmask ch2
+    }
+
+    #[test]
+    fn transfer_block_verify_increment_advances_without_memory_rw() {
+        // Spec: Intel 8237A mode bits 3:2 = Verify (00) — address/count advance and
+        // TC like a real transfer, but no memory or I/O data movement. Without
+        // Autoinitialize the channel is hardware-masked after TC.
+        let mut d = Dma8237::new();
+        program_ch2_verify(&mut d, 0x01, 0x1000, 3); // 4 bytes
+        let mem = RefCell::new(vec![0x5Au8; 0x2_0000]);
+        let before = mem.borrow().clone();
+        let mut io = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let n = d
+            .transfer_block(
+                2,
+                &mut io,
+                |_| panic!("Verify must not call mem_read"),
+                |_, _| panic!("Verify must not call mem_write"),
+            )
+            .expect("verify transfer");
+        assert_eq!(n, 4);
+        assert_eq!(io, [0xAA, 0xBB, 0xCC, 0xDD]); // io_buf payload untouched
+        assert_eq!(*mem.borrow(), before); // memory unchanged
+        assert_eq!(d.master.channels[2].addr, 0x1004);
+        assert_eq!(d.master.channels[2].count, 0xFFFF);
+        assert_eq!(d.port_read(0x08, 1) as u8 & 0x0F, 0x04); // TC ch2
+        assert_eq!(d.master.mask & 0x04, 0x04); // auto-masked
+                                                // Still require buffer length for API consistency.
+        program_ch2_verify(&mut d, 0x01, 0x2000, 3);
+        let mut short = [0u8; 2];
+        assert_eq!(
+            d.transfer_block(2, &mut short, |_| 0, |_, _| {}),
+            Err(DmaTransferError::BufferTooShort)
+        );
+    }
+
+    #[test]
+    fn transfer_block_verify_autoinit_reloads_base_without_mask() {
+        // Spec: Intel 8237A — Verify + Autoinitialize (bit 4): at TC Current reloads
+        // from Base; channel is not auto-masked; still no memory R/W.
+        let mut d = Dma8237::new();
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, 0x00);
+        d.port_write(0x04, 1, 0x10); // addr 0x1000
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, 0x01); // count 1 → 2 bytes
+        d.port_write(0x05, 1, 0x00);
+        d.port_write(DMA_PAGE_CH2, 1, 0x01);
+        d.port_write(0x0B, 1, 0x52); // Single | AutoInit | Inc | Verify | ch2
+        d.port_write(0x0A, 1, 0x02);
+        assert_eq!(d.master.channels[2].base_addr, 0x1000);
+        assert_eq!(d.master.channels[2].base_count, 1);
+        let mem = RefCell::new(vec![0xEEu8; 0x2_0000]);
+        let before = mem.borrow().clone();
+        let mut io = [0x11u8, 0x22];
+        d.transfer_block(
+            2,
+            &mut io,
+            |_| panic!("Verify must not call mem_read"),
+            |_, _| panic!("Verify must not call mem_write"),
+        )
+        .expect("verify autoinit");
+        assert_eq!(io, [0x11, 0x22]);
+        assert_eq!(*mem.borrow(), before);
+        assert_eq!(d.master.channels[2].addr, 0x1000);
+        assert_eq!(d.master.channels[2].count, 1);
+        assert_eq!(d.master.mask & 0x04, 0); // not auto-masked
+        assert_eq!(d.master.status & 0x0F, 0x04);
+        // Second verify without unmask must succeed.
+        d.transfer_block(
+            2,
+            &mut io,
+            |_| panic!("Verify must not call mem_read"),
+            |_, _| panic!("Verify must not call mem_write"),
+        )
+        .expect("second verify autoinit");
+        assert_eq!(d.master.channels[2].addr, 0x1000);
+        assert_eq!(d.master.channels[2].count, 1);
+    }
+
+    #[test]
+    fn transfer_block_verify_decrement_advances_without_memory_rw() {
+        // Spec: Intel 8237A — Verify + address decrement (bit 5): Current Address
+        // steps −1 per byte; no memory R/W; non-autoinit → auto-mask.
+        let mut d = Dma8237::new();
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, 0x03);
+        d.port_write(0x04, 1, 0x10); // addr 0x1003
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, 0x03); // 4 bytes
+        d.port_write(0x05, 1, 0x00);
+        d.port_write(DMA_PAGE_CH2, 1, 0x01);
+        d.port_write(0x0B, 1, 0x62); // Single | Dec | Verify | ch2
+        d.port_write(0x0A, 1, 0x02);
+        let mem = RefCell::new(vec![0xA5u8; 0x2_0000]);
+        let before = mem.borrow().clone();
+        let mut io = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let n = d
+            .transfer_block(
+                2,
+                &mut io,
+                |_| panic!("Verify must not call mem_read"),
+                |_, _| panic!("Verify must not call mem_write"),
+            )
+            .expect("verify decrement");
+        assert_eq!(n, 4);
+        assert_eq!(io, [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(*mem.borrow(), before);
+        assert_eq!(d.master.channels[2].addr, 0x0FFF); // 0x1003 − 4
+        assert_eq!(d.master.channels[2].count, 0xFFFF);
+        assert_eq!(d.master.mask & 0x04, 0x04);
+        assert_eq!(d.master.status & 0x0F, 0x04);
+    }
+
+    #[test]
+    fn transfer_block_read_write_still_work_beside_verify() {
+        // Smoke: Read/Write subset remains accepted after Verify support.
+        let mut d = Dma8237::new();
+        program_ch2_write(&mut d, 0x00, 0x0100, 0); // 1 byte Write
+        let mem = RefCell::new(vec![0u8; 0x1000]);
+        let mut io = [0x99u8];
+        d.transfer_block(
+            2,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("write smoke");
+        assert_eq!(mem.borrow()[0x0100], 0x99);
+
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, 0x00);
+        d.port_write(0x04, 1, 0x02); // addr 0x0200
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, 0x00); // 1 byte
+        d.port_write(0x05, 1, 0x00);
+        d.port_write(DMA_PAGE_CH2, 1, 0x00);
+        d.port_write(0x0B, 1, 0x4A); // Single | Inc | Read | ch2
+        d.port_write(0x0A, 1, 0x02);
+        mem.borrow_mut()[0x0200] = 0x77;
+        let mut io_r = [0u8];
+        d.transfer_block(
+            2,
+            &mut io_r,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("read smoke");
+        assert_eq!(io_r, [0x77]);
     }
 }
