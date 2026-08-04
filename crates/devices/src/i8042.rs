@@ -10,7 +10,8 @@
 //!   commands written to data port `0x60` when the controller is not expecting a
 //!   command-byte parameter: `0xFF` Reset (ACK `0xFA`, BAT `0xAA`), `0xF2` Get
 //!   Keyboard ID (ACK then ID bytes, typically `0xAB` `0x83` for MF2), `0xF4`/
-//!   `0xF5` Enable/Disable Scanning (ACK `0xFA`).
+//!   `0xF5` Enable/Disable Scanning (ACK `0xFA`), `0xED` Set LEDs (+ LED mask),
+//!   `0xF3` Set Typematic Rate/Delay (+ rate/delay byte).
 //! - OSDev Wiki: [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) — host→device
 //!   commands `0xFF` Reset (ACK `0xFA`, BAT `0xAA`, ID `0x00`), `0xF2` Get Device
 //!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF3` Set
@@ -40,13 +41,15 @@
 //! command completion (IBF never stays set across a status poll).
 //!
 //! First-port **keyboard** device: when `PendingWrite` is none, a data-port
-//! (`0x60`) write is a host→keyboard command. A minimal keyboard stub answers
-//! Enable/Disable Scanning (`0xF4`/`0xF5`) with ACK `0xFA`, Get Keyboard ID
-//! (`0xF2`) with ACK + MF2 ID `0xAB` `0x83`, and Reset (`0xFF`) with ACK + BAT
-//! `0xAA`, on the keyboard OBF (not AUX) → IRQ1 when config bit 0 is set.
-//! Multi-byte responses queue like the mouse stub; keyboard clock disable
-//! (config bit4) holds presentation until `0xAE`. Other host→kbd bytes (LEDs,
-//! typematic, scancode-set select, …) are accepted and left unanswered.
+//! (`0x60`) write is a host→keyboard command (or a pending command parameter).
+//! A minimal keyboard stub answers Enable/Disable Scanning (`0xF4`/`0xF5`) with
+//! ACK `0xFA`, Get Keyboard ID (`0xF2`) with ACK + MF2 ID `0xAB` `0x83`, Reset
+//! (`0xFF`) with ACK + BAT `0xAA`, Set LEDs (`0xED` + mask) and Set Typematic
+//! Rate/Delay (`0xF3` + byte) with ACK per byte and stored state, on the
+//! keyboard OBF (not AUX) → IRQ1 when config bit 0 is set. Multi-byte responses
+//! queue like the mouse stub; keyboard clock disable (config bit4) holds
+//! presentation until `0xAE`. Other host→kbd bytes (scancode-set select `0xF0`,
+//! echo, …) are accepted and left unanswered.
 //!
 //! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xA9`
 //! answers `0x00` on the normal output buffer, `0xD4` routes the next data-port
@@ -71,8 +74,9 @@
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
-//! - Full AT keyboard protocol beyond the ACK subset above (LEDs `0xED`,
-//!   typematic `0xF3`, scancode-set select `0xF0`, echo, … unanswered)
+//! - Full AT keyboard protocol beyond the ACK/param subset above (scancode-set
+//!   select `0xF0`, echo `0xEE`, resend, … unanswered; LED mask is stored only —
+//!   no host-visible LED hardware)
 //! - Pulse-reset lines (`0xFE` / output-port bit0 system-reset)
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
 
@@ -149,6 +153,22 @@ pub const KBD_CMD_GET_ID: u8 = 0xF2;
 pub const KBD_CMD_ENABLE_SCANNING: u8 = 0xF4;
 /// PS/2 keyboard command: Disable Scanning → ACK.
 pub const KBD_CMD_DISABLE_SCANNING: u8 = 0xF5;
+/// PS/2 keyboard command: Set LEDs → ACK; next data-port byte is the LED mask.
+pub const KBD_CMD_SET_LEDS: u8 = 0xED;
+/// PS/2 keyboard command: Set Typematic Rate/Delay → ACK; next byte is the value.
+pub const KBD_CMD_SET_TYPEMATIC: u8 = 0xF3;
+
+/// Default typematic rate/delay after Reset (OSDev: ~10.9 cps, 500 ms delay).
+///
+/// Encoding: bits 4:0 = rate index `0x0B`, bits 6:5 = delay `01` → `0x2B`.
+pub const KBD_DEFAULT_TYPEMATIC: u8 = 0x2B;
+
+/// Set LEDs mask bits (OSDev PS/2 Keyboard): bit0 Scroll Lock, bit1 Num Lock,
+/// bit2 Caps Lock. Stored as given by the host; helpers for tests / callers.
+pub const KBD_LED_SCROLL: u8 = 1 << 0;
+pub const KBD_LED_NUM: u8 = 1 << 1;
+pub const KBD_LED_CAPS: u8 = 1 << 2;
+pub const KBD_LED_MASK: u8 = KBD_LED_SCROLL | KBD_LED_NUM | KBD_LED_CAPS;
 
 /// PS/2 mouse command: Reset → ACK, BAT, device ID.
 pub const MOUSE_CMD_RESET: u8 = 0xFF;
@@ -215,6 +235,16 @@ enum MousePendingParam {
     SampleRate,
     /// Following `0xE8` — next byte is resolution (0..3).
     Resolution,
+}
+
+/// Next host→keyboard data-port byte expected as a parameter for a prior command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KbdPendingParam {
+    None,
+    /// Following `0xED` — next byte is the LED mask.
+    Leds,
+    /// Following `0xF3` — next byte is typematic rate/delay.
+    Typematic,
 }
 
 /// Output-port bit 1: A20 gate enable (1 = A20 line high / unmasked).
@@ -324,6 +354,12 @@ pub struct I8042 {
     ///
     /// When false, [`I8042::inject_scancode`] drops make/break traffic.
     kbd_scanning: bool,
+    /// Keyboard LED mask (Scroll/Num/Caps); stored by `0xED` + value. Reset → 0.
+    kbd_leds: u8,
+    /// Keyboard typematic rate/delay byte; stored by `0xF3` + value.
+    kbd_typematic: u8,
+    /// Awaiting LED or typematic parameter byte after `0xED` / `0xF3`.
+    kbd_pending_param: KbdPendingParam,
     /// Pending keyboard → host response bytes waiting for an empty output buffer
     /// (and an enabled keyboard clock) before presentation on keyboard OBF.
     kbd_resp: [u8; KBD_RESP_QUEUE_CAP],
@@ -353,6 +389,9 @@ impl I8042 {
             aux_resp: [0; AUX_RESP_QUEUE_CAP],
             aux_resp_len: 0,
             kbd_scanning: true,
+            kbd_leds: 0,
+            kbd_typematic: KBD_DEFAULT_TYPEMATIC,
+            kbd_pending_param: KbdPendingParam::None,
             kbd_resp: [0; KBD_RESP_QUEUE_CAP],
             kbd_resp_len: 0,
             translate_pending_break: false,
@@ -380,12 +419,15 @@ impl I8042 {
         self.translate_pending_break = false;
     }
 
-    /// Restore keyboard stub defaults (scanning enabled).
+    /// Restore keyboard stub defaults (scanning, LEDs, typematic).
     ///
     /// Spec: OSDev PS/2 Keyboard — Reset returns the keyboard to power-on
-    /// defaults with scanning enabled.
+    /// defaults with scanning enabled, LEDs off, and default typematic rate/delay.
     fn reset_kbd_defaults(&mut self) {
         self.kbd_scanning = true;
+        self.kbd_leds = 0;
+        self.kbd_typematic = KBD_DEFAULT_TYPEMATIC;
+        self.kbd_pending_param = KbdPendingParam::None;
     }
 
     /// Restore mouse stub defaults (sample rate / resolution / scaling / reporting).
@@ -549,6 +591,26 @@ impl I8042 {
     /// [`Self::inject_scancode`] drops make/break traffic.
     pub fn kbd_scanning_enabled(&self) -> bool {
         self.kbd_scanning
+    }
+
+    /// Current keyboard LED mask (set by `0xED` + value; default 0 / all off).
+    ///
+    /// Spec: OSDev PS/2 Keyboard — [`KBD_LED_SCROLL`] / [`KBD_LED_NUM`] /
+    /// [`KBD_LED_CAPS`]. Stored only; no host-visible LED hardware. Upper bits
+    /// beyond [`KBD_LED_MASK`] are retained if the host wrote them.
+    pub fn kbd_leds(&self) -> u8 {
+        self.kbd_leds
+    }
+
+    /// Whether any of Scroll/Num/Caps LED bits are set in the stored mask.
+    pub fn kbd_leds_any(&self) -> bool {
+        (self.kbd_leds & KBD_LED_MASK) != 0
+    }
+
+    /// Current typematic rate/delay byte (set by `0xF3` + value; default
+    /// [`KBD_DEFAULT_TYPEMATIC`]).
+    pub fn kbd_typematic(&self) -> u8 {
+        self.kbd_typematic
     }
 
     /// Whether the mouse stub has data reporting enabled (`0xF4` / not `0xF5`).
@@ -819,11 +881,28 @@ impl I8042 {
     /// Spec: OSDev [PS/2 Keyboard](https://wiki.osdev.org/PS/2_Keyboard) —
     /// commands on `0x60` when the controller is not expecting a write-config /
     /// write-output / write-aux parameter. Supported stub commands answer with
-    /// ACK/`0xFA` (and BAT/ID where required) on keyboard OBF.
+    /// ACK/`0xFA` (and BAT/ID where required) on keyboard OBF. `0xED` / `0xF3`
+    /// arm a one-byte parameter expected on the next data-port write.
     fn handle_kbd_device_byte(&mut self, cmd: u8) {
+        match self.kbd_pending_param {
+            KbdPendingParam::Leds => {
+                self.kbd_pending_param = KbdPendingParam::None;
+                self.kbd_leds = cmd;
+                self.begin_kbd_response(&[KBD_ACK]);
+                return;
+            }
+            KbdPendingParam::Typematic => {
+                self.kbd_pending_param = KbdPendingParam::None;
+                self.kbd_typematic = cmd;
+                self.begin_kbd_response(&[KBD_ACK]);
+                return;
+            }
+            KbdPendingParam::None => {}
+        }
+
         match cmd {
             KBD_CMD_RESET => {
-                // Spec: Reset → ACK, BAT OK; restore scanning default.
+                // Spec: Reset → ACK, BAT OK; restore scanning / LEDs / typematic.
                 self.reset_kbd_defaults();
                 self.begin_kbd_response(&[KBD_ACK, KBD_BAT_OK]);
             }
@@ -837,6 +916,16 @@ impl I8042 {
             }
             KBD_CMD_DISABLE_SCANNING => {
                 self.kbd_scanning = false;
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
+            KBD_CMD_SET_LEDS => {
+                // Spec: Set LEDs — ACK, then accept LED mask on next data write.
+                self.kbd_pending_param = KbdPendingParam::Leds;
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
+            KBD_CMD_SET_TYPEMATIC => {
+                // Spec: Set Typematic Rate/Delay — ACK, then accept value next.
+                self.kbd_pending_param = KbdPendingParam::Typematic;
                 self.begin_kbd_response(&[KBD_ACK]);
             }
             _ => {
@@ -1098,17 +1187,91 @@ mod tests {
         assert!(k.irq1_line());
     }
 
-    /// Spec: unsupported host→keyboard commands (e.g. LEDs `0xED`) are accepted
+    /// Spec: unsupported host→keyboard commands (e.g. Echo `0xEE`) are accepted
     /// with no ACK; controller config/output buffer unchanged.
     #[test]
     fn data_write_unsupported_kbd_command_no_ack() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         let before = k.clone();
-        k.port_write(I8042_DATA, 1, 0xED); // Set LEDs — not implemented
+        k.port_write(I8042_DATA, 1, 0xEE); // Echo — not implemented
         assert_eq!(k.config, before.config);
         assert_eq!(k.output_buffer(), None);
         assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Set LEDs (`0xED`) → ACK `0xFA`, then LED
+    /// parameter byte → ACK; store ScrollLock/NumLock/CapsLock bits.
+    #[test]
+    fn kbd_set_leds_ed_acks_and_stores_mask() {
+        let mut k = I8042::new();
+        assert_eq!(k.kbd_leds(), 0);
+
+        write_kbd(&mut k, KBD_CMD_SET_LEDS);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+
+        // bit0 ScrollLock | bit1 NumLock | bit2 CapsLock
+        let leds = KBD_LED_SCROLL | KBD_LED_NUM | KBD_LED_CAPS;
+        k.port_write(I8042_DATA, 1, u32::from(leds));
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.kbd_leds(), leds);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+        assert!(!k.irq12_line());
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Set Typematic Rate/Delay (`0xF3`) → ACK,
+    /// then rate/delay parameter → ACK; store the byte.
+    #[test]
+    fn kbd_set_typematic_f3_acks_and_stores_value() {
+        let mut k = I8042::new();
+        assert_eq!(k.kbd_typematic(), KBD_DEFAULT_TYPEMATIC);
+
+        write_kbd(&mut k, KBD_CMD_SET_TYPEMATIC);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+
+        k.port_write(I8042_DATA, 1, 0x00); // fastest rate / shortest delay encoding
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.kbd_typematic(), 0x00);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: Reset restores LED mask and typematic defaults (OSDev power-on).
+    #[test]
+    fn kbd_reset_restores_leds_and_typematic_defaults() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_SET_LEDS);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        k.port_write(I8042_DATA, 1, u32::from(KBD_LED_CAPS));
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.kbd_leds(), KBD_LED_CAPS);
+
+        write_kbd(&mut k, KBD_CMD_SET_TYPEMATIC);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        k.port_write(I8042_DATA, 1, 0x7F);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.kbd_typematic(), 0x7F);
+
+        write_kbd(&mut k, KBD_CMD_RESET);
+        assert_eq!(k.kbd_leds(), 0);
+        assert_eq!(k.kbd_typematic(), KBD_DEFAULT_TYPEMATIC);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_BAT_OK);
+    }
+
+    /// Spec: after Set LEDs ACK, the next data-port byte is the LED parameter
+    /// (even if its value coincides with a command opcode).
+    #[test]
+    fn kbd_set_leds_param_consumes_next_data_byte() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_SET_LEDS);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+
+        // 0xFF would be Reset if mis-handled as a command.
+        k.port_write(I8042_DATA, 1, 0xFF);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.kbd_leds(), 0xFF);
+        assert!(k.kbd_scanning_enabled());
+        assert_eq!(k.status() & STATUS_OBF, 0); // no BAT — not a Reset
     }
 
     /// Helper: enable first port then send one host→keyboard byte on `0x60`.
@@ -1413,10 +1576,10 @@ mod tests {
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
 
-        // Next data byte is keyboard-bound again: aux state untouched; LEDs
-        // (`0xED`) are an unsupported kbd command (no ACK).
+        // Next data byte is keyboard-bound again: aux state untouched; Echo
+        // (`0xEE`) remains an unsupported kbd command (no ACK).
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
-        k.port_write(I8042_DATA, 1, 0xED);
+        k.port_write(I8042_DATA, 1, 0xEE);
         assert_eq!(k.aux_device_writes, 1);
         assert_eq!(k.last_aux_device_write, Some(0xF0));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
