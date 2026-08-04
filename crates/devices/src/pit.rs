@@ -7,25 +7,32 @@
 //!
 //! - Intel 8254 Programmable Interval Timer datasheet — control word format
 //!   (SC/RW/M/BCD), counter latch command, LSB/MSB / LSB-then-MSB access,
-//!   operating modes 0–5; mode 0/2/3 OUT pin behavior (GATE assumed high).
+//!   operating modes 0–5; "Mode Definitions" for mode 0/1/2/3/4/5 OUT pin
+//!   behavior and the GATE-pin operations summary table.
 //! - Intel 8259A — edge-triggered IR: low→high latches IRR (wired in `machine-pc`).
 //! - Classic IBM PC/AT I/O map: `0x40`–`0x43`; ch0 OUT → IRQ0.
 //! - `docs/machine-model-pc-v1.md`, `docs/sources.md`, `plan.md` §15.3 / §21.
 //!
-//! # Scope (this slice)
+//! # Scope
 //!
-//! Channel 0 control-word programming (modes 0, 2, 3 required; other mode bits
-//! stored), access-mode count load, counter-latch read-back, counting-element
-//! (`ce`) advancement via [`Pit8254::tick_ch0`], and OUT pin level / rising-edge
+//! Channel control-word programming (operating modes 0, 1, 2, 3, 4, 5),
+//! access-mode count load, counter-latch read-back, counting-element (`ce`)
+//! advancement via [`Pit8254::tick_ch0`], and OUT pin level / rising-edge
 //! reporting for IRQ0. Channel 2: GATE via port `0x61` bit0, OUT readback on
 //! bit5, speaker-data latch bit1 (no host audio), and [`Pit8254::tick_ch2`].
 //! Channel 1 accepts control words and byte I/O but is **not** fully supported.
 //!
+//! GATE-triggered modes 1 and 5 need a GATE rising edge to start counting, so
+//! on this machine model they are only reachable on channel 2 (port `0x61`
+//! bit0); channel 0/1 GATE is tied high and never has a rising edge.
+//!
 //! # Unsupported (explicit)
 //!
 //! - Channel 0/1 gate input (assumed always high)
-//! - Modes 1 / 4 / 5 OUT/IRQ claims — programmed/stored; tick is a no-op
 //! - Mode 3 exact 50% duty cycle (simplified: one rising OUT edge per period)
+//! - Sub-CLK load delay: a count write (modes 0/2/3/4) or GATE trigger
+//!   (modes 1/5) takes effect on the same model clock, not on the following
+//!   CLK as on real hardware (terminal count lands one CLK early)
 //! - BCD counting during tick (BCD flag stored; tick uses binary)
 //! - Read-back command (`SC=11`) status/count latches (ignored)
 //! - Channel 1 DRAM refresh; host PC-speaker audio output
@@ -118,10 +125,11 @@ pub struct PitChannel {
     pub ce: u32,
     /// Channel OUT pin level (Intel 8254 OUT).
     pub out_level: bool,
-    /// True while the counting element is advancing under modes 0/2/3.
+    /// True while the counting element is advancing (mode/GATE permitting).
     pub counting: bool,
-    /// Mode 2: OUT is low for this model clock; next clock rises.
-    mode2_out_low: bool,
+    /// OUT is low for this model clock; next clock rises. Used by the mode 2/3
+    /// rate pulse and the mode 4/5 one-CLK strobe.
+    out_low_pulse: bool,
     /// Latched value for read-back after a latch command.
     latched: Option<u16>,
     /// Whether a full count has been written since the last mode program.
@@ -143,7 +151,7 @@ impl PitChannel {
             ce: 0,
             out_level: false,
             counting: false,
-            mode2_out_low: false,
+            out_low_pulse: false,
             latched: None,
             count_loaded: false,
             gate: true,
@@ -201,11 +209,11 @@ impl PitChannel {
         self.count_loaded = false;
         self.latched = None;
         self.counting = false;
-        self.mode2_out_low = false;
+        self.out_low_pulse = false;
         self.ce = 0;
-        // Spec: Intel 8254 — after control word, mode 0 OUT low; modes 2/3 OUT high
-        // (GATE high assumed). Modes 1/4/5: OUT not claimed for IRQ in this slice.
-        self.out_level = matches!(self.mode, 2 | 3);
+        // Spec: Intel 8254 "Mode Definitions" — after the control word only mode 0
+        // drives OUT low; modes 1/2/3/4/5 are initially high.
+        self.out_level = self.mode != 0;
         self.write_phase = match self.access {
             AccessMode::Hi => BytePhase::ExpectHi,
             _ => BytePhase::ExpectLo,
@@ -218,16 +226,26 @@ impl PitChannel {
 
     fn arm_count_loaded(&mut self) {
         self.count_loaded = true;
+        if matches!(self.mode, 1 | 5) {
+            // Spec: Intel 8254 modes 1/5 — the count write is not a trigger; CE
+            // is loaded on the GATE rising edge, and a new count written during
+            // a one-shot / strobe only takes effect on the next trigger.
+            if !self.counting {
+                self.ce = self.reload_ce();
+            }
+            return;
+        }
         // Spec: Intel 8254 — full count load arms CE; 0 encodes 65536.
         self.ce = self.reload_ce();
-        self.mode2_out_low = false;
-        // Modes 0/2/3: start counting when GATE high. Modes 1/4/5: store only.
-        self.counting = matches!(self.mode, 0 | 2 | 3) && self.gate;
+        self.out_low_pulse = false;
+        // Modes 0/2/3/4: the count write starts counting when GATE is high.
+        self.counting = self.gate;
     }
 
-    /// Update GATE. Spec: Intel 8254 — mode 0 GATE enables/disables counting;
-    /// modes 2/3 GATE low forces OUT high and disables counting; rising GATE
-    /// reloads CE for modes 2/3.
+    /// Update GATE. Spec: Intel 8254 GATE-pin operations summary — GATE low
+    /// disables counting in modes 0/2/3/4 (and forces OUT high in modes 2/3) but
+    /// has no effect in modes 1/5; a GATE rising edge reloads CE and (re)starts
+    /// counting in modes 1/2/3/5 and re-enables counting in modes 0/4.
     fn set_gate(&mut self, high: bool) {
         let was = self.gate;
         if was == high {
@@ -237,9 +255,10 @@ impl PitChannel {
         if !high {
             if matches!(self.mode, 2 | 3) {
                 self.out_level = true;
-                self.mode2_out_low = false;
+                self.out_low_pulse = false;
             }
-            // Mode 0: OUT unchanged; tick paused while GATE low.
+            // Modes 0/4: OUT unchanged; tick paused while GATE low.
+            // Modes 1/5: GATE low has no effect on the in-progress count.
             return;
         }
         // Rising edge.
@@ -247,14 +266,29 @@ impl PitChannel {
             return;
         }
         match self.mode {
-            0 => {
+            0 | 4 => {
                 if self.ce > 0 {
                     self.counting = true;
                 }
             }
+            1 => {
+                // Retriggerable one-shot: reload CE, OUT low until terminal count.
+                self.ce = self.reload_ce();
+                self.out_low_pulse = false;
+                self.out_level = false;
+                self.counting = true;
+            }
             2 | 3 => {
                 self.ce = self.reload_ce();
-                self.mode2_out_low = false;
+                self.out_low_pulse = false;
+                self.out_level = true;
+                self.counting = true;
+            }
+            5 => {
+                // Hardware triggered strobe: reload CE; OUT stays high until the
+                // one-CLK strobe at terminal count.
+                self.ce = self.reload_ce();
+                self.out_low_pulse = false;
                 self.out_level = true;
                 self.counting = true;
             }
@@ -282,7 +316,11 @@ impl PitChannel {
                     self.count = (self.count & 0xFF00) | u16::from(value);
                     self.write_phase = BytePhase::ExpectHi;
                     self.count_loaded = false;
-                    self.counting = false;
+                    // Modes 1/5: a new count never disturbs the running one-shot
+                    // or strobe (Intel 8254 mode 1/5 definitions).
+                    if !matches!(self.mode, 1 | 5) {
+                        self.counting = false;
+                    }
                 }
                 BytePhase::ExpectHi => {
                     self.count = (self.count & 0x00FF) | (u16::from(value) << 8);
@@ -317,16 +355,21 @@ impl PitChannel {
 
     /// Advance one model CLK. Returns true if OUT had a rising edge this clock.
     ///
-    /// Spec: Intel 8254 modes 0 / 2 / 3 OUT (requires GATE high). Modes 1/4/5: no-op.
+    /// Spec: Intel 8254 modes 0–5 OUT. Per the GATE-pin operations summary, GATE
+    /// low disables counting in modes 0/2/3/4 but not in modes 1/5.
     fn tick_one(&mut self) -> bool {
-        if !self.gate || !self.counting {
+        if !self.counting {
+            return false;
+        }
+        if !self.gate && !matches!(self.mode, 1 | 5) {
             return false;
         }
         match self.mode {
             0 => self.tick_mode0(),
+            1 => self.tick_mode1(),
             2 => self.tick_mode2(),
             3 => self.tick_mode3(),
-            // Modes 1/4/5: unsupported for IRQ/OUT claims in this slice.
+            4 | 5 => self.tick_strobe(),
             _ => false,
         }
     }
@@ -344,19 +387,28 @@ impl PitChannel {
         !prev && self.out_level
     }
 
+    /// Mode 1 — hardware retriggerable one-shot: OUT (already driven low by the
+    /// GATE trigger in [`PitChannel::set_gate`]) returns high at terminal count.
+    ///
+    /// Same counting cadence as mode 0; the modes differ only in what starts the
+    /// count and drives OUT low (control word vs GATE trigger).
+    fn tick_mode1(&mut self) -> bool {
+        self.tick_mode0()
+    }
+
     /// Mode 2 — rate generator: at terminal, OUT low one clock then high; reload CE.
     fn tick_mode2(&mut self) -> bool {
         let prev = self.out_level;
-        if self.mode2_out_low {
+        if self.out_low_pulse {
             // Prior clock was the one-clock OUT low pulse — rise and continue.
             self.out_level = true;
-            self.mode2_out_low = false;
+            self.out_low_pulse = false;
             return !prev && self.out_level;
         }
         if self.ce <= 1 {
             // Terminal: OUT low for one model clock; reload CE (period = N).
             self.out_level = false;
-            self.mode2_out_low = true;
+            self.out_low_pulse = true;
             self.ce = self.reload_ce();
         } else {
             self.ce -= 1;
@@ -372,6 +424,28 @@ impl PitChannel {
     fn tick_mode3(&mut self) -> bool {
         // Reuse mode-2 edge cadence; duty-cycle asymmetry is documented above.
         self.tick_mode2()
+    }
+
+    /// Modes 4 and 5 — strobe: OUT goes low for exactly one CLK at terminal
+    /// count, then returns high (the rising edge). Both are one-shot: mode 4 is
+    /// re-armed by writing a new count, mode 5 by a GATE rising edge.
+    fn tick_strobe(&mut self) -> bool {
+        let prev = self.out_level;
+        if self.out_low_pulse {
+            // Prior clock was the one-clock strobe — rise and stop counting.
+            self.out_level = true;
+            self.out_low_pulse = false;
+            self.counting = false;
+            return !prev && self.out_level;
+        }
+        if self.ce <= 1 {
+            self.ce = 0;
+            self.out_level = false;
+            self.out_low_pulse = true;
+        } else {
+            self.ce -= 1;
+        }
+        !prev && self.out_level
     }
 }
 
@@ -740,6 +814,214 @@ mod tests {
         assert!(!pit.channel2().gate);
         assert!(pit.out_ch2()); // forced high
         assert!(!pit.tick_ch2(10));
+    }
+
+    /// Spec: Intel 8254 datasheet "Mode Definitions" — Mode 4 (Software
+    /// Triggered Strobe): OUT is high after the control word; writing the count
+    /// starts counting; OUT is low for one CLK at terminal count then high.
+    #[test]
+    fn mode4_strobe_pulses_out_low_for_one_clock() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x38); // ch0 lohi mode 4
+        assert_eq!(pit.channel0().mode, 4);
+        assert!(pit.out_ch0()); // mode 4: OUT high after CW
+        pit.port_write(PIT_CH0_DATA, 1, 0x05);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 5 → starts counting
+        assert!(pit.channel0().counting);
+        assert!(pit.out_ch0());
+
+        // N-1 clocks: OUT stays high, no edges.
+        for _ in 0..4 {
+            assert!(!pit.tick_ch0(1));
+            assert!(pit.out_ch0());
+        }
+        // Terminal count: OUT low for exactly one model clock (no rise yet).
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0());
+        // Strobe ends: OUT rises, reported exactly once.
+        assert!(pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+        assert!(!pit.tick_ch0(20));
+        assert!(pit.out_ch0());
+    }
+
+    /// Spec: Intel 8254 Mode 4 — one-shot: no further strobes until a new count
+    /// is written (writing a new count re-arms without a new control word).
+    #[test]
+    fn mode4_one_shot_rearms_on_new_count() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x38); // ch0 lohi mode 4
+        pit.port_write(PIT_CH0_DATA, 1, 0x02);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 2
+        assert!(pit.tick_ch0(3)); // low on clock 2, rises on clock 3
+        assert!(pit.out_ch0());
+        assert!(!pit.channel0().counting);
+        assert!(!pit.tick_ch0(10)); // one-shot: no repeat
+        assert!(pit.out_ch0());
+
+        pit.port_write(PIT_CH0_DATA, 1, 0x02);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // re-arm, count = 2
+        assert!(pit.channel0().counting);
+        assert!(!pit.tick_ch0(2));
+        assert!(!pit.out_ch0());
+        assert!(pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+    }
+
+    /// Spec: Intel 8254 GATE-pin operations summary — Mode 4: GATE low disables
+    /// counting, GATE high enables it (OUT is unaffected by GATE).
+    #[test]
+    fn ch2_mode4_gate_low_disables_counting() {
+        let mut pit = Pit8254::new();
+        pit.port61_write(PORT61_GATE2);
+        pit.port_write(PIT_CONTROL, 1, 0xB8); // ch2 lohi mode 4
+        assert!(pit.out_ch2());
+        pit.port_write(PIT_CH2_DATA, 1, 0x04);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 4
+        assert!(pit.channel2().counting);
+
+        assert!(!pit.tick_ch2(2)); // CE 4 → 2
+        assert_eq!(pit.channels[2].ce, 2);
+
+        pit.port61_write(0); // GATE low → counting disabled
+        assert!(!pit.tick_ch2(50));
+        assert_eq!(pit.channels[2].ce, 2);
+        assert!(pit.out_ch2()); // GATE does not move OUT in mode 4
+
+        pit.port61_write(PORT61_GATE2); // GATE high → resume from CE (no reload)
+        assert!(!pit.tick_ch2(1));
+        assert!(!pit.tick_ch2(1)); // terminal count → OUT low one clock
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1));
+        assert!(pit.out_ch2());
+    }
+
+    /// Spec: Intel 8254 "Mode Definitions" — Mode 5 (Hardware Triggered
+    /// Strobe): OUT high after the control word; counting starts on the GATE
+    /// rising edge (not on the count write); OUT low one CLK at terminal count.
+    #[test]
+    fn ch2_mode5_starts_on_gate_rising_edge() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xBA); // ch2 lohi mode 5 (GATE2 low at reset)
+        assert_eq!(pit.channel2().mode, 5);
+        assert!(pit.out_ch2()); // mode 5: OUT high after CW
+        pit.port_write(PIT_CH2_DATA, 1, 0x03);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 3 — not a trigger
+        assert!(!pit.channel2().counting);
+        assert!(!pit.tick_ch2(10));
+        assert!(pit.out_ch2());
+
+        pit.port61_write(PORT61_GATE2); // GATE rising edge triggers
+        assert!(pit.channel2().counting);
+        assert!(pit.out_ch2());
+        assert!(!pit.tick_ch2(2));
+        assert!(pit.out_ch2());
+        assert!(!pit.tick_ch2(1)); // terminal count → OUT low one clock
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1)); // strobe ends → single rising edge
+        assert!(pit.out_ch2());
+        assert!(!pit.tick_ch2(10)); // needs a new trigger
+    }
+
+    /// Spec: Intel 8254 Mode 5 — retriggerable: a GATE rising edge reloads the
+    /// counter; GATE low alone does not disable counting.
+    #[test]
+    fn ch2_mode5_gate_rising_edge_retriggers() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xBA); // ch2 lohi mode 5
+        pit.port_write(PIT_CH2_DATA, 1, 0x04);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 4
+        pit.port61_write(PORT61_GATE2);
+        assert!(!pit.tick_ch2(2)); // CE 4 → 2
+        assert_eq!(pit.channels[2].ce, 2);
+
+        pit.port61_write(0); // mode 5: GATE low does not disable counting
+        assert!(!pit.tick_ch2(1));
+        assert_eq!(pit.channels[2].ce, 1);
+
+        pit.port61_write(PORT61_GATE2); // retrigger → full count again
+        assert_eq!(pit.channels[2].ce, 4);
+        assert!(!pit.tick_ch2(3)); // would have strobed at CE 1 without reload
+        assert!(pit.out_ch2());
+        assert!(!pit.tick_ch2(1)); // terminal count → OUT low
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1));
+        assert!(pit.out_ch2());
+    }
+
+    /// Spec: Intel 8254 "Mode Definitions" — Mode 1 (Hardware Retriggerable
+    /// One-Shot): OUT high after the control word, low on the GATE trigger,
+    /// low until terminal count, then high.
+    #[test]
+    fn ch2_mode1_one_shot_low_until_terminal_count() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xB2); // ch2 lohi mode 1
+        assert_eq!(pit.channel2().mode, 1);
+        assert!(pit.out_ch2()); // mode 1: OUT high after CW
+        pit.port_write(PIT_CH2_DATA, 1, 0x03);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 3 — not a trigger
+        assert!(!pit.channel2().counting);
+        assert!(!pit.tick_ch2(10));
+        assert!(pit.out_ch2());
+
+        pit.port61_write(PORT61_GATE2); // trigger → OUT low
+        assert!(pit.channel2().counting);
+        assert!(!pit.out_ch2());
+        assert!(!pit.tick_ch2(2));
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1)); // terminal count → single rising edge
+        assert!(pit.out_ch2());
+        assert!(!pit.tick_ch2(10));
+        assert!(pit.out_ch2());
+    }
+
+    /// Spec: Intel 8254 Mode 1 — retriggerable: a GATE rising edge while OUT is
+    /// low reloads the counter and restarts the low period.
+    #[test]
+    fn ch2_mode1_gate_rising_edge_restarts_one_shot() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xB2); // ch2 lohi mode 1
+        pit.port_write(PIT_CH2_DATA, 1, 0x04);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 4
+        pit.port61_write(PORT61_GATE2);
+        assert!(!pit.tick_ch2(2)); // CE 4 → 2, OUT still low
+        assert!(!pit.out_ch2());
+
+        pit.port61_write(0);
+        pit.port61_write(PORT61_GATE2); // retrigger mid one-shot
+        assert!(!pit.out_ch2());
+        assert_eq!(pit.channels[2].ce, 4);
+        assert!(!pit.tick_ch2(3)); // full count from the retrigger
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1));
+        assert!(pit.out_ch2());
+    }
+
+    /// Spec: Intel 8254 Mode 1 — writing a new count does not affect the
+    /// in-progress one-shot; it is loaded on the next trigger.
+    #[test]
+    fn ch2_mode1_new_count_applies_on_next_trigger() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xB2); // ch2 lohi mode 1
+        pit.port_write(PIT_CH2_DATA, 1, 0x02);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 2
+        pit.port61_write(PORT61_GATE2); // trigger → CE = 2
+
+        pit.port_write(PIT_CH2_DATA, 1, 0x05);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // new count = 5 mid one-shot
+        assert_eq!(pit.channels[2].ce, 2);
+        assert!(!pit.out_ch2());
+        assert!(!pit.tick_ch2(1));
+        assert!(pit.tick_ch2(1)); // original count of 2 finishes the one-shot
+        assert!(pit.out_ch2());
+
+        pit.port61_write(0);
+        pit.port61_write(PORT61_GATE2); // next trigger loads the new count
+        assert_eq!(pit.channels[2].ce, 5);
+        assert!(!pit.out_ch2());
+        assert!(!pit.tick_ch2(4));
+        assert!(pit.tick_ch2(1));
+        assert!(pit.out_ch2());
     }
 
     #[test]
