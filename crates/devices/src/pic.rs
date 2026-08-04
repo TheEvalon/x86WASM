@@ -6,7 +6,8 @@
 //!
 //! - Intel 8259A Programmable Interrupt Controller datasheet — ICW1–ICW4;
 //!   OCW1 (IMR); OCW2 non-specific / specific EOI; OCW3 IRR/ISR read select;
-//!   IRR/ISR; fully nested priority; cascade EOI (master + slave).
+//!   OCW3 poll command (`P=1`); IRR/ISR; fully nested priority; cascade EOI
+//!   (master + slave).
 //! - Classic IBM PC/AT: master at `0x20`/`0x21`, slave at `0xA0`/`0xA1`, slave
 //!   cascaded on master IR2.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 / §21 / §23.3.
@@ -17,13 +18,15 @@
 //! - OCW1 IMR read/write on data port after init
 //! - OCW2 non-specific EOI (`R=0,SL=0,EOI=1`) and specific EOI (`R=0,SL=1,EOI=1`)
 //! - OCW3 read-register select (`RR`/`RIS`) for IRR/ISR on command-port reads
+//! - OCW3 poll command (`P=1`): one-shot acknowledging command-port read
+//!   returning `0x80 | level`, including software-sequenced cascaded polling
 //! - Edge-triggered IR line assert, IRR→ISR on acknowledge, vector selection
 //! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
 //!
 //! # Unsupported (explicit)
 //!
-//! - Auto-EOI (ICW4.AEOI), rotate modes (OCW2 `R=1`), special mask mode
-//! - OCW3 poll command (`P=1`)
+//! - Auto-EOI (ICW4.AEOI), rotate modes (OCW2 `R=1`), special mask mode,
+//!   special fully-nested mode
 //! - Level-triggered delivery beyond storing ICW1.LTIM (runtime uses edge model)
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
@@ -109,6 +112,11 @@ pub struct Pic8259 {
     ir_level: u8,
     /// OCW3 read-register selection for command-port reads.
     read_reg: ReadReg,
+    /// OCW3 `P=1` armed: the next command-port read is an interrupt acknowledge.
+    ///
+    /// This is the 8259A software *poll command*, not to be confused with
+    /// [`DualPic::poll_irq`], which samples an INTA vector for the machine bus.
+    poll_command_armed: bool,
 }
 
 impl Pic8259 {
@@ -138,6 +146,7 @@ impl Pic8259 {
             isr: 0,
             ir_level: 0,
             read_reg: ReadReg::Irr,
+            poll_command_armed: false,
         }
     }
 
@@ -254,6 +263,7 @@ impl Pic8259 {
         self.isr = 0;
         self.ir_level = 0;
         self.read_reg = ReadReg::Irr;
+        self.poll_command_armed = false;
         self.phase = InitPhase::ExpectIcw2;
     }
 
@@ -317,10 +327,16 @@ impl Pic8259 {
         }
     }
 
-    /// OCW3: IRR/ISR read select. Poll / special-mask unsupported.
+    /// OCW3: poll command (`P=1`) and IRR/ISR read select. Special-mask
+    /// (`ESMM`/`SMM`) unsupported.
+    ///
+    /// Spec: Intel 8259A datasheet — OCW3 format / Poll Command. Model choice:
+    /// `P=1` arms the poll for the next command-port read and leaves the
+    /// `RR`/`RIS` selection untouched (the datasheet does not define combining
+    /// a poll with a read-register select).
     fn write_ocw3(&mut self, value: u8) {
         if value & OCW3_P != 0 {
-            // Poll command — unsupported.
+            self.poll_command_armed = true;
             return;
         }
         if value & OCW3_RR != 0 {
@@ -329,6 +345,25 @@ impl Pic8259 {
             } else {
                 ReadReg::Irr
             };
+        }
+    }
+
+    /// Consume an armed OCW3 poll command: acknowledge the highest-priority
+    /// unmasked request like an INTA cycle and return the poll byte.
+    ///
+    /// Spec: Intel 8259A datasheet — Poll Command: bit7 = 1 when an interrupt is
+    /// pending, bits 2:0 = binary level of that request; the IS bit is set and
+    /// the IR bit cleared (edge model) via the shared [`Pic8259::ack_ir`] path.
+    /// Model choice: with nothing pending the byte is `0x00` (bit7 clear, level
+    /// bits zero) — the datasheet leaves the level bits unspecified there.
+    fn take_poll_command_byte(&mut self) -> u8 {
+        self.poll_command_armed = false;
+        match self.highest_priority_request() {
+            Some(ir) => {
+                self.ack_ir(ir);
+                0x80 | ir
+            }
+            None => 0x00,
         }
     }
 
@@ -414,8 +449,29 @@ impl DualPic {
     }
 
     /// Vector for `Bus::poll_external_irq` (acknowledge on poll).
+    ///
+    /// Note: this is external IRQ sampling for the machine bus, *not* the 8259A
+    /// OCW3 poll command (see [`Pic8259::take_poll_command_byte`]).
     pub fn poll_irq(&mut self) -> Option<u8> {
         self.acknowledge()
+    }
+
+    /// Command-port read while an OCW3 poll command is armed (`P=1`).
+    ///
+    /// Spec: Intel 8259A datasheet — Poll Command: the read is an interrupt
+    /// acknowledge for the addressed chip only. Cascaded polling is therefore
+    /// software sequenced: poll the master (returns the cascade level, IR2 on the
+    /// PC AT), then poll the slave's own command port for the slave level.
+    fn poll_command_read(&mut self, slave: bool) -> u8 {
+        self.sync_cascade();
+        let byte = if slave {
+            self.slave.take_poll_command_byte()
+        } else {
+            self.master.take_poll_command_byte()
+        };
+        // Slave INT may drop once the acknowledge moved its request IRR→ISR.
+        self.sync_cascade();
+        byte
     }
 
     fn chip_mut(&mut self, port: u16) -> Option<(&mut Pic8259, bool)> {
@@ -450,11 +506,13 @@ impl PortDevice for DualPic {
         let Some((chip, is_data)) = self.chip(port) else {
             return 0xFFFF_FFFF;
         };
-        u32::from(if is_data {
-            chip.read_data()
-        } else {
-            chip.read_cmd()
-        })
+        if is_data {
+            return u32::from(chip.read_data());
+        }
+        if !chip.poll_command_armed {
+            return u32::from(chip.read_cmd());
+        }
+        u32::from(self.poll_command_read(port == PIC_SLAVE_CMD))
     }
 
     fn port_write(&mut self, port: u16, _size: u8, value: u32) {
@@ -736,6 +794,129 @@ mod tests {
         pic.port_write(PIC_MASTER_CMD, 1, 0x20);
         assert_eq!(pic.slave.isr, 0);
         assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 8259A datasheet — Poll Command (OCW3 `P=1`): the next
+    /// command-port read is an interrupt acknowledge; it sets the IS bit of the
+    /// highest-priority unmasked request, clears its IR bit (edge mode), and
+    /// returns bit7=1 with the binary level in bits 2:0.
+    #[test]
+    fn ocw3_poll_command_acknowledges_pending_request() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // OCW1 unmask all
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.master.irr, 1 << 3);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // OCW3 D3=1, P=1
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 3);
+        assert_eq!(pic.master.isr, 1 << 3);
+        assert_eq!(pic.master.irr & (1 << 3), 0);
+    }
+
+    /// Spec: Intel 8259A datasheet — Poll Command: bit7 = 0 when no interrupt is
+    /// pending. Documented model choice: the datasheet leaves bits 2:0
+    /// unspecified in that case; this model returns `0x00`.
+    #[test]
+    fn ocw3_poll_command_without_pending_request() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // OCW1 unmask all
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x00);
+        assert_eq!(pic.master.isr, 0);
+
+        // Fully masked request: IRR is non-zero but nothing is pending, so the
+        // poll byte is 0x00 rather than the IRR contents.
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFF);
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.master.irr, 1 << 3);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x00);
+        assert_eq!(pic.master.isr, 0);
+        assert_eq!(pic.master.irr, 1 << 3);
+    }
+
+    /// Spec: Intel 8259A datasheet — Poll Command resolves the *highest*
+    /// priority request (fully nested: IR0 highest … IR7 lowest).
+    #[test]
+    fn ocw3_poll_command_returns_highest_priority_level() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // OCW1 unmask all
+        pic.set_irq_line(6, true);
+        pic.set_irq_line(3, true);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 3);
+        assert_eq!(pic.master.isr, 1 << 3);
+        assert_eq!(pic.master.irr, 1 << 6);
+    }
+
+    /// Spec: Intel 8259A datasheet — Poll Command / OCW1: a masked IR is not a
+    /// pending request, so the poll returns the unmasked lower-priority level.
+    #[test]
+    fn ocw3_poll_command_respects_imr() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xBF); // unmask IR6 only
+        pic.set_irq_line(3, true);
+        pic.set_irq_line(6, true);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 6);
+        assert_eq!(pic.master.isr, 1 << 6);
+        assert_eq!(pic.master.irr, 1 << 3);
+    }
+
+    /// Spec: Intel 8259A datasheet — Poll Command applies to the *next* read
+    /// only; later command-port reads use the OCW3 `RR`/`RIS` selection, and a
+    /// fresh OCW3 `P=1` re-arms the poll.
+    #[test]
+    fn ocw3_poll_command_is_one_shot_and_rearmable() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00); // OCW1 unmask all
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0B); // OCW3 RR=1, RIS=1 → ISR
+        pic.set_irq_line(6, true);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // OCW3 P=1
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 6);
+        // One-shot: reads revert to the previously selected register (ISR).
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 1 << 6);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 1 << 6);
+        // RR/RIS select still works after a poll.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0A); // OCW3 RR=1, RIS=0 → IRR
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x00);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // non-specific EOI
+        pic.set_irq_line(1, true);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 1 << 1); // IRR select
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // re-arm poll
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 1);
+        assert_eq!(pic.master.isr, 1 << 1);
+    }
+
+    /// Spec: Intel 8259A datasheet — Poll Command with cascade: polling is
+    /// software sequenced. The master poll returns the cascade level (IR2 on the
+    /// PC AT) and sets master IS2; polling the slave's own command port then
+    /// returns the slave level and sets the slave IS bit.
+    #[test]
+    fn ocw3_poll_command_cascaded_master_then_slave() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask master IR2 (cascade)
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+        pic.set_irq_line(9, true); // slave IR1
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 2);
+        assert_eq!(pic.master.isr, 1 << 2);
+
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_SLAVE_CMD, 1), 0x80 | 1);
+        assert_eq!(pic.slave.isr, 1 << 1);
+        assert_eq!(pic.slave.irr, 0);
     }
 
     /// Spec: fully nested — in-service IR0 blocks lower-priority IR1 until EOI.
