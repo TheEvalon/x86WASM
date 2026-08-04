@@ -37,12 +37,15 @@
 //! - Special Fully Nested Mode (ICW4.SFNM on master): a slave-connected in-service
 //!   IR does not lock that cascade line out of the master's priority logic, so a
 //!   higher-priority IR on the same slave can be delivered without a master EOI
-//! - Edge-triggered IR line assert, IRR→ISR on acknowledge, vector selection
+//! - Edge-triggered IR line assert (ICW1.LTIM=0): rising edge latches IRR
+//! - Level-triggered IR line assert (ICW1.LTIM=1): IRR follows IR level; deassert
+//!   clears IRR; acknowledge while still high re-pending IRR for post-EOI delivery
+//! - IRR→ISR on acknowledge, vector selection
 //! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
 //!
 //! # Unsupported (explicit)
 //!
-//! - Level-triggered delivery beyond storing ICW1.LTIM (runtime uses edge model)
+//! - Spurious / DEFAULT IR7 when IR drops before first INTA falling edge
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
 use crate::PortDevice;
@@ -111,7 +114,11 @@ pub struct Pic8259 {
     pub expect_icw4: bool,
     /// ICW1.SNGL — single (no cascade / no ICW3).
     pub single: bool,
-    /// ICW1.LTIM — level-triggered when true (stored; runtime uses edge model).
+    /// ICW1.LTIM — level-triggered when true (edge-triggered when false).
+    ///
+    /// Spec: Intel 8259A datasheet — LTIM=1 disables edge detect; a high level
+    /// on IR is a valid request. The request must be removed before EOI (or
+    /// before IF is re-enabled) to avoid a second interrupt.
     pub level_triggered: bool,
     /// Raw ICW1 byte from the last started sequence (0 after reset).
     pub icw1: u8,
@@ -243,7 +250,12 @@ impl Pic8259 {
         Some((self.vector_base & 0xF8) | (irq & 0x07))
     }
 
-    /// Drive IR`irq` (0–7). Edge-triggered: low→high sets IRR (Intel 8259A).
+    /// Drive IR`irq` (0–7).
+    ///
+    /// Spec: Intel 8259A ICW1.LTIM —
+    /// - Edge (LTIM=0): low→high latches IRR; holding high does not re-request;
+    ///   deassert does not clear a latched IRR bit.
+    /// - Level (LTIM=1): high level sets IRR; deassert clears that IRR bit.
     pub fn set_irq_line(&mut self, irq: u8, high: bool) {
         if irq > 7 {
             return;
@@ -252,12 +264,18 @@ impl Pic8259 {
         let was_high = self.ir_level & bit != 0;
         if high {
             self.ir_level |= bit;
-            if !was_high {
+            if self.level_triggered {
+                self.irr |= bit;
+            } else if !was_high {
                 // Edge sense: rising edge latches IRR (datasheet ICW1 / edge mode).
                 self.irr |= bit;
             }
         } else {
             self.ir_level &= !bit;
+            if self.level_triggered {
+                // Level mode: removing the IR level removes the request.
+                self.irr &= !bit;
+            }
         }
     }
 
@@ -374,10 +392,17 @@ impl Pic8259 {
     /// Acknowledge IR`ir`: clear IRR, set ISR; with AEOI, clear that ISR bit
     /// at the end of the acknowledge sequence (Intel 8259A Automatic EOI).
     /// With Rotate in Automatic EOI Mode, also assign `ir` lowest priority.
+    ///
+    /// Spec: Intel 8259A level mode — if IR remains high after acknowledge, the
+    /// request is still present (IRR re-pending) so a second interrupt occurs
+    /// once the IS bit no longer nested-blocks (typically after EOI).
     fn ack_ir(&mut self, ir: u8) {
         let bit = 1u8 << ir;
         self.irr &= !bit;
         self.isr |= bit;
+        if self.level_triggered && self.ir_level & bit != 0 {
+            self.irr |= bit;
+        }
         if self.auto_eoi {
             self.isr &= !bit;
             if self.rotate_on_auto_eoi {
@@ -554,7 +579,8 @@ impl Pic8259 {
     ///
     /// Spec: Intel 8259A datasheet — Poll Command: bit7 = 1 when an interrupt is
     /// pending, bits 2:0 = binary level of that request; the IS bit is set and
-    /// the IR bit cleared (edge model) via the shared [`Pic8259::ack_ir`] path.
+    /// the IR bit cleared via the shared [`Pic8259::ack_ir`] path (level mode
+    /// may re-pending IRR while IR stays high).
     /// With ICW4.AEOI the IS bit is cleared again at the end of that acknowledge.
     /// Model choice: with nothing pending the byte is `0x00` (bit7 clear, level
     /// bits zero) — the datasheet leaves the level bits unspecified there.
@@ -1726,5 +1752,114 @@ mod tests {
         pic.port_write(PIC_MASTER_CMD, 1, 0x11); // new ICW1
         assert!(!pic.master.special_fully_nested);
         assert!(!pic.master.initialized);
+    }
+
+    /// PC AT cascade with ICW1.LTIM set on both chips (level-triggered IR inputs).
+    fn init_at_cascade_level(pic: &mut DualPic) {
+        // ICW1 = 0x19: D4 | LTIM | IC4 (Intel 8259A ICW1 bit3 = level-triggered).
+        pic.port_write(PIC_MASTER_CMD, 1, 0x19);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x19);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+    }
+
+    /// Spec: Intel 8259A ICW1.LTIM — LTIM=1 programs level interrupt mode.
+    #[test]
+    fn icw1_ltim_programs_level_triggered() {
+        let mut pic = DualPic::new();
+        init_at_cascade_level(&mut pic);
+        assert!(pic.master.level_triggered);
+        assert!(pic.slave.level_triggered);
+        assert_eq!(pic.master.icw1, 0x19);
+        assert_eq!(pic.slave.icw1, 0x19);
+    }
+
+    /// Spec: Intel 8259A level mode — IR high sets IRR; deassert removes the request
+    /// (unlike edge mode, where IRR stays latched after a rising edge).
+    #[test]
+    fn level_triggered_deassert_clears_irr() {
+        let mut pic = DualPic::new();
+        init_at_cascade_level(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.master.irr, 0x01);
+        pic.set_irq_line(0, false);
+        assert_eq!(pic.master.irr, 0);
+        assert_eq!(pic.poll_irq(), None);
+    }
+
+    /// Spec: Intel 8259A level mode — after INTA, if IR remains high the request
+    /// stays pending (IRR reflects the level) so EOI can re-deliver without a
+    /// new edge. Datasheet: request must be removed before EOI to avoid a second
+    /// interrupt.
+    #[test]
+    fn level_triggered_ack_while_asserted_keeps_irr_and_redelivers_after_eoi() {
+        let mut pic = DualPic::new();
+        init_at_cascade_level(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.isr, 0x01);
+        // Level still high → IRR re-pending while in service.
+        assert_eq!(pic.master.irr & 0x01, 0x01);
+        // Nested-blocked until EOI.
+        assert_eq!(pic.poll_irq(), None);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // non-specific EOI
+        assert_eq!(pic.master.isr, 0);
+        // No new edge: level still asserted → second delivery.
+        assert_eq!(pic.poll_irq(), Some(0x08));
+    }
+
+    /// Spec: Intel 8259A level mode — removing the IR level before EOI prevents
+    /// a second interrupt.
+    #[test]
+    fn level_triggered_deassert_before_eoi_prevents_redelivery() {
+        let mut pic = DualPic::new();
+        init_at_cascade_level(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        pic.set_irq_line(0, false);
+        assert_eq!(pic.master.irr & 0x01, 0);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.poll_irq(), None);
+    }
+
+    /// Spec: edge mode (LTIM=0) still requires a rising edge after EOI even if
+    /// the IR line stayed high through the first acknowledge.
+    #[test]
+    fn edge_mode_held_high_does_not_redeliver_after_eoi() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        assert!(!pic.master.level_triggered);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.irr & 0x01, 0); // edge: IRR cleared on ack
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        // Line still high, no new edge → no delivery.
+        assert_eq!(pic.poll_irq(), None);
+        pic.set_irq_line(0, false);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+    }
+
+    /// Spec: level-triggered cascade — slave IR held high re-delivers after dual EOI.
+    #[test]
+    fn level_triggered_slave_irq_redelivers_while_held() {
+        let mut pic = DualPic::new();
+        init_at_cascade_level(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        assert_eq!(pic.slave.irr & (1 << 1), 1 << 1);
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.poll_irq(), Some(0x71));
     }
 }
