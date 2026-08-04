@@ -5,10 +5,10 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 ## CPU and architecture
 
 - Intel 64 and IA-32 Architectures Software Developer's Manual (SDM), Volumes 1–4
-- Intel SDM Vol. 2 — LGDT/SGDT (`0F 01 /2`, `/0`); LIDT/SIDT (`0F 01 /3`, `/1`); SMSW/LMSW (`0F 01 /4`, `/6`); INVLPG (`0F 01 /7`; real-address mode architectural NOP; register form `#UD`); m16&32 pseudo-descriptor; LGDT/LIDT/INVLPG register form `#UD`
+- Intel SDM Vol. 2 — LGDT/SGDT (`0F 01 /2`, `/0`); LIDT/SIDT (`0F 01 /3`, `/1`); SMSW/LMSW (`0F 01 /4`, `/6`; LMSW cannot clear PE once set); INVLPG (`0F 01 /7`; real-address mode architectural NOP; register form `#UD`); m16&32 pseudo-descriptor; LGDT/LIDT/INVLPG register form `#UD`
 - Intel SDM Vol. 3 §2.4.1 — GDTR base/limit
 - Intel SDM Vol. 3 §2.4.3 — IDTR base/limit
-- Intel SDM Vol. 3 §2.5 — CR0 / machine status word (PE sticky under LMSW)
+- Intel SDM Vol. 3 §2.5 — CR0 / machine status word (PE sticky under LMSW). This emulator treats LMSW/MOV-CR0 `CR0.PE=1` as a sticky CR0 bit only: segment loads and far JMP remain real-mode / sticky-unreal (`base = selector << 4`; SDM Vol. 3 §3.4.2–§3.4.3). Protected-mode GDT descriptor loads / far jumps into PM / paging are separate slices.
 - Intel SDM Vol. 2 — MOV to/from Control Registers (`0F 20`/`0F 22` `/r`); mod field of ModR/M architecturally ignored (register-direct only, no SIB/displacement); CR1/CR5/CR6/CR7 reference → `#UD`; MOV to CR0 (unlike LMSW) may clear PE; MOV to CR zeros CR upper 32 bits outside 64-bit mode
 - Intel processor datasheets relevant to Core 2 Conroe/Penryn CPUID presentation
 
