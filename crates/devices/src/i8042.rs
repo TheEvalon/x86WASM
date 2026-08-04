@@ -6,6 +6,11 @@
 //!   — data/status/command ports, status OBF/IBF, controller self-test `0xAA`→`0x55`,
 //!   configuration byte via `0x20`/`0x60` (bit0 = first-port IRQ enable → IRQ1),
 //!   disable/enable first port `0xAD`/`0xAE`.
+//! - OSDev Wiki: [PS/2 Keyboard](https://wiki.osdev.org/PS/2_Keyboard) — host→device
+//!   commands written to data port `0x60` when the controller is not expecting a
+//!   command-byte parameter: `0xFF` Reset (ACK `0xFA`, BAT `0xAA`), `0xF2` Get
+//!   Keyboard ID (ACK then ID bytes, typically `0xAB` `0x83` for MF2), `0xF4`/
+//!   `0xF5` Enable/Disable Scanning (ACK `0xFA`).
 //! - OSDev Wiki: [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) — host→device
 //!   commands `0xFF` Reset (ACK `0xFA`, BAT `0xAA`, ID `0x00`), `0xF2` Get Device
 //!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF3` Set
@@ -34,6 +39,15 @@
 //! "Translation" + Andries Brouwer / Gary J. Konzak 8042 table). Instant
 //! command completion (IBF never stays set across a status poll).
 //!
+//! First-port **keyboard** device: when `PendingWrite` is none, a data-port
+//! (`0x60`) write is a host→keyboard command. A minimal keyboard stub answers
+//! Enable/Disable Scanning (`0xF4`/`0xF5`) with ACK `0xFA`, Get Keyboard ID
+//! (`0xF2`) with ACK + MF2 ID `0xAB` `0x83`, and Reset (`0xFF`) with ACK + BAT
+//! `0xAA`, on the keyboard OBF (not AUX) → IRQ1 when config bit 0 is set.
+//! Multi-byte responses queue like the mouse stub; keyboard clock disable
+//! (config bit4) holds presentation until `0xAE`. Other host→kbd bytes (LEDs,
+//! typematic, scancode-set select, …) are accepted and left unanswered.
+//!
 //! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xA9`
 //! answers `0x00` on the normal output buffer, `0xD4` routes the next data-port
 //! byte to the aux device (recorded in [`I8042::last_aux_device_write`] /
@@ -57,7 +71,8 @@
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
-//! - Full AT keyboard protocol (no host→device commands, no `0xFA` ACK stream)
+//! - Full AT keyboard protocol beyond the ACK subset above (LEDs `0xED`,
+//!   typematic `0xF3`, scancode-set select `0xF0`, echo, … unanswered)
 //! - Pulse-reset lines (`0xFE` / output-port bit0 system-reset)
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
 
@@ -111,12 +126,29 @@ pub const SELF_TEST_OK: u8 = 0x55;
 /// Second-port interface test result: no error (IBM PS/2 `0xA9`).
 pub const TEST_AUX_OK: u8 = 0x00;
 
-/// PS/2 mouse / keyboard ACK response (OSDev PS/2 Mouse "Mouse Commands").
+/// PS/2 mouse / keyboard ACK response (OSDev PS/2 Keyboard / Mouse).
 pub const MOUSE_ACK: u8 = 0xFA;
+/// Alias: keyboard command ACK (`0xFA`).
+pub const KBD_ACK: u8 = MOUSE_ACK;
 /// PS/2 mouse BAT (Basic Assurance Test) passed after Reset `0xFF`.
 pub const MOUSE_BAT_OK: u8 = 0xAA;
+/// Keyboard BAT passed after Reset `0xFF` (same value as mouse BAT).
+pub const KBD_BAT_OK: u8 = MOUSE_BAT_OK;
 /// Standard PS/2 mouse device ID (no IntelliMouse / 5-button extensions).
 pub const MOUSE_ID_STANDARD: u8 = 0x00;
+/// First MF2 keyboard ID byte after Get Keyboard ID (`0xF2`).
+pub const KBD_ID_MF2_0: u8 = 0xAB;
+/// Second MF2 keyboard ID byte after Get Keyboard ID (`0xF2`).
+pub const KBD_ID_MF2_1: u8 = 0x83;
+
+/// PS/2 keyboard command: Reset → ACK, BAT.
+pub const KBD_CMD_RESET: u8 = 0xFF;
+/// PS/2 keyboard command: Get Keyboard ID → ACK, ID bytes.
+pub const KBD_CMD_GET_ID: u8 = 0xF2;
+/// PS/2 keyboard command: Enable Scanning → ACK.
+pub const KBD_CMD_ENABLE_SCANNING: u8 = 0xF4;
+/// PS/2 keyboard command: Disable Scanning → ACK.
+pub const KBD_CMD_DISABLE_SCANNING: u8 = 0xF5;
 
 /// PS/2 mouse command: Reset → ACK, BAT, device ID.
 pub const MOUSE_CMD_RESET: u8 = 0xFF;
@@ -170,6 +202,10 @@ pub const MOUSE_PKT_Y_OVERFLOW: u8 = 1 << 7;
 /// (Status Request needs ACK + 3 status bytes; a movement packet is 3 bytes —
 /// allow a few packets without dropping).
 const AUX_RESP_QUEUE_CAP: usize = 16;
+
+/// Capacity of the pending keyboard → host response queue
+/// (Get ID needs ACK + 2 ID bytes; Reset needs ACK + BAT).
+const KBD_RESP_QUEUE_CAP: usize = 8;
 
 /// Next host→aux byte expected as a parameter for a prior mouse command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +320,14 @@ pub struct I8042 {
     /// (and an enabled aux clock) before presentation on AUX OBF.
     aux_resp: [u8; AUX_RESP_QUEUE_CAP],
     aux_resp_len: u8,
+    /// Keyboard stub: scanning enabled (`0xF4` / cleared by `0xF5`; Reset → on).
+    ///
+    /// When false, [`I8042::inject_scancode`] drops make/break traffic.
+    kbd_scanning: bool,
+    /// Pending keyboard → host response bytes waiting for an empty output buffer
+    /// (and an enabled keyboard clock) before presentation on keyboard OBF.
+    kbd_resp: [u8; KBD_RESP_QUEUE_CAP],
+    kbd_resp_len: u8,
     /// Set 2 break prefix (`0xF0`) seen while config bit6 translation is on;
     /// the next keyboard byte is translated then OR'd with `0x80` (Set 1 break).
     translate_pending_break: bool,
@@ -308,6 +352,9 @@ impl I8042 {
             mouse_pending_param: MousePendingParam::None,
             aux_resp: [0; AUX_RESP_QUEUE_CAP],
             aux_resp_len: 0,
+            kbd_scanning: true,
+            kbd_resp: [0; KBD_RESP_QUEUE_CAP],
+            kbd_resp_len: 0,
             translate_pending_break: false,
         };
         s.apply_reset_defaults();
@@ -327,7 +374,18 @@ impl I8042 {
         self.reset_mouse_defaults();
         self.aux_resp = [0; AUX_RESP_QUEUE_CAP];
         self.aux_resp_len = 0;
+        self.reset_kbd_defaults();
+        self.kbd_resp = [0; KBD_RESP_QUEUE_CAP];
+        self.kbd_resp_len = 0;
         self.translate_pending_break = false;
+    }
+
+    /// Restore keyboard stub defaults (scanning enabled).
+    ///
+    /// Spec: OSDev PS/2 Keyboard — Reset returns the keyboard to power-on
+    /// defaults with scanning enabled.
+    fn reset_kbd_defaults(&mut self) {
+        self.kbd_scanning = true;
     }
 
     /// Restore mouse stub defaults (sample rate / resolution / scaling / reporting).
@@ -447,10 +505,11 @@ impl I8042 {
     /// (any pending break flag is discarded).
     ///
     /// Returns true if IRQ1 had a rising edge (same as [`Self::place_output`]).
-    /// Returns false when the clock is disabled, or when a translate-mode
-    /// `0xF0` break prefix is consumed without presenting a host byte.
+    /// Returns false when the clock is disabled, when scanning is disabled
+    /// (`0xF5`), or when a translate-mode `0xF0` break prefix is consumed
+    /// without presenting a host byte.
     pub fn inject_scancode(&mut self, make_code: u8) -> bool {
-        if self.keyboard_clock_disabled() {
+        if self.keyboard_clock_disabled() || !self.kbd_scanning {
             return false;
         }
         let host_byte = if self.config & CFG_TRANSLATE != 0 {
@@ -482,6 +541,14 @@ impl I8042 {
             self.translate_pending_break = false;
         }
         Some(host)
+    }
+
+    /// Whether the keyboard stub has scanning enabled (`0xF4` / not `0xF5`).
+    ///
+    /// Spec: OSDev PS/2 Keyboard — Enable/Disable Scanning. When disabled,
+    /// [`Self::inject_scancode`] drops make/break traffic.
+    pub fn kbd_scanning_enabled(&self) -> bool {
+        self.kbd_scanning
     }
 
     /// Whether the mouse stub has data reporting enabled (`0xF4` / not `0xF5`).
@@ -580,12 +647,54 @@ impl I8042 {
     }
 
     /// Pop the output buffer, clearing OBF and AUX OBF (`0x60` read), then
-    /// present the next queued mouse response byte if any.
+    /// present the next queued keyboard or mouse response byte if any.
     fn take_output(&mut self) -> Option<u8> {
         let v = self.output.take();
         self.output_from_aux = false;
+        self.flush_kbd_response_queue();
         self.flush_aux_response_queue();
         v
+    }
+
+    /// Append bytes to the keyboard → host queue (does not present).
+    fn push_kbd_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if (self.kbd_resp_len as usize) < KBD_RESP_QUEUE_CAP {
+                self.kbd_resp[self.kbd_resp_len as usize] = b;
+                self.kbd_resp_len = self.kbd_resp_len.saturating_add(1);
+            }
+        }
+    }
+
+    /// Queue a keyboard command response (replaces any pending kbd queue) and
+    /// present the first byte when the buffer is free and the keyboard clock
+    /// is enabled.
+    fn begin_kbd_response(&mut self, bytes: &[u8]) {
+        self.kbd_resp_len = 0;
+        self.push_kbd_bytes(bytes);
+        self.flush_kbd_response_queue();
+    }
+
+    fn pop_kbd_response(&mut self) -> Option<u8> {
+        if self.kbd_resp_len == 0 {
+            return None;
+        }
+        let b = self.kbd_resp[0];
+        let n = self.kbd_resp_len as usize;
+        self.kbd_resp.copy_within(1..n, 0);
+        self.kbd_resp_len -= 1;
+        Some(b)
+    }
+
+    /// Present the next queued keyboard response on keyboard OBF when the
+    /// buffer is empty and the keyboard clock is enabled.
+    fn flush_kbd_response_queue(&mut self) {
+        if self.output.is_some() || self.keyboard_clock_disabled() {
+            return;
+        }
+        if let Some(b) = self.pop_kbd_response() {
+            self.push_output(b);
+        }
     }
 
     /// Append bytes to the aux → host queue (does not present).
@@ -703,6 +812,38 @@ impl I8042 {
             }
         }
     }
+
+    /// Handle a host→keyboard byte written to the data port with no pending
+    /// controller command parameter.
+    ///
+    /// Spec: OSDev [PS/2 Keyboard](https://wiki.osdev.org/PS/2_Keyboard) —
+    /// commands on `0x60` when the controller is not expecting a write-config /
+    /// write-output / write-aux parameter. Supported stub commands answer with
+    /// ACK/`0xFA` (and BAT/ID where required) on keyboard OBF.
+    fn handle_kbd_device_byte(&mut self, cmd: u8) {
+        match cmd {
+            KBD_CMD_RESET => {
+                // Spec: Reset → ACK, BAT OK; restore scanning default.
+                self.reset_kbd_defaults();
+                self.begin_kbd_response(&[KBD_ACK, KBD_BAT_OK]);
+            }
+            KBD_CMD_GET_ID => {
+                // Spec: Get Keyboard ID → ACK then MF2 ID bytes `0xAB` `0x83`.
+                self.begin_kbd_response(&[KBD_ACK, KBD_ID_MF2_0, KBD_ID_MF2_1]);
+            }
+            KBD_CMD_ENABLE_SCANNING => {
+                self.kbd_scanning = true;
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
+            KBD_CMD_DISABLE_SCANNING => {
+                self.kbd_scanning = false;
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
+            _ => {
+                // Unsupported keyboard command: accepted, no ACK (see module docs).
+            }
+        }
+    }
 }
 
 /// Build a standard 3-byte stream-mode mouse packet (OSDev Mouse Packet Format).
@@ -769,6 +910,8 @@ impl I8042 {
             }
             CMD_ENABLE_KBD => {
                 self.config &= !CFG_KBD_CLOCK_DISABLE;
+                // Spec: re-enable keyboard clock — present any held kbd responses.
+                self.flush_kbd_response_queue();
             }
             CMD_READ_OUTPUT_PORT => {
                 self.push_output(self.output_port);
@@ -826,7 +969,9 @@ impl PortDevice for I8042 {
                         self.pending = PendingWrite::None;
                     }
                     PendingWrite::None => {
-                        // Keyboard data path: accept and drop (no device ACK).
+                        // Spec: OSDev PS/2 Keyboard — data-port write with no
+                        // pending controller parameter is a host→keyboard command.
+                        self.handle_kbd_device_byte(v);
                     }
                 }
             }
@@ -953,14 +1098,154 @@ mod tests {
         assert!(k.irq1_line());
     }
 
+    /// Spec: unsupported host→keyboard commands (e.g. LEDs `0xED`) are accepted
+    /// with no ACK; controller config/output buffer unchanged.
     #[test]
-    fn data_write_without_pending_is_ignored() {
+    fn data_write_unsupported_kbd_command_no_ack() {
         let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         let before = k.clone();
-        k.port_write(I8042_DATA, 1, 0xED); // typical LED command — no device
+        k.port_write(I8042_DATA, 1, 0xED); // Set LEDs — not implemented
         assert_eq!(k.config, before.config);
         assert_eq!(k.output_buffer(), None);
         assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Helper: enable first port then send one host→keyboard byte on `0x60`.
+    fn write_kbd(k: &mut I8042, byte: u8) {
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        k.port_write(I8042_DATA, 1, u32::from(byte));
+    }
+
+    /// Drain one keyboard (non-AUX) response byte.
+    fn read_kbd_byte(k: &mut I8042) -> u8 {
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.status() & STATUS_AUX_OBF, 0);
+        assert!(!k.aux_obf());
+        k.port_read(I8042_DATA, 1) as u8
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Enable Scanning (`0xF4`) / Disable Scanning
+    /// (`0xF5`) written to `0x60` (no pending controller write) → ACK `0xFA`.
+    #[test]
+    fn kbd_enable_f4_and_disable_f5_ack_and_store_scanning_flag() {
+        let mut k = I8042::new();
+        assert!(k.kbd_scanning_enabled());
+
+        write_kbd(&mut k, KBD_CMD_DISABLE_SCANNING);
+        assert!(!k.kbd_scanning_enabled());
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+
+        write_kbd(&mut k, KBD_CMD_ENABLE_SCANNING);
+        assert!(k.kbd_scanning_enabled());
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Get Keyboard ID (`0xF2`) → ACK `0xFA` then
+    /// MF2 identification bytes `0xAB` `0x83` on keyboard OBF (not AUX).
+    #[test]
+    fn kbd_get_id_f2_returns_ack_and_mf2_id_bytes() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_GET_ID);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ID_MF2_0);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ID_MF2_1);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+        assert!(!k.irq12_line());
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Reset (`0xFF`) → ACK `0xFA` then BAT `0xAA`;
+    /// restores scanning enabled.
+    #[test]
+    fn kbd_reset_ff_returns_ack_and_bat_restores_scanning() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_DISABLE_SCANNING);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert!(!k.kbd_scanning_enabled());
+
+        write_kbd(&mut k, KBD_CMD_RESET);
+        assert!(k.kbd_scanning_enabled());
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_BAT_OK);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+        assert!(!k.irq1_line()); // INT1 clear by default after enable-only path
+    }
+
+    /// Spec: keyboard ACK path raises IRQ1 when config INT1 is set; never IRQ12.
+    #[test]
+    fn kbd_ack_with_int1_asserts_irq1_not_irq12() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_INT12));
+
+        k.port_write(I8042_DATA, 1, u32::from(KBD_CMD_ENABLE_SCANNING));
+        assert!(k.irq1_line());
+        assert!(!k.irq12_line());
+        assert_eq!(k.status() & STATUS_AUX_OBF, 0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, KBD_ACK);
+        assert!(!k.irq1_line());
+    }
+
+    /// Spec: controller pending writes (`0x60` write-config) do not route to the
+    /// keyboard device — config byte is stored, no keyboard ACK.
+    #[test]
+    fn controller_write_config_not_routed_to_kbd_device() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        // 0xF4 would be Enable Scanning if mis-routed to the keyboard.
+        k.port_write(I8042_DATA, 1, u32::from(KBD_CMD_ENABLE_SCANNING));
+        assert_eq!(k.config, KBD_CMD_ENABLE_SCANNING);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.output_buffer(), None);
+    }
+
+    /// Spec: `0xD4` aux routing still owns the next `0x60` write — keyboard stub
+    /// must not steal mouse Reset / ACK path.
+    #[test]
+    fn aux_d4_reset_not_stolen_by_kbd_stub() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_AUX));
+        k.port_write(I8042_DATA, 1, u32::from(MOUSE_CMD_RESET));
+        assert_eq!(k.aux_device_writes, 1);
+        assert_ne!(k.status() & STATUS_AUX_OBF, 0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, MOUSE_ACK);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, MOUSE_BAT_OK);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, MOUSE_ID_STANDARD);
+    }
+
+    /// Spec: keyboard clock disable holds command responses until `0xAE`.
+    #[test]
+    fn kbd_response_held_while_clock_disabled_flushed_on_enable() {
+        let mut k = I8042::new();
+        assert!(k.keyboard_clock_disabled());
+        k.port_write(I8042_DATA, 1, u32::from(KBD_CMD_GET_ID));
+        assert_eq!(k.status() & STATUS_OBF, 0);
+
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ID_MF2_0);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ID_MF2_1);
+    }
+
+    /// Spec: Disable Scanning drops injected make-codes until Enable Scanning.
+    #[test]
+    fn inject_scancode_dropped_when_scanning_disabled() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_DISABLE_SCANNING);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert!(!k.inject_scancode(0x1C));
+        assert_eq!(k.status() & STATUS_OBF, 0);
+
+        write_kbd(&mut k, KBD_CMD_ENABLE_SCANNING);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        k.inject_scancode(0x1C);
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E); // Set2→Set1 'A'
     }
 
     #[test]
@@ -1113,7 +1398,7 @@ mod tests {
     /// Spec: OSDev I8042 / IBM PS/2 KBC — `0xD4` routes the next data-port byte to
     /// the auxiliary device. Unsupported mouse commands are recorded / counted
     /// with no device response; the following data-port write goes back to the
-    /// keyboard path (accepted and dropped).
+    /// keyboard path (unsupported kbd cmds remain unanswered).
     #[test]
     fn write_aux_d4_routes_next_data_byte_to_aux_device() {
         let mut k = I8042::new();
@@ -1128,7 +1413,9 @@ mod tests {
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
 
-        // Next data byte is keyboard-bound again: aux state untouched.
+        // Next data byte is keyboard-bound again: aux state untouched; LEDs
+        // (`0xED`) are an unsupported kbd command (no ACK).
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         k.port_write(I8042_DATA, 1, 0xED);
         assert_eq!(k.aux_device_writes, 1);
         assert_eq!(k.last_aux_device_write, Some(0xF0));
