@@ -34,7 +34,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - OSDev Wiki ISA DMA — AT port map and page registers (not port `0x80`); 8-bit channel physical address `(page << 16) | addr`
 - IBM VGA / classic PC color text frame buffer at physical `0xB8000` (80×25, char+attr)
 - OSDev Text UI — VGA text-mode memory layout
-- OSDev VGA Hardware / FreeVGA CRT Controller — color CRTC Address `0x3D4`, Data `0x3D5`, indexes `0x00`–`0x18`
+- OSDev VGA Hardware / FreeVGA CRT Controller / IBM VGA — color CRTC Address `0x3D4`, Data `0x3D5`, indexes `0x00`–`0x18`; Cursor Start `0x0A` (bits 4:0 start scanline, bit5 Cursor Disable), Cursor End `0x0B` (bits 4:0 end scanline), Cursor Location High `0x0E` / Low `0x0F` (16-bit character address into the refresh buffer; text plane byte offset = location × 2)
 - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data `0x3C5`, indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character Map Select, Memory Mode); mode-03h-class defaults `03/00/03/00/02`
 - OSDev VGA Hardware / FreeVGA Graphics Registers — Address `0x3CE`, Data `0x3CF`, indexes `0x00`–`0x08` (Set/Reset … Bit Mask); mode-03h-class defaults `00/00/00/00/00/10/0E/00/FF`
 - OSDev VGA Hardware / FreeVGA Attribute Controller Registers + Accessing the Attribute Registers — Address/Data `0x3C0` (index/data flip-flop; bit5 PAS), Data Read `0x3C1`; indexes `0x00`–`0x14` (palette `0x00`–`0x0F`, Mode Control `0x10`, Overscan `0x11`, Color Plane Enable `0x12`, Horizontal PEL Panning `0x13`, Color Select `0x14`); read Input Status #1 (`0x3DA` color / `0x3BA` mono per Misc IOAS) resets flip-flop to address; mode-03h-class defaults palette `00/01/02/03/04/05/14/07/38/39/3A/3B/3C/3D/3E/3F` + `0C/00/0F/08/00`
