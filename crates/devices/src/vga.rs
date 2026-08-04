@@ -42,10 +42,10 @@
 //!   written; mode-03h reset default `0xFF` = all bits enabled).
 //! - OSDev VGA Hardware / FreeVGA Attribute Controller Registers — Address/Data
 //!   at `0x3C0` (flip-flop), Data Read at `0x3C1`; indexes `0x00`–`0x14`
-//!   (palette `0x00`–`0x0F`, Mode Control `0x10`, Overscan `0x11`, Color Plane
-//!   Enable `0x12`, Horizontal PEL Panning `0x13`, Color Select `0x14`). Reading
-//!   Input Status #1 (color `0x3DA` / mono `0x3BA`) resets the flip-flop to
-//!   address state.
+//!   (palette `0x00`–`0x0F`, Mode Control `0x10` with mode-03h reset default
+//!   `0x0C`, Overscan `0x11`, Color Plane Enable `0x12`, Horizontal PEL
+//!   Panning `0x13`, Color Select `0x14`). Reading Input Status #1 (color
+//!   `0x3DA` / mono `0x3BA`) resets the flip-flop to address state.
 //! - OSDev VGA Hardware / FreeVGA External Registers — Input Status #1 read at
 //!   `0x3DA` (color) / `0x3BA` (mono): bit0 Display Disabled (inverted
 //!   display-enable; set during horizontal or vertical retrace), bit3 Vertical
@@ -88,8 +88,9 @@
 //!   `0x08` store/readback with mode-03h reset default `0xFF` (no write-mode /
 //!   map / bitmask side effects)
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
-//!   `0x3C1`, flip-flop reset via Input Status #1 (active IOAS map) (no palette /
-//!   mode-control / render side effects)
+//!   `0x3C1`, flip-flop reset via Input Status #1 (active IOAS map); Mode Control
+//!   `0x10` store/readback with mode-03h reset default `0x0C` (no palette /
+//!   blink / PEL-pan / ATC→DAC / render side effects)
 //! - Input Status #1: ATC flip-flop reset + deterministic display-enable /
 //!   vertical-retrace status bits (read-phase counter); port selected by Misc
 //!   Output IOAS (`0x3DA` color / `0x3BA` mono)
@@ -502,17 +503,54 @@ pub const VGA_ATC_PAS: u8 = 0x20;
 /// Spec: Ralf Brown Interrupt List / IBM VGA — index register often left with
 /// Palette Address Source set after mode programming.
 pub const VGA_ATC_INDEX_DEFAULT: u8 = VGA_ATC_PAS;
+/// Attribute Controller Mode Control Register index.
+///
+/// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x10`.
+/// Selects graphics/alphanumeric mode, Line Graphics Enable (LGE/ELG), blink
+/// enable, and related Attribute Controller display controls. Blink / PEL-pan /
+/// ATC→DAC remap side effects are out of scope (store/readback only).
+pub const VGA_ATC_MODE_CONTROL: u8 = 0x10;
+/// Mode-03h-class Mode Control reset default (`0x0C` = BLINK|LGE, alphanumeric).
+///
+/// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Mode Control `0x0C` enables
+/// Line Graphics Enable and blink for alphanumeric text. Store/readback only;
+/// no blink / PEL-pan / ATC→DAC side effects.
+pub const VGA_ATC_MODE_CONTROL_DEFAULT: u8 = 0x0C;
 
 /// Mode-03h-class Attribute Controller reset defaults (store/readback only).
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-set palette — internal palette
-/// `00/01/02/03/04/05/14/07/38/39/3A/3B/3C/3D/3E/3F`; Mode Control `0x0C`
-/// (BLINK|LGE, alphanumeric); Overscan `0x00`; Color Plane Enable `0x0F`;
-/// Horizontal PEL Panning `0x08`; Color Select `0x00`.
+/// `00/01/02/03/04/05/14/07/38/39/3A/3B/3C/3D/3E/3F`; Mode Control
+/// [`VGA_ATC_MODE_CONTROL_DEFAULT`] (BLINK|LGE, alphanumeric); Overscan `0x00`;
+/// Color Plane Enable `0x0F`; Horizontal PEL Panning `0x08`; Color Select `0x00`.
 pub const VGA_ATC_DEFAULTS: [u8; VGA_ATC_REG_COUNT] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
-    0x0C, 0x00, 0x0F, 0x08, 0x00,
+    0x00,
+    0x01,
+    0x02,
+    0x03,
+    0x04,
+    0x05,
+    0x14,
+    0x07,
+    0x38,
+    0x39,
+    0x3A,
+    0x3B,
+    0x3C,
+    0x3D,
+    0x3E,
+    0x3F,
+    VGA_ATC_MODE_CONTROL_DEFAULT,
+    0x00,
+    0x0F,
+    0x08,
+    0x00,
 ];
+const _: () = assert!(
+    VGA_ATC_MODE_CONTROL == 0x10
+        && VGA_ATC_MODE_CONTROL_DEFAULT == 0x0C
+        && VGA_ATC_DEFAULTS[VGA_ATC_MODE_CONTROL as usize] == VGA_ATC_MODE_CONTROL_DEFAULT
+);
 
 /// DAC / PEL Mask Register (R/W).
 ///
@@ -2464,6 +2502,63 @@ mod tests {
         assert!(!v.owns_port(VGA_INPUT_STATUS_1_MONO));
     }
 
+    /// Spec: FreeVGA Attribute Controller Registers — Mode Control (index `0x10`)
+    /// store/readback via `0x3C0`/`0x3C1`. Mode-03h reset default is
+    /// [`VGA_ATC_MODE_CONTROL_DEFAULT`] (`0x0C`).
+    #[test]
+    fn atc_mode_control_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)],
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
+
+        // Non-default Mode Control programming (blink/PEL-pan side effects deferred).
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x41);
+        assert_eq!(v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)], 0x41);
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x41);
+
+        // Word write path (lo=index, hi=data) also updates Mode Control.
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            2,
+            (u32::from(0x0Cu8) << 8) | u32::from(VGA_ATC_MODE_CONTROL),
+        );
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)],
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
+
+        v.reset();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)],
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
+    }
+
     #[test]
     fn attribute_controller_flip_flop_index_data_round_trip() {
         // Spec: FreeVGA Accessing the Attribute Registers — read 0x3DA to reset
@@ -2471,18 +2566,31 @@ mod tests {
         let mut v = VgaText::new();
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         assert!(!v.atc_flip_flop_data);
-        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10); // Mode Control index, PAS=0
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL)); // Mode Control index, PAS=0
         assert!(v.atc_flip_flop_data);
-        assert_eq!(v.atc_index, 0x10);
-        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x0C);
+        assert_eq!(v.atc_index, VGA_ATC_MODE_CONTROL);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_MODE_CONTROL_DEFAULT),
+        );
         assert!(!v.atc_flip_flop_data);
-        assert_eq!(v.atc_regs[0x10], 0x0C);
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)],
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
         // Read path: reset → write index → read 0x3C1 (does not toggle flip-flop).
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
-        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
-        assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x0C);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
         assert!(v.atc_flip_flop_data); // still awaiting data after address write
-        assert_eq!(v.port_read(VGA_ATC_ADDRESS_DATA, 1) as u8, 0x10);
+        assert_eq!(
+            v.port_read(VGA_ATC_ADDRESS_DATA, 1) as u8,
+            VGA_ATC_MODE_CONTROL
+        );
     }
 
     #[test]
@@ -2535,7 +2643,10 @@ mod tests {
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x11); // Overscan index
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x55);
         assert_eq!(v.atc_regs[0x11], 0x55);
-        assert_eq!(v.atc_regs[0x10], 0x0C); // Mode Control default untouched
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)],
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        ); // Mode Control default untouched
     }
 
     #[test]
@@ -2744,19 +2855,26 @@ mod tests {
         // Spec: FreeVGA Attribute Address — bit5 PAS; bits4:0 select register.
         let mut v = VgaText::new();
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
-        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_PAS | 0x10));
-        assert_eq!(v.atc_index, VGA_ATC_PAS | 0x10);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_PAS | VGA_ATC_MODE_CONTROL),
+        );
+        assert_eq!(v.atc_index, VGA_ATC_PAS | VGA_ATC_MODE_CONTROL);
         assert_eq!(
             v.port_read(VGA_ATC_ADDRESS_DATA, 1) as u8,
-            VGA_ATC_PAS | 0x10
+            VGA_ATC_PAS | VGA_ATC_MODE_CONTROL
         );
-        assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x0C);
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
         // Finishing the data write leaves PAS in the address register.
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x08);
-        assert_eq!(v.atc_regs[0x10], 0x08);
+        assert_eq!(v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)], 0x08);
         assert_eq!(
             v.port_read(VGA_ATC_ADDRESS_DATA, 1) as u8,
-            VGA_ATC_PAS | 0x10
+            VGA_ATC_PAS | VGA_ATC_MODE_CONTROL
         );
     }
 
@@ -2789,13 +2907,17 @@ mod tests {
     #[test]
     fn attribute_controller_reset_defaults_mode03h() {
         // Spec: FreeVGA / IBM VGA / Abrash mode-03h-class ATC — palette
-        // 00..05/14/07/38..3F, Mode Control 0x0C, plane enable 0x0F, pan 0x08.
+        // 00..05/14/07/38..3F, Mode Control [`VGA_ATC_MODE_CONTROL_DEFAULT`],
+        // plane enable 0x0F, pan 0x08.
         let v = VgaText::new();
         assert_eq!(v.atc_index, VGA_ATC_INDEX_DEFAULT);
         assert!(!v.atc_flip_flop_data);
         assert_eq!(v.atc_regs, VGA_ATC_DEFAULTS);
         assert_eq!(v.atc_regs[0x06], 0x14);
-        assert_eq!(v.atc_regs[0x10], 0x0C);
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)],
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
         assert_eq!(v.atc_regs[0x12], 0x0F);
         assert_eq!(v.atc_regs[0x13], 0x08);
     }
@@ -2804,19 +2926,22 @@ mod tests {
     fn reset_restores_attribute_controller_defaults() {
         let mut v = VgaText::new();
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
-        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x00);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x06);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x06);
-        assert_eq!(v.atc_regs[0x10], 0x00);
+        assert_eq!(v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)], 0x00);
         assert_eq!(v.atc_regs[0x06], 0x06);
         v.reset();
         assert_eq!(v.atc_index, VGA_ATC_INDEX_DEFAULT);
         assert!(!v.atc_flip_flop_data);
         assert_eq!(v.atc_regs, VGA_ATC_DEFAULTS);
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
-        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
-        assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x0C);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_MODE_CONTROL_DEFAULT
+        );
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x06);
         assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x14);
