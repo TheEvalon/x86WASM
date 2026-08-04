@@ -127,15 +127,18 @@
 //! - WRITE DATA (`0x05` | MT/MFM): Spec Intel 82077AA §5.1.2 / Table 5-1 —
 //!   command byte lower 5 bits `00101`; optional MT (`0x80`)/MFM (`0x40`);
 //!   same eight params and 7-byte result as READ DATA. With attached 1.44MB
-//!   media, `N=2`, and C/H/R in geometry: transfer **one** sector only (MT
-//!   ignored this slice) from the `latch_write_sector` buffer (device-only
-//!   stand-in) **or** via MachineBus ISA DMA ch2 Read (memory→device) when
-//!   DOR DMA/IRQ enable arms [`Self::dma_write_pending`], then
-//!   [`Self::commit_dma_write_sector`] / [`Self::write_sector`] into the image,
-//!   latch bytes in `last_write`, result ST0 (IC=00 normal | H | US), ST1=0,
-//!   ST2=0, C/H/R/N = command ENDaddress. No media / wrong N / OOR CHS → ST0
-//!   IC=01 abnormal | H | US, ST1 NW, ST2=0; asserts IRQ6 (cleared on first
-//!   result byte); EOT latched into `sc_eot`.
+//!   media, `N=2`, C/H/R in geometry, and **not** [`Self::write_protected`]:
+//!   transfer **one** sector only (MT ignored this slice) from the
+//!   `latch_write_sector` buffer (device-only stand-in) **or** via MachineBus
+//!   ISA DMA ch2 Read (memory→device) when DOR DMA/IRQ enable arms
+//!   [`Self::dma_write_pending`], then [`Self::commit_dma_write_sector`] /
+//!   [`Self::write_sector`] into the image, latch bytes in `last_write`,
+//!   result ST0 (IC=00 normal | H | US), ST1=0, ST2=0, C/H/R/N = command
+//!   ENDaddress. Media + `write_protected` (WP pin) → ST0 IC=01 abnormal |
+//!   H | US, ST1 NW (Not Writable, §6.2), ST2=0; clear `last_write` /
+//!   `dma_write_pending`; no image write. No media / wrong N / OOR CHS → same
+//!   NW abnormal. Asserts IRQ6 (cleared on first result byte); EOT latched
+//!   into `sc_eot`.
 //! - FORMAT TRACK (`0x0D` | MFM): Spec Intel 82077AA §5.1.7 / Table 5-1 —
 //!   command byte lower 5 bits `01101`; optional MFM (`0x40`); five params
 //!   (HD|US, N, SC, GPL, D); no media image → skip execution/DMA and the
@@ -153,14 +156,14 @@
 //!   `write_sector` helpers (PC MFM geometry); DIR bit7 DSKCHG stub: set on
 //!   eject, preserved across re-attach/`reset`, cleared by successful
 //!   Recalibrate/Seek when media present (classic disk-change clear);
-//!   `write_protected` / [`Self::set_write_protected`] for ST3
-//!   WP; `reset()` preserves media and write-protect flag like IDE. READ DATA
-//!   success path latches one sector in `last_sector` and arms
+//!   `write_protected` / [`Self::set_write_protected`] for ST3 WP and WRITE
+//!   DATA ST1 NW; `reset()` preserves media and write-protect flag like IDE.
+//!   READ DATA success path latches one sector in `last_sector` and arms
 //!   `dma_read_pending` when DOR bit3 is set for MachineBus auto DMA ch2 Write
 //!   (device→memory). WRITE DATA success path accepts one sector via
 //!   `latch_write_sector` → `last_write` / `write_sector`, or arms
 //!   `dma_write_pending` for MachineBus ISA DMA ch2 Read (memory→device) when
-//!   no pre-latch and DOR bit3 is set.
+//!   no pre-latch and DOR bit3 is set (skipped when write-protected).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
@@ -1178,8 +1181,11 @@ impl Fdc82077 {
     ///
     /// Spec: Intel 82077AA §5.1.2 / §6.1 / §6.2 / IBM 1.44MB geometry:
     ///
-    /// - With media, `N == 2` (512-byte sectors), and C/H/R in range: transfer
-    ///   **one** sector (MT ignored this slice):
+    /// - With media and [`Self::write_protected`]: skip execution/DMA, ST0 IC=01
+    ///   (abnormal) | H | US, ST1 NW (Not Writable — WP pin, §6.2), ST2=0,
+    ///   C/H/R/N ENDaddress; clear `last_write` / `dma_write_pending`.
+    /// - With media, WP clear, `N == 2` (512-byte sectors), and C/H/R in range:
+    ///   transfer **one** sector (MT ignored this slice):
     ///   - If [`Self::last_write`] was pre-latched via [`Self::latch_write_sector`]
     ///     (device-only DMA stand-in): write into the image immediately.
     ///   - Else if DOR DMA/IRQ enable: arm [`Self::dma_write_pending`] for
@@ -1207,6 +1213,24 @@ impl Fdc82077 {
         self.sc_eot = eot;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
         let dma = self.dor & FDC_DOR_DMA_IRQ != 0;
+
+        // Spec: Intel 82077AA §5.1.2 / §6.2 ST1 NW — WP pin during WRITE DATA.
+        if self.has_media() && self.write_protected {
+            self.last_write = None;
+            self.dma_write_pending = false;
+            self.read_result = [
+                FDC_ST0_IC_ABNORMAL | st0_head | unit,
+                FDC_ST1_NW,
+                0x00,
+                c,
+                h,
+                r,
+                n,
+            ];
+            self.irq_pending = true;
+            self.phase = Phase::WriteDataResult { index: 0 };
+            return;
+        }
 
         // Single-sector success: media + N=2 + valid CHS (R 1-based).
         if n == FDC_SECTOR_N {
@@ -1243,7 +1267,7 @@ impl Fdc82077 {
             }
         }
 
-        // No media / wrong N / OOR CHS → honest NW abnormal (existing stub).
+        // No media / wrong N / OOR CHS → honest NW abnormal (WP handled above).
         self.last_write = None;
         self.dma_write_pending = false;
         self.read_result = [
@@ -4746,5 +4770,92 @@ mod tests {
             let _ = f.port_read(FDC_FIFO, 1);
         }
         assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA §5.1.2 WRITE DATA / §6.2 ST1 NW (Not Writable) —
+    /// with media attached and `write_protected`, WRITE DATA must not write the
+    /// image; result ST0 IC=01 abnormal | H | US, ST1 NW, ST2=0, C/H/R/N
+    /// ENDaddress; clear `last_write` / `dma_write_pending`; still IRQ6 when
+    /// DOR DMA/IRQ enable.
+    #[test]
+    fn write_data_write_protected_nw_leaves_image_unchanged() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.set_write_protected(true);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        let mut data = [0u8; FDC_SECTOR_SIZE];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        f.latch_write_sector(data);
+
+        // WRITE DATA MFM: C=0,H=0,R=1,N=2 — valid CHS that would succeed if WP clear.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(
+            f.irq_line(),
+            "WRITE DATA WP abort still asserts IRQ6 when DOR DMA/IRQ enable"
+        );
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0, FDC_ST0_IC_ABNORMAL,
+            "ST0 = IC=01 | H=0 | US=0 (abnormal — Not Writable)"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST1_NW,
+            "ST1 NW — write protect pin / Not Writable"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12, "EOT still latched for DUMPREG");
+
+        assert!(
+            f.last_write().is_none(),
+            "WP abort must clear last_write latch"
+        );
+        assert!(
+            !f.take_pending_dma_write(),
+            "WP abort must not arm dma_write_pending"
+        );
+        let sector = f.read_sector(0, 0, 1).expect("media still attached");
+        assert!(
+            sector.iter().all(|&b| b == 0xAA),
+            "write-protected WRITE DATA must not modify the image"
+        );
+    }
+
+    /// Spec: Intel 82077AA §5.1.2 — `write_protected` false keeps the media
+    /// WRITE DATA success path (ST0 IC=00, image updated).
+    #[test]
+    fn write_data_write_protected_false_still_succeeds() {
+        let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
+        f.set_write_protected(true);
+        f.set_write_protected(false);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        let data = [0x5Au8; FDC_SECTOR_SIZE];
+        f.latch_write_sector(data);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_NORMAL);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x00,
+            "ST1 clear when WP off"
+        );
+        assert_eq!(f.read_sector(0, 0, 1).expect("written"), data);
     }
 }
