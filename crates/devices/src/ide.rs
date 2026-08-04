@@ -118,6 +118,9 @@ pub const ATA_CMD_NOP: u8 = 0x00;
 /// READ MULTIPLE — multi-sector PIO; this stub aborts (block count not configured).
 /// Spec: ATA/ATAPI Command Set — READ MULTIPLE (`0xC4`).
 pub const ATA_CMD_READ_MULTIPLE: u8 = 0xC4;
+/// WRITE MULTIPLE — multi-sector PIO; this stub aborts (block count not configured).
+/// Spec: ATA/ATAPI Command Set — WRITE MULTIPLE (`0xC5`).
+pub const ATA_CMD_WRITE_MULTIPLE: u8 = 0xC5;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -537,6 +540,21 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
+    /// WRITE MULTIPLE (`0xC5`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA WRITE MULTIPLE requires a prior SET MULTIPLE MODE block count.
+    /// This stub has no multiple-mode state; SeaBIOS-friendly ERR+ABRT.
+    fn exec_write_multiple(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
     /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
@@ -589,6 +607,7 @@ impl IdePrimary {
             ATA_CMD_FLUSH_CACHE => self.exec_flush_cache(),
             ATA_CMD_NOP => self.exec_nop(),
             ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
+            ATA_CMD_WRITE_MULTIPLE => self.exec_write_multiple(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             ATA_CMD_SET_FEATURES => self.exec_set_features(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
@@ -1438,6 +1457,20 @@ mod tests {
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — WRITE MULTIPLE (`0xC5`) without SET MULTIPLE MODE → ERR+ABRT.
+    #[test]
+    fn write_multiple_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
     }
 
     #[test]

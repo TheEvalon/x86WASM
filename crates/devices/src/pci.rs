@@ -90,6 +90,11 @@ pub const PCI_PIIX_USB_BAR0_OFFSET: u8 = 0x20;
 /// UHCI BAR0 size decode mask — 32-byte aligned I/O base (bits 15:5).
 /// Spec: PCI I/O BAR + UHCI I/O footprint (32 bytes).
 pub const PCI_PIIX_USB_BAR0_MASK: u32 = 0xFFE0;
+/// PIIX ISA PIRQ route control registers (PIRQRC[A:D]) config offsets `0x60`–`0x63`.
+/// Spec: Intel 82371SB — each byte defaults to `0x80` (route disabled).
+pub const PCI_PIIX_ISA_PIRQRC_OFFSET: u8 = 0x60;
+/// Default PIRQRC byte value (IRQ routing disabled).
+pub const PCI_PIIX_ISA_PIRQRC_DEFAULT: u8 = 0x80;
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -174,6 +179,10 @@ impl PciConfig {
                 header_type: PCI_HEADER_MULTIFUNCTION,
             },
         );
+        // Spec: Intel 82371SB — PIRQRC[A:D] at 0x60–0x63 default 0x80 (disabled).
+        for i in 0..4 {
+            cfg[PCI_PIIX_ISA_PIRQRC_OFFSET as usize + i] = PCI_PIIX_ISA_PIRQRC_DEFAULT;
+        }
         cfg
     }
 
@@ -694,6 +703,33 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: Intel 82371SB — PIRQRC[A:D] at ISA config `0x60`–`0x63` default
+    /// `0x80`; store/readback (routing not wired to PIC yet).
+    #[test]
+    fn piix_isa_pirqrc_default_and_store_readback() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_PIIX_ISA_PIRQRC_OFFSET, true),
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 4),
+            0x8080_8080,
+            "PIRQRC[A:D] default 0x80 each"
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0B0A_0903);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x0B0A_0903);
+        // Byte lane store of PIRQRC[B] (offset 0x61).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, 0x61, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 1, 0x05);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 1) as u8, 0x05);
     }
 
     /// Spec: Intel 82371SB — PIIX USB UHCI BAR0 at PCI config `0x20` is an I/O

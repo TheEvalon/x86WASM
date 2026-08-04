@@ -179,6 +179,13 @@ pub const FDC_CMD_READ_DELETED_DATA: u8 = 0x0C;
 /// VERIFY base opcode (bits 4:0). Spec: Intel 82077AA Table 5-1 —
 /// command byte is `MT|MFM|SK|1 0 1 1 0`; match with [`FDC_CMD_OPCODE_MASK`].
 pub const FDC_CMD_VERIFY: u8 = 0x16;
+/// READ ID base opcode (bits 4:0). Spec: Intel 82077AA Table 5-1 —
+/// command byte is `0|MFM|0|0 0 0 1 0 1 0`; match with [`FDC_CMD_OPCODE_MASK`].
+pub const FDC_CMD_READ_ID: u8 = 0x0A;
+/// Documented READ ID form: MFM|0x0A. Spec: 82077AA Table 5-1.
+pub const FDC_CMD_READ_ID_MFM: u8 = FDC_CMD_MFM | FDC_CMD_READ_ID;
+/// READ ID result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA.
+pub const FDC_READ_ID_RESULT_LEN: u8 = 7;
 /// Mask for FDC command opcode bits (excludes MT/MFM/SK). Spec: 82077AA Table 5-1.
 pub const FDC_CMD_OPCODE_MASK: u8 = 0x1F;
 /// Command bit7 Multi-Track (MT). Spec: Intel 82077AA Table 5-1 symbol MT.
@@ -349,6 +356,10 @@ enum Phase {
     FormatTrackParams { index: u8 },
     /// FORMAT TRACK result: 7 bytes (ST0, ST1, ST2, 4 undefined). Spec: §5.1.7.
     FormatTrackResult { index: u8 },
+    /// READ ID parameter: HD|US (1 byte). Spec: Intel 82077AA Table 5-1.
+    ReadIdParam,
+    /// READ ID result: 7 bytes (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA.
+    ReadIdResult { index: u8 },
 }
 
 /// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/
@@ -503,7 +514,8 @@ impl Fdc82077 {
                 | Phase::VerifyParams { .. }
                 | Phase::WriteDataParams { .. }
                 | Phase::WriteDeletedDataParams { .. }
-                | Phase::FormatTrackParams { .. } => FDC_MSR_RQM,
+                | Phase::FormatTrackParams { .. }
+                | Phase::ReadIdParam => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. }
                 | Phase::SenseDriveStatusResult
                 | Phase::VersionResult
@@ -514,7 +526,8 @@ impl Fdc82077 {
                 | Phase::VerifyResult { .. }
                 | Phase::WriteDataResult { .. }
                 | Phase::WriteDeletedDataResult { .. }
-                | Phase::FormatTrackResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
+                | Phase::FormatTrackResult { .. }
+                | Phase::ReadIdResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
             }
         }
     }
@@ -966,6 +979,40 @@ impl Fdc82077 {
         cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_FORMAT_TRACK_MFM & FDC_CMD_OPCODE_MASK)
     }
 
+    /// Begin READ ID parameter phase (1 byte HD|US). Spec: Intel 82077AA Table 5-1.
+    fn start_read_id(&mut self) {
+        self.phase = Phase::ReadIdParam;
+    }
+
+    /// Complete READ ID — no-media stub.
+    ///
+    /// Spec: Intel 82077AA READ ID — one HD|US param; no media → ST0 IC=01|H|US,
+    /// ST1 ND, ST2=0, C/H/R/N=0; IRQ6 when DOR enables.
+    fn finish_read_id(&mut self, head_unit: u8) {
+        let unit = head_unit & 0x03;
+        let head = (head_unit >> 2) & 0x01;
+        let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        self.read_result = [
+            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST1_ND,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        self.irq_pending = true;
+        self.phase = Phase::ReadIdResult { index: 0 };
+    }
+
+    /// True if `cmd` is READ ID including optional MFM modifier.
+    ///
+    /// Spec: Intel 82077AA Table 5-1 — opcode bits 4:0 = `01010`; bit6 = MFM.
+    #[inline]
+    fn is_read_id_command(cmd: u8) -> bool {
+        cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_READ_ID_MFM & FDC_CMD_OPCODE_MASK)
+    }
+
     /// One DUMPREG result byte by index. Spec: Intel 82077AA Table 5-1 / §5.3.3.
     fn dumpreg_byte(&self, index: u8) -> u8 {
         match index {
@@ -1001,7 +1048,8 @@ impl Fdc82077 {
             | Phase::VerifyParams { .. }
             | Phase::WriteDataParams { .. }
             | Phase::WriteDeletedDataParams { .. }
-            | Phase::FormatTrackParams { .. } => 0xFF,
+            | Phase::FormatTrackParams { .. }
+            | Phase::ReadIdParam => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
@@ -1119,6 +1167,18 @@ impl Fdc82077 {
                 }
                 v
             }
+            Phase::ReadIdResult { index } => {
+                if index == 0 {
+                    self.irq_pending = false;
+                }
+                let v = self.read_result[index as usize];
+                if index + 1 >= FDC_READ_ID_RESULT_LEN {
+                    self.phase = Phase::Command;
+                } else {
+                    self.phase = Phase::ReadIdResult { index: index + 1 };
+                }
+                v
+            }
         }
     }
 
@@ -1176,6 +1236,9 @@ impl Fdc82077 {
                 } else if Self::is_format_track_command(v) {
                     // Spec: Intel 82077AA §5.1.7 — MFM | 01101; five params.
                     self.start_format_track();
+                } else if Self::is_read_id_command(v) {
+                    // Spec: Intel 82077AA Table 5-1 — MFM | 01010; one HD|US param.
+                    self.start_read_id();
                 }
                 // Other opcodes: accept/drop until a command engine exists.
             }
@@ -1288,6 +1351,10 @@ impl Fdc82077 {
                     self.phase = Phase::FormatTrackParams { index: index + 1 };
                 }
             }
+            Phase::ReadIdParam => {
+                // Spec: Intel 82077AA — HD|US param; no-media result + IRQ6.
+                self.finish_read_id(v);
+            }
             Phase::SenseIntResult { .. }
             | Phase::SenseDriveStatusResult
             | Phase::VersionResult
@@ -1298,7 +1365,8 @@ impl Fdc82077 {
             | Phase::VerifyResult { .. }
             | Phase::WriteDataResult { .. }
             | Phase::WriteDeletedDataResult { .. }
-            | Phase::FormatTrackResult { .. } => {
+            | Phase::FormatTrackResult { .. }
+            | Phase::ReadIdResult { .. } => {
                 // Host must not write during result phase (stub ignores).
             }
         }
@@ -3068,6 +3136,29 @@ mod tests {
 
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 — READ ID (`0x0A` / MFM `0x4A`) no-media:
+    /// 1 param HD|US → ST0 IC=01|H|US, ST1 ND, C/H/R/N=0 + IRQ6.
+    #[test]
+    fn read_id_mfm_no_media_abnormal_result_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(FDC_CMD_READ_ID_MFM, 0x4A);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_ID_MFM));
+        assert_eq!(f.phase, Phase::ReadIdParam);
+        assert!(!f.irq_line());
+        f.port_write(FDC_FIFO, 1, 0x04); // head1 / unit0
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0, FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD);
+        assert!(!f.irq_line(), "first result byte clears IRQ6");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0); // ST2
+        for _ in 0..4 {
+            assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0); // C/H/R/N
+        }
+        assert_eq!(f.phase, Phase::Command);
     }
 
     /// Spec: Intel 82077AA Table 5-1 — VERIFY (`0x16`) no-media stub.

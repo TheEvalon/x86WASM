@@ -173,6 +173,12 @@ pub const KBD_CMD_SET_DEFAULT: u8 = 0xF6;
 /// PS/2 keyboard command: Set All Keys Typematic — ACK (no further params).
 /// Spec: OSDev PS/2 Keyboard — `0xF7` Set All Keys Typematic.
 pub const KBD_CMD_SET_ALL_TYPEMATIC: u8 = 0xF7;
+/// PS/2 keyboard command: Set All Keys Make/Break — ACK (no further params).
+/// Spec: OSDev PS/2 Keyboard — `0xF8` Set All Keys Make/Break.
+pub const KBD_CMD_SET_ALL_MAKE_BREAK: u8 = 0xF8;
+/// PS/2 keyboard command: Set All Keys Make — ACK (no further params).
+/// Spec: OSDev PS/2 Keyboard — `0xF9` Set All Keys Make.
+pub const KBD_CMD_SET_ALL_MAKE: u8 = 0xF9;
 
 /// Echo response byte (same value as [`KBD_CMD_ECHO`]).
 pub const KBD_ECHO: u8 = 0xEE;
@@ -1064,6 +1070,14 @@ impl I8042 {
                 // ACK only; key-type state not modeled beyond acceptance.
                 self.begin_kbd_response(&[KBD_ACK]);
             }
+            KBD_CMD_SET_ALL_MAKE_BREAK => {
+                // Spec: OSDev PS/2 Keyboard — Set All Keys Make/Break (`0xF8`).
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
+            KBD_CMD_SET_ALL_MAKE => {
+                // Spec: OSDev PS/2 Keyboard — Set All Keys Make (`0xF9`).
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
             _ => {
                 // Unsupported keyboard command: accepted, no ACK (see module docs).
             }
@@ -1341,6 +1355,17 @@ mod tests {
     fn kbd_set_all_typematic_f7_acks() {
         let mut k = I8042::new();
         write_kbd(&mut k, KBD_CMD_SET_ALL_TYPEMATIC);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Set All Keys Make/Break (`0xF8`) + Make (`0xF9`).
+    #[test]
+    fn kbd_set_all_make_break_f8_and_make_f9_ack() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_SET_ALL_MAKE_BREAK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        write_kbd(&mut k, KBD_CMD_SET_ALL_MAKE);
         assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
         assert_eq!(k.status() & STATUS_OBF, 0);
     }
