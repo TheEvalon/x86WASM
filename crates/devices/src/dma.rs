@@ -22,16 +22,18 @@
 //!   (Intel 8237A programming model).
 //! - Status register TC bits (3:0) clear-on-read + `latch_tc` device/test API.
 //! - `transfer_block` software helper for 8-bit channels 0–3: length `count+1`,
-//!   Single + Increment + Read/Write, Autoinitialize optional, `mem_read` /
-//!   `mem_write` callbacks. With Autoinitialize, after TC Current is reloaded
-//!   from Base and the channel stays unmasked/ready for another helper call.
+//!   Single + Increment/Decrement + Read/Write, Autoinitialize optional,
+//!   `mem_read` / `mem_write` callbacks. With Autoinitialize, after TC Current
+//!   is reloaded from Base and the channel stays unmasked/ready for another
+//!   helper call. Address decrement (mode bit 5) steps Current Address by −1
+//!   per byte within the 64 KiB page.
 //! - Page address register R/W for the eight AT channels above.
 //! - `PortDevice` for MachineBus wiring.
 //!
 //! # Unsupported (explicit)
 //!
 //! - Hardware DREQ/DACK handshake / cycle-accurate bus timing
-//! - Address decrement, demand/block/cascade/verify modes
+//! - Demand/block/cascade/verify modes
 //! - Hardware auto-mask after non-autoinit TC (mask left as programmed)
 //! - 16-bit channels 4–7 word addressing / transfers
 //! - Floppy / IDE automatic DMA engine / DREQ path (Machine PhysMem wiring lives in
@@ -46,7 +48,7 @@ pub enum DmaTransferError {
     BadChannel,
     /// Channel mask bit is set (masked channels do not transfer).
     Masked,
-    /// Mode register outside Single + Increment + Read/Write (+ optional Autoinitialize).
+    /// Mode register outside Single + Inc/Dec + Read/Write (+ optional Autoinitialize).
     UnsupportedMode,
     /// `io_buf` shorter than programmed `count + 1`.
     BufferTooShort,
@@ -284,25 +286,26 @@ impl Dma8237 {
     ///
     /// Spec: Intel 8237A — word count holds N−1 so length is `count + 1`; after N
     /// transfers the channel TC status bit is set. Without Autoinitialize,
-    /// Current Address ends at the post-increment value and Current Word Count
-    /// is `0xFFFF`. With Autoinitialize (mode bit 4), Current Address / Word
-    /// Count are restored from Base Address / Base Word Count at TC and the
-    /// channel remains ready (mask bit left as programmed — this helper does
-    /// not auto-mask after non-autoinit TC either). Address increment updates
-    /// the current address by +1 per byte (wraps in the 64 KiB page; page
-    /// register is not auto-incremented).
+    /// Current Address ends at the post-step value and Current Word Count is
+    /// `0xFFFF`. With Autoinitialize (mode bit 4), Current Address / Word Count
+    /// are restored from Base Address / Base Word Count at TC and the channel
+    /// remains ready (mask bit left as programmed — this helper does not
+    /// auto-mask after non-autoinit TC either). Address direction follows mode
+    /// bit 5: `0` increments Current Address by +1 per byte, `1` decrements by
+    /// −1 per byte (both wrap in the 64 KiB page; page register is not
+    /// auto-bumped).
     /// Physical byte address = `(page << 16) | current_addr` (OSDev ISA DMA).
     ///
     /// # Mode subset honored
     ///
     /// - bits 7:6 = Single mode (`01`)
-    /// - bit 5 = address increment (`0`)
+    /// - bit 5 = address increment (`0`) or decrement (`1`)
     /// - bit 4 = Autoinitialize enable (`0` or `1`)
     /// - bits 3:2 = Write (`01`, I/O→memory from `io_buf` via `mem_write`) or
     ///   Read (`10`, memory→I/O into `io_buf` via `mem_read`)
     /// - bits 1:0 must match the controller channel index
     ///
-    /// Demand/block/cascade/verify, decrement, and ISA channels 4–7 return
+    /// Demand/block/cascade/verify and ISA channels 4–7 return
     /// [`DmaTransferError::UnsupportedMode`] / [`BadChannel`].
     ///
     /// This is a software helper for device/unit tests — **not** DREQ/DACK timing.
@@ -334,6 +337,7 @@ impl Dma8237 {
         let page = self.page[isa_channel];
         let write_to_mem = ((mode >> 2) & 0x03) == 0b01;
         let auto_init = (mode >> 4) & 1 != 0;
+        let decrement = (mode >> 5) & 1 != 0;
         let mut addr = self.master.channels[isa_channel].addr;
         for byte in io_buf.iter_mut().take(len) {
             let phys = (u32::from(page) << 16) | u32::from(addr);
@@ -342,7 +346,12 @@ impl Dma8237 {
             } else {
                 *byte = mem_read(phys);
             }
-            addr = addr.wrapping_add(1);
+            // Spec: Intel 8237A mode bit 5 — address increment (0) / decrement (1).
+            addr = if decrement {
+                addr.wrapping_sub(1)
+            } else {
+                addr.wrapping_add(1)
+            };
         }
         if auto_init {
             // Spec: Intel 8237A Autoinitialize — restore Current from Base at TC.
@@ -357,13 +366,12 @@ impl Dma8237 {
         Ok(len)
     }
 
-    /// Single + Increment + Read/Write, Autoinitialize optional, channel matches.
+    /// Single + Inc/Dec + Read/Write, Autoinitialize optional, channel matches.
     fn mode_supports_transfer_block(mode: u8, ctrl_channel: usize) -> bool {
         let sel = (mode & 0x03) as usize;
         let xfer = (mode >> 2) & 0x03;
-        let decrement = (mode >> 5) & 1;
         let mode_sel = (mode >> 6) & 0x03;
-        sel == ctrl_channel && decrement == 0 && mode_sel == 0b01 && (xfer == 0b01 || xfer == 0b10)
+        sel == ctrl_channel && mode_sel == 0b01 && (xfer == 0b01 || xfer == 0b10)
     }
 
     fn page_channel(port: u16) -> Option<usize> {
@@ -797,5 +805,147 @@ mod tests {
         assert_eq!(d.master.channels[2].count, 0xFFFF);
         assert_eq!(d.master.channels[2].base_addr, 0x1000);
         assert_eq!(d.master.channels[2].base_count, 1);
+    }
+
+    /// Program master ch2: Single+Dec+Write (`0x66`).
+    fn program_ch2_decrement_write(d: &mut Dma8237, page: u8, addr: u16, count_minus_one: u16) {
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, (addr & 0xFF) as u32);
+        d.port_write(0x04, 1, (addr >> 8) as u32);
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, (count_minus_one & 0xFF) as u32);
+        d.port_write(0x05, 1, (count_minus_one >> 8) as u32);
+        d.port_write(DMA_PAGE_CH2, 1, u32::from(page));
+        d.port_write(0x0B, 1, 0x66); // Single | Dec | Write | ch2
+        d.port_write(0x0A, 1, 0x02); // unmask ch2
+    }
+
+    #[test]
+    fn transfer_block_decrement_write_moves_io_to_memory() {
+        // Spec: Intel 8237A mode bit 5 = address decrement — Current Address
+        // decrements by 1 per byte; wraps within the 64 KiB page (page register
+        // unchanged). Without Autoinitialize, Current ends at the post-decrement
+        // address and Current Word Count is 0xFFFF; TC latches.
+        let mut d = Dma8237::new();
+        program_ch2_decrement_write(&mut d, 0x01, 0x1003, 3); // 4 bytes
+        let mem = RefCell::new(vec![0u8; 0x2_0000]);
+        let mut io = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let n = d
+            .transfer_block(
+                2,
+                &mut io,
+                |phys| mem.borrow()[phys as usize],
+                |phys, b| mem.borrow_mut()[phys as usize] = b,
+            )
+            .expect("decrement write");
+        assert_eq!(n, 4);
+        assert_eq!(mem.borrow()[0x1_1003], 0xAA);
+        assert_eq!(mem.borrow()[0x1_1002], 0xBB);
+        assert_eq!(mem.borrow()[0x1_1001], 0xCC);
+        assert_eq!(mem.borrow()[0x1_1000], 0xDD);
+        assert_eq!(d.master.channels[2].addr, 0x0FFF);
+        assert_eq!(d.master.channels[2].count, 0xFFFF);
+        assert_eq!(d.master.status & 0x0F, 0x04);
+        assert_eq!(d.page[2], 0x01);
+    }
+
+    #[test]
+    fn transfer_block_decrement_read_moves_memory_to_io() {
+        // Spec: Intel 8237A — address decrement + Read (bits 3:2 = 10).
+        let mut d = Dma8237::new();
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, 0x03);
+        d.port_write(0x04, 1, 0x20); // addr 0x2003
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, 0x01); // count 1 → 2 bytes
+        d.port_write(0x05, 1, 0x00);
+        d.port_write(DMA_PAGE_CH2, 1, 0x00);
+        d.port_write(0x0B, 1, 0x6A); // Single | Dec | Read | ch2
+        d.port_write(0x0A, 1, 0x02);
+        let mem = RefCell::new(vec![0u8; 0x3000]);
+        mem.borrow_mut()[0x2003] = 0x11;
+        mem.borrow_mut()[0x2002] = 0x22;
+        let mut io = [0u8; 2];
+        let n = d
+            .transfer_block(
+                2,
+                &mut io,
+                |phys| mem.borrow()[phys as usize],
+                |phys, b| mem.borrow_mut()[phys as usize] = b,
+            )
+            .expect("decrement read");
+        assert_eq!(n, 2);
+        assert_eq!(io, [0x11, 0x22]);
+        assert_eq!(d.master.channels[2].addr, 0x2001);
+        assert_eq!(d.master.channels[2].count, 0xFFFF);
+        assert_eq!(d.master.status & 0x0F, 0x04);
+    }
+
+    #[test]
+    fn transfer_block_decrement_wraps_within_64k_page() {
+        // Spec: Intel 8237A / ISA DMA — 16-bit current address wraps on decrement;
+        // page register does not auto-bump.
+        let mut d = Dma8237::new();
+        program_ch2_decrement_write(&mut d, 0x02, 0x0000, 1); // 2 bytes at page start
+        let mem = RefCell::new(vec![0u8; 0x4_0000]);
+        let mut io = [0xEEu8, 0xFF];
+        d.transfer_block(
+            2,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .unwrap();
+        assert_eq!(mem.borrow()[0x2_0000], 0xEE);
+        assert_eq!(mem.borrow()[0x2_FFFF], 0xFF);
+        assert_eq!(d.master.channels[2].addr, 0xFFFE); // wrapped past 0
+        assert_eq!(d.page[2], 0x02);
+    }
+
+    #[test]
+    fn transfer_block_decrement_autoinit_reloads_base() {
+        // Spec: Intel 8237A — Autoinitialize (bit 4) still restores Current from
+        // Base at TC when address decrement (bit 5) is selected; channel stays
+        // unmasked/ready for another helper call.
+        let mut d = Dma8237::new();
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, 0x03);
+        d.port_write(0x04, 1, 0x10); // addr 0x1003
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, 0x03); // count 3 → 4 bytes
+        d.port_write(0x05, 1, 0x00);
+        d.port_write(DMA_PAGE_CH2, 1, 0x01);
+        d.port_write(0x0B, 1, 0x76); // Single | AutoInit | Dec | Write | ch2
+        d.port_write(0x0A, 1, 0x02);
+        assert_eq!(d.master.channels[2].base_addr, 0x1003);
+        assert_eq!(d.master.channels[2].base_count, 3);
+        let mem = RefCell::new(vec![0u8; 0x2_0000]);
+        let mut io = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        d.transfer_block(
+            2,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("decrement autoinit write");
+        assert_eq!(mem.borrow()[0x1_1003], 0xAA);
+        assert_eq!(mem.borrow()[0x1_1000], 0xDD);
+        assert_eq!(d.master.channels[2].addr, 0x1003);
+        assert_eq!(d.master.channels[2].count, 3);
+        assert_eq!(d.master.mask & 0x04, 0);
+        assert_eq!(d.master.status & 0x0F, 0x04);
+
+        let mut io2 = [0x11u8, 0x22, 0x33, 0x44];
+        d.transfer_block(
+            2,
+            &mut io2,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("second decrement autoinit write");
+        assert_eq!(mem.borrow()[0x1_1003], 0x11);
+        assert_eq!(mem.borrow()[0x1_1000], 0x44);
+        assert_eq!(d.master.channels[2].addr, 0x1003);
+        assert_eq!(d.master.channels[2].count, 3);
     }
 }
