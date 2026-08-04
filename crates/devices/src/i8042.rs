@@ -167,6 +167,9 @@ pub const KBD_CMD_SET_SCANCODE_SET: u8 = 0xF0;
 pub const KBD_CMD_SET_TYPEMATIC: u8 = 0xF3;
 /// PS/2 keyboard command: Resend → requeue the last keyboard OBF byte.
 pub const KBD_CMD_RESEND: u8 = 0xFE;
+/// PS/2 keyboard command: Set Default — restore defaults and ACK.
+/// Spec: OSDev PS/2 Keyboard — `0xF6` Set Default.
+pub const KBD_CMD_SET_DEFAULT: u8 = 0xF6;
 
 /// Echo response byte (same value as [`KBD_CMD_ECHO`]).
 pub const KBD_ECHO: u8 = 0xEE;
@@ -1032,6 +1035,13 @@ impl I8042 {
                 let last = self.kbd_last_byte;
                 self.begin_kbd_response(&[last]);
             }
+            KBD_CMD_SET_DEFAULT => {
+                // Spec: OSDev PS/2 Keyboard — Set Default (`0xF6`): restore
+                // power-on defaults (scanning on, LEDs 0, typematic default,
+                // scancode set 2) and ACK. Unlike Reset, no BAT `0xAA` byte.
+                self.reset_kbd_defaults();
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
             _ => {
                 // Unsupported keyboard command: accepted, no ACK (see module docs).
             }
@@ -1291,16 +1301,42 @@ mod tests {
         assert!(k.irq1_line());
     }
 
-    /// Spec: unsupported host→keyboard commands (e.g. Set Default `0xF6`) are
-    /// accepted with no ACK; controller config/output buffer unchanged.
+    /// Spec: unsupported host→keyboard commands (e.g. Resend was previously
+    /// listed; use an unimplemented opcode such as `0xF7`) are accepted with
+    /// no ACK; controller config/output buffer unchanged.
     #[test]
     fn data_write_unsupported_kbd_command_no_ack() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         let before = k.clone();
-        k.port_write(I8042_DATA, 1, 0xF6); // Set Default — not implemented
+        k.port_write(I8042_DATA, 1, 0xF7); // Set All Keys Typematic — not implemented
         assert_eq!(k.config, before.config);
         assert_eq!(k.output_buffer(), None);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Set Default (`0xF6`) restores defaults and
+    /// ACKs without a BAT byte (unlike Reset `0xFF`).
+    #[test]
+    fn kbd_set_default_f6_acks_and_restores_defaults() {
+        let mut k = I8042::new();
+        // Dirty state away from defaults.
+        write_kbd(&mut k, KBD_CMD_DISABLE_SCANNING);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        write_kbd(&mut k, KBD_CMD_SET_LEDS);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        write_kbd(&mut k, 0x07);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert!(!k.kbd_scanning_enabled());
+        assert_eq!(k.kbd_leds(), 0x07);
+
+        write_kbd(&mut k, KBD_CMD_SET_DEFAULT);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert!(k.kbd_scanning_enabled(), "Set Default re-enables scanning");
+        assert_eq!(k.kbd_leds(), 0);
+        assert_eq!(k.kbd_typematic(), KBD_DEFAULT_TYPEMATIC);
+        assert_eq!(k.kbd_scancode_set(), KBD_DEFAULT_SCANCODE_SET);
+        // No BAT on OBF after Set Default.
         assert_eq!(k.status() & STATUS_OBF, 0);
     }
 
