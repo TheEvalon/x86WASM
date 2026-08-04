@@ -26,10 +26,12 @@
 //!   for 16 scanlines). Offset `0x13` (logical line width in words; mode-03h
 //!   reset default `0x28` for 80-column text). Underline Location `0x14`
 //!   (bits 4:0 underline scanline − 1; bit5 DIV4; bit6 DW; mode-03h reset
-//!   default `0x1F`). Vertical Retrace End `0x11` bit7 Protect: when set,
-//!   writes to indexes `0x00`–`0x07` are ignored except Overflow (`0x07`) bit4
-//!   (Line Compare bit8); indexes `>= 0x08` (including Start Address,
-//!   Maximum Scan Line, Offset, and Underline Location) remain writable.
+//!   default `0x1F`). Overflow `0x07` (FreeVGA high bits: VT/VDE/VRS/SVB bit8,
+//!   Line Compare bit8 in bit4, VT/VDE/VRS bit9). Vertical Retrace End `0x11`
+//!   bit7 Protect: when set, writes to indexes `0x00`–`0x07` are ignored except
+//!   Overflow (`0x07`) bit4 (Line Compare bit8); indexes `>= 0x08` (including
+//!   Start Address, Maximum Scan Line, Offset, and Underline Location) remain
+//!   writable.
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode). Map Mask `0x02` (bits 3:0 enable write planes
@@ -75,9 +77,11 @@
 //!   `0x0C`/`0x0D` store/readback with [`VgaText::text_start_address`] helper
 //!   and mode-03h reset default `0x0000` (Protect does not block); Maximum Scan
 //!   Line `0x09` store/readback with mode-03h reset default `0x0F` (Protect does
-//!   not block); Vertical Retrace End `0x11` bit7 Protect blocks writes to
-//!   indexes `0x00`–`0x07` (Overflow bit4 still writable; no host cursor glyph
-//!   render, start-address scroll/pan, max-scan glyph height, or CRTC timing)
+//!   not block); Overflow `0x07` store/readback with FreeVGA bit consts (under
+//!   Protect only bit4 / Line Compare bit8 remains writable); Vertical Retrace
+//!   End `0x11` bit7 Protect blocks writes to indexes `0x00`–`0x07` (Overflow
+//!   bit4 still writable; no host cursor glyph render, start-address scroll/pan,
+//!   max-scan glyph height, Line Compare split-screen, or CRTC timing)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults; Map Mask `0x02` store/readback
 //!   with mode-03h reset default `0x03`; Character Map Select `0x03` store/readback
@@ -201,15 +205,52 @@ pub const VGA_CRTC_CURSOR_LOC_LOW: u8 = 0x0F;
 pub const VGA_CRTC_CURSOR_DISABLE: u8 = 0x20;
 /// Cursor Start/End scanline field mask (bits 4:0).
 pub const VGA_CRTC_CURSOR_SCANLINE_MASK: u8 = 0x1F;
-/// CRTC Overflow Register index (holds Line Compare bit8 in bit4).
+/// CRTC Overflow Register index.
 ///
-/// Spec: FreeVGA CRT Controller Registers / IBM VGA — index `0x07`.
+/// Spec: FreeVGA CRT Controller Registers / IBM VGA — index `0x07`. Holds the
+/// high bits of several vertical timing fields plus Line Compare bit8:
+/// - bit0 Vertical Total bit8
+/// - bit1 Vertical Display End bit8
+/// - bit2 Vertical Retrace Start bit8
+/// - bit3 Start Vertical Blanking bit8
+/// - bit4 Line Compare bit8 (writable under Protect; see
+///   [`VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8`])
+/// - bit5 Vertical Total bit9
+/// - bit6 Vertical Display End bit9
+/// - bit7 Vertical Retrace Start bit9
+///
+/// Store/readback only in this stub (no CRTC timing / split-screen side effects).
 pub const VGA_CRTC_OVERFLOW: u8 = 0x07;
+/// Overflow bit0 — Vertical Total bit8. Spec: FreeVGA.
+pub const VGA_CRTC_OVERFLOW_VT_BIT8: u8 = 0x01;
+/// Overflow bit1 — Vertical Display End bit8. Spec: FreeVGA.
+pub const VGA_CRTC_OVERFLOW_VDE_BIT8: u8 = 0x02;
+/// Overflow bit2 — Vertical Retrace Start bit8. Spec: FreeVGA.
+pub const VGA_CRTC_OVERFLOW_VRS_BIT8: u8 = 0x04;
+/// Overflow bit3 — Start Vertical Blanking bit8. Spec: FreeVGA.
+pub const VGA_CRTC_OVERFLOW_START_VBLANK_BIT8: u8 = 0x08;
 /// Overflow bit4 — Line Compare bit8; remains writable under Protect.
 ///
 /// Spec: FreeVGA Vertical Retrace End Protect — indexes `0x00`–`0x07` ignore
 /// writes when Protect is set, except this Overflow bit.
 pub const VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8: u8 = 0x10;
+/// Overflow bit5 — Vertical Total bit9. Spec: FreeVGA.
+pub const VGA_CRTC_OVERFLOW_VT_BIT9: u8 = 0x20;
+/// Overflow bit6 — Vertical Display End bit9. Spec: FreeVGA.
+pub const VGA_CRTC_OVERFLOW_VDE_BIT9: u8 = 0x40;
+/// Overflow bit7 — Vertical Retrace Start bit9. Spec: FreeVGA.
+pub const VGA_CRTC_OVERFLOW_VRS_BIT9: u8 = 0x80;
+const _: () = assert!(
+    VGA_CRTC_OVERFLOW == 0x07
+        && VGA_CRTC_OVERFLOW_VT_BIT8 == 0x01
+        && VGA_CRTC_OVERFLOW_VDE_BIT8 == 0x02
+        && VGA_CRTC_OVERFLOW_VRS_BIT8 == 0x04
+        && VGA_CRTC_OVERFLOW_START_VBLANK_BIT8 == 0x08
+        && VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8 == 0x10
+        && VGA_CRTC_OVERFLOW_VT_BIT9 == 0x20
+        && VGA_CRTC_OVERFLOW_VDE_BIT9 == 0x40
+        && VGA_CRTC_OVERFLOW_VRS_BIT9 == 0x80
+);
 /// CRTC Vertical Retrace End Register index.
 ///
 /// Spec: FreeVGA CRT Controller Registers / IBM VGA — index `0x11`; bit7 is
@@ -1818,6 +1859,82 @@ mod tests {
         // Clearing bit4 under Protect also works; other bits stay.
         v.port_write(VGA_CRTC_DATA, 1, 0x00);
         assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OVERFLOW)], 0x0F);
+    }
+
+    /// Spec: FreeVGA CRT Controller — Overflow (index [`VGA_CRTC_OVERFLOW`] =
+    /// `0x07`) store/readback of FreeVGA high-bit fields; under Protect only
+    /// bit4 ([`VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8`] / Line Compare bit8)
+    /// remains writable.
+    #[test]
+    fn crtc_overflow_store_readback_line_compare_under_protect() {
+        assert_eq!(VGA_CRTC_OVERFLOW, 0x07);
+        let mut v = VgaText::new();
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OVERFLOW)], 0);
+
+        // Unlocked: full FreeVGA Overflow bitfield store/readback.
+        let all_bits = VGA_CRTC_OVERFLOW_VT_BIT8
+            | VGA_CRTC_OVERFLOW_VDE_BIT8
+            | VGA_CRTC_OVERFLOW_VRS_BIT8
+            | VGA_CRTC_OVERFLOW_START_VBLANK_BIT8
+            | VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8
+            | VGA_CRTC_OVERFLOW_VT_BIT9
+            | VGA_CRTC_OVERFLOW_VDE_BIT9
+            | VGA_CRTC_OVERFLOW_VRS_BIT9;
+        assert_eq!(all_bits, 0xFF);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OVERFLOW));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(all_bits));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, all_bits);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OVERFLOW)], all_bits);
+
+        // Seed non-LC bits, clear Line Compare bit8, then enable Protect.
+        let seed = VGA_CRTC_OVERFLOW_VT_BIT8
+            | VGA_CRTC_OVERFLOW_VDE_BIT8
+            | VGA_CRTC_OVERFLOW_VRS_BIT8
+            | VGA_CRTC_OVERFLOW_START_VBLANK_BIT8
+            | VGA_CRTC_OVERFLOW_VT_BIT9;
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(seed));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, seed);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_VERTICAL_RETRACE_END));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_PROTECT));
+
+        // Under Protect: only Line Compare bit8 (Overflow bit4) updates; other
+        // FreeVGA Overflow bits stay at the pre-Protect seed.
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OVERFLOW));
+        v.port_write(
+            VGA_CRTC_DATA,
+            1,
+            u32::from(
+                VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8
+                    | VGA_CRTC_OVERFLOW_VDE_BIT9
+                    | VGA_CRTC_OVERFLOW_VRS_BIT9,
+            ),
+        );
+        let expected = seed | VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8;
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, expected);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OVERFLOW)], expected);
+
+        // Clear Line Compare bit8 under Protect; non-LC seed bits preserved.
+        v.port_write(VGA_CRTC_DATA, 1, 0x00);
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, seed);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OVERFLOW)], seed);
+
+        // Word write path (lo=index, hi=data) also updates only bit4 under Protect.
+        v.port_write(
+            VGA_CRTC_INDEX,
+            2,
+            u32::from(VGA_CRTC_OVERFLOW)
+                | (u32::from(VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8 | VGA_CRTC_OVERFLOW_VRS_BIT9)
+                    << 8),
+        );
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_OVERFLOW)],
+            seed | VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8
+        );
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OVERFLOW));
+        assert_eq!(
+            v.port_read(VGA_CRTC_DATA, 1) as u8,
+            seed | VGA_CRTC_OVERFLOW_LINE_COMPARE_BIT8
+        );
     }
 
     #[test]
