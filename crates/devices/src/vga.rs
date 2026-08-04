@@ -33,7 +33,8 @@
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode). Map Mask `0x02` (bits 3:0 enable write planes
-//!   0–3; mode-03h reset default `0x03` = planes 0+1).
+//!   0–3; mode-03h reset default `0x03` = planes 0+1). Character Map Select
+//!   `0x03` (font map A/B select; mode-03h reset default `0x00`).
 //! - OSDev VGA Hardware / FreeVGA Graphics Registers — Address `0x3CE`, Data
 //!   `0x3CF`; indexes `0x00`–`0x08` (Set/Reset, Enable Set/Reset, Color Compare,
 //!   Data Rotate, Read Map Select, Graphics Mode, Miscellaneous, Color Don't
@@ -79,7 +80,9 @@
 //!   render, start-address scroll/pan, max-scan glyph height, or CRTC timing)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults; Map Mask `0x02` store/readback
-//!   with mode-03h reset default `0x03` (no timing/plane write-enable side effects)
+//!   with mode-03h reset default `0x03`; Character Map Select `0x03` store/readback
+//!   with mode-03h reset default `0x00` (no timing/plane write-enable/font-map
+//!   side effects)
 //! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
 //!   register file on `0x3CF` with mode-03h-class reset defaults; Bit Mask
 //!   `0x08` store/readback with mode-03h reset default `0xFF` (no write-mode /
@@ -304,7 +307,8 @@ pub const VGA_SEQ_REG_COUNT: usize = 5;
 /// Spec: FreeVGA / IBM VGA alphanumeric programming SeaBIOS probes —
 /// Reset `0x03` (both reset bits clear → run), Clocking Mode `0x00`,
 /// Map Mask [`VGA_SEQ_MAP_MASK_DEFAULT`] (planes 0+1), Character Map Select
-/// `0x00`, Memory Mode `0x02` (extended memory enable; odd/even + chain-4 clear).
+/// [`VGA_SEQ_CHAR_MAP_SELECT_DEFAULT`], Memory Mode `0x02` (extended memory
+/// enable; odd/even + chain-4 clear).
 pub const VGA_SEQ_DEFAULTS: [u8; VGA_SEQ_REG_COUNT] = [0x03, 0x00, 0x03, 0x00, 0x02];
 /// Sequencer index: Clocking Mode register. Spec: FreeVGA Sequencer Registers.
 pub const VGA_SEQ_CLOCKING_MODE: u8 = 0x01;
@@ -329,6 +333,24 @@ const _: () = assert!(
     VGA_SEQ_MAP_MASK == 0x02
         && VGA_SEQ_MAP_MASK_DEFAULT == 0x03
         && VGA_SEQ_DEFAULTS[VGA_SEQ_MAP_MASK as usize] == VGA_SEQ_MAP_MASK_DEFAULT
+);
+/// Sequencer Character Map Select Register index.
+///
+/// Spec: FreeVGA Sequencer Registers / IBM VGA — index `0x03`. Selects which
+/// character-generator maps (fonts in plane 2) are used for alphanumeric
+/// display (Map Select A/B fields). Font-map / glyph-fetch side effects are
+/// out of scope (store/readback only).
+pub const VGA_SEQ_CHAR_MAP_SELECT: u8 = 0x03;
+/// Mode-03h-class Character Map Select reset default (`0x00` = map 0).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Character Map Select `0x00`
+/// so both Map Select A and B refer to font map 0. Store/readback only; no
+/// font-map side effects on glyph fetch.
+pub const VGA_SEQ_CHAR_MAP_SELECT_DEFAULT: u8 = 0x00;
+const _: () = assert!(
+    VGA_SEQ_CHAR_MAP_SELECT == 0x03
+        && VGA_SEQ_CHAR_MAP_SELECT_DEFAULT == 0x00
+        && VGA_SEQ_DEFAULTS[VGA_SEQ_CHAR_MAP_SELECT as usize] == VGA_SEQ_CHAR_MAP_SELECT_DEFAULT
 );
 
 /// Miscellaneous Output Register write port.
@@ -2287,6 +2309,49 @@ mod tests {
         assert_eq!(v.port_read(VGA_SEQ_DATA, 1) as u8, VGA_SEQ_MAP_MASK_DEFAULT);
     }
 
+    /// Spec: FreeVGA Sequencer Registers — Character Map Select (index `0x03`)
+    /// store/readback. Mode-03h reset default is
+    /// [`VGA_SEQ_CHAR_MAP_SELECT_DEFAULT`] (`0x00`).
+    #[test]
+    fn seq_char_map_select_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.seq_regs[usize::from(VGA_SEQ_CHAR_MAP_SELECT)],
+            VGA_SEQ_CHAR_MAP_SELECT_DEFAULT
+        );
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_CHAR_MAP_SELECT));
+        assert_eq!(
+            v.port_read(VGA_SEQ_DATA, 1) as u8,
+            VGA_SEQ_CHAR_MAP_SELECT_DEFAULT
+        );
+
+        // Non-zero Map Select A/B programming (font-map side effects deferred).
+        v.port_write(VGA_SEQ_DATA, 1, 0x20);
+        assert_eq!(v.port_read(VGA_SEQ_DATA, 1) as u8, 0x20);
+        assert_eq!(v.seq_regs[usize::from(VGA_SEQ_CHAR_MAP_SELECT)], 0x20);
+
+        // Word write path (lo=index, hi=data) also updates Character Map Select.
+        v.port_write(
+            VGA_SEQ_INDEX,
+            2,
+            (u32::from(0x14u8) << 8) | u32::from(VGA_SEQ_CHAR_MAP_SELECT),
+        );
+        assert_eq!(v.seq_regs[usize::from(VGA_SEQ_CHAR_MAP_SELECT)], 0x14);
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_CHAR_MAP_SELECT));
+        assert_eq!(v.port_read(VGA_SEQ_DATA, 1) as u8, 0x14);
+
+        v.reset();
+        assert_eq!(
+            v.seq_regs[usize::from(VGA_SEQ_CHAR_MAP_SELECT)],
+            VGA_SEQ_CHAR_MAP_SELECT_DEFAULT
+        );
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_CHAR_MAP_SELECT));
+        assert_eq!(
+            v.port_read(VGA_SEQ_DATA, 1) as u8,
+            VGA_SEQ_CHAR_MAP_SELECT_DEFAULT
+        );
+    }
+
     /// Spec: FreeVGA — Sequencer Clocking Mode (index `0x01`) bit0 8/9-dot
     /// store/readback (glyph timing not enforced).
     #[test]
@@ -2340,8 +2405,9 @@ mod tests {
     fn sequencer_reset_defaults_mode03h() {
         // Spec: FreeVGA / IBM VGA mode-03h-class Sequencer programming SeaBIOS
         // probes — Reset `0x03`, Clocking Mode `0x00`, Map Mask
-        // [`VGA_SEQ_MAP_MASK_DEFAULT`], Character Map Select `0x00`, Memory Mode
-        // `0x02` (store/readback only).
+        // [`VGA_SEQ_MAP_MASK_DEFAULT`], Character Map Select
+        // [`VGA_SEQ_CHAR_MAP_SELECT_DEFAULT`], Memory Mode `0x02`
+        // (store/readback only).
         let v = VgaText::new();
         assert_eq!(v.seq_index, 0);
         assert_eq!(v.seq_regs, VGA_SEQ_DEFAULTS);
@@ -2349,7 +2415,20 @@ mod tests {
             v.seq_regs[usize::from(VGA_SEQ_MAP_MASK)],
             VGA_SEQ_MAP_MASK_DEFAULT
         );
-        assert_eq!(v.seq_regs, [0x03, 0x00, 0x03, 0x00, 0x02]);
+        assert_eq!(
+            v.seq_regs[usize::from(VGA_SEQ_CHAR_MAP_SELECT)],
+            VGA_SEQ_CHAR_MAP_SELECT_DEFAULT
+        );
+        assert_eq!(
+            v.seq_regs,
+            [
+                0x03,
+                0x00,
+                VGA_SEQ_MAP_MASK_DEFAULT,
+                VGA_SEQ_CHAR_MAP_SELECT_DEFAULT,
+                0x02
+            ]
+        );
     }
 
     #[test]
@@ -2357,6 +2436,8 @@ mod tests {
         let mut v = VgaText::new();
         v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_MAP_MASK));
         v.port_write(VGA_SEQ_DATA, 1, 0x0F);
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_CHAR_MAP_SELECT));
+        v.port_write(VGA_SEQ_DATA, 1, 0x20);
         v.port_write(VGA_SEQ_INDEX, 1, 0x01);
         v.port_write(VGA_SEQ_DATA, 1, 0x01);
         v.reset();
@@ -2364,6 +2445,11 @@ mod tests {
         assert_eq!(v.seq_regs, VGA_SEQ_DEFAULTS);
         v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_MAP_MASK));
         assert_eq!(v.port_read(VGA_SEQ_DATA, 1) as u8, VGA_SEQ_MAP_MASK_DEFAULT);
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_CHAR_MAP_SELECT));
+        assert_eq!(
+            v.port_read(VGA_SEQ_DATA, 1) as u8,
+            VGA_SEQ_CHAR_MAP_SELECT_DEFAULT
+        );
     }
 
     #[test]
