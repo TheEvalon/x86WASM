@@ -15,9 +15,8 @@ pub use mem::PhysMem;
 use devices::{
     CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, IdePrimary, IdeSecondary,
     PciConfig, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, FDC_DOR_DMA_IRQ,
-    FDC_SECTOR_SIZE, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
-    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
-    PORT_SYSTEM_CONTROL,
+    I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+    PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -412,11 +411,13 @@ impl Machine {
     }
 
     /// If FDC has a pending WRITE DATA DMA arm (DOR DMA/IRQ at command complete),
-    /// fill a sector buffer through ISA DMA channel 2 in Read mode
+    /// fill a buffer through ISA DMA channel 2 in Read mode
     /// (memory → I/O device) and commit it into the floppy image.
     ///
-    /// Spec: Intel 82077AA DMA mode; Intel 8237A Read transfer; OSDev ISA DMA
-    /// floppy channel 2. Prefer the MachineBus auto-wire after FDC FIFO writes.
+    /// Spec: Intel 82077AA §5.1.2 WRITE DATA multi-sector / EOT; Intel 8237A
+    /// Read transfer; OSDev ISA DMA floppy channel 2. Buffer length is
+    /// [`Fdc82077::pending_dma_write_byte_count`] (MT=0 R..=EOT × 512).
+    /// Prefer the MachineBus auto-wire after FDC FIFO writes.
     ///
     /// Returns `None` when nothing is pending; `Some(Ok(n))` / `Some(Err(_))`
     /// from [`Self::dma_transfer`]. On transfer error the pending arm is still
@@ -425,13 +426,14 @@ impl Machine {
         if self.fdc.dor & FDC_DOR_DMA_IRQ == 0 {
             return None;
         }
-        if !self.fdc.take_pending_dma_write() {
+        let len = self.fdc.pending_dma_write_byte_count();
+        if len == 0 || !self.fdc.take_pending_dma_write() {
             return None;
         }
-        let mut buf = [0u8; FDC_SECTOR_SIZE];
+        let mut buf = vec![0u8; len];
         match self.dma_transfer(2, &mut buf) {
             Ok(n) => {
-                let _ = self.fdc.commit_dma_write_sector(buf);
+                let _ = self.fdc.commit_dma_write_sector(&buf);
                 Some(Ok(n))
             }
             Err(e) => Some(Err(e)),
@@ -494,24 +496,26 @@ impl MachineBus<'_> {
         let _ = self.dma_transfer(2, &mut buf);
     }
 
-    /// Auto-wire: pending FDC WRITE DATA → ISA DMA ch2 Read → sector buffer → image.
+    /// Auto-wire: pending FDC WRITE DATA → ISA DMA ch2 Read → buffer → image.
     ///
-    /// Spec: Intel 82077AA DMA mode + 8237A Read + OSDev ISA DMA floppy ch2.
-    /// Invoked after every FDC `port_write` so WRITE DATA FIFO completion with
-    /// media + DOR DMA/IRQ (no device pre-latch) pulls 512 bytes from PhysMem
-    /// and commits via [`Fdc82077::commit_dma_write_sector`].
+    /// Spec: Intel 82077AA §5.1.2 WRITE DATA multi-sector / EOT + 8237A Read +
+    /// OSDev ISA DMA floppy ch2. Invoked after every FDC `port_write` so WRITE
+    /// DATA FIFO completion with media + DOR DMA/IRQ (no device pre-latch)
+    /// pulls [`Fdc82077::pending_dma_write_byte_count`] bytes from PhysMem
+    /// (MT=0 R..=EOT × 512) and commits via [`Fdc82077::commit_dma_write_sector`].
     fn try_fdc_dma_ch2_read(&mut self) {
         if self.fdc.dor & FDC_DOR_DMA_IRQ == 0 {
             return;
         }
-        if !self.fdc.take_pending_dma_write() {
+        let len = self.fdc.pending_dma_write_byte_count();
+        if len == 0 || !self.fdc.take_pending_dma_write() {
             return;
         }
-        let mut buf = [0u8; FDC_SECTOR_SIZE];
+        let mut buf = vec![0u8; len];
         // Guest must have programmed ch2 (page/addr/count/mode Read|Single).
         // Errors leave the image unchanged; pending arm already consumed.
         if self.dma_transfer(2, &mut buf).is_ok() {
-            let _ = self.fdc.commit_dma_write_sector(buf);
+            let _ = self.fdc.commit_dma_write_sector(&buf);
         }
     }
 
@@ -2392,6 +2396,7 @@ mod tests {
     /// MachineBus FDC FIFO WRITE DATA completion with media auto-wires
     /// `dma_transfer(2)` Read (memory→device): 512 PhysMem bytes land in the
     /// floppy image via `write_sector` / `last_write` and TC latches.
+    /// EOT==R → single-sector (multi-sector uses `pending_dma_write_byte_count`).
     #[test]
     fn machine_bus_fdc_write_data_dma_ch2_reads_sector_from_physmem() {
         let mut m = Machine::new(256 * 1024);
@@ -2409,18 +2414,20 @@ mod tests {
         {
             let mut bus = m.bus_mut();
             bus.port_out_u8(FDC_DOR, FDC_DOR_MOTOR0_DMA).unwrap();
-            // WRITE DATA MFM: C/H/R/N = 0/0/1/2 — no device pre-latch.
+            // WRITE DATA MFM: C/H/R/N/EOT = 0/0/1/2/1 — single-sector, no pre-latch.
             bus.port_out_u8(FDC_FIFO, FDC_CMD_MFM | FDC_CMD_WRITE_DATA)
                 .unwrap();
-            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
                 bus.port_out_u8(FDC_FIFO, p).unwrap();
             }
         }
 
-        let written = *m
+        let written = m
             .fdc
             .last_write()
-            .expect("Machine DMA commit latches last_write");
+            .expect("Machine DMA commit latches last_write")
+            .to_vec();
+        assert_eq!(written.len(), FDC_SECTOR_SIZE);
         for (i, b) in written.iter().enumerate() {
             assert_eq!(*b, (i & 0xFF) as u8, "last_write[{i}]");
         }
@@ -2428,7 +2435,7 @@ mod tests {
             .fdc
             .read_sector(0, 0, 1)
             .expect("image must contain DMA-written sector");
-        assert_eq!(image_sector, written);
+        assert_eq!(image_sector.as_slice(), written.as_slice());
         assert_eq!(m.dma.master.channels[2].count, 0xFFFF);
         assert_eq!(
             m.dma.port_read(0x08, 1) as u8 & 0x0F,
