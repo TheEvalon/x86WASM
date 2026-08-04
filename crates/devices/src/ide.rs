@@ -6,8 +6,9 @@
 //!
 //! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
 //!   WRITE SECTORS (`0x30`), PACKET (`0xA0`), IDENTIFY PACKET DEVICE (`0xA1`),
-//!   SMART (`0xB0`), task-file registers, status bits BSY/DRDY/DRQ/ERR, error
-//!   ABRT, LBA28 addressing; device control nIEN; INTRQ when drive needs attention.
+//!   SMART (`0xB0`), READ DMA (`0xC8`), task-file registers, status bits
+//!   BSY/DRDY/DRQ/ERR, error ABRT, LBA28 addressing; device control nIEN;
+//!   INTRQ when drive needs attention.
 //! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ/WRITE IRQ+PIO sequence,
 //!   status read clears IRQ / alternate status does not, 256-word PIO,
 //!   sector-count `0` = 256 sectors; primary channel → ISA IRQ14;
@@ -26,6 +27,8 @@
 //!   absent/slave → status 0; INTRQ follows nIEN like WRITE/IDENTIFY abort
 //! - SMART (`0xB0`): ATA master → ERR+ABRT (no SMART feature-set data);
 //!   absent/slave → status 0; INTRQ follows nIEN like PACKET/READ MULTIPLE abort
+//! - READ DMA (`0xC8`): ATA master → ERR+ABRT (no BM-DMA/PRD engine);
+//!   absent/slave → status 0; INTRQ follows nIEN like SMART/PACKET abort
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
@@ -36,7 +39,8 @@
 //!
 //! - ATAPI PACKET media engine / CD-ROM / ISO boot / slave ATAPI identify buffer
 //! - SMART feature set (thresholds, return data, enable/disable subcommands)
-//! - DMA IDE (UDMA/MDMA), WRITE DMA, LBA48
+//! - Real BM-DMA / UDMA/MDMA / WRITE DMA / PRD engine (READ DMA is ABRT-only)
+//! - LBA48
 //! - Slave drive on either channel
 //! - SeaBIOS / PCI IDE BAR remapping
 //!
@@ -171,6 +175,9 @@ pub const ATA_CMD_MEDIA_UNLOCK: u8 = 0xDF;
 /// SMART — feature-set command; this stub aborts (no SMART support).
 /// Spec: ATA/ATAPI Command Set — SMART (`0xB0`).
 pub const ATA_CMD_SMART: u8 = 0xB0;
+/// READ DMA — bus-master DMA read; this stub aborts (no BM-DMA/PRD engine).
+/// Spec: ATA/ATAPI Command Set — READ DMA (`0xC8`).
+pub const ATA_CMD_READ_DMA: u8 = 0xC8;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -622,6 +629,23 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
+    /// READ DMA (`0xC8`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ DMA transfers sectors via bus-master
+    /// DMA (PRD). This stub has no BM-DMA engine; ATA disks abort with ERR+ABRT
+    /// and no DRQ / DMA start. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SMART / PACKET abort.
+    fn exec_read_dma(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// IDLE / IDLE IMMEDIATE / STANDBY IMMEDIATE — non-data success stubs.
     ///
     /// Spec: ATA power-management commands complete with DRDY|DSC; this stub
@@ -812,6 +836,7 @@ impl IdePrimary {
             ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
             ATA_CMD_WRITE_MULTIPLE => self.exec_write_multiple(),
             ATA_CMD_SMART => self.exec_smart(),
+            ATA_CMD_READ_DMA => self.exec_read_dma(),
             ATA_CMD_SET_MULTIPLE_MODE => self.exec_set_multiple_mode(),
             ATA_CMD_IDLE
             | ATA_CMD_IDLE_IMMEDIATE
@@ -1730,6 +1755,53 @@ mod tests {
         let mut ide = IdePrimary::new();
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SMART));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — READ DMA (`0xC8`) needs bus-master DMA.
+    /// This stub has no BM-DMA/PRD engine; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn read_dma_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn read_dma_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match SMART/PACKET).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn read_dma_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match SMART abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn read_dma_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
         assert!(!ide.irq_line());
