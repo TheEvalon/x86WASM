@@ -18,7 +18,9 @@
 //!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF3` Set
 //!   Sample Rate (+ value), `0xE8` Set Resolution (+ value), `0xE9` Status
 //!   Request (ACK + 3-byte status), `0xE6`/`0xE7` Set Scaling 1:1 / 2:1,
-//!   `0xEA` Set Stream Mode / `0xF0` Set Remote Mode (ACK; mode flag stored),
+//!   `0xEA` Set Stream Mode / `0xF0` Set Remote Mode (ACK; mode flag stored;
+//!   either clears wrap), `0xEE` Set Wrap Mode (ACK; wrap flag stored; Reset /
+//!   Stream / Remote clear wrap — **wrap-mode byte echo deferred**),
 //!   `0xEB` Read Data (ACK then one 3-byte movement packet — last inject or
 //!   zeros; SeaBIOS/OSDev-friendly stub answers in stream or remote mode);
 //!   stream-mode **Mouse Packet Format** (3 bytes: flags/buttons/signs/overflows,
@@ -62,9 +64,9 @@
 //! [`I8042::aux_device_writes`]), and a minimal PS/2 **mouse stub** answers the
 //! common identify/reset/enable commands with ACK/`0xFA` (and BAT/ID where
 //! required) on AUX OBF → IRQ12 when config bit 1 is set. Parameter commands
-//! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`/`0xEA`/`0xF0`/`0xEB`) store rate/resolution/
-//! scaling/mode and answer Status Request / Read Data with the OSDev packets;
-//! Reset restores defaults (stream mode).
+//! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`/`0xEA`/`0xF0`/`0xEE`/`0xEB`) store
+//! rate/resolution/scaling/mode/wrap and answer Status Request / Read Data with
+//! the OSDev packets; Reset restores defaults (stream mode, wrap off).
 //! [`I8042::inject_mouse_packet`] queues a standard 3-byte movement packet when
 //! data reporting is enabled (`0xF4`) and remembers last dx/dy/buttons for
 //! Read Data (`0xEB`); while reporting is disabled (`0xF5` / Reset default)
@@ -76,9 +78,10 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - Wheel / 5-button (IntelliMouse) extensions / wrap mode / full remote
-//!   protocol beyond Read Data `0xEB` (other host→aux bytes are recorded,
-//!   unanswered)
+//! - Wheel / 5-button (IntelliMouse) extensions / wrap-mode **byte echo**
+//!   (Set Wrap `0xEE` ACK+flag is stored; subsequent host→aux bytes are **not**
+//!   echoed yet) / Reset Wrap `0xEC` / full remote protocol beyond Read Data
+//!   `0xEB` (other host→aux bytes are recorded, unanswered)
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
@@ -246,6 +249,10 @@ pub const MOUSE_CMD_SET_STREAM_MODE: u8 = 0xEA;
 pub const MOUSE_CMD_SET_REMOTE_MODE: u8 = 0xF0;
 /// Spec: OSDev PS/2 Mouse — `0xEB` Read Data (force one movement packet).
 pub const MOUSE_CMD_READ_DATA: u8 = 0xEB;
+/// Spec: OSDev PS/2 Mouse — `0xEE` Set Wrap Mode (ACK; store wrap flag).
+///
+/// Wrap-mode echoing of subsequent host→aux bytes is **deferred** (flag only).
+pub const MOUSE_CMD_SET_WRAP_MODE: u8 = 0xEE;
 
 /// Default sample rate after Reset (OSDev PS/2 Mouse defaults).
 pub const MOUSE_DEFAULT_SAMPLE_RATE: u8 = 100;
@@ -414,6 +421,10 @@ pub struct I8042 {
     ///
     /// Spec: OSDev PS/2 Mouse — Set Remote / Set Stream Mode.
     mouse_remote_mode: bool,
+    /// Mouse wrap mode when true (`0xEE`); cleared by Reset / Stream / Remote.
+    ///
+    /// Spec: OSDev PS/2 Mouse — Set Wrap Mode. Flag stored; byte echo deferred.
+    mouse_wrap_mode: bool,
     /// Last movement deltas/buttons from a successful [`I8042::inject_mouse_packet`].
     ///
     /// Spec: OSDev PS/2 Mouse — Read Data (`0xEB`) returns this packet (or zeros
@@ -478,6 +489,7 @@ impl I8042 {
             mouse_resolution: MOUSE_DEFAULT_RESOLUTION,
             mouse_scaling_21: false,
             mouse_remote_mode: false,
+            mouse_wrap_mode: false,
             mouse_last_dx: 0,
             mouse_last_dy: 0,
             mouse_last_buttons: 0,
@@ -538,13 +550,14 @@ impl I8042 {
     ///
     /// Spec: OSDev PS/2 Mouse — Reset returns the device to power-on defaults
     /// (100 reports/sec, 4 counts/mm, scaling 1:1, data reporting disabled,
-    /// stream mode). Controllers `I8042::reset` uses the same defaults.
+    /// stream mode, wrap off). Controllers `I8042::reset` uses the same defaults.
     fn reset_mouse_defaults(&mut self) {
         self.mouse_reporting = false;
         self.mouse_sample_rate = MOUSE_DEFAULT_SAMPLE_RATE;
         self.mouse_resolution = MOUSE_DEFAULT_RESOLUTION;
         self.mouse_scaling_21 = false;
         self.mouse_remote_mode = false;
+        self.mouse_wrap_mode = false;
         self.mouse_last_dx = 0;
         self.mouse_last_dy = 0;
         self.mouse_last_buttons = 0;
@@ -804,6 +817,14 @@ impl I8042 {
         self.mouse_remote_mode
     }
 
+    /// Whether wrap mode is active (`0xEE`); cleared by Reset / Stream / Remote.
+    ///
+    /// Spec: OSDev PS/2 Mouse — Set Wrap Mode. Flag only; host→aux byte echo in
+    /// wrap mode is deferred.
+    pub fn mouse_wrap_mode(&self) -> bool {
+        self.mouse_wrap_mode
+    }
+
     /// Build Status Request byte 1 from current mouse stub state.
     ///
     /// Spec: OSDev [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) Status Request
@@ -1027,13 +1048,23 @@ impl I8042 {
                 self.begin_mouse_response(&[last]);
             }
             MOUSE_CMD_SET_STREAM_MODE => {
-                // Spec: OSDev PS/2 Mouse — Set Stream Mode (`0xEA`) → ACK.
+                // Spec: OSDev PS/2 Mouse — Set Stream Mode (`0xEA`) → ACK;
+                // clears remote and wrap.
                 self.mouse_remote_mode = false;
+                self.mouse_wrap_mode = false;
                 self.begin_mouse_response(&[MOUSE_ACK]);
             }
             MOUSE_CMD_SET_REMOTE_MODE => {
-                // Spec: OSDev PS/2 Mouse — Set Remote Mode (`0xF0`) → ACK.
+                // Spec: OSDev PS/2 Mouse — Set Remote Mode (`0xF0`) → ACK;
+                // clears wrap.
                 self.mouse_remote_mode = true;
+                self.mouse_wrap_mode = false;
+                self.begin_mouse_response(&[MOUSE_ACK]);
+            }
+            MOUSE_CMD_SET_WRAP_MODE => {
+                // Spec: OSDev PS/2 Mouse — Set Wrap Mode (`0xEE`) → ACK + flag.
+                // Wrap-mode echoing of subsequent host→aux bytes is deferred.
+                self.mouse_wrap_mode = true;
                 self.begin_mouse_response(&[MOUSE_ACK]);
             }
             MOUSE_CMD_READ_DATA => {
@@ -2058,11 +2089,11 @@ mod tests {
         assert_eq!(k.aux_device_writes, 0);
         assert_eq!(k.last_aux_device_write, None);
 
-        // 0xEE = Set Wrap Mode — not implemented; recorded, no ACK.
+        // 0xEC = Reset Wrap Mode — not implemented; recorded, no ACK.
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_AUX));
-        k.port_write(I8042_DATA, 1, 0xEE);
+        k.port_write(I8042_DATA, 1, 0xEC);
         assert_eq!(k.aux_device_writes, 1);
-        assert_eq!(k.last_aux_device_write, Some(0xEE));
+        assert_eq!(k.last_aux_device_write, Some(0xEC));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
 
@@ -2071,9 +2102,63 @@ mod tests {
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         k.port_write(I8042_DATA, 1, 0xF1);
         assert_eq!(k.aux_device_writes, 1);
-        assert_eq!(k.last_aux_device_write, Some(0xEE));
+        assert_eq!(k.last_aux_device_write, Some(0xEC));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert_eq!(k.unsupported_commands, 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Set Wrap Mode (`0xEE`) via `0xD4` → ACK on AUX
+    /// OBF; stores wrap-mode flag. Wrap-mode byte echo is deferred.
+    #[test]
+    fn mouse_set_wrap_mode_ee_acks() {
+        let mut k = I8042::new();
+        assert!(!k.mouse_wrap_mode());
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert!(k.mouse_wrap_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Reset restores defaults including wrap off.
+    #[test]
+    fn mouse_reset_clears_wrap_mode() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert!(k.mouse_wrap_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_RESET);
+        assert!(!k.mouse_wrap_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_BAT_OK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Set Stream Mode (`0xEA`) clears wrap mode.
+    #[test]
+    fn mouse_set_stream_mode_clears_wrap() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert!(k.mouse_wrap_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_SET_STREAM_MODE);
+        assert!(!k.mouse_wrap_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Set Remote Mode (`0xF0`) clears wrap mode.
+    #[test]
+    fn mouse_set_remote_mode_clears_wrap() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert!(k.mouse_wrap_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_SET_REMOTE_MODE);
+        assert!(!k.mouse_wrap_mode());
+        assert!(k.mouse_remote_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
     }
 
     /// Spec: OSDev PS/2 Mouse — Set Stream Mode (`0xEA`) via `0xD4` → ACK.
