@@ -12,8 +12,8 @@
 //!   SECURITY DISABLE PASSWORD (`0xF6`), DOWNLOAD MICROCODE (`0x92`), READ LOG
 //!   EXT (`0x2F`), WRITE LOG EXT (`0x3F`),
 //!   DATA SET MANAGEMENT (`0x06`), TRUSTED RECEIVE (`0x5C`), TRUSTED SEND
-//!   (`0x5E`), READ BUFFER (`0xE4`), task-file registers, status bits
-//!   BSY/DRDY/DRQ/ERR, error ABRT,
+//!   (`0x5E`), READ BUFFER (`0xE4`), WRITE BUFFER (`0xE8`), task-file
+//!   registers, status bits BSY/DRDY/DRQ/ERR, error ABRT,
 //!   LBA28 addressing;
 //!   device control nIEN; INTRQ when drive needs attention.
 //! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ/WRITE IRQ+PIO sequence,
@@ -67,6 +67,8 @@
 //!   like TRUSTED RECEIVE
 //! - READ BUFFER (`0xE4`): ATA master → ERR+ABRT (no 512-byte sector buffer
 //!   PIO); absent/slave → status 0; INTRQ follows nIEN like TRUSTED SEND
+//! - WRITE BUFFER (`0xE8`): ATA master → ERR+ABRT (no 512-byte sector buffer
+//!   PIO); absent/slave → status 0; INTRQ follows nIEN like READ BUFFER
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
@@ -84,7 +86,8 @@
 //! - DATA SET MANAGEMENT / TRIM range-list PIO (ABRT-only stub)
 //! - TRUSTED RECEIVE / TRUSTED SEND Security Protocol PIO (ABRT-only stubs for
 //!   `0x5C` / `0x5E`)
-//! - READ BUFFER 512-byte sector-buffer PIO (ABRT-only stub for `0xE4`)
+//! - READ BUFFER / WRITE BUFFER 512-byte sector-buffer PIO (ABRT-only stubs for
+//!   `0xE4` / `0xE8`)
 //! - Real BM-DMA / UDMA/MDMA / PRD engine (READ/WRITE DMA are ABRT-only)
 //! - LBA48
 //! - Slave drive on either channel
@@ -266,6 +269,9 @@ pub const ATA_CMD_TRUSTED_SEND: u8 = 0x5E;
 /// READ BUFFER — 512-byte sector buffer read; this stub aborts.
 /// Spec: ATA/ATAPI Command Set — READ BUFFER (`0xE4`).
 pub const ATA_CMD_READ_BUFFER: u8 = 0xE4;
+/// WRITE BUFFER — 512-byte sector buffer write; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`).
+pub const ATA_CMD_WRITE_BUFFER: u8 = 0xE8;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -980,6 +986,23 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
+    /// WRITE BUFFER (`0xE8`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — WRITE BUFFER accepts the 512-byte sector
+    /// buffer via PIO (no LBA). This stub does not implement the sector buffer;
+    /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
+    /// INTRQ follows nIEN like READ BUFFER abort.
+    fn exec_write_buffer(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// IDLE / IDLE IMMEDIATE / STANDBY IMMEDIATE — non-data success stubs.
     ///
     /// Spec: ATA power-management commands complete with DRDY|DSC; this stub
@@ -1185,6 +1208,7 @@ impl IdePrimary {
             ATA_CMD_TRUSTED_RECEIVE => self.exec_trusted_receive(),
             ATA_CMD_TRUSTED_SEND => self.exec_trusted_send(),
             ATA_CMD_READ_BUFFER => self.exec_read_buffer(),
+            ATA_CMD_WRITE_BUFFER => self.exec_write_buffer(),
             ATA_CMD_SET_MULTIPLE_MODE => self.exec_set_multiple_mode(),
             ATA_CMD_IDLE
             | ATA_CMD_IDLE_IMMEDIATE
@@ -2913,6 +2937,54 @@ mod tests {
         let mut ide = IdePrimary::new();
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`) accepts the 512-byte
+    /// sector buffer via PIO. This stub has no sector-buffer path; ATA master →
+    /// ERR+ABRT, no DRQ.
+    #[test]
+    fn write_buffer_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn write_buffer_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match READ BUFFER).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn write_buffer_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match READ BUFFER abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_buffer_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
         assert!(!ide.irq_line());
