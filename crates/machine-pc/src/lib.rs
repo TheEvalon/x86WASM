@@ -10,8 +10,8 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DualPic, Fdc82077, IdePrimary, IdeSecondary, PciConfig,
-    Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA,
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, IdePrimary, IdeSecondary,
+    PciConfig, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, I8042, I8042_DATA,
     I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA,
     PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
 };
@@ -342,6 +342,35 @@ impl Machine {
         self.cpu.request_nmi();
         true
     }
+
+    /// Run [`Dma8237::transfer_block`] for an ISA 8-bit channel against [`PhysMem`].
+    ///
+    /// Spec: Intel 8237A + OSDev ISA DMA — length `count+1`, phys
+    /// `(page << 16) | addr`, Single+Increment+Read/Write mode subset. Memory
+    /// callbacks use [`PhysMem::read_u8`] / [`PhysMem::write_u8`] (A20 applied).
+    ///
+    /// Software helper for machine integration tests / future FDC callers —
+    /// **not** DREQ/DACK timing or automatic FDC/IDE DMA.
+    pub fn dma_transfer(
+        &mut self,
+        isa_channel: usize,
+        io_buf: &mut [u8],
+    ) -> Result<usize, DmaTransferError> {
+        // `transfer_block` holds read+write closures simultaneously; stage PhysMem
+        // in a RefCell so both can capture it without overlapping `&mut` borrows.
+        use std::cell::RefCell;
+        let mem = RefCell::new(std::mem::replace(&mut self.mem, PhysMem::new(0)));
+        let result = self.dma.transfer_block(
+            isa_channel,
+            io_buf,
+            |phys| mem.borrow().read_u8(u64::from(phys)).unwrap_or(0xFF),
+            |phys, b| {
+                let _ = mem.borrow_mut().write_u8(u64::from(phys), b);
+            },
+        );
+        self.mem = mem.into_inner();
+        result
+    }
 }
 
 struct MachineBus<'a> {
@@ -362,6 +391,27 @@ struct MachineBus<'a> {
 }
 
 impl MachineBus<'_> {
+    /// Same as [`Machine::dma_transfer`]: `transfer_block` → [`PhysMem`].
+    #[cfg(test)]
+    fn dma_transfer(
+        &mut self,
+        isa_channel: usize,
+        io_buf: &mut [u8],
+    ) -> Result<usize, DmaTransferError> {
+        use std::cell::RefCell;
+        let mem = RefCell::new(std::mem::replace(self.mem, PhysMem::new(0)));
+        let result = self.dma.transfer_block(
+            isa_channel,
+            io_buf,
+            |phys| mem.borrow().read_u8(u64::from(phys)).unwrap_or(0xFF),
+            |phys, b| {
+                let _ = mem.borrow_mut().write_u8(u64::from(phys), b);
+            },
+        );
+        *self.mem = mem.into_inner();
+        result
+    }
+
     /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
@@ -1426,6 +1476,107 @@ mod tests {
         assert_eq!(m.dma.master.channels[0].addr, 0);
         assert_eq!(m.dma.page[2], 0);
         assert_eq!(m.dma.master.mask, 0x0F);
+    }
+
+    /// Program master ch2: page, addr, count=N−1, Single+Inc+Write (`0x46`), unmasked.
+    fn program_dma_ch2_write(m: &mut Machine, page: u8, addr: u16, count_minus_one: u16) {
+        use devices::DMA_PAGE_CH2;
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x04, 1, u32::from(addr & 0xFF));
+        m.dma.port_write(0x04, 1, u32::from(addr >> 8));
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x05, 1, u32::from(count_minus_one & 0xFF));
+        m.dma.port_write(0x05, 1, u32::from(count_minus_one >> 8));
+        m.dma.port_write(DMA_PAGE_CH2, 1, u32::from(page));
+        m.dma.port_write(0x0B, 1, 0x46); // Single | Inc | Write | ch2
+        m.dma.port_write(0x0A, 1, 0x02); // unmask ch2
+    }
+
+    /// Spec: Intel 8237A + OSDev ISA DMA — `Machine::dma_transfer` Write moves
+    /// I/O buffer into PhysMem at `(page<<16)|addr` and latches TC.
+    #[test]
+    fn machine_dma_transfer_ch2_write_into_physmem_latches_tc() {
+        let mut m = Machine::new(256 * 1024);
+        program_dma_ch2_write(&mut m, 0x01, 0x1000, 3); // 4 bytes @ 0x1_1000
+        let mut io = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let n = m.dma_transfer(2, &mut io).expect("ch2 write into PhysMem");
+        assert_eq!(n, 4);
+        assert_eq!(m.mem.read_u8(0x1_1000).unwrap(), 0xAA);
+        assert_eq!(m.mem.read_u8(0x1_1001).unwrap(), 0xBB);
+        assert_eq!(m.mem.read_u8(0x1_1002).unwrap(), 0xCC);
+        assert_eq!(m.mem.read_u8(0x1_1003).unwrap(), 0xDD);
+        assert_eq!(m.dma.master.channels[2].addr, 0x1004);
+        assert_eq!(m.dma.master.channels[2].count, 0xFFFF);
+        assert_eq!(m.dma.port_read(0x08, 1) as u8 & 0x0F, 0x04); // TC ch2
+        assert_eq!(m.dma.port_read(0x08, 1) as u8 & 0x0F, 0); // clear-on-read
+    }
+
+    /// Spec: Intel 8237A Read mode — `Machine::dma_transfer` fills I/O from PhysMem.
+    #[test]
+    fn machine_dma_transfer_ch2_read_from_physmem() {
+        use devices::DMA_PAGE_CH2;
+        let mut m = Machine::new(64 * 1024);
+        m.mem.write_u8(0x2000, 0x11).unwrap();
+        m.mem.write_u8(0x2001, 0x22).unwrap();
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x04, 1, 0x00);
+        m.dma.port_write(0x04, 1, 0x20); // addr 0x2000
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x05, 1, 0x01); // count 1 → 2 bytes
+        m.dma.port_write(0x05, 1, 0x00);
+        m.dma.port_write(DMA_PAGE_CH2, 1, 0x00);
+        m.dma.port_write(0x0B, 1, 0x4A); // Single | Inc | Read | ch2
+        m.dma.port_write(0x0A, 1, 0x02);
+        let mut io = [0u8; 2];
+        let n = m.dma_transfer(2, &mut io).expect("ch2 read from PhysMem");
+        assert_eq!(n, 2);
+        assert_eq!(io, [0x11, 0x22]);
+        assert_eq!(m.dma.master.channels[2].addr, 0x2002);
+        assert_eq!(m.dma.master.status & 0x0F, 0x04);
+    }
+
+    /// Spec: IBM PC AT A20 — DMA PhysMem callbacks honor the A20 gate mask.
+    #[test]
+    fn machine_dma_transfer_honors_a20_gate() {
+        use devices::DMA_PAGE_CH0;
+        let mut m = Machine::new(2 * 1024 * 1024);
+        // Distinct values at aliased addresses when A20 is off.
+        m.mem.write_u8(0x1000, 0x11).unwrap();
+        m.mem.write_u8(0x1000 | (1 << 20), 0x22).unwrap();
+        m.mem.set_a20_enabled(false);
+        // Program ch0 Write to phys 0x10_1000 (= page 0x10, addr 0x1000).
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x00, 1, 0x00);
+        m.dma.port_write(0x00, 1, 0x10); // addr 0x1000
+        m.dma.port_write(0x0C, 1, 0);
+        m.dma.port_write(0x01, 1, 0x00); // count 0 → 1 byte
+        m.dma.port_write(0x01, 1, 0x00);
+        m.dma.port_write(DMA_PAGE_CH0, 1, 0x10);
+        m.dma.port_write(0x0B, 1, 0x44); // Single | Inc | Write | ch0
+        m.dma.port_write(0x0A, 1, 0x00); // unmask ch0
+        let mut io = [0xAAu8];
+        m.dma_transfer(0, &mut io).expect("ch0 write with A20 off");
+        // With A20 off, write aliases to 0x1000, not 0x10_1000.
+        assert_eq!(m.mem.read_u8(0x1000).unwrap(), 0xAA);
+        m.mem.set_a20_enabled(true);
+        assert_eq!(m.mem.read_u8(0x1000 | (1 << 20)).unwrap(), 0x22); // untouched
+    }
+
+    /// MachineBus path shares the same PhysMem wiring as [`Machine::dma_transfer`].
+    #[test]
+    fn machine_bus_dma_transfer_ch2_write_into_physmem() {
+        let mut m = Machine::new(256 * 1024);
+        program_dma_ch2_write(&mut m, 0x01, 0x0800, 1); // 2 bytes @ 0x1_0800
+        let mut io = [0xEEu8, 0xFF];
+        {
+            let mut bus = m.bus_mut();
+            let n = bus.dma_transfer(2, &mut io).expect("bus ch2 write");
+            assert_eq!(n, 2);
+        }
+        assert_eq!(m.mem.read_u8(0x1_0800).unwrap(), 0xEE);
+        assert_eq!(m.mem.read_u8(0x1_0801).unwrap(), 0xFF);
+        assert_eq!(m.dma.master.channels[2].count, 0xFFFF);
+        assert_eq!(m.dma.master.status & 0x0F, 0x04);
     }
 
     /// Spec: IBM VGA text — MachineBus overlays 0xB8000 plane (not PhysMem RAM).
