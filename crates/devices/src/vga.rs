@@ -40,8 +40,11 @@
 //! - OSDev VGA Hardware / FreeVGA Graphics Registers — Address `0x3CE`, Data
 //!   `0x3CF`; indexes `0x00`–`0x08` (Set/Reset, Enable Set/Reset, Color Compare,
 //!   Data Rotate, Read Map Select, Graphics Mode, Miscellaneous, Color Don't
-//!   Care, Bit Mask). Bit Mask `0x08` (bits 7:0 select which data bits are
-//!   written; mode-03h reset default `0xFF` = all bits enabled).
+//!   Care, Bit Mask). Graphics Mode `0x05` (bits 1:0 Write Mode, bit3 Read Mode,
+//!   bit4 Host Odd/Even, bit5 Shift Register Interleave, bit6 Shift256;
+//!   mode-03h reset default `0x10` = Host Odd/Even). Bit Mask `0x08` (bits 7:0
+//!   select which data bits are written; mode-03h reset default `0xFF` = all
+//!   bits enabled).
 //! - OSDev VGA Hardware / FreeVGA Attribute Controller Registers — Address/Data
 //!   at `0x3C0` (flip-flop), Data Read at `0x3C1`; indexes `0x00`–`0x14`
 //!   (palette `0x00`–`0x0F`, Mode Control `0x10` with mode-03h reset default
@@ -91,9 +94,10 @@
 //!   with mode-03h reset default `0x00` (no timing/plane write-enable/font-map
 //!   side effects)
 //! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
-//!   register file on `0x3CF` with mode-03h-class reset defaults; Bit Mask
-//!   `0x08` store/readback with mode-03h reset default `0xFF` (no write-mode /
-//!   map / bitmask side effects)
+//!   register file on `0x3CF` with mode-03h-class reset defaults; Graphics Mode
+//!   `0x05` store/readback with mode-03h reset default `0x10`; Bit Mask `0x08`
+//!   store/readback with mode-03h reset default `0xFF` (no write-mode / read-mode
+//!   / map / bitmask side effects)
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
 //!   `0x3C1`, flip-flop reset via Input Status #1 (active IOAS map); Mode Control
 //!   `0x10` store/readback with mode-03h reset default `0x0C`; Overscan Color
@@ -467,6 +471,20 @@ pub const VGA_GC_DATA_ROTATE: u8 = 0x03;
 /// writes replace plane data without rotate or logical mix. Store/readback
 /// only; no rotate/function side effects on the text plane.
 pub const VGA_GC_DATA_ROTATE_DEFAULT: u8 = 0x00;
+/// Graphics Controller Graphics Mode Register index.
+///
+/// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x05`. Bits 1:0 = Write
+/// Mode (`00`–`11`); bit3 = Read Mode; bit4 = Host Odd/Even Memory Read
+/// Addressing; bit5 = Shift Register Interleave; bit6 = 256-Color Shift Mode.
+/// Write/read-mode and shift side effects on the plane path are out of scope
+/// (store/readback only).
+pub const VGA_GC_MODE: u8 = 0x05;
+/// Mode-03h-class Graphics Mode reset default (`0x10` = Host Odd/Even).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Graphics Mode `0x10` so host
+/// memory reads use odd/even addressing. Store/readback only; no write-mode /
+/// read-mode / shift side effects on the text plane.
+pub const VGA_GC_MODE_DEFAULT: u8 = 0x10;
 /// Graphics Controller Bit Mask Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x08`. Bits 7:0 select
@@ -483,6 +501,9 @@ pub const VGA_GC_BIT_MASK_DEFAULT: u8 = 0xFF;
 const _: () = assert!(
     VGA_GC_DATA_ROTATE == 0x03
         && VGA_GC_DATA_ROTATE_DEFAULT == 0x00
+        && VGA_GC_MODE == 0x05
+        && VGA_GC_MODE_DEFAULT == 0x10
+        && VGA_GC_DEFAULTS[VGA_GC_MODE as usize] == VGA_GC_MODE_DEFAULT
         && VGA_GC_BIT_MASK == 0x08
         && VGA_GC_BIT_MASK_DEFAULT == 0xFF
 );
@@ -492,16 +513,16 @@ const _: () = assert!(
 /// Spec: FreeVGA Graphics Registers / OSDev VGA Hardware / IBM VGA mode-03h —
 /// SeaBIOS-class text programming: Set/Reset `0x00`, Enable Set/Reset `0x00`,
 /// Color Compare `0x00`, Data Rotate [`VGA_GC_DATA_ROTATE_DEFAULT`], Read Map
-/// Select `0x00`, Graphics Mode `0x10` (host odd/even), Miscellaneous `0x0E`
-/// (odd/even + memory map `B8000`), Color Don't Care `0x00`, Bit Mask
-/// [`VGA_GC_BIT_MASK_DEFAULT`].
+/// Select `0x00`, Graphics Mode [`VGA_GC_MODE_DEFAULT`] (host odd/even),
+/// Miscellaneous `0x0E` (odd/even + memory map `B8000`), Color Don't Care
+/// `0x00`, Bit Mask [`VGA_GC_BIT_MASK_DEFAULT`].
 pub const VGA_GC_DEFAULTS: [u8; VGA_GC_REG_COUNT] = [
     0x00,
     0x00,
     0x00,
     VGA_GC_DATA_ROTATE_DEFAULT,
     0x00,
-    0x10,
+    VGA_GC_MODE_DEFAULT,
     0x0E,
     0x00,
     VGA_GC_BIT_MASK_DEFAULT,
@@ -2320,15 +2341,15 @@ mod tests {
         // Spec: FreeVGA Graphics Registers — write index 0x3CE, data 0x3CF;
         // indexes 0x00–0x08 (Set/Reset … Bit Mask).
         let mut v = VgaText::new();
-        v.port_write(VGA_GC_INDEX, 1, 0x05); // Graphics Mode
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
         v.port_write(VGA_GC_DATA, 1, 0x00);
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_BIT_MASK));
         v.port_write(VGA_GC_DATA, 1, 0xAA);
-        assert_eq!(v.gc_regs[0x05], 0x00);
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MODE)], 0x00);
         assert_eq!(v.gc_regs[usize::from(VGA_GC_BIT_MASK)], 0xAA);
         assert_eq!(v.port_read(VGA_GC_INDEX, 1) as u8, VGA_GC_BIT_MASK);
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0xAA);
-        v.port_write(VGA_GC_INDEX, 1, 0x05);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x00);
     }
 
@@ -2410,6 +2431,37 @@ mod tests {
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_BIT_MASK_DEFAULT);
     }
 
+    /// Spec: FreeVGA Graphics Registers — Graphics Mode (index `0x05`)
+    /// store/readback. Mode-03h reset default is [`VGA_GC_MODE_DEFAULT`]
+    /// (`0x10` = Host Odd/Even).
+    #[test]
+    fn gc_mode_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MODE)], VGA_GC_MODE_DEFAULT);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_MODE_DEFAULT);
+
+        // Write Mode 2 (bits 1:0 = 10) + Shift256 (bit6) — store/readback only.
+        v.port_write(VGA_GC_DATA, 1, 0x42);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x42);
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MODE)], 0x42);
+
+        // Word write path (lo=index, hi=data) also updates Graphics Mode.
+        v.port_write(
+            VGA_GC_INDEX,
+            2,
+            (u32::from(0x00u8) << 8) | u32::from(VGA_GC_MODE),
+        );
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MODE)], 0x00);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x00);
+
+        v.reset();
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MODE)], VGA_GC_MODE_DEFAULT);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_MODE_DEFAULT);
+    }
+
     #[test]
     fn graphics_controller_word_write_index_and_data() {
         // Mirror CRTC/Sequencer: 16-bit write to address port (lo=index, hi=data).
@@ -2429,8 +2481,8 @@ mod tests {
         // read returns 0 (same CRTC/Sequencer out-of-range policy).
         assert_eq!(v.gc_regs, VGA_GC_DEFAULTS);
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0);
-        v.port_write(VGA_GC_INDEX, 1, 0x05);
-        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x10);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_MODE_DEFAULT);
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_BIT_MASK));
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_BIT_MASK_DEFAULT);
     }
@@ -2447,6 +2499,7 @@ mod tests {
             v.gc_regs[usize::from(VGA_GC_DATA_ROTATE)],
             VGA_GC_DATA_ROTATE_DEFAULT
         );
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MODE)], VGA_GC_MODE_DEFAULT);
         assert_eq!(
             v.gc_regs[usize::from(VGA_GC_BIT_MASK)],
             VGA_GC_BIT_MASK_DEFAULT
@@ -2459,7 +2512,7 @@ mod tests {
                 0x00,
                 VGA_GC_DATA_ROTATE_DEFAULT,
                 0x00,
-                0x10,
+                VGA_GC_MODE_DEFAULT,
                 0x0E,
                 0x00,
                 VGA_GC_BIT_MASK_DEFAULT
@@ -2470,7 +2523,7 @@ mod tests {
     #[test]
     fn reset_restores_graphics_controller_defaults() {
         let mut v = VgaText::new();
-        v.port_write(VGA_GC_INDEX, 1, 0x05);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
         v.port_write(VGA_GC_DATA, 1, 0x40);
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_DATA_ROTATE));
         v.port_write(VGA_GC_DATA, 1, 0x18);
@@ -2479,8 +2532,8 @@ mod tests {
         v.reset();
         assert_eq!(v.gc_index, 0);
         assert_eq!(v.gc_regs, VGA_GC_DEFAULTS);
-        v.port_write(VGA_GC_INDEX, 1, 0x05);
-        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x10);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_MODE_DEFAULT);
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_DATA_ROTATE));
         assert_eq!(
             v.port_read(VGA_GC_DATA, 1) as u8,
