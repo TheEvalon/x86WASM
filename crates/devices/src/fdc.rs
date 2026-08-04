@@ -1,8 +1,9 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
 //! Relative Seek/Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
 //! READ DATA (media + no-media ND) / READ ID (media sector-ID stub + no-media
-//! ND) / READ DELETED DATA / WRITE DATA / WRITE DELETED DATA / VERIFY (media
-//! readable-sector stub + no-media ND) / FORMAT TRACK (no-media stubs) + IRQ6.
+//! ND) / READ DELETED DATA (media + no-media ND; no deleted-AM) / WRITE DATA /
+//! WRITE DELETED DATA / VERIFY (media readable-sector stub + no-media ND) /
+//! FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -30,11 +31,14 @@
 //!   bytes then 7-byte result; with media + N=2 + valid CHS → ST0 IC=00 +
 //!   ST1=0 + `last_sector` latch (MT=0 same-head sectors R..=EOT concatenated;
 //!   EOT==R → one sector) + IRQ6; else no-media/wrong-N/
-//!   OOR → ST0 IC=01 + ST1 ND + C/H/R/N ENDaddress and IRQ6; READ DELETED DATA (`0x0C` with
-//!   optional MT/MFM/SK in bits 7:5, §5.1.3 / Table 5-1) same 8-param /
-//!   7-result shape as READ DATA; no-media stub completes with ST0 IC=01 +
-//!   ST1 ND + C/H/R/N ENDaddress and IRQ6; WRITE DATA (`0x05` with optional
-//!   MT/MFM in bits 7:6, §5.1.2 / Table 5-1) same 8-param / 7-result shape;
+//!   OOR → ST0 IC=01 + ST1 ND + C/H/R/N ENDaddress and IRQ6; READ DELETED DATA
+//!   (`0x0C` with optional MT/MFM/SK in bits 7:5, §5.1.3 / Table 5-1) same
+//!   8-param / 7-result shape as READ DATA; with or without media → ST0 IC=01
+//!   | ST1 ND | C/H/R/N ENDaddress and IRQ6 (deleted address-mark engine
+//!   unsupported: raw images have no deleted AM; honest ND, not READ DATA
+//!   fall-through; single-sector stub, MT ignored); WRITE DATA (`0x05` with
+//!   optional MT/MFM in bits 7:6, §5.1.2 / Table 5-1) same 8-param / 7-result
+//!   shape;
 //!   with media + N=2 + valid CHS → ST0 IC=00 + ST1=0 + `last_write` latch
 //!   (MT=0 same-head sectors R..=EOT concatenated; EOT==R → one sector) /
 //!   `write_sector` + IRQ6; else no-media/wrong-N/OOR → ST0
@@ -129,11 +133,16 @@
 //!   params, RQM|DIO during result.
 //! - READ DELETED DATA (`0x0C` | MT/MFM/SK): Spec Intel 82077AA §5.1.3 /
 //!   Table 5-1 — command byte lower 5 bits `01100`; optional MT/MFM/SK; same
-//!   eight params and 7-byte result as READ DATA; no media image → skip
+//!   eight params and 7-byte result as READ DATA. Spec seeks sectors with a
+//!   *deleted* data address mark; this emulator has no deleted-AM engine and
+//!   raw 1.44MB images carry none → treat as no deleted sector found: skip
 //!   execution/DMA, immediate result ST0 (IC=01 abnormal | H | US), ST1 ND
-//!   (same honest no-media ST1 as READ DATA stub), ST2=0, C/H/R/N = command
-//!   ENDaddress; asserts IRQ6 (cleared on first result byte); EOT latched
-//!   into `sc_eot`.
+//!   (§6.2 No Data; SeaBIOS-safe; ST2 CM unused — CM is for encountering a
+//!   deleted mark during READ DATA / skip path), ST2=0, C/H/R/N = command
+//!   ENDaddress. Same ND with media attached (distinct from no-media only by
+//!   `has_media`) or without; does **not** fall through to READ DATA success.
+//!   Single-sector stub (starting R; MT / multi-sector deferred). Asserts IRQ6
+//!   (cleared on first result byte); EOT latched into `sc_eot`.
 //! - WRITE DATA (`0x05` | MT/MFM): Spec Intel 82077AA §5.1.2 / Table 5-1 —
 //!   command byte lower 5 bits `00101`; optional MT (`0x80`)/MFM (`0x40`);
 //!   same eight params and 7-byte result as READ DATA. With attached 1.44MB
@@ -197,9 +206,9 @@
 //!
 //! - WRITE DELETED DATA / READ TRACK and other transfer commands; VERIFY
 //!   multi-sector / EC/CRC compare beyond readable-sector stub; READ ID full
-//!   IDAM track scan (sector-ID stub only); READ DELETED DATA
-//!   media/deleted-address-mark engine; FORMAT TRACK media write / per-sector
-//!   ID DMA
+//!   IDAM track scan (sector-ID stub only); READ DELETED DATA deleted
+//!   address-mark engine (media path remains honest ST1 ND); FORMAT TRACK
+//!   media write / per-sector ID DMA
 //! - MT head-switch multi-track; VERIFY DMA; DREQ/DACK cycle timing; FORMAT
 //!   media
 //! - Seek / Relative Seek step timing; Relative Seek ST0 EC when stepping out
@@ -1254,15 +1263,20 @@ impl Fdc82077 {
         self.phase = Phase::ReadDeletedDataParams { index: 0 };
     }
 
-    /// Complete READ DELETED DATA after eight parameters — no-media stub.
+    /// Complete READ DELETED DATA after eight parameters.
     ///
     /// Spec: Intel 82077AA §5.1.3 / Table 5-1 / §6.1 / §6.2 — same parameter and
-    /// result shape as READ DATA. With no media image this stub skips the
-    /// execution/DMA transfer phase and enters result immediately: ST0 IC=01
-    /// (abnormal termination) | H | US; ST1 ND (No Data — honest no-media
-    /// equivalent consistent with the READ DATA stub); ST2=0; C/H/R/N reflect
-    /// command ENDaddress; latches EOT into `sc_eot`; asserts IRQ (cleared when
-    /// the host reads the first result byte). No Sense Interrupt.
+    /// result shape as READ DATA. READ DELETED DATA seeks a *deleted* data
+    /// address mark. This emulator has no deleted-AM engine and raw 1.44MB
+    /// images carry none → honest "no deleted sector" path for both media and
+    /// no-media: skip execution/DMA, clear any prior `last_sector` /
+    /// `dma_read_pending`, enter result immediately with ST0 IC=01 (abnormal)
+    /// | H | US; ST1 ND (No Data, §6.2 — preferred over inventing ST2 CM, which
+    /// applies when a deleted mark is encountered on READ DATA / SK paths);
+    /// ST2=0; C/H/R/N = command ENDaddress. Single-sector stub (starting R;
+    /// MT ignored). Latches EOT into `sc_eot`; asserts IRQ (cleared when the
+    /// host reads the first result byte). No Sense Interrupt. Does **not**
+    /// fall through to READ DATA success when media is present (SeaBIOS-safe).
     fn finish_read_deleted_data(&mut self) {
         let head_unit = self.read_params[0];
         let unit = head_unit & 0x03;
@@ -1272,10 +1286,13 @@ impl Fdc82077 {
         let r = self.read_params[3];
         let n = self.read_params[4];
         let eot = self.read_params[5];
-        // GPL (params[6]) and DTL (params[7]) accepted; unused without media.
+        // GPL (params[6]) and DTL (params[7]) accepted; MT / multi-sector deferred.
+        // Media presence does not change the result: deleted-AM engine unsupported.
 
         self.sc_eot = eot;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        self.last_sector = None;
+        self.dma_read_pending = false;
         self.read_result = [
             FDC_ST0_IC_ABNORMAL | st0_head | unit,
             FDC_ST1_ND,
@@ -4612,6 +4629,135 @@ mod tests {
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
         assert_eq!(f.phase, Phase::Command);
         assert_eq!(f.sc_eot, 0x12, "EOT latched for DUMPREG");
+        assert!(!f.has_media(), "no-media path: image absent");
+    }
+
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1 / §6.2 — with media attached,
+    /// READ DELETED DATA still completes ST0 IC=01 + ST1 ND because the
+    /// deleted address-mark engine is unsupported (raw 1.44MB images have no
+    /// deleted AM). Distinct from the no-media ND test: `has_media` is true,
+    /// and READ DATA on the same image would succeed. Single-sector (EOT==R);
+    /// no `last_sector` / DMA arm (not a READ DATA fall-through).
+    #[test]
+    fn read_deleted_data_with_media_nd_no_dma() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let mut f = Fdc82077::with_image(img);
+        assert!(
+            f.has_media(),
+            "media attached — distinct from no-media ND test"
+        );
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // Prove the sector is readable via READ DATA (media works).
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_NORMAL);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x00,
+            "ST1 clear on READ DATA"
+        );
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert!(
+            f.last_sector().is_some(),
+            "READ DATA latched sector — media path works"
+        );
+
+        // Soft-reset abort / clear latches, then READ DELETED DATA on same media.
+        f.port_write(FDC_DOR, 1, 0);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(f.has_media());
+
+        // READ DELETED DATA MFM: C=0,H=0,R=1,N=2,EOT=1 — single sector.
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_READ_DELETED_DATA),
+        );
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(
+            f.irq_line(),
+            "READ DELETED DATA asserts IRQ6 on media ND completion"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0, FDC_ST0_IC_ABNORMAL,
+            "ST0 = IC=01 | H=0 | US=0 (abnormal — no deleted AM)"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST1_ND,
+            "ST1 ND — deleted AM absent / engine unsupported (82077AA §5.1.3 / §6.2)"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x00,
+            "ST2 clear (no CM invent)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x01, "EOT latched for DUMPREG");
+        assert!(f.has_media(), "media still attached after ND result");
+
+        assert!(
+            f.last_sector().is_none(),
+            "READ DELETED must not latch host/DMA sector bytes"
+        );
+        assert_eq!(f.pending_dma_byte_count(), 0);
+        assert!(
+            f.take_pending_dma_sector().is_none(),
+            "READ DELETED must not arm DMA pending"
+        );
+    }
+
+    /// Spec: Intel 82077AA §5.1.3 — MT ignored; EOT>R still single-sector ND
+    /// (multi-sector / deleted-AM engine deferred).
+    #[test]
+    fn read_deleted_data_with_media_mt_ignored_single_sector_nd() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_DELETED_DATA_MT_MFM_SK));
+        for p in [0x04u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=01 | H=1 | US=0; MT does not change ND stub"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R (starting, not EOT)
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.sc_eot, 0x02);
+        assert!(f.last_sector().is_none());
+        assert!(f.take_pending_dma_sector().is_none());
     }
 
     /// Spec: Intel 82077AA Table 5-1 — MT|MFM|SK|READ DELETED DATA (`0xEC`) uses
