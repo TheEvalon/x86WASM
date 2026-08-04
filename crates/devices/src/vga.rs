@@ -230,6 +230,10 @@ pub const VGA_MISC_CLOCK_28MHZ: u8 = 0x04;
 const _: () = assert!((VGA_MISC_OUTPUT_DEFAULT & VGA_MISC_CLOCK_SELECT) == VGA_MISC_CLOCK_28MHZ);
 /// Compile-time check: 25 MHz-class encoding is bits 3:2 = 00.
 const _: () = assert!(VGA_MISC_CLOCK_25MHZ == 0x00);
+/// Misc Output bit6 — Horizontal Sync Polarity. Spec: FreeVGA / IBM VGA.
+pub const VGA_MISC_HSYNC_POLARITY: u8 = 0x40;
+/// Misc Output bit7 — Vertical Sync Polarity. Spec: FreeVGA / IBM VGA.
+pub const VGA_MISC_VSYNC_POLARITY: u8 = 0x80;
 
 /// Graphics Controller Address (index) Register.
 ///
@@ -521,6 +525,16 @@ impl VgaText {
     /// Misc Output Clock Select field (bits 3:2). Spec: FreeVGA / IBM VGA.
     pub fn misc_clock_select(&self) -> u8 {
         self.misc_output & VGA_MISC_CLOCK_SELECT
+    }
+
+    /// Misc Output HSYNC polarity bit (bit6). Spec: FreeVGA / IBM VGA.
+    pub fn misc_hsync_polarity(&self) -> bool {
+        self.misc_output & VGA_MISC_HSYNC_POLARITY != 0
+    }
+
+    /// Misc Output VSYNC polarity bit (bit7). Spec: FreeVGA / IBM VGA.
+    pub fn misc_vsync_polarity(&self) -> bool {
+        self.misc_output & VGA_MISC_VSYNC_POLARITY != 0
     }
 
     /// True if this device owns the I/O port (CRTC + Sequencer + GC + ATC +
@@ -1541,6 +1555,36 @@ mod tests {
             v.port_read(VGA_MISC_OUTPUT_READ, 1) as u8,
             VGA_MISC_OUTPUT_DEFAULT
         );
+    }
+
+    /// Spec: FreeVGA / IBM VGA — Misc Output bits 6/7 HSYNC/VSYNC polarity
+    /// store/readback (timing side effects not modeled).
+    #[test]
+    fn misc_hsync_vsync_polarity_store_readback() {
+        let mut v = VgaText::new();
+        // Default `0x67` has HSYNC=1 VSYNC=0.
+        assert!(v.misc_hsync_polarity());
+        assert!(!v.misc_vsync_polarity());
+        let cleared = v.misc_output & !(VGA_MISC_HSYNC_POLARITY | VGA_MISC_VSYNC_POLARITY);
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(cleared | VGA_MISC_VSYNC_POLARITY),
+        );
+        assert!(!v.misc_hsync_polarity());
+        assert!(v.misc_vsync_polarity());
+        assert_eq!(
+            v.port_read(VGA_MISC_OUTPUT_READ, 1) as u8
+                & (VGA_MISC_HSYNC_POLARITY | VGA_MISC_VSYNC_POLARITY),
+            VGA_MISC_VSYNC_POLARITY
+        );
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(cleared | VGA_MISC_HSYNC_POLARITY | VGA_MISC_VSYNC_POLARITY),
+        );
+        assert!(v.misc_hsync_polarity());
+        assert!(v.misc_vsync_polarity());
     }
 
     /// Spec: FreeVGA / IBM VGA — Misc Output bits 3:2 Clock Select store/readback.

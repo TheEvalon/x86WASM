@@ -135,6 +135,18 @@ pub const ATA_CMD_STANDBY_IMMEDIATE: u8 = 0xE0;
 pub const ATA_CMD_CHECK_POWER_MODE: u8 = 0xE5;
 /// CHECK POWER MODE result: device is Active or Idle.
 pub const ATA_POWER_ACTIVE_OR_IDLE: u8 = 0xFF;
+/// STANDBY — non-data success (timer in sector_count ignored).
+/// Spec: ATA/ATAPI Command Set — STANDBY (`0xE2`).
+pub const ATA_CMD_STANDBY: u8 = 0xE2;
+/// SLEEP — non-data success.
+/// Spec: ATA/ATAPI Command Set — SLEEP (`0xE6`).
+pub const ATA_CMD_SLEEP: u8 = 0xE6;
+/// RECALIBRATE — non-data success stub.
+/// Spec: ATA/ATAPI Command Set — RECALIBRATE (`0x10`).
+pub const ATA_CMD_RECALIBRATE: u8 = 0x10;
+/// SEEK — non-data success stub.
+/// Spec: ATA/ATAPI Command Set — SEEK (`0x70`).
+pub const ATA_CMD_SEEK: u8 = 0x70;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -610,6 +622,26 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// RECALIBRATE (`0x10`) / SEEK (`0x70`) — non-data success stubs.
+    ///
+    /// Spec: ATA RECALIBRATE/SEEK complete with DRDY|DSC; this stub does not
+    /// model physical head motion (DSC always set when ready).
+    fn exec_recalibrate_seek_success(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
     /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
@@ -663,10 +695,13 @@ impl IdePrimary {
             ATA_CMD_NOP => self.exec_nop(),
             ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
             ATA_CMD_WRITE_MULTIPLE => self.exec_write_multiple(),
-            ATA_CMD_IDLE | ATA_CMD_IDLE_IMMEDIATE | ATA_CMD_STANDBY_IMMEDIATE => {
-                self.exec_power_mgmt_success()
-            }
+            ATA_CMD_IDLE
+            | ATA_CMD_IDLE_IMMEDIATE
+            | ATA_CMD_STANDBY_IMMEDIATE
+            | ATA_CMD_STANDBY
+            | ATA_CMD_SLEEP => self.exec_power_mgmt_success(),
             ATA_CMD_CHECK_POWER_MODE => self.exec_check_power_mode(),
+            ATA_CMD_RECALIBRATE | ATA_CMD_SEEK => self.exec_recalibrate_seek_success(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             ATA_CMD_SET_FEATURES => self.exec_set_features(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
@@ -1532,10 +1567,10 @@ mod tests {
         assert_eq!(st & ATA_SR_DRQ, 0);
     }
 
-    /// Spec: ATA — IDLE / IDLE IMMEDIATE / STANDBY IMMEDIATE succeed; CHECK POWER
-    /// MODE sets sector_count=`0xFF` (Active/Idle).
+    /// Spec: ATA — IDLE / IDLE IMMEDIATE / STANDBY IMMEDIATE / STANDBY / SLEEP
+    /// succeed; CHECK POWER MODE sets sector_count=`0xFF` (Active/Idle).
     #[test]
-    fn idle_standby_and_check_power_mode() {
+    fn idle_standby_sleep_and_check_power_mode() {
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
         clear_nien(&mut ide);
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
@@ -1543,6 +1578,8 @@ mod tests {
             ATA_CMD_IDLE,
             ATA_CMD_IDLE_IMMEDIATE,
             ATA_CMD_STANDBY_IMMEDIATE,
+            ATA_CMD_STANDBY,
+            ATA_CMD_SLEEP,
         ] {
             ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
             assert!(ide.irq_line());
@@ -1559,6 +1596,21 @@ mod tests {
         );
         let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
         assert_eq!(st & ATA_SR_ERR, 0);
+    }
+
+    /// Spec: ATA — RECALIBRATE (`0x10`) and SEEK (`0x70`) non-data success.
+    #[test]
+    fn recalibrate_and_seek_succeed() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        for cmd in [ATA_CMD_RECALIBRATE, ATA_CMD_SEEK] {
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
+            assert!(ide.irq_line());
+            let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+            assert_eq!(st & ATA_SR_ERR, 0);
+            assert_ne!(st & ATA_SR_DSC, 0);
+        }
     }
 
     #[test]

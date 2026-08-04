@@ -182,6 +182,12 @@ pub const FDC_CMD_VERIFY: u8 = 0x16;
 /// READ ID base opcode (bits 4:0). Spec: Intel 82077AA Table 5-1 —
 /// command byte is `0|MFM|0|0 0 0 1 0 1 0`; match with [`FDC_CMD_OPCODE_MASK`].
 pub const FDC_CMD_READ_ID: u8 = 0x0A;
+/// SCAN EQUAL base opcode (bits 4:0). Spec: Intel 82077AA Table 5-1 —
+/// command byte is `MT|MFM|SK|1 0 0 0 1`; match with [`FDC_CMD_OPCODE_MASK`].
+pub const FDC_CMD_SCAN_EQUAL: u8 = 0x11;
+/// Documented SCAN EQUAL form: MT|MFM|SK|0x11. Spec: 82077AA Table 5-1.
+pub const FDC_CMD_SCAN_EQUAL_MT_MFM_SK: u8 =
+    FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_SK | FDC_CMD_SCAN_EQUAL;
 /// Documented READ ID form: MFM|0x0A. Spec: 82077AA Table 5-1.
 pub const FDC_CMD_READ_ID_MFM: u8 = FDC_CMD_MFM | FDC_CMD_READ_ID;
 /// READ ID result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA.
@@ -878,6 +884,14 @@ impl Fdc82077 {
         cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_VERIFY_MT_MFM_SK & FDC_CMD_OPCODE_MASK)
     }
 
+    /// True if `cmd` is SCAN EQUAL including optional MT/MFM/SK modifiers.
+    ///
+    /// Spec: Intel 82077AA Table 5-1 — opcode bits 4:0 = `10001`.
+    #[inline]
+    fn is_scan_equal_command(cmd: u8) -> bool {
+        cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_SCAN_EQUAL_MT_MFM_SK & FDC_CMD_OPCODE_MASK)
+    }
+
     /// True if `cmd` is WRITE DATA including optional MT/MFM modifiers.
     ///
     /// Spec: Intel 82077AA §5.1.2 / Table 5-1 — opcode bits 4:0 = `00101`;
@@ -1226,6 +1240,9 @@ impl Fdc82077 {
                     self.start_read_deleted_data();
                 } else if Self::is_verify_command(v) {
                     // Spec: Intel 82077AA Table 5-1 — MT/MFM/SK | 10110; eight params.
+                    self.start_verify();
+                } else if Self::is_scan_equal_command(v) {
+                    // Spec: Intel 82077AA Table 5-1 — SCAN EQUAL; reuse VERIFY no-media path.
                     self.start_verify();
                 } else if Self::is_write_data_command(v) {
                     // Spec: Intel 82077AA §5.1.2 — MT/MFM | 00101; eight params.
@@ -3136,6 +3153,25 @@ mod tests {
 
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 — SCAN EQUAL (`0x11`) no-media via VERIFY path.
+    #[test]
+    fn scan_equal_mfm_no_media_via_verify_path() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_SCAN_EQUAL));
+        assert_eq!(f.phase, Phase::VerifyParams { index: 0 });
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
     }
 
     /// Spec: Intel 82077AA Table 5-1 — READ ID (`0x0A` / MFM `0x4A`) no-media:
