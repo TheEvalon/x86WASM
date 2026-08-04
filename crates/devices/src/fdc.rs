@@ -1,5 +1,5 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
-//! Sense Int/Sense Drive/Version/Configure + IRQ6.
+//! Sense Int/Sense Drive/Version/Configure/LOCK + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -15,13 +15,15 @@
 //!   bit7 unused=0, bit6 WP, bit5 unused=1, bit4 T0, bit3 unused=1, bit2 HD,
 //!   bits1:0 DS1/DS0), no IRQ; Version (`0x10`) no parameters, 1-byte result
 //!   `0x90` (82077AA identification); Configure (`0x13`) three parameter bytes
-//!   (unused, EIS|FIFO_DIS|POLL_DIS|FIFOTHR, PRETRK), no result/IRQ; DOR bit3
-//!   DMA/IRQ enable; IRQ6 on command / reset completion.
+//!   (unused, EIS|FIFO_DIS|POLL_DIS|FIFOTHR, PRETRK), no result/IRQ; LOCK
+//!   (`0x14`/`0x94`, §5.3.2) no params, LOCK in command bit7, result
+//!   `LOCK<<4`, no IRQ; DOR bit3 DMA/IRQ enable; IRQ6 on command / reset
+//!   completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
 //!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
 //!   Version returns `0x90` for 82077AA-class controllers; Configure stores
-//!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes.
+//!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes; Lock/Unlock via MT bit.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -49,19 +51,24 @@
 //!   parameters, no IRQ assert/clear; MSR RQM|DIO during result phase
 //! - Configure (`0x13`): command byte → three parameter bytes stored
 //!   (`configure_byte0`, `configure_eis_fifo_poll_thr`, `configure_pretrk`);
-//!   no result phase; no IRQ; MSR RQM (!DIO) during parameter phase. Soft
-//!   `reset()` clears stored fields to 0 (stub default; real post-hardware-reset
-//!   often has FIFO disabled / thr=1 — not modeled until LOCK/engine work).
+//!   no result phase; no IRQ; MSR RQM (!DIO) during parameter phase.
+//! - LOCK (`0x14` unlock / `0x94` lock): Spec Intel 82077AA §5.3.2 — LOCK is
+//!   command-byte bit7 (no parameter bytes); one result byte `LOCK<<4` with
+//!   MSR RQM|DIO; no IRQ. Soft DOR reset does **not** clear LOCK; when LOCK=0
+//!   soft reset restores Configure EFIFO/FIFOTHR/PRETRK stub defaults (0);
+//!   when LOCK=1 those Configure fields survive soft reset. Full `reset()`
+//!   (hardware) clears LOCK and all Configure fields.
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - Other commands (READ/WRITE/FORMAT/LOCK/PERPENDICULAR/DUMPREG/…)
+//! - Other commands (READ/WRITE/FORMAT/PERPENDICULAR/DUMPREG/…)
 //! - Media image, seek step timing, format/read/write transfers
 //! - DMA channel 2 transfers (ND bit stored only; not enforced)
 //! - Automatic IRQ on real media command completion (host may still use assert API)
 //! - Drive sensing, disk-change edge timing, perpendicular mode
-//! - Configure bit side effects (FIFO enable, implied seek, poll disable enforcement)
+//! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
+//!   implied seek, poll disable enforcement); DSR software-reset path
 
 use crate::PortDevice;
 
@@ -106,6 +113,14 @@ pub const FDC_CMD_VERSION: u8 = 0x10;
 /// Configure command opcode. Spec: Intel 82077AA / OSDev FDC — 3 parameter
 /// bytes, no result phase, no IRQ.
 pub const FDC_CMD_CONFIGURE: u8 = 0x13;
+/// LOCK command base opcode (bits 6:0). Spec: Intel 82077AA §5.3.2 / OSDev —
+/// command byte is `LOCK|0x14` where bit7 is the LOCK value (`0x14` unlock,
+/// `0x94` lock); no parameter bytes; 1 result byte.
+pub const FDC_CMD_LOCK: u8 = 0x14;
+/// LOCK command with LOCK bit set (MT/LOCK position). Spec: 82077AA §5.3.2.
+pub const FDC_CMD_LOCK_SET: u8 = 0x94;
+/// LOCK result: LOCK value in bit4 (`lock << 4`). Spec: 82077AA §5.3.2 / OSDev.
+pub const FDC_LOCK_RESULT_SHIFT: u8 = 4;
 /// Version result byte for 82077AA-class controllers. Spec: Intel 82077AA /
 /// OSDev FDC — `0x90` identifies enhanced/82077AA (vs `0x80` for older 8272A).
 pub const FDC_VERSION_82077AA: u8 = 0x90;
@@ -151,9 +166,11 @@ enum Phase {
     /// Configure parameters: byte0 unused, byte1 EIS|FIFO_DIS|POLL_DIS|FIFOTHR,
     /// byte2 PRETRK.
     ConfigureParams { index: u8 },
+    /// LOCK result: single status byte (`LOCK<<4`). Spec: 82077AA §5.3.2.
+    LockResult,
 }
 
-/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/Configure + IRQ6.
+/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/Configure/LOCK + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -183,6 +200,10 @@ pub struct Fdc82077 {
     pub configure_eis_fifo_poll_thr: u8,
     /// Configure parameter 2: PRETRK (write precompensation start track).
     pub configure_pretrk: u8,
+    /// LOCK bit from LOCK command (`0x14`/`0x94`). Spec: Intel 82077AA §5.3.2 —
+    /// when set, soft DOR/DSR reset must not restore Configure EFIFO/FIFOTHR/
+    /// PRETRK defaults; hardware/`reset()` clears LOCK.
+    pub lock: bool,
     /// Latched IRQ request (command-complete / reset stub). Spec: 82077AA → ISA IRQ6.
     irq_pending: bool,
     phase: Phase,
@@ -221,6 +242,7 @@ impl Fdc82077 {
             configure_byte0: 0x00,
             configure_eis_fifo_poll_thr: 0x00,
             configure_pretrk: 0x00,
+            lock: false,
             irq_pending: false,
             phase: Phase::Command,
             pending_sense_st0: None,
@@ -262,7 +284,8 @@ impl Fdc82077 {
                 | Phase::ConfigureParams { .. } => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. }
                 | Phase::SenseDriveStatusResult
-                | Phase::VersionResult => FDC_MSR_RQM | FDC_MSR_DIO,
+                | Phase::VersionResult
+                | Phase::LockResult => FDC_MSR_RQM | FDC_MSR_DIO,
             }
         }
     }
@@ -293,6 +316,12 @@ impl Fdc82077 {
         self.seek_head_unit = 0;
         self.sense_st0 = 0;
         self.sense_st3 = 0;
+        // Spec: Intel 82077AA §5.3.2 — soft DOR reset does not clear LOCK; when
+        // LOCK=0, EFIFO/FIFOTHR/PRETRK return to defaults (stub zeros).
+        if !self.lock {
+            self.configure_eis_fifo_poll_thr = 0;
+            self.configure_pretrk = 0;
+        }
     }
 
     /// Begin Specify parameter phase (2 bytes). Spec: Intel 82077AA Specify.
@@ -385,6 +414,15 @@ impl Fdc82077 {
         self.phase = Phase::ConfigureParams { index: 0 };
     }
 
+    /// Begin LOCK result phase. Spec: Intel 82077AA §5.3.2 / OSDev Lock.
+    ///
+    /// Command byte encodes LOCK in bit7 (`0x14` unlock / `0x94` lock); no
+    /// parameter bytes; one result byte `LOCK<<4`; no IRQ.
+    fn start_lock(&mut self, cmd: u8) {
+        self.lock = (cmd & 0x80) != 0;
+        self.phase = Phase::LockResult;
+    }
+
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
             // Spec: Specify/Recalibrate/Seek/Configure have no result phase; open-bus when idle/params.
@@ -413,6 +451,10 @@ impl Fdc82077 {
             Phase::VersionResult => {
                 self.phase = Phase::Command;
                 FDC_VERSION_82077AA
+            }
+            Phase::LockResult => {
+                self.phase = Phase::Command;
+                u8::from(self.lock) << FDC_LOCK_RESULT_SHIFT
             }
         }
     }
@@ -444,6 +486,9 @@ impl Fdc82077 {
                 } else if v == FDC_CMD_CONFIGURE {
                     // Spec: Intel 82077AA Configure — three params; no result/IRQ.
                     self.start_configure();
+                } else if v == FDC_CMD_LOCK || v == FDC_CMD_LOCK_SET {
+                    // Spec: Intel 82077AA §5.3.2 — LOCK in bit7; no params; result LOCK<<4.
+                    self.start_lock(v);
                 }
                 // Other opcodes: accept/drop until a command engine exists.
             }
@@ -498,7 +543,10 @@ impl Fdc82077 {
                     }
                 }
             }
-            Phase::SenseIntResult { .. } | Phase::SenseDriveStatusResult | Phase::VersionResult => {
+            Phase::SenseIntResult { .. }
+            | Phase::SenseDriveStatusResult
+            | Phase::VersionResult
+            | Phase::LockResult => {
                 // Host must not write during result phase (stub ignores).
             }
         }
@@ -1256,8 +1304,8 @@ mod tests {
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
         assert_eq!(f.phase, Phase::Command);
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
-        // Soft DOR reset aborts phase (partial command discarded); stored fields
-        // survive until full `reset()` — same policy as Specify.
+        // Soft DOR reset aborts phase; with LOCK=0, EFIFO/FIFOTHR/PRETRK return
+        // to stub defaults (0). Unused configure_byte0 is not LOCK-protected.
         assert_eq!(f.configure_byte0, 0xAB);
         assert_eq!(f.configure_eis_fifo_poll_thr, 0);
         assert_eq!(f.configure_pretrk, 0);
@@ -1309,6 +1357,171 @@ mod tests {
         assert_eq!(f.configure_byte0, 0);
         assert_eq!(f.configure_eis_fifo_poll_thr, 0);
         assert_eq!(f.configure_pretrk, 0);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA §5.3.2 / OSDev Lock — opcode `0x94` (LOCK=1 in bit7),
+    /// no parameter bytes; result `LOCK<<4` = `0x10`; no IRQ.
+    #[test]
+    fn lock_set_stores_flag_and_returns_result_0x10() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        assert!(f.lock, "LOCK bit set from command byte bit7");
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(!f.irq_line(), "LOCK must not assert IRQ");
+
+        let result = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            result,
+            1u8 << FDC_LOCK_RESULT_SHIFT,
+            "result reflects LOCK in bit4"
+        );
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "idle command phase after result"
+        );
+        assert_eq!(f.phase, Phase::Command);
+        assert!(f.lock);
+    }
+
+    /// Spec: Intel 82077AA §5.3.2 / OSDev — unlock opcode `0x14` (LOCK=0);
+    /// result `0x00`; no params; no IRQ.
+    #[test]
+    fn lock_clear_stores_flag_and_returns_result_0x00() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.lock = true;
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK));
+        assert!(!f.lock, "LOCK cleared by 0x14");
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM | FDC_MSR_DIO);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.phase, Phase::Command);
+        assert!(!f.lock);
+        assert!(!f.irq_line());
+    }
+
+    /// Spec: 82077AA §5.3.2 — "No interrupts are generated at the end of this command."
+    #[test]
+    fn lock_does_not_touch_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        assert!(f.irq_line(), "command byte must not clear IRQ");
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(f.irq_line(), "result read must not clear IRQ");
+
+        f.clear_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK));
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(!f.irq_line(), "LOCK never asserts IRQ");
+    }
+
+    #[test]
+    fn lock_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert!(!f.lock, "ignored while held in DOR reset");
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0xFF,
+            "no LOCK result latched while held in reset"
+        );
+    }
+
+    #[test]
+    fn dor_reset_aborts_lock_result_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        assert!(f.lock);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM | FDC_MSR_DIO);
+        f.port_write(FDC_DOR, 1, 0); // enter reset — aborts result phase
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        // Spec: 82077AA §5.3.2 — soft DOR reset does not clear LOCK.
+        assert!(f.lock, "soft reset must not clear LOCK");
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0xFF,
+            "aborted LOCK result is discarded"
+        );
+    }
+
+    /// Spec: 82077AA §5.3.2 — when LOCK=1, soft DOR reset must not restore
+    /// Configure EFIFO/FIFOTHR/PRETRK defaults.
+    #[test]
+    fn dor_soft_reset_preserves_configure_when_locked() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x57);
+        f.port_write(FDC_FIFO, 1, 0x12);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(f.lock);
+
+        f.port_write(FDC_DOR, 1, 0); // soft DOR reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(f.lock, "LOCK survives soft reset");
+        assert_eq!(f.configure_eis_fifo_poll_thr, 0x57);
+        assert_eq!(f.configure_pretrk, 0x12);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: 82077AA §5.3.2 — when LOCK=0, soft DOR reset returns Configure
+    /// EFIFO/FIFOTHR/PRETRK to defaults (stub zeros).
+    #[test]
+    fn dor_soft_reset_clears_configure_fifo_params_when_unlocked() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        f.port_write(FDC_FIFO, 1, 0x01);
+        f.port_write(FDC_FIFO, 1, 0x57);
+        f.port_write(FDC_FIFO, 1, 0x12);
+        assert!(!f.lock);
+
+        f.port_write(FDC_DOR, 1, 0); // soft DOR reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(!f.lock);
+        assert_eq!(
+            f.configure_eis_fifo_poll_thr, 0,
+            "unlocked soft reset clears FIFOTHR/EIS/FIFO/POLL"
+        );
+        assert_eq!(f.configure_pretrk, 0, "unlocked soft reset clears PRETRK");
+        // Spec protects only EFIFO/FIFOTHR/PRETRK; unused configure_byte0 policy
+        // matches prior stub (survives soft reset until full `reset()`).
+        assert_eq!(f.configure_byte0, 0x01);
+    }
+
+    /// Spec: 82077AA §5.3.2 — hardware reset (pin / full `reset()`) clears LOCK.
+    #[test]
+    fn hardware_reset_clears_lock() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(f.lock);
+        f.reset();
+        assert!(!f.lock);
         assert_eq!(f.phase, Phase::Command);
     }
 }
