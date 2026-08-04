@@ -2358,6 +2358,77 @@ mod tests {
         );
     }
 
+    /// Spec: Intel 82077AA §5.1.1 / Table 5-1 READ DATA multi-sector (MT=0
+    /// same head, EOT=R+1) + Intel 8237A Write + OSDev ISA DMA floppy ch2 —
+    /// MachineBus auto-wire copies the concatenated 2×512 latch into PhysMem
+    /// when ch2 Word Count is programmed for the full transfer.
+    ///
+    /// Media via [`Machine::with_floppy`] / [`Machine::attach_floppy_image`].
+    #[test]
+    fn machine_bus_fdc_read_data_multi_sector_dma_ch2_writes_into_physmem() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        // Sector R=1 @ 0: 0x00..; sector R=2 @ 512: 0x80..
+        for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        for (i, b) in img[FDC_SECTOR_SIZE..2 * FDC_SECTOR_SIZE]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = 0x80 | ((i & 0x7F) as u8);
+        }
+        let mut m = Machine::with_floppy(256 * 1024, img).expect("1.44MB image");
+        let xfer_len = 2 * FDC_SECTOR_SIZE;
+        // count = N−1 → 1023 for 1024 bytes @ phys 0x1_1000
+        program_dma_ch2_write(&mut m, 0x01, 0x1000, (xfer_len - 1) as u16);
+        for i in 0..xfer_len {
+            m.mem.write_u8(0x1_1000 + i as u64, 0xEE).unwrap();
+        }
+
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(FDC_DOR, FDC_DOR_MOTOR0_DMA).unwrap();
+            // READ DATA MFM MT=0: C/H/R/N/EOT = 0/0/1/2/2 — two sectors.
+            bus.port_out_u8(FDC_FIFO, FDC_CMD_MFM | FDC_CMD_READ_DATA)
+                .unwrap();
+            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+                bus.port_out_u8(FDC_FIFO, p).unwrap();
+            }
+        }
+
+        assert_eq!(
+            m.fdc.last_sector_byte_count(),
+            xfer_len,
+            "device latch concatenates R..=EOT"
+        );
+        for i in 0..FDC_SECTOR_SIZE {
+            assert_eq!(
+                m.mem.read_u8(0x1_1000 + i as u64).unwrap(),
+                (i & 0xFF) as u8,
+                "PhysMem sector1[{i}]"
+            );
+        }
+        for i in 0..FDC_SECTOR_SIZE {
+            assert_eq!(
+                m.mem
+                    .read_u8(0x1_1000 + FDC_SECTOR_SIZE as u64 + i as u64)
+                    .unwrap(),
+                0x80 | ((i & 0x7F) as u8),
+                "PhysMem sector2[{i}]"
+            );
+        }
+        assert_eq!(m.dma.master.channels[2].count, 0xFFFF);
+        assert_eq!(
+            m.dma.port_read(0x08, 1) as u8 & 0x0F,
+            0x04,
+            "TC latched for ch2"
+        );
+        assert!(
+            m.fdc.take_pending_dma_sector().is_none(),
+            "pending arm consumed by auto-wire"
+        );
+    }
+
     /// Spec: 82077AA — no media → ND result, no `last_sector`, MachineBus must
     /// not call DMA / must leave PhysMem at the DMA address unchanged.
     #[test]
