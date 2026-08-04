@@ -2,11 +2,14 @@
 //!
 //! # Spec refs
 //!
-//! - Motorola MC146818 Real-Time Clock Plus RAM datasheet — address/data
-//!   multiplexing, register map 0x00–0x0D (time + status A–D), status B
-//!   PIE/AIE/UIE, status C PF/AF/UF/IRQF (read-to-clear), IRQ pin.
+//! - Motorola MC146818A Real Time Clock Plus RAM datasheet — address/data
+//!   multiplexing, register map 0x00–0x0D (time + calendar + status A–D),
+//!   "Time, Calendar, and Alarm Locations", update-cycle time/calendar
+//!   increment with automatic leap-year compensation, status A UIP, status B
+//!   SET/DM/24-12 + PIE/AIE/UIE, status C PF/AF/UF/IRQF (read-to-clear), IRQ pin.
 //! - IBM PC/AT Technical Reference — CMOS index port `0x70` (bit7 = NMI mask),
-//!   data port `0x71`; RTC IRQ → ISA IRQ8 (8259A slave IR0).
+//!   data port `0x71`; RTC IRQ → ISA IRQ8 (8259A slave IR0); BCD century at
+//!   index `0x32` (later standardized as the ACPI FADT `CENTURY` index byte).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 RTC.
 //!
 //! # Scope (this slice)
@@ -14,9 +17,18 @@
 //! 128-byte register bank with index/data port access, NMI-mask bit tracking
 //! (port `0x70` bit7), status B PIE/AIE/UIE subset, model `tick` that sets
 //! PF/UF (and AF on alarm match), IRQF → IRQ line for MachineBus → DualPic
-//! IRQ8, plus a simple `tick_second` update cycle (Status A UIP + BCD seconds
-//! cascade). Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
+//! IRQ8, plus a `tick_second` update cycle (Status A UIP + the full BCD
+//! calendar cascade: seconds → minutes → hours → date of month → month → year
+//! → century `0x32`, with day-of-week 1–7 and Gregorian leap years).
+//! Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
 //! `Machine::nmi_delivery_enabled` / `Machine::inject_nmi` gate CPU `#NMI`.
+//!
+//! # Model note: invalid calendar state
+//!
+//! Reset leaves the time/calendar registers zeroed, so month `0x00` / date
+//! `0x00` / weekday `0x00` are reachable but are not valid dates. The cascade is
+//! total and never panics or wraps arithmetically: see [`FALLBACK_MONTH_DAYS`]
+//! for the documented fallback month length and resynchronization rules.
 //!
 //! # Unsupported (explicit)
 //!
@@ -25,7 +37,10 @@
 //!   (`Machine::inject_nmi` + interpreter vector-2 stub covers the pin path)
 //! - Exact crystal divider / UIP pulse width (UIP is set for the duration of
 //!   the modeled update call, or until `end_update_for_test`)
-//! - Full calendar BCD (day/month/year/century); only sec→min→hour cascade
+//! - Binary (non-BCD) data mode (status B `DM`, bit 2) and 12-hour mode
+//!   (status B bit 1): the reset default is BCD / 24-hour and the update cycle
+//!   always interprets the registers that way; the bits are stored but do not
+//!   change the counting format
 //! - ACPI extended CMOS beyond 128 bytes
 //! - Square-wave output (SQWE)
 
@@ -53,6 +68,17 @@ const REG_HOUR: u8 = 0x04;
 const REG_SEC_ALARM: u8 = 0x01;
 const REG_MIN_ALARM: u8 = 0x03;
 const REG_HOUR_ALARM: u8 = 0x05;
+/// Calendar: day of week (1 = Sunday), day of month, month, year.
+const REG_DAY_OF_WEEK: u8 = 0x06;
+const REG_DAY_OF_MONTH: u8 = 0x07;
+const REG_MONTH: u8 = 0x08;
+const REG_YEAR: u8 = 0x09;
+/// Century register.
+///
+/// Spec: not part of the base MC146818 register file (0x00–0x0D). PC/AT CMOS
+/// convention places the BCD century at index `0x32`, which ACPI later
+/// standardized as the FADT `CENTURY` index byte.
+const REG_CENTURY: u8 = 0x32;
 
 /// Index port bit7: NMI disable when set (PC/AT).
 const NMI_DISABLE: u8 = 1 << 7;
@@ -86,6 +112,21 @@ const DEFAULT_STATUS_D: u8 = 0x80;
 
 /// Status A RS field mask (bits 3:0); 0 = periodic interrupt disabled.
 const STATUS_A_RS_MASK: u8 = 0x0F;
+
+/// Day-of-week counter modulus (MC146818: 1 = Sunday … 7 = Saturday).
+const DAYS_PER_WEEK: u8 = 7;
+/// Month counter modulus (MC146818: 01 = January … 12 = December).
+const MONTHS_PER_YEAR: u8 = 12;
+/// Month length used when the month register does not hold BCD `0x01`–`0x12`.
+///
+/// Model note (not MC146818 spec): reset zeroes the time/calendar registers, so
+/// month `0x00` and date `0x00` are reachable states that are not valid dates.
+/// The update cycle stays total and non-panicking by treating an unrecognized
+/// month as the longest possible month, so no valid date ever wraps early; a
+/// date past that length wraps to 01 and steps the month, an unrecognized month
+/// steps to January without a year carry, and an unrecognized day-of-week resets
+/// to 1. Guests (SeaBIOS) program a valid date before relying on the cascade.
+const FALLBACK_MONTH_DAYS: u8 = 31;
 
 /// 128-byte CMOS/RTC image with index+data port access.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,7 +215,7 @@ impl CmosRtc {
     /// Spec (MC146818): when RS≠0, each period sets PF; when SET=0 each period
     /// also sets UF (update-ended colocated with the quantum — honesty note:
     /// calendar fields are not advanced here; use [`Self::tick_second`] for the
-    /// UIP + BCD second update stub). AIE sets AF when alarm regs match time.
+    /// UIP + BCD calendar update cycle). AIE sets AF when alarm regs match time.
     /// IRQF = (PF∧PIE) ∨ (AF∧AIE) ∨ (UF∧UIE). Returns true on IRQ pin rising edge.
     pub fn tick(&mut self, periods: u64) -> bool {
         if periods == 0 {
@@ -199,7 +240,7 @@ impl CmosRtc {
         !prev && self.irq_line()
     }
 
-    /// One second update cycle: UIP → BCD sec++ (cascade min/hour) → clear UIP → UF.
+    /// One second update cycle: UIP → BCD calendar advance → clear UIP → UF.
     ///
     /// Spec (MC146818): when Status B SET=0, the chip runs an update cycle each
     /// second; Status A UIP is set while the cycle runs and cleared when done;
@@ -209,7 +250,7 @@ impl CmosRtc {
         if !self.begin_update_cycle() {
             return false;
         }
-        self.advance_bcd_seconds();
+        self.advance_calendar();
         self.finish_update_cycle()
     }
 
@@ -242,8 +283,14 @@ impl CmosRtc {
         !prev && self.irq_line()
     }
 
-    /// Stub BCD time advance: seconds → minutes → hours (0x00–0x23), no day.
-    fn advance_bcd_seconds(&mut self) {
+    /// Full BCD time + calendar advance for one update cycle.
+    ///
+    /// Spec (MC146818, "Time, Calendar, and Alarm Locations" + update cycle):
+    /// seconds 59→00 carry into minutes, minutes 59→00 into hours, hours 23→00
+    /// into the date of month, the date rolls per month length (with automatic
+    /// leap-year compensation for February), month 12→01 carries into the year,
+    /// and the day-of-week counter advances on every date rollover.
+    fn advance_calendar(&mut self) {
         let (sec, carry_min) = bcd_inc_mod(self.ram[REG_SEC as usize], 0x59);
         self.ram[REG_SEC as usize] = sec;
         if !carry_min {
@@ -254,8 +301,80 @@ impl CmosRtc {
         if !carry_hour {
             return;
         }
-        let (hour, _) = bcd_inc_mod(self.ram[REG_HOUR as usize], 0x23);
+        let (hour, carry_day) = bcd_inc_mod(self.ram[REG_HOUR as usize], 0x23);
         self.ram[REG_HOUR as usize] = hour;
+        if !carry_day {
+            return;
+        }
+        self.advance_day_of_week();
+        self.advance_date();
+    }
+
+    /// Day-of-week counter (1 = Sunday … 7 = Saturday), wrapping 7 → 1.
+    ///
+    /// Spec: MC146818 day-of-week register 0x06 counts 1–7 independently of the
+    /// date arithmetic. Any other stored value is not a valid weekday and is
+    /// resynchronized to 1 (see [`FALLBACK_MONTH_DAYS`] model note).
+    fn advance_day_of_week(&mut self) {
+        let dow = self.ram[REG_DAY_OF_WEEK as usize];
+        self.ram[REG_DAY_OF_WEEK as usize] = if (1..DAYS_PER_WEEK).contains(&dow) {
+            dow + 1
+        } else {
+            1
+        };
+    }
+
+    /// Date of month, carrying into month/year/century at the end of the month.
+    fn advance_date(&mut self) {
+        let days_in_month = month_length(self.ram[REG_MONTH as usize], self.full_year());
+        let next_day = bcd_to_bin(self.ram[REG_DAY_OF_MONTH as usize])
+            .filter(|day| *day < days_in_month)
+            .map(|day| bin_to_bcd(day + 1));
+        match next_day {
+            Some(day) => self.ram[REG_DAY_OF_MONTH as usize] = day,
+            None => {
+                self.ram[REG_DAY_OF_MONTH as usize] = bin_to_bcd(1);
+                self.advance_month();
+            }
+        }
+    }
+
+    /// Month 01–12, carrying into the year after December.
+    ///
+    /// An unrecognized month resets to January without a year carry.
+    fn advance_month(&mut self) {
+        let month = match bcd_to_bin(self.ram[REG_MONTH as usize]) {
+            Some(month) if (1..MONTHS_PER_YEAR).contains(&month) => month + 1,
+            Some(MONTHS_PER_YEAR) => {
+                self.advance_year();
+                1
+            }
+            _ => 1,
+        };
+        self.ram[REG_MONTH as usize] = bin_to_bcd(month);
+    }
+
+    /// Year 00–99, carrying into the century register (`0x32`).
+    ///
+    /// Spec: PC/AT CMOS convention, standardized by the ACPI FADT `CENTURY`
+    /// index byte; the base MC146818 has no century register.
+    fn advance_year(&mut self) {
+        let (year, carry_century) = bcd_inc_mod(self.ram[REG_YEAR as usize], 0x99);
+        self.ram[REG_YEAR as usize] = year;
+        if !carry_century {
+            return;
+        }
+        let century = bcd_to_bin(self.ram[REG_CENTURY as usize]).unwrap_or(0);
+        self.ram[REG_CENTURY as usize] = bin_to_bcd((century + 1) % 100);
+    }
+
+    /// Full Gregorian year from the century register (`0x32`) and year register.
+    ///
+    /// Non-BCD digits in either byte read as 00 (model note, not spec).
+    fn full_year(&self) -> u16 {
+        let century = bcd_to_bin(self.ram[REG_CENTURY as usize]).unwrap_or(0);
+        let year = bcd_to_bin(self.ram[REG_YEAR as usize]).unwrap_or(0);
+        u16::from(century) * 100 + u16::from(year)
     }
 
     fn maybe_set_alarm_flag(&mut self) {
@@ -358,6 +477,42 @@ fn bcd_inc_mod(value: u8, max_bcd: u8) -> (u8, bool) {
     } else {
         (next, false)
     }
+}
+
+/// Decode a packed two-digit BCD byte; `None` when either nibble is above 9.
+fn bcd_to_bin(value: u8) -> Option<u8> {
+    let ones = value & 0x0F;
+    let tens = value >> 4;
+    if ones > 9 || tens > 9 {
+        None
+    } else {
+        Some(tens * 10 + ones)
+    }
+}
+
+/// Encode 0–99 as packed BCD (larger inputs fold modulo 100).
+fn bin_to_bcd(value: u8) -> u8 {
+    let value = value % 100;
+    ((value / 10) << 4) | (value % 10)
+}
+
+/// Days in `month_bcd` for `full_year`.
+///
+/// Spec: MC146818 date-of-month counting with automatic leap-year compensation
+/// for February. Unrecognized months use [`FALLBACK_MONTH_DAYS`].
+fn month_length(month_bcd: u8, full_year: u16) -> u8 {
+    match bcd_to_bin(month_bcd) {
+        Some(1 | 3 | 5 | 7 | 8 | 10 | 12) => 31,
+        Some(4 | 6 | 9 | 11) => 30,
+        Some(2) if is_leap_year(full_year) => 29,
+        Some(2) => 28,
+        _ => FALLBACK_MONTH_DAYS,
+    }
+}
+
+/// Gregorian leap year: divisible by 4, except centuries not divisible by 400.
+fn is_leap_year(full_year: u16) -> bool {
+    full_year.is_multiple_of(4) && (!full_year.is_multiple_of(100) || full_year.is_multiple_of(400))
 }
 
 #[cfg(test)]
@@ -604,6 +759,182 @@ mod tests {
         assert_eq!(c.read_reg(REG_SEC), 0x10);
         assert_eq!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
         assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+    }
+
+    /// Program the BCD calendar registers (century, year, month, day, weekday).
+    fn set_date(c: &mut CmosRtc, century: u8, year: u8, month: u8, day: u8, dow: u8) {
+        c.write_reg(REG_CENTURY, century);
+        c.write_reg(REG_YEAR, year);
+        c.write_reg(REG_MONTH, month);
+        c.write_reg(REG_DAY_OF_MONTH, day);
+        c.write_reg(REG_DAY_OF_WEEK, dow);
+    }
+
+    /// Park the clock one second before midnight so a single update cycle
+    /// runs the whole sec→min→hour→day cascade.
+    fn set_end_of_day(c: &mut CmosRtc) {
+        c.write_reg(REG_HOUR, 0x23);
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+    }
+
+    /// Stored calendar BCD as (century, year, month, day, weekday).
+    fn date_of(c: &CmosRtc) -> (u8, u8, u8, u8, u8) {
+        (
+            c.read_reg(REG_CENTURY),
+            c.read_reg(REG_YEAR),
+            c.read_reg(REG_MONTH),
+            c.read_reg(REG_DAY_OF_MONTH),
+            c.read_reg(REG_DAY_OF_WEEK),
+        )
+    }
+
+    /// Advance exactly one day boundary.
+    fn tick_over_midnight(c: &mut CmosRtc) {
+        set_end_of_day(c);
+        let _ = c.tick_second();
+    }
+
+    /// Spec: MC146818 update cycle — hours 23 → 00 carries into the day of month,
+    /// and the day-of-week register (0x06) advances with the date
+    /// (datasheet "Time, Calendar, and Alarm Locations" + update-cycle section).
+    #[test]
+    fn hour_rollover_carries_into_day_and_weekday() {
+        let mut c = CmosRtc::new();
+        set_date(&mut c, 0x20, 0x24, 0x03, 0x10, 0x01);
+        set_end_of_day(&mut c);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 0x00);
+        assert_eq!(c.read_reg(REG_MIN), 0x00);
+        assert_eq!(c.read_reg(REG_HOUR), 0x00);
+        assert_eq!(date_of(&c), (0x20, 0x24, 0x03, 0x11, 0x02));
+        // A second inside the day leaves the calendar untouched.
+        c.write_reg(REG_HOUR, 0x12);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 0x01);
+        assert_eq!(date_of(&c), (0x20, 0x24, 0x03, 0x11, 0x02));
+    }
+
+    /// Spec: MC146818 date of month counts per month length — 31-day and 30-day
+    /// months roll to day 01 of the next month (datasheet calendar locations).
+    #[test]
+    fn end_of_month_rolls_31_and_30_day_months() {
+        let mut jan = CmosRtc::new();
+        set_date(&mut jan, 0x20, 0x24, 0x01, 0x31, 0x03);
+        tick_over_midnight(&mut jan);
+        assert_eq!(date_of(&jan), (0x20, 0x24, 0x02, 0x01, 0x04));
+
+        let mut apr = CmosRtc::new();
+        set_date(&mut apr, 0x20, 0x24, 0x04, 0x30, 0x03);
+        tick_over_midnight(&mut apr);
+        assert_eq!(date_of(&apr), (0x20, 0x24, 0x05, 0x01, 0x04));
+    }
+
+    /// Spec: MC146818 automatic leap-year compensation — February has 28 days in
+    /// a common year, so Feb 28 rolls to Mar 1.
+    #[test]
+    fn february_non_leap_year_rolls_to_march() {
+        let mut c = CmosRtc::new();
+        set_date(&mut c, 0x20, 0x23, 0x02, 0x28, 0x02);
+        tick_over_midnight(&mut c);
+        assert_eq!(date_of(&c), (0x20, 0x23, 0x03, 0x01, 0x03));
+    }
+
+    /// Spec: MC146818 automatic leap-year compensation — a leap year gets Feb 29
+    /// before rolling into March.
+    #[test]
+    fn february_leap_year_has_twenty_nine_days() {
+        let mut c = CmosRtc::new();
+        set_date(&mut c, 0x20, 0x24, 0x02, 0x28, 0x04);
+        tick_over_midnight(&mut c);
+        assert_eq!(date_of(&c), (0x20, 0x24, 0x02, 0x29, 0x05));
+        tick_over_midnight(&mut c);
+        assert_eq!(date_of(&c), (0x20, 0x24, 0x03, 0x01, 0x06));
+    }
+
+    /// Spec: Gregorian rule via the PC/AT + ACPI FADT century register (index 0x32):
+    /// 2000 is divisible by 400 (leap), 1900 is divisible by 100 but not 400 (common).
+    #[test]
+    fn century_years_follow_gregorian_leap_rule() {
+        let mut y2000 = CmosRtc::new();
+        set_date(&mut y2000, 0x20, 0x00, 0x02, 0x28, 0x03);
+        tick_over_midnight(&mut y2000);
+        assert_eq!(date_of(&y2000), (0x20, 0x00, 0x02, 0x29, 0x04));
+
+        let mut y1900 = CmosRtc::new();
+        set_date(&mut y1900, 0x19, 0x00, 0x02, 0x28, 0x04);
+        tick_over_midnight(&mut y1900);
+        assert_eq!(date_of(&y1900), (0x19, 0x00, 0x03, 0x01, 0x05));
+    }
+
+    /// Spec: MC146818 month 12 → 01 carries into the year register.
+    #[test]
+    fn december_31_rolls_into_next_year() {
+        let mut c = CmosRtc::new();
+        set_date(&mut c, 0x20, 0x23, 0x12, 0x31, 0x01);
+        tick_over_midnight(&mut c);
+        assert_eq!(date_of(&c), (0x20, 0x24, 0x01, 0x01, 0x02));
+    }
+
+    /// Spec: year 99 → 00 carries into the PC/AT + ACPI FADT century byte (0x32),
+    /// which is outside the base MC146818 register file.
+    #[test]
+    fn year_99_carries_into_century_register() {
+        let mut c = CmosRtc::new();
+        set_date(&mut c, 0x19, 0x99, 0x12, 0x31, 0x06);
+        tick_over_midnight(&mut c);
+        assert_eq!(date_of(&c), (0x20, 0x00, 0x01, 0x01, 0x07));
+    }
+
+    /// Spec: MC146818 day-of-week counts 1–7 (1 = Sunday) and wraps 7 → 1,
+    /// independently of the month/day arithmetic.
+    #[test]
+    fn day_of_week_wraps_seven_to_one() {
+        let mut c = CmosRtc::new();
+        set_date(&mut c, 0x20, 0x24, 0x06, 0x15, 0x07);
+        tick_over_midnight(&mut c);
+        assert_eq!(date_of(&c), (0x20, 0x24, 0x06, 0x16, 0x01));
+    }
+
+    /// Spec: MC146818 Status B SET=1 inhibits the update cycle — no field of the
+    /// time or calendar advances while the guest is programming the clock.
+    #[test]
+    fn set_inhibits_calendar_advance() {
+        let mut c = CmosRtc::new();
+        set_date(&mut c, 0x20, 0x24, 0x12, 0x31, 0x03);
+        set_end_of_day(&mut c);
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_SET);
+        assert!(!c.tick_second());
+        assert_eq!(c.read_reg(REG_SEC), 0x59);
+        assert_eq!(c.read_reg(REG_MIN), 0x59);
+        assert_eq!(c.read_reg(REG_HOUR), 0x23);
+        assert_eq!(date_of(&c), (0x20, 0x24, 0x12, 0x31, 0x03));
+    }
+
+    /// Model note (not MC146818 spec): reset leaves the calendar zeroed, so month
+    /// 0x00 / day 0x00 / weekday 0x00 are reachable but are not valid dates.
+    /// The cascade stays total: an unrecognized month uses the 31-day fallback
+    /// length, a day past that length wraps to 01 and steps the month, an
+    /// unrecognized month steps to January without a year carry, and an
+    /// unrecognized weekday resets to 1. No panic or wrap-around.
+    #[test]
+    fn invalid_zero_calendar_advances_without_panic() {
+        let mut zeroed = CmosRtc::new();
+        assert_eq!(date_of(&zeroed), (0x00, 0x00, 0x00, 0x00, 0x00));
+        tick_over_midnight(&mut zeroed);
+        assert_eq!(date_of(&zeroed), (0x00, 0x00, 0x00, 0x01, 0x01));
+
+        let mut past_fallback = CmosRtc::new();
+        set_date(&mut past_fallback, 0x00, 0x00, 0x00, 0x31, 0x00);
+        tick_over_midnight(&mut past_fallback);
+        assert_eq!(date_of(&past_fallback), (0x00, 0x00, 0x01, 0x01, 0x01));
+
+        // Non-BCD day/month digits are equally well defined (day wraps, month
+        // falls back to January).
+        let mut non_bcd = CmosRtc::new();
+        set_date(&mut non_bcd, 0x20, 0x24, 0x1A, 0x9F, 0x0F);
+        tick_over_midnight(&mut non_bcd);
+        assert_eq!(date_of(&non_bcd), (0x20, 0x24, 0x01, 0x01, 0x01));
     }
 
     /// Spec: UIE + update-ended from `tick_second` asserts IRQF (same IRQ pin as PIE path).

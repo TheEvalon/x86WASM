@@ -25,7 +25,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - PS/2 and 8042 controller references
 - Intel 8259A / 8259A-2 / 8259A-8 Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW; Operation Command Word OCW3 format; Poll Command `P=1` acknowledging command-port read returning bit7 pending + binary level)
 - Intel 8254 Programmable Interval Timer datasheet — control word (SC/RW/M/BCD), counter latch, LSB/MSB access; "Mode Definitions" mode 0 (interrupt on terminal count), mode 1 (hardware retriggerable one-shot), mode 2 (rate generator), mode 3 (square wave), mode 4 (software triggered strobe), mode 5 (hardware triggered strobe); GATE-pin operations summary table (GATE low disables counting in modes 0/2/3/4 and forces OUT high in modes 2/3; GATE rising edge triggers modes 1/2/3/5)
-- Motorola MC146818 / IBM PC AT CMOS RTC register map (ports `0x70`/`0x71`; index bit7 = NMI disable)
+- Motorola MC146818A Real Time Clock Plus RAM datasheet / IBM PC AT CMOS RTC register map (ports `0x70`/`0x71`; index bit7 = NMI disable; "Time, Calendar, and Alarm Locations" `0x00`–`0x09` incl. day-of-week 1–7 with 1 = Sunday; update-cycle time/calendar increment with automatic leap-year compensation; status A UIP/divider/RS; status B SET/DM/24-12/PIE/AIE/UIE; status C PF/AF/UF/IRQF)
+- IBM PC/AT CMOS BCD century byte at index `0x32`, later standardized as the ACPI FADT `CENTURY` index field (century is **not** part of the MC146818 register file)
 - Intel SDM Vol. 3 §6.3.3 / §6.7 / §6.15 — `#NMI` (interrupt vector 2; not maskable by `IF`)
 - Intel 8237A Programmable DMA Controller datasheet (addr/count/mode/mask/flip-flop)
 - OSDev Wiki ISA DMA — AT port map and page registers (not port `0x80`)
