@@ -28,9 +28,11 @@
 //! Register bank wired onto `machine-pc::MachineBus` at ports `0x60`/`0x64`:
 //! status bits useful for firmware polling, a small documented command subset,
 //! output-buffer data path, IRQ1 when config bit0 is set and OBF is set from the
-//! keyboard, and a make-code inject stub (`inject_scancode`) that respects
-//! keyboard clock disable. Instant command completion (IBF never stays set
-//! across a status poll).
+//! keyboard, and a make-code inject path (`inject_scancode`) that respects
+//! keyboard clock disable and, when config bit6 is set, applies IBM PC/XT
+//! Scan Set 2→Set 1 translation on the way to host OBF (OSDev I8042
+//! "Translation" + Andries Brouwer / Gary J. Konzak 8042 table). Instant
+//! command completion (IBF never stays set across a status poll).
 //!
 //! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xA9`
 //! answers `0x00` on the normal output buffer, `0xD4` routes the next data-port
@@ -55,8 +57,7 @@
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
-//! - Full AT keyboard protocol (no host→device commands, no `0xFA` ACK, no break codes)
-//! - Set2↔Set1 translation table (config bit6 is stored; inject is passthrough)
+//! - Full AT keyboard protocol (no host→device commands, no `0xFA` ACK stream)
 //! - Pulse-reset lines (`0xFE` / output-port bit0 system-reset)
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
 
@@ -196,8 +197,39 @@ pub const CFG_KBD_CLOCK_DISABLE: u8 = 1 << 4;
 pub const CFG_AUX_CLOCK_DISABLE: u8 = 1 << 5;
 /// Configuration bit 6: first PS/2 port translation enabled when set.
 ///
-/// Stored and readable; this stub does **not** remap Set2↔Set1 bytes.
+/// Spec: OSDev [I8042 PS/2 Controller](https://wiki.osdev.org/I8042_PS/2_Controller)
+/// "Translation" — when set, the controller remaps keyboard Scan Code Set 2
+/// into Scan Code Set 1 (IBM PC/XT compatibility) before placing bytes in the
+/// host output buffer. When clear, device bytes pass through unchanged.
 pub const CFG_TRANSLATE: u8 = 1 << 6;
+
+/// IBM PC/AT 8042 Scan Set 2 → Set 1 translation table (index = device byte).
+///
+/// Spec: Andries Brouwer, *Keyboard scancodes* §10 "Keyboard-internal
+/// scancodes" (<https://kbd-project.org/docs/scancodes/scancodes-10.html>);
+/// first half also in Gary J. Konzak, *PC 8042 Controller*. Byte `0xF0` is
+/// handled as the Set 2 break prefix (consumed; next byte OR'd with `0x80`)
+/// and is never looked up here — the table slot is unused (`0x00` placeholder).
+#[rustfmt::skip]
+const SET2_TO_SET1: [u8; 256] = [
+    //  0x00  01    02    03    04    05    06    07    08    09    0A    0B    0C    0D    0E    0F
+    0xFF, 0x43, 0x41, 0x3F, 0x3D, 0x3B, 0x3C, 0x58, 0x64, 0x44, 0x42, 0x40, 0x3E, 0x0F, 0x29, 0x59, // 0x00
+    0x65, 0x38, 0x2A, 0x70, 0x1D, 0x10, 0x02, 0x5A, 0x66, 0x71, 0x2C, 0x1F, 0x1E, 0x11, 0x03, 0x5B, // 0x10
+    0x67, 0x2E, 0x2D, 0x20, 0x12, 0x05, 0x04, 0x5C, 0x68, 0x39, 0x2F, 0x21, 0x14, 0x13, 0x06, 0x5D, // 0x20
+    0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5E, 0x6A, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5F, // 0x30
+    0x6B, 0x33, 0x25, 0x17, 0x18, 0x0B, 0x0A, 0x60, 0x6C, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0C, 0x61, // 0x40
+    0x6D, 0x73, 0x28, 0x74, 0x1A, 0x0D, 0x62, 0x6E, 0x3A, 0x36, 0x1C, 0x1B, 0x75, 0x2B, 0x63, 0x76, // 0x50
+    0x55, 0x56, 0x77, 0x78, 0x79, 0x7A, 0x0E, 0x7B, 0x7C, 0x4F, 0x7D, 0x4B, 0x47, 0x7E, 0x7F, 0x6F, // 0x60
+    0x52, 0x53, 0x50, 0x4C, 0x4D, 0x48, 0x01, 0x45, 0x57, 0x4E, 0x51, 0x4A, 0x37, 0x49, 0x46, 0x54, // 0x70
+    0x80, 0x81, 0x82, 0x41, 0x54, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F, // 0x80
+    0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, // 0x90
+    0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF, // 0xA0
+    0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, // 0xB0
+    0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF, // 0xC0
+    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, // 0xD0
+    0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, // 0xE0
+    0x00, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF, // 0xF0
+];
 
 /// Reset default configuration: keyboard clock disabled, translation on,
 /// auxiliary clock enabled (bit5 clear). Both IRQ enables (bits 0/1) stay clear
@@ -252,6 +284,9 @@ pub struct I8042 {
     /// (and an enabled aux clock) before presentation on AUX OBF.
     aux_resp: [u8; AUX_RESP_QUEUE_CAP],
     aux_resp_len: u8,
+    /// Set 2 break prefix (`0xF0`) seen while config bit6 translation is on;
+    /// the next keyboard byte is translated then OR'd with `0x80` (Set 1 break).
+    translate_pending_break: bool,
 }
 
 impl I8042 {
@@ -273,6 +308,7 @@ impl I8042 {
             mouse_pending_param: MousePendingParam::None,
             aux_resp: [0; AUX_RESP_QUEUE_CAP],
             aux_resp_len: 0,
+            translate_pending_break: false,
         };
         s.apply_reset_defaults();
         s
@@ -291,6 +327,7 @@ impl I8042 {
         self.reset_mouse_defaults();
         self.aux_resp = [0; AUX_RESP_QUEUE_CAP];
         self.aux_resp_len = 0;
+        self.translate_pending_break = false;
     }
 
     /// Restore mouse stub defaults (sample rate / resolution / scaling / reporting).
@@ -394,24 +431,57 @@ impl I8042 {
         !prev && self.irq1_line()
     }
 
-    /// Inject a keyboard make-code into the output buffer (device → host).
+    /// Inject a keyboard scan-code byte into the host output buffer (device → host).
     ///
     /// Spec: OSDev I8042 / IBM PC AT — when the first-port clock is disabled
     /// (config bit4), the keyboard interface ignores device traffic. When
-    /// enabled, a make-code is placed in the output buffer (OBF) and may raise
-    /// IRQ1 if config INT1 is set.
+    /// enabled, a byte is placed in the output buffer (OBF) and may raise IRQ1
+    /// if config INT1 is set.
     ///
-    /// Translation (config bit6): passthrough stub only — no Set2↔Set1 remap.
-    /// Callers should supply already-Set1 codes when translation is on (the
-    /// firmware default); when translation is off the same raw byte is placed.
+    /// Translation (config bit6): when set, the byte is treated as Scan Code
+    /// Set 2 from the device and remapped to Scan Code Set 1 for the host
+    /// (OSDev I8042 "Translation"; Brouwer/Konzak table). Set 2 break prefix
+    /// `0xF0` is consumed (no OBF byte) and causes the next keyboard byte to
+    /// be translated then OR'd with `0x80`. Extended prefix `0xE0` passes
+    /// through as `0xE0`. When bit6 is clear, the raw byte is placed unchanged
+    /// (any pending break flag is discarded).
     ///
     /// Returns true if IRQ1 had a rising edge (same as [`Self::place_output`]).
+    /// Returns false when the clock is disabled, or when a translate-mode
+    /// `0xF0` break prefix is consumed without presenting a host byte.
     pub fn inject_scancode(&mut self, make_code: u8) -> bool {
         if self.keyboard_clock_disabled() {
             return false;
         }
-        // Translation bit is stored only; no Set2↔Set1 table in this slice.
-        self.place_output(make_code)
+        let host_byte = if self.config & CFG_TRANSLATE != 0 {
+            self.translate_set2_to_set1(make_code)
+        } else {
+            self.translate_pending_break = false;
+            Some(make_code)
+        };
+        match host_byte {
+            Some(b) => self.place_output(b),
+            None => false,
+        }
+    }
+
+    /// Apply IBM PC/AT 8042 Set 2 → Set 1 translation for one device byte.
+    ///
+    /// Spec: Andries Brouwer §10 — `0xF0` becomes "OR next with `0x80`"; other
+    /// bytes are looked up in the controller translation table (`SET2_TO_SET1`).
+    /// Returns `None` when the byte is consumed without a host OBF write.
+    fn translate_set2_to_set1(&mut self, device_byte: u8) -> Option<u8> {
+        // Set 2 break prefix: remember and emit nothing (OSDev / Brouwer).
+        if device_byte == 0xF0 {
+            self.translate_pending_break = true;
+            return None;
+        }
+        let mut host = SET2_TO_SET1[device_byte as usize];
+        if self.translate_pending_break {
+            host |= 0x80;
+            self.translate_pending_break = false;
+        }
+        Some(host)
     }
 
     /// Whether the mouse stub has data reporting enabled (`0xF4` / not `0xF5`).
@@ -968,15 +1038,17 @@ mod tests {
     }
 
     /// Spec: OSDev I8042 / IBM PC AT — enabled first port accepts make-code → OBF.
+    /// Default reset leaves translate on, so Set 2 `0x1C` (A) → Set 1 `0x1E`.
     #[test]
     fn inject_scancode_sets_obf_when_kbd_enabled() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         assert!(!k.keyboard_clock_disabled());
+        assert_ne!(k.config & CFG_TRANSLATE, 0);
         // INT1 clear: inject still fills OBF; no IRQ rising edge.
-        assert!(!k.inject_scancode(0x1C)); // Set1 make-code 'A'
+        assert!(!k.inject_scancode(0x1C)); // Set 2 make-code 'A'
         assert_ne!(k.status() & STATUS_OBF, 0);
-        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1C);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E); // Set 1 'A'
         assert_eq!(k.status() & STATUS_OBF, 0);
     }
 
@@ -988,10 +1060,10 @@ mod tests {
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
         // Clock enabled (bit4 clear), INT1 + translate (firmware-like).
         k.port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_TRANSLATE));
-        assert!(k.inject_scancode(0x1C));
+        assert!(k.inject_scancode(0x1C)); // Set 2 'A'
         assert!(k.irq1_line());
         assert_ne!(k.status() & STATUS_OBF, 0);
-        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1C);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E); // Set 1 'A'
         assert!(!k.irq1_line());
         assert_eq!(k.status() & STATUS_OBF, 0);
     }
@@ -1461,6 +1533,7 @@ mod tests {
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
         k.port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_INT12));
 
+        // Translate off (config has only INT bits): raw byte passthrough.
         assert!(k.inject_scancode(0x1C));
         assert_ne!(k.status() & STATUS_OBF, 0);
         assert_eq!(k.status() & STATUS_AUX_OBF, 0);
@@ -1495,22 +1568,96 @@ mod tests {
         assert_eq!(k.last_aux_device_write, None);
     }
 
-    /// Translation bit is passthrough: raw make-code placed whether on or off.
+    /// Spec: OSDev I8042 "Translation" + Brouwer §10 — config bit6 clear:
+    /// device bytes pass through unchanged on the keyboard OBF path.
     #[test]
-    fn inject_scancode_passthrough_regardless_of_translate() {
+    fn inject_scancode_passthrough_when_translate_clear() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
-        // Translate off.
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
         k.port_write(I8042_DATA, 1, 0x00);
         assert_eq!(k.config & CFG_TRANSLATE, 0);
-        k.inject_scancode(0x1E);
-        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E);
+        // Set 2 'A' (0x1C) is not remapped when translation is off.
+        k.inject_scancode(0x1C);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1C);
+        k.inject_scancode(0xF0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0xF0);
+    }
 
-        // Translate on — still no Set2↔Set1 remap in this stub.
-        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
-        k.port_write(I8042_DATA, 1, u32::from(CFG_TRANSLATE));
-        k.inject_scancode(0x1E);
-        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E);
+    /// Spec: OSDev I8042 "Translation" + Brouwer/Konzak table — config bit6 set:
+    /// common Set 2 make codes become Set 1 on host OBF.
+    #[test]
+    fn inject_scancode_translates_set2_make_to_set1_when_bit6_set() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        assert_ne!(k.config & CFG_TRANSLATE, 0); // reset default: translate on
+
+        // Set 2 → Set 1 (Brouwer table / OSDev PS/2 Keyboard set tables):
+        // A 1C→1E, Enter 5A→1C, Esc 76→01, Space 29→39, 1 16→02, Q 15→10.
+        for &(set2, set1) in &[
+            (0x1Cu8, 0x1Eu8),
+            (0x5A, 0x1C),
+            (0x76, 0x01),
+            (0x29, 0x39),
+            (0x16, 0x02),
+            (0x15, 0x10),
+        ] {
+            k.inject_scancode(set2);
+            assert_eq!(
+                k.port_read(I8042_DATA, 1) as u8,
+                set1,
+                "Set2 {set2:#04x} should become Set1 {set1:#04x}"
+            );
+        }
+    }
+
+    /// Spec: Brouwer §10 — Set 2 break is `F0` + code; 8042 consumes `F0` and
+    /// ORs `0x80` onto the translated next byte (Set 1 break = make|0x80).
+    #[test]
+    fn inject_scancode_translates_set2_break_f0_prefix() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        assert_ne!(k.config & CFG_TRANSLATE, 0);
+
+        // Set 2 break for 'A': F0 1C → host Set 1 break 0x9E (0x1E|0x80).
+        assert!(!k.inject_scancode(0xF0)); // consumed; no OBF
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.output_buffer(), None);
+
+        assert!(!k.inject_scancode(0x1C)); // INT1 clear → no IRQ edge
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x9E);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard + Brouwer — extended keys keep `E0` prefix;
+    /// the following Set 2 code is translated (Right arrow Set2 E0 74 → Set1 E0 4D).
+    #[test]
+    fn inject_scancode_translates_extended_e0_prefix() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        assert_ne!(k.config & CFG_TRANSLATE, 0);
+
+        // Make: E0 74 → E0 4D
+        k.inject_scancode(0xE0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0xE0);
+        k.inject_scancode(0x74);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x4D);
+
+        // Break: E0 F0 74 → E0 CD (0x4D|0x80)
+        k.inject_scancode(0xE0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0xE0);
+        assert!(!k.inject_scancode(0xF0));
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        k.inject_scancode(0x74);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0xCD);
+    }
+
+    /// Spec: translation applies only on the keyboard inject path; aux/mouse
+    /// bytes are never Set2→Set1 remapped.
+    #[test]
+    fn aux_inject_not_translated_by_config_bit6() {
+        let mut k = I8042::new();
+        assert_ne!(k.config & CFG_TRANSLATE, 0);
+        k.inject_aux_byte(0x1C);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1C);
     }
 }
