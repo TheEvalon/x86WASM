@@ -2,8 +2,8 @@
 //! index/data port stub (`0x3D4`/`0x3D5`), Sequencer index/data stub
 //! (`0x3C4`/`0x3C5`), Graphics Controller index/data stub (`0x3CE`/`0x3CF`),
 //! Attribute Controller address/data flip-flop stub (`0x3C0`/`0x3C1` + Input
-//! Status #1 `0x3DA` flip-flop reset and status bits), and Miscellaneous Output
-//! Register stub (`0x3C2` write / `0x3CC` readback).
+//! Status #1 flip-flop reset and status bits at `0x3DA`/`0x3BA` via Misc IOAS),
+//! and Miscellaneous Output Register stub (`0x3C2` write / `0x3CC` readback).
 //!
 //! # Spec refs
 //!
@@ -25,12 +25,17 @@
 //!   at `0x3C0` (flip-flop), Data Read at `0x3C1`; indexes `0x00`–`0x14`
 //!   (palette `0x00`–`0x0F`, Mode Control `0x10`, Overscan `0x11`, Color Plane
 //!   Enable `0x12`, Horizontal PEL Panning `0x13`, Color Select `0x14`). Reading
-//!   Input Status #1 (`0x3DA` color) resets the flip-flop to address state.
+//!   Input Status #1 (color `0x3DA` / mono `0x3BA`) resets the flip-flop to
+//!   address state.
 //! - OSDev VGA Hardware / FreeVGA External Registers — Input Status #1 read at
-//!   `0x3DA` (color): bit0 Display Disabled (inverted display-enable; set during
-//!   horizontal or vertical retrace), bit3 Vertical Retrace.
-//! - OSDev VGA Hardware / FreeVGA Miscellaneous Output Register — write port
-//!   `0x3C2`, readback port `0x3CC` (write-only at `0x3C2`).
+//!   `0x3DA` (color) / `0x3BA` (mono): bit0 Display Disabled (inverted
+//!   display-enable; set during horizontal or vertical retrace), bit3 Vertical
+//!   Retrace.
+//! - OSDev VGA Hardware / FreeVGA / IBM VGA Miscellaneous Output Register —
+//!   write port `0x3C2`, readback port `0x3CC` (write-only at `0x3C2`); bit0
+//!   I/O Address Select (IOAS): `1` = color CRTC/status map (`0x3D4`/`0x3D5`,
+//!   Input Status #1 `0x3DA`); `0` = mono map (CRTC `0x3B4`/`0x3B5`, Input
+//!   Status #1 `0x3BA`).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.6 / §21 VGA text mode.
 //!
 //! # Scope (this slice)
@@ -46,21 +51,23 @@
 //!   register file on `0x3CF` with mode-03h-class reset defaults (no write-mode /
 //!   map / bitmask side effects)
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
-//!   `0x3C1`, flip-flop reset via Input Status #1 `0x3DA` (no palette /
+//!   `0x3C1`, flip-flop reset via Input Status #1 (active IOAS map) (no palette /
 //!   mode-control / render side effects)
-//! - Input Status #1 (`0x3DA`): ATC flip-flop reset + deterministic
-//!   display-enable / vertical-retrace status bits (read-phase counter model)
-//! - Misc Output store/readback only (`0x3C2`/`0x3CC`); bits do not change
-//!   clock, IOAS, or RAM-enable behavior yet
+//! - Input Status #1: ATC flip-flop reset + deterministic display-enable /
+//!   vertical-retrace status bits (read-phase counter); port selected by Misc
+//!   Output IOAS (`0x3DA` color / `0x3BA` mono)
+//! - Misc Output store/readback (`0x3C2`/`0x3CC`); IOAS bit remaps Input Status
+//!   #1 ownership only (not CRTC mono map, clock, or RAM-enable)
 //!
 //! # Unsupported (explicit)
 //!
 //! - ATC / Sequencer / GC timing, palette→DAC, blink, PEL pan, plane-enable,
 //!   map-mask, write-mode, read-map, or bitmask side effects on the text plane
-//! - CRTC-timed Input Status #1 accuracy, mono Input Status #1 at `0x3BA`,
-//!   vertical-retrace IRQ, Feature Control diagnostic bits
-//! - CRTC protect bit (index `0x11` bit7), mono map at `0x3B4`/`0x3B5`
-//! - Misc Output bit side effects (IOAS remap, clock select, RAM enable)
+//! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
+//!   diagnostic bits
+//! - CRTC protect bit (index `0x11` bit7), mono CRTC map at `0x3B4`/`0x3B5`
+//! - Misc Output bit side effects beyond Input Status #1 IOAS (clock select,
+//!   RAM enable)
 //! - Planar graphics, VBE, host canvas rendering, dirty tracking
 //! - Font ROM, hardware cursor position driven from CRTC into the plane
 
@@ -121,6 +128,12 @@ pub const VGA_MISC_OUTPUT_READ: u16 = 0x3CC;
 /// color CRTC map (IOAS), RAM enable, and 25 MHz-class clock select bits
 /// (`0x67` = color + enable RAM + typical text-mode polarity/clock nibble).
 pub const VGA_MISC_OUTPUT_DEFAULT: u8 = 0x67;
+/// Miscellaneous Output bit0 — I/O Address Select (IOAS).
+///
+/// Spec: FreeVGA / IBM VGA Misc Output — `1` = color I/O map (`0x3Dx` CRTC +
+/// Input Status #1 `0x3DA`); `0` = mono I/O map (`0x3Bx` CRTC + Input Status #1
+/// `0x3BA`). This stub remaps Input Status #1 ownership only.
+pub const VGA_MISC_IOAS: u8 = 0x01;
 
 /// Graphics Controller Address (index) Register.
 ///
@@ -151,11 +164,17 @@ pub const VGA_ATC_ADDRESS_DATA: u16 = 0x3C0;
 /// Attribute Controller Data Read Register.
 pub const VGA_ATC_DATA_READ: u16 = 0x3C1;
 /// Color Input Status #1 — reading resets the ATC address/data flip-flop and
-/// returns display/retrace status bits.
+/// returns display/retrace status bits when Misc Output IOAS selects color.
 ///
 /// Spec: FreeVGA External Registers / IBM VGA / OSDev VGA Hardware — port
-/// `0x3DA` (color); mono alias `0x3BA` is not owned.
+/// `0x3DA` (color); mono alias is [`VGA_INPUT_STATUS_1_MONO`].
 pub const VGA_INPUT_STATUS_1: u16 = 0x3DA;
+/// Mono Input Status #1 alias — same status model + ATC flip-flop reset when
+/// Misc Output IOAS selects mono.
+///
+/// Spec: FreeVGA External Registers / IBM VGA / Misc Output bit0 (IOAS) —
+/// mono I/O map places Input Status #1 at `0x3BA`.
+pub const VGA_INPUT_STATUS_1_MONO: u16 = 0x3BA;
 /// Input Status #1 bit0 — Display Disabled (inverted display-enable).
 ///
 /// Spec: FreeVGA External Registers — set during horizontal or vertical retrace.
@@ -168,8 +187,8 @@ pub const VGA_STATUS1_VR: u8 = 0x08;
 ///
 /// Model choice (documented, not CRTC-timed): even phases are display-active
 /// (`DD=0`, `VR=0`); odd phases are vertical retrace (`DD=1`, `VR=1`). Advances
-/// only on `0x3DA` reads so SeaBIOS-style wait-for-VR / wait-for-end-VR loops
-/// terminate without a machine tick hook.
+/// only on active-map status reads (`0x3DA` or `0x3BA` per IOAS) so SeaBIOS-style
+/// wait-for-VR / wait-for-end-VR loops terminate without a machine tick hook.
 pub const VGA_STATUS1_PHASE_PERIOD: u8 = 2;
 /// Number of standard VGA Attribute Controller registers (`0x00`–`0x14`).
 pub const VGA_ATC_REG_COUNT: usize = 0x15;
@@ -215,11 +234,14 @@ pub struct VgaText {
     pub atc_regs: [u8; VGA_ATC_REG_COUNT],
     /// ATC flip-flop: `false` = next `0x3C0` write is address; `true` = data.
     pub atc_flip_flop_data: bool,
-    /// Deterministic Input Status #1 phase (advances on each `0x3DA` read).
+    /// Deterministic Input Status #1 phase (advances on each active-map status
+    /// read — `0x3DA` or `0x3BA` per Misc IOAS).
     ///
     /// See [`VGA_STATUS1_PHASE_PERIOD`] for the active/retrace model.
     pub status1_phase: u8,
     /// Miscellaneous Output Register (store via `0x3C2`, read via `0x3CC`).
+    ///
+    /// Bit0 ([`VGA_MISC_IOAS`]) selects Input Status #1 port ownership.
     pub misc_output: u8,
 }
 
@@ -282,23 +304,35 @@ impl VgaText {
         (VGA_TEXT_BASE..VGA_TEXT_END).contains(&addr)
     }
 
+    /// True when Misc Output IOAS selects the color I/O map (bit0 = 1).
+    ///
+    /// Spec: FreeVGA / IBM VGA Misc Output — IOAS selects `0x3Dx` vs `0x3Bx`.
+    pub fn misc_ioas_color(&self) -> bool {
+        self.misc_output & VGA_MISC_IOAS != 0
+    }
+
     /// True if this device owns the I/O port (color CRTC + Sequencer + GC + ATC
-    /// + Input Status #1 + Misc).
-    pub fn owns_port(port: u16) -> bool {
-        matches!(
-            port,
+    /// + Input Status #1 at the IOAS-selected address + Misc).
+    ///
+    /// Spec: FreeVGA / IBM — Input Status #1 is `0x3DA` when IOAS=1 (color) and
+    /// `0x3BA` when IOAS=0 (mono). CRTC remains color `0x3D4`/`0x3D5` in this
+    /// stub (mono CRTC remap is unsupported).
+    pub fn owns_port(&self, port: u16) -> bool {
+        match port {
+            VGA_INPUT_STATUS_1 => self.misc_ioas_color(),
+            VGA_INPUT_STATUS_1_MONO => !self.misc_ioas_color(),
             VGA_CRTC_INDEX
-                | VGA_CRTC_DATA
-                | VGA_SEQ_INDEX
-                | VGA_SEQ_DATA
-                | VGA_GC_INDEX
-                | VGA_GC_DATA
-                | VGA_ATC_ADDRESS_DATA
-                | VGA_ATC_DATA_READ
-                | VGA_INPUT_STATUS_1
-                | VGA_MISC_OUTPUT_WRITE
-                | VGA_MISC_OUTPUT_READ
-        )
+            | VGA_CRTC_DATA
+            | VGA_SEQ_INDEX
+            | VGA_SEQ_DATA
+            | VGA_GC_INDEX
+            | VGA_GC_DATA
+            | VGA_ATC_ADDRESS_DATA
+            | VGA_ATC_DATA_READ
+            | VGA_MISC_OUTPUT_WRITE
+            | VGA_MISC_OUTPUT_READ => true,
+            _ => false,
+        }
     }
 
     pub fn read_u8(&self, addr: u64) -> Option<u8> {
@@ -434,7 +468,8 @@ impl VgaText {
     }
 
     fn write_misc_output(&mut self, value: u8) {
-        // Store only — IOAS/clock/RAM-enable bits are not enforced yet.
+        // Store; IOAS (bit0) remaps Input Status #1 ownership. Clock select and
+        // RAM-enable bits are not enforced; mono CRTC `0x3B4`/`0x3B5` is not.
         self.misc_output = value;
     }
 
@@ -515,7 +550,10 @@ impl PortDevice for VgaText {
             VGA_GC_DATA => u32::from(self.read_gc_data()),
             VGA_ATC_ADDRESS_DATA => u32::from(self.read_atc_address()),
             VGA_ATC_DATA_READ => u32::from(self.read_atc_data()),
-            VGA_INPUT_STATUS_1 => u32::from(self.read_input_status_1()),
+            VGA_INPUT_STATUS_1 if self.misc_ioas_color() => u32::from(self.read_input_status_1()),
+            VGA_INPUT_STATUS_1_MONO if !self.misc_ioas_color() => {
+                u32::from(self.read_input_status_1())
+            }
             // Spec: FreeVGA / OSDev — `0x3C2` is write-only; read is undefined.
             // Stub returns open-bus-style `0xFF` (use `0x3CC` for readback).
             VGA_MISC_OUTPUT_WRITE => 0xFF,
@@ -570,7 +608,7 @@ impl PortDevice for VgaText {
             // Spec: FreeVGA — `0x3C1` is data-read; writes ignored.
             VGA_ATC_DATA_READ => {}
             // Spec: FreeVGA — Input Status #1 is read-only; writes ignored.
-            VGA_INPUT_STATUS_1 => {}
+            VGA_INPUT_STATUS_1 | VGA_INPUT_STATUS_1_MONO => {}
             VGA_MISC_OUTPUT_WRITE => self.write_misc_output(value as u8),
             // Spec: FreeVGA / OSDev — `0x3CC` is read-only; writes ignored.
             VGA_MISC_OUTPUT_READ => {}
@@ -642,9 +680,9 @@ mod tests {
     fn crtc_index_data_round_trip() {
         // Spec: OSDev VGA Hardware / FreeVGA — write index 0x3D4, data 0x3D5.
         let mut v = VgaText::new();
-        assert!(VgaText::owns_port(VGA_CRTC_INDEX));
-        assert!(VgaText::owns_port(VGA_CRTC_DATA));
-        assert!(!VgaText::owns_port(0x3B4));
+        assert!(v.owns_port(VGA_CRTC_INDEX));
+        assert!(v.owns_port(VGA_CRTC_DATA));
+        assert!(!v.owns_port(0x3B4));
         v.port_write(VGA_CRTC_INDEX, 1, 0x0E); // cursor location high
         v.port_write(VGA_CRTC_DATA, 1, 0x12);
         v.port_write(VGA_CRTC_INDEX, 1, 0x0F); // cursor location low
@@ -691,12 +729,13 @@ mod tests {
     fn misc_output_owns_ports_with_crtc_not_mono() {
         // Spec: FreeVGA / OSDev — Misc Output write `0x3C2`, read `0x3CC`;
         // color CRTC remains `0x3D4`/`0x3D5`; mono `0x3B4`/`0x3B5` not owned.
-        assert!(VgaText::owns_port(VGA_MISC_OUTPUT_WRITE));
-        assert!(VgaText::owns_port(VGA_MISC_OUTPUT_READ));
-        assert!(VgaText::owns_port(VGA_CRTC_INDEX));
-        assert!(VgaText::owns_port(VGA_CRTC_DATA));
-        assert!(!VgaText::owns_port(0x3B4));
-        assert!(!VgaText::owns_port(0x3B5));
+        let v = VgaText::new();
+        assert!(v.owns_port(VGA_MISC_OUTPUT_WRITE));
+        assert!(v.owns_port(VGA_MISC_OUTPUT_READ));
+        assert!(v.owns_port(VGA_CRTC_INDEX));
+        assert!(v.owns_port(VGA_CRTC_DATA));
+        assert!(!v.owns_port(0x3B4));
+        assert!(!v.owns_port(0x3B5));
     }
 
     #[test]
@@ -740,16 +779,18 @@ mod tests {
     fn sequencer_owns_ports() {
         // Spec: FreeVGA / OSDev VGA Hardware / IBM VGA — Sequencer Address
         // `0x3C4`, Data `0x3C5`.
-        assert!(VgaText::owns_port(VGA_SEQ_INDEX));
-        assert!(VgaText::owns_port(VGA_SEQ_DATA));
+        let v = VgaText::new();
+        assert!(v.owns_port(VGA_SEQ_INDEX));
+        assert!(v.owns_port(VGA_SEQ_DATA));
     }
 
     #[test]
     fn graphics_controller_owns_ports() {
         // Spec: FreeVGA / OSDev VGA Hardware / IBM VGA — GC Address `0x3CE`,
         // Data `0x3CF`.
-        assert!(VgaText::owns_port(VGA_GC_INDEX));
-        assert!(VgaText::owns_port(VGA_GC_DATA));
+        let v = VgaText::new();
+        assert!(v.owns_port(VGA_GC_INDEX));
+        assert!(v.owns_port(VGA_GC_DATA));
     }
 
     #[test]
@@ -896,10 +937,12 @@ mod tests {
     fn attribute_controller_owns_ports() {
         // Spec: FreeVGA Attribute Controller — Address/Data `0x3C0`, Data Read
         // `0x3C1`; Input Status #1 `0x3DA` resets the flip-flop (color map).
-        assert!(VgaText::owns_port(VGA_ATC_ADDRESS_DATA));
-        assert!(VgaText::owns_port(VGA_ATC_DATA_READ));
-        assert!(VgaText::owns_port(VGA_INPUT_STATUS_1));
-        assert!(!VgaText::owns_port(0x3BA)); // mono Input Status #1 not owned
+        let v = VgaText::new();
+        assert!(v.misc_ioas_color());
+        assert!(v.owns_port(VGA_ATC_ADDRESS_DATA));
+        assert!(v.owns_port(VGA_ATC_DATA_READ));
+        assert!(v.owns_port(VGA_INPUT_STATUS_1));
+        assert!(!v.owns_port(VGA_INPUT_STATUS_1_MONO));
     }
 
     #[test]
@@ -1068,6 +1111,112 @@ mod tests {
         v.port_write(VGA_INPUT_STATUS_1, 1, 0xFF);
         assert_eq!(v.status1_phase, 0);
         let s = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_eq!(s & (VGA_STATUS1_DD | VGA_STATUS1_VR), 0);
+    }
+
+    #[test]
+    fn input_status1_mono_alias_when_misc_ioas_cleared() {
+        // Spec: FreeVGA / IBM VGA Misc Output bit0 (IOAS) — clear selects mono
+        // I/O map; Input Status #1 moves to `0x3BA` with the same DD/VR model
+        // and ATC flip-flop reset. Color `0x3DA` is not owned.
+        let mut v = VgaText::new();
+        assert!(v.misc_ioas_color());
+        assert!(v.owns_port(VGA_INPUT_STATUS_1));
+        assert!(!v.owns_port(VGA_INPUT_STATUS_1_MONO));
+
+        // Clear IOAS (keep other default-ish bits); mono status map.
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_IOAS),
+        );
+        assert!(!v.misc_ioas_color());
+        assert!(!v.owns_port(VGA_INPUT_STATUS_1));
+        assert!(v.owns_port(VGA_INPUT_STATUS_1_MONO));
+
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
+        assert!(v.atc_flip_flop_data);
+
+        let a = v.port_read(VGA_INPUT_STATUS_1_MONO, 1) as u8;
+        assert_eq!(a & VGA_STATUS1_VR, 0, "phase0: not in vertical retrace");
+        assert_eq!(a & VGA_STATUS1_DD, 0, "phase0: display enabled");
+        assert!(!v.atc_flip_flop_data);
+
+        let b = v.port_read(VGA_INPUT_STATUS_1_MONO, 1) as u8;
+        assert_eq!(
+            b & (VGA_STATUS1_DD | VGA_STATUS1_VR),
+            VGA_STATUS1_DD | VGA_STATUS1_VR
+        );
+
+        // Inactive color port must not advance phase or reset the flip-flop.
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
+        assert!(v.atc_flip_flop_data);
+        let phase_before = v.status1_phase;
+        assert_eq!(v.port_read(VGA_INPUT_STATUS_1, 1), 0xFFFF_FFFF);
+        assert_eq!(v.status1_phase, phase_before);
+        assert!(v.atc_flip_flop_data);
+    }
+
+    #[test]
+    fn input_status1_color_port_when_misc_ioas_set() {
+        // Spec: FreeVGA / IBM — IOAS=1 keeps Input Status #1 at `0x3DA`; mono
+        // `0x3BA` is ignored / not owned.
+        let mut v = VgaText::new();
+        assert_eq!(v.misc_output & VGA_MISC_IOAS, VGA_MISC_IOAS);
+        assert!(v.owns_port(VGA_INPUT_STATUS_1));
+        assert!(!v.owns_port(VGA_INPUT_STATUS_1_MONO));
+
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
+        assert!(v.atc_flip_flop_data);
+        let phase_before = v.status1_phase;
+        assert_eq!(v.port_read(VGA_INPUT_STATUS_1_MONO, 1), 0xFFFF_FFFF);
+        assert_eq!(v.status1_phase, phase_before);
+        assert!(v.atc_flip_flop_data);
+
+        let s = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_eq!(s & (VGA_STATUS1_DD | VGA_STATUS1_VR), 0);
+        assert!(!v.atc_flip_flop_data);
+        assert_eq!(v.status1_phase, 1);
+    }
+
+    #[test]
+    fn input_status1_ioas_switch_shares_phase_counter() {
+        // Spec: FreeVGA External Registers — color/mono are aliases of one
+        // Input Status #1; the phase model is shared across IOAS switches.
+        let mut v = VgaText::new();
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1); // phase 0 → 1
+        assert_eq!(v.status1_phase, 1);
+
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_IOAS),
+        );
+        let s = v.port_read(VGA_INPUT_STATUS_1_MONO, 1) as u8;
+        assert_eq!(
+            s & (VGA_STATUS1_DD | VGA_STATUS1_VR),
+            VGA_STATUS1_DD | VGA_STATUS1_VR
+        );
+        assert_eq!(v.status1_phase, 0);
+
+        // Restore color map; next read continues the shared counter.
+        v.port_write(VGA_MISC_OUTPUT_WRITE, 1, u32::from(VGA_MISC_OUTPUT_DEFAULT));
+        let s = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_eq!(s & (VGA_STATUS1_DD | VGA_STATUS1_VR), 0);
+        assert_eq!(v.status1_phase, 1);
+    }
+
+    #[test]
+    fn input_status1_mono_write_ignored() {
+        let mut v = VgaText::new();
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_IOAS),
+        );
+        v.port_write(VGA_INPUT_STATUS_1_MONO, 1, 0xFF);
+        assert_eq!(v.status1_phase, 0);
+        let s = v.port_read(VGA_INPUT_STATUS_1_MONO, 1) as u8;
         assert_eq!(s & (VGA_STATUS1_DD | VGA_STATUS1_VR), 0);
     }
 
