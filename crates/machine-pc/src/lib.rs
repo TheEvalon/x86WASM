@@ -379,7 +379,7 @@ impl MachineBus<'_> {
         if PciConfig::owns_port(port) {
             return self.pci.port_read(port, size);
         }
-        if VgaText::owns_port(port) {
+        if self.vga.owns_port(port) {
             return self.vga.port_read(port, size);
         }
         match port {
@@ -419,7 +419,7 @@ impl MachineBus<'_> {
             self.pci.port_write(port, size, value);
             return;
         }
-        if VgaText::owns_port(port) {
+        if self.vga.owns_port(port) {
             self.vga.port_write(port, size, value);
             return;
         }
