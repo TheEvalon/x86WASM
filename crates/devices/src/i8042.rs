@@ -12,7 +12,10 @@
 //!   Keyboard ID (ACK then ID bytes, typically `0xAB` `0x83` for MF2), `0xF4`/
 //!   `0xF5` Enable/Disable Scanning (ACK `0xFA`), `0xED` Set LEDs (+ LED mask),
 //!   `0xF3` Set Typematic Rate/Delay (+ rate/delay byte), `0xF0` Get/Set
-//!   Scancode Set (+ sub-command), `0xEE` Echo, `0xFE` Resend (last byte).
+//!   Scancode Set (+ sub-command), `0xF6` Set Default, `0xF7`/`0xF8`/`0xF9`/
+//!   `0xFA` Set All Keys Typematic/Make-Break/Make/Typematic-Make-Break (ACK),
+//!   `0xFB`/`0xFC`/`0xFD` Set Key Type (+ scancode), `0xEE` Echo, `0xFE` Resend
+//!   (last byte).
 //! - OSDev Wiki: [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) — host→device
 //!   commands `0xFF` Reset (ACK `0xFA`, BAT `0xAA`, ID `0x00`), `0xF2` Get Device
 //!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF6` Set
@@ -54,11 +57,14 @@
 //! ACK `0xFA`, Get Keyboard ID (`0xF2`) with ACK + MF2 ID `0xAB` `0x83`, Reset
 //! (`0xFF`) with ACK + BAT `0xAA`, Set LEDs (`0xED` + mask), Set Typematic
 //! Rate/Delay (`0xF3` + byte), and Get/Set Scancode Set (`0xF0` + sub-command)
-//! with ACK per byte and stored state, plus Echo (`0xEE` → `0xEE`) and Resend
-//! (`0xFE` → requeue last keyboard OBF byte), on the keyboard OBF (not AUX) →
-//! IRQ1 when config bit 0 is set. Multi-byte responses queue like the mouse
-//! stub; keyboard clock disable (config bit4) holds presentation until `0xAE`.
-//! Other host→kbd bytes (set defaults, …) are accepted and left unanswered.
+//! with ACK per byte and stored state, Set Default (`0xF6`) with ACK + restore
+//! defaults (no BAT), Set All Keys (`0xF7`/`0xF8`/`0xF9`/`0xFA`) with ACK,
+//! Set Key Type (`0xFB`/`0xFC`/`0xFD`) with ACK + one ignored scancode, plus
+//! Echo (`0xEE` → `0xEE`) and Resend (`0xFE` → requeue last keyboard OBF byte),
+//! on the keyboard OBF (not AUX) → IRQ1 when config bit 0 is set. Multi-byte
+//! responses queue like the mouse stub; keyboard clock disable (config bit4)
+//! holds presentation until `0xAE`. Other host→kbd bytes are accepted and left
+//! unanswered.
 //!
 //! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xA9`
 //! answers `0x00` on the normal output buffer, `0xD4` routes the next data-port
@@ -88,10 +94,11 @@
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
-//! - Full AT keyboard protocol beyond the ACK/param/Resend subset above
-//!   (set-default, set-3 key-type cmds, … unanswered; LED mask / scancode-set /
-//!   typematic are stored only — no host-visible LED hardware; inject still
-//!   emits the existing Set2-oriented stream regardless of stored set)
+//! - Full AT keyboard protocol beyond the ACK/param/Resend/Set-All/Set-Key-Type
+//!   subset above (per-key set-3 type state not modeled beyond ACK; LED mask /
+//!   scancode-set / typematic are stored only — no host-visible LED hardware;
+//!   inject still emits the existing Set2-oriented stream regardless of stored
+//!   set)
 //! - Pulse-reset lines (controller command `0xFE` on `0x64` / output-port bit0
 //!   system-reset) — distinct from keyboard Resend `0xFE` on data port `0x60`
 //! - Interface test `0xAB`, diagnostic dump `0xAC`
@@ -194,6 +201,12 @@ pub const KBD_CMD_SET_ALL_MAKE_BREAK: u8 = 0xF8;
 /// PS/2 keyboard command: Set All Keys Make — ACK (no further params).
 /// Spec: OSDev PS/2 Keyboard — `0xF9` Set All Keys Make.
 pub const KBD_CMD_SET_ALL_MAKE: u8 = 0xF9;
+/// PS/2 keyboard command: Set All Keys Typematic/Make/Break — ACK (no further params).
+///
+/// Spec: OSDev PS/2 Keyboard — `0xFA` Set All Keys Typematic/Make/Break.
+/// Note: the host→device opcode value coincides with the device→host ACK byte
+/// [`KBD_ACK`]; direction distinguishes them.
+pub const KBD_CMD_SET_ALL_TYPEMATIC_MAKE_BREAK: u8 = 0xFA;
 /// PS/2 keyboard command: Set Key Type Typematic — ACK + one scancode param.
 /// Spec: OSDev PS/2 Keyboard — `0xFB`.
 pub const KBD_CMD_SET_KEY_TYPEMATIC: u8 = 0xFB;
@@ -1227,6 +1240,12 @@ impl I8042 {
                 // Spec: OSDev PS/2 Keyboard — Set All Keys Make (`0xF9`).
                 self.begin_kbd_response(&[KBD_ACK]);
             }
+            KBD_CMD_SET_ALL_TYPEMATIC_MAKE_BREAK => {
+                // Spec: OSDev PS/2 Keyboard — Set All Keys Typematic/Make/Break
+                // (`0xFA`): ACK only; key-type state not modeled beyond acceptance.
+                // Opcode value equals [`KBD_ACK`]; this is the host→device command.
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
             KBD_CMD_SET_KEY_TYPEMATIC | KBD_CMD_SET_KEY_MAKE_BREAK | KBD_CMD_SET_KEY_MAKE => {
                 // Spec: OSDev — ACK, then accept one scancode param (ignored).
                 self.kbd_pending_param = KbdPendingParam::KeyTypeScancode;
@@ -1527,6 +1546,23 @@ mod tests {
         write_kbd(&mut k, KBD_CMD_SET_ALL_MAKE);
         assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
         assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Set All Keys Typematic/Make/Break (`0xFA`) → ACK.
+    ///
+    /// Opcode `0xFA` equals the ACK response value; host→device vs device→host
+    /// distinguishes them. Get Scancode Set (`0xF0`+`0`) already exists.
+    #[test]
+    fn kbd_set_all_typematic_make_break_fa_acks() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_SET_ALL_TYPEMATIC_MAKE_BREAK);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.status() & STATUS_AUX_OBF, 0);
+        // Defaults unchanged (ACK-only; no key-type state modeled).
+        assert!(k.kbd_scanning_enabled());
+        assert_eq!(k.kbd_typematic(), KBD_DEFAULT_TYPEMATIC);
+        assert_eq!(k.kbd_scancode_set(), KBD_DEFAULT_SCANCODE_SET);
     }
 
     /// Spec: OSDev PS/2 Keyboard — Set Key Type `0xFB`/`0xFC`/`0xFD` ACK + scancode.
