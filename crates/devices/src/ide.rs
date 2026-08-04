@@ -101,6 +101,9 @@ pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
 pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
 /// WRITE SECTORS (with retry) — LBA28 PIO.
 pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+/// FLUSH CACHE — non-data command; completes with success on ATA master.
+/// Spec: ATA/ATAPI Command Set — FLUSH CACHE (`0xE7`).
+pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -464,6 +467,27 @@ impl IdePrimary {
         self.begin_pio_in();
     }
 
+    /// FLUSH CACHE (`0xE7`) on ATA master — non-data success completion.
+    ///
+    /// Spec: ATA/ATAPI Command Set — FLUSH CACHE writes volatile cache to media.
+    /// This stub has no volatile cache; it completes immediately with
+    /// DRDY|DSC, error=0, no DRQ, and raises INTRQ when nIEN=0 (SeaBIOS-friendly).
+    fn exec_flush_cache(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
     fn exec_command(&mut self, cmd: u8) {
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
@@ -471,6 +495,7 @@ impl IdePrimary {
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
+            ATA_CMD_FLUSH_CACHE => self.exec_flush_cache(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
         }
     }
@@ -1186,6 +1211,44 @@ mod tests {
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — FLUSH CACHE (`0xE7`) non-data success on
+    /// ATA master: DRDY|DSC, error=0, no DRQ; INTRQ when nIEN=0.
+    #[test]
+    fn flush_cache_succeeds_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE));
+        // Spec: ATA — INTRQ asserted on completion; status read clears it.
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8; // alt status: no IRQ clear
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_ne!(st & ATA_SR_DSC, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(ide.irq_line(), "alt status must not clear INTRQ");
+    }
+
+    #[test]
+    fn flush_cache_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn flush_cache_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert!(!ide.irq_line());
     }
 
