@@ -147,6 +147,9 @@ pub const ATA_CMD_RECALIBRATE: u8 = 0x10;
 /// SEEK — non-data success stub.
 /// Spec: ATA/ATAPI Command Set — SEEK (`0x70`).
 pub const ATA_CMD_SEEK: u8 = 0x70;
+/// INITIALIZE DEVICE PARAMETERS — non-data success stub.
+/// Spec: ATA/ATAPI Command Set — INITIALIZE DEVICE PARAMETERS (`0x91`).
+pub const ATA_CMD_INIT_DEV_PARAMS: u8 = 0x91;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -642,6 +645,26 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// INITIALIZE DEVICE PARAMETERS (`0x91`) — non-data success stub.
+    ///
+    /// Spec: ATA INITIALIZE DEVICE PARAMETERS programs sectors/heads from the
+    /// task file; this stub accepts and succeeds without changing geometry.
+    fn exec_init_dev_params(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
     /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
@@ -702,6 +725,7 @@ impl IdePrimary {
             | ATA_CMD_SLEEP => self.exec_power_mgmt_success(),
             ATA_CMD_CHECK_POWER_MODE => self.exec_check_power_mode(),
             ATA_CMD_RECALIBRATE | ATA_CMD_SEEK => self.exec_recalibrate_seek_success(),
+            ATA_CMD_INIT_DEV_PARAMS => self.exec_init_dev_params(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             ATA_CMD_SET_FEATURES => self.exec_set_features(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
@@ -1611,6 +1635,20 @@ mod tests {
             assert_eq!(st & ATA_SR_ERR, 0);
             assert_ne!(st & ATA_SR_DSC, 0);
         }
+    }
+
+    /// Spec: ATA — INITIALIZE DEVICE PARAMETERS (`0x91`) non-data success.
+    #[test]
+    fn init_device_parameters_succeeds() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 63);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_INIT_DEV_PARAMS));
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
     }
 
     #[test]

@@ -182,6 +182,15 @@ pub const KBD_CMD_SET_ALL_MAKE_BREAK: u8 = 0xF8;
 /// PS/2 keyboard command: Set All Keys Make — ACK (no further params).
 /// Spec: OSDev PS/2 Keyboard — `0xF9` Set All Keys Make.
 pub const KBD_CMD_SET_ALL_MAKE: u8 = 0xF9;
+/// PS/2 keyboard command: Set Key Type Typematic — ACK + one scancode param.
+/// Spec: OSDev PS/2 Keyboard — `0xFB`.
+pub const KBD_CMD_SET_KEY_TYPEMATIC: u8 = 0xFB;
+/// PS/2 keyboard command: Set Key Type Make/Break — ACK + one scancode param.
+/// Spec: OSDev PS/2 Keyboard — `0xFC`.
+pub const KBD_CMD_SET_KEY_MAKE_BREAK: u8 = 0xFC;
+/// PS/2 keyboard command: Set Key Type Make — ACK + one scancode param.
+/// Spec: OSDev PS/2 Keyboard — `0xFD`.
+pub const KBD_CMD_SET_KEY_MAKE: u8 = 0xFD;
 
 /// Echo response byte (same value as [`KBD_CMD_ECHO`]).
 pub const KBD_ECHO: u8 = 0xEE;
@@ -284,6 +293,8 @@ enum KbdPendingParam {
     Typematic,
     /// Following `0xF0` — next byte is get (`0`) or set (`1`/`2`/`3`).
     ScancodeSet,
+    /// Following `0xFB`/`0xFC`/`0xFD` — next byte is a scancode (ignored).
+    KeyTypeScancode,
 }
 
 /// Output-port bit 1: A20 gate enable (1 = A20 line high / unmasked).
@@ -1021,6 +1032,13 @@ impl I8042 {
                 }
                 return;
             }
+            KbdPendingParam::KeyTypeScancode => {
+                // Spec: OSDev — Set Key Type takes one scancode; ACK and ignore.
+                self.kbd_pending_param = KbdPendingParam::None;
+                let _scancode = cmd;
+                self.begin_kbd_response(&[KBD_ACK]);
+                return;
+            }
             KbdPendingParam::None => {}
         }
 
@@ -1085,6 +1103,11 @@ impl I8042 {
             }
             KBD_CMD_SET_ALL_MAKE => {
                 // Spec: OSDev PS/2 Keyboard — Set All Keys Make (`0xF9`).
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
+            KBD_CMD_SET_KEY_TYPEMATIC | KBD_CMD_SET_KEY_MAKE_BREAK | KBD_CMD_SET_KEY_MAKE => {
+                // Spec: OSDev — ACK, then accept one scancode param (ignored).
+                self.kbd_pending_param = KbdPendingParam::KeyTypeScancode;
                 self.begin_kbd_response(&[KBD_ACK]);
             }
             _ => {
@@ -1381,6 +1404,23 @@ mod tests {
         assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
         write_kbd(&mut k, KBD_CMD_SET_ALL_MAKE);
         assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Set Key Type `0xFB`/`0xFC`/`0xFD` ACK + scancode.
+    #[test]
+    fn kbd_set_key_type_fb_fc_fd_ack_with_scancode_param() {
+        let mut k = I8042::new();
+        for cmd in [
+            KBD_CMD_SET_KEY_TYPEMATIC,
+            KBD_CMD_SET_KEY_MAKE_BREAK,
+            KBD_CMD_SET_KEY_MAKE,
+        ] {
+            write_kbd(&mut k, cmd);
+            assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+            write_kbd(&mut k, 0x1C); // ignored scancode (A make)
+            assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
+        }
         assert_eq!(k.status() & STATUS_OBF, 0);
     }
 

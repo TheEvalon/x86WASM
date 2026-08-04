@@ -95,8 +95,12 @@ pub const PCI_PIIX_USB_BAR0_MASK: u32 = 0xFFE0;
 pub const PCI_PIIX_ISA_PIRQRC_OFFSET: u8 = 0x60;
 /// Default PIRQRC byte value (IRQ routing disabled).
 pub const PCI_PIIX_ISA_PIRQRC_DEFAULT: u8 = 0x80;
+/// PIIX IDE IDE Timing Register (IDETIM) config offset. Spec: Intel 82371SB — word at `0x40`.
+pub const PCI_PIIX_IDE_IDETIM_OFFSET: u8 = 0x40;
 /// PIIX ACPI PMBASE config offset (I/O BAR). Spec: Intel 82371AB — dword at `0x40`.
 pub const PCI_PIIX_ACPI_PMBASE_OFFSET: u8 = 0x40;
+/// IDETIM and ACPI PMBASE share config offset `0x40` on different functions.
+const _: () = assert!(PCI_PIIX_IDE_IDETIM_OFFSET == PCI_PIIX_ACPI_PMBASE_OFFSET);
 /// PMBASE I/O decode mask — 64-byte aligned (bits 15:6); bit0 = I/O space.
 pub const PCI_PIIX_ACPI_PMBASE_MASK: u32 = 0xFFC0;
 
@@ -717,6 +721,23 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: Intel 82371SB — IDE IDETIM at config `0x40` word store/readback
+    /// (timing decode not modeled).
+    #[test]
+    fn piix_ide_idetim_word_store_readback() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_IDETIM_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0);
+        pci.port_write(PCI_CONFIG_DATA, 2, 0xA307);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0xA307);
+        pci.port_write(PCI_CONFIG_DATA, 2, 0x0000);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0);
     }
 
     /// Spec: Intel 82371AB — PMBASE at ACPI config `0x40` is an I/O BAR
