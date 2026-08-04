@@ -18,7 +18,9 @@
 //!   standard VGA has 25 CRTC registers (indexes `0x00`–`0x18`). Cursor Start
 //!   `0x0A` (bits 4:0 scanline start; bit5 Cursor Disable), Cursor End `0x0B`
 //!   (bits 4:0 scanline end), Cursor Location High `0x0E` / Low `0x0F` (16-bit
-//!   character address into the refresh buffer). Maximum Scan Line `0x09`
+//!   character address into the refresh buffer). Start Address High `0x0C` /
+//!   Low `0x0D` (16-bit character address of the first displayed cell;
+//!   mode-03h reset default `0x0000`). Maximum Scan Line `0x09`
 //!   (bits 4:0 = character cell height − 1; bit5 Start Vertical Blanking bit9;
 //!   bit6 Line Compare bit9; bit7 Scan Doubling; mode-03h reset default `0x0F`
 //!   for 16 scanlines). Offset `0x13` (logical line width in words; mode-03h
@@ -26,8 +28,8 @@
 //!   (bits 4:0 underline scanline − 1; bit5 DIV4; bit6 DW; mode-03h reset
 //!   default `0x1F`). Vertical Retrace End `0x11` bit7 Protect: when set,
 //!   writes to indexes `0x00`–`0x07` are ignored except Overflow (`0x07`) bit4
-//!   (Line Compare bit8); indexes `>= 0x08` (including Maximum Scan Line,
-//!   Offset, and Underline Location) remain writable.
+//!   (Line Compare bit8); indexes `>= 0x08` (including Start Address,
+//!   Maximum Scan Line, Offset, and Underline Location) remain writable.
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode).
@@ -66,11 +68,13 @@
 //! - CRTC index/data: latch index / store/read register file on the IOAS-selected
 //!   map (`0x3D4`/`0x3D5` color or `0x3B4`/`0x3B5` mono; shared file); cursor
 //!   registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback plus helpers for
-//!   text-mode cursor character offset / row-col; Maximum Scan Line `0x09`
-//!   store/readback with mode-03h reset default `0x0F` (Protect does not block);
-//!   Vertical Retrace End `0x11` bit7 Protect blocks writes to indexes
-//!   `0x00`–`0x07` (Overflow bit4 still writable; no host cursor glyph render,
-//!   max-scan glyph height, or CRTC timing)
+//!   text-mode cursor character offset / row-col; Start Address High/Low
+//!   `0x0C`/`0x0D` store/readback with [`VgaText::text_start_address`] helper
+//!   and mode-03h reset default `0x0000` (Protect does not block); Maximum Scan
+//!   Line `0x09` store/readback with mode-03h reset default `0x0F` (Protect does
+//!   not block); Vertical Retrace End `0x11` bit7 Protect blocks writes to
+//!   indexes `0x00`–`0x07` (Overflow bit4 still writable; no host cursor glyph
+//!   render, start-address scroll/pan, max-scan glyph height, or CRTC timing)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults (no timing/plane side effects)
 //! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
@@ -150,6 +154,31 @@ pub const VGA_CRTC_CURSOR_START: u8 = 0x0A;
 ///
 /// Spec: FreeVGA / IBM VGA — bits 4:0 = cursor end scanline.
 pub const VGA_CRTC_CURSOR_END: u8 = 0x0B;
+/// CRTC Start Address High Register index.
+///
+/// Spec: FreeVGA CRT Controller Registers / IBM VGA — high byte of the 16-bit
+/// start address (character offset of the first displayed cell in the refresh
+/// buffer). Protect (Vertical Retrace End bit7) does **not** block this index
+/// (`>= 0x08`). Scroll/pan render side effects are out of scope
+/// (store/readback + helper only).
+pub const VGA_CRTC_START_ADDR_HIGH: u8 = 0x0C;
+/// CRTC Start Address Low Register index.
+///
+/// Spec: FreeVGA / IBM VGA — low byte of the 16-bit start address.
+pub const VGA_CRTC_START_ADDR_LOW: u8 = 0x0D;
+/// Mode-03h-class Start Address High reset default (`0x00`).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — display starts at character
+/// address `0` (High=`0x00`, Low=`0x00`).
+pub const VGA_CRTC_START_ADDR_HIGH_DEFAULT: u8 = 0x00;
+/// Mode-03h-class Start Address Low reset default (`0x00`).
+pub const VGA_CRTC_START_ADDR_LOW_DEFAULT: u8 = 0x00;
+const _: () = assert!(
+    VGA_CRTC_START_ADDR_HIGH == 0x0C
+        && VGA_CRTC_START_ADDR_LOW == 0x0D
+        && VGA_CRTC_START_ADDR_HIGH_DEFAULT == 0x00
+        && VGA_CRTC_START_ADDR_LOW_DEFAULT == 0x00
+);
 /// CRTC Cursor Location High Register index.
 ///
 /// Spec: FreeVGA / IBM VGA — high byte of the 16-bit cursor character address.
@@ -553,7 +582,9 @@ impl VgaText {
     }
 
     /// Reset text plane: 80×25 → space/`0x07`; remainder cleared; CRTC cleared
-    /// except Maximum Scan Line [`VGA_CRTC_MAX_SCAN_LINE`] =
+    /// except Start Address High/Low [`VGA_CRTC_START_ADDR_HIGH`]/
+    /// [`VGA_CRTC_START_ADDR_LOW`] = mode-03h defaults `0x00`/`0x00`,
+    /// Maximum Scan Line [`VGA_CRTC_MAX_SCAN_LINE`] =
     /// [`VGA_CRTC_MAX_SCAN_LINE_DEFAULT`], Offset [`VGA_CRTC_OFFSET`] =
     /// [`VGA_CRTC_OFFSET_DEFAULT`], and Underline Location
     /// [`VGA_CRTC_UNDERLINE_LOCATION`] =
@@ -576,6 +607,8 @@ impl VgaText {
         }
         self.crtc_index = 0;
         self.crtc_regs = [0; VGA_CRTC_REG_COUNT];
+        self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)] = VGA_CRTC_START_ADDR_HIGH_DEFAULT;
+        self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)] = VGA_CRTC_START_ADDR_LOW_DEFAULT;
         self.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)] = VGA_CRTC_MAX_SCAN_LINE_DEFAULT;
         self.crtc_regs[usize::from(VGA_CRTC_OFFSET)] = VGA_CRTC_OFFSET_DEFAULT;
         self.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)] =
@@ -708,6 +741,17 @@ impl VgaText {
         self.mem[off] = ch;
         self.mem[off + 1] = attr;
         true
+    }
+
+    /// 16-bit CRTC start address (`0x0C`:`0x0D`) — first displayed character.
+    ///
+    /// Spec: FreeVGA CRT Controller / IBM VGA — Start Address High/Low form a
+    /// linear character offset into the refresh buffer (not a byte offset).
+    /// Mode 03h defaults to `0`. Scroll/pan side effects are out of scope.
+    pub fn text_start_address(&self) -> u16 {
+        let high = self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)];
+        let low = self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)];
+        (u16::from(high) << 8) | u16::from(low)
     }
 
     /// 16-bit CRTC cursor character address (`0x0E`:`0x0F`).
@@ -1129,6 +1173,15 @@ mod tests {
         assert_eq!(v.mem[80 * 25 * 2], 0);
         assert_eq!(v.crtc_index, 0);
         assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)],
+            VGA_CRTC_START_ADDR_HIGH_DEFAULT
+        );
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)],
+            VGA_CRTC_START_ADDR_LOW_DEFAULT
+        );
+        assert_eq!(v.text_start_address(), 0);
+        assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
             VGA_CRTC_MAX_SCAN_LINE_DEFAULT
         );
@@ -1251,6 +1304,10 @@ mod tests {
         let mut v = VgaText::new();
         v.port_write(VGA_CRTC_INDEX, 1, 0x07);
         v.port_write(VGA_CRTC_DATA, 1, 0x99);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        v.port_write(VGA_CRTC_DATA, 1, 0x12);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        v.port_write(VGA_CRTC_DATA, 1, 0x34);
         v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
         v.port_write(VGA_CRTC_DATA, 1, 0x55);
         v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
@@ -1260,6 +1317,15 @@ mod tests {
         v.reset();
         assert_eq!(v.crtc_index, 0);
         assert_eq!(v.crtc_regs[0x07], 0);
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)],
+            VGA_CRTC_START_ADDR_HIGH_DEFAULT
+        );
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)],
+            VGA_CRTC_START_ADDR_LOW_DEFAULT
+        );
+        assert_eq!(v.text_start_address(), 0);
         assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
             VGA_CRTC_MAX_SCAN_LINE_DEFAULT
@@ -1272,6 +1338,60 @@ mod tests {
             v.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)],
             VGA_CRTC_UNDERLINE_LOCATION_DEFAULT
         );
+    }
+
+    /// Spec: FreeVGA CRT Controller / IBM VGA — Start Address High `0x0C` /
+    /// Low `0x0D` form a 16-bit character address of the first displayed cell;
+    /// Protect does not cover indexes `>= 0x08`. Mode-03h reset default is
+    /// `0x0000`.
+    #[test]
+    fn crtc_start_address_store_readback_and_helper() {
+        let mut v = VgaText::new();
+        assert_eq!(v.text_start_address(), 0);
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)],
+            VGA_CRTC_START_ADDR_HIGH_DEFAULT
+        );
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)],
+            VGA_CRTC_START_ADDR_LOW_DEFAULT
+        );
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        assert_eq!(
+            v.port_read(VGA_CRTC_DATA, 1) as u8,
+            VGA_CRTC_START_ADDR_HIGH_DEFAULT
+        );
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        assert_eq!(
+            v.port_read(VGA_CRTC_DATA, 1) as u8,
+            VGA_CRTC_START_ADDR_LOW_DEFAULT
+        );
+
+        // Protect set — indexes 0x0C/0x0D must still accept writes.
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_VERTICAL_RETRACE_END));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_PROTECT));
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        v.port_write(VGA_CRTC_DATA, 1, 0x01);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        v.port_write(VGA_CRTC_DATA, 1, 0x4F); // 0x014F = 335
+
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x01);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x4F);
+
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)], 0x01);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)], 0x4F);
+        assert_eq!(v.text_start_address(), 0x014F);
+
+        // Word write path (lo=index, hi=data) also updates Start Address under Protect.
+        v.port_write(VGA_CRTC_INDEX, 2, 0x50_0D); // index 0x0D, data 0x50
+        v.port_write(VGA_CRTC_INDEX, 2, 0x00_0C); // index 0x0C, data 0x00
+        assert_eq!(v.text_start_address(), 80);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x50);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x00);
     }
 
     /// Spec: FreeVGA CRT Controller — Maximum Scan Line (index `0x09`)
