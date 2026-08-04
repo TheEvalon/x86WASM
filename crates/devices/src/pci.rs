@@ -31,6 +31,8 @@
 //!   (`PCI_HOST_BRIDGE_COMMAND_MASK` = `0x0007`); other Command bits hardwired 0.
 //! - Host bridge Status (`0x06`) readback stub: CapList=0, FastB2B=1, DevSel=medium
 //!   (`PCI_HOST_BRIDGE_STATUS_STUB` = `0x0280`); RW1C error bits (MDPE/STA/RTA/RMA/SSE/DPE).
+//! - PIIX IDE (`00:01.1`) Command (`0x04`) store/readback: sticky IO/BusMaster only
+//!   (`PCI_PIIX_IDE_COMMAND_MASK` = `0x0005`); MEM and other bits hardwired 0.
 //! - PIIX-style stubs: `00:01.0` ISA bridge (multi-function), `00:01.1` IDE,
 //!   `00:01.2` USB UHCI, `00:01.3` ACPI identity only.
 //! - Absent devices: `0xFFFFFFFF` when enable is set.
@@ -41,8 +43,9 @@
 //! # Unsupported (explicit)
 //!
 //! - BAR MMIO/IO decode, bus mastering engine, INTx routing tables
-//! - Host-bridge Command side effects (IO/MEM decode, bus-master DMA)
-//! - Status error *signaling* (bridge never latches RW1C bits yet); PIIX Command bit masking
+//! - Host-bridge / PIIX IDE Command side effects (IO/MEM decode, bus-master DMA)
+//! - Status error *signaling* (bridge never latches RW1C bits yet)
+//! - PIIX ISA / USB / ACPI Command bit masking (IDE Command mask only)
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (config identity only)
 //! - Capability lists, MSI, PCIe, hotplug
@@ -71,6 +74,12 @@ pub const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
 /// hardwired 0 on store (no SERR/PERR/INTx-disable/etc. side effects yet).
 pub const PCI_HOST_BRIDGE_COMMAND_MASK: u16 =
     PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER;
+/// PIIX IDE (`00:01.1`) Command sticky-bit mask for this stub.
+///
+/// Sticky: IO | BusMaster (`0x0005`). MEM Space Enable and all other Command
+/// bits are hardwired 0 on store (legacy IDE + BMIBA are I/O; no MEM decode /
+/// BM engine side effects yet).
+pub const PCI_PIIX_IDE_COMMAND_MASK: u16 = PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER;
 
 /// PCI Status register config offset.
 /// Spec: PCI Local Bus — Type 0 header Status at `0x06`.
@@ -533,6 +542,14 @@ impl PciConfig {
             let status = PCI_HOST_BRIDGE_STATUS_STUB | rw1c;
             cfg[st_off..st_off + 2].copy_from_slice(&status.to_le_bytes());
         }
+        // Spec: PCI Local Bus + Intel 82371SB — PIIX IDE Command at 0x04 keeps
+        // only IO/BusMaster sticky; MEM and other bits hardwired 0 (no decode yet).
+        if is_piix_ide {
+            let cmd_off = PCI_COMMAND_OFFSET as usize;
+            let cmd = u16::from_le_bytes([cfg[cmd_off], cfg[cmd_off + 1]]);
+            let masked = cmd & PCI_PIIX_IDE_COMMAND_MASK;
+            cfg[cmd_off..cmd_off + 2].copy_from_slice(&masked.to_le_bytes());
+        }
         // Spec: Intel 82371SB / PCI — PIIX IDE BMIBA at config 0x20 is an I/O BAR:
         // bit0 hardwired 1; address bits 15:4 programmable; bits 3:1 zero.
         // Store/readback only — no BMIDE port decode yet.
@@ -972,6 +989,92 @@ mod tests {
             PciConfig::make_address(0, 1, 0, PCI_COMMAND_OFFSET, true),
         );
         // PIIX still accepts a wider writable Command word in this stub.
+        pci.port_write(PCI_CONFIG_DATA, 2, 0x0147);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0x0147);
+    }
+
+    /// Spec: PCI Local Bus — Command at `0x04`. PIIX IDE `00:01.1` stub keeps
+    /// IO/BusMaster sticky (`0x0005`); MEM and other Command bits hardwired 0.
+    #[test]
+    fn piix_ide_command_io_busmaster_sticky() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            0,
+            "Command defaults to 0 at reset"
+        );
+
+        // Guest writes all Command bits; only IO|BusMaster stick (no MEM).
+        pci.port_write(PCI_CONFIG_DATA, 2, 0xFFFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_PIIX_IDE_COMMAND_MASK
+        );
+        assert_eq!(
+            PCI_PIIX_IDE_COMMAND_MASK,
+            PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16 & PCI_COMMAND_MEM,
+            0,
+            "MEM Space Enable hardwired 0 on PIIX IDE"
+        );
+
+        // Subset stickiness: BusMaster without IO; SERR discarded.
+        pci.port_write(
+            PCI_CONFIG_DATA,
+            2,
+            u32::from(PCI_COMMAND_BUS_MASTER | 0x0100),
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_COMMAND_BUS_MASTER
+        );
+
+        // Byte lane at 0xCFC (Command low): junk high bits masked.
+        pci.port_write(PCI_CONFIG_DATA, 1, 0xFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_PIIX_IDE_COMMAND_MASK
+        );
+
+        pci.reset();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0);
+    }
+
+    /// PIIX IDE Command mask must not change host-bridge or ISA Command.
+    #[test]
+    fn piix_ide_command_mask_does_not_affect_other_functions() {
+        let mut pci = PciConfig::new();
+
+        // Host bridge still uses IO|MEM|BusMaster mask.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, 0xFFFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_HOST_BRIDGE_COMMAND_MASK
+        );
+
+        // ISA still accepts a wider writable Command word in this stub.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_COMMAND_OFFSET, true),
+        );
         pci.port_write(PCI_CONFIG_DATA, 2, 0x0147);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0x0147);
     }
