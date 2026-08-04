@@ -4,7 +4,7 @@
 //! Attribute Controller address/data flip-flop stub (`0x3C0`/`0x3C1` + Input
 //! Status #1 flip-flop reset and status bits at `0x3DA`/`0x3BA` via Misc IOAS),
 //! Miscellaneous Output Register stub (`0x3C2` write / `0x3CC` readback), and
-//! DAC / PEL color RAM stub (`0x3C7`/`0x3C8`/`0x3C9`).
+//! DAC / PEL color RAM stub (`0x3C7`/`0x3C8`/`0x3C9`) and PEL Mask (`0x3C6`).
 //!
 //! # Spec refs
 //!
@@ -37,10 +37,11 @@
 //!   I/O Address Select (IOAS): `1` = color CRTC/status map (`0x3D4`/`0x3D5`,
 //!   Input Status #1 `0x3DA`); `0` = mono map (CRTC `0x3B4`/`0x3B5`, Input
 //!   Status #1 `0x3BA`).
-//! - OSDev VGA Hardware / FreeVGA Color Registers + DAC Operation / IBM VGA —
-//!   PEL Address Write Mode `0x3C8`, PEL Address Read Mode write / DAC State
-//!   read `0x3C7`, PEL Data `0x3C9` (R→G→B, 6-bit, auto-increment after blue);
-//!   256×3 DAC RAM.
+//! - OSDev VGA Hardware / FreeVGA Color Registers + DAC Operation / IBM VGA /
+//!   RBIL — PEL Mask `0x3C6` (R/W, default `0xFF`; ANDed with the color index
+//!   for each displayed pixel before DAC lookup), PEL Address Write Mode
+//!   `0x3C8`, PEL Address Read Mode write / DAC State read `0x3C7`, PEL Data
+//!   `0x3C9` (R→G→B, 6-bit, auto-increment after blue); 256×3 DAC RAM.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.6 / §21 VGA text mode.
 //!
 //! # Scope (this slice)
@@ -65,12 +66,17 @@
 //!   #1 ownership only (not CRTC mono map, clock, or RAM-enable)
 //! - DAC / PEL store/readback: write index `0x3C8`, data `0x3C9` (R→G→B), read
 //!   index write / state read `0x3C7`; 256×3 RAM with mode-03h-ish defaults
+//! - PEL Mask `0x3C6` R/W store/readback (default `0xFF`); display-path AND is
+//!   not applied yet (no host render); does **not** alter `0x3C9` palette
+//!   programming (FreeVGA/RBIL/Abrash document mask on pixel-index lookup only)
 //!
 //! # Unsupported (explicit)
 //!
 //! - ATC / Sequencer / GC timing, ATC→DAC remap side effects, blink, PEL pan,
-//!   PEL mask `0x3C6`, plane-enable, map-mask, write-mode, read-map, or bitmask
-//!   side effects on the text plane
+//!   plane-enable, map-mask, write-mode, read-map, or bitmask side effects on
+//!   the text plane
+//! - PEL Mask display-path application (pixel index AND before DAC lookup) —
+//!   deferred until host render; hidden-DAC unlock via repeated `0x3C6` reads
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
 //! - CRTC protect bit (index `0x11` bit7), mono CRTC map at `0x3B4`/`0x3B5`
@@ -219,6 +225,16 @@ pub const VGA_ATC_DEFAULTS: [u8; VGA_ATC_REG_COUNT] = [
     0x0C, 0x00, 0x0F, 0x08, 0x00,
 ];
 
+/// DAC / PEL Mask Register (R/W).
+///
+/// Spec: FreeVGA Color Registers / OSDev VGA Hardware / IBM VGA / RBIL —
+/// ANDed with the color index of each displayed pixel before DAC lookup.
+/// Default `0xFF` (no masking). Store/readback only in this stub; the display
+/// AND is deferred until host render. Does not affect [`VGA_DAC_DATA`] palette
+/// programming (datasheets describe display-path lookup only).
+pub const VGA_DAC_PEL_MASK: u16 = 0x3C6;
+/// Reset / power-on default for [`VGA_DAC_PEL_MASK`].
+pub const VGA_DAC_PEL_MASK_DEFAULT: u8 = 0xFF;
 /// DAC Address Read Mode write / DAC State read port.
 ///
 /// Spec: FreeVGA Color Registers / OSDev VGA Hardware / IBM VGA — write sets
@@ -309,6 +325,9 @@ pub struct VgaText {
     ///
     /// Bit0 ([`VGA_MISC_IOAS`]) selects Input Status #1 port ownership.
     pub misc_output: u8,
+    /// PEL Mask (`0x3C6`): display-path color-index AND (store/readback; default
+    /// [`VGA_DAC_PEL_MASK_DEFAULT`]). Not applied to [`VGA_DAC_DATA`] R/W.
+    pub dac_pel_mask: u8,
     /// DAC color RAM: 256 entries × RGB (6-bit components stored).
     pub dac_ram: [[u8; 3]; VGA_DAC_ENTRY_COUNT],
     /// Current DAC write index (set via `0x3C8`).
@@ -344,6 +363,7 @@ impl VgaText {
             atc_flip_flop_data: false,
             status1_phase: 0,
             misc_output: VGA_MISC_OUTPUT_DEFAULT,
+            dac_pel_mask: VGA_DAC_PEL_MASK_DEFAULT,
             dac_ram: vga_dac_default_ram(),
             dac_write_index: 0,
             dac_read_index: 0,
@@ -359,8 +379,9 @@ impl VgaText {
     /// Sequencer restored to [`VGA_SEQ_DEFAULTS`]; Graphics Controller restored
     /// to [`VGA_GC_DEFAULTS`]; Attribute Controller restored to
     /// [`VGA_ATC_DEFAULTS`] with flip-flop in address state; Input Status #1
-    /// phase cleared; Misc Output restored to [`VGA_MISC_OUTPUT_DEFAULT`]; DAC
-    /// RAM restored to mode-03h-ish defaults ([`vga_dac_default_ram`]).
+    /// phase cleared; Misc Output restored to [`VGA_MISC_OUTPUT_DEFAULT`]; PEL
+    /// Mask restored to [`VGA_DAC_PEL_MASK_DEFAULT`]; DAC RAM restored to
+    /// mode-03h-ish defaults ([`vga_dac_default_ram`]).
     ///
     /// Spec: IBM VGA text — cells are (char, attr) pairs starting at `0xB8000`.
     pub fn reset(&mut self) {
@@ -382,6 +403,7 @@ impl VgaText {
         self.atc_flip_flop_data = false;
         self.status1_phase = 0;
         self.misc_output = VGA_MISC_OUTPUT_DEFAULT;
+        self.dac_pel_mask = VGA_DAC_PEL_MASK_DEFAULT;
         self.dac_ram = vga_dac_default_ram();
         self.dac_write_index = 0;
         self.dac_read_index = 0;
@@ -403,11 +425,11 @@ impl VgaText {
     }
 
     /// True if this device owns the I/O port (color CRTC + Sequencer + GC + ATC
-    /// + DAC PEL + Input Status #1 at the IOAS-selected address + Misc).
+    /// + DAC PEL / PEL Mask + Input Status #1 at the IOAS-selected address + Misc).
     ///
     /// Spec: FreeVGA / IBM — Input Status #1 is `0x3DA` when IOAS=1 (color) and
     /// `0x3BA` when IOAS=0 (mono). CRTC remains color `0x3D4`/`0x3D5` in this
-    /// stub (mono CRTC remap is unsupported). PEL mask `0x3C6` is not owned.
+    /// stub (mono CRTC remap is unsupported).
     pub fn owns_port(&self, port: u16) -> bool {
         match port {
             VGA_INPUT_STATUS_1 => self.misc_ioas_color(),
@@ -420,6 +442,7 @@ impl VgaText {
             | VGA_GC_DATA
             | VGA_ATC_ADDRESS_DATA
             | VGA_ATC_DATA_READ
+            | VGA_DAC_PEL_MASK
             | VGA_DAC_READ_INDEX
             | VGA_DAC_WRITE_INDEX
             | VGA_DAC_DATA
@@ -686,6 +709,16 @@ impl VgaText {
     fn read_dac_state(&self) -> u8 {
         self.dac_state
     }
+
+    /// Spec: FreeVGA / RBIL — write `0x3C6` stores the PEL Mask (default `0xFF`).
+    fn write_dac_pel_mask(&mut self, value: u8) {
+        self.dac_pel_mask = value;
+    }
+
+    /// Spec: FreeVGA / RBIL — read `0x3C6` returns the current PEL Mask.
+    fn read_dac_pel_mask(&self) -> u8 {
+        self.dac_pel_mask
+    }
 }
 
 impl PortDevice for VgaText {
@@ -699,6 +732,8 @@ impl PortDevice for VgaText {
             VGA_GC_DATA => u32::from(self.read_gc_data()),
             VGA_ATC_ADDRESS_DATA => u32::from(self.read_atc_address()),
             VGA_ATC_DATA_READ => u32::from(self.read_atc_data()),
+            // Spec: FreeVGA / RBIL — read `0x3C6` = PEL Mask.
+            VGA_DAC_PEL_MASK => u32::from(self.read_dac_pel_mask()),
             // Spec: FreeVGA Color Registers — read `0x3C7` = DAC State.
             VGA_DAC_READ_INDEX => u32::from(self.read_dac_state()),
             // Spec: FreeVGA Color Registers — read `0x3C8` = current write index.
@@ -761,6 +796,8 @@ impl PortDevice for VgaText {
             }
             // Spec: FreeVGA — `0x3C1` is data-read; writes ignored.
             VGA_ATC_DATA_READ => {}
+            // Spec: FreeVGA / RBIL — write `0x3C6` = PEL Mask.
+            VGA_DAC_PEL_MASK => self.write_dac_pel_mask(value as u8),
             // Spec: FreeVGA Color Registers — write `0x3C7` = read-mode index.
             VGA_DAC_READ_INDEX => self.write_dac_read_index(value as u8),
             VGA_DAC_WRITE_INDEX => self.write_dac_write_index(value as u8),
@@ -807,6 +844,7 @@ mod tests {
         assert_eq!(v.atc_regs, VGA_ATC_DEFAULTS);
         assert!(!v.atc_flip_flop_data);
         assert_eq!(v.misc_output, VGA_MISC_OUTPUT_DEFAULT);
+        assert_eq!(v.dac_pel_mask, VGA_DAC_PEL_MASK_DEFAULT);
         assert_eq!(v.dac_ram, vga_dac_default_ram());
         assert_eq!(v.dac_write_index, 0);
         assert_eq!(v.dac_read_index, 0);
@@ -1464,13 +1502,57 @@ mod tests {
 
     #[test]
     fn dac_pel_owns_ports() {
-        // Spec: FreeVGA Color Registers / OSDev VGA Hardware — DAC Read Index
-        // `0x3C7`, Write Index `0x3C8`, Data `0x3C9`. PEL mask `0x3C6` not owned.
+        // Spec: FreeVGA Color Registers / OSDev VGA Hardware / RBIL — PEL Mask
+        // `0x3C6`, DAC Read Index `0x3C7`, Write Index `0x3C8`, Data `0x3C9`.
         let v = VgaText::new();
+        assert!(v.owns_port(VGA_DAC_PEL_MASK));
         assert!(v.owns_port(VGA_DAC_READ_INDEX));
         assert!(v.owns_port(VGA_DAC_WRITE_INDEX));
         assert!(v.owns_port(VGA_DAC_DATA));
-        assert!(!v.owns_port(0x3C6));
+    }
+
+    #[test]
+    fn dac_pel_mask_default_ff_and_readback() {
+        // Spec: FreeVGA / RBIL / IBM VGA — PEL Mask at `0x3C6` is R/W; power-on
+        // / reset default is `0xFF` (pass all color-index bits).
+        let mut v = VgaText::new();
+        assert_eq!(v.dac_pel_mask, VGA_DAC_PEL_MASK_DEFAULT);
+        assert_eq!(
+            v.port_read(VGA_DAC_PEL_MASK, 1) as u8,
+            VGA_DAC_PEL_MASK_DEFAULT
+        );
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x0F);
+        assert_eq!(v.port_read(VGA_DAC_PEL_MASK, 1) as u8, 0x0F);
+        assert_eq!(v.dac_pel_mask, 0x0F);
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0xA5);
+        assert_eq!(v.port_read(VGA_DAC_PEL_MASK, 1) as u8, 0xA5);
+        v.reset();
+        assert_eq!(v.dac_pel_mask, VGA_DAC_PEL_MASK_DEFAULT);
+        assert_eq!(
+            v.port_read(VGA_DAC_PEL_MASK, 1) as u8,
+            VGA_DAC_PEL_MASK_DEFAULT
+        );
+    }
+
+    #[test]
+    fn dac_pel_mask_does_not_alter_dac_data_path() {
+        // Spec: FreeVGA / RBIL / Abrash — PEL Mask ANDs the *displayed* pixel
+        // color index before DAC lookup. It does not transform palette RAM
+        // programming via `0x3C9`. This stub stores the mask only (no host
+        // render yet); verify `0x3C9` store/readback is unchanged under a
+        // non-`0xFF` mask.
+        let mut v = VgaText::new();
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x00);
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x10);
+        v.port_write(VGA_DAC_DATA, 1, 0x3F);
+        v.port_write(VGA_DAC_DATA, 1, 0x2A);
+        v.port_write(VGA_DAC_DATA, 1, 0x15);
+        assert_eq!(v.dac_ram[0x10], [0x3F, 0x2A, 0x15]);
+        v.port_write(VGA_DAC_READ_INDEX, 1, 0x10);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x3F);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x2A);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x15);
+        assert_eq!(v.port_read(VGA_DAC_PEL_MASK, 1) as u8, 0x00);
     }
 
     #[test]
@@ -1565,6 +1647,7 @@ mod tests {
     #[test]
     fn reset_restores_dac_pel_defaults() {
         let mut v = VgaText::new();
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x55);
         v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x07);
         v.port_write(VGA_DAC_DATA, 1, 0x11);
         v.port_write(VGA_DAC_DATA, 1, 0x22);
@@ -1572,7 +1655,9 @@ mod tests {
         v.port_write(VGA_DAC_READ_INDEX, 1, 0x40);
         assert_eq!(v.dac_ram[0x07], [0x11, 0x22, 0x33]);
         assert_eq!(v.dac_state, VGA_DAC_STATE_READ);
+        assert_eq!(v.dac_pel_mask, 0x55);
         v.reset();
+        assert_eq!(v.dac_pel_mask, VGA_DAC_PEL_MASK_DEFAULT);
         assert_eq!(v.dac_ram, vga_dac_default_ram());
         assert_eq!(v.dac_ram[0x07], VGA_DAC_CGA16_DEFAULTS[0x07]);
         assert_eq!(v.dac_write_index, 0);
