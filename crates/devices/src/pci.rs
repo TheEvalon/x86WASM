@@ -41,6 +41,8 @@
 //!   (`PCI_PIIX_IDE_STATUS_STUB` = `0x0280`); RW1C error bits via `PCI_STATUS_RW1C_MASK`.
 //! - PIIX USB UHCI (`00:01.2`) Command (`0x04`) store/readback: sticky IO/MEM/BusMaster
 //!   (`PCI_PIIX_USB_COMMAND_MASK` = `0x0007`, same as host bridge); other bits hardwired 0.
+//! - PIIX USB Status (`0x06`) readback stub: same CapList/FastB2B/DevSel as host bridge
+//!   (`PCI_PIIX_USB_STATUS_STUB` = `0x0280`); RW1C error bits via `PCI_STATUS_RW1C_MASK`.
 //! - PIIX ACPI (`00:01.3`) Command (`0x04`) store/readback: sticky IO/MEM/BusMaster
 //!   (`PCI_PIIX_ACPI_COMMAND_MASK` = `0x0007`, same as host bridge); other bits hardwired 0.
 //! - PIIX-style stubs: `00:01.0` ISA bridge (multi-function), `00:01.1` IDE,
@@ -54,9 +56,9 @@
 //!
 //! - BAR MMIO/IO decode, bus mastering engine, INTx routing tables
 //! - Host-bridge / PIIX ISA / PIIX IDE / PIIX USB / PIIX ACPI Command side effects (IO/MEM decode, bus-master DMA)
-//! - Status error *signaling* (host / ISA / IDE never latch RW1C bits from real aborts yet)
-//! - Capability list walk (CapList hardwired 0 on host / ISA / IDE)
-//! - USB Status stubs; ACPI Status stubs
+//! - Status error *signaling* (host / ISA / IDE / USB never latch RW1C bits from real aborts yet)
+//! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB)
+//! - ACPI Status stubs
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (Command + PMBASE config only)
 //! - Capability lists, MSI, PCIe, hotplug
@@ -162,6 +164,11 @@ const _: () = assert!(PCI_PIIX_ISA_STATUS_STUB == PCI_HOST_BRIDGE_STATUS_STUB);
 /// PIIX IDE (`00:01.1`) Status hardwired stub — same CapList/FastB2B/DevSel pattern
 /// as the host bridge (`0x0280`). Spec: PCI Local Bus — Status register.
 pub const PCI_PIIX_IDE_STATUS_STUB: u16 = PCI_HOST_BRIDGE_STATUS_STUB;
+/// PIIX USB UHCI (`00:01.2`) Status hardwired stub — same CapList/FastB2B/DevSel
+/// pattern as the host bridge (`0x0280`). Spec: PCI Local Bus — Status register;
+/// Intel 82371SB USB UHCI function.
+pub const PCI_PIIX_USB_STATUS_STUB: u16 = PCI_HOST_BRIDGE_STATUS_STUB;
+const _: () = assert!(PCI_PIIX_USB_STATUS_STUB == PCI_HOST_BRIDGE_STATUS_STUB);
 
 /// Intel vendor ID.
 pub const PCI_VENDOR_INTEL: u16 = 0x8086;
@@ -372,6 +379,9 @@ impl PciConfig {
                 header_type: 0x00,
             },
         );
+        // Spec: PCI Local Bus — Status at 0x06 CapList=0, FastB2B, DevSel=medium stub.
+        let st = PCI_STATUS_OFFSET as usize;
+        cfg[st..st + 2].copy_from_slice(&PCI_PIIX_USB_STATUS_STUB.to_le_bytes());
         cfg
     }
 
@@ -540,7 +550,7 @@ impl PciConfig {
         let is_piix_usb = self.bus() == 0 && self.device() == 1 && self.function() == 2;
         let is_piix_acpi = self.bus() == 0 && self.device() == 1 && self.function() == 3;
         // Spec: PCI Status RW1C needs pre-write value (write-1-to-clear).
-        let old_status = if is_host_bridge || is_piix_isa || is_piix_ide {
+        let old_status = if is_host_bridge || is_piix_isa || is_piix_ide || is_piix_usb {
             self.selected_cfg().map(|cfg| {
                 let st = PCI_STATUS_OFFSET as usize;
                 u16::from_le_bytes([cfg[st], cfg[st + 1]])
@@ -630,12 +640,20 @@ impl PciConfig {
         }
         // Spec: PCI Local Bus + Intel 82371SB — PIIX USB UHCI Command at 0x04
         // keeps IO/MEM/BusMaster sticky (same mask as host bridge); other bits
-        // hardwired 0. Store/readback only — no UHCI IO/MEM/BM side effects yet.
+        // hardwired 0. Status at 0x06: same CapList/FastB2B/DevSel stub + RW1C.
+        // Store/readback only — no UHCI IO/MEM/BM side effects / error signaling yet.
         if is_piix_usb {
             let cmd_off = PCI_COMMAND_OFFSET as usize;
             let cmd = u16::from_le_bytes([cfg[cmd_off], cfg[cmd_off + 1]]);
             let masked = cmd & PCI_PIIX_USB_COMMAND_MASK;
             cfg[cmd_off..cmd_off + 2].copy_from_slice(&masked.to_le_bytes());
+
+            let st_off = PCI_STATUS_OFFSET as usize;
+            let old = old_status.unwrap_or(PCI_PIIX_USB_STATUS_STUB);
+            let written = status_written_bits(base, lane, size, value);
+            let rw1c = (old & PCI_STATUS_RW1C_MASK) & !(written & PCI_STATUS_RW1C_MASK);
+            let status = PCI_PIIX_USB_STATUS_STUB | rw1c;
+            cfg[st_off..st_off + 2].copy_from_slice(&status.to_le_bytes());
         }
         // Spec: PCI Local Bus + Intel 82371AB — PIIX ACPI Command at 0x04
         // keeps IO/MEM/BusMaster sticky (same mask as host bridge); other bits
@@ -1703,6 +1721,75 @@ mod tests {
         // Clear remaining RW1C with 0xFFFF; hardwired stub bits remain.
         pci.port_write(0xCFE, 2, 0xFFFF);
         assert_eq!(pci.port_read(0xCFE, 2) as u16, PCI_PIIX_IDE_STATUS_STUB);
+    }
+
+    /// Spec: PCI Local Bus — Status at `0x06`. PIIX USB UHCI stub CapList=0,
+    /// FastB2B=1, DevSel=medium (`PCI_PIIX_USB_STATUS_STUB` = `0x0280`).
+    /// Access via dword base `0x04` + CONFIG_DATA lane `0xCFE`.
+    #[test]
+    fn piix_usb_status_caplist_fastb2b_devsel_stub() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_COMMAND_OFFSET, true),
+        );
+        let status = pci.port_read(0xCFE, 2) as u16;
+        assert_eq!(status, PCI_PIIX_USB_STATUS_STUB);
+        assert_eq!(
+            status & PCI_STATUS_CAP_LIST,
+            0,
+            "CapList hardwired 0 (no caps)"
+        );
+        assert_ne!(status & PCI_STATUS_FAST_BACK, 0, "FastB2B hardwired 1");
+        assert_eq!(
+            status & PCI_STATUS_DEVSEL_MASK,
+            PCI_STATUS_DEVSEL_MEDIUM,
+            "DevSel=medium"
+        );
+        assert_eq!(PCI_PIIX_USB_STATUS_STUB, PCI_HOST_BRIDGE_STATUS_STUB);
+        assert_eq!(PCI_PIIX_USB_STATUS_STUB, PCI_PIIX_IDE_STATUS_STUB);
+        assert_eq!(PCI_PIIX_USB_STATUS_STUB, PCI_PIIX_ISA_STATUS_STUB);
+
+        // Guest cannot set CapList or change DevSel/FastB2B via config write.
+        pci.port_write(0xCFE, 2, 0xFFFF);
+        assert_eq!(pci.port_read(0xCFE, 2) as u16, PCI_PIIX_USB_STATUS_STUB);
+
+        pci.reset();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_COMMAND_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(0xCFE, 2) as u16, PCI_PIIX_USB_STATUS_STUB);
+    }
+
+    /// Spec: PCI Status RW1C — write-1 clears MDPE/STA/RTA/RMA/SSE/DPE on PIIX USB.
+    #[test]
+    fn piix_usb_status_rw1c_error_bits() {
+        let mut pci = PciConfig::new();
+        let st = PCI_STATUS_OFFSET as usize;
+        let injected =
+            PCI_PIIX_USB_STATUS_STUB | PCI_STATUS_REC_MASTER_ABORT | PCI_STATUS_DETECTED_PARITY;
+        pci.piix_usb[st..st + 2].copy_from_slice(&injected.to_le_bytes());
+
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_COMMAND_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(0xCFE, 2) as u16, injected);
+
+        // Write-0 to RMA keeps it; write-1 to DPE clears only DPE.
+        pci.port_write(0xCFE, 2, u32::from(PCI_STATUS_DETECTED_PARITY));
+        assert_eq!(
+            pci.port_read(0xCFE, 2) as u16,
+            PCI_PIIX_USB_STATUS_STUB | PCI_STATUS_REC_MASTER_ABORT
+        );
+
+        // Clear remaining RW1C with 0xFFFF; hardwired stub bits remain.
+        pci.port_write(0xCFE, 2, 0xFFFF);
+        assert_eq!(pci.port_read(0xCFE, 2) as u16, PCI_PIIX_USB_STATUS_STUB);
     }
 
     /// Spec: UHCI / PIIX USB — LEGSUP dword at config `0xC0` store/readback
