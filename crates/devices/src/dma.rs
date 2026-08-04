@@ -16,15 +16,17 @@
 //!
 //! - Dual 8237A programming model: addr/count with flip-flop, mode, masks,
 //!   command/request accept, status read, master/mask reset.
+//! - Status register TC bits (3:0) clear-on-read + `latch_tc` device/test API
+//!   (no DREQ/DACK memory transfers).
 //! - Page address register R/W for the eight AT channels above.
 //! - `PortDevice` for MachineBus wiring.
 //!
 //! # Unsupported (explicit)
 //!
-//! - Memory transfer engine (DREQ/DACK/TC that move RAM)
-//! - Terminal-count status bits (always 0 — no transfers)
+//! - Memory transfer engine (DREQ/DACK that move RAM)
+//! - Hardware DREQ-driven TC (status TC bits latch only via test/device API)
 //! - Auto-init / cascade channel 4 refresh behavior beyond storing registers
-//! - Floppy / Sound Blaster / other DMA device integration
+//! - Floppy / Sound Blaster / other DMA device integration (no SeaBIOS floppy DMA)
 
 use crate::PortDevice;
 
@@ -59,7 +61,8 @@ pub struct DmaController {
     pub flip_flop: bool,
     /// Command register (stored; transfer engine unsupported).
     pub command: u8,
-    /// Status register (TC bits remain 0 without a transfer engine).
+    /// Status register: bits 3:0 = TC per channel (clear-on-read);
+    /// bits 7:4 = request pending (DREQ path unsupported; stay 0 unless latched).
     pub status: u8,
     /// Software request register (stored).
     pub request: u8,
@@ -91,6 +94,18 @@ impl DmaController {
     /// Spec: Intel 8237A master clear — masks all channels, clears flip-flop.
     pub fn master_reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Latch terminal-count status for `channel` (0–3).
+    ///
+    /// Spec: Intel 8237A status register bits 3:0 are set when a channel reaches
+    /// TC. Without a DREQ/DACK transfer engine, firmware/tests use this hook to
+    /// exercise clear-on-read status semantics. Does **not** move memory.
+    pub fn latch_tc(&mut self, channel: usize) {
+        debug_assert!(channel < 4);
+        if channel < 4 {
+            self.status |= 1 << channel;
+        }
     }
 
     fn clear_flip_flop(&mut self) {
@@ -139,7 +154,13 @@ impl DmaController {
                 let is_count = offset % 2 == 1;
                 self.read_addr_count_byte(ch, is_count)
             }
-            8 => self.status, // TC/request bits; TC stays 0 without transfers
+            8 => {
+                // Spec: Intel 8237A — status read returns TC (bits 3:0) + request
+                // (bits 7:4); TC bits clear on read. Master clear also clears them.
+                let status = self.status;
+                self.status &= !0x0F;
+                status
+            }
             13 => self.temporary,
             15 => self.mask & 0x0F,
             _ => 0xFF, // write-only / undefined reads
@@ -203,6 +224,18 @@ impl Dma8237 {
 
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Latch TC status for ISA channel `0`–`7` (master 0–3 / slave 4–7).
+    ///
+    /// Device-level test/firmware-probe hook only — not a DREQ/DACK engine.
+    /// Spec: Intel 8237A status register TC bits.
+    pub fn latch_tc(&mut self, isa_channel: usize) {
+        match isa_channel {
+            0..=3 => self.master.latch_tc(isa_channel),
+            4..=7 => self.slave.latch_tc(isa_channel - 4),
+            _ => {}
+        }
     }
 
     fn page_channel(port: u16) -> Option<usize> {
@@ -338,9 +371,56 @@ mod tests {
     }
 
     #[test]
-    fn status_tc_bits_stay_clear() {
+    fn status_tc_clear_after_reset() {
+        // Spec: Intel 8237A — after master clear / power-on, TC bits are 0.
         let mut d = Dma8237::new();
         assert_eq!(d.port_read(0x08, 1) as u8, 0);
+    }
+
+    #[test]
+    fn status_tc_bits_readable_and_clear_on_read() {
+        // Spec: Intel 8237A status register — bits 3:0 set at TC; cleared by
+        // reading status (port 0x08). No DREQ/DACK transfer; latch via API.
+        let mut d = Dma8237::new();
+        d.latch_tc(2); // ISA ch2 (floppy channel) on master
+        assert_eq!(d.master.status & 0x0F, 0x04);
+        assert_eq!(d.port_read(0x08, 1) as u8 & 0x0F, 0x04);
+        assert_eq!(d.master.status & 0x0F, 0);
+        assert_eq!(d.port_read(0x08, 1) as u8 & 0x0F, 0);
+    }
+
+    #[test]
+    fn status_tc_multi_channel_and_master_reset() {
+        let mut d = Dma8237::new();
+        d.latch_tc(0);
+        d.latch_tc(3);
+        assert_eq!(d.port_read(0x08, 1) as u8 & 0x0F, 0x09);
+        d.latch_tc(1);
+        d.port_write(0x0D, 1, 0x00); // master clear
+        assert_eq!(d.port_read(0x08, 1) as u8 & 0x0F, 0);
+    }
+
+    #[test]
+    fn slave_status_tc_clear_on_read() {
+        // Spec: Intel 8237A slave status at offset 8 → port 0xD0.
+        let mut d = Dma8237::new();
+        d.latch_tc(5); // slave channel 1 (ISA ch5)
+        assert_eq!(d.port_read(0xD0, 1) as u8 & 0x0F, 0x02);
+        assert_eq!(d.port_read(0xD0, 1) as u8 & 0x0F, 0);
+    }
+
+    #[test]
+    fn software_request_and_mask_unchanged_with_tc() {
+        // Existing programming model must stay green beside TC latch/status.
+        let mut d = Dma8237::new();
+        d.port_write(0x09, 1, 0x04); // software request set ch0
+        assert_eq!(d.master.request, 0x04);
+        d.port_write(0x0A, 1, 0x00); // unmask ch0
+        assert_eq!(d.master.mask & 0x01, 0);
+        d.latch_tc(0);
+        assert_eq!(d.port_read(0x08, 1) as u8 & 0x0F, 0x01);
+        assert_eq!(d.master.request, 0x04);
+        assert_eq!(d.master.mask & 0x01, 0);
     }
 
     #[test]
