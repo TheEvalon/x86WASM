@@ -29,7 +29,8 @@
 //! - Hardware DREQ/DACK handshake / cycle-accurate bus timing
 //! - Auto-init, address decrement, demand/block/cascade/verify modes
 //! - 16-bit channels 4–7 word addressing / transfers
-//! - Floppy / IDE / other device integration (no Machine/FDC wiring; no SeaBIOS floppy DMA)
+//! - Floppy / IDE automatic DMA engine / DREQ path (Machine PhysMem wiring lives in
+//!   `machine-pc::Machine::dma_transfer`; no SeaBIOS floppy DMA)
 
 use crate::PortDevice;
 
