@@ -42,7 +42,8 @@
 //!   write port `0x3C2`, readback port `0x3CC` (write-only at `0x3C2`); bit0
 //!   I/O Address Select (IOAS): `1` = color CRTC/status map (`0x3D4`/`0x3D5`,
 //!   Input Status #1 `0x3DA`); `0` = mono map (CRTC `0x3B4`/`0x3B5`, Input
-//!   Status #1 `0x3BA`).
+//!   Status #1 `0x3BA`); bit1 RAM Enable: when clear, CPU accesses to video RAM
+//!   (text plane `0xB8000`–`0xBFFFF`) are disabled.
 //! - OSDev VGA Hardware / FreeVGA Color Registers + DAC Operation / IBM VGA /
 //!   RBIL — PEL Mask `0x3C6` (R/W, default `0xFF`; ANDed with the color index
 //!   for each displayed pixel before DAC lookup), PEL Address Write Mode
@@ -73,7 +74,8 @@
 //!   vertical-retrace status bits (read-phase counter); port selected by Misc
 //!   Output IOAS (`0x3DA` color / `0x3BA` mono)
 //! - Misc Output store/readback (`0x3C2`/`0x3CC`); IOAS bit remaps Input Status
-//!   #1 and CRTC index/data ownership (not clock or RAM-enable)
+//!   #1 and CRTC index/data ownership; RAM Enable (bit1) gates CPU text-plane
+//!   `read_u8`/`write_u8` (not clock select)
 //! - DAC / PEL store/readback: write index `0x3C8`, data `0x3C9` (R→G→B), read
 //!   index write / state read `0x3C7`; 256×3 RAM with mode-03h-ish defaults
 //! - PEL Mask `0x3C6` R/W store/readback (default `0xFF`); display-path AND is
@@ -90,8 +92,8 @@
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
 //! - Full CRTC timing/blanking (Protect write-gate only; no scanline counters)
-//! - Misc Output bit side effects beyond IOAS CRTC/status remap (clock select,
-//!   RAM enable)
+//! - Misc Output clock-select / polarity side effects (RAM Enable bit1 enforced
+//!   on CPU text-plane helpers)
 //! - Planar graphics, VBE, host canvas rendering, dirty tracking
 //! - Font ROM / host rendering of the hardware cursor glyph from CRTC start/end
 //!   scanlines (register state + offset helpers only)
@@ -209,6 +211,15 @@ pub const VGA_MISC_OUTPUT_DEFAULT: u8 = 0x67;
 /// Input Status #1 `0x3DA`); `0` = mono I/O map (`0x3Bx` CRTC + Input Status #1
 /// `0x3BA`). This stub remaps CRTC index/data and Input Status #1 ownership.
 pub const VGA_MISC_IOAS: u8 = 0x01;
+/// Miscellaneous Output bit1 — RAM Enable ("Enable RAM").
+///
+/// Spec: FreeVGA External Registers / IBM VGA Misc Output — when clear, CPU
+/// accesses to video RAM (including the color text plane at `0xB8000`–`0xBFFFF`)
+/// are disabled. This stub gates [`VgaText::read_u8`] / [`VgaText::write_u8`]:
+/// clear → same "not handled" returns as out-of-window (`None` / `false`) so
+/// `MachineBus` falls through to open-bus / PhysMem; set (default in `0x67`) →
+/// plane R/W unchanged.
+pub const VGA_MISC_RAM_ENABLE: u8 = 0x02;
 
 /// Graphics Controller Address (index) Register.
 ///
@@ -385,7 +396,8 @@ pub struct VgaText {
     pub status1_phase: u8,
     /// Miscellaneous Output Register (store via `0x3C2`, read via `0x3CC`).
     ///
-    /// Bit0 ([`VGA_MISC_IOAS`]) selects Input Status #1 port ownership.
+    /// Bit0 ([`VGA_MISC_IOAS`]) selects CRTC / Input Status #1 port ownership.
+    /// Bit1 ([`VGA_MISC_RAM_ENABLE`]) gates CPU text-plane `read_u8`/`write_u8`.
     pub misc_output: u8,
     /// PEL Mask (`0x3C6`): display-path color-index AND (store/readback; default
     /// [`VGA_DAC_PEL_MASK_DEFAULT`]). Not applied to [`VGA_DAC_DATA`] R/W.
@@ -486,6 +498,16 @@ impl VgaText {
         self.misc_output & VGA_MISC_IOAS != 0
     }
 
+    /// True when Misc Output RAM Enable is set (bit1 = 1).
+    ///
+    /// Spec: FreeVGA External Registers / IBM VGA Misc Output — when clear,
+    /// CPU accesses to video RAM are disabled. This stub gates
+    /// [`Self::read_u8`] / [`Self::write_u8`] only (test helpers may still
+    /// inspect the plane buffer).
+    pub fn misc_ram_enable(&self) -> bool {
+        self.misc_output & VGA_MISC_RAM_ENABLE != 0
+    }
+
     /// True if this device owns the I/O port (CRTC + Sequencer + GC + ATC +
     /// DAC PEL / PEL Mask + Input Status #1 at the IOAS-selected addresses + Misc).
     ///
@@ -514,7 +536,10 @@ impl VgaText {
     }
 
     pub fn read_u8(&self, addr: u64) -> Option<u8> {
-        if !Self::owns_addr(addr) {
+        if !Self::owns_addr(addr) || !self.misc_ram_enable() {
+            // Choice when RAM Enable clear: same `None` as out-of-window so
+            // `MachineBus` falls through to open-bus / PhysMem (does not expose
+            // plane data). Spec: FreeVGA / IBM Misc Output bit1.
             return None;
         }
         let off = (addr - VGA_TEXT_BASE) as usize;
@@ -522,7 +547,9 @@ impl VgaText {
     }
 
     pub fn write_u8(&mut self, addr: u64, val: u8) -> bool {
-        if !Self::owns_addr(addr) {
+        if !Self::owns_addr(addr) || !self.misc_ram_enable() {
+            // Choice when RAM Enable clear: ignore write (`false`), plane
+            // unchanged — same "not handled" as out-of-window.
             return false;
         }
         let off = (addr - VGA_TEXT_BASE) as usize;
@@ -710,7 +737,8 @@ impl VgaText {
 
     fn write_misc_output(&mut self, value: u8) {
         // Store; IOAS (bit0) remaps CRTC index/data and Input Status #1
-        // ownership. Clock select and RAM-enable bits are not enforced.
+        // ownership. RAM Enable (bit1) gates CPU text-plane helpers.
+        // Clock select / polarity bits are not enforced.
         self.misc_output = value;
     }
 
@@ -1405,6 +1433,76 @@ mod tests {
         v.port_write(VGA_MISC_OUTPUT_WRITE, 1, 0xA5);
         assert_eq!(v.misc_output, 0xA5);
         assert_eq!(v.port_read(VGA_MISC_OUTPUT_READ, 1) as u8, 0xA5);
+    }
+
+    #[test]
+    fn misc_ram_enable_default_allows_plane_rw() {
+        // Spec: FreeVGA External Registers / IBM VGA Misc Output — bit1 RAM
+        // Enable is set in the mode-03h-class default `0x67`; CPU text-plane
+        // R/W at `0xB8000` works as today.
+        let mut v = VgaText::new();
+        assert_eq!(v.misc_output, VGA_MISC_OUTPUT_DEFAULT);
+        assert_eq!(v.misc_output & VGA_MISC_RAM_ENABLE, VGA_MISC_RAM_ENABLE);
+        assert!(v.misc_ram_enable());
+        assert!(v.write_u8(VGA_TEXT_BASE, b'A'));
+        assert!(v.write_u8(VGA_TEXT_BASE + 1, 0x1E));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(b'A'));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE + 1), Some(0x1E));
+        assert_eq!(v.char_at(0, 0), Some(b'A'));
+        assert_eq!(v.attr_at(0, 0), Some(0x1E));
+    }
+
+    #[test]
+    fn misc_ram_enable_clear_blocks_plane_rw() {
+        // Spec: FreeVGA External Registers / IBM VGA Misc Output bit1 — when
+        // RAM Enable is clear, CPU accesses to video RAM are disabled.
+        // Choice: `read_u8` → `None`, `write_u8` → `false` (same as out-of-window)
+        // so `MachineBus` falls through to open-bus / PhysMem; plane contents
+        // are unchanged.
+        let mut v = VgaText::new();
+        assert!(v.write_u8(VGA_TEXT_BASE, b'Z'));
+        assert!(v.write_u8(VGA_TEXT_BASE + 1, 0x2F));
+        assert_eq!(v.char_at(0, 0), Some(b'Z'));
+
+        let disabled = VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_RAM_ENABLE;
+        v.port_write(VGA_MISC_OUTPUT_WRITE, 1, u32::from(disabled));
+        assert!(!v.misc_ram_enable());
+        assert_eq!(
+            v.port_read(VGA_MISC_OUTPUT_READ, 1) as u8 & VGA_MISC_RAM_ENABLE,
+            0
+        );
+
+        assert!(!v.write_u8(VGA_TEXT_BASE, b'X'));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), None);
+        assert_eq!(v.read_u8(VGA_TEXT_BASE + 1), None);
+        // Plane unchanged (helpers bypass the CPU gate for test inspection).
+        assert_eq!(v.char_at(0, 0), Some(b'Z'));
+        assert_eq!(v.attr_at(0, 0), Some(0x2F));
+    }
+
+    #[test]
+    fn misc_ram_enable_reenable_restores_plane_rw() {
+        // Spec: FreeVGA / IBM — clearing then setting bit1 restores CPU plane
+        // access; `0x3CC` readback reflects RAM Enable.
+        let mut v = VgaText::new();
+        assert!(v.write_u8(VGA_TEXT_BASE, b'Q'));
+
+        let disabled = VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_RAM_ENABLE;
+        v.port_write(VGA_MISC_OUTPUT_WRITE, 1, u32::from(disabled));
+        assert!(!v.write_u8(VGA_TEXT_BASE, b'N'));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), None);
+        assert_eq!(v.char_at(0, 0), Some(b'Q'));
+
+        v.port_write(VGA_MISC_OUTPUT_WRITE, 1, u32::from(VGA_MISC_OUTPUT_DEFAULT));
+        assert!(v.misc_ram_enable());
+        assert_eq!(
+            v.port_read(VGA_MISC_OUTPUT_READ, 1) as u8 & VGA_MISC_RAM_ENABLE,
+            VGA_MISC_RAM_ENABLE
+        );
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(b'Q'));
+        assert!(v.write_u8(VGA_TEXT_BASE, b'R'));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(b'R'));
+        assert_eq!(v.char_at(0, 0), Some(b'R'));
     }
 
     #[test]
