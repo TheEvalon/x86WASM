@@ -2,8 +2,8 @@
 //! Relative Seek/Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
 //! READ DATA (media + no-media ND) / READ ID (media sector-ID stub + no-media
 //! ND) / READ DELETED DATA (media + no-media ND; no deleted-AM) / WRITE DATA /
-//! WRITE DELETED DATA / VERIFY (media readable-sector stub + no-media ND) /
-//! FORMAT TRACK (no-media stubs) + IRQ6.
+//! WRITE DELETED DATA (media + no-media NW; no deleted-AM) / VERIFY (media
+//! readable-sector stub + no-media ND) / FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -162,6 +162,18 @@
 //!   write. No media / wrong N / OOR CHS (any sector in the range) / wrong
 //!   latch length → same NW abnormal. Asserts IRQ6 (cleared on first result
 //!   byte); EOT latched into `sc_eot`.
+//! - WRITE DELETED DATA (`0x09` | MT/MFM): Spec Intel 82077AA §5.1.4 /
+//!   Table 5-1 — command byte lower 5 bits `01001`; optional MT/MFM; same
+//!   eight params and 7-byte result as WRITE DATA. Spec writes a *deleted*
+//!   data address mark; this emulator has no deleted-AM engine → skip
+//!   execution/DMA / image write, immediate result ST0 (IC=01 abnormal | H |
+//!   US), ST1 NW (Not Writable, §6.2 — preferred for the write path over ND;
+//!   media + `write_protected` also NW), ST2=0, C/H/R/N = command ENDaddress;
+//!   clear `last_write` / `dma_write_pending`. Same NW with media attached
+//!   (distinct from no-media only by `has_media`) or without; does **not**
+//!   fall through to WRITE DATA success. Single-sector stub (starting R; MT /
+//!   multi-sector deferred). Asserts IRQ6 (cleared on first result byte);
+//!   EOT latched into `sc_eot`.
 //! - FORMAT TRACK (`0x0D` | MFM): Spec Intel 82077AA §5.1.7 / Table 5-1 —
 //!   command byte lower 5 bits `01101`; optional MFM (`0x40`); five params
 //!   (HD|US, N, SC, GPL, D). Media + [`Self::write_protected`] (WP pin) →
@@ -190,8 +202,8 @@
 //!   eject, preserved across re-attach/`reset`, cleared by successful
 //!   Recalibrate/Seek when media present (classic disk-change clear);
 //!   `write_protected` / [`Self::set_write_protected`] for ST3 WP and WRITE
-//!   DATA / FORMAT TRACK ST1 NW; `reset()` preserves media and write-protect
-//!   flag like IDE.
+//!   DATA / WRITE DELETED DATA / FORMAT TRACK ST1 NW; `reset()` preserves media
+//!   and write-protect flag like IDE.
 //!   READ DATA success path latches concatenated sectors R..=EOT (MT=0) in
 //!   `last_sector` and arms `dma_read_pending` when DOR bit3 is set for
 //!   MachineBus auto DMA ch2 Write (device→memory; buffer length =
@@ -204,11 +216,12 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - WRITE DELETED DATA / READ TRACK and other transfer commands; VERIFY
-//!   multi-sector / EC/CRC compare beyond readable-sector stub; READ ID full
-//!   IDAM track scan (sector-ID stub only); READ DELETED DATA deleted
-//!   address-mark engine (media path remains honest ST1 ND); FORMAT TRACK
-//!   media write / per-sector ID DMA
+//! - READ TRACK and other transfer commands; VERIFY multi-sector / EC/CRC
+//!   compare beyond readable-sector stub; READ ID full IDAM track scan
+//!   (sector-ID stub only); READ DELETED DATA deleted address-mark engine
+//!   (media path remains honest ST1 ND); WRITE DELETED DATA deleted
+//!   address-mark / write engine (media path remains honest ST1 NW); FORMAT
+//!   TRACK media write / per-sector ID DMA
 //! - MT head-switch multi-track; VERIFY DMA; DREQ/DACK cycle timing; FORMAT
 //!   media
 //! - Seek / Relative Seek step timing; Relative Seek ST0 EC when stepping out
@@ -1584,11 +1597,20 @@ impl Fdc82077 {
         self.phase = Phase::WriteDeletedDataParams { index: 0 };
     }
 
-    /// Complete WRITE DELETED DATA after eight parameters — no-media stub.
+    /// Complete WRITE DELETED DATA after eight parameters.
     ///
-    /// Spec: Intel 82077AA §5.1.4 / Table 5-1 — same param/result shape as WRITE
-    /// DATA; no media → skip execution/DMA; ST0 IC=01|H|US; ST1 NW; ST2=0;
-    /// C/H/R/N ENDaddress; EOT→`sc_eot`; IRQ6 when DOR enables.
+    /// Spec: Intel 82077AA §5.1.4 / Table 5-1 / §6.1 / §6.2 — same parameter and
+    /// result shape as WRITE DATA. WRITE DELETED DATA writes a *deleted* data
+    /// address mark. This emulator has no deleted-AM engine and raw 1.44MB
+    /// images carry none → honest "cannot write deleted sector" path for both
+    /// media and no-media: skip execution/DMA, clear any prior `last_write` /
+    /// `dma_write_pending`, enter result immediately with ST0 IC=01 (abnormal)
+    /// | H | US; ST1 NW (Not Writable, §6.2 — preferred for the write path over
+    /// inventing ND; media + [`Self::write_protected`] is also NW); ST2=0;
+    /// C/H/R/N = command ENDaddress. Single-sector stub (starting R; MT
+    /// ignored). Latches EOT into `sc_eot`; asserts IRQ (cleared when the host
+    /// reads the first result byte). No Sense Interrupt. Does **not** fall
+    /// through to WRITE DATA success when media is present (SeaBIOS-safe).
     fn finish_write_deleted_data(&mut self) {
         let head_unit = self.read_params[0];
         let unit = head_unit & 0x03;
@@ -1598,9 +1620,13 @@ impl Fdc82077 {
         let r = self.read_params[3];
         let n = self.read_params[4];
         let eot = self.read_params[5];
+        // GPL (params[6]) and DTL (params[7]) accepted; MT / multi-sector deferred.
+        // Media presence / WP do not change the result: deleted-AM engine unsupported.
 
         self.sc_eot = eot;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        self.last_write = None;
+        self.dma_write_pending = false;
         self.read_result = [
             FDC_ST0_IC_ABNORMAL | st0_head | unit,
             FDC_ST1_NW,
@@ -4040,6 +4066,190 @@ mod tests {
 
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA §5.1.4 / Table 5-1 / §6.2 — with media attached,
+    /// WRITE DELETED DATA still completes ST0 IC=01 + ST1 NW because the
+    /// deleted address-mark engine is unsupported (raw 1.44MB images have no
+    /// deleted AM). Prefer ST1 NW for the write path (not ND). Distinct from
+    /// the no-media NW test: `has_media` is true, and WRITE DATA on the same
+    /// image would succeed. Single-sector (EOT==R); no image write; clear
+    /// `last_write` / `dma_write_pending` (not a WRITE DATA fall-through).
+    #[test]
+    fn write_deleted_data_with_media_nw_no_write() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        assert!(
+            f.has_media(),
+            "media attached — distinct from no-media NW test"
+        );
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // Prove the sector is writable via WRITE DATA (media works).
+        let mut data = [0u8; FDC_SECTOR_SIZE];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        f.latch_write_sector(data);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_NORMAL);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x00,
+            "ST1 clear on WRITE DATA"
+        );
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert!(
+            f.last_write().is_some(),
+            "WRITE DATA latched sector — media path works"
+        );
+        let after_write = f.read_sector(0, 0, 1).expect("media");
+        assert_eq!(after_write[0], 0x00);
+        assert_eq!(after_write[1], 0x01);
+
+        // Soft-reset abort / clear latches, restore AA image pattern, then
+        // WRITE DELETED DATA on same media with a pending latch that must not
+        // commit.
+        f.port_write(FDC_DOR, 1, 0);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(f.has_media());
+        assert!(
+            f.write_sector(0, 0, 1, &[0xAAu8; FDC_SECTOR_SIZE]),
+            "restore known image pattern before WRITE DELETED"
+        );
+        f.latch_write_sector([0x55u8; FDC_SECTOR_SIZE]);
+
+        // WRITE DELETED DATA MFM: C=0,H=0,R=1,N=2,EOT=1 — single sector.
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA),
+        );
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(
+            f.irq_line(),
+            "WRITE DELETED DATA asserts IRQ6 on media NW completion"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0, FDC_ST0_IC_ABNORMAL,
+            "ST0 = IC=01 | H=0 | US=0 (abnormal — deleted-AM unsupported)"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST1_NW,
+            "ST1 NW — deleted AM write unsupported (82077AA §5.1.4 / §6.2)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x01, "EOT latched for DUMPREG");
+        assert!(f.has_media(), "media still attached after NW result");
+
+        assert!(
+            f.last_write().is_none(),
+            "WRITE DELETED must clear last_write latch"
+        );
+        assert_eq!(f.pending_dma_write_byte_count(), 0);
+        assert!(
+            !f.take_pending_dma_write(),
+            "WRITE DELETED must not arm dma_write_pending"
+        );
+        let sector = f.read_sector(0, 0, 1).expect("media still attached");
+        assert!(
+            sector.iter().all(|&b| b == 0xAA),
+            "WRITE DELETED must not modify the image"
+        );
+    }
+
+    /// Spec: Intel 82077AA §5.1.4 / §6.2 — media + `write_protected` also yields
+    /// ST1 NW (same honest abnormal; no image write).
+    #[test]
+    fn write_deleted_data_with_media_wp_also_nw() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.set_write_protected(true);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.latch_write_sector([0x55u8; FDC_SECTOR_SIZE]);
+
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA),
+        );
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST1_NW,
+            "ST1 NW — WP and/or deleted-AM unsupported"
+        );
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert!(f.last_write().is_none());
+        assert!(!f.take_pending_dma_write());
+        let sector = f.read_sector(0, 0, 1).expect("media");
+        assert!(
+            sector.iter().all(|&b| b == 0xAA),
+            "media+WP WRITE DELETED must not write"
+        );
+    }
+
+    /// Spec: Intel 82077AA §5.1.4 — MT ignored; EOT>R still single-sector NW
+    /// (multi-sector / deleted-AM engine deferred).
+    #[test]
+    fn write_deleted_data_with_media_mt_ignored_single_sector_nw() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.latch_write_sector([0x55u8; FDC_SECTOR_SIZE]);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_WRITE_DELETED_DATA_MT_MFM));
+        for p in [0x04u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=01 | H=1 | US=0; MT does not change NW stub"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_NW);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R (starting, not EOT)
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.sc_eot, 0x02);
+        assert!(f.last_write().is_none());
+        let sector = f.read_sector(0, 1, 1).expect("media");
+        assert!(
+            sector.iter().all(|&b| b == 0xAA),
+            "MT WRITE DELETED stub must not write"
+        );
     }
 
     /// Spec: Intel 82077AA Table 5-1 — SCAN EQUAL (`0x11`) no-media via VERIFY path.

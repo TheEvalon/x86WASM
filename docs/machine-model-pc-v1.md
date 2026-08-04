@@ -45,7 +45,7 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x3C2` / `0x3CC` | VGA Miscellaneous Output — write `0x3C2`, readback `0x3CC` (reset default `0x67`; IOAS bit0 remaps CRTC + Input Status #1 ownership; RAM Enable bit1 gates CPU text-plane `read_u8`/`write_u8`; clock/polarity not enforced) |
 | `0x3C6` | VGA DAC/PEL Mask — R/W store/readback (reset default `0xFF`); FreeVGA/RBIL AND with displayed pixel color index before DAC lookup (display AND not applied yet — no host render; does not alter `0x3C9` palette programming) |
 | `0x3C7` / `0x3C8` / `0x3C9` | VGA DAC/PEL — read-index write + state read `0x3C7`, write index `0x3C8`, data `0x3C9` (R→G→B, 6-bit, auto-inc; 256×3 RAM; mode-03h-ish CGA-16 + black remainder; store/readback only) |
-| `0x3F0`–`0x3F5`, `0x3F7` | 82077AA FDC — SRA/SRB/DOR/TDR/MSR\|DSR/FIFO/DIR\|CCR stub + 1.44MB media; READ DELETED DATA (`0x0C`) media/no-media → ST1 ND (no deleted-AM engine) |
+| `0x3F0`–`0x3F5`, `0x3F7` | 82077AA FDC — SRA/SRB/DOR/TDR/MSR\|DSR/FIFO/DIR\|CCR stub + 1.44MB media; READ DELETED DATA (`0x0C`) media/no-media → ST1 ND (no deleted-AM engine); WRITE DELETED DATA (`0x09`) media/no-media → ST1 NW (no deleted-AM engine; prefer NW) |
 
 Unimplemented ports: read `0xFF?`, write ignored (traced when tracing is enabled). Unused page holes (`0x84`?`0x86`, `0x88`, `0x8C`?`0x8E`) stay open-bus.
 
