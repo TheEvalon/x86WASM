@@ -1,6 +1,6 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
 //! Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
-//! READ DATA / WRITE DATA (no-media stubs) + IRQ6.
+//! READ DATA / WRITE DATA / FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -27,15 +27,18 @@
 //!   ST1 ND + C/H/R/N ENDaddress and IRQ6; WRITE DATA (`0x05` with optional
 //!   MT/MFM in bits 7:6, §5.1.2 / Table 5-1) same 8-param / 7-result shape;
 //!   no-media stub completes with ST0 IC=01 + ST1 NW + C/H/R/N ENDaddress
-//!   and IRQ6; DOR bit3 DMA/IRQ enable; IRQ6 on command / reset completion.
+//!   and IRQ6; FORMAT TRACK (`0x0D` with optional MFM in bit6, §5.1.7 /
+//!   Table 5-1) five parameter bytes then 7-byte result; no-media stub
+//!   completes with ST0 IC=01 + ST1 NW + four undefined zeros and IRQ6;
+//!   DOR bit3 DMA/IRQ enable; IRQ6 on command / reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
 //!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
 //!   Version returns `0x90` for 82077AA-class controllers; Configure stores
 //!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes; Lock/Unlock via MT bit;
 //!   Perpendicular Mode configures GAP/WGATE (and enhanced Dn bits);
-//!   DUMPREG dumps internal registers; READ/WRITE DATA MT/MFM(/SK) forms →
-//!   IRQ then 7-byte result (not Sense Interrupt).
+//!   DUMPREG dumps internal registers; READ/WRITE DATA / FORMAT TRACK
+//!   MT/MFM(/SK) forms → IRQ then 7-byte result (not Sense Interrupt).
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -82,8 +85,8 @@
 //!   parameters; 10-byte result from stored state with MSR RQM|DIO; no IRQ.
 //!   Result order: PCN0–3 (per-drive Present Cylinder Numbers), SRT|HUT, HLT|ND,
 //!   SC/EOT, LOCK|0|D3–D0|GAP|WGATE, 0|EIS|EFIFO|POLL|FIFOTHR, PRETRK.
-//!   `sc_eot` updated from READ DATA EOT param; byte7 bits 5:0 reflect
-//!   stored PERPENDICULAR D3–D0|GAP|WGATE (OW not returned).
+//!   `sc_eot` updated from READ/WRITE DATA EOT or FORMAT TRACK SC; byte7 bits
+//!   5:0 reflect stored PERPENDICULAR D3–D0|GAP|WGATE (OW not returned).
 //! - READ DATA (`0x06` | MT/MFM/SK): Spec Intel 82077AA §5.1.1 / Table 5-1 —
 //!   command byte lower 5 bits `00110`; optional MT (`0x80`)/MFM (`0x40`)/
 //!   SK (`0x20`); eight params (HD|US, C, H, R, N, EOT, GPL, DTL); no media
@@ -97,12 +100,19 @@
 //!   execution/DMA, immediate result ST0 (IC=01 abnormal | H | US), ST1 NW
 //!   (Not Writable — no media to write), ST2=0, C/H/R/N = command ENDaddress;
 //!   asserts IRQ6 (cleared on first result byte); EOT latched into `sc_eot`.
+//! - FORMAT TRACK (`0x0D` | MFM): Spec Intel 82077AA §5.1.7 / Table 5-1 —
+//!   command byte lower 5 bits `01101`; optional MFM (`0x40`); five params
+//!   (HD|US, N, SC, GPL, D); no media image → skip execution/DMA and the
+//!   per-sector C/H/R/N ID stream, immediate result ST0 (IC=01 abnormal | H |
+//!   US), ST1 NW (Not Writable — §6.2 lists FORMAT TRACK), ST2=0, four
+//!   undefined result bytes = 0; asserts IRQ6 (cleared on first result byte);
+//!   SC latched into `sc_eot`.
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - READ DELETED DATA / WRITE DELETED / FORMAT / READ TRACK /
-//!   READ ID / VERIFY and other transfer commands
+//! - READ DELETED DATA / WRITE DELETED / READ TRACK / READ ID / VERIFY and
+//!   other transfer commands; FORMAT TRACK media write / per-sector ID DMA
 //! - Media image, seek step timing, real sector transfers
 //! - DMA channel 2 transfers (ND bit / Specify stored only; not enforced)
 //! - Implied seek from Configure EIS; multi-sector TC termination
@@ -173,6 +183,17 @@ pub const FDC_READ_DATA_RESULT_LEN: u8 = 7;
 pub const FDC_CMD_RECALIBRATE: u8 = 0x07;
 /// Sense Interrupt Status command opcode. Spec: Intel 82077AA / OSDev FDC.
 pub const FDC_CMD_SENSE_INT: u8 = 0x08;
+/// FORMAT TRACK base opcode (bits 4:0). Spec: Intel 82077AA §5.1.7 / Table 5-1 —
+/// command byte is `0|MFM|0|0 1 1 0 1`; match with [`FDC_CMD_OPCODE_MASK`].
+pub const FDC_CMD_FORMAT_TRACK: u8 = 0x0D;
+/// SeaBIOS-common FORMAT TRACK form: MFM|0x0D. Spec: 82077AA Table 5-1.
+pub const FDC_CMD_FORMAT_TRACK_MFM: u8 = FDC_CMD_MFM | FDC_CMD_FORMAT_TRACK;
+/// FORMAT TRACK parameter count after the command byte. Spec: 82077AA §5.1.7 —
+/// HD|US, N, SC, GPL, D (execution-phase per-sector C/H/R/N is separate; skipped
+/// by the no-media stub).
+pub const FDC_FORMAT_TRACK_PARAM_LEN: u8 = 5;
+/// FORMAT TRACK result byte count (ST0, ST1, ST2, 4 undefined). Spec: §5.1.7.
+pub const FDC_FORMAT_TRACK_RESULT_LEN: u8 = 7;
 /// DUMPREG command opcode. Spec: Intel 82077AA §5.2.10 / Table 5-1 — no
 /// parameters; 10-byte result dumping internal registers; no IRQ.
 pub const FDC_CMD_DUMPREG: u8 = 0x0E;
@@ -267,10 +288,16 @@ enum Phase {
     WriteDataParams { index: u8 },
     /// WRITE DATA result: 7 bytes (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.2.
     WriteDataResult { index: u8 },
+    /// FORMAT TRACK parameters: 5 bytes (HD|US, N, SC, GPL, D).
+    /// Spec: Intel 82077AA §5.1.7 / Table 5-1.
+    FormatTrackParams { index: u8 },
+    /// FORMAT TRACK result: 7 bytes (ST0, ST1, ST2, 4 undefined). Spec: §5.1.7.
+    FormatTrackResult { index: u8 },
 }
 
 /// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/
-/// Configure/LOCK/PERPENDICULAR/DUMPREG/READ·WRITE DATA (no-media) + IRQ6.
+/// Configure/LOCK/PERPENDICULAR/DUMPREG/READ·WRITE DATA/FORMAT TRACK
+/// (no-media) + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -316,8 +343,9 @@ pub struct Fdc82077 {
     /// §5.2.11 / Table 5-11 / §5.3.1 — always updated by the command; soft DOR
     /// reset clears to 0; appear in DUMPREG byte7 bits 1:0.
     pub perp_gap_wgate: u8,
-    /// Last SC (FORMAT) or EOT (READ/WRITE/…) parameter. Spec: Intel 82077AA
-    /// Table 5-1 note — DUMPREG result byte 6. Updated by READ/WRITE DATA EOT.
+    /// Last SC (FORMAT TRACK) or EOT (READ/WRITE/…) parameter. Spec: Intel
+    /// 82077AA Table 5-1 note — DUMPREG result byte 6. Updated by READ/WRITE
+    /// DATA EOT or FORMAT TRACK SC.
     pub sc_eot: u8,
     /// Latched IRQ request (command-complete / reset stub). Spec: 82077AA → ISA IRQ6.
     irq_pending: bool,
@@ -332,10 +360,12 @@ pub struct Fdc82077 {
     sense_pcn: u8,
     /// Sense Drive Status ST3 result byte (set when entering result phase).
     sense_st3: u8,
-    /// READ/WRITE DATA parameter bytes (8). Spec: Intel 82077AA §5.1.1 / §5.1.2.
-    /// Shared — transfer commands are mutually exclusive in the command stream.
+    /// READ/WRITE DATA / FORMAT TRACK parameter bytes. Spec: Intel 82077AA
+    /// §5.1.1 / §5.1.2 / §5.1.7. Shared — transfer commands are mutually
+    /// exclusive in the command stream (FORMAT uses the first 5 slots).
     read_params: [u8; FDC_READ_DATA_PARAM_LEN as usize],
-    /// READ/WRITE DATA result bytes (ST0..N). Spec: Intel 82077AA §5.1.1 / §5.1.2.
+    /// READ/WRITE DATA / FORMAT TRACK result bytes (ST0..). Spec: §5.1.1 /
+    /// §5.1.2 / §5.1.7.
     read_result: [u8; FDC_READ_DATA_RESULT_LEN as usize],
 }
 
@@ -412,14 +442,16 @@ impl Fdc82077 {
                 | Phase::ConfigureParams { .. }
                 | Phase::PerpendicularParam
                 | Phase::ReadDataParams { .. }
-                | Phase::WriteDataParams { .. } => FDC_MSR_RQM,
+                | Phase::WriteDataParams { .. }
+                | Phase::FormatTrackParams { .. } => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. }
                 | Phase::SenseDriveStatusResult
                 | Phase::VersionResult
                 | Phase::LockResult
                 | Phase::DumpRegResult { .. }
                 | Phase::ReadDataResult { .. }
-                | Phase::WriteDataResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
+                | Phase::WriteDataResult { .. }
+                | Phase::FormatTrackResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
             }
         }
     }
@@ -690,6 +722,53 @@ impl Fdc82077 {
         cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_WRITE_DATA_MT_MFM & FDC_CMD_OPCODE_MASK)
     }
 
+    /// Begin FORMAT TRACK parameter phase (5 bytes). Spec: Intel 82077AA §5.1.7.
+    fn start_format_track(&mut self) {
+        self.read_params = [0; FDC_READ_DATA_PARAM_LEN as usize];
+        self.phase = Phase::FormatTrackParams { index: 0 };
+    }
+
+    /// Complete FORMAT TRACK after five parameters — no-media stub.
+    ///
+    /// Spec: Intel 82077AA §5.1.7 / Table 5-1 / §6.1 / §6.2 — with no media
+    /// image this stub skips the execution phase (DMA and the per-sector
+    /// C/H/R/N ID stream) and enters result immediately: ST0 IC=01 (abnormal
+    /// termination) | H | US; ST1 NW (Not Writable — §6.2 lists FORMAT TRACK
+    /// with WRITE DATA); ST2=0; four undefined result bytes = 0; latches SC
+    /// into `sc_eot` (DUMPREG Table 5-1); asserts IRQ (cleared when the host
+    /// reads the first result byte). No Sense Interrupt.
+    fn finish_format_track(&mut self) {
+        let head_unit = self.read_params[0];
+        let unit = head_unit & 0x03;
+        let head = (head_unit >> 2) & 0x01;
+        // N (params[1]), GPL (params[3]), D (params[4]) accepted; unused without media.
+        let sc = self.read_params[2];
+
+        self.sc_eot = sc;
+        let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        self.read_result = [
+            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST1_NW,
+            0x00,
+            0x00, // undefined
+            0x00,
+            0x00,
+            0x00,
+        ];
+        self.irq_pending = true;
+        self.phase = Phase::FormatTrackResult { index: 0 };
+    }
+
+    /// True if `cmd` is FORMAT TRACK including optional MFM modifier.
+    ///
+    /// Spec: Intel 82077AA §5.1.7 / Table 5-1 — opcode bits 4:0 = `01101`;
+    /// bit6 is MFM (`FDC_CMD_MFM`); bits 7 and 5 are 0 in the documented form
+    /// (MT/SK not used for FORMAT TRACK).
+    #[inline]
+    fn is_format_track_command(cmd: u8) -> bool {
+        cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_FORMAT_TRACK_MFM & FDC_CMD_OPCODE_MASK)
+    }
+
     /// One DUMPREG result byte by index. Spec: Intel 82077AA Table 5-1 / §5.3.3.
     fn dumpreg_byte(&self, index: u8) -> u8 {
         match index {
@@ -721,7 +800,8 @@ impl Fdc82077 {
             | Phase::ConfigureParams { .. }
             | Phase::PerpendicularParam
             | Phase::ReadDataParams { .. }
-            | Phase::WriteDataParams { .. } => 0xFF,
+            | Phase::WriteDataParams { .. }
+            | Phase::FormatTrackParams { .. } => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
@@ -783,6 +863,20 @@ impl Fdc82077 {
                 }
                 v
             }
+            Phase::FormatTrackResult { index } => {
+                // Spec: 82077AA / OSDev — IRQ for format cleared as the host
+                // begins reading the result phase (first byte).
+                if index == 0 {
+                    self.irq_pending = false;
+                }
+                let v = self.read_result[index as usize];
+                if index + 1 >= FDC_FORMAT_TRACK_RESULT_LEN {
+                    self.phase = Phase::Command;
+                } else {
+                    self.phase = Phase::FormatTrackResult { index: index + 1 };
+                }
+                v
+            }
         }
     }
 
@@ -828,6 +922,9 @@ impl Fdc82077 {
                 } else if Self::is_write_data_command(v) {
                     // Spec: Intel 82077AA §5.1.2 — MT/MFM | 00101; eight params.
                     self.start_write_data();
+                } else if Self::is_format_track_command(v) {
+                    // Spec: Intel 82077AA §5.1.7 — MFM | 01101; five params.
+                    self.start_format_track();
                 }
                 // Other opcodes: accept/drop until a command engine exists.
             }
@@ -904,13 +1001,23 @@ impl Fdc82077 {
                     self.phase = Phase::WriteDataParams { index: index + 1 };
                 }
             }
+            Phase::FormatTrackParams { index } => {
+                // Spec: Intel 82077AA §5.1.7 — HD|US, N, SC, GPL, D.
+                self.read_params[index as usize] = v;
+                if index + 1 >= FDC_FORMAT_TRACK_PARAM_LEN {
+                    self.finish_format_track();
+                } else {
+                    self.phase = Phase::FormatTrackParams { index: index + 1 };
+                }
+            }
             Phase::SenseIntResult { .. }
             | Phase::SenseDriveStatusResult
             | Phase::VersionResult
             | Phase::LockResult
             | Phase::DumpRegResult { .. }
             | Phase::ReadDataResult { .. }
-            | Phase::WriteDataResult { .. } => {
+            | Phase::WriteDataResult { .. }
+            | Phase::FormatTrackResult { .. } => {
                 // Host must not write during result phase (stub ignores).
             }
         }
@@ -2537,6 +2644,137 @@ mod tests {
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
         f.port_write(FDC_FIFO, 1, 0x00);
         assert_eq!(f.phase, Phase::WriteDataParams { index: 1 });
+
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        assert_eq!(f.phase, Phase::Command);
+        assert!(!f.irq_line());
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA §5.1.7 / Table 5-1 — FORMAT TRACK opcode `0x0D` with
+    /// MFM (`0x4D`); five parameter bytes (HD|US, N, SC, GPL, D); no media →
+    /// skip execution/DMA/per-sector ID stream; immediate result ST0 IC=01
+    /// (abnormal) | H | US, ST1 NW (Not Writable — §6.2 applies to FORMAT),
+    /// ST2=0, four undefined bytes = 0; IRQ6 when DOR DMA/IRQ enable; SC→`sc_eot`.
+    #[test]
+    fn format_track_mfm_no_media_abnormal_result_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(!f.irq_line());
+
+        // SeaBIOS-style MFM FORMAT TRACK: MT=0 MFM=1 | 0x0D → 0x4D.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_FORMAT_TRACK));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::FormatTrackParams { index: 0 });
+
+        // Params: HD|US, N, SC, GPL, D. Spec: 82077AA Table 5-1.
+        let params = [0x04u8, 0x02, 0x12, 0x54, 0xF6]; // head1/unit0, N=2, SC=18
+        for (i, &p) in params.iter().enumerate() {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+            if i + 1 < params.len() {
+                assert_eq!(
+                    f.phase,
+                    Phase::FormatTrackParams {
+                        index: (i + 1) as u8
+                    }
+                );
+                assert!(!f.irq_line(), "IRQ only after all 5 params");
+            }
+        }
+
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(
+            f.irq_line(),
+            "FORMAT TRACK asserts IRQ6 on no-media completion"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=01 | H | US"
+        );
+        let st1 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st1, FDC_ST1_NW,
+            "ST1 NW — format not possible without media"
+        );
+        let st2 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st2, 0);
+        // Spec: 82077AA Table 5-1 — remaining four result bytes undefined.
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12, "SC latched for DUMPREG");
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 — plain FORMAT TRACK (`0x0D`, FM) uses the
+    /// same 5-param / 7-result shape as MFM `0x4D`.
+    #[test]
+    fn format_track_fm_opcode_form_accepted() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        assert_eq!(FDC_CMD_FORMAT_TRACK, 0x0D);
+        assert_eq!(FDC_CMD_FORMAT_TRACK_MFM, 0x4D);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_FORMAT_TRACK));
+        for p in [0x01u8, 0x02, 0x09, 0x2A, 0xF6] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(st0 & 0x03, 0x01, "US from param0");
+        for _ in 0..6 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x09);
+    }
+
+    /// Spec: Intel 82077AA DOR bit3 — IRQ line gated; pending still latched.
+    #[test]
+    fn format_track_irq_pending_gated_by_dor_dma_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N)); // DMA/IRQ disabled
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_FORMAT_TRACK));
+        for p in [0x00u8, 0x02, 0x12, 0x54, 0xF6] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(!f.irq_line(), "DOR DMA/IRQ clear → line inactive");
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM | FDC_MSR_DIO);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(f.irq_line(), "enabling DMA/IRQ reveals latched pending");
+    }
+
+    /// Spec: Intel 82077AA — held in DOR reset ignores command stream.
+    #[test]
+    fn format_track_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        assert_eq!(f.dor & FDC_DOR_RESET_N, 0);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_FORMAT_TRACK));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, 0);
+    }
+
+    /// Spec: Intel 82077AA — DOR soft reset aborts in-progress FORMAT TRACK params.
+    #[test]
+    fn dor_reset_aborts_format_track_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_FORMAT_TRACK));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert_eq!(f.phase, Phase::FormatTrackParams { index: 1 });
 
         f.port_write(FDC_DOR, 1, 0); // enter reset
         assert_eq!(f.phase, Phase::Command);
