@@ -1891,10 +1891,10 @@ mod tests {
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
 
-        // Next data byte is keyboard-bound again: aux state untouched; Set
-        // Default (`0xF6`) remains an unsupported kbd command (no ACK / no OBF).
+        // Next data byte is keyboard-bound again: aux state untouched; an
+        // unsupported kbd opcode (`0xF7`) produces no ACK / no OBF.
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
-        k.port_write(I8042_DATA, 1, 0xF6);
+        k.port_write(I8042_DATA, 1, 0xF7);
         assert_eq!(k.aux_device_writes, 1);
         assert_eq!(k.last_aux_device_write, Some(0xF0));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);

@@ -187,7 +187,8 @@ pub const FDC_CMD_SK: u8 = 0x20;
 /// SeaBIOS-common WRITE DATA form: MT|MFM|0x05. Spec: 82077AA Table 5-1.
 pub const FDC_CMD_WRITE_DATA_MT_MFM: u8 = FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_WRITE_DATA;
 /// SeaBIOS-common WRITE DELETED DATA form: MT|MFM|0x09. Spec: 82077AA Table 5-1.
-pub const FDC_CMD_WRITE_DELETED_DATA_MT_MFM: u8 = FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA;
+pub const FDC_CMD_WRITE_DELETED_DATA_MT_MFM: u8 =
+    FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA;
 /// SeaBIOS-common READ DATA form: MT|MFM|SK|0x06. Spec: 82077AA Table 5-1.
 pub const FDC_CMD_READ_DATA_MT_MFM_SK: u8 =
     FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_SK | FDC_CMD_READ_DATA;
@@ -943,7 +944,7 @@ impl Fdc82077 {
             | Phase::ReadDataParams { .. }
             | Phase::ReadDeletedDataParams { .. }
             | Phase::WriteDataParams { .. }
-                | Phase::WriteDeletedDataParams { .. }
+            | Phase::WriteDeletedDataParams { .. }
             | Phase::FormatTrackParams { .. } => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
@@ -1213,7 +1214,7 @@ impl Fdc82077 {
             | Phase::ReadDataResult { .. }
             | Phase::ReadDeletedDataResult { .. }
             | Phase::WriteDataResult { .. }
-                | Phase::WriteDeletedDataResult { .. }
+            | Phase::WriteDeletedDataResult { .. }
             | Phase::FormatTrackResult { .. } => {
                 // Host must not write during result phase (stub ignores).
             }
@@ -2859,7 +2860,11 @@ mod tests {
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert!(!f.irq_line());
 
-        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA));
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA),
+        );
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
         assert_eq!(f.phase, Phase::WriteDeletedDataParams { index: 0 });
 
@@ -2933,7 +2938,11 @@ mod tests {
         let mut f = Fdc82077::new();
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
 
-        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA));
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA),
+        );
         for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
             f.port_write(FDC_FIFO, 1, u32::from(p));
         }
@@ -2948,7 +2957,11 @@ mod tests {
     fn write_deleted_data_ignored_while_held_in_dor_reset() {
         let mut f = Fdc82077::new();
         assert_eq!(f.dor & FDC_DOR_RESET_N, 0);
-        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA));
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA),
+        );
         assert_eq!(f.phase, Phase::Command);
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, 0);
     }
@@ -2958,7 +2971,11 @@ mod tests {
     fn dor_reset_aborts_write_deleted_data_param_phase() {
         let mut f = Fdc82077::new();
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
-        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA));
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DELETED_DATA),
+        );
         f.port_write(FDC_FIFO, 1, 0x00);
         assert_eq!(f.phase, Phase::WriteDeletedDataParams { index: 1 });
 
@@ -2969,7 +2986,6 @@ mod tests {
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
     }
-
 
     /// Spec: Intel 82077AA §5.1.7 / Table 5-1 — FORMAT TRACK opcode `0x0D` with
     /// MFM (`0x4D`); five parameter bytes (HD|US, N, SC, GPL, D); no media →
