@@ -2,8 +2,8 @@
 //! index/data port stub (`0x3D4`/`0x3D5`), Sequencer index/data stub
 //! (`0x3C4`/`0x3C5`), Graphics Controller index/data stub (`0x3CE`/`0x3CF`),
 //! Attribute Controller address/data flip-flop stub (`0x3C0`/`0x3C1` + Input
-//! Status #1 `0x3DA` flip-flop reset), and Miscellaneous Output Register stub
-//! (`0x3C2` write / `0x3CC` readback).
+//! Status #1 `0x3DA` flip-flop reset and status bits), and Miscellaneous Output
+//! Register stub (`0x3C2` write / `0x3CC` readback).
 //!
 //! # Spec refs
 //!
@@ -26,6 +26,9 @@
 //!   (palette `0x00`–`0x0F`, Mode Control `0x10`, Overscan `0x11`, Color Plane
 //!   Enable `0x12`, Horizontal PEL Panning `0x13`, Color Select `0x14`). Reading
 //!   Input Status #1 (`0x3DA` color) resets the flip-flop to address state.
+//! - OSDev VGA Hardware / FreeVGA External Registers — Input Status #1 read at
+//!   `0x3DA` (color): bit0 Display Disabled (inverted display-enable; set during
+//!   horizontal or vertical retrace), bit3 Vertical Retrace.
 //! - OSDev VGA Hardware / FreeVGA Miscellaneous Output Register — write port
 //!   `0x3C2`, readback port `0x3CC` (write-only at `0x3C2`).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.6 / §21 VGA text mode.
@@ -43,8 +46,10 @@
 //!   register file on `0x3CF` with mode-03h-class reset defaults (no write-mode /
 //!   map / bitmask side effects)
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
-//!   `0x3C1`, flip-flop reset via Input Status #1 `0x3DA` (status byte stub only;
-//!   no palette/mode-control/render side effects)
+//!   `0x3C1`, flip-flop reset via Input Status #1 `0x3DA` (no palette /
+//!   mode-control / render side effects)
+//! - Input Status #1 (`0x3DA`): ATC flip-flop reset + deterministic
+//!   display-enable / vertical-retrace status bits (read-phase counter model)
 //! - Misc Output store/readback only (`0x3C2`/`0x3CC`); bits do not change
 //!   clock, IOAS, or RAM-enable behavior yet
 //!
@@ -52,8 +57,9 @@
 //!
 //! - ATC / Sequencer / GC timing, palette→DAC, blink, PEL pan, plane-enable,
 //!   map-mask, write-mode, read-map, or bitmask side effects on the text plane
-//! - Input Status #1 retrace/display-enable timing (read only resets ATC flip-flop)
-//! - CRTC protect bit (index `0x11` bit7), mono map at `0x3B4`/`0x3B5` / `0x3BA`
+//! - CRTC-timed Input Status #1 accuracy, mono Input Status #1 at `0x3BA`,
+//!   vertical-retrace IRQ, Feature Control diagnostic bits
+//! - CRTC protect bit (index `0x11` bit7), mono map at `0x3B4`/`0x3B5`
 //! - Misc Output bit side effects (IOAS remap, clock select, RAM enable)
 //! - Planar graphics, VBE, host canvas rendering, dirty tracking
 //! - Font ROM, hardware cursor position driven from CRTC into the plane
@@ -144,11 +150,27 @@ pub const VGA_GC_DEFAULTS: [u8; VGA_GC_REG_COUNT] =
 pub const VGA_ATC_ADDRESS_DATA: u16 = 0x3C0;
 /// Attribute Controller Data Read Register.
 pub const VGA_ATC_DATA_READ: u16 = 0x3C1;
-/// Color Input Status #1 — reading resets the ATC address/data flip-flop.
+/// Color Input Status #1 — reading resets the ATC address/data flip-flop and
+/// returns display/retrace status bits.
 ///
-/// Spec: FreeVGA / IBM VGA — port `0x3DA` (color); status bits themselves are
-/// a stub (no retrace timing modeled).
+/// Spec: FreeVGA External Registers / IBM VGA / OSDev VGA Hardware — port
+/// `0x3DA` (color); mono alias `0x3BA` is not owned.
 pub const VGA_INPUT_STATUS_1: u16 = 0x3DA;
+/// Input Status #1 bit0 — Display Disabled (inverted display-enable).
+///
+/// Spec: FreeVGA External Registers — set during horizontal or vertical retrace.
+pub const VGA_STATUS1_DD: u8 = 0x01;
+/// Input Status #1 bit3 — Vertical Retrace.
+///
+/// Spec: FreeVGA External Registers — set during the vertical retrace interval.
+pub const VGA_STATUS1_VR: u8 = 0x08;
+/// Period of the deterministic Input Status #1 read-phase counter.
+///
+/// Model choice (documented, not CRTC-timed): even phases are display-active
+/// (`DD=0`, `VR=0`); odd phases are vertical retrace (`DD=1`, `VR=1`). Advances
+/// only on `0x3DA` reads so SeaBIOS-style wait-for-VR / wait-for-end-VR loops
+/// terminate without a machine tick hook.
+pub const VGA_STATUS1_PHASE_PERIOD: u8 = 2;
 /// Number of standard VGA Attribute Controller registers (`0x00`–`0x14`).
 pub const VGA_ATC_REG_COUNT: usize = 0x15;
 /// PAS bit in the Attribute Address register (bit 5).
@@ -193,6 +215,10 @@ pub struct VgaText {
     pub atc_regs: [u8; VGA_ATC_REG_COUNT],
     /// ATC flip-flop: `false` = next `0x3C0` write is address; `true` = data.
     pub atc_flip_flop_data: bool,
+    /// Deterministic Input Status #1 phase (advances on each `0x3DA` read).
+    ///
+    /// See [`VGA_STATUS1_PHASE_PERIOD`] for the active/retrace model.
+    pub status1_phase: u8,
     /// Miscellaneous Output Register (store via `0x3C2`, read via `0x3CC`).
     pub misc_output: u8,
 }
@@ -216,6 +242,7 @@ impl VgaText {
             atc_index: VGA_ATC_INDEX_DEFAULT,
             atc_regs: VGA_ATC_DEFAULTS,
             atc_flip_flop_data: false,
+            status1_phase: 0,
             misc_output: VGA_MISC_OUTPUT_DEFAULT,
         };
         v.reset();
@@ -225,8 +252,8 @@ impl VgaText {
     /// Reset text plane: 80×25 → space/`0x07`; remainder cleared; CRTC cleared;
     /// Sequencer restored to [`VGA_SEQ_DEFAULTS`]; Graphics Controller restored
     /// to [`VGA_GC_DEFAULTS`]; Attribute Controller restored to
-    /// [`VGA_ATC_DEFAULTS`] with flip-flop in address state; Misc Output
-    /// restored to [`VGA_MISC_OUTPUT_DEFAULT`].
+    /// [`VGA_ATC_DEFAULTS`] with flip-flop in address state; Input Status #1
+    /// phase cleared; Misc Output restored to [`VGA_MISC_OUTPUT_DEFAULT`].
     ///
     /// Spec: IBM VGA text — cells are (char, attr) pairs starting at `0xB8000`.
     pub fn reset(&mut self) {
@@ -246,6 +273,7 @@ impl VgaText {
         self.atc_index = VGA_ATC_INDEX_DEFAULT;
         self.atc_regs = VGA_ATC_DEFAULTS;
         self.atc_flip_flop_data = false;
+        self.status1_phase = 0;
         self.misc_output = VGA_MISC_OUTPUT_DEFAULT;
     }
 
@@ -459,10 +487,20 @@ impl VgaText {
     }
 
     fn read_input_status_1(&mut self) -> u8 {
-        // Spec: FreeVGA / IBM VGA — read resets ATC flip-flop to address state.
-        // Retrace / display-enable timing is not modeled; return 0 (not blanking).
+        // Spec: FreeVGA Accessing the Attribute Registers / External Registers —
+        // read resets ATC flip-flop to address state and returns status bits.
         self.reset_atc_flip_flop();
-        0
+
+        // Deterministic read-phase model (not CRTC-timed): even → display active
+        // (DD=0, VR=0); odd → vertical retrace with display disabled (DD|VR).
+        // Advances only here so firmware poll loops terminate without a tick.
+        let phase = self.status1_phase;
+        self.status1_phase = (self.status1_phase + 1) % VGA_STATUS1_PHASE_PERIOD;
+        if phase.is_multiple_of(2) {
+            0
+        } else {
+            VGA_STATUS1_DD | VGA_STATUS1_VR
+        }
     }
 }
 
@@ -928,14 +966,109 @@ mod tests {
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
         assert!(v.atc_flip_flop_data);
-        let status = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
-        assert_eq!(status, 0); // stub: no retrace timing
+        // Flip-flop reset is independent of the status-bit model; bit values vary.
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         assert!(!v.atc_flip_flop_data);
         // Without reset this would have been a data write to index 0x10.
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x11); // Overscan index
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x55);
         assert_eq!(v.atc_regs[0x11], 0x55);
         assert_eq!(v.atc_regs[0x10], 0x0C); // Mode Control default untouched
+    }
+
+    #[test]
+    fn input_status1_vertical_retrace_and_display_disable_bits() {
+        // Spec: FreeVGA External Registers / IBM VGA / OSDev VGA Hardware —
+        // Input Status #1 (color `0x3DA`): bit0 = Display Disabled (inverted
+        // display-enable; set during H or V retrace), bit3 = Vertical Retrace
+        // (set during vertical retrace). Reading also resets the ATC flip-flop.
+        let mut v = VgaText::new();
+        assert_eq!(v.status1_phase, 0);
+
+        let a = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_eq!(a & VGA_STATUS1_VR, 0, "phase0: not in vertical retrace");
+        assert_eq!(a & VGA_STATUS1_DD, 0, "phase0: display enabled");
+        assert!(!v.atc_flip_flop_data);
+
+        let b = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_ne!(b & VGA_STATUS1_VR, 0, "phase1: vertical retrace");
+        assert_ne!(b & VGA_STATUS1_DD, 0, "phase1: display disabled during VR");
+        assert_eq!(
+            b & (VGA_STATUS1_DD | VGA_STATUS1_VR),
+            VGA_STATUS1_DD | VGA_STATUS1_VR
+        );
+
+        let c = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_eq!(c & VGA_STATUS1_VR, 0, "phase2: leaves vertical retrace");
+        assert_eq!(c & VGA_STATUS1_DD, 0, "phase2: display enabled again");
+    }
+
+    #[test]
+    fn input_status1_seabios_style_wait_for_retrace_terminates() {
+        // Firmware commonly polls: wait until VR set, then wait until VR clear.
+        // Deterministic read-phase model must make both waits terminate.
+        let mut v = VgaText::new();
+        let mut saw_vr = false;
+        for _ in 0..8 {
+            let s = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+            if s & VGA_STATUS1_VR != 0 {
+                saw_vr = true;
+                break;
+            }
+        }
+        assert!(saw_vr, "must eventually observe Vertical Retrace");
+
+        let mut left_vr = false;
+        for _ in 0..8 {
+            let s = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+            if s & VGA_STATUS1_VR == 0 {
+                left_vr = true;
+                break;
+            }
+        }
+        assert!(left_vr, "must eventually leave Vertical Retrace");
+    }
+
+    #[test]
+    fn input_status1_phase_advances_only_on_status_read() {
+        let mut v = VgaText::new();
+        let first = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        // ATC / Misc traffic must not advance the status phase.
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
+        let _ = v.port_read(VGA_ATC_DATA_READ, 1);
+        let _ = v.port_read(VGA_MISC_OUTPUT_READ, 1);
+        assert_eq!(v.status1_phase, 1);
+        let second = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_ne!(first & VGA_STATUS1_VR, second & VGA_STATUS1_VR);
+    }
+
+    #[test]
+    fn input_status1_reset_clears_phase_and_keeps_flip_flop_reset() {
+        let mut v = VgaText::new();
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1); // phase 0 → 1
+        assert_eq!(v.status1_phase, 1);
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1); // phase 1 → 0 (wraps)
+        assert_eq!(v.status1_phase, 0);
+        // Advance again so reset has a non-zero phase to clear.
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        assert_eq!(v.status1_phase, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x10);
+        assert!(v.atc_flip_flop_data);
+        v.reset();
+        assert_eq!(v.status1_phase, 0);
+        assert!(!v.atc_flip_flop_data);
+        let s = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_eq!(s & (VGA_STATUS1_DD | VGA_STATUS1_VR), 0);
+        assert!(!v.atc_flip_flop_data);
+    }
+
+    #[test]
+    fn input_status1_write_ignored() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_INPUT_STATUS_1, 1, 0xFF);
+        assert_eq!(v.status1_phase, 0);
+        let s = v.port_read(VGA_INPUT_STATUS_1, 1) as u8;
+        assert_eq!(s & (VGA_STATUS1_DD | VGA_STATUS1_VR), 0);
     }
 
     #[test]
