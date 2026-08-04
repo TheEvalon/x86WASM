@@ -23,13 +23,15 @@
 //!   (+ value), `0xE8` Set Resolution (+ value), `0xE9` Status Request
 //!   (ACK + 3-byte status), `0xE6`/`0xE7` Set Scaling 1:1 / 2:1, `0xEA` Set
 //!   Stream Mode / `0xF0` Set Remote Mode (ACK; mode flag stored; either clears
-//!   wrap), `0xEE` Set Wrap Mode (ACK; wrap flag stored; Reset / Stream /
-//!   Remote / Reset Wrap / Set Defaults clear wrap — **wrap-mode byte echo
-//!   deferred**), `0xEC` Reset Wrap Mode (ACK; clears wrap flag; stream/remote
-//!   unchanged), `0xEB` Read Data (ACK then one 3-byte movement packet — last
-//!   inject or zeros; SeaBIOS/OSDev-friendly stub answers in stream or remote
-//!   mode); stream-mode **Mouse Packet Format** (3 bytes: flags/buttons/signs/
-//!   overflows, X movement, Y movement) when reporting is enabled.
+//!   wrap when executed), `0xEE` Set Wrap Mode (ACK; wrap flag stored; while
+//!   wrap is set, subsequent host→aux bytes via `0xD4` are echoed on AUX OBF
+//!   with **no ACK** except Reset Wrap `0xEC` and Reset `0xFF`, which remain
+//!   commands — OSDev PS/2 Mouse wrap mode), `0xEC` Reset Wrap Mode (ACK;
+//!   clears wrap flag; stream/remote unchanged), `0xEB` Read Data (ACK then one
+//!   3-byte movement packet — last inject or zeros; SeaBIOS/OSDev-friendly stub
+//!   answers in stream or remote mode); stream-mode **Mouse Packet Format**
+//!   (3 bytes: flags/buttons/signs/overflows, X movement, Y movement) when
+//!   reporting is enabled.
 //! - IBM PC/AT 8042 keyboard-controller programming model (command/status/data);
 //!   output-buffer-full with IRQ enable → ISA IRQ1 (8259A master IR1).
 //! - IBM PS/2 keyboard-controller second (auxiliary) port: commands `0xA7`
@@ -74,7 +76,8 @@
 //! required) on AUX OBF → IRQ12 when config bit 1 is set. Parameter commands
 //! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`/`0xEA`/`0xF0`/`0xEE`/`0xEC`/`0xEB`/`0xF6`)
 //! store rate/resolution/scaling/mode/wrap and answer Status Request / Read Data
-//! with the OSDev packets; Reset and Set Defaults restore defaults (stream mode,
+//! with the OSDev packets; while wrap is set, non-`0xEC`/`0xFF` host→aux bytes
+//! are echoed (no ACK); Reset and Set Defaults restore defaults (stream mode,
 //! wrap off) — Set Defaults ACKs only (no BAT/ID).
 //! [`I8042::inject_mouse_packet`] queues a standard 3-byte movement packet when
 //! data reporting is enabled (`0xF4`) and remembers last dx/dy/buttons for
@@ -87,10 +90,9 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - Wheel / 5-button (IntelliMouse) extensions / wrap-mode **byte echo**
-//!   (Set Wrap `0xEE` ACK+flag and Reset Wrap `0xEC` ACK+clear are stored;
-//!   subsequent host→aux bytes are **not** echoed yet) / full remote protocol
-//!   beyond Read Data `0xEB` (other host→aux bytes are recorded, unanswered)
+//! - Wheel / 5-button (IntelliMouse) extensions / full remote protocol beyond
+//!   Read Data `0xEB` (other host→aux bytes outside wrap are recorded,
+//!   unanswered)
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
@@ -844,11 +846,12 @@ impl I8042 {
         self.mouse_remote_mode
     }
 
-    /// Whether wrap mode is active (`0xEE`); cleared by Reset / Stream / Remote /
-    /// Reset Wrap (`0xEC`).
+    /// Whether wrap mode is active (`0xEE`); cleared by Reset / Reset Wrap
+    /// (`0xEC`), and by Stream / Remote / Set Defaults when those commands are
+    /// executed (they are only echoed while wrap is active).
     ///
-    /// Spec: OSDev PS/2 Mouse — Set/Reset Wrap Mode. Flag only; host→aux byte
-    /// echo in wrap mode is deferred.
+    /// Spec: OSDev PS/2 Mouse — Set/Reset Wrap Mode; while set, host→aux bytes
+    /// other than `0xEC`/`0xFF` are echoed on AUX OBF (no ACK).
     pub fn mouse_wrap_mode(&self) -> bool {
         self.mouse_wrap_mode
     }
@@ -1011,6 +1014,14 @@ impl I8042 {
         self.last_aux_device_write = Some(cmd);
         self.aux_device_writes = self.aux_device_writes.saturating_add(1);
 
+        // Spec: OSDev PS/2 Mouse wrap mode — while wrap is set, every host→aux
+        // byte is echoed on AUX OBF (no ACK) except Reset Wrap (`0xEC`) and
+        // Reset (`0xFF`), which remain commands.
+        if self.mouse_wrap_mode && cmd != MOUSE_CMD_RESET_WRAP_MODE && cmd != MOUSE_CMD_RESET {
+            self.begin_mouse_response(&[cmd]);
+            return;
+        }
+
         match self.mouse_pending_param {
             MousePendingParam::SampleRate => {
                 self.mouse_pending_param = MousePendingParam::None;
@@ -1097,7 +1108,7 @@ impl I8042 {
             }
             MOUSE_CMD_SET_WRAP_MODE => {
                 // Spec: OSDev PS/2 Mouse — Set Wrap Mode (`0xEE`) → ACK + flag.
-                // Wrap-mode echoing of subsequent host→aux bytes is deferred.
+                // Subsequent host→aux bytes are echoed until Reset Wrap / Reset.
                 self.mouse_wrap_mode = true;
                 self.begin_mouse_response(&[MOUSE_ACK]);
             }
@@ -2171,7 +2182,8 @@ mod tests {
     }
 
     /// Spec: OSDev PS/2 Mouse — Set Wrap Mode (`0xEE`) via `0xD4` → ACK on AUX
-    /// OBF; stores wrap-mode flag. Wrap-mode byte echo is deferred.
+    /// OBF; stores wrap-mode flag. Subsequent host→aux bytes are echoed (see
+    /// wrap-echo tests) except Reset Wrap / Reset.
     #[test]
     fn mouse_set_wrap_mode_ee_acks() {
         let mut k = I8042::new();
@@ -2180,6 +2192,79 @@ mod tests {
         assert!(k.mouse_wrap_mode());
         assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse wrap mode — after Set Wrap ACK, host→aux data
+    /// bytes that are not Reset Wrap (`0xEC`) or Reset (`0xFF`) are echoed on
+    /// AUX OBF with no ACK prefix.
+    #[test]
+    fn mouse_wrap_mode_echoes_host_bytes_without_ack() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(k.mouse_wrap_mode());
+
+        write_aux(&mut k, 0x12);
+        assert!(k.mouse_wrap_mode());
+        assert_eq!(
+            read_aux_byte(&mut k),
+            0x12,
+            "wrap mode echoes the byte itself (no ACK)"
+        );
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+
+        write_aux(&mut k, 0xAB);
+        assert_eq!(read_aux_byte(&mut k), 0xAB);
+        assert!(k.mouse_wrap_mode());
+    }
+
+    /// Spec: OSDev PS/2 Mouse wrap mode — even bytes that are valid commands
+    /// when out of wrap (Enable Reporting, Set Wrap again, Status Request) are
+    /// only echoed while wrap is active.
+    #[test]
+    fn mouse_wrap_mode_echoes_command_like_bytes() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        assert!(!k.mouse_reporting_enabled(), "wrap echo must not Enable");
+        assert_eq!(read_aux_byte(&mut k), MOUSE_CMD_ENABLE_REPORTING);
+
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert!(k.mouse_wrap_mode());
+        assert_eq!(
+            read_aux_byte(&mut k),
+            MOUSE_CMD_SET_WRAP_MODE,
+            "0xEE while wrap is echoed, not re-ACKed as Set Wrap"
+        );
+
+        write_aux(&mut k, MOUSE_CMD_STATUS_REQUEST);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_CMD_STATUS_REQUEST);
+        assert_eq!(
+            k.status() & (STATUS_OBF | STATUS_AUX_OBF),
+            0,
+            "no Status Request payload after wrap echo"
+        );
+    }
+
+    /// Spec: OSDev PS/2 Mouse wrap mode — after Reset Wrap, normal command ACK
+    /// path resumes (no more echo).
+    #[test]
+    fn mouse_wrap_mode_echo_stops_after_reset_wrap() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        write_aux(&mut k, 0x55);
+        assert_eq!(read_aux_byte(&mut k), 0x55);
+
+        write_aux(&mut k, MOUSE_CMD_RESET_WRAP_MODE);
+        assert!(!k.mouse_wrap_mode());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_GET_DEVICE_ID);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
     }
 
     /// Spec: OSDev PS/2 Mouse — Reset restores defaults including wrap off.
@@ -2197,31 +2282,49 @@ mod tests {
         assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
     }
 
-    /// Spec: OSDev PS/2 Mouse — Set Stream Mode (`0xEA`) clears wrap mode.
+    /// Spec: OSDev PS/2 Mouse wrap mode — Set Stream Mode (`0xEA`) while wrap
+    /// is active is echoed (not executed); wrap stays set. After Reset Wrap,
+    /// Stream Mode ACKs normally.
     #[test]
-    fn mouse_set_stream_mode_clears_wrap() {
+    fn mouse_wrap_mode_echoes_set_stream_mode() {
         let mut k = I8042::new();
         write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
         assert!(k.mouse_wrap_mode());
         assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
 
         write_aux(&mut k, MOUSE_CMD_SET_STREAM_MODE);
+        assert!(
+            k.mouse_wrap_mode(),
+            "0xEA while wrap is echoed, not cleared"
+        );
+        assert_eq!(read_aux_byte(&mut k), MOUSE_CMD_SET_STREAM_MODE);
+
+        write_aux(&mut k, MOUSE_CMD_RESET_WRAP_MODE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(!k.mouse_wrap_mode());
+
+        write_aux(&mut k, MOUSE_CMD_SET_STREAM_MODE);
         assert!(!k.mouse_wrap_mode());
         assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
     }
 
-    /// Spec: OSDev PS/2 Mouse — Set Remote Mode (`0xF0`) clears wrap mode.
+    /// Spec: OSDev PS/2 Mouse wrap mode — Set Remote Mode (`0xF0`) while wrap
+    /// is active is echoed (not executed); wrap stays set and remote is not
+    /// entered.
     #[test]
-    fn mouse_set_remote_mode_clears_wrap() {
+    fn mouse_wrap_mode_echoes_set_remote_mode() {
         let mut k = I8042::new();
         write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
         assert!(k.mouse_wrap_mode());
         assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
 
         write_aux(&mut k, MOUSE_CMD_SET_REMOTE_MODE);
-        assert!(!k.mouse_wrap_mode());
-        assert!(k.mouse_remote_mode());
-        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(k.mouse_wrap_mode());
+        assert!(
+            !k.mouse_remote_mode(),
+            "0xF0 while wrap must not enter remote"
+        );
+        assert_eq!(read_aux_byte(&mut k), MOUSE_CMD_SET_REMOTE_MODE);
     }
 
     /// Spec: OSDev PS/2 Mouse — Reset Wrap Mode (`0xEC`) via `0xD4` → ACK on AUX
@@ -2634,8 +2737,14 @@ mod tests {
         let _ = read_aux_byte(&mut k);
         write_aux(&mut k, MOUSE_CMD_SET_REMOTE_MODE);
         let _ = read_aux_byte(&mut k);
+        // Enter wrap briefly then leave via Reset Wrap — while wrap is active,
+        // host→aux bytes (including Enable/Set Defaults) are echoed, not run.
         write_aux(&mut k, MOUSE_CMD_SET_WRAP_MODE);
         let _ = read_aux_byte(&mut k);
+        assert!(k.mouse_wrap_mode());
+        write_aux(&mut k, MOUSE_CMD_RESET_WRAP_MODE);
+        let _ = read_aux_byte(&mut k);
+        assert!(!k.mouse_wrap_mode());
         write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
         let _ = read_aux_byte(&mut k);
 
@@ -2643,7 +2752,7 @@ mod tests {
         assert_eq!(k.mouse_resolution(), 0);
         assert!(k.mouse_scaling_21());
         assert!(k.mouse_remote_mode());
-        assert!(k.mouse_wrap_mode());
+        assert!(!k.mouse_wrap_mode());
         assert!(k.mouse_reporting_enabled());
 
         write_aux(&mut k, MOUSE_CMD_SET_DEFAULTS);
@@ -2653,7 +2762,7 @@ mod tests {
         assert!(!k.mouse_scaling_21());
         assert!(!k.mouse_reporting_enabled());
         assert!(!k.mouse_remote_mode(), "Set Defaults restores stream mode");
-        assert!(!k.mouse_wrap_mode(), "Set Defaults clears wrap");
+        assert!(!k.mouse_wrap_mode(), "Set Defaults leaves wrap off");
         assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
         // No BAT/ID on OBF after Set Defaults.
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
