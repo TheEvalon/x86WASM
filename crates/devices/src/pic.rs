@@ -4,10 +4,10 @@
 //!
 //! # Spec refs
 //!
-//! - Intel 8259A Programmable Interrupt Controller datasheet — ICW1–ICW4;
-//!   OCW1 (IMR); OCW2 non-specific / specific EOI; OCW3 IRR/ISR read select;
-//!   OCW3 poll command (`P=1`); IRR/ISR; fully nested priority; cascade EOI
-//!   (master + slave).
+//! - Intel 8259A Programmable Interrupt Controller datasheet — ICW1–ICW4
+//!   (incl. ICW4.AEOI Automatic EOI); OCW1 (IMR); OCW2 non-specific / specific
+//!   EOI; OCW3 IRR/ISR read select; OCW3 poll command (`P=1`); IRR/ISR; fully
+//!   nested priority; cascade EOI (master + slave).
 //! - Classic IBM PC/AT: master at `0x20`/`0x21`, slave at `0xA0`/`0xA1`, slave
 //!   cascaded on master IR2.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 / §21 / §23.3.
@@ -20,13 +20,15 @@
 //! - OCW3 read-register select (`RR`/`RIS`) for IRR/ISR on command-port reads
 //! - OCW3 poll command (`P=1`): one-shot acknowledging command-port read
 //!   returning `0x80 | level`, including software-sequenced cascaded polling
+//! - Automatic EOI (ICW4.AEOI): after INTA / OCW3-poll acknowledge sets an ISR
+//!   bit, that bit is cleared at the end of the acknowledge sequence (no OCW2
+//!   EOI required)
 //! - Edge-triggered IR line assert, IRR→ISR on acknowledge, vector selection
 //! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
 //!
 //! # Unsupported (explicit)
 //!
-//! - Auto-EOI (ICW4.AEOI), rotate modes (OCW2 `R=1`), special mask mode,
-//!   special fully-nested mode
+//! - Rotate modes (OCW2 `R=1`), special mask mode, special fully-nested mode
 //! - Level-triggered delivery beyond storing ICW1.LTIM (runtime uses edge model)
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
@@ -49,6 +51,8 @@ const ICW1_SNGL: u8 = 1 << 1;
 const ICW1_LTIM: u8 = 1 << 3;
 /// ICW4 bit0: 8086/8088 mode (µPM).
 const ICW4_UPM: u8 = 1 << 0;
+/// ICW4 bit1: Automatic EOI (AEOI).
+const ICW4_AEOI: u8 = 1 << 1;
 
 /// OCW2/OCW3: D4 must be 0 (else ICW1).
 /// OCW2: D3=0; OCW3: D3=1 (datasheet Operation Command Word format).
@@ -102,6 +106,13 @@ pub struct Pic8259 {
     pub icw4: u8,
     /// ICW4.µPM — 8086/8088 mode.
     pub mode_8086: bool,
+    /// ICW4.AEOI — Automatic End of Interrupt.
+    ///
+    /// Spec: Intel 8259A datasheet — when AEOI is set, the ISR bit latched by
+    /// the interrupt-acknowledge sequence is cleared at the end of that
+    /// sequence (no OCW2 EOI required). Applies to hardware INTA and to the
+    /// OCW3 poll-command acknowledge path (shared [`Pic8259::ack_ir`]).
+    pub auto_eoi: bool,
     /// Interrupt Mask Register (OCW1). Bit=1 masks that IR. Reset: all masked.
     pub imr: u8,
     /// Interrupt Request Register.
@@ -141,6 +152,7 @@ impl Pic8259 {
             icw3: 0,
             icw4: 0,
             mode_8086: false,
+            auto_eoi: false,
             imr: 0xFF,
             irr: 0,
             isr: 0,
@@ -226,10 +238,15 @@ impl Pic8259 {
         self.highest_priority_request().is_some()
     }
 
+    /// Acknowledge IR`ir`: clear IRR, set ISR; with AEOI, clear that ISR bit
+    /// at the end of the acknowledge sequence (Intel 8259A Automatic EOI).
     fn ack_ir(&mut self, ir: u8) {
         let bit = 1u8 << ir;
         self.irr &= !bit;
         self.isr |= bit;
+        if self.auto_eoi {
+            self.isr &= !bit;
+        }
     }
 
     fn write_cmd(&mut self, value: u8) {
@@ -258,6 +275,7 @@ impl Pic8259 {
         self.icw3 = 0;
         self.icw4 = 0;
         self.mode_8086 = false;
+        self.auto_eoi = false;
         // Datasheet ICW1: edge sense circuit is reset; clear request state.
         self.irr = 0;
         self.isr = 0;
@@ -294,6 +312,7 @@ impl Pic8259 {
             InitPhase::ExpectIcw4 => {
                 self.icw4 = value;
                 self.mode_8086 = value & ICW4_UPM != 0;
+                self.auto_eoi = value & ICW4_AEOI != 0;
                 self.finish_init();
             }
         }
@@ -354,6 +373,7 @@ impl Pic8259 {
     /// Spec: Intel 8259A datasheet — Poll Command: bit7 = 1 when an interrupt is
     /// pending, bits 2:0 = binary level of that request; the IS bit is set and
     /// the IR bit cleared (edge model) via the shared [`Pic8259::ack_ir`] path.
+    /// With ICW4.AEOI the IS bit is cleared again at the end of that acknowledge.
     /// Model choice: with nothing pending the byte is `0x00` (bit7 clear, level
     /// bits zero) — the datasheet leaves the level bits unspecified there.
     fn take_poll_command_byte(&mut self) -> u8 {
@@ -431,7 +451,9 @@ impl DualPic {
     /// INTA-style acknowledge: move IRR→ISR and return 8086 vector, or `None`.
     ///
     /// Spec: Intel 8259A interrupt sequence / cascade — slave vector when master
-    /// selects a cascaded IR; EOI must later clear both slave and master ISR bits.
+    /// selects a cascaded IR. Without AEOI, EOI must later clear both slave and
+    /// master ISR bits; with ICW4.AEOI on a chip, that chip clears its ISR bit
+    /// at the end of its acknowledge (see [`Pic8259::ack_ir`]).
     pub fn acknowledge(&mut self) -> Option<u8> {
         self.sync_cascade();
         let ir = self.master.highest_priority_request()?;
@@ -535,16 +557,21 @@ mod tests {
     use super::*;
 
     fn init_at_cascade(pic: &mut DualPic) {
-        // Master: ICW1=0x11, ICW2=0x08, ICW3=0x04, ICW4=0x01
+        init_at_cascade_icw4(pic, 0x01);
+    }
+
+    /// PC AT cascade init with an explicit ICW4 byte (µPM / AEOI / …).
+    fn init_at_cascade_icw4(pic: &mut DualPic, icw4: u8) {
+        // Master: ICW1=0x11, ICW2=0x08, ICW3=0x04, ICW4=`icw4`
         pic.port_write(PIC_MASTER_CMD, 1, 0x11);
         pic.port_write(PIC_MASTER_DATA, 1, 0x08);
         pic.port_write(PIC_MASTER_DATA, 1, 0x04);
-        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
-        // Slave: ICW1=0x11, ICW2=0x70, ICW3=0x02, ICW4=0x01
+        pic.port_write(PIC_MASTER_DATA, 1, u32::from(icw4));
+        // Slave: ICW1=0x11, ICW2=0x70, ICW3=0x02, ICW4=`icw4`
         pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
         pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
         pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
-        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        pic.port_write(PIC_SLAVE_DATA, 1, u32::from(icw4));
     }
 
     /// Spec: reset leaves both PICs uninitialized (Intel 8259A; PC cold start).
@@ -561,6 +588,8 @@ mod tests {
         assert_eq!(pic.slave.icw3, 0);
         assert!(!pic.master.mode_8086);
         assert!(!pic.slave.mode_8086);
+        assert!(!pic.master.auto_eoi);
+        assert!(!pic.slave.auto_eoi);
         assert!(pic.master.is_master);
         assert!(!pic.slave.is_master);
         assert_eq!(pic.master.imr, 0xFF);
@@ -932,5 +961,88 @@ mod tests {
         assert_eq!(pic.poll_irq(), None); // IR1 blocked while IR0 in service
         pic.port_write(PIC_MASTER_CMD, 1, 0x20); // EOI IR0
         assert_eq!(pic.poll_irq(), Some(0x09));
+    }
+
+    /// Spec: Intel 8259A datasheet — ICW4 bit1 (AEOI). With Automatic EOI, the
+    /// ISR bit set by the interrupt-acknowledge sequence is cleared at the end
+    /// of that sequence; no OCW2 EOI is required before the next delivery.
+    #[test]
+    fn aeoi_clears_isr_after_acknowledge_without_eoi() {
+        let mut pic = DualPic::new();
+        // ICW4 = 0x03: µPM | AEOI
+        init_at_cascade_icw4(&mut pic, 0x03);
+        assert!(pic.master.auto_eoi);
+        assert!(pic.slave.auto_eoi);
+        assert_eq!(pic.master.icw4, 0x03);
+
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.irr, 0);
+        // AEOI: ISR cleared automatically after INTA / vector delivery.
+        assert_eq!(pic.master.isr, 0);
+
+        // Fresh edge delivers again without an OCW2 EOI.
+        pic.set_irq_line(0, false);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 8259A datasheet — without AEOI (ICW4.AEOI=0), ISR remains set
+    /// until an OCW2 EOI; a second edge cannot deliver while nested-blocked.
+    #[test]
+    fn without_aeoi_manual_eoi_still_required() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4(&mut pic, 0x01); // µPM only
+        assert!(!pic.master.auto_eoi);
+
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.isr, 0x01);
+        pic.set_irq_line(0, false);
+        pic.set_irq_line(0, true);
+        // Still in service → fully nested blocks the new IR0 request.
+        assert_eq!(pic.poll_irq(), None);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // non-specific EOI
+        assert_eq!(pic.master.isr, 0);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+    }
+
+    /// Spec: Intel 8259A datasheet — Poll Command is an interrupt acknowledge;
+    /// with AEOI the IS bit set by that acknowledge is cleared automatically
+    /// (same shared ack path as INTA).
+    #[test]
+    fn aeoi_clears_isr_on_ocw3_poll_command_ack() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4(&mut pic, 0x03);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x00);
+        pic.set_irq_line(3, true);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // OCW3 P=1
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 3);
+        assert_eq!(pic.master.irr & (1 << 3), 0);
+        assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 8259A cascade + AEOI — each chip clears its own ISR bit after
+    /// its acknowledge; cascaded INTA therefore leaves master and slave ISR clear
+    /// without OCW2 EOI on either chip.
+    #[test]
+    fn aeoi_cascade_clears_master_and_slave_isr() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4(&mut pic, 0x03);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask master IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        assert_eq!(pic.slave.isr, 0);
+        assert_eq!(pic.master.isr, 0);
+
+        // Re-edge delivers again without EOI.
+        pic.set_irq_line(9, false);
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
     }
 }
