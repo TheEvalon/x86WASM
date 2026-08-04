@@ -23,7 +23,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - ATA / ATAPI specifications (IDENTIFY DEVICE `0xEC`, IDENTIFY PACKET DEVICE `0xA1`, READ SECTORS `0x20`, WRITE SECTORS `0x30`, task-file / status bits, error ABRT, LBA28 PIO, device-control nIEN / INTRQ)
 - OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6` (IRQ14), secondary `0x170`–`0x177` / `0x376` (IRQ15), IDENTIFY/READ/WRITE polling (status clears IRQ; alt status does not); ATAPI probe via `0xA1`
 - PS/2 and 8042 controller references
-- Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
+- Intel 8259A / 8259A-2 / 8259A-8 Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW; Operation Command Word OCW3 format; Poll Command `P=1` acknowledging command-port read returning bit7 pending + binary level)
 - Intel 8254 Programmable Interval Timer datasheet
 - Motorola MC146818 / IBM PC AT CMOS RTC register map (ports `0x70`/`0x71`; index bit7 = NMI disable)
 - Intel SDM Vol. 3 §6.3.3 / §6.7 / §6.15 — `#NMI` (interrupt vector 2; not maskable by `IF`)
