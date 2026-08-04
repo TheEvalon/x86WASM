@@ -1,4 +1,7 @@
 //! Classic PC machine: CPU lab, serial HELLO ROM, and M2 PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE/FDC wiring.
+//!
+//! Floppy media for tests/host setup: [`Machine::attach_floppy_image`] /
+//! [`Machine::with_floppy`] wrap [`Fdc82077::attach_image`].
 
 #![forbid(unsafe_code)]
 
@@ -78,6 +81,23 @@ impl Machine {
             fdc: Fdc82077::new(),
             ports: PortBus::new(),
         }
+    }
+
+    /// Attach a raw 1.44MB floppy image to [`Self::fdc`].
+    ///
+    /// Wraps [`Fdc82077::attach_image`] (exact [`devices::FDC_1440_IMAGE_SIZE`]
+    /// bytes). Spec: IBM PC 1.44MB MFM. Does not clear DIR DSKCHG.
+    pub fn attach_floppy_image(&mut self, image: Vec<u8>) -> Result<(), &'static str> {
+        self.fdc.attach_image(image)
+    }
+
+    /// Construct a machine with a 1.44MB floppy image already attached.
+    ///
+    /// Wraps [`Self::new`] + [`Self::attach_floppy_image`].
+    pub fn with_floppy(ram_size: usize, image: Vec<u8>) -> Result<Self, &'static str> {
+        let mut m = Self::new(ram_size);
+        m.attach_floppy_image(image)?;
+        Ok(m)
     }
 
     /// Load a 64 KiB (or smaller) ROM at `0xFFFF_0000` for the Intel reset vector.
@@ -2260,18 +2280,38 @@ mod tests {
     /// DOR: nRESET | DMA/IRQ | motor0 (classic SeaBIOS-style enable).
     const FDC_DOR_MOTOR0_DMA: u8 = FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x10;
 
+    /// Spec: IBM PC 1.44MB — [`Machine::attach_floppy_image`] rejects wrong size
+    /// and [`Machine::with_floppy`] attaches exact-size media.
+    #[test]
+    fn machine_attach_floppy_image_and_with_floppy_helpers() {
+        let mut m = Machine::new(64 * 1024);
+        assert!(!m.fdc.has_media());
+        assert!(m.attach_floppy_image(vec![0u8; 512]).is_err());
+        assert!(!m.fdc.has_media());
+        m.attach_floppy_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE])
+            .expect("exact 1.44MB");
+        assert!(m.fdc.has_media());
+
+        assert!(Machine::with_floppy(64 * 1024, vec![0u8; 512]).is_err());
+        let m2 = Machine::with_floppy(64 * 1024, vec![0x55u8; FDC_1440_IMAGE_SIZE])
+            .expect("with_floppy exact 1.44MB");
+        assert!(m2.fdc.has_media());
+    }
+
     /// Spec: Intel 82077AA DMA mode + 8237A Write + OSDev ISA DMA floppy ch2 —
     /// MachineBus FDC FIFO READ DATA completion with media auto-wires
     /// `dma_transfer(2)` Write (device→memory): 512 sector bytes land in PhysMem
     /// at the programmed DMA address and TC latches.
+    ///
+    /// Media is attached via [`Machine::with_floppy`] (wraps
+    /// [`Machine::attach_floppy_image`] → [`Fdc82077::attach_image`]).
     #[test]
     fn machine_bus_fdc_read_data_dma_ch2_writes_sector_into_physmem() {
         let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
         for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
             *b = (i & 0xFF) as u8;
         }
-        let mut m = Machine::new(256 * 1024);
-        m.fdc.attach_image(img).expect("1.44MB image");
+        let mut m = Machine::with_floppy(256 * 1024, img).expect("1.44MB image");
         // Program ISA DMA ch2: page/addr, count=511 (512 bytes), Write|Single|Inc.
         program_dma_ch2_write(&mut m, 0x01, 0x1000, 511); // @ phys 0x1_1000
                                                           // Poison destination so we detect a real DMA write.
