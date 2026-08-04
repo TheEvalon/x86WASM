@@ -45,9 +45,10 @@
 //! - OSDev VGA Hardware / FreeVGA Attribute Controller Registers — Address/Data
 //!   at `0x3C0` (flip-flop), Data Read at `0x3C1`; indexes `0x00`–`0x14`
 //!   (palette `0x00`–`0x0F`, Mode Control `0x10` with mode-03h reset default
-//!   `0x0C`, Overscan `0x11`, Color Plane Enable `0x12`, Horizontal PEL
-//!   Panning `0x13`, Color Select `0x14`). Reading Input Status #1 (color
-//!   `0x3DA` / mono `0x3BA`) resets the flip-flop to address state.
+//!   `0x0C`, Overscan Color `0x11` with mode-03h reset default `0x00`, Color
+//!   Plane Enable `0x12`, Horizontal PEL Panning `0x13`, Color Select `0x14`).
+//!   Reading Input Status #1 (color `0x3DA` / mono `0x3BA`) resets the flip-flop
+//!   to address state.
 //! - OSDev VGA Hardware / FreeVGA External Registers — Input Status #1 read at
 //!   `0x3DA` (color) / `0x3BA` (mono): bit0 Display Disabled (inverted
 //!   display-enable; set during horizontal or vertical retrace), bit3 Vertical
@@ -93,8 +94,9 @@
 //!   map / bitmask side effects)
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
 //!   `0x3C1`, flip-flop reset via Input Status #1 (active IOAS map); Mode Control
-//!   `0x10` store/readback with mode-03h reset default `0x0C` (no palette /
-//!   blink / PEL-pan / ATC→DAC / render side effects)
+//!   `0x10` store/readback with mode-03h reset default `0x0C`; Overscan Color
+//!   `0x11` store/readback with mode-03h reset default `0x00` (no palette /
+//!   blink / PEL-pan / overscan-display / ATC→DAC / render side effects)
 //! - Input Status #1: ATC flip-flop reset + deterministic display-enable /
 //!   vertical-retrace status bits (read-phase counter); port selected by Misc
 //!   Output IOAS (`0x3DA` color / `0x3BA` mono)
@@ -557,13 +559,25 @@ pub const VGA_ATC_MODE_CONTROL: u8 = 0x10;
 /// Line Graphics Enable and blink for alphanumeric text. Store/readback only;
 /// no blink / PEL-pan / ATC→DAC side effects.
 pub const VGA_ATC_MODE_CONTROL_DEFAULT: u8 = 0x0C;
+/// Attribute Controller Overscan Color Register index.
+///
+/// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x11`.
+/// Selects the color used for the overscan (border) region around the active
+/// display. Overscan display side effects are out of scope (store/readback only).
+pub const VGA_ATC_OVERSCAN_COLOR: u8 = 0x11;
+/// Mode-03h-class Overscan Color reset default (`0x00` = black border).
+///
+/// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Overscan Color `0x00`.
+/// Store/readback only; no overscan-display / ATC→DAC side effects.
+pub const VGA_ATC_OVERSCAN_COLOR_DEFAULT: u8 = 0x00;
 
 /// Mode-03h-class Attribute Controller reset defaults (store/readback only).
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-set palette — internal palette
 /// `00/01/02/03/04/05/14/07/38/39/3A/3B/3C/3D/3E/3F`; Mode Control
-/// [`VGA_ATC_MODE_CONTROL_DEFAULT`] (BLINK|LGE, alphanumeric); Overscan `0x00`;
-/// Color Plane Enable `0x0F`; Horizontal PEL Panning `0x08`; Color Select `0x00`.
+/// [`VGA_ATC_MODE_CONTROL_DEFAULT`] (BLINK|LGE, alphanumeric); Overscan Color
+/// [`VGA_ATC_OVERSCAN_COLOR_DEFAULT`]; Color Plane Enable `0x0F`; Horizontal
+/// PEL Panning `0x08`; Color Select `0x00`.
 pub const VGA_ATC_DEFAULTS: [u8; VGA_ATC_REG_COUNT] = [
     0x00,
     0x01,
@@ -582,7 +596,7 @@ pub const VGA_ATC_DEFAULTS: [u8; VGA_ATC_REG_COUNT] = [
     0x3E,
     0x3F,
     VGA_ATC_MODE_CONTROL_DEFAULT,
-    0x00,
+    VGA_ATC_OVERSCAN_COLOR_DEFAULT,
     0x0F,
     0x08,
     0x00,
@@ -591,6 +605,11 @@ const _: () = assert!(
     VGA_ATC_MODE_CONTROL == 0x10
         && VGA_ATC_MODE_CONTROL_DEFAULT == 0x0C
         && VGA_ATC_DEFAULTS[VGA_ATC_MODE_CONTROL as usize] == VGA_ATC_MODE_CONTROL_DEFAULT
+);
+const _: () = assert!(
+    VGA_ATC_OVERSCAN_COLOR == 0x11
+        && VGA_ATC_OVERSCAN_COLOR_DEFAULT == 0x00
+        && VGA_ATC_DEFAULTS[VGA_ATC_OVERSCAN_COLOR as usize] == VGA_ATC_OVERSCAN_COLOR_DEFAULT
 );
 
 /// DAC / PEL Mask Register (R/W).
@@ -2617,6 +2636,63 @@ mod tests {
         assert!(v.owns_port(VGA_ATC_DATA_READ));
         assert!(v.owns_port(VGA_INPUT_STATUS_1));
         assert!(!v.owns_port(VGA_INPUT_STATUS_1_MONO));
+    }
+
+    /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — Overscan Color
+    /// (index `0x11`) store/readback via `0x3C0`/`0x3C1`. Mode-03h reset default
+    /// is [`VGA_ATC_OVERSCAN_COLOR_DEFAULT`] (`0x00`).
+    #[test]
+    fn atc_overscan_color_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_OVERSCAN_COLOR)],
+            VGA_ATC_OVERSCAN_COLOR_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_OVERSCAN_COLOR));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_OVERSCAN_COLOR_DEFAULT
+        );
+
+        // Non-default Overscan Color programming (display side effects deferred).
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_OVERSCAN_COLOR));
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x55);
+        assert_eq!(v.atc_regs[usize::from(VGA_ATC_OVERSCAN_COLOR)], 0x55);
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_OVERSCAN_COLOR));
+        assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x55);
+
+        // Word write path (lo=index, hi=data) also updates Overscan Color.
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            2,
+            (u32::from(0x00u8) << 8) | u32::from(VGA_ATC_OVERSCAN_COLOR),
+        );
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_OVERSCAN_COLOR)],
+            VGA_ATC_OVERSCAN_COLOR_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_OVERSCAN_COLOR));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_OVERSCAN_COLOR_DEFAULT
+        );
+
+        v.reset();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_OVERSCAN_COLOR)],
+            VGA_ATC_OVERSCAN_COLOR_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_OVERSCAN_COLOR));
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_OVERSCAN_COLOR_DEFAULT
+        );
     }
 
     /// Spec: FreeVGA Attribute Controller Registers — Mode Control (index `0x10`)
