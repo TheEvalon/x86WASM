@@ -159,6 +159,12 @@ pub const ATA_CMD_READ_NATIVE_MAX: u8 = 0xF8;
 /// SET MULTIPLE MODE — ABRT stub (multiple block count not stored).
 /// Spec: ATA/ATAPI Command Set — SET MULTIPLE MODE (`0xC6`).
 pub const ATA_CMD_SET_MULTIPLE_MODE: u8 = 0xC6;
+/// MEDIA LOCK (DOOR LOCK) — non-data success noop (no media tray).
+/// Spec: ATA/ATAPI Command Set — MEDIA LOCK (`0xDE`).
+pub const ATA_CMD_MEDIA_LOCK: u8 = 0xDE;
+/// MEDIA UNLOCK (DOOR UNLOCK) — non-data success noop.
+/// Spec: ATA/ATAPI Command Set — MEDIA UNLOCK (`0xDF`).
+pub const ATA_CMD_MEDIA_UNLOCK: u8 = 0xDF;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -712,6 +718,23 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) — success noop (no tray lock state).
+    fn exec_media_lock_unlock(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
     /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
@@ -775,6 +798,7 @@ impl IdePrimary {
             ATA_CMD_RECALIBRATE | ATA_CMD_SEEK => self.exec_recalibrate_seek_success(),
             ATA_CMD_INIT_DEV_PARAMS => self.exec_init_dev_params(),
             ATA_CMD_READ_NATIVE_MAX => self.exec_read_native_max(),
+            ATA_CMD_MEDIA_LOCK | ATA_CMD_MEDIA_UNLOCK => self.exec_media_lock_unlock(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             ATA_CMD_SET_FEATURES => self.exec_set_features(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
@@ -1741,6 +1765,21 @@ mod tests {
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
         assert!(ide.irq_line());
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    /// Spec: ATA — MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) success noop.
+    #[test]
+    fn media_lock_unlock_succeed_noop() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        for cmd in [ATA_CMD_MEDIA_LOCK, ATA_CMD_MEDIA_UNLOCK] {
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
+            assert!(ide.irq_line());
+            let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+            assert_eq!(st & ATA_SR_ERR, 0);
+            assert_ne!(st & ATA_SR_DRDY, 0);
+        }
     }
 
     #[test]

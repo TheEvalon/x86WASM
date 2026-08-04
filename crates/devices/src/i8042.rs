@@ -234,6 +234,8 @@ pub const MOUSE_CMD_SET_SCALING_2_1: u8 = 0xE7;
 /// PS/2 mouse Resend — requeue last AUX OBF byte.
 /// Spec: OSDev PS/2 Mouse — `0xFE` Resend.
 pub const MOUSE_CMD_RESEND: u8 = 0xFE;
+/// Spec: OSDev PS/2 Mouse — `0xEA` Set Stream Mode.
+pub const MOUSE_CMD_SET_STREAM_MODE: u8 = 0xEA;
 
 /// Default sample rate after Reset (OSDev PS/2 Mouse defaults).
 pub const MOUSE_DEFAULT_SAMPLE_RATE: u8 = 100;
@@ -982,6 +984,11 @@ impl I8042 {
                 // Spec: OSDev PS/2 Mouse — Resend last byte on AUX OBF.
                 let last = self.mouse_last_byte;
                 self.begin_mouse_response(&[last]);
+            }
+            MOUSE_CMD_SET_STREAM_MODE => {
+                // Spec: OSDev PS/2 Mouse — Set Stream Mode (`0xEA`) → ACK.
+                // Stub is already stream-oriented; no mode state beyond ACK.
+                self.begin_mouse_response(&[MOUSE_ACK]);
             }
             _ => {
                 // Unsupported mouse command: recorded, no response (see module docs).
@@ -2010,6 +2017,15 @@ mod tests {
         assert_eq!(k.last_aux_device_write, Some(0xF0));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert_eq!(k.unsupported_commands, 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Set Stream Mode (`0xEA`) via `0xD4` → ACK.
+    #[test]
+    fn mouse_set_stream_mode_ea_acks() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_STREAM_MODE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
     }
 
     /// Spec: OSDev PS/2 Mouse — Resend (`0xFE`) via `0xD4` requeues last AUX byte.

@@ -101,6 +101,9 @@ pub const PCI_PIIX_IDE_IDETIM_OFFSET: u8 = 0x40;
 pub const PCI_PIIX_ACPI_PMBASE_OFFSET: u8 = 0x40;
 /// IDETIM and ACPI PMBASE share config offset `0x40` on different functions.
 const _: () = assert!(PCI_PIIX_IDE_IDETIM_OFFSET == PCI_PIIX_ACPI_PMBASE_OFFSET);
+/// PIIX USB UHCI Legacy Support (LEGSUP) config offset. Spec: UHCI — dword at `0xC0`.
+pub const PCI_PIIX_USB_LEGSUP_OFFSET: u8 = 0xC0;
+const _: () = assert!(PCI_PIIX_USB_LEGSUP_OFFSET == 0xC0);
 /// PMBASE I/O decode mask — 64-byte aligned (bits 15:6); bit0 = I/O space.
 pub const PCI_PIIX_ACPI_PMBASE_MASK: u32 = 0xFFC0;
 
@@ -721,6 +724,23 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: UHCI / PIIX USB — LEGSUP dword at config `0xC0` store/readback
+    /// (legacy keyboard/mouse SMI routing not modeled).
+    #[test]
+    fn piix_usb_legsup_dword_store_readback() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_PIIX_USB_LEGSUP_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0);
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x2000_0000);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x2000_0000);
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_0000);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0);
     }
 
     /// Spec: Intel 82371SB — IDE IDETIM at config `0x40` word store/readback

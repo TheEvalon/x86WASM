@@ -191,6 +191,13 @@ pub const VGA_SEQ_REG_COUNT: usize = 5;
 /// Map Mask `0x03` (planes 0+1), Character Map Select `0x00`,
 /// Memory Mode `0x02` (extended memory enable; odd/even + chain-4 clear).
 pub const VGA_SEQ_DEFAULTS: [u8; VGA_SEQ_REG_COUNT] = [0x03, 0x00, 0x03, 0x00, 0x02];
+/// Sequencer index: Clocking Mode register. Spec: FreeVGA Sequencer Registers.
+pub const VGA_SEQ_CLOCKING_MODE: u8 = 0x01;
+/// Clocking Mode bit0 — 8/9 Dot Mode (1 = 8 dots/char, 0 = 9). Spec: FreeVGA.
+pub const VGA_SEQ_CLOCKING_8DOT: u8 = 0x01;
+/// Default Clocking Mode has 9-dot characters (bit0 clear).
+const _: () =
+    assert!((VGA_SEQ_DEFAULTS[VGA_SEQ_CLOCKING_MODE as usize] & VGA_SEQ_CLOCKING_8DOT) == 0);
 
 /// Miscellaneous Output Register write port.
 ///
@@ -1717,6 +1724,29 @@ mod tests {
         assert_eq!(v.port_read(VGA_SEQ_DATA, 1) as u8, 0x06);
         v.port_write(VGA_SEQ_INDEX, 1, 0x02);
         assert_eq!(v.port_read(VGA_SEQ_DATA, 1) as u8, 0x0F);
+    }
+
+    /// Spec: FreeVGA — Sequencer Clocking Mode (index `0x01`) bit0 8/9-dot
+    /// store/readback (glyph timing not enforced).
+    #[test]
+    fn sequencer_clocking_mode_8dot_bit_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.seq_regs[VGA_SEQ_CLOCKING_MODE as usize] & VGA_SEQ_CLOCKING_8DOT,
+            0,
+            "default 9-dot"
+        );
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_CLOCKING_MODE));
+        v.port_write(VGA_SEQ_DATA, 1, u32::from(VGA_SEQ_CLOCKING_8DOT));
+        assert_eq!(
+            v.port_read(VGA_SEQ_DATA, 1) as u8 & VGA_SEQ_CLOCKING_8DOT,
+            VGA_SEQ_CLOCKING_8DOT
+        );
+        v.port_write(VGA_SEQ_DATA, 1, 0x00);
+        assert_eq!(
+            v.port_read(VGA_SEQ_DATA, 1) as u8 & VGA_SEQ_CLOCKING_8DOT,
+            0
+        );
     }
 
     #[test]
