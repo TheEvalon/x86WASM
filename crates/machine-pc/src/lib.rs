@@ -845,17 +845,17 @@ mod tests {
             .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         m.kbd
             .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
-        // Clock enabled, INT1 + translate (passthrough stub).
+        // Clock enabled, INT1 + translate (Set 2 → Set 1 on keyboard OBF).
         m.kbd
             .port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_TRANSLATE));
-        assert!(m.kbd_inject_scancode(0x1C));
+        assert!(m.kbd_inject_scancode(0x1C)); // Set 2 'A'
         assert!(m.kbd.irq1_line());
         {
             let mut bus = m.bus_mut();
             // Spec: AT master ICW2 base 0x08 → IRQ1 vector 0x09.
             assert_eq!(bus.poll_external_irq(), Some(0x09));
             assert_eq!(bus.poll_external_irq(), None);
-            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), 0x1C);
+            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), 0x1E); // Set 1 'A'
             assert!(!bus.kbd.irq1_line());
             bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap(); // EOI
         }
