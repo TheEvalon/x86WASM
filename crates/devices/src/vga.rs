@@ -21,12 +21,13 @@
 //!   character address into the refresh buffer). Maximum Scan Line `0x09`
 //!   (bits 4:0 = character cell height − 1; bit5 Start Vertical Blanking bit9;
 //!   bit6 Line Compare bit9; bit7 Scan Doubling; mode-03h reset default `0x0F`
-//!   for 16 scanlines). Underline Location `0x14` (bits 4:0 underline scanline
-//!   − 1; bit5 DIV4; bit6 DW; mode-03h reset default `0x1F`). Vertical Retrace
-//!   End `0x11` bit7 Protect: when set, writes to indexes `0x00`–`0x07` are
-//!   ignored except Overflow (`0x07`) bit4 (Line Compare bit8); indexes
-//!   `>= 0x08` (including Maximum Scan Line and Underline Location) remain
-//!   writable.
+//!   for 16 scanlines). Offset `0x13` (logical line width in words; mode-03h
+//!   reset default `0x28` for 80-column text). Underline Location `0x14`
+//!   (bits 4:0 underline scanline − 1; bit5 DIV4; bit6 DW; mode-03h reset
+//!   default `0x1F`). Vertical Retrace End `0x11` bit7 Protect: when set,
+//!   writes to indexes `0x00`–`0x07` are ignored except Overflow (`0x07`) bit4
+//!   (Line Compare bit8); indexes `>= 0x08` (including Maximum Scan Line,
+//!   Offset, and Underline Location) remain writable.
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode).
@@ -212,6 +213,21 @@ const _: () = assert!(
                 | VGA_CRTC_MAX_SCAN_DOUBLING))
             == 0
 );
+/// CRTC Offset Register index.
+///
+/// Spec: FreeVGA CRT Controller Registers / IBM VGA — index `0x13`. Bits 7:0 =
+/// Offset (logical line width of the screen, in words when byte addressing is
+/// used). Protect (Vertical Retrace End bit7) does **not** block this index
+/// (`>= 0x08`). Pitch/render side effects are out of scope (store/readback
+/// only).
+pub const VGA_CRTC_OFFSET: u8 = 0x13;
+/// Mode-03h-class Offset reset default (`0x28` = 40 words → 80 columns).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Offset `0x28` for 80-column
+/// text (next character row starts 40 words after the previous). Store/readback
+/// only; no pitch side effects in host render.
+pub const VGA_CRTC_OFFSET_DEFAULT: u8 = 0x28;
+const _: () = assert!(VGA_CRTC_OFFSET_DEFAULT == 0x28 && VGA_CRTC_OFFSET == 0x13);
 /// CRTC Underline Location Register index.
 ///
 /// Spec: FreeVGA CRT Controller Registers / IBM VGA — index `0x14`. Bits 4:0 =
@@ -538,7 +554,8 @@ impl VgaText {
 
     /// Reset text plane: 80×25 → space/`0x07`; remainder cleared; CRTC cleared
     /// except Maximum Scan Line [`VGA_CRTC_MAX_SCAN_LINE`] =
-    /// [`VGA_CRTC_MAX_SCAN_LINE_DEFAULT`] and Underline Location
+    /// [`VGA_CRTC_MAX_SCAN_LINE_DEFAULT`], Offset [`VGA_CRTC_OFFSET`] =
+    /// [`VGA_CRTC_OFFSET_DEFAULT`], and Underline Location
     /// [`VGA_CRTC_UNDERLINE_LOCATION`] =
     /// [`VGA_CRTC_UNDERLINE_LOCATION_DEFAULT`]; Sequencer restored to
     /// [`VGA_SEQ_DEFAULTS`]; Graphics Controller restored to [`VGA_GC_DEFAULTS`];
@@ -560,6 +577,7 @@ impl VgaText {
         self.crtc_index = 0;
         self.crtc_regs = [0; VGA_CRTC_REG_COUNT];
         self.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)] = VGA_CRTC_MAX_SCAN_LINE_DEFAULT;
+        self.crtc_regs[usize::from(VGA_CRTC_OFFSET)] = VGA_CRTC_OFFSET_DEFAULT;
         self.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)] =
             VGA_CRTC_UNDERLINE_LOCATION_DEFAULT;
         self.seq_index = 0;
@@ -1115,6 +1133,10 @@ mod tests {
             VGA_CRTC_MAX_SCAN_LINE_DEFAULT
         );
         assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_OFFSET)],
+            VGA_CRTC_OFFSET_DEFAULT
+        );
+        assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)],
             VGA_CRTC_UNDERLINE_LOCATION_DEFAULT
         );
@@ -1203,10 +1225,14 @@ mod tests {
         v.port_write(VGA_CRTC_INDEX, 1, 0x20);
         v.port_write(VGA_CRTC_DATA, 1, 0x55);
         // Index 0x20 is beyond the 25 standard registers; data write ignored.
-        // In-range mode-03h Max Scan Line / Underline defaults are unchanged.
+        // In-range mode-03h Max Scan Line / Offset / Underline defaults are unchanged.
         assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
             VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_OFFSET)],
+            VGA_CRTC_OFFSET_DEFAULT
         );
         assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)],
@@ -1227,6 +1253,8 @@ mod tests {
         v.port_write(VGA_CRTC_DATA, 1, 0x99);
         v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
         v.port_write(VGA_CRTC_DATA, 1, 0x55);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        v.port_write(VGA_CRTC_DATA, 1, 0x55);
         v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_UNDERLINE_LOCATION));
         v.port_write(VGA_CRTC_DATA, 1, 0x55);
         v.reset();
@@ -1235,6 +1263,10 @@ mod tests {
         assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)],
             VGA_CRTC_MAX_SCAN_LINE_DEFAULT
+        );
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_OFFSET)],
+            VGA_CRTC_OFFSET_DEFAULT
         );
         assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)],
@@ -1275,6 +1307,35 @@ mod tests {
         assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)], 0x4E);
         v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_MAX_SCAN_LINE));
         assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x4E);
+    }
+
+    /// Spec: FreeVGA CRT Controller — Offset (index `0x13`) store/readback;
+    /// Protect does not cover indexes `>= 0x08`. Mode-03h reset default is
+    /// [`VGA_CRTC_OFFSET_DEFAULT`] (`0x28` for 80-column text).
+    #[test]
+    fn crtc_offset_store_readback_with_protect() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_OFFSET)],
+            VGA_CRTC_OFFSET_DEFAULT
+        );
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, VGA_CRTC_OFFSET_DEFAULT);
+
+        // Protect set — index 0x13 must still accept writes.
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_VERTICAL_RETRACE_END));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_PROTECT));
+        let programmed = 0x50; // 80 words (e.g. wider logical pitch)
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(programmed));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, programmed);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OFFSET)], programmed);
+
+        // Word write path (lo=index, hi=data) also updates Offset under Protect.
+        v.port_write(VGA_CRTC_INDEX, 2, 0x40_13); // index 0x13, data 0x40
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OFFSET)], 0x40);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x40);
     }
 
     /// Spec: FreeVGA CRT Controller — Underline Location (index `0x14`)
