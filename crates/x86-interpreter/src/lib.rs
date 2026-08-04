@@ -2174,8 +2174,9 @@ fn step_two_byte(
         }
         0x01 => {
             // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2;
-            // "SGDT"/"SIDT"/"LGDT"/"LIDT"/"SMSW"/"LMSW".
-            // Unsupported here: INVLPG (/7); protected-mode entry from PE.
+            // "SGDT"/"SIDT"/"LGDT"/"LIDT"/"SMSW"/"LMSW"/"INVLPG".
+            // Unsupported here: /5 (extensions); protected-mode entry from PE;
+            // paging/TLB invalidate side effects (real-mode INVLPG is a NOP).
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x01))?;
             match m.reg {
                 0 => {
@@ -2226,6 +2227,17 @@ fn step_two_byte(
                         low |= 1; // Spec: LMSW cannot clear PE
                     }
                     cpu.cr0 = (cpu.cr0 & !0xFFFF) | low;
+                    cpu.set_ip16(next_ip);
+                    Ok(())
+                }
+                7 => {
+                    // INVLPG m — Spec: Intel SDM Vol. 2 "INVLPG—Invalidate TLB
+                    // Entries". Register form (mod=11) → #UD. In real-address
+                    // mode the instruction is an architectural NOP (no TLB /
+                    // paging here); GPRs and CR0 are unchanged.
+                    if m.mod_ == 3 {
+                        return Err(ExecError::ArchFault(6));
+                    }
                     cpu.set_ip16(next_ip);
                     Ok(())
                 }
@@ -10552,6 +10564,60 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0B00);
         assert_eq!(cpu.cs.selector, 0);
+    }
+
+    /// INVLPG m — opcode 0F 01 /7 (SDM Vol. 2 "INVLPG—Invalidate TLB Entries").
+    /// Real-address mode: memory form is an architectural NOP (TLB-less; no paging).
+    /// Register form (mod=11) → #UD via IVT. Does not modify GPRs or CR0 / enable PE/PM.
+    #[test]
+    fn invlpg_real_mode_nop_and_reg_ud() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT #UD vector 6 → handler at 0x0B00
+        mem[6 * 4] = 0x00;
+        mem[6 * 4 + 1] = 0x0B;
+        mem[6 * 4 + 2] = 0x00;
+        mem[6 * 4 + 3] = 0x00;
+        let code = 0x1000usize;
+        // +0: 0F 01 3E 00 40    INVLPG [0x4000]  (memory form → NOP)
+        // +5: 0F 01 F8         INVLPG EAX        (mod=11 → #UD)
+        // +8: F4               HLT
+        mem[code] = 0x0F;
+        mem[code + 1] = 0x01;
+        mem[code + 2] = 0x3E;
+        mem[code + 3] = 0x00;
+        mem[code + 4] = 0x40;
+        mem[code + 5] = 0x0F;
+        mem[code + 6] = 0x01;
+        mem[code + 7] = 0xF8; // mod=11, reg=7, rm=EAX
+        mem[code + 8] = 0xF4;
+        // Sentinel at operand address — INVLPG must not read or write it.
+        mem[0x4000] = 0xA5;
+        mem[0x4001] = 0x5A;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1122_3344);
+        cpu.set_gpr_u32(CpuState::RBX, 0x5566_7788);
+        let cr0_before = cpu.cr0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // INVLPG [0x4000]
+        assert_eq!(cpu.rip, (code + 5) as u64, "memory INVLPG advances IP");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1122_3344, "GPRs unchanged");
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x5566_7788, "GPRs unchanged");
+        assert_eq!(cpu.cr0, cr0_before, "CR0 unchanged (no PE/PM side effects)");
+        assert_eq!(bus.mem[0x4000], 0xA5, "operand memory not accessed");
+        assert_eq!(bus.mem[0x4001], 0x5A, "operand memory not accessed");
+
+        // Register form → #UD via IVT
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0B00);
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.cr0, cr0_before, "CR0 still unchanged after #UD path");
     }
 
     /// LGDT/SGDT m16&32 — opcode 0F 01 /2 and /0 (SDM Vol. 2 LGDT/SGDT; Vol. 3 §2.4.1).
