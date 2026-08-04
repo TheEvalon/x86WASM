@@ -6,9 +6,10 @@
 //! # Spec refs
 //!
 //! - Intel 8254 Programmable Interval Timer datasheet — control word format
-//!   (SC/RW/M/BCD), counter latch command, LSB/MSB / LSB-then-MSB access,
-//!   operating modes 0–5; "Mode Definitions" for mode 0/1/2/3/4/5 OUT pin
-//!   behavior and the GATE-pin operations summary table.
+//!   (SC/RW/M/BCD), counter latch command, Read-Back command (`SC=11`,
+//!   COUNT/STATUS + CNTn select), status byte (OUT / NULL COUNT / RW / M / BCD),
+//!   LSB/MSB / LSB-then-MSB access, operating modes 0–5; "Mode Definitions"
+//!   for mode 0/1/2/3/4/5 OUT pin behavior and the GATE-pin operations summary.
 //! - Intel 8259A — edge-triggered IR: low→high latches IRR (wired in `machine-pc`).
 //! - Classic IBM PC/AT I/O map: `0x40`–`0x43`; ch0 OUT → IRQ0.
 //! - `docs/machine-model-pc-v1.md`, `docs/sources.md`, `plan.md` §15.3 / §21.
@@ -16,11 +17,12 @@
 //! # Scope
 //!
 //! Channel control-word programming (operating modes 0, 1, 2, 3, 4, 5),
-//! access-mode count load, counter-latch read-back, counting-element (`ce`)
-//! advancement via [`Pit8254::tick_ch0`], and OUT pin level / rising-edge
-//! reporting for IRQ0. Channel 2: GATE via port `0x61` bit0, OUT readback on
-//! bit5, speaker-data latch bit1 (no host audio), and [`Pit8254::tick_ch2`].
-//! Channel 1 accepts control words and byte I/O but is **not** fully supported.
+//! access-mode count load, counter-latch and Read-Back status/count latches,
+//! counting-element (`ce`) advancement via [`Pit8254::tick_ch0`], and OUT pin
+//! level / rising-edge reporting for IRQ0. Channel 2: GATE via port `0x61`
+//! bit0, OUT readback on bit5, speaker-data latch bit1 (no host audio), and
+//! [`Pit8254::tick_ch2`]. Channel 1 accepts control words and byte I/O but is
+//! **not** fully supported.
 //!
 //! GATE-triggered modes 1 and 5 need a GATE rising edge to start counting, so
 //! on this machine model they are only reachable on channel 2 (port `0x61`
@@ -32,9 +34,9 @@
 //! - Mode 3 exact 50% duty cycle (simplified: one rising OUT edge per period)
 //! - Sub-CLK load delay: a count write (modes 0/2/3/4) or GATE trigger
 //!   (modes 1/5) takes effect on the same model clock, not on the following
-//!   CLK as on real hardware (terminal count lands one CLK early)
-//! - BCD counting during tick (BCD flag stored; tick uses binary)
-//! - Read-back command (`SC=11`) status/count latches (ignored)
+//!   CLK as on real hardware (terminal count lands one CLK early); NULL COUNT
+//!   therefore clears on the same model clock the CE is loaded
+//! - BCD counting during tick (BCD flag stored and reported in status; tick uses binary)
 //! - Channel 1 DRAM refresh; host PC-speaker audio output
 //! - Host-real-time wall-clock rate (callers choose tick quantum)
 //! - Port `0x61` NMI/parity/refresh toggle side effects (bits other than 0/1/5)
@@ -69,6 +71,15 @@ const CW_MODE_SHIFT: u8 = 1;
 const CW_MODE_MASK: u8 = 0b111;
 /// Control-word BCD bit.
 const CW_BCD: u8 = 1 << 0;
+
+/// Read-Back command (SC=11): COUNT=0 latches count of selected counters.
+const RB_COUNT: u8 = 1 << 5;
+/// Read-Back command (SC=11): STATUS=0 latches status of selected counters.
+const RB_STATUS: u8 = 1 << 4;
+/// Read-Back CNT0 / CNT1 / CNT2 select bits (1 = select).
+const RB_CNT0: u8 = 1 << 1;
+const RB_CNT1: u8 = 1 << 2;
+const RB_CNT2: u8 = 1 << 3;
 
 /// Access mode: counter latch command (RW=00).
 const RW_LATCH: u8 = 0b00;
@@ -130,8 +141,12 @@ pub struct PitChannel {
     /// OUT is low for this model clock; next clock rises. Used by the mode 2/3
     /// rate pulse and the mode 4/5 one-CLK strobe.
     out_low_pulse: bool,
-    /// Latched value for read-back after a latch command.
+    /// Latched count (output latch / OL) after a counter-latch or Read-Back COUNT.
     latched: Option<u16>,
+    /// Latched status byte after a Read-Back with STATUS=0 (Intel 8254 Figure 11).
+    status_latched: Option<u8>,
+    /// NULL COUNT (status bit6): set until the last written CR is loaded into CE.
+    null_count: bool,
     /// Whether a full count has been written since the last mode program.
     pub count_loaded: bool,
     /// GATE input. Ch0/ch1 assumed high; ch2 driven by port `0x61` bit0.
@@ -153,6 +168,8 @@ impl PitChannel {
             counting: false,
             out_low_pulse: false,
             latched: None,
+            status_latched: None,
+            null_count: true,
             count_loaded: false,
             gate: true,
         }
@@ -184,7 +201,7 @@ impl PitChannel {
         }
     }
 
-    /// Value captured by a counter-latch command.
+    /// Value captured by a counter-latch / Read-Back COUNT command.
     fn latch_snapshot(&self) -> u16 {
         if self.counting {
             (self.ce & 0xFFFF) as u16
@@ -193,12 +210,57 @@ impl PitChannel {
         }
     }
 
+    /// Status byte format (Intel 8254 Figure 11): OUT | NULL COUNT | RW | M | BCD.
+    /// Bits 5:0 match the last Mode Control Word; SC is not included.
+    fn status_byte(&self) -> u8 {
+        let mut s = self.control_word & 0x3F;
+        if self.null_count {
+            s |= 1 << 6;
+        }
+        if self.out_level {
+            s |= 1 << 7;
+        }
+        s
+    }
+
+    /// Latch count into OL if not already latched (later latches ignored until read).
+    fn latch_count(&mut self) {
+        if self.latched.is_some() {
+            return;
+        }
+        self.latched = Some(self.latch_snapshot());
+        self.read_phase = match self.access {
+            AccessMode::Hi => BytePhase::ExpectHi,
+            _ => BytePhase::ExpectLo,
+        };
+    }
+
+    /// Latch status if not already latched (later status latches ignored until read).
+    fn latch_status(&mut self) {
+        if self.status_latched.is_none() {
+            self.status_latched = Some(self.status_byte());
+        }
+    }
+
+    /// Apply Read-Back COUNT/STATUS latches for this channel.
+    ///
+    /// Spec: Intel 8254 Read-Back Command — COUNT=0 / STATUS=0 (active-low
+    /// sense on those bits) latch the selected fields; unread latches are kept.
+    fn apply_read_back(&mut self, latch_count: bool, latch_status: bool) {
+        if latch_status {
+            self.latch_status();
+        }
+        if latch_count {
+            self.latch_count();
+        }
+    }
+
     fn apply_control(&mut self, value: u8) {
         let rw = (value >> CW_RW_SHIFT) & CW_RW_MASK;
         if rw == RW_LATCH {
             // Counter latch: freeze current CE (when counting) or programmed count.
-            self.latched = Some(self.latch_snapshot());
-            self.read_phase = BytePhase::ExpectLo;
+            // Spec: subsequent latches while unread do not replace the OL.
+            self.latch_count();
             return;
         }
 
@@ -207,7 +269,9 @@ impl PitChannel {
         self.mode = Self::decode_mode((value >> CW_MODE_SHIFT) & CW_MODE_MASK);
         self.bcd = value & CW_BCD != 0;
         self.count_loaded = false;
+        self.null_count = true;
         self.latched = None;
+        self.status_latched = None;
         self.counting = false;
         self.out_low_pulse = false;
         self.ce = 0;
@@ -232,11 +296,14 @@ impl PitChannel {
             // a one-shot / strobe only takes effect on the next trigger.
             if !self.counting {
                 self.ce = self.reload_ce();
+                self.null_count = false;
             }
+            // else: CR pending until GATE; NULL COUNT stays set.
             return;
         }
         // Spec: Intel 8254 — full count load arms CE; 0 encodes 65536.
         self.ce = self.reload_ce();
+        self.null_count = false;
         self.out_low_pulse = false;
         // Modes 0/2/3/4: the count write starts counting when GATE is high.
         self.counting = self.gate;
@@ -274,12 +341,14 @@ impl PitChannel {
             1 => {
                 // Retriggerable one-shot: reload CE, OUT low until terminal count.
                 self.ce = self.reload_ce();
+                self.null_count = false;
                 self.out_low_pulse = false;
                 self.out_level = false;
                 self.counting = true;
             }
             2 | 3 => {
                 self.ce = self.reload_ce();
+                self.null_count = false;
                 self.out_low_pulse = false;
                 self.out_level = true;
                 self.counting = true;
@@ -288,6 +357,7 @@ impl PitChannel {
                 // Hardware triggered strobe: reload CE; OUT stays high until the
                 // one-CLK strobe at terminal count.
                 self.ce = self.reload_ce();
+                self.null_count = false;
                 self.out_low_pulse = false;
                 self.out_level = true;
                 self.counting = true;
@@ -304,11 +374,13 @@ impl PitChannel {
             AccessMode::Lo => {
                 self.count = (self.count & 0xFF00) | u16::from(value);
                 self.write_phase = BytePhase::Complete;
+                self.null_count = true;
                 self.arm_count_loaded();
             }
             AccessMode::Hi => {
                 self.count = (self.count & 0x00FF) | (u16::from(value) << 8);
                 self.write_phase = BytePhase::Complete;
+                self.null_count = true;
                 self.arm_count_loaded();
             }
             AccessMode::LoHi => match self.write_phase {
@@ -316,6 +388,7 @@ impl PitChannel {
                     self.count = (self.count & 0xFF00) | u16::from(value);
                     self.write_phase = BytePhase::ExpectHi;
                     self.count_loaded = false;
+                    self.null_count = true;
                     // Modes 1/5: a new count never disturbs the running one-shot
                     // or strobe (Intel 8254 mode 1/5 definitions).
                     if !matches!(self.mode, 1 | 5) {
@@ -332,6 +405,11 @@ impl PitChannel {
     }
 
     fn read_data(&mut self) -> u8 {
+        // Spec: Intel 8254 — if both status and count are latched, the first
+        // read returns status; subsequent reads return the latched count.
+        if let Some(status) = self.status_latched.take() {
+            return status;
+        }
         let value = self.latched.unwrap_or(self.count);
         match self.access {
             AccessMode::Latch | AccessMode::LoHi => match self.read_phase {
@@ -342,14 +420,18 @@ impl PitChannel {
                 BytePhase::ExpectHi => {
                     self.read_phase = BytePhase::ExpectLo;
                     // Latch consumed after both bytes (datasheet latch read-out).
-                    if self.latched.is_some() {
-                        self.latched = None;
-                    }
+                    self.latched = None;
                     (value >> 8) as u8
                 }
             },
-            AccessMode::Lo => (value & 0xFF) as u8,
-            AccessMode::Hi => (value >> 8) as u8,
+            AccessMode::Lo => {
+                self.latched = None;
+                (value & 0xFF) as u8
+            }
+            AccessMode::Hi => {
+                self.latched = None;
+                (value >> 8) as u8
+            }
         }
     }
 
@@ -580,7 +662,23 @@ impl PortDevice for Pit8254 {
             PIT_CONTROL => {
                 let sc = (v >> CW_SC_SHIFT) & 0b11;
                 if sc == 0b11 {
-                    // Read-back command — unsupported in this slice.
+                    // Spec: Intel 8254 Read-Back Command format —
+                    // D7:D6=11, COUNT(D5)=0 latch count, STATUS(D4)=0 latch status,
+                    // CNT2/CNT1/CNT0 (D3:D1)=1 select, D0 reserved.
+                    let latch_count = v & RB_COUNT == 0;
+                    let latch_status = v & RB_STATUS == 0;
+                    if !latch_count && !latch_status {
+                        return;
+                    }
+                    if v & RB_CNT0 != 0 {
+                        self.channels[0].apply_read_back(latch_count, latch_status);
+                    }
+                    if v & RB_CNT1 != 0 {
+                        self.channels[1].apply_read_back(latch_count, latch_status);
+                    }
+                    if v & RB_CNT2 != 0 {
+                        self.channels[2].apply_read_back(latch_count, latch_status);
+                    }
                     return;
                 }
                 self.channels[sc as usize].apply_control(v);
@@ -737,16 +835,121 @@ mod tests {
         assert_eq!(pit.channel0().mode, 3);
     }
 
+    /// Spec: Intel 8254 Read-Back Command (SC=11) — STATUS=0 latches status;
+    /// first data-port read returns status: OUT | NULL_COUNT | RW | M | BCD
+    /// (datasheet Figure 11 / status byte).
     #[test]
-    fn read_back_command_ignored() {
+    fn read_back_status_latch_ch0() {
         let mut pit = Pit8254::new();
+        // ch0, lohi, mode 3, binary → control 0x36; OUT high after CW, null count set.
         pit.port_write(PIT_CONTROL, 1, 0x36);
+        // Read-back status only for CNT0: SC=11 COUNT=1 STATUS=0 CNT0=1 → 0xE2.
+        pit.port_write(PIT_CONTROL, 1, 0xE2);
+        let status = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        // OUT=1, NULL_COUNT=1, RW=11, M=011, BCD=0 → 0xF6.
+        assert_eq!(status, 0xF6);
+        assert_eq!(pit.channel0().mode, 3);
+        assert!(!pit.channel0().count_loaded);
+
+        // After count load, NULL_COUNT clears; OUT still high (mode 3).
         pit.port_write(PIT_CH0_DATA, 1, 0x00);
         pit.port_write(PIT_CH0_DATA, 1, 0x10);
-        let before = pit.channel0().clone();
-        // SC=11 read-back — unsupported; must not alter channel 0 program.
+        pit.port_write(PIT_CONTROL, 1, 0xE2);
+        let status = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        // OUT=1, NULL_COUNT=0, RW/M/BCD from 0x36 → 0xB6.
+        assert_eq!(status, 0xB6);
+        assert!(pit.out_ch0());
+    }
+
+    /// Spec: Intel 8254 Read-Back — COUNT=0 latches CE like a counter-latch;
+    /// subsequent unread latches of the same OL are ignored.
+    #[test]
+    fn read_back_count_latch_ch0() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x36); // ch0 lohi mode 3
+        pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        pit.port_write(PIT_CH0_DATA, 1, 0x10); // count = 0x1000
+        assert!(pit.channel0().counting);
+        // Drive CE down a few clocks without changing programmed count.
+        let _ = pit.tick_ch0(3);
+        let ce_now = pit.channel0().ce;
+        assert!(ce_now > 0 && ce_now < 0x1000);
+
+        // Read-back count only CNT0: SC=11 COUNT=0 STATUS=1 CNT0=1 → 0xD2.
+        pit.port_write(PIT_CONTROL, 1, 0xD2);
+        let _ = pit.tick_ch0(5); // live CE advances; latched OL must not.
+        let lo = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        let hi = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), ce_now as u16);
+
+        // Second unread count latch ignored: latch again, advance, re-latch → first OL kept.
+        pit.port_write(PIT_CONTROL, 1, 0xD2);
+        let first = pit.channel0().ce;
+        let _ = pit.tick_ch0(7);
+        pit.port_write(PIT_CONTROL, 1, 0xD2); // ignored while unread
+        let lo = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        let hi = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), first as u16);
+    }
+
+    /// Spec: Intel 8254 — when both count and status are latched, the first
+    /// counter read returns status; the next one/two reads return the count.
+    #[test]
+    fn read_back_status_then_count_order() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x30); // ch0 lohi mode 0 (OUT low after CW)
+        pit.port_write(PIT_CH0_DATA, 1, 0x04);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 4; counting, OUT still low
+        assert!(pit.channel0().counting);
+        assert!(!pit.out_ch0());
+
+        // Both count+status CNT0: SC=11 COUNT=0 STATUS=0 CNT0=1 → 0xC2.
         pit.port_write(PIT_CONTROL, 1, 0xC2);
-        assert_eq!(pit.channel0(), &before);
+        let status = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        // OUT=0, NULL_COUNT=0, RW=11, M=000, BCD=0 → 0x30.
+        assert_eq!(status, 0x30);
+        let lo = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        let hi = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), 4);
+    }
+
+    /// Spec: Intel 8254 Read-Back may select multiple counters in one command.
+    #[test]
+    fn read_back_multi_channel_status() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x36); // ch0 mode 3 lohi
+        pit.port_write(PIT_CH0_DATA, 1, 0xFF);
+        pit.port_write(PIT_CH0_DATA, 1, 0xFF);
+        pit.port_write(PIT_CONTROL, 1, 0xB0); // ch2 mode 0 lohi
+                                              // Status of CNT2+CNT0: SC=11 COUNT=1 STATUS=0 CNT2=1 CNT0=1 → 0xEA.
+        pit.port_write(PIT_CONTROL, 1, 0xEA);
+        let st0 = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        let st2 = pit.port_read(PIT_CH2_DATA, 1) as u8;
+        // ch0: OUT=1 NULL=0 + 0x36 → 0xB6; ch2: OUT=0 NULL=1 + 0x30 → 0x70.
+        assert_eq!(st0, 0xB6);
+        assert_eq!(st2, 0x70);
+        assert_eq!(pit.channel0().mode, 3);
+        assert_eq!(pit.channel2().mode, 0);
+    }
+
+    /// Spec: Read-Back must not disturb programmed mode / access / reload.
+    #[test]
+    fn read_back_preserves_mode_programming() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x34); // ch0 lohi mode 2
+        pit.port_write(PIT_CH0_DATA, 1, 0x10);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        let mode = pit.channel0().mode;
+        let count = pit.channel0().count;
+        let cw = pit.channel0().control_word;
+        pit.port_write(PIT_CONTROL, 1, 0xC2); // latch both on ch0
+        let _ = pit.port_read(PIT_CH0_DATA, 1); // status
+        let _ = pit.port_read(PIT_CH0_DATA, 1); // count lo
+        let _ = pit.port_read(PIT_CH0_DATA, 1); // count hi
+        assert_eq!(pit.channel0().mode, mode);
+        assert_eq!(pit.channel0().count, count);
+        assert_eq!(pit.channel0().control_word, cw);
+        assert!(pit.channel0().counting);
     }
 
     #[test]
