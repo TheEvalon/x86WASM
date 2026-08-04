@@ -25,8 +25,9 @@
 //!   Single + Increment/Decrement + Read/Write, Autoinitialize optional,
 //!   `mem_read` / `mem_write` callbacks. With Autoinitialize, after TC Current
 //!   is reloaded from Base and the channel stays unmasked/ready for another
-//!   helper call. Address decrement (mode bit 5) steps Current Address by −1
-//!   per byte within the 64 KiB page.
+//!   helper call. Without Autoinitialize, after TC the channel mask bit is set
+//!   (Intel 8237A hardware auto-mask). Address decrement (mode bit 5) steps
+//!   Current Address by −1 per byte within the 64 KiB page.
 //! - Page address register R/W for the eight AT channels above.
 //! - `PortDevice` for MachineBus wiring.
 //!
@@ -34,7 +35,6 @@
 //!
 //! - Hardware DREQ/DACK handshake / cycle-accurate bus timing
 //! - Demand/block/cascade/verify modes
-//! - Hardware auto-mask after non-autoinit TC (mask left as programmed)
 //! - 16-bit channels 4–7 word addressing / transfers
 //! - Floppy / IDE automatic DMA engine / DREQ path (Machine PhysMem wiring lives in
 //!   `machine-pc::Machine::dma_transfer`; no SeaBIOS floppy DMA)
@@ -286,14 +286,13 @@ impl Dma8237 {
     ///
     /// Spec: Intel 8237A — word count holds N−1 so length is `count + 1`; after N
     /// transfers the channel TC status bit is set. Without Autoinitialize,
-    /// Current Address ends at the post-step value and Current Word Count is
-    /// `0xFFFF`. With Autoinitialize (mode bit 4), Current Address / Word Count
-    /// are restored from Base Address / Base Word Count at TC and the channel
-    /// remains ready (mask bit left as programmed — this helper does not
-    /// auto-mask after non-autoinit TC either). Address direction follows mode
-    /// bit 5: `0` increments Current Address by +1 per byte, `1` decrements by
-    /// −1 per byte (both wrap in the 64 KiB page; page register is not
-    /// auto-bumped).
+    /// Current Address ends at the post-step value, Current Word Count is
+    /// `0xFFFF`, and the channel is hardware-masked (mask bit set). With
+    /// Autoinitialize (mode bit 4), Current Address / Word Count are restored
+    /// from Base Address / Base Word Count at TC and the channel remains ready
+    /// (not auto-masked). Address direction follows mode bit 5: `0` increments
+    /// Current Address by +1 per byte, `1` decrements by −1 per byte (both wrap
+    /// in the 64 KiB page; page register is not auto-bumped).
     /// Physical byte address = `(page << 16) | current_addr` (OSDev ISA DMA).
     ///
     /// # Mode subset honored
@@ -354,13 +353,17 @@ impl Dma8237 {
             };
         }
         if auto_init {
-            // Spec: Intel 8237A Autoinitialize — restore Current from Base at TC.
+            // Spec: Intel 8237A Autoinitialize — restore Current from Base at TC;
+            // channel is not masked and remains ready for another transfer.
             let ch = &mut self.master.channels[isa_channel];
             ch.addr = ch.base_addr;
             ch.count = ch.base_count;
         } else {
+            // Spec: Intel 8237A — without Autoinitialize, after TC Current ends at
+            // the post-step address / 0xFFFF and the channel is hardware-masked.
             self.master.channels[isa_channel].addr = addr;
             self.master.channels[isa_channel].count = 0xFFFF;
+            self.master.mask |= 1 << isa_channel;
         }
         self.master.latch_tc(isa_channel);
         Ok(len)
@@ -805,6 +808,135 @@ mod tests {
         assert_eq!(d.master.channels[2].count, 0xFFFF);
         assert_eq!(d.master.channels[2].base_addr, 0x1000);
         assert_eq!(d.master.channels[2].base_count, 1);
+    }
+
+    #[test]
+    fn transfer_block_without_autoinit_auto_masks_after_tc() {
+        // Spec: Intel 8237A — when Autoinitialize is not selected, the channel is
+        // hardware-masked after terminal count. A subsequent transfer_block must
+        // return Masked until software clears the mask bit. latch_tc alone does
+        // not change mask (see software_request_and_mask_unchanged_with_tc).
+        let mut d = Dma8237::new();
+        program_ch2_write(&mut d, 0x01, 0x1000, 1); // 2 bytes, mode 0x46 (no AutoInit)
+        assert_eq!(d.master.mask & 0x04, 0);
+        let mem = RefCell::new(vec![0u8; 0x2_0000]);
+        let mut io = [0xAAu8, 0xBB];
+        d.transfer_block(
+            2,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("first non-autoinit write");
+        assert_eq!(d.master.status & 0x0F, 0x04); // TC latched
+        assert_eq!(d.master.mask & 0x04, 0x04); // ch2 auto-masked
+
+        let mut io2 = [0x11u8, 0x22];
+        let err = d
+            .transfer_block(
+                2,
+                &mut io2,
+                |phys| mem.borrow()[phys as usize],
+                |phys, b| mem.borrow_mut()[phys as usize] = b,
+            )
+            .expect_err("masked after non-autoinit TC");
+        assert_eq!(err, DmaTransferError::Masked);
+
+        // Software unmask allows another programmed transfer.
+        d.port_write(0x0A, 1, 0x02); // clear mask ch2
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x04, 1, 0x00);
+        d.port_write(0x04, 1, 0x20); // addr 0x2000
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x05, 1, 0x01);
+        d.port_write(0x05, 1, 0x00);
+        d.port_write(0x0B, 1, 0x46);
+        let mut io3 = [0xCCu8, 0xDD];
+        d.transfer_block(
+            2,
+            &mut io3,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("after software unmask");
+        assert_eq!(&mem.borrow()[0x1_2000..0x1_2002], &[0xCC, 0xDD]);
+        assert_eq!(d.master.mask & 0x04, 0x04); // auto-masked again
+    }
+
+    #[test]
+    fn transfer_block_autoinit_does_not_auto_mask_after_tc() {
+        // Spec: Intel 8237A — Autoinitialize selected: channel is not masked at TC
+        // and stays ready for another transfer without a mask-register write.
+        let mut d = Dma8237::new();
+        program_ch2_autoinit_write(&mut d, 0x01, 0x1000, 1); // 2 bytes, mode 0x56
+        let mem = RefCell::new(vec![0u8; 0x2_0000]);
+        let mut io = [0xAAu8, 0xBB];
+        d.transfer_block(
+            2,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("autoinit write");
+        assert_eq!(d.master.status & 0x0F, 0x04);
+        assert_eq!(d.master.mask & 0x04, 0); // not auto-masked
+        let mut io2 = [0x11u8, 0x22];
+        d.transfer_block(
+            2,
+            &mut io2,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("second autoinit without unmask");
+        assert_eq!(&mem.borrow()[0x1_1000..0x1_1002], &[0x11, 0x22]);
+        assert_eq!(d.master.mask & 0x04, 0);
+    }
+
+    #[test]
+    fn transfer_block_decrement_without_autoinit_auto_masks() {
+        // Spec: Intel 8237A — auto-mask after non-autoinit TC is independent of
+        // address direction (mode bit 5).
+        let mut d = Dma8237::new();
+        program_ch2_decrement_write(&mut d, 0x01, 0x1003, 1); // 2 bytes, mode 0x66
+        let mem = RefCell::new(vec![0u8; 0x2_0000]);
+        let mut io = [0xAAu8, 0xBB];
+        d.transfer_block(
+            2,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("decrement non-autoinit write");
+        assert_eq!(d.master.mask & 0x04, 0x04);
+        assert_eq!(d.master.status & 0x0F, 0x04);
+    }
+
+    #[test]
+    fn transfer_block_ch0_without_autoinit_auto_masks() {
+        // Spec: Intel 8237A — per-channel auto-mask on master ch0–3.
+        let mut d = Dma8237::new();
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x00, 1, 0x00);
+        d.port_write(0x00, 1, 0x10); // addr 0x1000
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x01, 1, 0x00); // count 0 → 1 byte
+        d.port_write(0x01, 1, 0x00);
+        d.port_write(DMA_PAGE_CH0, 1, 0x00);
+        d.port_write(0x0B, 1, 0x44); // Single | Inc | Write | ch0
+        d.port_write(0x0A, 1, 0x00); // unmask ch0
+        let mem = RefCell::new(vec![0u8; 0x2000]);
+        let mut io = [0x5Au8];
+        d.transfer_block(
+            0,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("ch0 write");
+        assert_eq!(mem.borrow()[0x1000], 0x5A);
+        assert_eq!(d.master.mask & 0x01, 0x01); // ch0 auto-masked
+                                                // ch1–3 were still reset-masked (never unmasked); auto-mask only ORs ch0.
+        assert_eq!(d.master.mask, 0x0F);
     }
 
     /// Program master ch2: Single+Dec+Write (`0x66`).
