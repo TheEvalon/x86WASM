@@ -45,7 +45,7 @@ pub struct Machine {
     pub kbd: I8042,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
-    /// VGA color text plane at 0xB8000 + CRTC `0x3D4`/`0x3D5` + Misc Output `0x3C2`/`0x3CC`.
+    /// VGA color text plane at 0xB8000 + CRTC/Seq/GC/ATC/DAC/Misc stubs.
     pub vga: VgaText,
     /// PCI configuration mechanism #1 (ports 0xCF8 / 0xCFC–0xCFF).
     pub pci: PciConfig,
@@ -537,8 +537,8 @@ mod tests {
         PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
         PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B,
         REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
-        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ,
-        VGA_MISC_OUTPUT_WRITE,
+        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
+        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -1498,6 +1498,26 @@ mod tests {
         assert_eq!(m.vga.misc_output, 0xA5);
         m.reset();
         assert_eq!(m.vga.misc_output, VGA_MISC_OUTPUT_DEFAULT);
+    }
+
+    /// Spec: FreeVGA Color Registers / OSDev VGA Hardware — DAC PEL `0x3C8`/`0x3C9`/`0x3C7`.
+    #[test]
+    fn machine_bus_vga_dac_pel_round_trip() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(VGA_DAC_WRITE_INDEX, 0x10).unwrap();
+            bus.port_out_u8(VGA_DAC_DATA, 0x3F).unwrap();
+            bus.port_out_u8(VGA_DAC_DATA, 0x2A).unwrap();
+            bus.port_out_u8(VGA_DAC_DATA, 0x15).unwrap();
+            bus.port_out_u8(VGA_DAC_READ_INDEX, 0x10).unwrap();
+            assert_eq!(bus.port_in_u8(VGA_DAC_DATA).unwrap(), 0x3F);
+            assert_eq!(bus.port_in_u8(VGA_DAC_DATA).unwrap(), 0x2A);
+            assert_eq!(bus.port_in_u8(VGA_DAC_DATA).unwrap(), 0x15);
+        }
+        assert_eq!(m.vga.dac_ram[0x10], [0x3F, 0x2A, 0x15]);
+        m.reset();
+        assert_eq!(m.vga.dac_ram[0x10], [0x00, 0x00, 0x00]);
     }
 
     /// Spec: PCI Local Bus Mechanism #1 — host bridge vendor/device via MachineBus.

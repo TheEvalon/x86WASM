@@ -3,7 +3,8 @@
 //! (`0x3C4`/`0x3C5`), Graphics Controller index/data stub (`0x3CE`/`0x3CF`),
 //! Attribute Controller address/data flip-flop stub (`0x3C0`/`0x3C1` + Input
 //! Status #1 flip-flop reset and status bits at `0x3DA`/`0x3BA` via Misc IOAS),
-//! and Miscellaneous Output Register stub (`0x3C2` write / `0x3CC` readback).
+//! Miscellaneous Output Register stub (`0x3C2` write / `0x3CC` readback), and
+//! DAC / PEL color RAM stub (`0x3C7`/`0x3C8`/`0x3C9`).
 //!
 //! # Spec refs
 //!
@@ -36,6 +37,10 @@
 //!   I/O Address Select (IOAS): `1` = color CRTC/status map (`0x3D4`/`0x3D5`,
 //!   Input Status #1 `0x3DA`); `0` = mono map (CRTC `0x3B4`/`0x3B5`, Input
 //!   Status #1 `0x3BA`).
+//! - OSDev VGA Hardware / FreeVGA Color Registers + DAC Operation / IBM VGA —
+//!   PEL Address Write Mode `0x3C8`, PEL Address Read Mode write / DAC State
+//!   read `0x3C7`, PEL Data `0x3C9` (R→G→B, 6-bit, auto-increment after blue);
+//!   256×3 DAC RAM.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.6 / §21 VGA text mode.
 //!
 //! # Scope (this slice)
@@ -58,11 +63,14 @@
 //!   Output IOAS (`0x3DA` color / `0x3BA` mono)
 //! - Misc Output store/readback (`0x3C2`/`0x3CC`); IOAS bit remaps Input Status
 //!   #1 ownership only (not CRTC mono map, clock, or RAM-enable)
+//! - DAC / PEL store/readback: write index `0x3C8`, data `0x3C9` (R→G→B), read
+//!   index write / state read `0x3C7`; 256×3 RAM with mode-03h-ish defaults
 //!
 //! # Unsupported (explicit)
 //!
-//! - ATC / Sequencer / GC timing, palette→DAC, blink, PEL pan, plane-enable,
-//!   map-mask, write-mode, read-map, or bitmask side effects on the text plane
+//! - ATC / Sequencer / GC timing, ATC→DAC remap side effects, blink, PEL pan,
+//!   PEL mask `0x3C6`, plane-enable, map-mask, write-mode, read-map, or bitmask
+//!   side effects on the text plane
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
 //! - CRTC protect bit (index `0x11` bit7), mono CRTC map at `0x3B4`/`0x3B5`
@@ -211,7 +219,65 @@ pub const VGA_ATC_DEFAULTS: [u8; VGA_ATC_REG_COUNT] = [
     0x0C, 0x00, 0x0F, 0x08, 0x00,
 ];
 
-/// Color text-mode frame buffer + CRTC + Sequencer + GC + ATC + Misc stubs.
+/// DAC Address Read Mode write / DAC State read port.
+///
+/// Spec: FreeVGA Color Registers / OSDev VGA Hardware / IBM VGA — write sets
+/// the read index for subsequent [`VGA_DAC_DATA`] reads; read returns DAC state.
+pub const VGA_DAC_READ_INDEX: u16 = 0x3C7;
+/// DAC Address Write Mode Register (R/W).
+///
+/// Spec: FreeVGA Color Registers — write sets the write index for subsequent
+/// [`VGA_DAC_DATA`] writes; read returns the current write index.
+pub const VGA_DAC_WRITE_INDEX: u16 = 0x3C8;
+/// DAC / PEL Data Register (R/W) — R→G→B, auto-increment after blue.
+pub const VGA_DAC_DATA: u16 = 0x3C9;
+/// Number of DAC palette entries (256 × RGB).
+pub const VGA_DAC_ENTRY_COUNT: usize = 256;
+/// VGA DAC color components are 6-bit (bits 5:0).
+pub const VGA_DAC_COLOR_MASK: u8 = 0x3F;
+/// DAC State (read `0x3C7`): prepared to accept reads from PEL Data.
+///
+/// Spec: FreeVGA Color Registers — bits 1:0 = `00`.
+pub const VGA_DAC_STATE_READ: u8 = 0x00;
+/// DAC State (read `0x3C7`): prepared to accept writes to PEL Data.
+///
+/// Spec: FreeVGA Color Registers — bits 1:0 = `11`.
+pub const VGA_DAC_STATE_WRITE: u8 = 0x03;
+
+/// Mode-03h-class DAC reset defaults for indices `0`–`15` (6-bit RGB).
+///
+/// Spec: IBM VGA / classic CGA–EGA 16-color palette in 6-bit DAC units
+/// (`0x00`/`0x15`/`0x2A`/`0x3F`). Indices `16`–`255` reset to black. Store /
+/// readback only — no ATC→DAC remap or host render.
+pub const VGA_DAC_CGA16_DEFAULTS: [[u8; 3]; 16] = [
+    [0x00, 0x00, 0x00], // 0  black
+    [0x00, 0x00, 0x2A], // 1  blue
+    [0x00, 0x2A, 0x00], // 2  green
+    [0x00, 0x2A, 0x2A], // 3  cyan
+    [0x2A, 0x00, 0x00], // 4  red
+    [0x2A, 0x00, 0x2A], // 5  magenta
+    [0x2A, 0x15, 0x00], // 6  brown
+    [0x2A, 0x2A, 0x2A], // 7  light gray
+    [0x15, 0x15, 0x15], // 8  dark gray
+    [0x15, 0x15, 0x3F], // 9  light blue
+    [0x15, 0x3F, 0x15], // 10 light green
+    [0x15, 0x3F, 0x3F], // 11 light cyan
+    [0x3F, 0x15, 0x15], // 12 light red
+    [0x3F, 0x15, 0x3F], // 13 light magenta
+    [0x3F, 0x3F, 0x15], // 14 yellow
+    [0x3F, 0x3F, 0x3F], // 15 white
+];
+
+/// Build mode-03h-ish 256×3 DAC RAM (CGA-16 + black remainder).
+pub fn vga_dac_default_ram() -> [[u8; 3]; VGA_DAC_ENTRY_COUNT] {
+    let mut ram = [[0u8; 3]; VGA_DAC_ENTRY_COUNT];
+    for (i, rgb) in VGA_DAC_CGA16_DEFAULTS.iter().enumerate() {
+        ram[i] = *rgb;
+    }
+    ram
+}
+
+/// Color text-mode frame buffer + CRTC + Sequencer + GC + ATC + Misc + DAC stubs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VgaText {
     /// Raw plane bytes (char/attr interleaved).
@@ -243,6 +309,18 @@ pub struct VgaText {
     ///
     /// Bit0 ([`VGA_MISC_IOAS`]) selects Input Status #1 port ownership.
     pub misc_output: u8,
+    /// DAC color RAM: 256 entries × RGB (6-bit components stored).
+    pub dac_ram: [[u8; 3]; VGA_DAC_ENTRY_COUNT],
+    /// Current DAC write index (set via `0x3C8`).
+    pub dac_write_index: u8,
+    /// Current DAC read index (set via write to `0x3C7`).
+    pub dac_read_index: u8,
+    /// Write channel: `0`=R, `1`=G, `2`=B.
+    pub dac_write_channel: u8,
+    /// Read channel: `0`=R, `1`=G, `2`=B.
+    pub dac_read_channel: u8,
+    /// DAC State bits 1:0 ([`VGA_DAC_STATE_READ`] / [`VGA_DAC_STATE_WRITE`]).
+    pub dac_state: u8,
 }
 
 impl Default for VgaText {
@@ -266,6 +344,12 @@ impl VgaText {
             atc_flip_flop_data: false,
             status1_phase: 0,
             misc_output: VGA_MISC_OUTPUT_DEFAULT,
+            dac_ram: vga_dac_default_ram(),
+            dac_write_index: 0,
+            dac_read_index: 0,
+            dac_write_channel: 0,
+            dac_read_channel: 0,
+            dac_state: VGA_DAC_STATE_WRITE,
         };
         v.reset();
         v
@@ -275,7 +359,8 @@ impl VgaText {
     /// Sequencer restored to [`VGA_SEQ_DEFAULTS`]; Graphics Controller restored
     /// to [`VGA_GC_DEFAULTS`]; Attribute Controller restored to
     /// [`VGA_ATC_DEFAULTS`] with flip-flop in address state; Input Status #1
-    /// phase cleared; Misc Output restored to [`VGA_MISC_OUTPUT_DEFAULT`].
+    /// phase cleared; Misc Output restored to [`VGA_MISC_OUTPUT_DEFAULT`]; DAC
+    /// RAM restored to mode-03h-ish defaults ([`vga_dac_default_ram`]).
     ///
     /// Spec: IBM VGA text — cells are (char, attr) pairs starting at `0xB8000`.
     pub fn reset(&mut self) {
@@ -297,6 +382,12 @@ impl VgaText {
         self.atc_flip_flop_data = false;
         self.status1_phase = 0;
         self.misc_output = VGA_MISC_OUTPUT_DEFAULT;
+        self.dac_ram = vga_dac_default_ram();
+        self.dac_write_index = 0;
+        self.dac_read_index = 0;
+        self.dac_write_channel = 0;
+        self.dac_read_channel = 0;
+        self.dac_state = VGA_DAC_STATE_WRITE;
     }
 
     /// True if `addr` (after A20) falls in the text plane.
@@ -312,11 +403,11 @@ impl VgaText {
     }
 
     /// True if this device owns the I/O port (color CRTC + Sequencer + GC + ATC
-    /// + Input Status #1 at the IOAS-selected address + Misc).
+    /// + DAC PEL + Input Status #1 at the IOAS-selected address + Misc).
     ///
     /// Spec: FreeVGA / IBM — Input Status #1 is `0x3DA` when IOAS=1 (color) and
     /// `0x3BA` when IOAS=0 (mono). CRTC remains color `0x3D4`/`0x3D5` in this
-    /// stub (mono CRTC remap is unsupported).
+    /// stub (mono CRTC remap is unsupported). PEL mask `0x3C6` is not owned.
     pub fn owns_port(&self, port: u16) -> bool {
         match port {
             VGA_INPUT_STATUS_1 => self.misc_ioas_color(),
@@ -329,6 +420,9 @@ impl VgaText {
             | VGA_GC_DATA
             | VGA_ATC_ADDRESS_DATA
             | VGA_ATC_DATA_READ
+            | VGA_DAC_READ_INDEX
+            | VGA_DAC_WRITE_INDEX
+            | VGA_DAC_DATA
             | VGA_MISC_OUTPUT_WRITE
             | VGA_MISC_OUTPUT_READ => true,
             _ => false,
@@ -537,6 +631,61 @@ impl VgaText {
             VGA_STATUS1_DD | VGA_STATUS1_VR
         }
     }
+
+    /// Spec: FreeVGA Color Registers — write `0x3C8` sets write index and arms
+    /// the R→G→B write cycle; DAC state becomes write-ready.
+    fn write_dac_write_index(&mut self, value: u8) {
+        self.dac_write_index = value;
+        self.dac_write_channel = 0;
+        self.dac_state = VGA_DAC_STATE_WRITE;
+    }
+
+    /// Spec: FreeVGA Color Registers — write `0x3C7` sets read index and arms
+    /// the R→G→B read cycle; DAC state becomes read-ready.
+    fn write_dac_read_index(&mut self, value: u8) {
+        self.dac_read_index = value;
+        self.dac_read_channel = 0;
+        self.dac_state = VGA_DAC_STATE_READ;
+    }
+
+    /// Spec: FreeVGA Color Registers — write `0x3C9` stores a 6-bit component
+    /// (R then G then B); after blue the write index auto-increments.
+    fn write_dac_data(&mut self, value: u8) {
+        let ch = usize::from(self.dac_write_channel.min(2));
+        let idx = usize::from(self.dac_write_index);
+        self.dac_ram[idx][ch] = value & VGA_DAC_COLOR_MASK;
+        self.dac_state = VGA_DAC_STATE_WRITE;
+        if self.dac_write_channel >= 2 {
+            self.dac_write_channel = 0;
+            self.dac_write_index = self.dac_write_index.wrapping_add(1);
+        } else {
+            self.dac_write_channel += 1;
+        }
+    }
+
+    /// Spec: FreeVGA Color Registers — read `0x3C9` returns a 6-bit component
+    /// (R then G then B); after blue the read index auto-increments.
+    fn read_dac_data(&mut self) -> u8 {
+        let ch = usize::from(self.dac_read_channel.min(2));
+        let idx = usize::from(self.dac_read_index);
+        let value = self.dac_ram[idx][ch];
+        self.dac_state = VGA_DAC_STATE_READ;
+        if self.dac_read_channel >= 2 {
+            self.dac_read_channel = 0;
+            self.dac_read_index = self.dac_read_index.wrapping_add(1);
+        } else {
+            self.dac_read_channel += 1;
+        }
+        value
+    }
+
+    fn read_dac_write_index(&self) -> u8 {
+        self.dac_write_index
+    }
+
+    fn read_dac_state(&self) -> u8 {
+        self.dac_state
+    }
 }
 
 impl PortDevice for VgaText {
@@ -550,6 +699,11 @@ impl PortDevice for VgaText {
             VGA_GC_DATA => u32::from(self.read_gc_data()),
             VGA_ATC_ADDRESS_DATA => u32::from(self.read_atc_address()),
             VGA_ATC_DATA_READ => u32::from(self.read_atc_data()),
+            // Spec: FreeVGA Color Registers — read `0x3C7` = DAC State.
+            VGA_DAC_READ_INDEX => u32::from(self.read_dac_state()),
+            // Spec: FreeVGA Color Registers — read `0x3C8` = current write index.
+            VGA_DAC_WRITE_INDEX => u32::from(self.read_dac_write_index()),
+            VGA_DAC_DATA => u32::from(self.read_dac_data()),
             VGA_INPUT_STATUS_1 if self.misc_ioas_color() => u32::from(self.read_input_status_1()),
             VGA_INPUT_STATUS_1_MONO if !self.misc_ioas_color() => {
                 u32::from(self.read_input_status_1())
@@ -607,6 +761,19 @@ impl PortDevice for VgaText {
             }
             // Spec: FreeVGA — `0x3C1` is data-read; writes ignored.
             VGA_ATC_DATA_READ => {}
+            // Spec: FreeVGA Color Registers — write `0x3C7` = read-mode index.
+            VGA_DAC_READ_INDEX => self.write_dac_read_index(value as u8),
+            VGA_DAC_WRITE_INDEX => self.write_dac_write_index(value as u8),
+            VGA_DAC_DATA => {
+                // Spec: FreeVGA — RGB must be written as three successive bytes.
+                // A 16-bit OUT supplies two of those bytes (lo then hi).
+                if size >= 2 {
+                    self.write_dac_data(value as u8);
+                    self.write_dac_data((value >> 8) as u8);
+                } else {
+                    self.write_dac_data(value as u8);
+                }
+            }
             // Spec: FreeVGA — Input Status #1 is read-only; writes ignored.
             VGA_INPUT_STATUS_1 | VGA_INPUT_STATUS_1_MONO => {}
             VGA_MISC_OUTPUT_WRITE => self.write_misc_output(value as u8),
@@ -640,6 +807,12 @@ mod tests {
         assert_eq!(v.atc_regs, VGA_ATC_DEFAULTS);
         assert!(!v.atc_flip_flop_data);
         assert_eq!(v.misc_output, VGA_MISC_OUTPUT_DEFAULT);
+        assert_eq!(v.dac_ram, vga_dac_default_ram());
+        assert_eq!(v.dac_write_index, 0);
+        assert_eq!(v.dac_read_index, 0);
+        assert_eq!(v.dac_write_channel, 0);
+        assert_eq!(v.dac_read_channel, 0);
+        assert_eq!(v.dac_state, VGA_DAC_STATE_WRITE);
     }
 
     #[test]
@@ -1287,5 +1460,125 @@ mod tests {
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x06);
         assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x14);
+    }
+
+    #[test]
+    fn dac_pel_owns_ports() {
+        // Spec: FreeVGA Color Registers / OSDev VGA Hardware — DAC Read Index
+        // `0x3C7`, Write Index `0x3C8`, Data `0x3C9`. PEL mask `0x3C6` not owned.
+        let v = VgaText::new();
+        assert!(v.owns_port(VGA_DAC_READ_INDEX));
+        assert!(v.owns_port(VGA_DAC_WRITE_INDEX));
+        assert!(v.owns_port(VGA_DAC_DATA));
+        assert!(!v.owns_port(0x3C6));
+    }
+
+    #[test]
+    fn dac_pel_write_index_rgb_round_trip() {
+        // Spec: FreeVGA Color Registers / IBM VGA — write index at 0x3C8, then
+        // R→G→B to 0x3C9; read index at 0x3C7, then R→G→B from 0x3C9.
+        let mut v = VgaText::new();
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x10);
+        assert_eq!(v.port_read(VGA_DAC_WRITE_INDEX, 1) as u8, 0x10);
+        assert_eq!(
+            v.port_read(VGA_DAC_READ_INDEX, 1) as u8,
+            VGA_DAC_STATE_WRITE
+        );
+        v.port_write(VGA_DAC_DATA, 1, 0x3F);
+        v.port_write(VGA_DAC_DATA, 1, 0x2A);
+        v.port_write(VGA_DAC_DATA, 1, 0x15);
+        assert_eq!(v.dac_ram[0x10], [0x3F, 0x2A, 0x15]);
+        // Auto-increment after blue.
+        assert_eq!(v.dac_write_index, 0x11);
+        assert_eq!(v.dac_write_channel, 0);
+
+        v.port_write(VGA_DAC_READ_INDEX, 1, 0x10);
+        assert_eq!(v.port_read(VGA_DAC_READ_INDEX, 1) as u8, VGA_DAC_STATE_READ);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x3F);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x2A);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x15);
+        assert_eq!(v.dac_read_index, 0x11);
+        assert_eq!(v.dac_read_channel, 0);
+    }
+
+    #[test]
+    fn dac_pel_auto_increment_consecutive_entries() {
+        // Spec: FreeVGA DAC Operation — after each RGB triplet the index
+        // advances so the next entry can be programmed without reloading.
+        let mut v = VgaText::new();
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x20);
+        v.port_write(VGA_DAC_DATA, 1, 0x01);
+        v.port_write(VGA_DAC_DATA, 1, 0x02);
+        v.port_write(VGA_DAC_DATA, 1, 0x03);
+        v.port_write(VGA_DAC_DATA, 1, 0x04);
+        v.port_write(VGA_DAC_DATA, 1, 0x05);
+        v.port_write(VGA_DAC_DATA, 1, 0x06);
+        assert_eq!(v.dac_ram[0x20], [0x01, 0x02, 0x03]);
+        assert_eq!(v.dac_ram[0x21], [0x04, 0x05, 0x06]);
+        assert_eq!(v.port_read(VGA_DAC_WRITE_INDEX, 1) as u8, 0x22);
+
+        v.port_write(VGA_DAC_READ_INDEX, 1, 0x20);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x01);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x02);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x03);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x04);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x05);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x06);
+    }
+
+    #[test]
+    fn dac_pel_masks_to_six_bits() {
+        // Spec: FreeVGA Color Registers / IBM VGA — DAC data is 6-bit (5:0).
+        let mut v = VgaText::new();
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x05);
+        v.port_write(VGA_DAC_DATA, 1, 0xFF);
+        v.port_write(VGA_DAC_DATA, 1, 0xC0);
+        v.port_write(VGA_DAC_DATA, 1, 0x7E);
+        assert_eq!(v.dac_ram[0x05], [0x3F, 0x00, 0x3E]);
+        v.port_write(VGA_DAC_READ_INDEX, 1, 0x05);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x3F);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x00);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x3E);
+    }
+
+    #[test]
+    fn dac_pel_reset_defaults_mode03h() {
+        // Spec: IBM VGA / classic CGA–EGA 16-color 6-bit palette for indices
+        // 0–15; remaining entries black. Store/readback only.
+        let v = VgaText::new();
+        assert_eq!(&v.dac_ram[..16], &VGA_DAC_CGA16_DEFAULTS);
+        assert_eq!(v.dac_ram[0], [0x00, 0x00, 0x00]);
+        assert_eq!(v.dac_ram[7], [0x2A, 0x2A, 0x2A]);
+        assert_eq!(v.dac_ram[15], [0x3F, 0x3F, 0x3F]);
+        assert_eq!(v.dac_ram[16], [0x00, 0x00, 0x00]);
+        assert_eq!(v.dac_ram[255], [0x00, 0x00, 0x00]);
+        assert_eq!(v.dac_state, VGA_DAC_STATE_WRITE);
+
+        // Readback path for a default entry.
+        let mut v = VgaText::new();
+        v.port_write(VGA_DAC_READ_INDEX, 1, 0x0E); // yellow
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x3F);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x3F);
+        assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x15);
+    }
+
+    #[test]
+    fn reset_restores_dac_pel_defaults() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x07);
+        v.port_write(VGA_DAC_DATA, 1, 0x11);
+        v.port_write(VGA_DAC_DATA, 1, 0x22);
+        v.port_write(VGA_DAC_DATA, 1, 0x33);
+        v.port_write(VGA_DAC_READ_INDEX, 1, 0x40);
+        assert_eq!(v.dac_ram[0x07], [0x11, 0x22, 0x33]);
+        assert_eq!(v.dac_state, VGA_DAC_STATE_READ);
+        v.reset();
+        assert_eq!(v.dac_ram, vga_dac_default_ram());
+        assert_eq!(v.dac_ram[0x07], VGA_DAC_CGA16_DEFAULTS[0x07]);
+        assert_eq!(v.dac_write_index, 0);
+        assert_eq!(v.dac_read_index, 0);
+        assert_eq!(v.dac_write_channel, 0);
+        assert_eq!(v.dac_read_channel, 0);
+        assert_eq!(v.dac_state, VGA_DAC_STATE_WRITE);
     }
 }
