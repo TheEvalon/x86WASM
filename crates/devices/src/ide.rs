@@ -109,6 +109,9 @@ pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
 pub const ATA_CMD_DIAGNOSTIC: u8 = 0x90;
 /// Diagnostic passed code in error register.
 pub const ATA_DIAG_PASSED: u8 = 0x01;
+/// SET FEATURES — non-data; this stub accepts and succeeds (no feature side effects).
+/// Spec: ATA/ATAPI Command Set — SET FEATURES (`0xEF`).
+pub const ATA_CMD_SET_FEATURES: u8 = 0xEF;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -497,6 +500,28 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// SET FEATURES (`0xEF`) — accept features register, succeed without side effects.
+    ///
+    /// Spec: ATA SET FEATURES uses the Features register as a subcommand.
+    /// This stub completes successfully on present master (SeaBIOS-friendly
+    /// accept); feature-specific behavior remains unsupported.
+    fn exec_set_features(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        let _subcmd = self.features; // accepted; no side effects yet
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
     fn exec_flush_cache(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -522,6 +547,7 @@ impl IdePrimary {
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
             ATA_CMD_FLUSH_CACHE => self.exec_flush_cache(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
+            ATA_CMD_SET_FEATURES => self.exec_set_features(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
         }
     }
@@ -1269,8 +1295,6 @@ mod tests {
         assert!(!ide.irq_line());
     }
 
-    #[test]
-
     /// Spec: ATA — EXECUTE DEVICE DIAGNOSTIC (`0x90`) → error=0x01 passed.
     #[test]
     fn diagnostic_passes_on_ata_master() {
@@ -1285,11 +1309,34 @@ mod tests {
         assert_ne!(st & ATA_SR_DRDY, 0);
     }
 
+    /// Spec: ATA — SET FEATURES (`0xEF`) succeeds on ATA master (no side effects).
+    #[test]
+    fn set_features_succeeds_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_ERROR, 1, 0x03); // features write via error port alias
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_FEATURES));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+    }
+
     #[test]
     fn diagnostic_absent_drive_status_zero() {
         let mut ide = IdePrimary::new();
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DIAGNOSTIC));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+    }
+
+    #[test]
+    fn set_features_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_FEATURES));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
     }
 
