@@ -44,7 +44,7 @@ pub struct Machine {
     pub kbd: I8042,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
-    /// VGA color text plane at 0xB8000 + CRTC index/data `0x3D4`/`0x3D5` noop.
+    /// VGA color text plane at 0xB8000 + CRTC `0x3D4`/`0x3D5` + Misc Output `0x3C2`/`0x3CC`.
     pub vga: VgaText,
     /// PCI configuration mechanism #1 (ports 0xCF8 / 0xCFC–0xCFF).
     pub pci: PciConfig,
@@ -512,7 +512,8 @@ mod tests {
         PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
         PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B,
         REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF,
-        VGA_CRTC_DATA, VGA_CRTC_INDEX,
+        VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ,
+        VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -1369,6 +1370,27 @@ mod tests {
         assert_eq!(m.vga.crtc_regs[0x0E], 0x12);
         m.reset();
         assert_eq!(m.vga.crtc_regs[0x0E], 0);
+    }
+
+    /// Spec: FreeVGA / OSDev VGA Hardware — Misc Output write `0x3C2`, readback `0x3CC`.
+    #[test]
+    fn machine_bus_vga_misc_output_round_trip() {
+        let mut m = Machine::new(64 * 1024);
+        assert_eq!(m.vga.misc_output, VGA_MISC_OUTPUT_DEFAULT);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(
+                bus.port_in_u8(VGA_MISC_OUTPUT_READ).unwrap(),
+                VGA_MISC_OUTPUT_DEFAULT
+            );
+            bus.port_out_u8(VGA_MISC_OUTPUT_WRITE, 0xA5).unwrap();
+            assert_eq!(bus.port_in_u8(VGA_MISC_OUTPUT_READ).unwrap(), 0xA5);
+            // Write-only at 0x3C2: open-bus-style 0xFF on read.
+            assert_eq!(bus.port_in_u8(VGA_MISC_OUTPUT_WRITE).unwrap(), 0xFF);
+        }
+        assert_eq!(m.vga.misc_output, 0xA5);
+        m.reset();
+        assert_eq!(m.vga.misc_output, VGA_MISC_OUTPUT_DEFAULT);
     }
 
     /// Spec: PCI Local Bus Mechanism #1 — host bridge vendor/device via MachineBus.

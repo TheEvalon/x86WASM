@@ -32,6 +32,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - IBM VGA / classic PC color text frame buffer at physical `0xB8000` (80×25, char+attr)
 - OSDev Text UI — VGA text-mode memory layout
 - OSDev VGA Hardware / FreeVGA CRT Controller — color CRTC Address `0x3D4`, Data `0x3D5`, indexes `0x00`–`0x18`
+- OSDev VGA Hardware / FreeVGA Miscellaneous Output Register — write `0x3C2`, readback `0x3CC` (write-only at `0x3C2`; common BIOS text-mode value `0x67`)
 - Intel 82077AA CHMOS Single-Chip Floppy Disk Controller — DOR/MSR/FIFO/DIR/CCR; Specify (`0x03`) two params (SRT|HUT, HLT|ND), no result/IRQ; Recalibrate (`0x07`) one unit-select param, PCN=0, ST0 Seek End (`0x20|US`), IRQ; Seek (`0x0F`) HD|US + NCN, PCN=NCN, ST0 Seek End (`0x20|US`, H in ST0 always 0), IRQ; Sense Interrupt Status (`0x08`) ST0+PCN (command ST0 latch or post-reset `0xC0|US`); Sense Drive Status (`0x04`) HD|US → ST3; Version (`0x10`) no params, result `0x90` (82077AA id), no IRQ; Configure (`0x13`) three params (unused, EIS|FIFO_DIS|POLL_DIS|FIFOTHR, PRETRK), no result/IRQ; DOR bit3 DMA/IRQ enable; IRQ on command complete
 - OSDev Wiki Floppy Disk Controller — ports `0x3F0`–`0x3F7` excluding `0x3F6` (IDE); MSR RQM/DIO; Specify timing; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears IRQ; Version returns `0x90` for 82077AA-class; Configure stores EIS/FIFO/POLL/FIFOTHR/PRETRK; ISA IRQ6
 - IBM PC/AT IRQ assignment — floppy disk controller → IRQ6 (8259 master IR6)
