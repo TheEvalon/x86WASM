@@ -8,7 +8,9 @@
 //!   disable/enable first port `0xAD`/`0xAE`.
 //! - OSDev Wiki: [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) — host→device
 //!   commands `0xFF` Reset (ACK `0xFA`, BAT `0xAA`, ID `0x00`), `0xF2` Get Device
-//!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`).
+//!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF3` Set
+//!   Sample Rate (+ value), `0xE8` Set Resolution (+ value), `0xE9` Status
+//!   Request (ACK + 3-byte status), `0xE6`/`0xE7` Set Scaling 1:1 / 2:1.
 //! - IBM PC/AT 8042 keyboard-controller programming model (command/status/data);
 //!   output-buffer-full with IRQ enable → ISA IRQ1 (8259A master IR1).
 //! - IBM PS/2 keyboard-controller second (auxiliary) port: commands `0xA7`
@@ -33,14 +35,16 @@
 //! byte to the aux device (recorded in [`I8042::last_aux_device_write`] /
 //! [`I8042::aux_device_writes`]), and a minimal PS/2 **mouse stub** answers the
 //! common identify/reset/enable commands with ACK/`0xFA` (and BAT/ID where
-//! required) on AUX OBF → IRQ12 when config bit 1 is set. The buffered byte's
-//! source selects the line: keyboard data drives IRQ1 only, aux data IRQ12 only.
-//! [`I8042::inject_aux_byte`] remains available for test injection.
+//! required) on AUX OBF → IRQ12 when config bit 1 is set. Parameter commands
+//! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`) store rate/resolution/scaling and answer
+//! Status Request with the OSDev 3-byte packet; Reset restores defaults. The
+//! buffered byte's source selects the line: keyboard data drives IRQ1 only, aux
+//! data IRQ12 only. [`I8042::inject_aux_byte`] remains available for test injection.
 //!
 //! # Unsupported (explicit)
 //!
-//! - Mouse sample rate / resolution / scaling / 3-byte movement packets /
-//!   wheel / 5-button extensions (other host→aux bytes are recorded, unanswered)
+//! - 3-byte movement packet streaming / wheel / 5-button extensions / remote
+//!   mode / wrap mode (other host→aux bytes are recorded, unanswered)
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses and [`I8042::inject_aux_byte`]
 //! - Full AT keyboard protocol (no host→device commands, no `0xFA` ACK, no break codes)
@@ -113,9 +117,42 @@ pub const MOUSE_CMD_GET_DEVICE_ID: u8 = 0xF2;
 pub const MOUSE_CMD_ENABLE_REPORTING: u8 = 0xF4;
 /// PS/2 mouse command: Disable Data Reporting → ACK.
 pub const MOUSE_CMD_DISABLE_REPORTING: u8 = 0xF5;
+/// PS/2 mouse command: Set Sample Rate → ACK; next `0xD4` byte is the rate.
+pub const MOUSE_CMD_SET_SAMPLE_RATE: u8 = 0xF3;
+/// PS/2 mouse command: Set Resolution → ACK; next `0xD4` byte is the value.
+pub const MOUSE_CMD_SET_RESOLUTION: u8 = 0xE8;
+/// PS/2 mouse command: Status Request → ACK + 3-byte status packet.
+pub const MOUSE_CMD_STATUS_REQUEST: u8 = 0xE9;
+/// PS/2 mouse command: Set Scaling 1:1 → ACK.
+pub const MOUSE_CMD_SET_SCALING_1_1: u8 = 0xE6;
+/// PS/2 mouse command: Set Scaling 2:1 → ACK.
+pub const MOUSE_CMD_SET_SCALING_2_1: u8 = 0xE7;
 
-/// Capacity of the pending aux-device → host response queue (Reset needs 3).
+/// Default sample rate after Reset (OSDev PS/2 Mouse defaults).
+pub const MOUSE_DEFAULT_SAMPLE_RATE: u8 = 100;
+/// Default resolution after Reset: `2` = 4 counts/mm (OSDev encoding 0..3).
+pub const MOUSE_DEFAULT_RESOLUTION: u8 = 2;
+
+/// Status Request byte1 bit4: scaling is 2:1 when set (OSDev PS/2 Mouse).
+pub const MOUSE_STATUS_SCALING: u8 = 1 << 4;
+/// Status Request byte1 bit5: data reporting enabled when set.
+pub const MOUSE_STATUS_ENABLE: u8 = 1 << 5;
+/// Status Request byte1 bit6: remote mode when set (stub always clears — stream).
+pub const MOUSE_STATUS_REMOTE: u8 = 1 << 6;
+
+/// Capacity of the pending aux-device → host response queue
+/// (Status Request needs ACK + 3 status bytes).
 const AUX_RESP_QUEUE_CAP: usize = 4;
+
+/// Next host→aux byte expected as a parameter for a prior mouse command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MousePendingParam {
+    None,
+    /// Following `0xF3` — next byte is sample rate.
+    SampleRate,
+    /// Following `0xE8` — next byte is resolution (0..3).
+    Resolution,
+}
 
 /// Output-port bit 1: A20 gate enable (1 = A20 line high / unmasked).
 pub const OUTPUT_PORT_A20: u8 = 1 << 1;
@@ -177,6 +214,14 @@ pub struct I8042 {
     ///
     /// Stored only — this stub does not emit movement packets.
     mouse_reporting: bool,
+    /// Mouse sample rate (reports/sec); default 100. Stored by `0xF3` + value.
+    mouse_sample_rate: u8,
+    /// Mouse resolution encoding 0..3 (1/2/4/8 counts/mm); default 2.
+    mouse_resolution: u8,
+    /// Mouse scaling 2:1 when true (`0xE7`); 1:1 when false (`0xE6` / Reset).
+    mouse_scaling_21: bool,
+    /// Awaiting sample-rate or resolution parameter byte after `0xF3` / `0xE8`.
+    mouse_pending_param: MousePendingParam,
     /// Pending mouse → host response bytes waiting for an empty output buffer
     /// (and an enabled aux clock) before presentation on AUX OBF.
     aux_resp: [u8; AUX_RESP_QUEUE_CAP],
@@ -196,6 +241,10 @@ impl I8042 {
             last_aux_device_write: None,
             aux_device_writes: 0,
             mouse_reporting: false,
+            mouse_sample_rate: MOUSE_DEFAULT_SAMPLE_RATE,
+            mouse_resolution: MOUSE_DEFAULT_RESOLUTION,
+            mouse_scaling_21: false,
+            mouse_pending_param: MousePendingParam::None,
             aux_resp: [0; AUX_RESP_QUEUE_CAP],
             aux_resp_len: 0,
         };
@@ -213,9 +262,22 @@ impl I8042 {
         self.unsupported_commands = 0;
         self.last_aux_device_write = None;
         self.aux_device_writes = 0;
-        self.mouse_reporting = false;
+        self.reset_mouse_defaults();
         self.aux_resp = [0; AUX_RESP_QUEUE_CAP];
         self.aux_resp_len = 0;
+    }
+
+    /// Restore mouse stub defaults (sample rate / resolution / scaling / reporting).
+    ///
+    /// Spec: OSDev PS/2 Mouse — Reset returns the device to power-on defaults
+    /// (100 reports/sec, 4 counts/mm, scaling 1:1, data reporting disabled,
+    /// stream mode). Controllers `I8042::reset` uses the same defaults.
+    fn reset_mouse_defaults(&mut self) {
+        self.mouse_reporting = false;
+        self.mouse_sample_rate = MOUSE_DEFAULT_SAMPLE_RATE;
+        self.mouse_resolution = MOUSE_DEFAULT_RESOLUTION;
+        self.mouse_scaling_21 = false;
+        self.mouse_pending_param = MousePendingParam::None;
     }
 
     pub fn reset(&mut self) {
@@ -334,6 +396,40 @@ impl I8042 {
         self.mouse_reporting
     }
 
+    /// Current mouse sample rate (set by `0xF3` + value; default 100).
+    pub fn mouse_sample_rate(&self) -> u8 {
+        self.mouse_sample_rate
+    }
+
+    /// Current mouse resolution encoding 0..3 (set by `0xE8` + value; default 2).
+    pub fn mouse_resolution(&self) -> u8 {
+        self.mouse_resolution
+    }
+
+    /// Whether scaling 2:1 is active (`0xE7`); false means 1:1 (`0xE6` / Reset).
+    pub fn mouse_scaling_21(&self) -> bool {
+        self.mouse_scaling_21
+    }
+
+    /// Build Status Request byte 1 from current mouse stub state.
+    ///
+    /// Spec: OSDev [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) Status Request
+    /// — bit0 Right, bit1 Middle, bit2 Left, bit3 always 0, bit4 Scaling (2:1),
+    /// bit5 Enable (reporting), bit6 Mode (remote; stub always stream = 0),
+    /// bit7 always 0. Buttons are never pressed in this stub.
+    fn mouse_status_byte1(&self) -> u8 {
+        let mut b = 0u8;
+        if self.mouse_scaling_21 {
+            b |= MOUSE_STATUS_SCALING;
+        }
+        if self.mouse_reporting {
+            b |= MOUSE_STATUS_ENABLE;
+        }
+        // Stream mode only — remote (bit6) stays clear.
+        debug_assert_eq!(b & MOUSE_STATUS_REMOTE, 0);
+        b
+    }
+
     /// Inject an auxiliary-device (second PS/2 port) byte into the output buffer.
     ///
     /// Spec: IBM PS/2 keyboard controller — aux data sets OBF *and* AUX OBF
@@ -405,14 +501,33 @@ impl I8042 {
     ///
     /// Spec: OSDev [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) "Mouse
     /// Commands" + IBM PS/2 KBC `0xD4` routing. Supported stub commands answer
-    /// with ACK/`0xFA` (and BAT/ID for Reset / Get Device ID) on AUX OBF.
+    /// with ACK/`0xFA` (and BAT/ID / status bytes where required) on AUX OBF.
+    /// `0xF3` / `0xE8` arm a one-byte parameter expected on the next `0xD4`.
     fn handle_aux_device_byte(&mut self, cmd: u8) {
         self.last_aux_device_write = Some(cmd);
         self.aux_device_writes = self.aux_device_writes.saturating_add(1);
+
+        match self.mouse_pending_param {
+            MousePendingParam::SampleRate => {
+                self.mouse_pending_param = MousePendingParam::None;
+                self.mouse_sample_rate = cmd;
+                self.begin_mouse_response(&[MOUSE_ACK]);
+                return;
+            }
+            MousePendingParam::Resolution => {
+                self.mouse_pending_param = MousePendingParam::None;
+                // Spec: resolution argument is 0..3; store as given (firmware probe).
+                self.mouse_resolution = cmd;
+                self.begin_mouse_response(&[MOUSE_ACK]);
+                return;
+            }
+            MousePendingParam::None => {}
+        }
+
         match cmd {
             MOUSE_CMD_RESET => {
-                // Spec: Reset → ACK, BAT OK, standard mouse ID; reporting off.
-                self.mouse_reporting = false;
+                // Spec: Reset → ACK, BAT OK, standard mouse ID; restore defaults.
+                self.reset_mouse_defaults();
                 self.begin_mouse_response(&[MOUSE_ACK, MOUSE_BAT_OK, MOUSE_ID_STANDARD]);
             }
             MOUSE_CMD_GET_DEVICE_ID => {
@@ -424,6 +539,31 @@ impl I8042 {
             }
             MOUSE_CMD_DISABLE_REPORTING => {
                 self.mouse_reporting = false;
+                self.begin_mouse_response(&[MOUSE_ACK]);
+            }
+            MOUSE_CMD_SET_SAMPLE_RATE => {
+                // Spec: Set Sample Rate — ACK, then accept rate on next `0xD4`.
+                self.mouse_pending_param = MousePendingParam::SampleRate;
+                self.begin_mouse_response(&[MOUSE_ACK]);
+            }
+            MOUSE_CMD_SET_RESOLUTION => {
+                // Spec: Set Resolution — ACK, then accept value on next `0xD4`.
+                self.mouse_pending_param = MousePendingParam::Resolution;
+                self.begin_mouse_response(&[MOUSE_ACK]);
+            }
+            MOUSE_CMD_STATUS_REQUEST => {
+                // Spec: Status Request → ACK + flags + resolution + sample rate.
+                let status1 = self.mouse_status_byte1();
+                let res = self.mouse_resolution;
+                let rate = self.mouse_sample_rate;
+                self.begin_mouse_response(&[MOUSE_ACK, status1, res, rate]);
+            }
+            MOUSE_CMD_SET_SCALING_1_1 => {
+                self.mouse_scaling_21 = false;
+                self.begin_mouse_response(&[MOUSE_ACK]);
+            }
+            MOUSE_CMD_SET_SCALING_2_1 => {
+                self.mouse_scaling_21 = true;
                 self.begin_mouse_response(&[MOUSE_ACK]);
             }
             _ => {
@@ -515,7 +655,7 @@ impl PortDevice for I8042 {
                     }
                     PendingWrite::AuxDevice => {
                         // Spec: IBM PS/2 `0xD4` — byte is sent to the aux device
-                        // (mouse stub answers Reset / Get ID / Enable / Disable).
+                        // (mouse stub: identify/enable/params via Mouse Commands).
                         self.handle_aux_device_byte(v);
                         self.pending = PendingWrite::None;
                     }
@@ -812,18 +952,18 @@ mod tests {
         assert_eq!(k.aux_device_writes, 0);
         assert_eq!(k.last_aux_device_write, None);
 
-        // 0xE6 = Set Scaling 1:1 — not implemented; recorded, no ACK.
+        // 0xF0 = Set Remote Mode — not implemented; recorded, no ACK.
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_AUX));
-        k.port_write(I8042_DATA, 1, 0xE6);
+        k.port_write(I8042_DATA, 1, 0xF0);
         assert_eq!(k.aux_device_writes, 1);
-        assert_eq!(k.last_aux_device_write, Some(0xE6));
+        assert_eq!(k.last_aux_device_write, Some(0xF0));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
 
         // Next data byte is keyboard-bound again: aux state untouched.
         k.port_write(I8042_DATA, 1, 0xED);
         assert_eq!(k.aux_device_writes, 1);
-        assert_eq!(k.last_aux_device_write, Some(0xE6));
+        assert_eq!(k.last_aux_device_write, Some(0xF0));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert_eq!(k.unsupported_commands, 0);
     }
@@ -899,6 +1039,136 @@ mod tests {
         let _ = read_aux_byte(&mut k); // ACK
 
         write_aux(&mut k, MOUSE_CMD_RESET);
+        assert!(!k.mouse_reporting_enabled());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_BAT_OK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
+    }
+
+    /// Spec: OSDev PS/2 Mouse "Mouse Commands" — Set Sample Rate (`0xF3`) ACKs,
+    /// then the next `0xD4` byte is the rate (stored) and is also ACKed.
+    #[test]
+    fn mouse_set_sample_rate_f3_acks_and_stores_value() {
+        let mut k = I8042::new();
+        assert_eq!(k.mouse_sample_rate(), MOUSE_DEFAULT_SAMPLE_RATE);
+
+        write_aux(&mut k, MOUSE_CMD_SET_SAMPLE_RATE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        write_aux(&mut k, 80);
+        assert_eq!(k.mouse_sample_rate(), 80);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Set Resolution (`0xE8`) ACKs, then stores the
+    /// next `0xD4` byte (0..3 encoding) and ACKs.
+    #[test]
+    fn mouse_set_resolution_e8_acks_and_stores_value() {
+        let mut k = I8042::new();
+        assert_eq!(k.mouse_resolution(), MOUSE_DEFAULT_RESOLUTION);
+
+        write_aux(&mut k, MOUSE_CMD_SET_RESOLUTION);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        write_aux(&mut k, 3); // 8 counts/mm
+        assert_eq!(k.mouse_resolution(), 3);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+    }
+
+    /// Spec: OSDev PS/2 Mouse Status Request (`0xE9`) → ACK `0xFA` then a 3-byte
+    /// status packet: flags (bit4 scaling, bit5 enable, bit6 remote), resolution,
+    /// sample rate. Buttons stay clear; mode stays stream (bit6=0).
+    #[test]
+    fn mouse_status_request_e9_returns_ack_and_three_status_bytes() {
+        let mut k = I8042::new();
+        // Defaults: scaling 1:1, reporting off, res=2, rate=100.
+        write_aux(&mut k, MOUSE_CMD_STATUS_REQUEST);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        let flags = read_aux_byte(&mut k);
+        assert_eq!(flags, 0x00); // scaling/enable/remote/buttons clear
+        assert_eq!(flags & MOUSE_STATUS_REMOTE, 0); // stub is always stream mode
+        assert_eq!(read_aux_byte(&mut k), MOUSE_DEFAULT_RESOLUTION);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_DEFAULT_SAMPLE_RATE);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+
+        // Change params + enable reporting; status must reflect them.
+        write_aux(&mut k, MOUSE_CMD_SET_SAMPLE_RATE);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, 200);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, MOUSE_CMD_SET_RESOLUTION);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, 1);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, MOUSE_CMD_SET_SCALING_2_1);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        let _ = read_aux_byte(&mut k);
+
+        write_aux(&mut k, MOUSE_CMD_STATUS_REQUEST);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(
+            read_aux_byte(&mut k),
+            MOUSE_STATUS_SCALING | MOUSE_STATUS_ENABLE
+        );
+        assert_eq!(read_aux_byte(&mut k), 1);
+        assert_eq!(read_aux_byte(&mut k), 200);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Set Scaling 1:1 (`0xE6`) / 2:1 (`0xE7`) → ACK;
+    /// Status Request bit4 follows the stored scaling.
+    #[test]
+    fn mouse_set_scaling_e6_e7_ack_and_affect_status() {
+        let mut k = I8042::new();
+        assert!(!k.mouse_scaling_21());
+
+        write_aux(&mut k, MOUSE_CMD_SET_SCALING_2_1);
+        assert!(k.mouse_scaling_21());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_STATUS_REQUEST);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_STATUS_SCALING);
+        let _ = read_aux_byte(&mut k); // res
+        let _ = read_aux_byte(&mut k); // rate
+
+        write_aux(&mut k, MOUSE_CMD_SET_SCALING_1_1);
+        assert!(!k.mouse_scaling_21());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_STATUS_REQUEST);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), 0x00);
+        let _ = read_aux_byte(&mut k);
+        let _ = read_aux_byte(&mut k);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Reset restores sample rate / resolution / scaling
+    /// defaults (100, 2, 1:1) in addition to clearing data reporting.
+    #[test]
+    fn mouse_reset_restores_parameter_defaults() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_SAMPLE_RATE);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, 40);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, MOUSE_CMD_SET_RESOLUTION);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, 0);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, MOUSE_CMD_SET_SCALING_2_1);
+        let _ = read_aux_byte(&mut k);
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        let _ = read_aux_byte(&mut k);
+
+        assert_eq!(k.mouse_sample_rate(), 40);
+        assert_eq!(k.mouse_resolution(), 0);
+        assert!(k.mouse_scaling_21());
+        assert!(k.mouse_reporting_enabled());
+
+        write_aux(&mut k, MOUSE_CMD_RESET);
+        assert_eq!(k.mouse_sample_rate(), MOUSE_DEFAULT_SAMPLE_RATE);
+        assert_eq!(k.mouse_resolution(), MOUSE_DEFAULT_RESOLUTION);
+        assert!(!k.mouse_scaling_21());
         assert!(!k.mouse_reporting_enabled());
         assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
         assert_eq!(read_aux_byte(&mut k), MOUSE_BAT_OK);
