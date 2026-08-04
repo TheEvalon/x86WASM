@@ -9,6 +9,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - Intel SDM Vol. 3 §2.4.1 — GDTR base/limit
 - Intel SDM Vol. 3 §2.4.3 — IDTR base/limit
 - Intel SDM Vol. 3 §2.5 — CR0 / machine status word (PE sticky under LMSW)
+- Intel SDM Vol. 2 — MOV to/from Control Registers (`0F 20`/`0F 22` `/r`); mod field of ModR/M architecturally ignored (register-direct only, no SIB/displacement); CR1/CR5/CR6/CR7 reference → `#UD`; MOV to CR0 (unlike LMSW) may clear PE; MOV to CR zeros CR upper 32 bits outside 64-bit mode
 - Intel processor datasheets relevant to Core 2 Conroe/Penryn CPUID presentation
 
 ## Platform and devices

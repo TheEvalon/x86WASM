@@ -2223,6 +2223,45 @@ fn step_two_byte(
                 _ => Err(ExecError::Unsupported(0x01)),
             }
         }
+        0x20 => {
+            // MOV r32, CR0 — Spec: Intel SDM Vol. 2 "MOV—Move to/from Control
+            // Registers"; Vol. 3 §2.5 (CR0). ModRM.reg selects the control
+            // register; the mod field is architecturally ignored (decoder
+            // never populates SIB/displacement for this opcode). Operand
+            // size is always 32 bits regardless of any 0x66 prefix.
+            // CR1 → #UD. CR2/CR3/CR4 → explicit Unsupported (out of scope).
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0x20))?;
+            match m.reg {
+                0 => {
+                    cpu.set_gpr_u32(m.rm as usize, cpu.cr0 as u32);
+                    cpu.set_ip16(next_ip);
+                    Ok(())
+                }
+                1 => real_mode_ud(cpu, bus),
+                2..=4 => Err(ExecError::Unsupported(0x20)),
+                _ => real_mode_ud(cpu, bus),
+            }
+        }
+        0x22 => {
+            // MOV CR0, r32 — Spec: Intel SDM Vol. 2 "MOV—Move to/from Control
+            // Registers"; Vol. 3 §2.5 (CR0). Unlike LMSW, this instruction
+            // MAY clear PE. Setting/clearing PE here does not switch this
+            // emulator's segment execution model in or out of protected
+            // mode (segment loads keep using real-mode / sticky-unreal
+            // `selector << 4` bases; no descriptor tables are consulted).
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0x22))?;
+            match m.reg {
+                0 => {
+                    let src = cpu.gpr_u32(m.rm as usize);
+                    cpu.cr0 = u64::from(src);
+                    cpu.set_ip16(next_ip);
+                    Ok(())
+                }
+                1 => real_mode_ud(cpu, bus),
+                2..=4 => Err(ExecError::Unsupported(0x22)),
+                _ => real_mode_ud(cpu, bus),
+            }
+        }
         0xAF => {
             // IMUL r16, r/m16 / IMUL r32, r/m32 — Spec: Intel SDM Vol. 2 "IMUL".
             // Dest = ModRM.reg := ModRM.reg * r/m (signed).
@@ -10205,6 +10244,175 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap(); // MOV AX,0x10
         step(&mut cpu, &mut bus).unwrap(); // LMSW AX with PE sticky
         assert_eq!(cpu.cr0 & 0xFFFF, 0x0011, "ET loaded; PE remains set");
+    }
+
+    /// MOV r32, CR0 — opcode 0F 20 /r (SDM Vol. 2 "MOV—Move to/from Control
+    /// Registers"; Vol. 3 §2.5 CR0). Reads the full 32-bit CR0 into a GPR.
+    #[test]
+    fn mov_r32_cr0_reads_reset_value() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        // +0: 0F 20 C0   MOV EAX, CR0
+        // +3: F4         HLT
+        mem[code] = 0x0F;
+        mem[code + 1] = 0x20;
+        mem[code + 2] = 0xC0; // 11_000_000: reg=0 (CR0), rm=0 (EAX)
+        mem[code + 3] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        // Reset CR0 = CD|NW|ET (Spec: typical real-mode after RESET).
+        assert_eq!(cpu.cr0, 0x6000_0010);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x6000_0010);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX) & 0xFFFF, 0x0010, "ET set");
+    }
+
+    /// MOV CR0, r32 — opcode 0F 22 /r. Unlike LMSW, this can clear PE.
+    /// Setting/clearing PE must not switch the segment-load/execution model —
+    /// segment loads keep using `selector << 4` real-mode bases.
+    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"; Vol. 3 §2.5.
+    #[test]
+    fn mov_cr0_r32_sets_and_clears_pe_no_mode_change() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        // +0:  66 B8 11 00 00 60   MOV EAX, 0x60000011  (PE=1, plus CD|NW|ET)
+        // +6:  0F 22 C0            MOV CR0, EAX
+        // +9:  B8 34 12            MOV AX, 0x1234
+        // +C:  8E D8               MOV DS, AX           (still real-mode base<<4)
+        // +E:  66 B8 10 00 00 60   MOV EAX, 0x60000010  (PE=0)
+        // +14: 0F 22 C0            MOV CR0, EAX         (MOV CR0 CAN clear PE)
+        // +17: F4                  HLT
+        mem[code] = 0x66;
+        mem[code + 1] = 0xB8;
+        mem[code + 2] = 0x11;
+        mem[code + 3] = 0x00;
+        mem[code + 4] = 0x00;
+        mem[code + 5] = 0x60;
+        mem[code + 6] = 0x0F;
+        mem[code + 7] = 0x22;
+        mem[code + 8] = 0xC0; // reg=0 (CR0), rm=0 (EAX)
+        mem[code + 9] = 0xB8;
+        mem[code + 10] = 0x34;
+        mem[code + 11] = 0x12;
+        mem[code + 12] = 0x8E;
+        mem[code + 13] = 0xD8; // MOV DS, AX
+        mem[code + 14] = 0x66;
+        mem[code + 15] = 0xB8;
+        mem[code + 16] = 0x10;
+        mem[code + 17] = 0x00;
+        mem[code + 18] = 0x00;
+        mem[code + 19] = 0x60;
+        mem[code + 20] = 0x0F;
+        mem[code + 21] = 0x22;
+        mem[code + 22] = 0xC0;
+        mem[code + 23] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV EAX, 0x60000011
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x6000_0011);
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV CR0, EAX
+        assert_eq!(cpu.cr0, 0x6000_0011);
+        assert_eq!(cpu.cr0 & 1, 1, "PE set via MOV CR0");
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 0x1234
+        step(&mut cpu, &mut bus).unwrap(); // MOV DS, AX
+        assert_eq!(
+            cpu.ds.selector, 0x1234,
+            "PE=1 does not change segment-load model"
+        );
+        assert_eq!(
+            cpu.ds.base,
+            0x1234u64 << 4,
+            "DS base still selector<<4; no protected-mode descriptor lookup"
+        );
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV EAX, 0x60000010
+        step(&mut cpu, &mut bus).unwrap(); // MOV CR0, EAX — clears PE
+        assert_eq!(cpu.cr0 & 1, 0, "MOV CR0 (unlike LMSW) can clear PE");
+        assert_eq!(cpu.cr0, 0x6000_0010);
+    }
+
+    /// MOV to/from CR1 is architecturally undefined — #UD via the real-mode IVT.
+    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"
+    /// ("Attempts to reference CR1 ... result in undefined opcode (#UD)").
+    #[test]
+    fn mov_cr1_is_ud_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT #UD vector 6 → handler at 0x0B00.
+        mem[6 * 4] = 0x00;
+        mem[6 * 4 + 1] = 0x0B;
+        mem[6 * 4 + 2] = 0x00;
+        mem[6 * 4 + 3] = 0x00;
+        let code = 0x1000usize;
+        // +0: 0F 20 C8   MOV EAX, CR1  (reg=1) → #UD
+        // +3: F4         HLT (unreached)
+        mem[code] = 0x0F;
+        mem[code + 1] = 0x20;
+        mem[code + 2] = 0xC8; // 11_001_000: reg=1 (CR1), rm=0 (EAX)
+        mem[code + 3] = 0xF4;
+        mem[0xB00] = 0xF4; // handler HLT
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.ip16(), 0x0B00);
+    }
+
+    /// MOV to/from CR2/CR3/CR4 are valid on real hardware but out of scope for
+    /// this slice — must fail explicitly rather than silently faking behavior.
+    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"; Vol. 3 §2.5.
+    #[test]
+    fn mov_cr2_cr3_cr4_are_explicitly_unsupported() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        // +0: 0F 20 D0   MOV EAX, CR2  (reg=2)
+        // +3: 0F 22 D8   MOV CR3, EAX  (reg=3)
+        // +6: 0F 20 E0   MOV EAX, CR4  (reg=4)
+        mem[code] = 0x0F;
+        mem[code + 1] = 0x20;
+        mem[code + 2] = 0xD0;
+        mem[code + 3] = 0x0F;
+        mem[code + 4] = 0x22;
+        mem[code + 5] = 0xD8;
+        mem[code + 6] = 0x0F;
+        mem[code + 7] = 0x20;
+        mem[code + 8] = 0xE0;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x20)));
+        cpu.set_ip16(cpu.ip16().wrapping_add(3));
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x22)));
+        cpu.set_ip16(cpu.ip16().wrapping_add(3));
+        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x20)));
     }
 
     /// LIDT/SIDT m16&32 — opcode 0F 01 /3 and /1 (SDM Vol. 2 LIDT/SIDT; Vol. 3 §2.4.3).
