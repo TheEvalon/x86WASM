@@ -31,6 +31,8 @@
 //!   (`PCI_HOST_BRIDGE_COMMAND_MASK` = `0x0007`); other Command bits hardwired 0.
 //! - Host bridge Status (`0x06`) readback stub: CapList=0, FastB2B=1, DevSel=medium
 //!   (`PCI_HOST_BRIDGE_STATUS_STUB` = `0x0280`); RW1C error bits (MDPE/STA/RTA/RMA/SSE/DPE).
+//! - PIIX ISA bridge (`00:01.0`) Command (`0x04`) store/readback: sticky IO/MEM/BusMaster
+//!   (`PCI_PIIX_ISA_COMMAND_MASK` = `0x0007`, same as host bridge); other bits hardwired 0.
 //! - PIIX IDE (`00:01.1`) Command (`0x04`) store/readback: sticky IO/BusMaster only
 //!   (`PCI_PIIX_IDE_COMMAND_MASK` = `0x0005`); MEM and other bits hardwired 0.
 //! - PIIX IDE Status (`0x06`) readback stub: same CapList/FastB2B/DevSel as host bridge
@@ -45,10 +47,10 @@
 //! # Unsupported (explicit)
 //!
 //! - BAR MMIO/IO decode, bus mastering engine, INTx routing tables
-//! - Host-bridge / PIIX IDE Command side effects (IO/MEM decode, bus-master DMA)
+//! - Host-bridge / PIIX ISA / PIIX IDE Command side effects (IO/MEM decode, bus-master DMA)
 //! - Status error *signaling* (host / IDE never latch RW1C bits from real aborts yet)
 //! - Capability list walk (CapList hardwired 0 on host / IDE)
-//! - PIIX ISA / USB / ACPI Command bit masking or Status stubs (IDE Command+Status only)
+//! - PIIX ISA Status stub; USB / ACPI Command bit masking or Status stubs
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (config identity only)
 //! - Capability lists, MSI, PCIe, hotplug
@@ -77,6 +79,15 @@ pub const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
 /// hardwired 0 on store (no SERR/PERR/INTx-disable/etc. side effects yet).
 pub const PCI_HOST_BRIDGE_COMMAND_MASK: u16 =
     PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER;
+/// PIIX ISA bridge (`00:01.0`) Command sticky-bit mask for this stub.
+///
+/// Sticky: IO | MEM | BusMaster (`0x0007`) — same mask as the host bridge
+/// (`PCI_HOST_BRIDGE_COMMAND_MASK`). All other Command bits are hardwired 0 on
+/// store (no IO/MEM/BM decode side effects yet).
+/// Spec: PCI Local Bus Command at `0x04`; Intel 82371SB ISA bridge function.
+pub const PCI_PIIX_ISA_COMMAND_MASK: u16 =
+    PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER;
+const _: () = assert!(PCI_PIIX_ISA_COMMAND_MASK == PCI_HOST_BRIDGE_COMMAND_MASK);
 /// PIIX IDE (`00:01.1`) Command sticky-bit mask for this stub.
 ///
 /// Sticky: IO | BusMaster (`0x0005`). MEM Space Enable and all other Command
@@ -492,6 +503,7 @@ impl PciConfig {
         let lane = (port - PCI_CONFIG_DATA) as usize;
         let off = base + lane;
         let is_host_bridge = self.bus() == 0 && self.device() == 0 && self.function() == 0;
+        let is_piix_isa = self.bus() == 0 && self.device() == 1 && self.function() == 0;
         let is_piix_ide = self.bus() == 0 && self.device() == 1 && self.function() == 1;
         let is_piix_usb = self.bus() == 0 && self.device() == 1 && self.function() == 2;
         let is_piix_acpi = self.bus() == 0 && self.device() == 1 && self.function() == 3;
@@ -550,6 +562,15 @@ impl PciConfig {
             let rw1c = (old & PCI_STATUS_RW1C_MASK) & !(written & PCI_STATUS_RW1C_MASK);
             let status = PCI_HOST_BRIDGE_STATUS_STUB | rw1c;
             cfg[st_off..st_off + 2].copy_from_slice(&status.to_le_bytes());
+        }
+        // Spec: PCI Local Bus + Intel 82371SB — PIIX ISA bridge Command at 0x04
+        // keeps IO/MEM/BusMaster sticky (same mask as host bridge); other bits
+        // hardwired 0. Store/readback only — no decode side effects yet.
+        if is_piix_isa {
+            let cmd_off = PCI_COMMAND_OFFSET as usize;
+            let cmd = u16::from_le_bytes([cfg[cmd_off], cfg[cmd_off + 1]]);
+            let masked = cmd & PCI_PIIX_ISA_COMMAND_MASK;
+            cfg[cmd_off..cmd_off + 2].copy_from_slice(&masked.to_le_bytes());
         }
         // Spec: PCI Local Bus + Intel 82371SB — PIIX IDE Command at 0x04 keeps
         // only IO/BusMaster sticky; MEM and other bits hardwired 0 (no decode yet).
@@ -996,18 +1017,104 @@ mod tests {
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0);
     }
 
-    /// Host-bridge Command mask must not change PIIX ISA Command at `00:01.0`.
+    /// Spec: PCI Local Bus + Intel 82371SB — Command at `0x04`. PIIX ISA
+    /// `00:01.0` stub keeps IO/MEM/BusMaster sticky (`0x0007`), mirroring
+    /// `PCI_HOST_BRIDGE_COMMAND_MASK`; other Command bits hardwired 0.
     #[test]
-    fn host_bridge_command_mask_does_not_affect_piix_isa() {
+    fn piix_isa_command_io_mem_busmaster_sticky() {
         let mut pci = PciConfig::new();
         pci.port_write(
             PCI_CONFIG_ADDRESS,
             4,
             PciConfig::make_address(0, 1, 0, PCI_COMMAND_OFFSET, true),
         );
-        // PIIX still accepts a wider writable Command word in this stub.
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            0,
+            "Command defaults to 0 at reset"
+        );
+
+        // Guest writes all Command bits; only IO|MEM|BusMaster stick.
+        pci.port_write(PCI_CONFIG_DATA, 2, 0xFFFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_PIIX_ISA_COMMAND_MASK
+        );
+        assert_eq!(
+            PCI_PIIX_ISA_COMMAND_MASK,
+            PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER
+        );
+        assert_eq!(
+            PCI_PIIX_ISA_COMMAND_MASK, PCI_HOST_BRIDGE_COMMAND_MASK,
+            "ISA Command mask mirrors host bridge"
+        );
+
+        // Subset stickiness: MEM|BusMaster without IO; SERR discarded.
+        pci.port_write(
+            PCI_CONFIG_DATA,
+            2,
+            u32::from(PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER | 0x0100),
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER
+        );
+
+        // Byte lane at 0xCFC (Command low): junk high bits masked.
+        pci.port_write(PCI_CONFIG_DATA, 1, 0xFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_PIIX_ISA_COMMAND_MASK
+        );
+
+        // Wider write that previously stuck unmasked must now drop non-sticky bits.
         pci.port_write(PCI_CONFIG_DATA, 2, 0x0147);
-        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0x0147);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER
+        );
+
+        pci.reset();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_COMMAND_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0);
+    }
+
+    /// PIIX ISA Command mask must not change host-bridge or IDE Command.
+    #[test]
+    fn piix_isa_command_mask_does_not_affect_other_functions() {
+        let mut pci = PciConfig::new();
+
+        // Host bridge still uses IO|MEM|BusMaster mask.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, 0xFFFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_HOST_BRIDGE_COMMAND_MASK
+        );
+
+        // IDE still uses IO|BusMaster only (no MEM).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, 0xFFFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_PIIX_IDE_COMMAND_MASK
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16 & PCI_COMMAND_MEM,
+            0
+        );
     }
 
     /// Spec: PCI Local Bus — Command at `0x04`. PIIX IDE `00:01.1` stub keeps
@@ -1086,14 +1193,17 @@ mod tests {
             PCI_HOST_BRIDGE_COMMAND_MASK
         );
 
-        // ISA still accepts a wider writable Command word in this stub.
+        // ISA uses its own IO|MEM|BusMaster sticky mask (same bits as host).
         pci.port_write(
             PCI_CONFIG_ADDRESS,
             4,
             PciConfig::make_address(0, 1, 0, PCI_COMMAND_OFFSET, true),
         );
         pci.port_write(PCI_CONFIG_DATA, 2, 0x0147);
-        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0x0147);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_PIIX_ISA_COMMAND_MASK
+        );
     }
 
     /// Spec: PCI Local Bus — Status at `0x06`. Host bridge stub CapList=0,
