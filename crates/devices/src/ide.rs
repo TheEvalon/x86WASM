@@ -6,8 +6,9 @@
 //!
 //! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
 //!   WRITE SECTORS (`0x30`), PACKET (`0xA0`), IDENTIFY PACKET DEVICE (`0xA1`),
-//!   SMART (`0xB0`), READ DMA (`0xC8`), WRITE DMA (`0xCA`), SECURITY FREEZE LOCK
-//!   (`0xF5`), DOWNLOAD MICROCODE (`0x92`), READ LOG EXT (`0x2F`), WRITE LOG EXT
+//!   SMART (`0xB0`), READ DMA (`0xC8`), WRITE DMA (`0xCA`), SECURITY SET
+//!   PASSWORD (`0xF1`), SECURITY UNLOCK (`0xF2`), SECURITY FREEZE LOCK (`0xF5`),
+//!   DOWNLOAD MICROCODE (`0x92`), READ LOG EXT (`0x2F`), WRITE LOG EXT
 //!   (`0x3F`), DATA SET MANAGEMENT (`0x06`), TRUSTED RECEIVE (`0x5C`), TRUSTED
 //!   SEND (`0x5E`), task-file
 //!   registers, status bits BSY/DRDY/DRQ/ERR, error ABRT,
@@ -35,6 +36,9 @@
 //!   absent/slave → status 0; INTRQ follows nIEN like SMART/PACKET abort
 //! - WRITE DMA (`0xCA`): ATA master → ERR+ABRT (no BM-DMA/PRD engine);
 //!   absent/slave → status 0; INTRQ follows nIEN like READ DMA abort
+//! - SECURITY SET PASSWORD (`0xF1`): ATA master → ERR+ABRT (no SECURITY feature
+//!   set / password PIO); absent/slave → status 0; INTRQ follows nIEN like
+//!   SECURITY UNLOCK / FREEZE LOCK
 //! - SECURITY FREEZE LOCK (`0xF5`): ATA master → ERR+ABRT (no SECURITY feature
 //!   set / freeze state); absent/slave → status 0; INTRQ follows nIEN like SMART
 //! - DOWNLOAD MICROCODE (`0x92`): ATA master → ERR+ABRT (no microcode download /
@@ -60,7 +64,8 @@
 //!
 //! - ATAPI PACKET media engine / CD-ROM / ISO boot / slave ATAPI identify buffer
 //! - SMART feature set (thresholds, return data, enable/disable subcommands)
-//! - SECURITY feature set (passwords, FREEZE LOCK state, unlock/erase)
+//! - SECURITY feature set (passwords, SET PASSWORD PIO, FREEZE LOCK state,
+//!   unlock/erase)
 //! - DOWNLOAD MICROCODE transfer / vendor microcode apply (ABRT-only stub)
 //! - READ/WRITE LOG EXT / General Purpose Logging (log pages, LBA48 HOB) (ABRT-only stubs)
 //! - DATA SET MANAGEMENT / TRIM range-list PIO (ABRT-only stub)
@@ -208,6 +213,9 @@ pub const ATA_CMD_READ_DMA: u8 = 0xC8;
 /// WRITE DMA — bus-master DMA write; this stub aborts (no BM-DMA/PRD engine).
 /// Spec: ATA/ATAPI Command Set — WRITE DMA (`0xCA`).
 pub const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+/// SECURITY SET PASSWORD — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY SET PASSWORD (`0xF1`).
+pub const ATA_CMD_SECURITY_SET_PASSWORD: u8 = 0xF1;
 /// SECURITY UNLOCK — SECURITY feature-set command; this stub aborts.
 /// Spec: ATA/ATAPI Command Set — SECURITY UNLOCK (`0xF2`).
 pub const ATA_CMD_SECURITY_UNLOCK: u8 = 0xF2;
@@ -717,6 +725,25 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
+    /// SECURITY SET PASSWORD (`0xF1`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY SET PASSWORD is a SECURITY
+    /// feature-set command that transfers a password identifier / password
+    /// buffer to enable device security. This stub does not implement SECURITY
+    /// passwords/state; ATA disks abort with ERR+ABRT and no password PIO /
+    /// DRQ. Absent/slave → status 0. INTRQ follows nIEN like SECURITY UNLOCK /
+    /// FREEZE LOCK abort.
+    fn exec_security_set_password(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// SECURITY UNLOCK (`0xF2`) on ATA master — ABRT stub.
     ///
     /// Spec: ATA/ATAPI Command Set — SECURITY UNLOCK is a SECURITY feature-set
@@ -1048,6 +1075,7 @@ impl IdePrimary {
             ATA_CMD_SMART => self.exec_smart(),
             ATA_CMD_READ_DMA => self.exec_read_dma(),
             ATA_CMD_WRITE_DMA => self.exec_write_dma(),
+            ATA_CMD_SECURITY_SET_PASSWORD => self.exec_security_set_password(),
             ATA_CMD_SECURITY_UNLOCK => self.exec_security_unlock(),
             ATA_CMD_SECURITY_FREEZE_LOCK => self.exec_security_freeze_lock(),
             ATA_CMD_DOWNLOAD_MICROCODE => self.exec_download_microcode(),
@@ -2068,6 +2096,70 @@ mod tests {
         let mut ide = IdePrimary::new();
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_DMA));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY SET PASSWORD (`0xF1`) is a
+    /// SECURITY feature-set command. This stub has no SECURITY passwords/state;
+    /// ATA master → ERR+ABRT, no password PIO/DRQ.
+    #[test]
+    fn security_set_password_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_set_password_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match UNLOCK/FREEZE).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_set_password_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match UNLOCK abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_set_password_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
         assert!(!ide.irq_line());
