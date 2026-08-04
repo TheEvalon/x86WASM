@@ -1340,6 +1340,7 @@ mod tests {
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
     }
 
+    #[test]
     fn flush_cache_absent_drive_status_zero() {
         let mut ide = IdePrimary::new();
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);

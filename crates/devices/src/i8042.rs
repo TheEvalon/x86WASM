@@ -1915,8 +1915,6 @@ mod tests {
         assert_eq!(k.unsupported_commands, 0);
     }
 
-    /// Helper: send one host→aux byte via controller command `0xD4`.
-
     /// Spec: OSDev PS/2 Mouse — Resend (`0xFE`) via `0xD4` requeues last AUX byte.
     #[test]
     fn mouse_resend_fe_requeues_last_aux_byte() {
@@ -1928,6 +1926,7 @@ mod tests {
         assert_eq!(read_aux_byte(&mut k), 0x00, "resend last AUX byte (ID)");
     }
 
+    /// Helper: send one host→aux byte via controller command `0xD4`.
     fn write_aux(k: &mut I8042, byte: u8) {
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_AUX));
         k.port_write(I8042_DATA, 1, u32::from(byte));
