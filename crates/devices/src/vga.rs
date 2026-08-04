@@ -2078,6 +2078,20 @@ mod tests {
         );
     }
 
+    /// Spec: FreeVGA — ATC address write retains PAS (bit5) in `atc_index`.
+    #[test]
+    fn atc_pas_bit5_retained_on_address_write() {
+        let mut v = VgaText::new();
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1); // flip-flop → address
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_PAS | 0x05));
+        assert_eq!(v.atc_index & VGA_ATC_PAS, VGA_ATC_PAS);
+        assert_eq!(v.atc_index & 0x1F, 0x05);
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x03); // PAS clear
+        assert_eq!(v.atc_index & VGA_ATC_PAS, 0);
+        assert_eq!(v.atc_index & 0x1F, 0x03);
+    }
+
     #[test]
     fn attribute_controller_out_of_range_index_ignored_on_data() {
         let mut v = VgaText::new();

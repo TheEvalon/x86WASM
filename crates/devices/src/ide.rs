@@ -150,6 +150,15 @@ pub const ATA_CMD_SEEK: u8 = 0x70;
 /// INITIALIZE DEVICE PARAMETERS — non-data success stub.
 /// Spec: ATA/ATAPI Command Set — INITIALIZE DEVICE PARAMETERS (`0x91`).
 pub const ATA_CMD_INIT_DEV_PARAMS: u8 = 0x91;
+/// FLUSH CACHE EXT — same non-data success as FLUSH CACHE in this stub.
+/// Spec: ATA/ATAPI Command Set — FLUSH CACHE EXT (`0xEA`).
+pub const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
+/// READ NATIVE MAX ADDRESS — returns max LBA28 in task-file registers.
+/// Spec: ATA/ATAPI Command Set — READ NATIVE MAX ADDRESS (`0xF8`).
+pub const ATA_CMD_READ_NATIVE_MAX: u8 = 0xF8;
+/// SET MULTIPLE MODE — ABRT stub (multiple block count not stored).
+/// Spec: ATA/ATAPI Command Set — SET MULTIPLE MODE (`0xC6`).
+pub const ATA_CMD_SET_MULTIPLE_MODE: u8 = 0xC6;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -665,6 +674,44 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// SET MULTIPLE MODE (`0xC6`) — ABRT stub (no multiple-mode state).
+    fn exec_set_multiple_mode(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// READ NATIVE MAX ADDRESS (`0xF8`) — write max LBA28 into task-file regs.
+    ///
+    /// Spec: ATA READ NATIVE MAX ADDRESS returns the native maximum address in
+    /// LBA Low/Mid/High and Device bits 3:0. This stub uses `total_sectors-1`
+    /// (or 0 if empty). Completes with DRDY|DSC and INTRQ when nIEN=0.
+    fn exec_read_native_max(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        let max = self.total_sectors().saturating_sub(1);
+        self.lba_lo = (max & 0xFF) as u8;
+        self.lba_mid = ((max >> 8) & 0xFF) as u8;
+        self.lba_hi = ((max >> 16) & 0xFF) as u8;
+        self.drive_head = (self.drive_head & 0xF0) | (((max >> 24) & 0x0F) as u8);
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
     /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
@@ -714,10 +761,11 @@ impl IdePrimary {
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
-            ATA_CMD_FLUSH_CACHE => self.exec_flush_cache(),
+            ATA_CMD_FLUSH_CACHE | ATA_CMD_FLUSH_CACHE_EXT => self.exec_flush_cache(),
             ATA_CMD_NOP => self.exec_nop(),
             ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
             ATA_CMD_WRITE_MULTIPLE => self.exec_write_multiple(),
+            ATA_CMD_SET_MULTIPLE_MODE => self.exec_set_multiple_mode(),
             ATA_CMD_IDLE
             | ATA_CMD_IDLE_IMMEDIATE
             | ATA_CMD_STANDBY_IMMEDIATE
@@ -726,6 +774,7 @@ impl IdePrimary {
             ATA_CMD_CHECK_POWER_MODE => self.exec_check_power_mode(),
             ATA_CMD_RECALIBRATE | ATA_CMD_SEEK => self.exec_recalibrate_seek_success(),
             ATA_CMD_INIT_DEV_PARAMS => self.exec_init_dev_params(),
+            ATA_CMD_READ_NATIVE_MAX => self.exec_read_native_max(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             ATA_CMD_SET_FEATURES => self.exec_set_features(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
@@ -1649,6 +1698,49 @@ mod tests {
         let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
         assert_eq!(st & ATA_SR_ERR, 0);
         assert_ne!(st & ATA_SR_DRDY, 0);
+    }
+
+    /// Spec: ATA — FLUSH CACHE EXT (`0xEA`) same success path as FLUSH CACHE.
+    #[test]
+    fn flush_cache_ext_succeeds_like_flush_cache() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE_EXT));
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    /// Spec: ATA — READ NATIVE MAX ADDRESS (`0xF8`) writes max LBA into task file.
+    #[test]
+    fn read_native_max_address_writes_task_file() {
+        // 4 sectors → max LBA = 3.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_NATIVE_MAX));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8, 3);
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_MID, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_HI, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DRIVE, 1) as u8 & 0x0F, 0);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+    }
+
+    /// Spec: ATA — SET MULTIPLE MODE (`0xC6`) → ERR+ABRT (no multiple state).
+    #[test]
+    fn set_multiple_mode_aborts() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 16);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
     }
 
     #[test]
