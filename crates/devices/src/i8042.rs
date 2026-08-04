@@ -18,7 +18,9 @@
 //!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF3` Set
 //!   Sample Rate (+ value), `0xE8` Set Resolution (+ value), `0xE9` Status
 //!   Request (ACK + 3-byte status), `0xE6`/`0xE7` Set Scaling 1:1 / 2:1,
-//!   `0xEA` Set Stream Mode / `0xF0` Set Remote Mode (ACK; mode flag stored);
+//!   `0xEA` Set Stream Mode / `0xF0` Set Remote Mode (ACK; mode flag stored),
+//!   `0xEB` Read Data (ACK then one 3-byte movement packet — last inject or
+//!   zeros; SeaBIOS/OSDev-friendly stub answers in stream or remote mode);
 //!   stream-mode **Mouse Packet Format** (3 bytes: flags/buttons/signs/overflows,
 //!   X movement, Y movement) when reporting is enabled.
 //! - IBM PC/AT 8042 keyboard-controller programming model (command/status/data);
@@ -60,22 +62,23 @@
 //! [`I8042::aux_device_writes`]), and a minimal PS/2 **mouse stub** answers the
 //! common identify/reset/enable commands with ACK/`0xFA` (and BAT/ID where
 //! required) on AUX OBF → IRQ12 when config bit 1 is set. Parameter commands
-//! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`/`0xEA`/`0xF0`) store rate/resolution/
-//! scaling/mode and answer Status Request with the OSDev 3-byte packet; Reset
-//! restores defaults (stream mode).
+//! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`/`0xEA`/`0xF0`/`0xEB`) store rate/resolution/
+//! scaling/mode and answer Status Request / Read Data with the OSDev packets;
+//! Reset restores defaults (stream mode).
 //! [`I8042::inject_mouse_packet`] queues a standard 3-byte movement packet when
-//! data reporting is enabled (`0xF4`); while reporting is disabled (`0xF5` /
-//! Reset default) injects are **dropped** (not deferred). Packet bytes present
-//! on AUX OBF one at a time (same queue as command responses) → IRQ12 when
-//! config bit 1 is set. The buffered byte's source selects the line: keyboard
-//! data drives IRQ1 only, aux data IRQ12 only. [`I8042::inject_aux_byte`] remains
-//! available for raw test injection.
+//! data reporting is enabled (`0xF4`) and remembers last dx/dy/buttons for
+//! Read Data (`0xEB`); while reporting is disabled (`0xF5` / Reset default)
+//! injects are **dropped** (not deferred). Packet bytes present on AUX OBF one
+//! at a time (same queue as command responses) → IRQ12 when config bit 1 is set.
+//! The buffered byte's source selects the line: keyboard data drives IRQ1 only,
+//! aux data IRQ12 only. [`I8042::inject_aux_byte`] remains available for raw
+//! test injection.
 //!
 //! # Unsupported (explicit)
 //!
-//! - Wheel / 5-button (IntelliMouse) extensions / wrap mode / remote-mode
-//!   Read Data (`0xEB`) packet-on-demand (Set Remote Mode `0xF0` ACK + flag
-//!   only; other host→aux bytes are recorded, unanswered)
+//! - Wheel / 5-button (IntelliMouse) extensions / wrap mode / full remote
+//!   protocol beyond Read Data `0xEB` (other host→aux bytes are recorded,
+//!   unanswered)
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
 //!   writes; it gates presenting mouse responses, movement packets, and
 //!   [`I8042::inject_aux_byte`]
@@ -241,6 +244,8 @@ pub const MOUSE_CMD_RESEND: u8 = 0xFE;
 pub const MOUSE_CMD_SET_STREAM_MODE: u8 = 0xEA;
 /// Spec: OSDev PS/2 Mouse — `0xF0` Set Remote Mode.
 pub const MOUSE_CMD_SET_REMOTE_MODE: u8 = 0xF0;
+/// Spec: OSDev PS/2 Mouse — `0xEB` Read Data (force one movement packet).
+pub const MOUSE_CMD_READ_DATA: u8 = 0xEB;
 
 /// Default sample rate after Reset (OSDev PS/2 Mouse defaults).
 pub const MOUSE_DEFAULT_SAMPLE_RATE: u8 = 100;
@@ -407,9 +412,15 @@ pub struct I8042 {
     mouse_scaling_21: bool,
     /// Mouse remote mode when true (`0xF0`); stream when false (`0xEA` / Reset).
     ///
-    /// Spec: OSDev PS/2 Mouse — Set Remote / Set Stream Mode. Flag only; Read
-    /// Data (`0xEB`) packet-on-demand is not implemented.
+    /// Spec: OSDev PS/2 Mouse — Set Remote / Set Stream Mode.
     mouse_remote_mode: bool,
+    /// Last movement deltas/buttons from a successful [`I8042::inject_mouse_packet`].
+    ///
+    /// Spec: OSDev PS/2 Mouse — Read Data (`0xEB`) returns this packet (or zeros
+    /// if none). Cleared by mouse / controller Reset.
+    mouse_last_dx: i16,
+    mouse_last_dy: i16,
+    mouse_last_buttons: u8,
     /// Awaiting sample-rate or resolution parameter byte after `0xF3` / `0xE8`.
     mouse_pending_param: MousePendingParam,
     /// Pending mouse → host response bytes waiting for an empty output buffer
@@ -467,6 +478,9 @@ impl I8042 {
             mouse_resolution: MOUSE_DEFAULT_RESOLUTION,
             mouse_scaling_21: false,
             mouse_remote_mode: false,
+            mouse_last_dx: 0,
+            mouse_last_dy: 0,
+            mouse_last_buttons: 0,
             mouse_pending_param: MousePendingParam::None,
             aux_resp: [0; AUX_RESP_QUEUE_CAP],
             aux_resp_len: 0,
@@ -531,6 +545,9 @@ impl I8042 {
         self.mouse_resolution = MOUSE_DEFAULT_RESOLUTION;
         self.mouse_scaling_21 = false;
         self.mouse_remote_mode = false;
+        self.mouse_last_dx = 0;
+        self.mouse_last_dy = 0;
+        self.mouse_last_buttons = 0;
         self.mouse_pending_param = MousePendingParam::None;
         self.mouse_last_byte = 0;
     }
@@ -754,6 +771,10 @@ impl I8042 {
         if (self.aux_resp_len as usize) + 3 > AUX_RESP_QUEUE_CAP {
             return false;
         }
+        // Remember for Read Data (`0xEB`) even after the stream packet is drained.
+        self.mouse_last_dx = dx;
+        self.mouse_last_dy = dy;
+        self.mouse_last_buttons = buttons;
         let packet = encode_mouse_packet(dx, dy, buttons);
         let prev = self.irq12_line();
         self.push_aux_bytes(&packet);
@@ -778,8 +799,7 @@ impl I8042 {
 
     /// Whether remote mode is active (`0xF0`); false means stream (`0xEA` / Reset).
     ///
-    /// Spec: OSDev PS/2 Mouse — Set Remote Mode / Set Stream Mode. Flag only;
-    /// Read Data (`0xEB`) packet-on-demand is not implemented.
+    /// Spec: OSDev PS/2 Mouse — Set Remote Mode / Set Stream Mode.
     pub fn mouse_remote_mode(&self) -> bool {
         self.mouse_remote_mode
     }
@@ -1013,9 +1033,19 @@ impl I8042 {
             }
             MOUSE_CMD_SET_REMOTE_MODE => {
                 // Spec: OSDev PS/2 Mouse — Set Remote Mode (`0xF0`) → ACK.
-                // Mode flag only; Read Data (`0xEB`) packet-on-demand unsupported.
                 self.mouse_remote_mode = true;
                 self.begin_mouse_response(&[MOUSE_ACK]);
+            }
+            MOUSE_CMD_READ_DATA => {
+                // Spec: OSDev PS/2 Mouse — Read Data (`0xEB`) → ACK then one
+                // 3-byte movement packet (last inject, or zeros). Answer in both
+                // remote and stream mode (SeaBIOS/OSDev-friendly stub).
+                let packet = encode_mouse_packet(
+                    self.mouse_last_dx,
+                    self.mouse_last_dy,
+                    self.mouse_last_buttons,
+                );
+                self.begin_mouse_response(&[MOUSE_ACK, packet[0], packet[1], packet[2]]);
             }
             _ => {
                 // Unsupported mouse command: recorded, no response (see module docs).
@@ -2057,7 +2087,7 @@ mod tests {
     }
 
     /// Spec: OSDev PS/2 Mouse — Set Remote Mode (`0xF0`) via `0xD4` → ACK on AUX
-    /// OBF; stores remote-mode flag (Read Data `0xEB` packet-on-demand unsupported).
+    /// OBF; stores remote-mode flag (Status Request byte1 bit6).
     #[test]
     fn mouse_set_remote_mode_f0_acks() {
         let mut k = I8042::new();
@@ -2072,6 +2102,91 @@ mod tests {
         assert_eq!(read_aux_byte(&mut k), MOUSE_STATUS_REMOTE);
         let _ = read_aux_byte(&mut k); // res
         let _ = read_aux_byte(&mut k); // rate
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Read Data (`0xEB`) via `0xD4` → ACK then one
+    /// 3-byte movement packet. With no prior inject, the packet is zeros
+    /// (always-1 flag only). Works after Set Remote Mode (`0xF0`).
+    #[test]
+    fn mouse_read_data_eb_acks_then_zero_packet_after_remote() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_SET_REMOTE_MODE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(k.mouse_remote_mode());
+
+        write_aux(&mut k, MOUSE_CMD_READ_DATA);
+        assert_eq!(k.last_aux_device_write, Some(MOUSE_CMD_READ_DATA));
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_PKT_ALWAYS1);
+        assert_eq!(read_aux_byte(&mut k), 0);
+        assert_eq!(read_aux_byte(&mut k), 0);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Read Data forces a packet; this stub also ACKs
+    /// + packet in stream mode (SeaBIOS/OSDev-friendly).
+    #[test]
+    fn mouse_read_data_eb_acks_then_packet_in_stream_mode() {
+        let mut k = I8042::new();
+        assert!(!k.mouse_remote_mode());
+        write_aux(&mut k, MOUSE_CMD_READ_DATA);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_PKT_ALWAYS1);
+        assert_eq!(read_aux_byte(&mut k), 0);
+        assert_eq!(read_aux_byte(&mut k), 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Read Data returns the last injected movement
+    /// (dx/dy/buttons) after stream packet is drained.
+    #[test]
+    fn mouse_read_data_eb_uses_last_injected_packet() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(!k.inject_mouse_packet(5, -3, MOUSE_BTN_LEFT));
+        // Drain stream-mode packet.
+        assert_eq!(
+            read_aux_byte(&mut k),
+            MOUSE_PKT_ALWAYS1 | MOUSE_BTN_LEFT | MOUSE_PKT_Y_SIGN
+        );
+        assert_eq!(read_aux_byte(&mut k), 5u8);
+        assert_eq!(read_aux_byte(&mut k), (-3i8) as u8);
+
+        write_aux(&mut k, MOUSE_CMD_SET_REMOTE_MODE);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        write_aux(&mut k, MOUSE_CMD_READ_DATA);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(
+            read_aux_byte(&mut k),
+            MOUSE_PKT_ALWAYS1 | MOUSE_BTN_LEFT | MOUSE_PKT_Y_SIGN
+        );
+        assert_eq!(read_aux_byte(&mut k), 5u8);
+        assert_eq!(read_aux_byte(&mut k), (-3i8) as u8);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Reset clears remembered movement; next Read Data
+    /// returns a zero packet.
+    #[test]
+    fn mouse_reset_clears_last_packet_for_read_data() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(!k.inject_mouse_packet(7, 1, MOUSE_BTN_RIGHT));
+        let _ = read_aux_byte(&mut k);
+        let _ = read_aux_byte(&mut k);
+        let _ = read_aux_byte(&mut k);
+
+        write_aux(&mut k, MOUSE_CMD_RESET);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_BAT_OK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
+
+        write_aux(&mut k, MOUSE_CMD_READ_DATA);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_PKT_ALWAYS1);
+        assert_eq!(read_aux_byte(&mut k), 0);
+        assert_eq!(read_aux_byte(&mut k), 0);
     }
 
     /// Spec: OSDev PS/2 Mouse — Reset restores stream mode (clears remote).
