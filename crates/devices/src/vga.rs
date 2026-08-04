@@ -12,9 +12,12 @@
 //!   80×25 cells, 2 bytes per cell (ASCII character, attribute).
 //! - OSDev Text UI — memory layout for mode 03h text (char at even offset,
 //!   attribute at odd); window commonly treated as 32 KiB (`0xB8000`–`0xBFFFF`).
-//! - OSDev VGA Hardware / FreeVGA CRT Controller — color CRTC Address Register
-//!   at `0x3D4`, Data Register at `0x3D5`; standard VGA has 25 CRTC registers
-//!   (indexes `0x00`–`0x18`).
+//! - OSDev VGA Hardware / FreeVGA CRT Controller / IBM VGA — color CRTC Address
+//!   Register at `0x3D4`, Data Register at `0x3D5`; standard VGA has 25 CRTC
+//!   registers (indexes `0x00`–`0x18`). Cursor Start `0x0A` (bits 4:0 scanline
+//!   start; bit5 Cursor Disable), Cursor End `0x0B` (bits 4:0 scanline end),
+//!   Cursor Location High `0x0E` / Low `0x0F` (16-bit character address into
+//!   the refresh buffer).
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode).
@@ -49,8 +52,10 @@
 //! - 32 KiB text plane buffer at `VGA_TEXT_BASE`…`VGA_TEXT_END`
 //! - Byte R/W; reset fills first 80×25 with space + attribute `0x07`
 //! - Helpers for tests (`char_at` / `attr_at` / `put_char`)
-//! - CRTC index/data noop: latch index on `0x3D4`, store/read register file on
-//!   `0x3D5` (no timing, cursor render, or protect-bit enforcement)
+//! - CRTC index/data: latch index on `0x3D4`, store/read register file on
+//!   `0x3D5`; cursor registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback
+//!   plus helpers for text-mode cursor character offset / row-col (no host
+//!   cursor glyph render, CRTC timing, or protect-bit enforcement)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults (no timing/plane side effects)
 //! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
@@ -79,11 +84,13 @@
 //!   deferred until host render; hidden-DAC unlock via repeated `0x3C6` reads
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
-//! - CRTC protect bit (index `0x11` bit7), mono CRTC map at `0x3B4`/`0x3B5`
+//! - CRTC protect bit (index `0x11` bit7), full CRTC timing/blanking, mono CRTC
+//!   map at `0x3B4`/`0x3B5`
 //! - Misc Output bit side effects beyond Input Status #1 IOAS (clock select,
 //!   RAM enable)
 //! - Planar graphics, VBE, host canvas rendering, dirty tracking
-//! - Font ROM, hardware cursor position driven from CRTC into the plane
+//! - Font ROM / host rendering of the hardware cursor glyph from CRTC start/end
+//!   scanlines (register state + offset helpers only)
 
 use crate::PortDevice;
 
@@ -110,6 +117,30 @@ pub const VGA_CRTC_INDEX: u16 = 0x3D4;
 pub const VGA_CRTC_DATA: u16 = 0x3D5;
 /// Number of standard VGA CRTC registers (indexes `0x00`–`0x18`).
 pub const VGA_CRTC_REG_COUNT: usize = 0x19;
+
+/// CRTC Cursor Start Register index.
+///
+/// Spec: FreeVGA CRT Controller Registers / IBM VGA — bits 4:0 = cursor start
+/// scanline; bit5 = Cursor Disable (`CD`).
+pub const VGA_CRTC_CURSOR_START: u8 = 0x0A;
+/// CRTC Cursor End Register index.
+///
+/// Spec: FreeVGA / IBM VGA — bits 4:0 = cursor end scanline.
+pub const VGA_CRTC_CURSOR_END: u8 = 0x0B;
+/// CRTC Cursor Location High Register index.
+///
+/// Spec: FreeVGA / IBM VGA — high byte of the 16-bit cursor character address.
+pub const VGA_CRTC_CURSOR_LOC_HIGH: u8 = 0x0E;
+/// CRTC Cursor Location Low Register index.
+///
+/// Spec: FreeVGA / IBM VGA — low byte of the 16-bit cursor character address.
+pub const VGA_CRTC_CURSOR_LOC_LOW: u8 = 0x0F;
+/// Cursor Start bit5 — Cursor Disable (`CD`).
+///
+/// Spec: FreeVGA CRT Controller — when set, hardware cursor is disabled.
+pub const VGA_CRTC_CURSOR_DISABLE: u8 = 0x20;
+/// Cursor Start/End scanline field mask (bits 4:0).
+pub const VGA_CRTC_CURSOR_SCANLINE_MASK: u8 = 0x1F;
 
 /// Sequencer Address (index) Register.
 ///
@@ -300,7 +331,7 @@ pub struct VgaText {
     pub mem: Vec<u8>,
     /// Latched CRTC index (written via `0x3D4`).
     pub crtc_index: u8,
-    /// CRTC register file (noop store/readback).
+    /// CRTC register file (store/readback; cursor indexes have helpers).
     pub crtc_regs: [u8; VGA_CRTC_REG_COUNT],
     /// Latched Sequencer index (written via `0x3C4`).
     pub seq_index: u8,
@@ -493,6 +524,50 @@ impl VgaText {
         self.mem[off] = ch;
         self.mem[off + 1] = attr;
         true
+    }
+
+    /// 16-bit CRTC cursor character address (`0x0E`:`0x0F`).
+    ///
+    /// Spec: FreeVGA CRT Controller / IBM VGA — Cursor Location High/Low form a
+    /// linear character offset into the refresh buffer (not a byte offset).
+    pub fn crtc_cursor_location(&self) -> u16 {
+        let high = self.crtc_regs[usize::from(VGA_CRTC_CURSOR_LOC_HIGH)];
+        let low = self.crtc_regs[usize::from(VGA_CRTC_CURSOR_LOC_LOW)];
+        (u16::from(high) << 8) | u16::from(low)
+    }
+
+    /// Byte offset of the cursor cell in the text plane (`location * 2`).
+    ///
+    /// Spec: IBM VGA / OSDev Text UI — each alphanumeric cell is two bytes
+    /// (character + attribute).
+    pub fn crtc_cursor_plane_offset(&self) -> usize {
+        usize::from(self.crtc_cursor_location()) * VGA_CELL_BYTES
+    }
+
+    /// Text-mode `(row, col)` for an 80-column layout from cursor location.
+    ///
+    /// Spec: FreeVGA cursor location is a character index; classic mode 03h uses
+    /// 80 columns. Does not subtract Start Address (`0x0C`/`0x0D`).
+    pub fn crtc_cursor_row_col(&self) -> (usize, usize) {
+        let loc = usize::from(self.crtc_cursor_location());
+        (loc / VGA_TEXT_COLS, loc % VGA_TEXT_COLS)
+    }
+
+    /// Cursor Start scanline (CRTC `0x0A` bits 4:0).
+    pub fn crtc_cursor_start_scanline(&self) -> u8 {
+        self.crtc_regs[usize::from(VGA_CRTC_CURSOR_START)] & VGA_CRTC_CURSOR_SCANLINE_MASK
+    }
+
+    /// Cursor End scanline (CRTC `0x0B` bits 4:0).
+    pub fn crtc_cursor_end_scanline(&self) -> u8 {
+        self.crtc_regs[usize::from(VGA_CRTC_CURSOR_END)] & VGA_CRTC_CURSOR_SCANLINE_MASK
+    }
+
+    /// True when Cursor Start bit5 (Cursor Disable) is set.
+    ///
+    /// Spec: FreeVGA CRT Controller Registers — `CD` disables the hardware cursor.
+    pub fn crtc_cursor_disabled(&self) -> bool {
+        self.crtc_regs[usize::from(VGA_CRTC_CURSOR_START)] & VGA_CRTC_CURSOR_DISABLE != 0
     }
 
     fn crtc_index_masked(index: u8) -> Option<usize> {
@@ -934,6 +1009,98 @@ mod tests {
         v.reset();
         assert_eq!(v.crtc_index, 0);
         assert_eq!(v.crtc_regs[0x07], 0);
+    }
+
+    #[test]
+    fn crtc_cursor_location_store_readback_and_offset() {
+        // Spec: FreeVGA CRT Controller / IBM VGA — Cursor Location High `0x0E`
+        // and Low `0x0F` form a 16-bit character address; text cells are 2 bytes.
+        let mut v = VgaText::new();
+        assert_eq!(v.crtc_cursor_location(), 0);
+        assert_eq!(v.crtc_cursor_plane_offset(), 0);
+        assert_eq!(v.crtc_cursor_row_col(), (0, 0));
+
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_LOC_HIGH));
+        v.port_write(VGA_CRTC_DATA, 1, 0x01);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_LOC_LOW));
+        v.port_write(VGA_CRTC_DATA, 1, 0x4F); // 0x014F = 335 → row 4, col 15
+
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_LOC_HIGH));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x01);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_LOC_LOW));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x4F);
+
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_CURSOR_LOC_HIGH)], 0x01);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_CURSOR_LOC_LOW)], 0x4F);
+        assert_eq!(v.crtc_cursor_location(), 0x014F);
+        assert_eq!(v.crtc_cursor_plane_offset(), 0x014F * VGA_CELL_BYTES);
+        assert_eq!(v.crtc_cursor_row_col(), (4, 15));
+    }
+
+    #[test]
+    fn crtc_cursor_location_word_write_and_row_col() {
+        // Spec: FreeVGA — 16-bit write to 0x3D4 (lo=index, hi=data); location
+        // is a character index (row = loc/80, col = loc%80 for mode 03h).
+        let mut v = VgaText::new();
+        // Character 80 → start of row 1.
+        v.port_write(VGA_CRTC_INDEX, 2, 0x50_0F); // index 0x0F, data 0x50
+        v.port_write(VGA_CRTC_INDEX, 2, 0x00_0E); // index 0x0E, data 0x00
+        assert_eq!(v.crtc_cursor_location(), 80);
+        assert_eq!(v.crtc_cursor_row_col(), (1, 0));
+        assert_eq!(v.crtc_cursor_plane_offset(), 160);
+    }
+
+    #[test]
+    fn crtc_cursor_start_end_and_disable() {
+        // Spec: FreeVGA CRT Controller — Cursor Start `0x0A` bits 4:0 start
+        // scanline, bit5 Cursor Disable; Cursor End `0x0B` bits 4:0 end.
+        let mut v = VgaText::new();
+        assert!(!v.crtc_cursor_disabled());
+        assert_eq!(v.crtc_cursor_start_scanline(), 0);
+        assert_eq!(v.crtc_cursor_end_scanline(), 0);
+
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_START));
+        v.port_write(VGA_CRTC_DATA, 1, 0x0E); // underline-ish start, CD clear
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_END));
+        v.port_write(VGA_CRTC_DATA, 1, 0x0F);
+
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x0F);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_START));
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x0E);
+        assert_eq!(v.crtc_cursor_start_scanline(), 0x0E);
+        assert_eq!(v.crtc_cursor_end_scanline(), 0x0F);
+        assert!(!v.crtc_cursor_disabled());
+
+        // Bit5 CD disables cursor; scanline field still readable via mask.
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_CURSOR_DISABLE | 0x0A));
+        assert!(v.crtc_cursor_disabled());
+        assert_eq!(v.crtc_cursor_start_scanline(), 0x0A);
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_CURSOR_START)],
+            VGA_CRTC_CURSOR_DISABLE | 0x0A
+        );
+    }
+
+    #[test]
+    fn crtc_cursor_regs_cleared_on_reset() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_CRTC_INDEX, 2, 0x12_0E);
+        v.port_write(VGA_CRTC_INDEX, 2, 0x34_0F);
+        v.port_write(VGA_CRTC_INDEX, 2, 0x2E_0A);
+        v.port_write(VGA_CRTC_INDEX, 2, 0x0F_0B);
+        assert_eq!(v.crtc_cursor_location(), 0x1234);
+        assert!(v.crtc_cursor_disabled());
+
+        v.reset();
+        assert_eq!(v.crtc_cursor_location(), 0);
+        assert_eq!(v.crtc_cursor_plane_offset(), 0);
+        assert!(!v.crtc_cursor_disabled());
+        assert_eq!(v.crtc_cursor_start_scanline(), 0);
+        assert_eq!(v.crtc_cursor_end_scanline(), 0);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_CURSOR_START)], 0);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_CURSOR_END)], 0);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_CURSOR_LOC_HIGH)], 0);
+        assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_CURSOR_LOC_LOW)], 0);
     }
 
     #[test]
