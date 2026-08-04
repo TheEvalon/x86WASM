@@ -5,13 +5,13 @@
 //! # Spec refs
 //!
 //! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
-//!   WRITE SECTORS (`0x30`), IDENTIFY PACKET DEVICE (`0xA1`), task-file
-//!   registers, status bits BSY/DRDY/DRQ/ERR, error ABRT, LBA28 addressing;
-//!   device control nIEN; INTRQ when drive needs attention.
+//!   WRITE SECTORS (`0x30`), PACKET (`0xA0`), IDENTIFY PACKET DEVICE (`0xA1`),
+//!   task-file registers, status bits BSY/DRDY/DRQ/ERR, error ABRT, LBA28
+//!   addressing; device control nIEN; INTRQ when drive needs attention.
 //! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ/WRITE IRQ+PIO sequence,
 //!   status read clears IRQ / alternate status does not, 256-word PIO,
 //!   sector-count `0` = 256 sectors; primary channel → ISA IRQ14;
-//!   WRITE: host fills data port after DRQ; ATAPI probe via `0xA1`.
+//!   WRITE: host fills data port after DRQ; ATAPI probe via `0xA1` / PACKET.
 //! - IBM PC/AT IDE — alternate status / device control at `0x3F6`; IRQ14.
 //! - Intel 8259A — DualPic IR14 (slave IR6) vectoring via MachineBus.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.5 / §21 PIIX IDE / ATAPI.
@@ -22,6 +22,8 @@
 //! - Commands: IDENTIFY (`0xEC`), READ SECTORS (`0x20`), WRITE SECTORS (`0x30`) PIO
 //! - IDENTIFY PACKET DEVICE (`0xA1`): ATA master → ERR+ABRT (no PACKET device);
 //!   SeaBIOS-friendly reject of ATAPI probe on disk master
+//! - PACKET (`0xA0`): ATA master → ERR+ABRT (no 12-byte packet PIO / DRQ);
+//!   absent/slave → status 0; INTRQ follows nIEN like WRITE/IDENTIFY abort
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
@@ -30,7 +32,7 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - ATAPI PACKET command (`0xA0`) / CD-ROM media / slave ATAPI identify buffer
+//! - ATAPI PACKET media engine / CD-ROM / ISO boot / slave ATAPI identify buffer
 //! - DMA IDE (UDMA/MDMA), WRITE DMA, LBA48
 //! - Slave drive on either channel
 //! - SeaBIOS / PCI IDE BAR remapping
@@ -91,6 +93,8 @@ pub const ATA_SR_ERR: u8 = 0x01;
 
 /// IDENTIFY DEVICE.
 pub const ATA_CMD_IDENTIFY: u8 = 0xEC;
+/// PACKET (ATAPI) — rejected with ABRT on ATA master (no packet PIO).
+pub const ATA_CMD_PACKET: u8 = 0xA0;
 /// IDENTIFY PACKET DEVICE (ATAPI) — rejected with ABRT on ATA master.
 pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
 /// READ SECTORS (with retry) — LBA28 PIO.
@@ -396,6 +400,22 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
+    /// PACKET (`0xA0`) on an ATA-only master.
+    ///
+    /// Spec: ATA/ATAPI — PACKET starts a 12-byte command packet transfer on
+    /// ATAPI devices (DRQ). Non-ATAPI (ATA disk) devices abort with ERR+ABRT
+    /// and no packet PIO. SeaBIOS-friendly: honest reject without a packet
+    /// engine. INTRQ follows the same nIEN rules as WRITE/IDENTIFY abort.
+    fn exec_packet(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     fn exec_read_sectors(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -447,6 +467,7 @@ impl IdePrimary {
     fn exec_command(&mut self, cmd: u8) {
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
+            ATA_CMD_PACKET => self.exec_packet(),
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
@@ -649,12 +670,13 @@ impl PortDevice for IdePrimary {
 ///
 /// # Scope
 ///
-/// - Master only; IDENTIFY / READ / WRITE / 0xA1 ABRT via inner [`IdePrimary`]
+/// - Master only; IDENTIFY / READ / WRITE / PACKET+IDENTIFY PACKET ABRT via
+///   inner [`IdePrimary`]
 /// - IRQ15 when INTRQ ∧ ¬nIEN (`irq_line`)
 ///
 /// # Unsupported
 ///
-/// - Slave drive, DMA, LBA48, PACKET media, PCI BAR remap
+/// - Slave drive, DMA, LBA48, PACKET media engine, PCI BAR remap
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct IdeSecondary {
     /// Shared ATA PIO engine (ports remapped in [`PortDevice`]).
@@ -1118,6 +1140,53 @@ mod tests {
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY_PACKET));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    #[test]
+    fn packet_aborts_on_ata_master() {
+        // Spec: ATA/ATAPI — PACKET (0xA0) is for ATAPI devices; ATA disk → ERR+ABRT.
+        // No 12-byte packet PIO / DRQ phase on non-ATAPI master (SeaBIOS-friendly).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn packet_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match WRITE/IDENTIFY).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn packet_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match WRITE SECTORS).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn packet_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
     }
 
     #[test]
