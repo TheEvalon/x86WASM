@@ -42,9 +42,11 @@
 //!   Data Rotate, Read Map Select, Graphics Mode, Miscellaneous, Color Don't
 //!   Care, Bit Mask). Graphics Mode `0x05` (bits 1:0 Write Mode, bit3 Read Mode,
 //!   bit4 Host Odd/Even, bit5 Shift Register Interleave, bit6 Shift256;
-//!   mode-03h reset default `0x10` = Host Odd/Even). Bit Mask `0x08` (bits 7:0
-//!   select which data bits are written; mode-03h reset default `0xFF` = all
-//!   bits enabled).
+//!   mode-03h reset default `0x10` = Host Odd/Even). Miscellaneous `0x06` (bit0
+//!   Graphics/Alphanumeric, bit1 Chain Odd/Even, bits 3:2 Memory Map Select;
+//!   mode-03h reset default `0x0E` = Chain Odd/Even + `B8000` map). Bit Mask
+//!   `0x08` (bits 7:0 select which data bits are written; mode-03h reset default
+//!   `0xFF` = all bits enabled).
 //! - OSDev VGA Hardware / FreeVGA Attribute Controller Registers — Address/Data
 //!   at `0x3C0` (flip-flop), Data Read at `0x3C1`; indexes `0x00`–`0x14`
 //!   (palette `0x00`–`0x0F`, Mode Control `0x10` with mode-03h reset default
@@ -95,7 +97,8 @@
 //!   side effects)
 //! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
 //!   register file on `0x3CF` with mode-03h-class reset defaults; Graphics Mode
-//!   `0x05` store/readback with mode-03h reset default `0x10`; Bit Mask `0x08`
+//!   `0x05` store/readback with mode-03h reset default `0x10`; Miscellaneous
+//!   `0x06` store/readback with mode-03h reset default `0x0E`; Bit Mask `0x08`
 //!   store/readback with mode-03h reset default `0xFF` (no write-mode / read-mode
 //!   / map / bitmask side effects)
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
@@ -485,6 +488,20 @@ pub const VGA_GC_MODE: u8 = 0x05;
 /// memory reads use odd/even addressing. Store/readback only; no write-mode /
 /// read-mode / shift side effects on the text plane.
 pub const VGA_GC_MODE_DEFAULT: u8 = 0x10;
+/// Graphics Controller Miscellaneous Register index.
+///
+/// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x06`. Bit0 = Graphics /
+/// Alphanumeric Mode; bit1 = Chain Odd/Even Enable; bits 3:2 = Memory Map Select
+/// (`00` = `A0000`–`BFFFF`, `01` = `A0000`–`AFFFF`, `10` = `B0000`–`B7FFF`,
+/// `11` = `B8000`–`BFFFF`). Memory-map and chain-odd/even side effects on the
+/// plane path are out of scope (store/readback only).
+pub const VGA_GC_MISC: u8 = 0x06;
+/// Mode-03h-class Miscellaneous reset default (`0x0E` = odd/even + `B8000` map).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Miscellaneous `0x0E`
+/// (Chain Odd/Even + Memory Map Select `11` = `B8000`–`BFFFF`). Store/readback
+/// only; no memory-map / chain-odd/even side effects on the text plane.
+pub const VGA_GC_MISC_DEFAULT: u8 = 0x0E;
 /// Graphics Controller Bit Mask Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x08`. Bits 7:0 select
@@ -504,6 +521,9 @@ const _: () = assert!(
         && VGA_GC_MODE == 0x05
         && VGA_GC_MODE_DEFAULT == 0x10
         && VGA_GC_DEFAULTS[VGA_GC_MODE as usize] == VGA_GC_MODE_DEFAULT
+        && VGA_GC_MISC == 0x06
+        && VGA_GC_MISC_DEFAULT == 0x0E
+        && VGA_GC_DEFAULTS[VGA_GC_MISC as usize] == VGA_GC_MISC_DEFAULT
         && VGA_GC_BIT_MASK == 0x08
         && VGA_GC_BIT_MASK_DEFAULT == 0xFF
 );
@@ -514,8 +534,8 @@ const _: () = assert!(
 /// SeaBIOS-class text programming: Set/Reset `0x00`, Enable Set/Reset `0x00`,
 /// Color Compare `0x00`, Data Rotate [`VGA_GC_DATA_ROTATE_DEFAULT`], Read Map
 /// Select `0x00`, Graphics Mode [`VGA_GC_MODE_DEFAULT`] (host odd/even),
-/// Miscellaneous `0x0E` (odd/even + memory map `B8000`), Color Don't Care
-/// `0x00`, Bit Mask [`VGA_GC_BIT_MASK_DEFAULT`].
+/// Miscellaneous [`VGA_GC_MISC_DEFAULT`] (odd/even + memory map `B8000`), Color
+/// Don't Care `0x00`, Bit Mask [`VGA_GC_BIT_MASK_DEFAULT`].
 pub const VGA_GC_DEFAULTS: [u8; VGA_GC_REG_COUNT] = [
     0x00,
     0x00,
@@ -523,7 +543,7 @@ pub const VGA_GC_DEFAULTS: [u8; VGA_GC_REG_COUNT] = [
     VGA_GC_DATA_ROTATE_DEFAULT,
     0x00,
     VGA_GC_MODE_DEFAULT,
-    0x0E,
+    VGA_GC_MISC_DEFAULT,
     0x00,
     VGA_GC_BIT_MASK_DEFAULT,
 ];
@@ -2462,6 +2482,37 @@ mod tests {
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_MODE_DEFAULT);
     }
 
+    /// Spec: FreeVGA Graphics Registers — Miscellaneous (index `0x06`)
+    /// store/readback. Mode-03h reset default is [`VGA_GC_MISC_DEFAULT`]
+    /// (`0x0E` = Chain Odd/Even + Memory Map `B8000`).
+    #[test]
+    fn gc_misc_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MISC)], VGA_GC_MISC_DEFAULT);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MISC));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_MISC_DEFAULT);
+
+        // Graphics Mode + Chain OE + Memory Map A0000 — store/readback only.
+        v.port_write(VGA_GC_DATA, 1, 0x05);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x05);
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MISC)], 0x05);
+
+        // Word write path (lo=index, hi=data) also updates Miscellaneous.
+        v.port_write(
+            VGA_GC_INDEX,
+            2,
+            (u32::from(0x00u8) << 8) | u32::from(VGA_GC_MISC),
+        );
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MISC)], 0x00);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MISC));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x00);
+
+        v.reset();
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MISC)], VGA_GC_MISC_DEFAULT);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MISC));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_MISC_DEFAULT);
+    }
+
     #[test]
     fn graphics_controller_word_write_index_and_data() {
         // Mirror CRTC/Sequencer: 16-bit write to address port (lo=index, hi=data).
@@ -2500,6 +2551,7 @@ mod tests {
             VGA_GC_DATA_ROTATE_DEFAULT
         );
         assert_eq!(v.gc_regs[usize::from(VGA_GC_MODE)], VGA_GC_MODE_DEFAULT);
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_MISC)], VGA_GC_MISC_DEFAULT);
         assert_eq!(
             v.gc_regs[usize::from(VGA_GC_BIT_MASK)],
             VGA_GC_BIT_MASK_DEFAULT
@@ -2513,7 +2565,7 @@ mod tests {
                 VGA_GC_DATA_ROTATE_DEFAULT,
                 0x00,
                 VGA_GC_MODE_DEFAULT,
-                0x0E,
+                VGA_GC_MISC_DEFAULT,
                 0x00,
                 VGA_GC_BIT_MASK_DEFAULT
             ]
