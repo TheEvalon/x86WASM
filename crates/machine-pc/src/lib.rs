@@ -592,6 +592,9 @@ mod tests {
     }
 
     /// Spec: DualPic assert → MachineBus::poll_external_irq returns 8259 vector.
+    ///
+    /// Drive IRQ0 via PIT ch0 OUT so `poll_external_irq`'s line sync keeps IR0
+    /// high through first INTA (Intel 8259A: pin low at INTA → DEFAULT IR7).
     #[test]
     fn machine_bus_poll_external_irq_from_pic() {
         let mut m = Machine::new(64 * 1024);
@@ -607,7 +610,12 @@ mod tests {
             bus.port_out_u8(PIC_SLAVE_DATA, 0x01).unwrap();
             bus.port_out_u8(PIC_MASTER_DATA, 0xFE).unwrap(); // unmask IR0
         }
-        m.pic.set_irq_line(0, true);
+        // Mode 0 count=1 → OUT rises and stays high for the poll sync.
+        m.pit.port_write(PIT_CONTROL, 1, 0x30);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x01);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        m.tick_pit(1);
+        assert!(m.pit.out_ch0());
         {
             let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -963,6 +971,9 @@ mod tests {
 
     /// Guest STI + PIC IRQ0 → IVT delivery via poll_external_irq.
     /// Spec: SDM Vol. 3 §6.8.1; Intel 8259A vector = ICW2 base | IR.
+    ///
+    /// Raise IRQ0 with PIT ch0 OUT held high so MachineBus line sync does not
+    /// drop the pin before first INTA (DEFAULT IR7).
     #[test]
     fn guest_sti_delivers_pic_irq0_via_ivt() {
         let mut m = Machine::new(64 * 1024);
@@ -993,7 +1004,11 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFE);
-        m.pic.set_irq_line(0, true);
+        m.pit.port_write(PIT_CONTROL, 1, 0x30);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x01);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        m.tick_pit(1);
+        assert!(m.pit.out_ch0());
 
         m.step().unwrap();
         assert_eq!(m.cpu.ip16(), 0x0E00);

@@ -40,12 +40,14 @@
 //! - Edge-triggered IR line assert (ICW1.LTIM=0): rising edge latches IRR
 //! - Level-triggered IR line assert (ICW1.LTIM=1): IRR follows IR level; deassert
 //!   clears IRR; acknowledge while still high re-pending IRR for post-EOI delivery
+//! - Spurious / DEFAULT IR7 when IR pin is low at first INTA (vector IR7, ISR
+//!   bit7 not set); cascade master IR is never remapped — empty/spurious slave
+//!   still sets master cascade IS
 //! - IRR→ISR on acknowledge, vector selection
 //! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
 //!
 //! # Unsupported (explicit)
 //!
-//! - Spurious / DEFAULT IR7 when IR drops before first INTA falling edge
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
 
 use crate::PortDevice;
@@ -389,16 +391,30 @@ impl Pic8259 {
         self.highest_priority_request().is_some()
     }
 
-    /// Acknowledge IR`ir`: clear IRR, set ISR; with AEOI, clear that ISR bit
-    /// at the end of the acknowledge sequence (Intel 8259A Automatic EOI).
-    /// With Rotate in Automatic EOI Mode, also assign `ir` lowest priority.
+    /// Acknowledge selected IR`ir` and return the IR index used for the vector.
     ///
-    /// Spec: Intel 8259A level mode — if IR remains high after acknowledge, the
-    /// request is still present (IRR re-pending) so a second interrupt occurs
-    /// once the IS bit no longer nested-blocks (typically after EOI).
-    fn ack_ir(&mut self, ir: u8) {
+    /// Spec: Intel 8259A — IR inputs must remain high until after the falling
+    /// edge of the first INTA. If the pin is low at acknowledge, a DEFAULT IR7
+    /// occurs: the vector is IR7 but ISR bit7 is **not** set (a real IR7 does
+    /// set it). Cascade IR on a master is never remapped to DEFAULT — the
+    /// cascaded slave may still deliver DEFAULT IR7 on its own chip.
+    ///
+    /// Spec: level mode — if IR remains high after a normal acknowledge, IRR is
+    /// re-pended so EOI can re-deliver. AEOI clears the IS bit (and may rotate)
+    /// only for a non-spurious acknowledge.
+    fn ack_ir(&mut self, ir: u8) -> u8 {
+        let cascade_ir =
+            self.is_master && !self.single && (self.slave_ir_mask() & (1u8 << ir)) != 0;
+        self.ack_ir_inner(ir, !cascade_ir)
+    }
+
+    fn ack_ir_inner(&mut self, ir: u8, detect_spurious: bool) -> u8 {
         let bit = 1u8 << ir;
         self.irr &= !bit;
+        if detect_spurious && self.ir_level & bit == 0 {
+            // DEFAULT IR7 — do not set ISR bit7 (or any other IS bit).
+            return 7;
+        }
         self.isr |= bit;
         if self.level_triggered && self.ir_level & bit != 0 {
             self.irr |= bit;
@@ -409,6 +425,7 @@ impl Pic8259 {
                 self.rotate_lowest_to(ir);
             }
         }
+        ir
     }
 
     fn write_cmd(&mut self, value: u8) {
@@ -580,7 +597,8 @@ impl Pic8259 {
     /// Spec: Intel 8259A datasheet — Poll Command: bit7 = 1 when an interrupt is
     /// pending, bits 2:0 = binary level of that request; the IS bit is set and
     /// the IR bit cleared via the shared [`Pic8259::ack_ir`] path (level mode
-    /// may re-pending IRR while IR stays high).
+    /// may re-pending IRR while IR stays high; DEFAULT IR7 reports level 7
+    /// without setting ISR bit7).
     /// With ICW4.AEOI the IS bit is cleared again at the end of that acknowledge.
     /// Model choice: with nothing pending the byte is `0x00` (bit7 clear, level
     /// bits zero) — the datasheet leaves the level bits unspecified there.
@@ -588,8 +606,8 @@ impl Pic8259 {
         self.poll_command_armed = false;
         match self.highest_priority_request() {
             Some(ir) => {
-                self.ack_ir(ir);
-                0x80 | ir
+                let vec_ir = self.ack_ir(ir);
+                0x80 | vec_ir
             }
             None => 0x00,
         }
@@ -662,20 +680,29 @@ impl DualPic {
     /// selects a cascaded IR. Without AEOI, EOI must later clear both slave and
     /// master ISR bits; with ICW4.AEOI on a chip, that chip clears its ISR bit
     /// at the end of its acknowledge (see [`Pic8259::ack_ir`]).
+    ///
+    /// Spec: Intel 8259A DEFAULT IR7 — if a device IR pin is low at first INTA,
+    /// the chip returns the IR7 vector without setting ISR bit7. A cascaded
+    /// master IR is never remapped; if the slave has no request (or its own IR
+    /// pin dropped), the slave delivers DEFAULT IR7 while the master still sets
+    /// its cascade IS bit.
     pub fn acknowledge(&mut self) -> Option<u8> {
         self.sync_cascade();
         let ir = self.master.highest_priority_request()?;
         let bit = 1u8 << ir;
         if !self.master.single && (self.master.slave_ir_mask() & bit) != 0 {
-            let slave_ir = self.slave.highest_priority_request()?;
-            self.slave.ack_ir(slave_ir);
-            self.master.ack_ir(ir);
-            let vec = self.slave.irq_vector(slave_ir);
+            let slave_vec_ir = match self.slave.highest_priority_request() {
+                Some(slave_ir) => self.slave.ack_ir(slave_ir),
+                // Cascade selected but slave IRR empty → slave DEFAULT IR7.
+                None => 7,
+            };
+            let _ = self.master.ack_ir(ir);
+            let vec = self.slave.irq_vector(slave_vec_ir);
             self.sync_cascade();
             return vec;
         }
-        self.master.ack_ir(ir);
-        self.master.irq_vector(ir)
+        let vec_ir = self.master.ack_ir(ir);
+        self.master.irq_vector(vec_ir)
     }
 
     /// Vector for `Bus::poll_external_irq` (acknowledge on poll).
@@ -1861,5 +1888,91 @@ mod tests {
         pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
         pic.port_write(PIC_MASTER_CMD, 1, 0x20);
         assert_eq!(pic.poll_irq(), Some(0x71));
+    }
+
+    /// Spec: Intel 8259A — IR must remain high until after the falling edge of
+    /// the first INTA. If the IR goes low before that, a DEFAULT IR7 occurs and
+    /// ISR bit7 is not set (distinguishable from a real IR7).
+    #[test]
+    fn edge_deassert_before_ack_delivers_default_ir7_without_isr() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xF7); // unmask IR3
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.master.irr, 1 << 3);
+        pic.set_irq_line(3, false); // edge: IRR stays latched, pin low
+        assert_eq!(pic.master.irr, 1 << 3);
+        assert_eq!(pic.poll_irq(), Some(0x0F)); // DEFAULT IR7, base 0x08
+        assert_eq!(pic.master.isr & (1 << 7), 0); // ISR bit7 clear
+        assert_eq!(pic.master.isr, 0);
+        assert_eq!(pic.master.irr & (1 << 3), 0);
+    }
+
+    /// Spec: Intel 8259A — a normal IR7 sets ISR bit7; DEFAULT IR7 does not.
+    #[test]
+    fn real_ir7_sets_isr_bit7() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x7F); // unmask IR7
+        pic.set_irq_line(7, true);
+        assert_eq!(pic.poll_irq(), Some(0x0F));
+        assert_eq!(pic.master.isr & (1 << 7), 1 << 7);
+    }
+
+    /// Spec: slave DEFAULT IR7 (IRQ15) when slave IR drops before first INTA;
+    /// master cascade IS bit is still set (EOI master, not slave).
+    #[test]
+    fn slave_edge_deassert_before_ack_default_ir7() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+        pic.set_irq_line(9, true);
+        pic.set_irq_line(9, false); // edge: slave IRR latched, pin low
+        assert_eq!(pic.poll_irq(), Some(0x77)); // slave base 0x70 | 7
+        assert_eq!(pic.slave.isr, 0); // DEFAULT: no slave ISR bit7
+        assert_eq!(pic.master.isr & (1 << 2), 1 << 2); // cascade still in service
+    }
+
+    /// Spec: cascade with empty slave IRR (level slave dropped; master edge-latched
+    /// IR2) still yields slave DEFAULT IR7; master IS2 set, slave ISR clear.
+    #[test]
+    fn cascade_empty_slave_delivers_default_ir7() {
+        let mut pic = DualPic::new();
+        // Master edge (default ICW1), slave level — deassert clears slave IRR
+        // while master's cascade IRR can remain latched from the rising edge.
+        init_at_cascade_icw4_roles(&mut pic, 0x01, 0x01);
+        // Re-init slave alone with LTIM so only slave is level-triggered.
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x19); // ICW1 LTIM + IC4
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        assert!(!pic.master.level_triggered);
+        assert!(pic.slave.level_triggered);
+
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD);
+        pic.set_irq_line(9, true);
+        assert!(pic.master.irr & (1 << 2) != 0);
+        pic.set_irq_line(9, false); // level slave: IRR cleared; master IR2 pin low, IRR2 latched
+        assert_eq!(pic.slave.irr, 0);
+        assert!(pic.master.irr & (1 << 2) != 0);
+        assert_eq!(pic.poll_irq(), Some(0x77));
+        assert_eq!(pic.slave.isr, 0);
+        assert_eq!(pic.master.isr & (1 << 2), 1 << 2);
+    }
+
+    /// Spec: OCW3 poll shares the INTA acknowledge path — DEFAULT IR7 reports
+    /// level 7 with bit7 set in the poll byte, and does not set ISR bit7.
+    #[test]
+    fn ocw3_poll_default_ir7_without_isr() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xF7); // unmask IR3
+        pic.set_irq_line(3, true);
+        pic.set_irq_line(3, false);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // OCW3 P=1
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 7);
+        assert_eq!(pic.master.isr, 0);
     }
 }
