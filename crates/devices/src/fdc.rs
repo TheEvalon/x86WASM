@@ -35,8 +35,9 @@
 //!   7-result shape as READ DATA; no-media stub completes with ST0 IC=01 +
 //!   ST1 ND + C/H/R/N ENDaddress and IRQ6; WRITE DATA (`0x05` with optional
 //!   MT/MFM in bits 7:6, §5.1.2 / Table 5-1) same 8-param / 7-result shape;
-//!   with media + N=2 + valid CHS → ST0 IC=00 + ST1=0 + single-sector
-//!   `last_write` / `write_sector` + IRQ6; else no-media/wrong-N/OOR → ST0
+//!   with media + N=2 + valid CHS → ST0 IC=00 + ST1=0 + `last_write` latch
+//!   (MT=0 same-head sectors R..=EOT concatenated; EOT==R → one sector) /
+//!   `write_sector` + IRQ6; else no-media/wrong-N/OOR → ST0
 //!   IC=01 + ST1 NW + C/H/R/N ENDaddress and IRQ6; VERIFY (`0x16` with optional
 //!   MT/MFM/SK in bits 7:5, Table 5-1) same 8-param / 7-result shape; with
 //!   media + N=2 + valid CHS → ST0 IC=00 + ST1=0 (no DMA / no host buffer;
@@ -136,18 +137,22 @@
 //! - WRITE DATA (`0x05` | MT/MFM): Spec Intel 82077AA §5.1.2 / Table 5-1 —
 //!   command byte lower 5 bits `00101`; optional MT (`0x80`)/MFM (`0x40`);
 //!   same eight params and 7-byte result as READ DATA. With attached 1.44MB
-//!   media, `N=2`, C/H/R in geometry, and **not** [`Self::write_protected`]:
-//!   transfer **one** sector only (MT ignored this slice) from the
-//!   `latch_write_sector` buffer (device-only stand-in) **or** via MachineBus
-//!   ISA DMA ch2 Read (memory→device) when DOR DMA/IRQ enable arms
-//!   [`Self::dma_write_pending`], then [`Self::commit_dma_write_sector`] /
+//!   media, `N=2`, every CHS in geometry for **R..=EOT**, and **not**
+//!   [`Self::write_protected`]: MT=0 same-head transfer of consecutive sectors
+//!   **R..=EOT** (EOT==R → one sector; EOT>R → multi-sector; EOT<R → treat as
+//!   single R) from [`Self::latch_write_data`] / [`Self::latch_write_sector`]
+//!   (device-only stand-in; buffer length = sector_count×512) **or** via
+//!   MachineBus ISA DMA ch2 Read (memory→device) when DOR DMA/IRQ enable arms
+//!   [`Self::dma_write_pending`] ([`Self::pending_dma_write_byte_count`] =
+//!   total bytes), then [`Self::commit_dma_write_sector`] /
 //!   [`Self::write_sector`] into the image, latch bytes in `last_write`,
-//!   result ST0 (IC=00 normal | H | US), ST1=0, ST2=0, C/H/R/N = command
-//!   ENDaddress. Media + `write_protected` (WP pin) → ST0 IC=01 abnormal |
-//!   H | US, ST1 NW (Not Writable, §6.2), ST2=0; clear `last_write` /
-//!   `dma_write_pending`; no image write. No media / wrong N / OOR CHS → same
-//!   NW abnormal. Asserts IRQ6 (cleared on first result byte); EOT latched
-//!   into `sc_eot`.
+//!   result ST0 (IC=00 normal | H | US), ST1=0, ST2=0, C/H/R/N = ENDaddress of
+//!   the **last** sector written. MT head-switch deferred. Media +
+//!   `write_protected` (WP pin) → ST0 IC=01 abnormal | H | US, ST1 NW (Not
+//!   Writable, §6.2), ST2=0; clear `last_write` / `dma_write_pending`; no image
+//!   write. No media / wrong N / OOR CHS (any sector in the range) / wrong
+//!   latch length → same NW abnormal. Asserts IRQ6 (cleared on first result
+//!   byte); EOT latched into `sc_eot`.
 //! - FORMAT TRACK (`0x0D` | MFM): Spec Intel 82077AA §5.1.7 / Table 5-1 —
 //!   command byte lower 5 bits `01101`; optional MFM (`0x40`); five params
 //!   (HD|US, N, SC, GPL, D). Media + [`Self::write_protected`] (WP pin) →
@@ -181,10 +186,11 @@
 //!   READ DATA success path latches concatenated sectors R..=EOT (MT=0) in
 //!   `last_sector` and arms `dma_read_pending` when DOR bit3 is set for
 //!   MachineBus auto DMA ch2 Write (device→memory; buffer length =
-//!   sector_count×512). WRITE DATA success path accepts one sector via
-//!   `latch_write_sector` → `last_write` / `write_sector`, or arms
-//!   `dma_write_pending` for MachineBus ISA DMA ch2 Read (memory→device) when
-//!   no pre-latch and DOR bit3 is set (skipped when write-protected).
+//!   sector_count×512). WRITE DATA success path accepts R..=EOT via
+//!   `latch_write_data` / `latch_write_sector` → `last_write` / `write_sector`,
+//!   or arms `dma_write_pending` for MachineBus ISA DMA ch2 Read
+//!   (memory→device; [`Self::pending_dma_write_byte_count`] = sector_count×512)
+//!   when no pre-latch and DOR bit3 is set (skipped when write-protected).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
@@ -194,8 +200,8 @@
 //!   IDAM track scan (sector-ID stub only); READ DELETED DATA
 //!   media/deleted-address-mark engine; FORMAT TRACK media write / per-sector
 //!   ID DMA
-//! - MT head-switch multi-track; WRITE DATA multi-sector; VERIFY DMA; DREQ/DACK
-//!   cycle timing; FORMAT media
+//! - MT head-switch multi-track; VERIFY DMA; DREQ/DACK cycle timing; FORMAT
+//!   media
 //! - Seek / Relative Seek step timing; Relative Seek ST0 EC when stepping out
 //!   beyond track 0 (PCN clamp only this slice); real DIR disk-change edge
 //!   timing (DSKCHG stub only)
@@ -575,14 +581,15 @@ pub struct Fdc82077 {
     /// and DOR DMA/IRQ enable is set with no pre-latched [`Self::last_write`].
     /// Cleared by [`Self::take_pending_dma_write`] or abnormal/reset paths.
     dma_write_pending: bool,
-    /// Pending / last sector bytes for WRITE DATA (single-sector slice).
+    /// Sector bytes for WRITE DATA (MT=0 same-head R..=EOT concatenated;
+    /// length = sector_count × [`FDC_SECTOR_SIZE`]).
     ///
     /// Device-only stand-in for ISA DMA ch2 Read (memory→device): tests call
-    /// [`Self::latch_write_sector`] before command completion;
-    /// [`Self::finish_write_data`] writes into the image. MachineBus fills via
-    /// DMA Read + [`Self::commit_dma_write_sector`]. Cleared on NW/abnormal
-    /// completion.
-    last_write: Option<[u8; FDC_SECTOR_SIZE]>,
+    /// [`Self::latch_write_data`] / [`Self::latch_write_sector`] before command
+    /// completion; [`Self::finish_write_data`] writes into the image.
+    /// MachineBus fills via DMA Read + [`Self::commit_dma_write_sector`].
+    /// Cleared on NW/abnormal completion.
+    last_write: Option<Vec<u8>>,
 }
 
 impl Default for Fdc82077 {
@@ -704,23 +711,53 @@ impl Fdc82077 {
         }
     }
 
-    /// Bytes of the last successful WRITE DATA sector transfer (512 bytes), if any.
+    /// Bytes of the last successful WRITE DATA transfer (one or more 512-byte
+    /// sectors concatenated), if any.
     ///
-    /// Also the pending buffer supplied by [`Self::latch_write_sector`] before
-    /// command completion (device-only DMA Read stand-in). Cleared on NW/abnormal.
-    pub fn last_write(&self) -> Option<&[u8; FDC_SECTOR_SIZE]> {
-        self.last_write.as_ref()
+    /// Also the pending buffer supplied by [`Self::latch_write_data`] /
+    /// [`Self::latch_write_sector`] before command completion (device-only DMA
+    /// Read stand-in). Cleared on NW/abnormal.
+    /// Spec: Intel 82077AA §5.1.2 — MT=0 same-head R..=EOT.
+    pub fn last_write(&self) -> Option<&[u8]> {
+        self.last_write.as_deref()
     }
 
-    /// Latch 512 sector bytes for the next WRITE DATA media success path.
+    /// Length in bytes of [`Self::last_write`] (0 when empty).
+    pub fn last_write_byte_count(&self) -> usize {
+        self.last_write.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Pending DMA-write byte count when the DMA-write arm is set (else 0).
+    /// Equals MT=0 R..=EOT sector_count × [`FDC_SECTOR_SIZE`] while armed so
+    /// Machine can size ISA DMA ch2 Word Count for the full multi-sector transfer.
+    /// Spec: Intel 82077AA §5.1.2 WRITE DATA multi-sector / EOT.
+    pub fn pending_dma_write_byte_count(&self) -> usize {
+        if !self.dma_write_pending {
+            return 0;
+        }
+        let r = self.read_params[3];
+        let eot = self.read_params[5];
+        let end_r = if eot >= r { eot } else { r };
+        (usize::from(end_r - r) + 1) * FDC_SECTOR_SIZE
+    }
+
+    /// Latch concatenated sector bytes for the next WRITE DATA media success path.
     ///
     /// Spec: Intel 82077AA DMA mode — WRITE DATA execution receives sector bytes
-    /// from the floppy DMA channel (ISA ch2 Read = memory→device). Device tests
-    /// call this before the 8th WRITE DATA parameter completes (stand-in for
-    /// MachineBus DMA). When present, [`Self::finish_write_data`] writes the
-    /// latch immediately and does **not** arm [`Self::dma_write_pending`].
-    pub fn latch_write_sector(&mut self, data: [u8; FDC_SECTOR_SIZE]) {
+    /// from the floppy DMA channel (ISA ch2 Read = memory→device). Length must
+    /// match MT=0 R..=EOT × 512 when the command completes. Device tests call
+    /// this before the 8th WRITE DATA parameter completes (stand-in for
+    /// MachineBus DMA). When present with matching length, [`Self::finish_write_data`]
+    /// writes the latch immediately and does **not** arm [`Self::dma_write_pending`].
+    pub fn latch_write_data(&mut self, data: Vec<u8>) {
         self.last_write = Some(data);
+    }
+
+    /// Latch one 512-byte sector for the next WRITE DATA media success path.
+    ///
+    /// Convenience for single-sector (EOT==R) tests; see [`Self::latch_write_data`].
+    pub fn latch_write_sector(&mut self, data: [u8; FDC_SECTOR_SIZE]) {
+        self.latch_write_data(data.to_vec());
     }
 
     /// Consume a one-shot pending DMA-read buffer (clone of [`Self::last_sector`]).
@@ -742,9 +779,10 @@ impl Fdc82077 {
     /// Consume a one-shot pending WRITE DATA DMA arm (ISA ch2 Read = memory→device).
     ///
     /// Spec: Intel 82077AA DMA mode + 8237A Read transfer; OSDev ISA DMA floppy
-    /// channel 2. MachineBus calls this after FIFO completion, fills a 512-byte
-    /// buffer via `dma_transfer(2, …)` Read, then
-    /// [`Self::commit_dma_write_sector`]. Returns `false` when not armed.
+    /// channel 2. MachineBus calls this after FIFO completion, fills a buffer of
+    /// [`Self::pending_dma_write_byte_count`] bytes via `dma_transfer(2, …)` Read,
+    /// then [`Self::commit_dma_write_sector`]. Returns `false` when not armed.
+    /// Call [`Self::pending_dma_write_byte_count`] **before** this method.
     pub fn take_pending_dma_write(&mut self) -> bool {
         if !self.dma_write_pending {
             return false;
@@ -753,21 +791,33 @@ impl Fdc82077 {
         true
     }
 
-    /// Commit ISA DMA ch2 Read sector bytes into the image at the last WRITE
-    /// DATA C/H/R (`read_params`) and latch [`Self::last_write`].
+    /// Commit ISA DMA ch2 Read bytes into the image for the last WRITE DATA
+    /// MT=0 R..=EOT range (`read_params`) and latch [`Self::last_write`].
     ///
-    /// Spec: Intel 82077AA §5.1.2 WRITE DATA execution + IBM 1.44MB geometry.
-    /// Returns `false` if CHS/media reject the write.
-    pub fn commit_dma_write_sector(&mut self, data: [u8; FDC_SECTOR_SIZE]) -> bool {
+    /// Spec: Intel 82077AA §5.1.2 WRITE DATA multi-sector / EOT + IBM 1.44MB
+    /// geometry. `data.len()` must equal sector_count × [`FDC_SECTOR_SIZE`].
+    /// Returns `false` if length/CHS/media reject the write.
+    pub fn commit_dma_write_sector(&mut self, data: &[u8]) -> bool {
         let c = self.read_params[1];
         let h = self.read_params[2];
         let r = self.read_params[3];
-        if self.write_sector(c, h, r, &data) {
-            self.last_write = Some(data);
-            true
-        } else {
-            false
+        let eot = self.read_params[5];
+        let end_r = if eot >= r { eot } else { r };
+        let sector_count = usize::from(end_r - r) + 1;
+        let expected = sector_count * FDC_SECTOR_SIZE;
+        if data.len() != expected {
+            return false;
         }
+        for (i, sec) in (r..=end_r).enumerate() {
+            let start = i * FDC_SECTOR_SIZE;
+            let mut chunk = [0u8; FDC_SECTOR_SIZE];
+            chunk.copy_from_slice(&data[start..start + FDC_SECTOR_SIZE]);
+            if !self.write_sector(c, h, sec, &chunk) {
+                return false;
+            }
+        }
+        self.last_write = Some(data.to_vec());
+        true
     }
 
     /// CHS → byte offset in a linear 1.44MB image. `r` is 1-based (sector ID).
@@ -1247,23 +1297,27 @@ impl Fdc82077 {
 
     /// Complete WRITE DATA after eight parameters.
     ///
-    /// Spec: Intel 82077AA §5.1.2 / §6.1 / §6.2 / IBM 1.44MB geometry:
+    /// Spec: Intel 82077AA §5.1.2 / Table 5-1 / §6.1 / §6.2 / IBM 1.44MB geometry:
     ///
     /// - With media and [`Self::write_protected`]: skip execution/DMA, ST0 IC=01
     ///   (abnormal) | H | US, ST1 NW (Not Writable — WP pin, §6.2), ST2=0,
     ///   C/H/R/N ENDaddress; clear `last_write` / `dma_write_pending`.
-    /// - With media, WP clear, `N == 2` (512-byte sectors), and C/H/R in range:
-    ///   transfer **one** sector (MT ignored this slice):
-    ///   - If [`Self::last_write`] was pre-latched via [`Self::latch_write_sector`]
-    ///     (device-only DMA stand-in): write into the image immediately.
-    ///   - Else if DOR DMA/IRQ enable: arm [`Self::dma_write_pending`] for
-    ///     MachineBus ISA DMA ch2 Read (memory→device) +
-    ///     [`Self::commit_dma_write_sector`]; do not write zeros yet.
-    ///   - Else (no DMA, no latch): write a zero sector (device fallback).
-    ///     Result ST0 IC=00 (normal) | H | US, ST1=0, ST2=0, C/H/R/N ENDaddress.
-    /// - Otherwise (no media / wrong N / out-of-range CHS): skip execution,
-    ///   ST0 IC=01 (abnormal) | H | US, ST1 NW, ST2=0, C/H/R/N ENDaddress;
-    ///   clear `last_write` / `dma_write_pending`.
+    /// - With media, WP clear, `N == 2` (512-byte sectors), and every CHS in
+    ///   range: MT=0 same-head transfer of consecutive sectors **R..=EOT**
+    ///   (when EOT < R, transfer only R). MT head-switch deferred.
+    ///   - If [`Self::last_write`] was pre-latched via [`Self::latch_write_data`]
+    ///     / [`Self::latch_write_sector`] with length = sector_count×512:
+    ///     write into the image immediately.
+    ///   - Else if DOR DMA/IRQ enable and all CHS valid: arm
+    ///     [`Self::dma_write_pending`] for MachineBus ISA DMA ch2 Read
+    ///     (memory→device) + [`Self::commit_dma_write_sector`]; do not write
+    ///     zeros yet. [`Self::pending_dma_write_byte_count`] reports total bytes.
+    ///   - Else (no DMA, no latch): write zero sectors (device fallback).
+    ///     Result ST0 IC=00 (normal) | H | US, ST1=0, ST2=0, C/H/R/N =
+    ///     ENDaddress of the **last** sector written.
+    /// - Otherwise (no media / wrong N / out-of-range CHS / wrong latch length):
+    ///   skip execution, ST0 IC=01 (abnormal) | H | US, ST1 NW, ST2=0,
+    ///   C/H/R/N command ENDaddress; clear `last_write` / `dma_write_pending`.
     ///
     /// Latches EOT into `sc_eot` (DUMPREG Table 5-1); asserts IRQ (cleared
     /// when the host reads the first result byte). No Sense Interrupt.
@@ -1276,11 +1330,16 @@ impl Fdc82077 {
         let r = self.read_params[3];
         let n = self.read_params[4];
         let eot = self.read_params[5];
-        // GPL (params[6]) and DTL (params[7]) accepted; multi-sector MT ignored.
+        // GPL (params[6]) and DTL (params[7]) accepted; MT head-switch deferred.
 
         self.sc_eot = eot;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
         let dma = self.dor & FDC_DOR_DMA_IRQ != 0;
+        // Spec: 82077AA §5.1.2 — MT=0 stops at EOT on the current head.
+        // EOT < R is not a multi-sector range; transfer the starting sector only.
+        let end_r = if eot >= r { eot } else { r };
+        let sector_count = usize::from(end_r - r) + 1;
+        let expected_len = sector_count * FDC_SECTOR_SIZE;
 
         // Spec: Intel 82077AA §5.1.2 / §6.2 ST1 NW — WP pin during WRITE DATA.
         if self.has_media() && self.write_protected {
@@ -1300,34 +1359,86 @@ impl Fdc82077 {
             return;
         }
 
-        // Single-sector success: media + N=2 + valid CHS (R 1-based).
+        // Media + N=2 + valid CHS for every sector in R..=EOT.
         if n == FDC_SECTOR_N {
-            if let Some(data) = self.last_write {
+            if let Some(data) = self.last_write.take() {
                 // Pre-latched device stand-in — write now; Machine DMA not armed.
-                if self.write_sector(c, h, r, &data) {
-                    self.last_write = Some(data);
-                    self.dma_write_pending = false;
-                    self.read_result =
-                        [FDC_ST0_IC_NORMAL | st0_head | unit, 0x00, 0x00, c, h, r, n];
+                if data.len() == expected_len {
+                    let mut ok = true;
+                    for (i, sec) in (r..=end_r).enumerate() {
+                        let start = i * FDC_SECTOR_SIZE;
+                        let mut chunk = [0u8; FDC_SECTOR_SIZE];
+                        chunk.copy_from_slice(&data[start..start + FDC_SECTOR_SIZE]);
+                        if !self.write_sector(c, h, sec, &chunk) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        self.last_write = Some(data);
+                        self.dma_write_pending = false;
+                        // ENDaddress = last sector written (82077AA §5.1.2 result).
+                        self.read_result = [
+                            FDC_ST0_IC_NORMAL | st0_head | unit,
+                            0x00,
+                            0x00,
+                            c,
+                            h,
+                            end_r,
+                            n,
+                        ];
+                        self.irq_pending = true;
+                        self.phase = Phase::WriteDataResult { index: 0 };
+                        return;
+                    }
+                }
+                // Wrong length / OOR mid-range — fall through to NW (latch cleared).
+            } else if dma && self.has_media() {
+                // Spec: 82077AA DOR bit3 — arm one-shot for MachineBus ch2 Read.
+                let mut ok = true;
+                for sec in r..=end_r {
+                    if Self::chs_byte_offset(c, h, sec).is_none() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    self.dma_write_pending = true;
+                    self.last_write = None;
+                    self.read_result = [
+                        FDC_ST0_IC_NORMAL | st0_head | unit,
+                        0x00,
+                        0x00,
+                        c,
+                        h,
+                        end_r,
+                        n,
+                    ];
                     self.irq_pending = true;
                     self.phase = Phase::WriteDataResult { index: 0 };
                     return;
                 }
-            } else if dma && Self::chs_byte_offset(c, h, r).is_some() && self.has_media() {
-                // Spec: 82077AA DOR bit3 — arm one-shot for MachineBus ch2 Read.
-                self.dma_write_pending = true;
-                self.last_write = None;
-                self.read_result = [FDC_ST0_IC_NORMAL | st0_head | unit, 0x00, 0x00, c, h, r, n];
-                self.irq_pending = true;
-                self.phase = Phase::WriteDataResult { index: 0 };
-                return;
             } else {
-                let data = [0u8; FDC_SECTOR_SIZE];
-                if self.write_sector(c, h, r, &data) {
-                    self.last_write = Some(data);
+                let zeros = [0u8; FDC_SECTOR_SIZE];
+                let mut ok = true;
+                for sec in r..=end_r {
+                    if !self.write_sector(c, h, sec, &zeros) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    self.last_write = Some(vec![0u8; expected_len]);
                     self.dma_write_pending = false;
-                    self.read_result =
-                        [FDC_ST0_IC_NORMAL | st0_head | unit, 0x00, 0x00, c, h, r, n];
+                    self.read_result = [
+                        FDC_ST0_IC_NORMAL | st0_head | unit,
+                        0x00,
+                        0x00,
+                        c,
+                        h,
+                        end_r,
+                        n,
+                    ];
                     self.irq_pending = true;
                     self.phase = Phase::WriteDataResult { index: 0 };
                     return;
@@ -1335,7 +1446,7 @@ impl Fdc82077 {
             }
         }
 
-        // No media / wrong N / OOR CHS → honest NW abnormal (WP handled above).
+        // No media / wrong N / OOR CHS / wrong latch length → honest NW abnormal.
         self.last_write = None;
         self.dma_write_pending = false;
         self.read_result = [
@@ -5052,8 +5163,8 @@ mod tests {
     /// CHS, normal termination (IC=00 | H | US), ST1=ST2=0, C/H/R/N ENDaddress,
     /// EOT→`sc_eot`, IRQ6; accepts one 512-byte sector from `latch_write_sector`
     /// (device-only DMA stand-in; does not arm `dma_write_pending`) via
-    /// `write_sector` into the image and latches `last_write`. Multi-sector MT
-    /// ignored — one sector only. Spec: IBM 1.44MB geometry.
+    /// `write_sector` into the image and latches `last_write`. EOT==R →
+    /// single-sector. Spec: IBM 1.44MB geometry.
     #[test]
     fn write_data_with_media_normal_result_and_last_write() {
         let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
@@ -5065,9 +5176,9 @@ mod tests {
         }
         f.latch_write_sector(data);
 
-        // WRITE DATA MFM: C=0,H=0,R=1,N=2 — first sector of the image.
+        // WRITE DATA MFM: C=0,H=0,R=1,N=2,EOT=1 — single sector (EOT==R).
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
-        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
             f.port_write(FDC_FIFO, 1, u32::from(p));
         }
 
@@ -5094,10 +5205,13 @@ mod tests {
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
         assert_eq!(f.phase, Phase::Command);
-        assert_eq!(f.sc_eot, 0x12, "EOT latched for DUMPREG");
+        assert_eq!(f.sc_eot, 0x01, "EOT latched for DUMPREG");
 
-        let written = *f.last_write().expect("media WRITE DATA latches last_write");
-        assert_eq!(written, data);
+        let written = f
+            .last_write()
+            .expect("media WRITE DATA latches last_write")
+            .to_vec();
+        assert_eq!(written.as_slice(), data.as_slice());
         let image_sector = f
             .read_sector(0, 0, 1)
             .expect("image must contain written sector");
@@ -5111,6 +5225,75 @@ mod tests {
         );
     }
 
+    /// Spec: Intel 82077AA §5.1.2 / Table 5-1 WRITE DATA multi-sector — MT=0
+    /// same head: when EOT > R, accept/write consecutive sectors R..=EOT from
+    /// the concatenated `last_write` latch (`latch_write_data`); ST0 IC=00
+    /// normal; ST1=ST2=0; result C/H/R/N = ENDaddress of the **last** sector
+    /// written; EOT→`sc_eot`. IBM 1.44MB geometry; MT head-switch out of scope.
+    #[test]
+    fn write_data_multi_sector_same_head_eot_r_plus_one() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        let expected_len = 2 * FDC_SECTOR_SIZE;
+        let mut data = vec![0u8; expected_len];
+        for (i, b) in data[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        for (i, b) in data[FDC_SECTOR_SIZE..].iter_mut().enumerate() {
+            *b = 0x80 | ((i & 0x7F) as u8);
+        }
+        f.latch_write_data(data.clone());
+
+        // WRITE DATA MFM MT=0: C=0,H=0,R=1,N=2,EOT=2 — two sectors same head.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line(), "multi-sector WRITE DATA asserts IRQ6");
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0, FDC_ST0_IC_NORMAL,
+            "ST0 = IC=00 normal (multi-sector same-head)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST1 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "C ENDaddress");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "H ENDaddress");
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x02,
+            "R ENDaddress = last sector written (EOT)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02, "N");
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x02, "EOT latched for DUMPREG");
+
+        assert_eq!(f.last_write_byte_count(), expected_len);
+        let latch = f
+            .last_write()
+            .expect("multi-sector WRITE DATA latches concatenated sectors")
+            .to_vec();
+        assert_eq!(latch, data);
+        assert_eq!(
+            f.read_sector(0, 0, 1).expect("sector1").as_slice(),
+            &data[..FDC_SECTOR_SIZE],
+            "image sector R=1"
+        );
+        assert_eq!(
+            f.read_sector(0, 0, 2).expect("sector2").as_slice(),
+            &data[FDC_SECTOR_SIZE..],
+            "image sector R=2"
+        );
+        assert!(
+            !f.take_pending_dma_write(),
+            "pre-latch path must not arm Machine DMA write pending"
+        );
+        assert_eq!(f.pending_dma_write_byte_count(), 0);
+    }
+
     /// Spec: Intel 82077AA DMA mode + DOR bit3 — media WRITE DATA without a
     /// pre-latch arms `dma_write_pending` for MachineBus ISA ch2 Read; image
     /// stays untouched until `commit_dma_write_sector`.
@@ -5119,7 +5302,8 @@ mod tests {
         let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
-        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+        // EOT==R → single-sector DMA arm (512 bytes).
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
             f.port_write(FDC_FIFO, 1, u32::from(p));
         }
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_NORMAL);
@@ -5132,14 +5316,16 @@ mod tests {
             sector.iter().all(|&b| b == 0xAA),
             "image untouched before commit"
         );
+        assert_eq!(f.pending_dma_write_byte_count(), FDC_SECTOR_SIZE);
         assert!(f.take_pending_dma_write(), "DOR DMA arms write pending");
         assert!(!f.take_pending_dma_write(), "one-shot arm");
+        assert_eq!(f.pending_dma_write_byte_count(), 0);
         let mut data = [0u8; FDC_SECTOR_SIZE];
         for (i, b) in data.iter_mut().enumerate() {
             *b = (i & 0xFF) as u8;
         }
-        assert!(f.commit_dma_write_sector(data));
-        assert_eq!(*f.last_write().expect("commit latches"), data);
+        assert!(f.commit_dma_write_sector(&data));
+        assert_eq!(f.last_write().expect("commit latches"), data.as_slice());
         assert_eq!(f.read_sector(0, 0, 1).expect("written"), data);
     }
 
@@ -5194,9 +5380,9 @@ mod tests {
         }
         f.latch_write_sector(data);
 
-        // WRITE DATA MFM: C=0,H=0,R=1,N=2 — valid CHS that would succeed if WP clear.
+        // WRITE DATA MFM: C=0,H=0,R=1,N=2,EOT=1 — valid CHS that would succeed if WP clear.
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
-        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
             f.port_write(FDC_FIFO, 1, u32::from(p));
         }
 
@@ -5221,7 +5407,7 @@ mod tests {
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
         assert_eq!(f.phase, Phase::Command);
-        assert_eq!(f.sc_eot, 0x12, "EOT still latched for DUMPREG");
+        assert_eq!(f.sc_eot, 0x01, "EOT still latched for DUMPREG");
 
         assert!(
             f.last_write().is_none(),
@@ -5251,7 +5437,7 @@ mod tests {
         f.latch_write_sector(data);
 
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
-        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
             f.port_write(FDC_FIFO, 1, u32::from(p));
         }
 
