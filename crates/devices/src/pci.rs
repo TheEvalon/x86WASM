@@ -27,6 +27,8 @@
 //!
 //! - Type 1 address latch (enable / bus / device / function / register).
 //! - Host bridge at `00:00.0` with Intel-style vendor/device/class/header type 0.
+//! - Host bridge Command (`0x04`) store/readback: sticky IO/MEM/BusMaster only
+//!   (`PCI_HOST_BRIDGE_COMMAND_MASK` = `0x0007`); other Command bits hardwired 0.
 //! - PIIX-style stubs: `00:01.0` ISA bridge (multi-function), `00:01.1` IDE,
 //!   `00:01.2` USB UHCI, `00:01.3` ACPI identity only.
 //! - Absent devices: `0xFFFFFFFF` when enable is set.
@@ -36,7 +38,9 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - BAR MMIO/IO decode, bus mastering, INTx routing tables
+//! - BAR MMIO/IO decode, bus mastering engine, INTx routing tables
+//! - Host-bridge Command side effects (IO/MEM decode, bus-master DMA)
+//! - Status register W1C semantics; PIIX Command bit masking
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (config identity only)
 //! - Capability lists, MSI, PCIe, hotplug
@@ -49,6 +53,22 @@ use crate::PortDevice;
 pub const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 /// CONFIG_DATA base (bytes `0xCFC`–`0xCFF`).
 pub const PCI_CONFIG_DATA: u16 = 0xCFC;
+
+/// PCI Command register config offset.
+/// Spec: PCI Local Bus — Type 0 header Command at `0x04`.
+pub const PCI_COMMAND_OFFSET: u8 = 0x04;
+/// Command bit 0: I/O Space Enable.
+pub const PCI_COMMAND_IO: u16 = 1 << 0;
+/// Command bit 1: Memory Space Enable.
+pub const PCI_COMMAND_MEM: u16 = 1 << 1;
+/// Command bit 2: Bus Master Enable.
+pub const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
+/// Host bridge (`00:00.0`) Command sticky-bit mask for this stub.
+///
+/// Sticky: IO | MEM | BusMaster (`0x0007`). All other Command bits are
+/// hardwired 0 on store (no SERR/PERR/INTx-disable/etc. side effects yet).
+pub const PCI_HOST_BRIDGE_COMMAND_MASK: u16 =
+    PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER;
 
 /// Intel vendor ID.
 pub const PCI_VENDOR_INTEL: u16 = 0x8086;
@@ -412,6 +432,7 @@ impl PciConfig {
         let base = self.reg_offset() as usize;
         let lane = (port - PCI_CONFIG_DATA) as usize;
         let off = base + lane;
+        let is_host_bridge = self.bus() == 0 && self.device() == 0 && self.function() == 0;
         let is_piix_ide = self.bus() == 0 && self.device() == 1 && self.function() == 1;
         let is_piix_usb = self.bus() == 0 && self.device() == 1 && self.function() == 2;
         let is_piix_acpi = self.bus() == 0 && self.device() == 1 && self.function() == 3;
@@ -445,6 +466,14 @@ impl PciConfig {
                 }
             }
             _ => {}
+        }
+        // Spec: PCI Local Bus — Command at 0x04. Host bridge stub keeps only
+        // IO/MEM/BusMaster sticky; other Command bits hardwired 0 (no decode yet).
+        if is_host_bridge {
+            let cmd_off = PCI_COMMAND_OFFSET as usize;
+            let cmd = u16::from_le_bytes([cfg[cmd_off], cfg[cmd_off + 1]]);
+            let masked = cmd & PCI_HOST_BRIDGE_COMMAND_MASK;
+            cfg[cmd_off..cmd_off + 2].copy_from_slice(&masked.to_le_bytes());
         }
         // Spec: Intel 82371SB / PCI — PIIX IDE BMIBA at config 0x20 is an I/O BAR:
         // bit0 hardwired 1; address bits 15:4 programmable; bits 3:1 zero.
@@ -796,6 +825,74 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: PCI Local Bus — Command at `0x04`. Host bridge `00:00.0` stub
+    /// keeps IO/MEM/BusMaster sticky (`0x0007`); other Command bits hardwired 0.
+    #[test]
+    fn host_bridge_command_io_mem_busmaster_sticky() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_COMMAND_OFFSET, true),
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            0,
+            "Command defaults to 0 at reset"
+        );
+
+        // Guest writes all Command bits; only IO|MEM|BusMaster stick.
+        pci.port_write(PCI_CONFIG_DATA, 2, 0xFFFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_HOST_BRIDGE_COMMAND_MASK
+        );
+        assert_eq!(
+            PCI_HOST_BRIDGE_COMMAND_MASK,
+            PCI_COMMAND_IO | PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER
+        );
+
+        // Subset stickiness: MEM|BusMaster without IO.
+        pci.port_write(
+            PCI_CONFIG_DATA,
+            2,
+            u32::from(PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER | 0x0100), // SERR discarded
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_COMMAND_MEM | PCI_COMMAND_BUS_MASTER
+        );
+
+        // Byte lane at 0xCFC (Command low): junk high bits masked.
+        pci.port_write(PCI_CONFIG_DATA, 1, 0xFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 2) as u16,
+            PCI_HOST_BRIDGE_COMMAND_MASK
+        );
+
+        pci.reset();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_COMMAND_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0);
+    }
+
+    /// Host-bridge Command mask must not change PIIX ISA Command at `00:01.0`.
+    #[test]
+    fn host_bridge_command_mask_does_not_affect_piix_isa() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_COMMAND_OFFSET, true),
+        );
+        // PIIX still accepts a wider writable Command word in this stub.
+        pci.port_write(PCI_CONFIG_DATA, 2, 0x0147);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 2) as u16, 0x0147);
     }
 
     /// Spec: UHCI / PIIX USB — LEGSUP dword at config `0xC0` store/readback
