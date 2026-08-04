@@ -1,6 +1,6 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
 //! Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
-//! READ DATA / READ DELETED DATA / WRITE DATA / WRITE DELETED DATA / FORMAT TRACK (no-media stubs) + IRQ6.
+//! READ DATA / READ DELETED DATA / WRITE DATA / WRITE DELETED DATA / VERIFY / FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -176,6 +176,9 @@ pub const FDC_CMD_READ_DATA: u8 = 0x06;
 /// Table 5-1 — command byte is `MT|MFM|SK|0 1 1 0 0`; match with
 /// [`FDC_CMD_OPCODE_MASK`].
 pub const FDC_CMD_READ_DELETED_DATA: u8 = 0x0C;
+/// VERIFY base opcode (bits 4:0). Spec: Intel 82077AA Table 5-1 —
+/// command byte is `MT|MFM|SK|1 0 1 1 0`; match with [`FDC_CMD_OPCODE_MASK`].
+pub const FDC_CMD_VERIFY: u8 = 0x16;
 /// Mask for FDC command opcode bits (excludes MT/MFM/SK). Spec: 82077AA Table 5-1.
 pub const FDC_CMD_OPCODE_MASK: u8 = 0x1F;
 /// Command bit7 Multi-Track (MT). Spec: Intel 82077AA Table 5-1 symbol MT.
@@ -195,6 +198,8 @@ pub const FDC_CMD_READ_DATA_MT_MFM_SK: u8 =
 /// Documented READ DELETED DATA form: MT|MFM|SK|0x0C. Spec: 82077AA Table 5-1.
 pub const FDC_CMD_READ_DELETED_DATA_MT_MFM_SK: u8 =
     FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_SK | FDC_CMD_READ_DELETED_DATA;
+/// Documented VERIFY form: MT|MFM|SK|0x16. Spec: 82077AA Table 5-1.
+pub const FDC_CMD_VERIFY_MT_MFM_SK: u8 = FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_SK | FDC_CMD_VERIFY;
 /// WRITE DATA parameter count after the command byte. Spec: 82077AA §5.1.2.
 pub const FDC_WRITE_DATA_PARAM_LEN: u8 = 8;
 /// WRITE DATA result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA §5.1.2.
@@ -213,6 +218,10 @@ pub const FDC_READ_DATA_RESULT_LEN: u8 = 7;
 pub const FDC_READ_DELETED_DATA_PARAM_LEN: u8 = 8;
 /// READ DELETED DATA result byte count (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.3.
 pub const FDC_READ_DELETED_DATA_RESULT_LEN: u8 = 7;
+/// VERIFY parameter count after the command byte. Spec: 82077AA — same as READ DATA.
+pub const FDC_VERIFY_PARAM_LEN: u8 = 8;
+/// VERIFY result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA.
+pub const FDC_VERIFY_RESULT_LEN: u8 = 7;
 /// Recalibrate command opcode. Spec: Intel 82077AA / OSDev FDC — 1 unit parameter.
 pub const FDC_CMD_RECALIBRATE: u8 = 0x07;
 /// Sense Interrupt Status command opcode. Spec: Intel 82077AA / OSDev FDC.
@@ -322,6 +331,10 @@ enum Phase {
     ReadDeletedDataParams { index: u8 },
     /// READ DELETED DATA result: 7 bytes (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.3.
     ReadDeletedDataResult { index: u8 },
+    /// VERIFY parameters: 8 bytes (same as READ DATA).
+    VerifyParams { index: u8 },
+    /// VERIFY result: 7 bytes (ST0..N). Spec: 82077AA Table 5-1.
+    VerifyResult { index: u8 },
     /// WRITE DATA parameters: 8 bytes (HD|US, C, H, R, N, EOT, GPL, DTL).
     /// Spec: Intel 82077AA §5.1.2 / Table 5-1.
     WriteDataParams { index: u8 },
@@ -487,6 +500,7 @@ impl Fdc82077 {
                 | Phase::PerpendicularParam
                 | Phase::ReadDataParams { .. }
                 | Phase::ReadDeletedDataParams { .. }
+                | Phase::VerifyParams { .. }
                 | Phase::WriteDataParams { .. }
                 | Phase::WriteDeletedDataParams { .. }
                 | Phase::FormatTrackParams { .. } => FDC_MSR_RQM,
@@ -497,6 +511,7 @@ impl Fdc82077 {
                 | Phase::DumpRegResult { .. }
                 | Phase::ReadDataResult { .. }
                 | Phase::ReadDeletedDataResult { .. }
+                | Phase::VerifyResult { .. }
                 | Phase::WriteDataResult { .. }
                 | Phase::WriteDeletedDataResult { .. }
                 | Phase::FormatTrackResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
@@ -810,6 +825,46 @@ impl Fdc82077 {
         cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_READ_DELETED_DATA_MT_MFM_SK & FDC_CMD_OPCODE_MASK)
     }
 
+    /// Begin VERIFY parameter phase (8 bytes). Spec: Intel 82077AA Table 5-1.
+    fn start_verify(&mut self) {
+        self.read_params = [0; FDC_VERIFY_PARAM_LEN as usize];
+        self.phase = Phase::VerifyParams { index: 0 };
+    }
+
+    /// Complete VERIFY after eight parameters — no-media stub (no DMA).
+    ///
+    /// Spec: Intel 82077AA VERIFY — same param/result shape as READ DATA; no media
+    /// → abnormal ST0 IC=01|H|US, ST1 ND, ST2=0, C/H/R/N; EOT→`sc_eot`; IRQ6.
+    fn finish_verify(&mut self) {
+        let head_unit = self.read_params[0];
+        let unit = head_unit & 0x03;
+        let head = (head_unit >> 2) & 0x01;
+        let c = self.read_params[1];
+        let h = self.read_params[2];
+        let r = self.read_params[3];
+        let n = self.read_params[4];
+        let eot = self.read_params[5];
+        self.sc_eot = eot;
+        let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        self.read_result = [
+            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST1_ND,
+            0x00,
+            c,
+            h,
+            r,
+            n,
+        ];
+        self.irq_pending = true;
+        self.phase = Phase::VerifyResult { index: 0 };
+    }
+
+    /// True if `cmd` is VERIFY including optional MT/MFM/SK modifiers.
+    #[inline]
+    fn is_verify_command(cmd: u8) -> bool {
+        cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_VERIFY_MT_MFM_SK & FDC_CMD_OPCODE_MASK)
+    }
+
     /// True if `cmd` is WRITE DATA including optional MT/MFM modifiers.
     ///
     /// Spec: Intel 82077AA §5.1.2 / Table 5-1 — opcode bits 4:0 = `00101`;
@@ -943,6 +998,7 @@ impl Fdc82077 {
             | Phase::PerpendicularParam
             | Phase::ReadDataParams { .. }
             | Phase::ReadDeletedDataParams { .. }
+            | Phase::VerifyParams { .. }
             | Phase::WriteDataParams { .. }
             | Phase::WriteDeletedDataParams { .. }
             | Phase::FormatTrackParams { .. } => 0xFF,
@@ -1004,6 +1060,20 @@ impl Fdc82077 {
                     self.phase = Phase::Command;
                 } else {
                     self.phase = Phase::ReadDeletedDataResult { index: index + 1 };
+                }
+                v
+            }
+            Phase::VerifyResult { index } => {
+                // Spec: 82077AA / OSDev — IRQ for read/write cleared as the host
+                // begins reading the result phase (first byte).
+                if index == 0 {
+                    self.irq_pending = false;
+                }
+                let v = self.read_result[index as usize];
+                if index + 1 >= FDC_VERIFY_RESULT_LEN {
+                    self.phase = Phase::Command;
+                } else {
+                    self.phase = Phase::VerifyResult { index: index + 1 };
                 }
                 v
             }
@@ -1094,6 +1164,9 @@ impl Fdc82077 {
                 } else if Self::is_read_deleted_data_command(v) {
                     // Spec: Intel 82077AA §5.1.3 — MT/MFM/SK | 01100; eight params.
                     self.start_read_deleted_data();
+                } else if Self::is_verify_command(v) {
+                    // Spec: Intel 82077AA Table 5-1 — MT/MFM/SK | 10110; eight params.
+                    self.start_verify();
                 } else if Self::is_write_data_command(v) {
                     // Spec: Intel 82077AA §5.1.2 — MT/MFM | 00101; eight params.
                     self.start_write_data();
@@ -1179,6 +1252,15 @@ impl Fdc82077 {
                     self.phase = Phase::ReadDeletedDataParams { index: index + 1 };
                 }
             }
+            Phase::VerifyParams { index } => {
+                self.read_params[index as usize] = v;
+                if index + 1 >= FDC_VERIFY_PARAM_LEN {
+                    self.finish_verify();
+                } else {
+                    self.phase = Phase::VerifyParams { index: index + 1 };
+                }
+            }
+
             Phase::WriteDataParams { index } => {
                 // Spec: Intel 82077AA §5.1.2 — HD|US, C, H, R, N, EOT, GPL, DTL.
                 self.read_params[index as usize] = v;
@@ -1213,6 +1295,7 @@ impl Fdc82077 {
             | Phase::DumpRegResult { .. }
             | Phase::ReadDataResult { .. }
             | Phase::ReadDeletedDataResult { .. }
+            | Phase::VerifyResult { .. }
             | Phase::WriteDataResult { .. }
             | Phase::WriteDeletedDataResult { .. }
             | Phase::FormatTrackResult { .. } => {
@@ -2985,6 +3068,54 @@ mod tests {
 
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 — VERIFY (`0x16`) no-media stub.
+    #[test]
+    fn verify_mfm_no_media_abnormal_result_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_VERIFY));
+        assert_eq!(f.phase, Phase::VerifyParams { index: 0 });
+        for p in [0x04u8, 0x12, 0x01, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0, FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12);
+    }
+
+    #[test]
+    fn verify_mt_mfm_sk_opcode_form_accepted() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(FDC_CMD_VERIFY_MT_MFM_SK, 0xF6);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERIFY_MT_MFM_SK));
+        for p in [0x01u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        let _ = f.port_read(FDC_FIFO, 1);
+        for _ in 0..6 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+    }
+
+    #[test]
+    fn dor_reset_aborts_verify_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_VERIFY));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert_eq!(f.phase, Phase::VerifyParams { index: 1 });
+        f.port_write(FDC_DOR, 1, 0);
+        assert_eq!(f.phase, Phase::Command);
     }
 
     /// Spec: Intel 82077AA §5.1.7 / Table 5-1 — FORMAT TRACK opcode `0x0D` with
