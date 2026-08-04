@@ -10,7 +10,9 @@
 //!   commands `0xFF` Reset (ACK `0xFA`, BAT `0xAA`, ID `0x00`), `0xF2` Get Device
 //!   ID, `0xF4`/`0xF5` Enable/Disable Data Reporting (ACK `0xFA`), `0xF3` Set
 //!   Sample Rate (+ value), `0xE8` Set Resolution (+ value), `0xE9` Status
-//!   Request (ACK + 3-byte status), `0xE6`/`0xE7` Set Scaling 1:1 / 2:1.
+//!   Request (ACK + 3-byte status), `0xE6`/`0xE7` Set Scaling 1:1 / 2:1;
+//!   stream-mode **Mouse Packet Format** (3 bytes: flags/buttons/signs/overflows,
+//!   X movement, Y movement) when reporting is enabled.
 //! - IBM PC/AT 8042 keyboard-controller programming model (command/status/data);
 //!   output-buffer-full with IRQ enable → ISA IRQ1 (8259A master IR1).
 //! - IBM PS/2 keyboard-controller second (auxiliary) port: commands `0xA7`
@@ -37,16 +39,22 @@
 //! common identify/reset/enable commands with ACK/`0xFA` (and BAT/ID where
 //! required) on AUX OBF → IRQ12 when config bit 1 is set. Parameter commands
 //! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`) store rate/resolution/scaling and answer
-//! Status Request with the OSDev 3-byte packet; Reset restores defaults. The
-//! buffered byte's source selects the line: keyboard data drives IRQ1 only, aux
-//! data IRQ12 only. [`I8042::inject_aux_byte`] remains available for test injection.
+//! Status Request with the OSDev 3-byte packet; Reset restores defaults.
+//! [`I8042::inject_mouse_packet`] queues a standard 3-byte movement packet when
+//! data reporting is enabled (`0xF4`); while reporting is disabled (`0xF5` /
+//! Reset default) injects are **dropped** (not deferred). Packet bytes present
+//! on AUX OBF one at a time (same queue as command responses) → IRQ12 when
+//! config bit 1 is set. The buffered byte's source selects the line: keyboard
+//! data drives IRQ1 only, aux data IRQ12 only. [`I8042::inject_aux_byte`] remains
+//! available for raw test injection.
 //!
 //! # Unsupported (explicit)
 //!
-//! - 3-byte movement packet streaming / wheel / 5-button extensions / remote
-//!   mode / wrap mode (other host→aux bytes are recorded, unanswered)
+//! - Wheel / 5-button (IntelliMouse) extensions / remote mode / wrap mode
+//!   (other host→aux bytes are recorded, unanswered)
 //! - Aux clock disable (config bit 5) is not applied to host→device `0xD4`
-//!   writes; it gates presenting mouse responses and [`I8042::inject_aux_byte`]
+//!   writes; it gates presenting mouse responses, movement packets, and
+//!   [`I8042::inject_aux_byte`]
 //! - Full AT keyboard protocol (no host→device commands, no `0xFA` ACK, no break codes)
 //! - Set2↔Set1 translation table (config bit6 is stored; inject is passthrough)
 //! - Pulse-reset lines (`0xFE` / output-port bit0 system-reset)
@@ -140,9 +148,27 @@ pub const MOUSE_STATUS_ENABLE: u8 = 1 << 5;
 /// Status Request byte1 bit6: remote mode when set (stub always clears — stream).
 pub const MOUSE_STATUS_REMOTE: u8 = 1 << 6;
 
+/// Movement-packet byte0 bit0: left button (OSDev "Mouse Packet Format").
+pub const MOUSE_BTN_LEFT: u8 = 1 << 0;
+/// Movement-packet byte0 bit1: right button.
+pub const MOUSE_BTN_RIGHT: u8 = 1 << 1;
+/// Movement-packet byte0 bit2: middle button.
+pub const MOUSE_BTN_MIDDLE: u8 = 1 << 2;
+/// Movement-packet byte0 bit3: always 1 in a valid standard packet.
+pub const MOUSE_PKT_ALWAYS1: u8 = 1 << 3;
+/// Movement-packet byte0 bit4: X sign (1 = negative).
+pub const MOUSE_PKT_X_SIGN: u8 = 1 << 4;
+/// Movement-packet byte0 bit5: Y sign (1 = negative).
+pub const MOUSE_PKT_Y_SIGN: u8 = 1 << 5;
+/// Movement-packet byte0 bit6: X overflow.
+pub const MOUSE_PKT_X_OVERFLOW: u8 = 1 << 6;
+/// Movement-packet byte0 bit7: Y overflow.
+pub const MOUSE_PKT_Y_OVERFLOW: u8 = 1 << 7;
+
 /// Capacity of the pending aux-device → host response queue
-/// (Status Request needs ACK + 3 status bytes).
-const AUX_RESP_QUEUE_CAP: usize = 4;
+/// (Status Request needs ACK + 3 status bytes; a movement packet is 3 bytes —
+/// allow a few packets without dropping).
+const AUX_RESP_QUEUE_CAP: usize = 16;
 
 /// Next host→aux byte expected as a parameter for a prior mouse command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,10 +416,40 @@ impl I8042 {
 
     /// Whether the mouse stub has data reporting enabled (`0xF4` / not `0xF5`).
     ///
-    /// Spec: OSDev PS/2 Mouse — Enable/Disable Data Reporting. This stub stores
-    /// the flag only; it does not stream movement packets.
+    /// Spec: OSDev PS/2 Mouse — Enable/Disable Data Reporting. When enabled,
+    /// [`Self::inject_mouse_packet`] may queue stream-mode movement packets.
     pub fn mouse_reporting_enabled(&self) -> bool {
         self.mouse_reporting
+    }
+
+    /// Encode and queue a standard 3-byte PS/2 mouse movement packet.
+    ///
+    /// Spec: OSDev [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) "Mouse Packet
+    /// Format" — byte0: bit0 Left / bit1 Right / bit2 Middle / bit3 always 1 /
+    /// bit4 X sign / bit5 Y sign / bit6 X overflow / bit7 Y overflow; byte1 X
+    /// movement; byte2 Y movement. Deltas use the 9-bit signed range
+    /// (−256…+255); values outside that set the corresponding overflow bit and
+    /// clamp the movement byte.
+    ///
+    /// Returns `true` if IRQ12 had a rising edge as a result of presenting the
+    /// first byte. Returns `false` (and **drops** the packet) when data
+    /// reporting is disabled (`0xF5` / Reset default), when the aux response
+    /// queue cannot hold three more bytes, or when no IRQ12 edge occurred.
+    ///
+    /// Aux clock disable (config bit5) holds queued bytes until `0xA8` (same as
+    /// command responses); it does not drop an accepted packet.
+    pub fn inject_mouse_packet(&mut self, dx: i16, dy: i16, buttons: u8) -> bool {
+        if !self.mouse_reporting {
+            return false;
+        }
+        if (self.aux_resp_len as usize) + 3 > AUX_RESP_QUEUE_CAP {
+            return false;
+        }
+        let packet = encode_mouse_packet(dx, dy, buttons);
+        let prev = self.irq12_line();
+        self.push_aux_bytes(&packet);
+        self.flush_aux_response_queue();
+        !prev && self.irq12_line()
     }
 
     /// Current mouse sample rate (set by `0xF3` + value; default 100).
@@ -462,15 +518,21 @@ impl I8042 {
         v
     }
 
-    /// Queue mouse → host bytes and present the first when the buffer is free.
-    fn begin_mouse_response(&mut self, bytes: &[u8]) {
-        self.aux_resp_len = 0;
+    /// Append bytes to the aux → host queue (does not present).
+    fn push_aux_bytes(&mut self, bytes: &[u8]) {
         for &b in bytes {
             if (self.aux_resp_len as usize) < AUX_RESP_QUEUE_CAP {
                 self.aux_resp[self.aux_resp_len as usize] = b;
                 self.aux_resp_len = self.aux_resp_len.saturating_add(1);
             }
         }
+    }
+
+    /// Queue a mouse command response (replaces any pending aux queue) and
+    /// present the first byte when the buffer is free.
+    fn begin_mouse_response(&mut self, bytes: &[u8]) {
+        self.aux_resp_len = 0;
+        self.push_aux_bytes(bytes);
         self.flush_aux_response_queue();
     }
 
@@ -571,7 +633,41 @@ impl I8042 {
             }
         }
     }
+}
 
+/// Build a standard 3-byte stream-mode mouse packet (OSDev Mouse Packet Format).
+fn encode_mouse_packet(dx: i16, dy: i16, buttons: u8) -> [u8; 3] {
+    let (dx_b, x_sign, x_ovf) = pack_mouse_axis(dx);
+    let (dy_b, y_sign, y_ovf) = pack_mouse_axis(dy);
+    let mut flags =
+        MOUSE_PKT_ALWAYS1 | (buttons & (MOUSE_BTN_LEFT | MOUSE_BTN_RIGHT | MOUSE_BTN_MIDDLE));
+    if x_sign {
+        flags |= MOUSE_PKT_X_SIGN;
+    }
+    if y_sign {
+        flags |= MOUSE_PKT_Y_SIGN;
+    }
+    if x_ovf {
+        flags |= MOUSE_PKT_X_OVERFLOW;
+    }
+    if y_ovf {
+        flags |= MOUSE_PKT_Y_OVERFLOW;
+    }
+    [flags, dx_b, dy_b]
+}
+
+/// Pack one movement axis into (byte, sign, overflow) for the 9-bit signed range.
+fn pack_mouse_axis(delta: i16) -> (u8, bool, bool) {
+    if delta > 255 {
+        (0xFF, false, true)
+    } else if delta < -256 {
+        (0x00, true, true)
+    } else {
+        (delta as u8, delta < 0, false)
+    }
+}
+
+impl I8042 {
     fn handle_command(&mut self, cmd: u8) {
         match cmd {
             CMD_READ_CONFIG => {
@@ -1173,6 +1269,99 @@ mod tests {
         assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
         assert_eq!(read_aux_byte(&mut k), MOUSE_BAT_OK);
         assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
+    }
+
+    /// Spec: OSDev PS/2 Mouse "Mouse Packet Format" — when data reporting is
+    /// enabled (`0xF4`), [`I8042::inject_mouse_packet`] queues a standard 3-byte
+    /// stream-mode packet (flags/buttons/signs/overflows, dx, dy) on AUX OBF,
+    /// one byte at a time.
+    #[test]
+    fn mouse_inject_packet_streams_three_bytes_when_reporting_enabled() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(k.mouse_reporting_enabled());
+
+        // dx=+5, dy=-3, left button → flags: always1 | left | Y sign.
+        assert!(!k.inject_mouse_packet(5, -3, MOUSE_BTN_LEFT));
+        assert_eq!(
+            read_aux_byte(&mut k),
+            MOUSE_PKT_ALWAYS1 | MOUSE_BTN_LEFT | MOUSE_PKT_Y_SIGN
+        );
+        assert_eq!(read_aux_byte(&mut k), 5u8);
+        assert_eq!(read_aux_byte(&mut k), (-3i8) as u8);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: OSDev PS/2 Mouse — Disable Data Reporting (`0xF5`) stops movement
+    /// packets; this stub **drops** [`I8042::inject_mouse_packet`] while
+    /// reporting is off (does not queue for later).
+    #[test]
+    fn mouse_inject_packet_dropped_when_reporting_disabled() {
+        let mut k = I8042::new();
+        assert!(!k.mouse_reporting_enabled());
+        assert!(!k.inject_mouse_packet(1, 1, 0));
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        write_aux(&mut k, MOUSE_CMD_DISABLE_REPORTING);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert!(!k.mouse_reporting_enabled());
+        assert!(!k.inject_mouse_packet(2, 2, MOUSE_BTN_RIGHT));
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: IBM PS/2 KBC + OSDev packet stream — first packet byte on AUX OBF
+    /// with config INT12 raises IRQ12; each `0x60` read clears then presents the
+    /// next queued byte (IRQ12 re-asserts while INT12 remains enabled).
+    #[test]
+    fn mouse_inject_packet_with_int12_asserts_irq12_per_byte() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, u32::from(CFG_INT12));
+
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        assert!(k.irq12_line());
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, MOUSE_ACK);
+        assert!(!k.irq12_line());
+
+        assert!(k.inject_mouse_packet(-1, 0, 0));
+        assert!(k.irq12_line());
+        assert_ne!(k.status() & STATUS_AUX_OBF, 0);
+        assert_eq!(
+            k.port_read(I8042_DATA, 1) as u8,
+            MOUSE_PKT_ALWAYS1 | MOUSE_PKT_X_SIGN
+        );
+        // Next byte presented immediately → IRQ12 still high.
+        assert!(k.irq12_line());
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0xFFu8); // dx = -1
+        assert!(k.irq12_line());
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0);
+        assert!(!k.irq12_line());
+    }
+
+    /// Spec: OSDev PS/2 Mouse packet — overflow bits set when |delta| exceeds the
+    /// 9-bit movement range (X/Y > 255 or < -256).
+    #[test]
+    fn mouse_inject_packet_sets_overflow_flags_outside_9bit_range() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_ENABLE_REPORTING);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+
+        assert!(!k.inject_mouse_packet(300, -300, 0));
+        let flags = read_aux_byte(&mut k);
+        assert_eq!(
+            flags
+                & (MOUSE_PKT_ALWAYS1
+                    | MOUSE_PKT_X_OVERFLOW
+                    | MOUSE_PKT_Y_OVERFLOW
+                    | MOUSE_PKT_Y_SIGN),
+            MOUSE_PKT_ALWAYS1 | MOUSE_PKT_X_OVERFLOW | MOUSE_PKT_Y_OVERFLOW | MOUSE_PKT_Y_SIGN
+        );
+        assert_eq!(flags & MOUSE_PKT_X_SIGN, 0);
+        let _dx = read_aux_byte(&mut k);
+        let _dy = read_aux_byte(&mut k);
     }
 
     /// Spec: IBM PS/2 KBC — mouse stub responses set AUX OBF and raise IRQ12
