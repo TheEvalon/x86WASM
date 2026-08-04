@@ -2322,10 +2322,10 @@ mod tests {
         {
             let mut bus = m.bus_mut();
             bus.port_out_u8(FDC_DOR, FDC_DOR_MOTOR0_DMA).unwrap();
-            // READ DATA MFM: C/H/R/N = 0/0/1/2
+            // READ DATA MFM: C/H/R/N = 0/0/1/2, EOT=R (single-sector).
             bus.port_out_u8(FDC_FIFO, FDC_CMD_MFM | FDC_CMD_READ_DATA)
                 .unwrap();
-            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
                 bus.port_out_u8(FDC_FIFO, p).unwrap();
             }
         }
