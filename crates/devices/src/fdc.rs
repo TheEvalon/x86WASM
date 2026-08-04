@@ -145,11 +145,13 @@
 //!   into `sc_eot`.
 //! - FORMAT TRACK (`0x0D` | MFM): Spec Intel 82077AA §5.1.7 / Table 5-1 —
 //!   command byte lower 5 bits `01101`; optional MFM (`0x40`); five params
-//!   (HD|US, N, SC, GPL, D); no media image → skip execution/DMA and the
-//!   per-sector C/H/R/N ID stream, immediate result ST0 (IC=01 abnormal | H |
-//!   US), ST1 NW (Not Writable — §6.2 lists FORMAT TRACK), ST2=0, four
-//!   undefined result bytes = 0; asserts IRQ6 (cleared on first result byte);
-//!   SC latched into `sc_eot`.
+//!   (HD|US, N, SC, GPL, D). Media + [`Self::write_protected`] (WP pin) →
+//!   skip execution/DMA / per-sector C/H/R/N ID stream, result ST0 (IC=01
+//!   abnormal | H | US), ST1 NW (Not Writable — §6.2 lists FORMAT TRACK with
+//!   WRITE DATA), ST2=0, four undefined = 0; no image write. No media, or
+//!   media with WP clear (FORMAT media-write engine still unsupported) → same
+//!   NW abnormal stub. Asserts IRQ6 (cleared on first result byte); SC latched
+//!   into `sc_eot`.
 //! - READ ID (`0x0A` | MFM): Spec Intel 82077AA Table 5-1 / §5.1.8 — command
 //!   byte lower 5 bits `01010`; optional MFM (`0x40`); one HD|US param; 7-byte
 //!   result. With media → ST0 IC=00 | H | US, ST1=ST2=0, sector-ID stub
@@ -161,7 +163,8 @@
 //!   eject, preserved across re-attach/`reset`, cleared by successful
 //!   Recalibrate/Seek when media present (classic disk-change clear);
 //!   `write_protected` / [`Self::set_write_protected`] for ST3 WP and WRITE
-//!   DATA ST1 NW; `reset()` preserves media and write-protect flag like IDE.
+//!   DATA / FORMAT TRACK ST1 NW; `reset()` preserves media and write-protect
+//!   flag like IDE.
 //!   READ DATA success path latches concatenated sectors R..=EOT (MT=0) in
 //!   `last_sector` and arms `dma_read_pending` when DOR bit3 is set for
 //!   MachineBus auto DMA ch2 Write (device→memory; buffer length =
@@ -184,7 +187,6 @@
 //!   timing (DSKCHG stub only)
 //! - Implied seek from Configure EIS; DMA TC early termination mid-transfer
 //!   (this stub completes R..=EOT then presents the full latch to DMA)
-//! - WRITE DATA / FORMAT ST1 NW from WP pin (Sense Drive ST3 WP only this slice)
 //! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
 //! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
 //!   implied seek, poll disable enforcement); DSR software-reset path
@@ -1465,24 +1467,48 @@ impl Fdc82077 {
         self.phase = Phase::FormatTrackParams { index: 0 };
     }
 
-    /// Complete FORMAT TRACK after five parameters — no-media stub.
+    /// Complete FORMAT TRACK after five parameters.
     ///
-    /// Spec: Intel 82077AA §5.1.7 / Table 5-1 / §6.1 / §6.2 — with no media
-    /// image this stub skips the execution phase (DMA and the per-sector
-    /// C/H/R/N ID stream) and enters result immediately: ST0 IC=01 (abnormal
-    /// termination) | H | US; ST1 NW (Not Writable — §6.2 lists FORMAT TRACK
-    /// with WRITE DATA); ST2=0; four undefined result bytes = 0; latches SC
-    /// into `sc_eot` (DUMPREG Table 5-1); asserts IRQ (cleared when the host
-    /// reads the first result byte). No Sense Interrupt.
+    /// Spec: Intel 82077AA §5.1.7 / Table 5-1 / §6.1 / §6.2 —
+    ///
+    /// - With media and [`Self::write_protected`]: skip execution/DMA and the
+    ///   per-sector C/H/R/N ID stream; ST0 IC=01 (abnormal) | H | US, ST1 NW
+    ///   (Not Writable — WP pin; §6.2 lists FORMAT TRACK with WRITE DATA),
+    ///   ST2=0, four undefined = 0; no image write.
+    /// - No media, or media with WP clear: same NW abnormal stub — FORMAT
+    ///   media-write / ID DMA engine is still unsupported (honest reject).
+    ///
+    /// Latches SC into `sc_eot` (DUMPREG Table 5-1); asserts IRQ (cleared when
+    /// the host reads the first result byte). No Sense Interrupt.
     fn finish_format_track(&mut self) {
         let head_unit = self.read_params[0];
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
-        // N (params[1]), GPL (params[3]), D (params[4]) accepted; unused without media.
+        // N (params[1]), GPL (params[3]), D (params[4]) accepted; unused until
+        // FORMAT media-write engine exists.
         let sc = self.read_params[2];
 
         self.sc_eot = sc;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+
+        // Spec: Intel 82077AA §5.1.7 / §6.2 ST1 NW — WP pin during FORMAT TRACK.
+        // (Same result shape as the no-media / no-format-engine stub below.)
+        if self.has_media() && self.write_protected {
+            self.read_result = [
+                FDC_ST0_IC_ABNORMAL | st0_head | unit,
+                FDC_ST1_NW,
+                0x00,
+                0x00, // undefined
+                0x00,
+                0x00,
+                0x00,
+            ];
+            self.irq_pending = true;
+            self.phase = Phase::FormatTrackResult { index: 0 };
+            return;
+        }
+
+        // No media / media+!WP without FORMAT engine → honest NW abnormal.
         self.read_result = [
             FDC_ST0_IC_ABNORMAL | st0_head | unit,
             FDC_ST1_NW,
@@ -4166,6 +4192,100 @@ mod tests {
 
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA §5.1.7 FORMAT TRACK / §6.2 ST1 NW (Not Writable) —
+    /// with media attached and `write_protected`, FORMAT TRACK must not write
+    /// the image; result ST0 IC=01 abnormal | H | US, ST1 NW, ST2=0, four
+    /// undefined = 0; still IRQ6 when DOR DMA/IRQ enable. SC→`sc_eot`.
+    #[test]
+    fn format_track_write_protected_nw_leaves_image_unchanged() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.set_write_protected(true);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // FORMAT TRACK MFM: HD|US, N=2, SC=18, GPL, D — params that would
+        // format a track once a media-write engine exists.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_FORMAT_TRACK));
+        for p in [0x00u8, 0x02, 0x12, 0x54, 0xF6] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(
+            f.irq_line(),
+            "FORMAT TRACK WP abort still asserts IRQ6 when DOR DMA/IRQ enable"
+        );
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0, FDC_ST0_IC_ABNORMAL,
+            "ST0 = IC=01 | H=0 | US=0 (abnormal — Not Writable)"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST1_NW,
+            "ST1 NW — write protect pin / Not Writable (82077AA §6.2)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        // Spec: 82077AA Table 5-1 — remaining four result bytes undefined.
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12, "SC still latched for DUMPREG");
+
+        let sector = f.read_sector(0, 0, 1).expect("media still attached");
+        assert!(
+            sector.iter().all(|&b| b == 0xAA),
+            "write-protected FORMAT TRACK must not modify the image"
+        );
+        // Sample another sector on the same head/track that FORMAT would touch.
+        let sector18 = f.read_sector(0, 0, 18).expect("media");
+        assert!(
+            sector18.iter().all(|&b| b == 0xAA),
+            "FORMAT WP must not fill track sectors"
+        );
+    }
+
+    /// Spec: Intel 82077AA §5.1.7 — media attached with WP clear still has no
+    /// FORMAT media-write engine this slice; honest NW abnormal stub (same
+    /// shape as no-media / media+WP), image unchanged.
+    #[test]
+    fn format_track_media_not_wp_still_nw_stub_no_write() {
+        let mut f = Fdc82077::with_image(vec![0x55u8; FDC_1440_IMAGE_SIZE]);
+        assert!(!f.write_protected);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_FORMAT_TRACK));
+        for p in [0x04u8, 0x02, 0x12, 0x54, 0xF6] {
+            // head1 / unit0
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=01 | H | US (FORMAT engine unsupported)"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST1_NW,
+            "ST1 NW — no FORMAT media write yet (honest stub)"
+        );
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12);
+
+        let sector = f.read_sector(0, 1, 1).expect("media");
+        assert!(
+            sector.iter().all(|&b| b == 0x55),
+            "FORMAT stub must not write fill byte into image"
+        );
     }
 
     /// Spec: Intel 82077AA §5.1.3 / Table 5-1 — READ DELETED DATA opcode `0x0C`
