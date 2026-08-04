@@ -76,6 +76,14 @@ pub const PCI_SUBCLASS_USB: u8 = 0x03;
 pub const PCI_PROG_IF_UHCI: u8 = 0x00;
 /// Header type multi-function bit.
 pub const PCI_HEADER_MULTIFUNCTION: u8 = 0x80;
+/// PIIX IDE Bus Master IDE Base Address Register (BMIBA) config offset.
+/// Spec: Intel 82371SB — PCI config dword at `0x20` is an I/O BAR (bit0=1).
+pub const PCI_PIIX_IDE_BMIBA_OFFSET: u8 = 0x20;
+/// BMIBA I/O space indicator bit (PCI I/O BAR bit0).
+pub const PCI_BAR_IO_SPACE: u32 = 0x01;
+/// BMIBA size decode mask — 16-byte aligned I/O base (bits 15:4); low nibble
+/// forced to `0001` (I/O space). Spec: PCI I/O BAR + PIIX BMIBA.
+pub const PCI_PIIX_IDE_BMIBA_MASK: u32 = 0xFFF0;
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -361,6 +369,7 @@ impl PciConfig {
         let base = self.reg_offset() as usize;
         let lane = (port - PCI_CONFIG_DATA) as usize;
         let off = base + lane;
+        let is_piix_ide = self.bus() == 0 && self.device() == 1 && self.function() == 1;
         // Identity / class / header type are read-only in this stub.
         let readonly = |o: usize| matches!(o, 0x00..=0x03 | 0x08..=0x0B | 0x0E);
         let Some(cfg) = self.selected_cfg_mut() else {
@@ -391,6 +400,15 @@ impl PciConfig {
                 }
             }
             _ => {}
+        }
+        // Spec: Intel 82371SB / PCI — PIIX IDE BMIBA at config 0x20 is an I/O BAR:
+        // bit0 hardwired 1; address bits 15:4 programmable; bits 3:1 zero.
+        // Store/readback only — no BMIDE port decode yet.
+        if is_piix_ide && base == PCI_PIIX_IDE_BMIBA_OFFSET as usize && lane == 0 && size == 4 {
+            let masked = (value & PCI_PIIX_IDE_BMIBA_MASK) | PCI_BAR_IO_SPACE;
+            let bytes = masked.to_le_bytes();
+            cfg[PCI_PIIX_IDE_BMIBA_OFFSET as usize..PCI_PIIX_IDE_BMIBA_OFFSET as usize + 4]
+                .copy_from_slice(&bytes);
         }
     }
 
@@ -597,6 +615,48 @@ mod tests {
         assert_eq!((class_dword >> 24) as u8, PCI_CLASS_STORAGE);
         assert_eq!((class_dword >> 16) as u8, PCI_SUBCLASS_IDE);
         assert_eq!((class_dword >> 8) as u8, 0x80); // prog IF bus-master capable bit
+    }
+
+    /// Spec: Intel 82371SB — PIIX IDE BMIBA at PCI config `0x20` is an I/O BAR
+    /// (bit0=1); bits 15:4 hold the 16-byte-aligned I/O base; store/readback only.
+    #[test]
+    fn piix_ide_bmiba_io_bar_store_readback() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+        );
+        // Default after init is 0.
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0);
+
+        // Guest programs base 0xF000 with junk low bits; device forces I/O BAR form.
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F00E);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 4),
+            0x0000_F001,
+            "BMIBA: bits15:4 kept, bit0=1, bits3:1=0"
+        );
+
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_C000);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x0000_C001);
+    }
+
+    #[test]
+    fn piix_ide_bmiba_does_not_alter_other_functions() {
+        // Writing BMIBA-shaped value at host bridge BAR0 offset must not force I/O form.
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F000);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 4),
+            0x0000_F000,
+            "non-IDE function keeps raw writable dword"
+        );
     }
 
     #[test]
