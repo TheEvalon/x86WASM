@@ -1875,7 +1875,7 @@ mod tests {
             assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x00);
             assert_eq!(bus.poll_external_irq(), None);
         }
-        assert_eq!(m.fdc.pcn, 0);
+        assert_eq!(m.fdc.pcn[1], 0);
         m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
     }
 
@@ -1900,7 +1900,7 @@ mod tests {
             assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x14);
             assert_eq!(bus.poll_external_irq(), None);
         }
-        assert_eq!(m.fdc.pcn, 0x14);
+        assert_eq!(m.fdc.pcn[1], 0x14);
         m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
     }
 

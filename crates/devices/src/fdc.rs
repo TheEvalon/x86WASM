@@ -40,18 +40,20 @@
 //! - Specify (`0x03`): command byte → two parameter bytes (stored); no result;
 //!   does not assert or clear IRQ; MSR RQM (!DIO) during parameter phase
 //! - Recalibrate (`0x07`): command byte → one unit-select parameter (bits 1:0);
-//!   sets `pcn = 0`, latches ST0 Seek End (`0x20 | unit`) for Sense Interrupt,
-//!   asserts IRQ; MSR RQM (!DIO) during parameter phase; no result phase
-//! - Seek (`0x0F`): command byte → HD|US + NCN; sets `pcn = NCN`, latches ST0
-//!   Seek End (`0x20 | unit`; H bit always 0 per 82077AA), asserts IRQ; no result
+//!   sets `pcn[unit] = 0`, latches ST0 Seek End (`0x20 | unit`) for Sense
+//!   Interrupt, asserts IRQ; MSR RQM (!DIO) during parameter phase; no result
+//! - Seek (`0x0F`): command byte → HD|US + NCN; sets `pcn[unit] = NCN`, latches
+//!   ST0 Seek End (`0x20 | unit`; H bit always 0 per 82077AA), asserts IRQ; no
+//!   result
 //! - Sense Interrupt Status (`0x08`): command byte → 2-byte result (ST0, PCN);
 //!   returns latched Recalibrate/Seek ST0 when present, else post-reset/`assert_irq6`
-//!   stub `0xC0 | DOR[1:0]`; clears latched IRQ; MSR RQM|DIO during result phase
+//!   stub `0xC0 | DOR[1:0]`; PCN is Present Cylinder Number for ST0 US bits
+//!   (`pcn[ST0[1:0]]`); clears latched IRQ; MSR RQM|DIO during result phase
 //! - Sense Drive Status (`0x04`): command byte → one HD|US parameter (same
 //!   packing as Seek param0) → 1-byte ST3 result; no execution phase, no IRQ
-//!   assert/clear; T0 stub reflects `pcn == 0` (single shared `pcn`, not
-//!   per-drive); WP stub always 0 (no media); reserved bits 3/5 always 1 per
-//!   82077AA §6.4; MSR RQM during parameter, RQM|DIO during result phase
+//!   assert/clear; T0 stub reflects `pcn[unit] == 0` for the selected unit;
+//!   WP stub always 0 (no media); reserved bits 3/5 always 1 per 82077AA §6.4;
+//!   MSR RQM during parameter, RQM|DIO during result phase
 //! - Version (`0x10`): command byte → 1-byte result `0x90` (82077AA id); no
 //!   parameters, no IRQ assert/clear; MSR RQM|DIO during result phase
 //! - Configure (`0x13`): command byte → three parameter bytes stored
@@ -71,11 +73,10 @@
 //!   Gap2/WGATE timing side effects are not enforced (no media engine).
 //! - DUMPREG (`0x0E`): Spec Intel 82077AA §5.2.10 / Table 5-1 / §5.3.3 — no
 //!   parameters; 10-byte result from stored state with MSR RQM|DIO; no IRQ.
-//!   Result order: PCN0–3, SRT|HUT, HLT|ND, SC/EOT, LOCK|0|D3–D0|GAP|WGATE,
-//!   0|EIS|EFIFO|POLL|FIFOTHR, PRETRK. Stub: single shared `pcn` mirrored to
-//!   all four PCN bytes; `sc_eot` defaults 0 (no READ/WRITE/FORMAT yet);
-//!   byte7 bits 5:0 reflect stored PERPENDICULAR D3–D0|GAP|WGATE (OW not
-//!   returned).
+//!   Result order: PCN0–3 (per-drive Present Cylinder Numbers), SRT|HUT, HLT|ND,
+//!   SC/EOT, LOCK|0|D3–D0|GAP|WGATE, 0|EIS|EFIFO|POLL|FIFOTHR, PRETRK.
+//!   `sc_eot` defaults 0 (no READ/WRITE/FORMAT yet); byte7 bits 5:0 reflect
+//!   stored PERPENDICULAR D3–D0|GAP|WGATE (OW not returned).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
@@ -86,7 +87,7 @@
 //! - Automatic IRQ on real media command completion (host may still use assert API)
 //! - Drive sensing, disk-change edge timing
 //! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
-//! - Per-drive PCN (DUMPREG mirrors shared `pcn`); SC/EOT update from media cmds
+//! - SC/EOT update from media cmds
 //! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
 //!   implied seek, poll disable enforcement); DSR software-reset path
 
@@ -220,8 +221,11 @@ pub struct Fdc82077 {
     pub srb: u8,
     /// Digital Input Register read value (disk-change stub; bit7 often media).
     pub dir: u8,
-    /// Present cylinder number stub (Sense Interrupt result byte 2).
-    pub pcn: u8,
+    /// Per-drive Present Cylinder Numbers (PCN0–PCN3). Spec: Intel 82077AA
+    /// Recalibrate/Seek/Sense Interrupt / DUMPREG Table 5-1 — each unit keeps
+    /// its own PCN; Recalibrate/Seek update the selected unit only; Sense
+    /// Interrupt reports `pcn[ST0[1:0]]`; DUMPREG returns all four.
+    pub pcn: [u8; 4],
     /// Specify parameter 1: SRT (bits 7–4) | HUT (bits 3–0). Spec: 82077AA.
     pub specify_srt_hut: u8,
     /// Specify parameter 2: HLT (bits 7–1) | ND (bit 0). Spec: 82077AA.
@@ -259,6 +263,8 @@ pub struct Fdc82077 {
     seek_head_unit: u8,
     /// Sense Interrupt ST0 result byte (set when entering result phase).
     sense_st0: u8,
+    /// Sense Interrupt PCN result byte (PCN of unit in `sense_st0` US bits).
+    sense_pcn: u8,
     /// Sense Drive Status ST3 result byte (set when entering result phase).
     sense_st3: u8,
 }
@@ -282,7 +288,7 @@ impl Fdc82077 {
             sra: 0x00,
             srb: 0x00,
             dir: 0x00,
-            pcn: 0x00,
+            pcn: [0x00; 4],
             specify_srt_hut: 0x00,
             specify_hlt_nd: 0x00,
             configure_byte0: 0x00,
@@ -297,6 +303,7 @@ impl Fdc82077 {
             pending_sense_st0: None,
             seek_head_unit: 0,
             sense_st0: 0,
+            sense_pcn: 0,
             sense_st3: 0,
         }
     }
@@ -390,13 +397,13 @@ impl Fdc82077 {
 
     /// Complete Recalibrate after unit-select parameter.
     ///
-    /// Spec: Intel 82077AA Recalibrate — retracts head to track 0; on completion
-    /// PCN=0, ST0 SE|US (`0x20 | unit`), interrupt asserted; host uses Sense
-    /// Interrupt Status (no Recalibrate result phase).
+    /// Spec: Intel 82077AA Recalibrate — retracts selected unit head to track 0;
+    /// on completion that unit's PCN=0, ST0 SE|US (`0x20 | unit`), interrupt
+    /// asserted; host uses Sense Interrupt Status (no Recalibrate result phase).
     fn finish_recalibrate(&mut self, param: u8) {
-        let unit = param & 0x03;
-        self.pcn = 0;
-        self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | unit);
+        let unit = (param & 0x03) as usize;
+        self.pcn[unit] = 0;
+        self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | (unit as u8));
         self.irq_pending = true;
         self.phase = Phase::Command;
     }
@@ -409,13 +416,14 @@ impl Fdc82077 {
 
     /// Complete Seek after NCN parameter.
     ///
-    /// Spec: Intel 82077AA Seek — steps to NCN; on completion PCN=NCN, ST0
-    /// SE|US (`0x20 | unit`; H in ST0 always 0), interrupt asserted; host uses
-    /// Sense Interrupt Status (no Seek result phase). OSDev: param0 = (HD<<2)|US.
+    /// Spec: Intel 82077AA Seek — steps selected unit to NCN; on completion that
+    /// unit's PCN=NCN, ST0 SE|US (`0x20 | unit`; H in ST0 always 0), interrupt
+    /// asserted; host uses Sense Interrupt Status (no Seek result phase).
+    /// OSDev: param0 = (HD<<2)|US.
     fn finish_seek(&mut self, ncn: u8) {
-        let unit = self.seek_head_unit & 0x03;
-        self.pcn = ncn;
-        self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | unit);
+        let unit = (self.seek_head_unit & 0x03) as usize;
+        self.pcn[unit] = ncn;
+        self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | (unit as u8));
         self.irq_pending = true;
         self.phase = Phase::Command;
     }
@@ -426,11 +434,13 @@ impl Fdc82077 {
     /// PCN; clears interrupt. When a seek-class command latched ST0 (Recalibrate
     /// / Seek), return that value; otherwise ST0 IC=11 (`0xC0`) models post-reset
     /// “ready line changed” / `assert_irq6`-only status; unit select from DOR[1:0].
+    /// PCN is the Present Cylinder Number for the unit in ST0 bits 1:0.
     fn start_sense_interrupt(&mut self) {
         self.sense_st0 = self
             .pending_sense_st0
             .take()
             .unwrap_or(FDC_ST0_IC_READY_CHANGE | (self.dor & 0x03));
+        self.sense_pcn = self.pcn[(self.sense_st0 & 0x03) as usize];
         self.irq_pending = false;
         self.phase = Phase::SenseIntResult { index: 0 };
     }
@@ -444,12 +454,13 @@ impl Fdc82077 {
     ///
     /// Spec: Intel 82077AA §5.2.5/§6.4 — no execution phase, goes directly to
     /// the result phase; ST3 bits 2:0 echo the HD|US parameter, T0 stub
-    /// reflects `pcn == 0` (single shared `pcn`, not per-drive in this stub),
-    /// WP stub always 0 (no media), reserved bits 3/5 always 1. No IRQ.
+    /// reflects `pcn[unit] == 0` for the selected unit, WP stub always 0 (no
+    /// media), reserved bits 3/5 always 1. No IRQ.
     fn finish_sense_drive_status(&mut self, param: u8) {
         let head_unit = param & (FDC_ST3_HEAD | FDC_ST3_UNIT_MASK);
+        let unit = (param & FDC_ST3_UNIT_MASK) as usize;
         let mut st3 = head_unit | FDC_ST3_RESERVED_BIT3 | FDC_ST3_RESERVED_BIT5;
-        if self.pcn == 0 {
+        if self.pcn[unit] == 0 {
             st3 |= FDC_ST3_TRACK0;
         }
         self.sense_st3 = st3;
@@ -506,7 +517,7 @@ impl Fdc82077 {
     /// One DUMPREG result byte by index. Spec: Intel 82077AA Table 5-1 / §5.3.3.
     fn dumpreg_byte(&self, index: u8) -> u8 {
         match index {
-            0..=3 => self.pcn, // shared PCN stub → all four drive slots
+            0..=3 => self.pcn[index as usize], // PCN0–PCN3 per drive
             4 => self.specify_srt_hut,
             5 => self.specify_hlt_nd,
             6 => self.sc_eot,
@@ -536,7 +547,7 @@ impl Fdc82077 {
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
-                    _ => self.pcn,
+                    _ => self.sense_pcn,
                 };
                 if index >= 1 {
                     self.phase = Phase::Command;
@@ -808,7 +819,7 @@ mod tests {
             1,
             u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01),
         );
-        f.pcn = 0x12;
+        f.pcn[1] = 0x12; // ST0 US will be DOR[1:0]=1
         f.assert_irq6();
         assert!(f.irq_line());
 
@@ -829,7 +840,7 @@ mod tests {
             "still in result after ST0"
         );
         let pcn = f.port_read(FDC_FIFO, 1) as u8;
-        assert_eq!(pcn, 0x12);
+        assert_eq!(pcn, 0x12, "PCN of unit 1");
         assert_eq!(
             f.port_read(FDC_MSR, 1) as u8,
             FDC_MSR_RQM,
@@ -938,7 +949,7 @@ mod tests {
             1,
             u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01),
         );
-        f.pcn = 0x2A;
+        f.pcn = [0x2A; 4];
         assert!(!f.irq_line());
 
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
@@ -953,7 +964,8 @@ mod tests {
 
         // Unit select = 2 (bits 1:0); upper bits ignored by stub.
         f.port_write(FDC_FIFO, 1, 0x12);
-        assert_eq!(f.pcn, 0, "Recalibrate forces PCN=0");
+        assert_eq!(f.pcn[2], 0, "Recalibrate forces selected unit PCN=0");
+        assert_eq!(f.pcn[0], 0x2A, "other units' PCN unchanged");
         assert_eq!(f.phase, Phase::Command);
         assert!(f.irq_line(), "Recalibrate asserts IRQ on completion");
         assert_eq!(
@@ -1013,12 +1025,12 @@ mod tests {
     #[test]
     fn recalibrate_ignored_while_held_in_dor_reset() {
         let mut f = Fdc82077::new();
-        f.pcn = 0x05;
+        f.pcn = [0x05; 4];
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RECALIBRATE));
         f.port_write(FDC_FIFO, 1, 0x01);
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
-        assert_eq!(f.pcn, 0x05, "ignored while reset");
+        assert_eq!(f.pcn, [0x05; 4], "ignored while reset");
         assert!(!f.irq_line());
         assert_eq!(f.phase, Phase::Command);
     }
@@ -1050,7 +1062,7 @@ mod tests {
             1,
             u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01),
         );
-        f.pcn = 0x00;
+        f.pcn = [0x00; 4];
         assert!(!f.irq_line());
 
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
@@ -1066,11 +1078,12 @@ mod tests {
         // Param0: head=1 (bit2) | unit=2 (bits1:0) → 0x06; ST0 H always 0 per 82077AA.
         f.port_write(FDC_FIFO, 1, 0x06);
         assert_eq!(f.phase, Phase::SeekParams { index: 1 });
-        assert_eq!(f.pcn, 0x00, "PCN unchanged until NCN");
+        assert_eq!(f.pcn[2], 0x00, "PCN unchanged until NCN");
         assert!(!f.irq_line());
 
         f.port_write(FDC_FIFO, 1, 0x28); // NCN
-        assert_eq!(f.pcn, 0x28, "Seek sets PCN = NCN");
+        assert_eq!(f.pcn[2], 0x28, "Seek sets selected unit PCN = NCN");
+        assert_eq!(f.pcn[0], 0x00, "other units' PCN unchanged");
         assert_eq!(f.phase, Phase::Command);
         assert!(f.irq_line(), "Seek asserts IRQ on completion");
         assert_eq!(
@@ -1089,12 +1102,12 @@ mod tests {
     }
 
     /// Spec: Intel 82077AA Sense Drive Status — opcode `0x04`, HD|US param, ST3
-    /// result (no execution phase, no IRQ). Track 0 reflects `pcn==0` (stub).
+    /// result (no execution phase, no IRQ). Track 0 reflects `pcn[unit]==0`.
     #[test]
     fn sense_drive_status_result_reflects_track0_head_and_unit() {
         let mut f = Fdc82077::new();
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
-        f.pcn = 0x00;
+        f.pcn = [0x00; 4];
 
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
@@ -1117,7 +1130,7 @@ mod tests {
         assert_eq!(
             st3,
             FDC_ST3_TRACK0 | FDC_ST3_RESERVED_BIT5 | FDC_ST3_RESERVED_BIT3 | 0x06,
-            "T0 (pcn==0) | reserved bits | HD|US from param"
+            "T0 (pcn[unit]==0) | reserved bits | HD|US from param"
         );
         assert_eq!(
             f.port_read(FDC_MSR, 1) as u8,
@@ -1142,12 +1155,13 @@ mod tests {
         );
     }
 
-    /// Spec: T0 bit reflects TRK0 pin state (stub: `pcn==0`); clear when pcn!=0.
+    /// Spec: T0 bit reflects TRK0 pin state (stub: `pcn[unit]==0`); clear when
+    /// that unit's PCN is nonzero.
     #[test]
     fn sense_drive_status_track0_clear_when_pcn_nonzero() {
         let mut f = Fdc82077::new();
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
-        f.pcn = 0x28;
+        f.pcn[1] = 0x28;
 
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
         f.port_write(FDC_FIFO, 1, 0x01); // unit 1, head 0
@@ -1155,7 +1169,7 @@ mod tests {
         assert_eq!(
             st3 & FDC_ST3_TRACK0,
             0,
-            "T0 clear when pcn!=0 (stub, single shared pcn)"
+            "T0 clear when selected unit pcn!=0"
         );
         assert_eq!(st3 & 0x07, 0x01, "HD|US preserved from param");
     }
@@ -1231,13 +1245,13 @@ mod tests {
     #[test]
     fn seek_ignored_while_held_in_dor_reset() {
         let mut f = Fdc82077::new();
-        f.pcn = 0x05;
+        f.pcn = [0x05; 4];
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
         f.port_write(FDC_FIFO, 1, 0x01);
         f.port_write(FDC_FIFO, 1, 0x20);
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
-        assert_eq!(f.pcn, 0x05, "ignored while reset");
+        assert_eq!(f.pcn, [0x05; 4], "ignored while reset");
         assert!(!f.irq_line());
         assert_eq!(f.phase, Phase::Command);
     }
@@ -1663,7 +1677,7 @@ mod tests {
         f.port_write(FDC_FIFO, 1, 0x0A); // PRETRK
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
         let _ = f.port_read(FDC_FIFO, 1);
-        f.pcn = 0x2A;
+        f.pcn = [0x2A; 4];
         f.sc_eot = 0x12;
 
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
@@ -1689,7 +1703,7 @@ mod tests {
         assert_eq!(
             &result[0..4],
             &[0x2A, 0x2A, 0x2A, 0x2A],
-            "PCN0–3 shared stub"
+            "PCN0–3 from per-drive array"
         );
         assert_eq!(result[4], 0xDF, "SRT|HUT");
         assert_eq!(result[5], 0x02, "HLT|ND");
@@ -1747,7 +1761,7 @@ mod tests {
     fn dor_reset_aborts_dumpreg_result_phase() {
         let mut f = Fdc82077::new();
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
-        f.pcn = 0x55;
+        f.pcn = [0x55; 4];
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
         assert_eq!(f.phase, Phase::DumpRegResult { index: 0 });
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM | FDC_MSR_DIO);
@@ -1937,6 +1951,115 @@ mod tests {
         }
         // LOCK<<7 | D3–D0<<2 | GAP|WGATE = 0x80 | (0x09<<2) | 0x02 = 0xA6
         assert_eq!(result[7], 0xA6, "LOCK|0|D3–D0|GAP|WGATE");
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA — each drive has its own Present Cylinder Number;
+    /// Recalibrate/Seek update only the selected unit (US bits).
+    #[test]
+    fn per_drive_pcn_seek_and_recalibrate_update_selected_unit_only() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // Seek unit 0 → NCN 0x10.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x00); // HD=0 | US=0
+        f.port_write(FDC_FIFO, 1, 0x10);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x10);
+
+        // Seek unit 1 → NCN 0x20.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x01); // US=1
+        f.port_write(FDC_FIFO, 1, 0x20);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END | 0x01);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x20);
+
+        assert_eq!(f.pcn[0], 0x10);
+        assert_eq!(f.pcn[1], 0x20);
+        assert_eq!(f.pcn[2], 0x00);
+        assert_eq!(f.pcn[3], 0x00);
+
+        // Recalibrate unit 0 only.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RECALIBRATE));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert_eq!(f.pcn[0], 0);
+        assert_eq!(
+            f.pcn[1], 0x20,
+            "unit 1 PCN preserved across unit-0 recalibrate"
+        );
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0);
+    }
+
+    /// Spec: Intel 82077AA Sense Interrupt — result PCN is the Present Cylinder
+    /// Number for the unit encoded in ST0 bits 1:0.
+    #[test]
+    fn sense_interrupt_reports_pcn_of_st0_unit() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.pcn = [0x11, 0x22, 0x33, 0x44];
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x03); // US=3
+        f.port_write(FDC_FIFO, 1, 0x55); // NCN overwrites pcn[3]
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_SEEK_END | 0x03);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x55);
+        assert_eq!(f.pcn, [0x11, 0x22, 0x33, 0x55]);
+
+        // Post-reset / assert_irq6 Sense Interrupt uses DOR US for PCN index.
+        f.port_write(
+            FDC_DOR,
+            1,
+            u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x02),
+        );
+        f.assert_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST0_IC_READY_CHANGE | 0x02
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x33, "PCN of DOR unit 2");
+    }
+
+    /// Spec: Intel 82077AA §5.2.5/§6.4 — Sense Drive Status T0 reflects the
+    /// selected unit's TRK0 / PCN, not a shared cylinder.
+    #[test]
+    fn sense_drive_status_t0_uses_selected_unit_pcn() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.pcn[0] = 0x05; // off track 0
+        f.pcn[1] = 0x00; // at track 0
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00); // unit 0
+        let st3_u0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st3_u0 & FDC_ST3_TRACK0, 0, "unit 0 off track 0");
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x01); // unit 1
+        let st3_u1 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st3_u1 & FDC_ST3_TRACK0, FDC_ST3_TRACK0, "unit 1 at track 0");
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 / §5.3.3 — DUMPREG result bytes 0–3 are
+    /// distinct PCN0–PCN3.
+    #[test]
+    fn dumpreg_reports_distinct_per_drive_pcn() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.pcn = [0x01, 0x02, 0x03, 0x04];
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        let mut result = [0u8; FDC_DUMPREG_RESULT_LEN as usize];
+        for byte in &mut result {
+            *byte = f.port_read(FDC_FIFO, 1) as u8;
+        }
+        assert_eq!(&result[0..4], &[0x01, 0x02, 0x03, 0x04], "PCN0–PCN3");
         assert_eq!(f.phase, Phase::Command);
     }
 }
