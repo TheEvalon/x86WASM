@@ -1,5 +1,5 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
-//! Sense Int/Sense Drive/Version/Configure/LOCK + IRQ6.
+//! Sense Int/Sense Drive/Version/Configure/LOCK/DUMPREG + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -17,13 +17,15 @@
 //!   `0x90` (82077AA identification); Configure (`0x13`) three parameter bytes
 //!   (unused, EIS|FIFO_DIS|POLL_DIS|FIFOTHR, PRETRK), no result/IRQ; LOCK
 //!   (`0x14`/`0x94`, §5.3.2) no params, LOCK in command bit7, result
-//!   `LOCK<<4`, no IRQ; DOR bit3 DMA/IRQ enable; IRQ6 on command / reset
-//!   completion.
+//!   `LOCK<<4`, no IRQ; DUMPREG (`0x0E`, §5.2.10 / §5.3.3) no params, 10-byte
+//!   result (PCN0–3, SRT|HUT, HLT|ND, SC/EOT, LOCK|perp, Configure, PRETRK),
+//!   no IRQ; DOR bit3 DMA/IRQ enable; IRQ6 on command / reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
 //!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
 //!   Version returns `0x90` for 82077AA-class controllers; Configure stores
-//!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes; Lock/Unlock via MT bit.
+//!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes; Lock/Unlock via MT bit;
+//!   DUMPREG dumps internal registers.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -58,15 +60,22 @@
 //!   soft reset restores Configure EFIFO/FIFOTHR/PRETRK stub defaults (0);
 //!   when LOCK=1 those Configure fields survive soft reset. Full `reset()`
 //!   (hardware) clears LOCK and all Configure fields.
+//! - DUMPREG (`0x0E`): Spec Intel 82077AA §5.2.10 / Table 5-1 / §5.3.3 — no
+//!   parameters; 10-byte result from stored state with MSR RQM|DIO; no IRQ.
+//!   Result order: PCN0–3, SRT|HUT, HLT|ND, SC/EOT, LOCK|0|D3–D0|GAP|WGATE,
+//!   0|EIS|EFIFO|POLL|FIFOTHR, PRETRK. Stub: single shared `pcn` mirrored to
+//!   all four PCN bytes; `sc_eot` defaults 0 (no READ/WRITE/FORMAT yet);
+//!   perpendicular D3–D0/GAP/WGATE always 0 until PERPENDICULAR exists.
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - Other commands (READ/WRITE/FORMAT/PERPENDICULAR/DUMPREG/…)
+//! - Other commands (READ/WRITE/FORMAT/PERPENDICULAR/…)
 //! - Media image, seek step timing, format/read/write transfers
 //! - DMA channel 2 transfers (ND bit stored only; not enforced)
 //! - Automatic IRQ on real media command completion (host may still use assert API)
 //! - Drive sensing, disk-change edge timing, perpendicular mode
+//! - Per-drive PCN (DUMPREG mirrors shared `pcn`); SC/EOT update from media cmds
 //! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
 //!   implied seek, poll disable enforcement); DSR software-reset path
 
@@ -105,6 +114,11 @@ pub const FDC_CMD_SPECIFY: u8 = 0x03;
 pub const FDC_CMD_RECALIBRATE: u8 = 0x07;
 /// Sense Interrupt Status command opcode. Spec: Intel 82077AA / OSDev FDC.
 pub const FDC_CMD_SENSE_INT: u8 = 0x08;
+/// DUMPREG command opcode. Spec: Intel 82077AA §5.2.10 / Table 5-1 — no
+/// parameters; 10-byte result dumping internal registers; no IRQ.
+pub const FDC_CMD_DUMPREG: u8 = 0x0E;
+/// Number of DUMPREG result bytes. Spec: Intel 82077AA Table 5-1 / §5.3.3.
+pub const FDC_DUMPREG_RESULT_LEN: u8 = 10;
 /// Seek command opcode. Spec: Intel 82077AA / OSDev FDC — HD|US + NCN.
 pub const FDC_CMD_SEEK: u8 = 0x0F;
 /// Version command opcode. Spec: Intel 82077AA / OSDev FDC — no parameters,
@@ -168,9 +182,12 @@ enum Phase {
     ConfigureParams { index: u8 },
     /// LOCK result: single status byte (`LOCK<<4`). Spec: 82077AA §5.3.2.
     LockResult,
+    /// DUMPREG result: 10 bytes (index 0..9). Spec: 82077AA §5.2.10 / §5.3.3.
+    DumpRegResult { index: u8 },
 }
 
-/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/Configure/LOCK + IRQ6.
+/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/
+/// Configure/LOCK/DUMPREG + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -204,6 +221,10 @@ pub struct Fdc82077 {
     /// when set, soft DOR/DSR reset must not restore Configure EFIFO/FIFOTHR/
     /// PRETRK defaults; hardware/`reset()` clears LOCK.
     pub lock: bool,
+    /// Last SC (FORMAT) or EOT (READ/WRITE/…) parameter. Spec: Intel 82077AA
+    /// Table 5-1 note — DUMPREG result byte 6. Stub defaults to 0 until media
+    /// commands exist.
+    pub sc_eot: u8,
     /// Latched IRQ request (command-complete / reset stub). Spec: 82077AA → ISA IRQ6.
     irq_pending: bool,
     phase: Phase,
@@ -243,6 +264,7 @@ impl Fdc82077 {
             configure_eis_fifo_poll_thr: 0x00,
             configure_pretrk: 0x00,
             lock: false,
+            sc_eot: 0x00,
             irq_pending: false,
             phase: Phase::Command,
             pending_sense_st0: None,
@@ -285,7 +307,8 @@ impl Fdc82077 {
                 Phase::SenseIntResult { .. }
                 | Phase::SenseDriveStatusResult
                 | Phase::VersionResult
-                | Phase::LockResult => FDC_MSR_RQM | FDC_MSR_DIO,
+                | Phase::LockResult
+                | Phase::DumpRegResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
             }
         }
     }
@@ -423,6 +446,29 @@ impl Fdc82077 {
         self.phase = Phase::LockResult;
     }
 
+    /// Begin DUMPREG result phase. Spec: Intel 82077AA §5.2.10 / Table 5-1 /
+    /// §5.3.3 / OSDev FDC.
+    ///
+    /// No parameters; 10 result bytes from stored registers; no IRQ.
+    fn start_dumpreg(&mut self) {
+        self.phase = Phase::DumpRegResult { index: 0 };
+    }
+
+    /// One DUMPREG result byte by index. Spec: Intel 82077AA Table 5-1 / §5.3.3.
+    fn dumpreg_byte(&self, index: u8) -> u8 {
+        match index {
+            0..=3 => self.pcn, // shared PCN stub → all four drive slots
+            4 => self.specify_srt_hut,
+            5 => self.specify_hlt_nd,
+            6 => self.sc_eot,
+            // LOCK | 0 | D3 D2 D1 D0 | GAP | WGATE — perp bits stub 0.
+            7 => u8::from(self.lock) << 7,
+            8 => self.configure_eis_fifo_poll_thr & 0x7F, // bit7 always 0
+            9 => self.configure_pretrk,
+            _ => 0xFF,
+        }
+    }
+
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
             // Spec: Specify/Recalibrate/Seek/Configure have no result phase; open-bus when idle/params.
@@ -456,6 +502,15 @@ impl Fdc82077 {
                 self.phase = Phase::Command;
                 u8::from(self.lock) << FDC_LOCK_RESULT_SHIFT
             }
+            Phase::DumpRegResult { index } => {
+                let v = self.dumpreg_byte(index);
+                if index + 1 >= FDC_DUMPREG_RESULT_LEN {
+                    self.phase = Phase::Command;
+                } else {
+                    self.phase = Phase::DumpRegResult { index: index + 1 };
+                }
+                v
+            }
         }
     }
 
@@ -480,6 +535,9 @@ impl Fdc82077 {
                 } else if v == FDC_CMD_SENSE_DRIVE_STATUS {
                     // Spec: Intel 82077AA §5.2.5 — expect HD|US param; no IRQ.
                     self.start_sense_drive_status();
+                } else if v == FDC_CMD_DUMPREG {
+                    // Spec: Intel 82077AA §5.2.10 — no params; 10-byte result; no IRQ.
+                    self.start_dumpreg();
                 } else if v == FDC_CMD_VERSION {
                     // Spec: Intel 82077AA Version — no params; result 0x90; no IRQ.
                     self.start_version();
@@ -546,7 +604,8 @@ impl Fdc82077 {
             Phase::SenseIntResult { .. }
             | Phase::SenseDriveStatusResult
             | Phase::VersionResult
-            | Phase::LockResult => {
+            | Phase::LockResult
+            | Phase::DumpRegResult { .. } => {
                 // Host must not write during result phase (stub ignores).
             }
         }
@@ -1522,6 +1581,147 @@ mod tests {
         assert!(f.lock);
         f.reset();
         assert!(!f.lock);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA §5.2.10 / Table 5-1 / §5.3.3 — DUMPREG (`0x0E`) has
+    /// no parameters; 10-byte result from stored registers; MSR RQM|DIO; no IRQ.
+    #[test]
+    fn dumpreg_returns_ten_bytes_from_stored_state() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // Seed Specify / Configure / LOCK / PCN / SC-EOT stub state.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SPECIFY));
+        f.port_write(FDC_FIFO, 1, 0xDF); // SRT|HUT
+        f.port_write(FDC_FIFO, 1, 0x02); // HLT|ND
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x57); // EIS|EFIFO|POLL|FIFOTHR
+        f.port_write(FDC_FIFO, 1, 0x0A); // PRETRK
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        let _ = f.port_read(FDC_FIFO, 1);
+        f.pcn = 0x2A;
+        f.sc_eot = 0x12;
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        assert_eq!(f.phase, Phase::DumpRegResult { index: 0 });
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(!f.irq_line(), "DUMPREG must not assert IRQ");
+
+        let mut result = [0u8; FDC_DUMPREG_RESULT_LEN as usize];
+        for byte in &mut result {
+            assert_eq!(
+                f.port_read(FDC_MSR, 1) as u8,
+                FDC_MSR_RQM | FDC_MSR_DIO,
+                "RQM|DIO until last result byte"
+            );
+            *byte = f.port_read(FDC_FIFO, 1) as u8;
+        }
+
+        assert_eq!(
+            &result[0..4],
+            &[0x2A, 0x2A, 0x2A, 0x2A],
+            "PCN0–3 shared stub"
+        );
+        assert_eq!(result[4], 0xDF, "SRT|HUT");
+        assert_eq!(result[5], 0x02, "HLT|ND");
+        assert_eq!(result[6], 0x12, "SC/EOT stub");
+        assert_eq!(result[7], 0x80, "LOCK<<7; perp bits stub 0");
+        assert_eq!(result[8], 0x57, "0|EIS|EFIFO|POLL|FIFOTHR");
+        assert_eq!(result[9], 0x0A, "PRETRK");
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "idle command phase after 10th result byte"
+        );
+        assert!(!f.irq_line());
+    }
+
+    /// Spec: DUMPREG generates no interrupt (diagnostic dump only).
+    #[test]
+    fn dumpreg_does_not_touch_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        assert!(f.irq_line(), "command byte must not clear IRQ");
+        for _ in 0..FDC_DUMPREG_RESULT_LEN {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert!(f.irq_line(), "result reads must not clear IRQ");
+
+        f.clear_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        for _ in 0..FDC_DUMPREG_RESULT_LEN {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert!(!f.irq_line(), "DUMPREG never asserts IRQ");
+    }
+
+    #[test]
+    fn dumpreg_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0xFF,
+            "no DUMPREG result latched while held in reset"
+        );
+    }
+
+    #[test]
+    fn dor_reset_aborts_dumpreg_result_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.pcn = 0x55;
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        assert_eq!(f.phase, Phase::DumpRegResult { index: 0 });
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM | FDC_MSR_DIO);
+        // Consume one result byte so we are mid-result.
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x55);
+        assert_eq!(f.phase, Phase::DumpRegResult { index: 1 });
+
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0xFF,
+            "aborted DUMPREG result is discarded"
+        );
+    }
+
+    /// After DUMPREG, Version / LOCK still work (SeaBIOS probe sequencing).
+    #[test]
+    fn dumpreg_then_version_and_lock_still_work() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        for _ in 0..FDC_DUMPREG_RESULT_LEN {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_VERSION_82077AA);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 1u8 << FDC_LOCK_RESULT_SHIFT);
+        assert!(f.lock);
         assert_eq!(f.phase, Phase::Command);
     }
 }
