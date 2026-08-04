@@ -1,4 +1,5 @@
-//! PCI configuration mechanism #1 stub — ports `0xCF8` / `0xCFC`–`0xCFF`.
+//! PCI configuration mechanism #1 stub — ports `0xCF8` / `0xCFC`–`0xCFF`,
+//! plus PIIX ISA Edge/Level Control (ELCR) at `0x4D0`/`0x4D1`.
 //!
 //! Classic PC Type 1 configuration access: latch a bus/device/function/register
 //! address in `CONFIG_ADDRESS`, then read/write `CONFIG_DATA`.
@@ -17,6 +18,9 @@
 //!   class codes — not copied source).
 //! - Intel 82371AB (PIIX4) ACPI function public ID `8086:7113` at `00:01.3`
 //!   (classic QEMU/SeaBIOS-compatible stub identity; class bridge/other `0x0680`).
+//! - Intel 82371 / PIIX ISA bridge ELCR — I/O ports `0x4D0` (master PIC IRQs
+//!   0–7) and `0x4D1` (slave PIC IRQs 8–15); SeaBIOS/firmware programs these for
+//!   PCI level-triggered IRQ routing. OSDev Wiki 8259 PIC — ELCR.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.2 / §21 PCI.
 //!
 //! # Scope (this slice)
@@ -28,6 +32,7 @@
 //! - Absent devices: `0xFFFFFFFF` when enable is set.
 //! - Enable bit clear: data-port reads return `0xFFFFFFFF` (open-bus style).
 //! - Byte/word/dword access via `0xCFC` + offset.
+//! - PIIX ELCR `0x4D0`/`0x4D1` byte store/readback (reset `0x00`/`0x00`).
 //!
 //! # Unsupported (explicit)
 //!
@@ -36,6 +41,7 @@
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (config identity only)
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
+//! - ELCR bits driving `DualPic` LTIM / per-IRQ edge vs level (store only)
 
 use crate::PortDevice;
 
@@ -106,6 +112,12 @@ pub const PCI_PIIX_USB_LEGSUP_OFFSET: u8 = 0xC0;
 const _: () = assert!(PCI_PIIX_USB_LEGSUP_OFFSET == 0xC0);
 /// PMBASE I/O decode mask — 64-byte aligned (bits 15:6); bit0 = I/O space.
 pub const PCI_PIIX_ACPI_PMBASE_MASK: u32 = 0xFFC0;
+/// PIIX ISA Edge/Level Control Register — master PIC (IRQs 0–7).
+/// Spec: Intel 82371 / OSDev 8259 PIC ELCR — I/O port `0x4D0`.
+pub const PIIX_ELCR_MASTER: u16 = 0x4D0;
+/// PIIX ISA Edge/Level Control Register — slave PIC (IRQs 8–15).
+/// Spec: Intel 82371 / OSDev 8259 PIC ELCR — I/O port `0x4D1`.
+pub const PIIX_ELCR_SLAVE: u16 = 0x4D1;
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -136,6 +148,9 @@ pub struct PciConfig {
     piix_usb: [u8; 256],
     /// PIIX ACPI at `00:01.3` (identity stub only; `8086:7113`).
     piix_acpi: [u8; 256],
+    /// PIIX ISA ELCR bytes at `0x4D0`/`0x4D1` (master/slave); reset `0x00`.
+    /// Store/readback only — not wired to `DualPic` LTIM yet.
+    pub elcr: [u8; 2],
 }
 
 impl Default for PciConfig {
@@ -153,6 +168,8 @@ impl PciConfig {
             piix_ide: Self::init_piix_ide(),
             piix_usb: Self::init_piix_usb(),
             piix_acpi: Self::init_piix_acpi(),
+            // Spec: PIIX ELCR power-on / reset defaults to edge-triggered (0).
+            elcr: [0, 0],
         }
     }
 
@@ -273,7 +290,7 @@ impl PciConfig {
 
     /// True if this device owns the I/O port.
     pub fn owns_port(port: u16) -> bool {
-        matches!(port, 0xCF8..=0xCFF)
+        matches!(port, 0xCF8..=0xCFF | PIIX_ELCR_MASTER | PIIX_ELCR_SLAVE)
     }
 
     fn enable(&self) -> bool {
@@ -479,6 +496,15 @@ impl PortDevice for PciConfig {
         if (0xCFC..=0xCFF).contains(&port) {
             return self.read_data(size, port);
         }
+        // Spec: Intel 82371 / OSDev ELCR — byte ports 0x4D0/0x4D1.
+        if port == PIIX_ELCR_MASTER || port == PIIX_ELCR_SLAVE {
+            let idx = (port - PIIX_ELCR_MASTER) as usize;
+            return match size {
+                1 => u32::from(self.elcr[idx]),
+                2 if port == PIIX_ELCR_MASTER => u32::from(u16::from_le_bytes(self.elcr)),
+                _ => u32::from(self.elcr[idx]),
+            };
+        }
         0xFFFFFFFF
     }
 
@@ -489,6 +515,18 @@ impl PortDevice for PciConfig {
         }
         if (0xCFC..=0xCFF).contains(&port) {
             self.write_data(size, port, value);
+            return;
+        }
+        // Spec: Intel 82371 / OSDev ELCR — store/readback; DualPic LTIM not wired.
+        if port == PIIX_ELCR_MASTER || port == PIIX_ELCR_SLAVE {
+            let idx = (port - PIIX_ELCR_MASTER) as usize;
+            match size {
+                1 => self.elcr[idx] = value as u8,
+                2 if port == PIIX_ELCR_MASTER => {
+                    self.elcr = (value as u16).to_le_bytes();
+                }
+                _ => self.elcr[idx] = value as u8,
+            }
         }
     }
 }
@@ -605,6 +643,40 @@ mod tests {
         assert!(PciConfig::owns_port(0xCFF));
         assert!(!PciConfig::owns_port(0xCF7));
         assert!(!PciConfig::owns_port(0xD00));
+    }
+
+    #[test]
+    fn owns_piix_elcr_ports() {
+        // Spec: Intel 82371 / OSDev ELCR — 0x4D0/0x4D1 on PIIX ISA path.
+        assert!(PciConfig::owns_port(PIIX_ELCR_MASTER));
+        assert!(PciConfig::owns_port(PIIX_ELCR_SLAVE));
+        assert!(!PciConfig::owns_port(0x4CF));
+        assert!(!PciConfig::owns_port(0x4D2));
+    }
+
+    /// Spec: Intel 82371 / OSDev 8259 PIC ELCR — SeaBIOS/PIIX programs
+    /// `0x4D0`/`0x4D1` for edge/level; store/readback stub (LTIM not wired).
+    #[test]
+    fn piix_elcr_store_readback_and_reset() {
+        let mut pci = PciConfig::new();
+        assert_eq!(pci.port_read(PIIX_ELCR_MASTER, 1) as u8, 0x00);
+        assert_eq!(pci.port_read(PIIX_ELCR_SLAVE, 1) as u8, 0x00);
+
+        pci.port_write(PIIX_ELCR_MASTER, 1, 0x28);
+        pci.port_write(PIIX_ELCR_SLAVE, 1, 0x0C);
+        assert_eq!(pci.port_read(PIIX_ELCR_MASTER, 1) as u8, 0x28);
+        assert_eq!(pci.port_read(PIIX_ELCR_SLAVE, 1) as u8, 0x0C);
+        assert_eq!(pci.elcr, [0x28, 0x0C]);
+
+        // Word access at 0x4D0 covers both ELCR bytes (LE).
+        pci.port_write(PIIX_ELCR_MASTER, 2, 0xA5_5A);
+        assert_eq!(pci.port_read(PIIX_ELCR_MASTER, 2) as u16, 0xA5_5A);
+        assert_eq!(pci.elcr, [0x5A, 0xA5]);
+
+        pci.reset();
+        assert_eq!(pci.elcr, [0x00, 0x00]);
+        assert_eq!(pci.port_read(PIIX_ELCR_MASTER, 1) as u8, 0x00);
+        assert_eq!(pci.port_read(PIIX_ELCR_SLAVE, 1) as u8, 0x00);
     }
 
     #[test]
