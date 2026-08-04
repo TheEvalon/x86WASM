@@ -504,13 +504,15 @@ mod tests {
     use devices::{
         CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, CFG_INT1, CFG_TRANSLATE, CMD_ENABLE_KBD,
         CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA,
-        CMOS_INDEX, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_DOR,
-        FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM,
-        FDC_ST0_SEEK_END, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
-        PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA,
-        PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL,
-        REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE,
-        STC_IRQF, STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX,
+        CMOS_INDEX, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK, FDC_CMD_SENSE_DRIVE_STATUS,
+        FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO,
+        FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, FDC_ST0_SEEK_END, FDC_ST3_RESERVED_BIT3,
+        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042, I8042_DATA, I8042_STATUS_CMD,
+        PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+        PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2,
+        PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C,
+        SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
+        VGA_CRTC_INDEX,
     };
 
     #[test]
@@ -1746,6 +1748,35 @@ mod tests {
         }
         assert_eq!(m.fdc.pcn, 0x14);
         m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+    }
+
+    /// Spec: Intel 82077AA §5.2.5 Sense Drive Status — HD|US param → ST3 result
+    /// via bus; no execution phase, no IRQ.
+    #[test]
+    fn machine_bus_fdc_sense_drive_status() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(FDC_DOR, FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ)
+                .unwrap();
+            bus.port_out_u8(FDC_FIFO, FDC_CMD_SENSE_DRIVE_STATUS)
+                .unwrap();
+            assert_eq!(bus.port_in_u8(FDC_MSR).unwrap(), FDC_MSR_RQM);
+            bus.port_out_u8(FDC_FIFO, 0x06).unwrap(); // HD=1 | US=2
+            assert_eq!(bus.port_in_u8(FDC_MSR).unwrap(), FDC_MSR_RQM | FDC_MSR_DIO);
+            let st3 = bus.port_in_u8(FDC_FIFO).unwrap();
+            assert_eq!(
+                st3,
+                FDC_ST3_TRACK0 | FDC_ST3_RESERVED_BIT3 | FDC_ST3_RESERVED_BIT5 | 0x06,
+                "T0 (pcn==0) | reserved bits | HD|US"
+            );
+            assert_eq!(bus.port_in_u8(FDC_MSR).unwrap(), FDC_MSR_RQM);
+            assert_eq!(
+                bus.poll_external_irq(),
+                None,
+                "Sense Drive Status has no IRQ"
+            );
+        }
     }
 
     /// Spec: Intel 82077AA + OSDev FDC + IBM PC AT — assert_irq6 → IRQ6 → vector 0x0E.

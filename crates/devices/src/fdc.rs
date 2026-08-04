@@ -9,11 +9,14 @@
 //!   DIR/CCR; Specify (`0x03`) two parameter bytes (SRT|HUT, HLT|ND), no result
 //!   phase / no IRQ; Recalibrate (`0x07`) one unit-select parameter, Seek End
 //!   ST0 + PCN=0 + IRQ; Seek (`0x0F`) HD|US + NCN, Seek End ST0 + PCN=NCN + IRQ;
-//!   Sense Interrupt Status (`0x08`) result ST0+PCN; DOR bit3 DMA/IRQ enable;
-//!   IRQ6 on command / reset completion.
+//!   Sense Interrupt Status (`0x08`) result ST0+PCN; Sense Drive Status
+//!   (`0x04`, §5.2.5) HD|US parameter, no execution phase, result ST3 (§6.4:
+//!   bit7 unused=0, bit6 WP, bit5 unused=1, bit4 T0, bit3 unused=1, bit2 HD,
+//!   bits1:0 DS1/DS0), no IRQ; DOR bit3 DMA/IRQ enable; IRQ6 on command /
+//!   reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
-//!   IRQ; post-reset Sense Interrupt polling.
+//!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -32,6 +35,11 @@
 //! - Sense Interrupt Status (`0x08`): command byte → 2-byte result (ST0, PCN);
 //!   returns latched Recalibrate/Seek ST0 when present, else post-reset/`assert_irq6`
 //!   stub `0xC0 | DOR[1:0]`; clears latched IRQ; MSR RQM|DIO during result phase
+//! - Sense Drive Status (`0x04`): command byte → one HD|US parameter (same
+//!   packing as Seek param0) → 1-byte ST3 result; no execution phase, no IRQ
+//!   assert/clear; T0 stub reflects `pcn == 0` (single shared `pcn`, not
+//!   per-drive); WP stub always 0 (no media); reserved bits 3/5 always 1 per
+//!   82077AA §6.4; MSR RQM during parameter, RQM|DIO during result phase
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
@@ -69,6 +77,9 @@ pub const FDC_DOR_RESET_N: u8 = 0x04;
 /// DOR bit3 — DMA and IRQ enable. Spec: Intel 82077AA / OSDev FDC.
 pub const FDC_DOR_DMA_IRQ: u8 = 0x08;
 
+/// Sense Drive Status command opcode. Spec: Intel 82077AA §5.2.5 — HD|US
+/// parameter, no execution phase, 1-byte ST3 result.
+pub const FDC_CMD_SENSE_DRIVE_STATUS: u8 = 0x04;
 /// Specify command opcode. Spec: Intel 82077AA / OSDev FDC — 2 parameter bytes.
 pub const FDC_CMD_SPECIFY: u8 = 0x03;
 /// Recalibrate command opcode. Spec: Intel 82077AA / OSDev FDC — 1 unit parameter.
@@ -82,6 +93,22 @@ pub const FDC_ST0_SEEK_END: u8 = 0x20;
 /// ST0 Interrupt Code = 11 (abnormal/ready-line-changed stub). Spec: 82077AA / OSDev.
 pub const FDC_ST0_IC_READY_CHANGE: u8 = 0xC0;
 
+/// ST3 bits 1:0 — Drive Select (DS1, DS0), status of the DS1/DS0 pins.
+/// Spec: Intel 82077AA §6.4 Status Register 3.
+pub const FDC_ST3_UNIT_MASK: u8 = 0x03;
+/// ST3 bit2 — Head Address (HD), status of the HDSEL pin. Spec: 82077AA §6.4.
+pub const FDC_ST3_HEAD: u8 = 0x04;
+/// ST3 bit3 — unused, always 1 per 82077AA §6.4 (some clones document as
+/// Two-Side; not modeled here).
+pub const FDC_ST3_RESERVED_BIT3: u8 = 0x08;
+/// ST3 bit4 — Track 0 (T0), status of the TRK0 pin. Spec: 82077AA §6.4.
+pub const FDC_ST3_TRACK0: u8 = 0x10;
+/// ST3 bit5 — unused, always 1 per 82077AA §6.4 (hardwired high; some
+/// software reads this as a Ready bit).
+pub const FDC_ST3_RESERVED_BIT5: u8 = 0x20;
+/// ST3 bit6 — Write Protected (WP), status of the WP pin. Spec: 82077AA §6.4.
+pub const FDC_ST3_WRITE_PROTECT: u8 = 0x40;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     /// Idle / accept command byte when RQM && !DIO.
@@ -94,6 +121,10 @@ enum Phase {
     SeekParams { index: u8 },
     /// Sense Interrupt result: ST0 then PCN.
     SenseIntResult { index: u8 },
+    /// Sense Drive Status parameter: byte0 = HD|US.
+    SenseDriveStatusParam,
+    /// Sense Drive Status result: ST3 (single byte).
+    SenseDriveStatusResult,
 }
 
 /// 82077AA-class FDC port stub with Specify + Recalibrate + Seek + Sense Interrupt + IRQ6.
@@ -128,6 +159,8 @@ pub struct Fdc82077 {
     seek_head_unit: u8,
     /// Sense Interrupt ST0 result byte (set when entering result phase).
     sense_st0: u8,
+    /// Sense Drive Status ST3 result byte (set when entering result phase).
+    sense_st3: u8,
 }
 
 impl Default for Fdc82077 {
@@ -157,6 +190,7 @@ impl Fdc82077 {
             pending_sense_st0: None,
             seek_head_unit: 0,
             sense_st0: 0,
+            sense_st3: 0,
         }
     }
 
@@ -187,8 +221,11 @@ impl Fdc82077 {
                 Phase::Command
                 | Phase::SpecifyParams { .. }
                 | Phase::RecalibrateParams
-                | Phase::SeekParams { .. } => FDC_MSR_RQM,
-                Phase::SenseIntResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
+                | Phase::SeekParams { .. }
+                | Phase::SenseDriveStatusParam => FDC_MSR_RQM,
+                Phase::SenseIntResult { .. } | Phase::SenseDriveStatusResult => {
+                    FDC_MSR_RQM | FDC_MSR_DIO
+                }
             }
         }
     }
@@ -218,6 +255,7 @@ impl Fdc82077 {
         self.pending_sense_st0 = None;
         self.seek_head_unit = 0;
         self.sense_st0 = 0;
+        self.sense_st3 = 0;
     }
 
     /// Begin Specify parameter phase (2 bytes). Spec: Intel 82077AA Specify.
@@ -277,13 +315,35 @@ impl Fdc82077 {
         self.phase = Phase::SenseIntResult { index: 0 };
     }
 
+    /// Begin Sense Drive Status parameter phase (1 byte). Spec: 82077AA §5.2.5.
+    fn start_sense_drive_status(&mut self) {
+        self.phase = Phase::SenseDriveStatusParam;
+    }
+
+    /// Complete Sense Drive Status after the HD|US parameter.
+    ///
+    /// Spec: Intel 82077AA §5.2.5/§6.4 — no execution phase, goes directly to
+    /// the result phase; ST3 bits 2:0 echo the HD|US parameter, T0 stub
+    /// reflects `pcn == 0` (single shared `pcn`, not per-drive in this stub),
+    /// WP stub always 0 (no media), reserved bits 3/5 always 1. No IRQ.
+    fn finish_sense_drive_status(&mut self, param: u8) {
+        let head_unit = param & (FDC_ST3_HEAD | FDC_ST3_UNIT_MASK);
+        let mut st3 = head_unit | FDC_ST3_RESERVED_BIT3 | FDC_ST3_RESERVED_BIT5;
+        if self.pcn == 0 {
+            st3 |= FDC_ST3_TRACK0;
+        }
+        self.sense_st3 = st3;
+        self.phase = Phase::SenseDriveStatusResult;
+    }
+
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
             // Spec: Specify/Recalibrate/Seek have no result phase; open-bus when idle/params.
             Phase::Command
             | Phase::SpecifyParams { .. }
             | Phase::RecalibrateParams
-            | Phase::SeekParams { .. } => 0xFF,
+            | Phase::SeekParams { .. }
+            | Phase::SenseDriveStatusParam => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
@@ -295,6 +355,10 @@ impl Fdc82077 {
                     self.phase = Phase::SenseIntResult { index: 1 };
                 }
                 v
+            }
+            Phase::SenseDriveStatusResult => {
+                self.phase = Phase::Command;
+                self.sense_st3
             }
         }
     }
@@ -317,6 +381,9 @@ impl Fdc82077 {
                 } else if v == FDC_CMD_SEEK {
                     // Spec: Intel 82077AA Seek — expect HD|US then NCN.
                     self.start_seek();
+                } else if v == FDC_CMD_SENSE_DRIVE_STATUS {
+                    // Spec: Intel 82077AA §5.2.5 — expect HD|US param; no IRQ.
+                    self.start_sense_drive_status();
                 }
                 // Other opcodes: accept/drop until a command engine exists.
             }
@@ -349,7 +416,11 @@ impl Fdc82077 {
                     }
                 }
             }
-            Phase::SenseIntResult { .. } => {
+            Phase::SenseDriveStatusParam => {
+                // Spec: Intel 82077AA §5.2.5 — HD|US param, no execution phase.
+                self.finish_sense_drive_status(v);
+            }
+            Phase::SenseIntResult { .. } | Phase::SenseDriveStatusResult => {
                 // Host must not write during result phase (stub ignores).
             }
         }
@@ -768,6 +839,124 @@ mod tests {
         assert_eq!(st0, FDC_ST0_SEEK_END | 0x02, "ST0 = SE | unit; H=0");
         let pcn = f.port_read(FDC_FIFO, 1) as u8;
         assert_eq!(pcn, 0x28);
+    }
+
+    /// Spec: Intel 82077AA Sense Drive Status — opcode `0x04`, HD|US param, ST3
+    /// result (no execution phase, no IRQ). Track 0 reflects `pcn==0` (stub).
+    #[test]
+    fn sense_drive_status_result_reflects_track0_head_and_unit() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.pcn = 0x00;
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "param phase: RQM, DIO clear"
+        );
+        assert_eq!(f.phase, Phase::SenseDriveStatusParam);
+
+        // Param: HD=1 (bit2) | US1,US0 = 2 (bits1:0) -> 0x06 (same packing as Seek).
+        f.port_write(FDC_FIFO, 1, 0x06);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+
+        let st3 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st3,
+            FDC_ST3_TRACK0 | FDC_ST3_RESERVED_BIT5 | FDC_ST3_RESERVED_BIT3 | 0x06,
+            "T0 (pcn==0) | reserved bits | HD|US from param"
+        );
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "idle command phase after result byte read"
+        );
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: WP reflects the WP pin; stub has no media, so always 0.
+    #[test]
+    fn sense_drive_status_write_protect_stub_always_clear() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        let st3 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st3 & FDC_ST3_WRITE_PROTECT,
+            0,
+            "no media in stub: WP always clear"
+        );
+    }
+
+    /// Spec: T0 bit reflects TRK0 pin state (stub: `pcn==0`); clear when pcn!=0.
+    #[test]
+    fn sense_drive_status_track0_clear_when_pcn_nonzero() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.pcn = 0x28;
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x01); // unit 1, head 0
+        let st3 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st3 & FDC_ST3_TRACK0,
+            0,
+            "T0 clear when pcn!=0 (stub, single shared pcn)"
+        );
+        assert_eq!(st3 & 0x07, 0x01, "HD|US preserved from param");
+    }
+
+    /// Spec: Sense Drive Status has no execution phase and must not assert or
+    /// clear IRQ (unlike Recalibrate/Seek).
+    #[test]
+    fn sense_drive_status_does_not_touch_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        assert!(f.irq_line(), "command byte must not clear IRQ");
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert!(f.irq_line(), "param byte must not clear or assert IRQ");
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(f.irq_line(), "result read must not clear IRQ");
+
+        // Starting from no pending IRQ, Sense Drive Status must not assert one.
+        f.clear_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(!f.irq_line(), "Sense Drive Status never asserts IRQ");
+    }
+
+    #[test]
+    fn sense_drive_status_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    #[test]
+    fn dor_reset_aborts_sense_drive_status_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_DRIVE_STATUS));
+        assert_eq!(f.phase, Phase::SenseDriveStatusParam);
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
     }
 
     /// Spec: after Seek ST0 is consumed, a later Sense Interrupt falls back to 0xC0|US.
