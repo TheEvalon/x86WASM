@@ -112,6 +112,12 @@ pub const ATA_DIAG_PASSED: u8 = 0x01;
 /// SET FEATURES — non-data; this stub accepts and succeeds (no feature side effects).
 /// Spec: ATA/ATAPI Command Set — SET FEATURES (`0xEF`).
 pub const ATA_CMD_SET_FEATURES: u8 = 0xEF;
+/// NOP — non-data success on ATA master (no side effects).
+/// Spec: ATA/ATAPI Command Set — NOP (`0x00`).
+pub const ATA_CMD_NOP: u8 = 0x00;
+/// READ MULTIPLE — multi-sector PIO; this stub aborts (block count not configured).
+/// Spec: ATA/ATAPI Command Set — READ MULTIPLE (`0xC4`).
+pub const ATA_CMD_READ_MULTIPLE: u8 = 0xC4;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -480,6 +486,57 @@ impl IdePrimary {
     /// Spec: ATA/ATAPI Command Set — FLUSH CACHE writes volatile cache to media.
     /// This stub has no volatile cache; it completes immediately with
     /// DRDY|DSC, error=0, no DRQ, and raises INTRQ when nIEN=0 (SeaBIOS-friendly).
+    fn exec_flush_cache(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// NOP (`0x00`) on ATA master — non-data success (no side effects).
+    ///
+    /// Spec: ATA/ATAPI Command Set — NOP completes with success; this stub
+    /// mirrors other non-data success completions (DRDY|DSC, error=0).
+    fn exec_nop(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// READ MULTIPLE (`0xC4`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA READ MULTIPLE requires a prior SET MULTIPLE MODE block count.
+    /// This stub has no multiple-mode state; SeaBIOS-friendly ERR+ABRT.
+    fn exec_read_multiple(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
     /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
@@ -522,22 +579,6 @@ impl IdePrimary {
         self.raise_irq();
     }
 
-    fn exec_flush_cache(&mut self) {
-        if !self.present || self.is_slave_selected() {
-            self.status = 0;
-            self.transferring = false;
-            self.pio_in = false;
-            self.clear_irq();
-            return;
-        }
-        self.error = 0;
-        self.transferring = false;
-        self.pio_in = false;
-        self.sectors_left = 0;
-        self.status = ATA_SR_DRDY | ATA_SR_DSC;
-        self.raise_irq();
-    }
-
     fn exec_command(&mut self, cmd: u8) {
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
@@ -546,6 +587,8 @@ impl IdePrimary {
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
             ATA_CMD_FLUSH_CACHE => self.exec_flush_cache(),
+            ATA_CMD_NOP => self.exec_nop(),
+            ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             ATA_CMD_SET_FEATURES => self.exec_set_features(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
@@ -1345,6 +1388,54 @@ mod tests {
         let mut ide = IdePrimary::new();
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI — NOP (`0x00`) non-data success on ATA master.
+    #[test]
+    fn nop_succeeds_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_NOP));
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_ne!(st & ATA_SR_DSC, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    #[test]
+    fn nop_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_NOP));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — READ MULTIPLE (`0xC4`) without SET MULTIPLE MODE → ERR+ABRT.
+    #[test]
+    fn read_multiple_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn read_multiple_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert!(!ide.irq_line());
     }

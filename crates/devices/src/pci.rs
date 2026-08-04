@@ -84,6 +84,12 @@ pub const PCI_BAR_IO_SPACE: u32 = 0x01;
 /// BMIBA size decode mask — 16-byte aligned I/O base (bits 15:4); low nibble
 /// forced to `0001` (I/O space). Spec: PCI I/O BAR + PIIX BMIBA.
 pub const PCI_PIIX_IDE_BMIBA_MASK: u32 = 0xFFF0;
+/// PIIX USB UHCI BAR0 config offset (I/O space).
+/// Spec: Intel 82371SB — UHCI I/O BAR at PCI config `0x20` (bit0=1).
+pub const PCI_PIIX_USB_BAR0_OFFSET: u8 = 0x20;
+/// UHCI BAR0 size decode mask — 32-byte aligned I/O base (bits 15:5).
+/// Spec: PCI I/O BAR + UHCI I/O footprint (32 bytes).
+pub const PCI_PIIX_USB_BAR0_MASK: u32 = 0xFFE0;
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -370,6 +376,7 @@ impl PciConfig {
         let lane = (port - PCI_CONFIG_DATA) as usize;
         let off = base + lane;
         let is_piix_ide = self.bus() == 0 && self.device() == 1 && self.function() == 1;
+        let is_piix_usb = self.bus() == 0 && self.device() == 1 && self.function() == 2;
         // Identity / class / header type are read-only in this stub.
         let readonly = |o: usize| matches!(o, 0x00..=0x03 | 0x08..=0x0B | 0x0E);
         let Some(cfg) = self.selected_cfg_mut() else {
@@ -408,6 +415,15 @@ impl PciConfig {
             let masked = (value & PCI_PIIX_IDE_BMIBA_MASK) | PCI_BAR_IO_SPACE;
             let bytes = masked.to_le_bytes();
             cfg[PCI_PIIX_IDE_BMIBA_OFFSET as usize..PCI_PIIX_IDE_BMIBA_OFFSET as usize + 4]
+                .copy_from_slice(&bytes);
+        }
+        // Spec: Intel 82371SB / PCI — PIIX USB UHCI BAR0 at config 0x20 is an
+        // I/O BAR: bit0 hardwired 1; bits 15:5 programmable (32-byte align);
+        // bits 4:1 zero. Store/readback only — no UHCI port decode yet.
+        if is_piix_usb && base == PCI_PIIX_USB_BAR0_OFFSET as usize && lane == 0 && size == 4 {
+            let masked = (value & PCI_PIIX_USB_BAR0_MASK) | PCI_BAR_IO_SPACE;
+            let bytes = masked.to_le_bytes();
+            cfg[PCI_PIIX_USB_BAR0_OFFSET as usize..PCI_PIIX_USB_BAR0_OFFSET as usize + 4]
                 .copy_from_slice(&bytes);
         }
     }
@@ -678,6 +694,30 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: Intel 82371SB — PIIX USB UHCI BAR0 at PCI config `0x20` is an I/O
+    /// BAR (bit0=1); bits 15:5 hold the 32-byte-aligned I/O base.
+    #[test]
+    fn piix_usb_bar0_io_bar_store_readback() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_PIIX_USB_BAR0_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0);
+
+        // Guest programs base 0xC000 with junk low bits; device forces I/O BAR form.
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_C01E);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 4),
+            0x0000_C001,
+            "UHCI BAR0: bits15:5 kept, bit0=1, bits4:1=0"
+        );
+
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F020);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x0000_F021);
     }
 
     #[test]

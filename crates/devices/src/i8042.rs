@@ -170,6 +170,9 @@ pub const KBD_CMD_RESEND: u8 = 0xFE;
 /// PS/2 keyboard command: Set Default — restore defaults and ACK.
 /// Spec: OSDev PS/2 Keyboard — `0xF6` Set Default.
 pub const KBD_CMD_SET_DEFAULT: u8 = 0xF6;
+/// PS/2 keyboard command: Set All Keys Typematic — ACK (no further params).
+/// Spec: OSDev PS/2 Keyboard — `0xF7` Set All Keys Typematic.
+pub const KBD_CMD_SET_ALL_TYPEMATIC: u8 = 0xF7;
 
 /// Echo response byte (same value as [`KBD_CMD_ECHO`]).
 pub const KBD_ECHO: u8 = 0xEE;
@@ -1056,6 +1059,11 @@ impl I8042 {
                 self.reset_kbd_defaults();
                 self.begin_kbd_response(&[KBD_ACK]);
             }
+            KBD_CMD_SET_ALL_TYPEMATIC => {
+                // Spec: OSDev PS/2 Keyboard — Set All Keys Typematic (`0xF7`):
+                // ACK only; key-type state not modeled beyond acceptance.
+                self.begin_kbd_response(&[KBD_ACK]);
+            }
             _ => {
                 // Unsupported keyboard command: accepted, no ACK (see module docs).
             }
@@ -1315,17 +1323,25 @@ mod tests {
         assert!(k.irq1_line());
     }
 
-    /// Spec: unsupported host→keyboard commands (e.g. Resend was previously
-    /// listed; use an unimplemented opcode such as `0xF7`) are accepted with
+    /// Spec: unsupported host→keyboard commands (e.g. `0xF1`) are accepted with
     /// no ACK; controller config/output buffer unchanged.
     #[test]
     fn data_write_unsupported_kbd_command_no_ack() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         let before = k.clone();
-        k.port_write(I8042_DATA, 1, 0xF7); // Set All Keys Typematic — not implemented
+        k.port_write(I8042_DATA, 1, 0xF1); // unimplemented keyboard opcode
         assert_eq!(k.config, before.config);
         assert_eq!(k.output_buffer(), None);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Set All Keys Typematic (`0xF7`) → ACK `0xFA`.
+    #[test]
+    fn kbd_set_all_typematic_f7_acks() {
+        let mut k = I8042::new();
+        write_kbd(&mut k, KBD_CMD_SET_ALL_TYPEMATIC);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ACK);
         assert_eq!(k.status() & STATUS_OBF, 0);
     }
 
@@ -1906,9 +1922,9 @@ mod tests {
         assert!(!k.irq12_line());
 
         // Next data byte is keyboard-bound again: aux state untouched; an
-        // unsupported kbd opcode (`0xF7`) produces no ACK / no OBF.
+        // unsupported kbd opcode (`0xF1`) produces no ACK / no OBF.
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
-        k.port_write(I8042_DATA, 1, 0xF7);
+        k.port_write(I8042_DATA, 1, 0xF1);
         assert_eq!(k.aux_device_writes, 1);
         assert_eq!(k.last_aux_device_write, Some(0xF0));
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
