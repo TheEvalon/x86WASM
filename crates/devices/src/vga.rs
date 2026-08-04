@@ -220,6 +220,16 @@ pub const VGA_MISC_IOAS: u8 = 0x01;
 /// `MachineBus` falls through to open-bus / PhysMem; set (default in `0x67`) →
 /// plane R/W unchanged.
 pub const VGA_MISC_RAM_ENABLE: u8 = 0x02;
+/// Misc Output bits 3:2 — Clock Select. Spec: FreeVGA / IBM VGA.
+pub const VGA_MISC_CLOCK_SELECT: u8 = 0x0C;
+/// Clock Select = 00b (25.175 MHz class). Spec: FreeVGA Misc Output.
+pub const VGA_MISC_CLOCK_25MHZ: u8 = 0x00;
+/// Clock Select = 01b (28.322 MHz class). Spec: FreeVGA Misc Output.
+pub const VGA_MISC_CLOCK_28MHZ: u8 = 0x04;
+/// Compile-time check: reset default Misc Output uses 28 MHz-class clock select.
+const _: () = assert!((VGA_MISC_OUTPUT_DEFAULT & VGA_MISC_CLOCK_SELECT) == VGA_MISC_CLOCK_28MHZ);
+/// Compile-time check: 25 MHz-class encoding is bits 3:2 = 00.
+const _: () = assert!(VGA_MISC_CLOCK_25MHZ == 0x00);
 
 /// Graphics Controller Address (index) Register.
 ///
@@ -506,6 +516,11 @@ impl VgaText {
     /// inspect the plane buffer).
     pub fn misc_ram_enable(&self) -> bool {
         self.misc_output & VGA_MISC_RAM_ENABLE != 0
+    }
+
+    /// Misc Output Clock Select field (bits 3:2). Spec: FreeVGA / IBM VGA.
+    pub fn misc_clock_select(&self) -> u8 {
+        self.misc_output & VGA_MISC_CLOCK_SELECT
     }
 
     /// True if this device owns the I/O port (CRTC + Sequencer + GC + ATC +
@@ -1526,6 +1541,31 @@ mod tests {
             v.port_read(VGA_MISC_OUTPUT_READ, 1) as u8,
             VGA_MISC_OUTPUT_DEFAULT
         );
+    }
+
+    /// Spec: FreeVGA / IBM VGA — Misc Output bits 3:2 Clock Select store/readback.
+    #[test]
+    fn misc_clock_select_bits_store_readback() {
+        let mut v = VgaText::new();
+        // Default `0x67` has clock select = 01b (28 MHz class).
+        assert_eq!(v.misc_clock_select(), VGA_MISC_CLOCK_28MHZ);
+        let base = v.misc_output & !VGA_MISC_CLOCK_SELECT;
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(base | VGA_MISC_CLOCK_25MHZ),
+        );
+        assert_eq!(v.misc_clock_select(), VGA_MISC_CLOCK_25MHZ);
+        assert_eq!(
+            v.port_read(VGA_MISC_OUTPUT_READ, 1) as u8 & VGA_MISC_CLOCK_SELECT,
+            VGA_MISC_CLOCK_25MHZ
+        );
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(base | VGA_MISC_CLOCK_28MHZ),
+        );
+        assert_eq!(v.misc_clock_select(), VGA_MISC_CLOCK_28MHZ);
     }
 
     #[test]

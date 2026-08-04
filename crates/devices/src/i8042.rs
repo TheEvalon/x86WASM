@@ -128,6 +128,9 @@ pub const CMD_READ_OUTPUT_PORT: u8 = 0xD0;
 pub const CMD_WRITE_OUTPUT_PORT: u8 = 0xD1;
 /// Controller command: write next data-port byte to the auxiliary device.
 pub const CMD_WRITE_AUX: u8 = 0xD4;
+/// Controller command: pulse output port bits (commonly used as system reset pulse).
+/// Spec: OSDev I8042 — `0xFE` on command port `0x64` (not keyboard Resend on `0x60`).
+pub const CMD_PULSE_RESET: u8 = 0xFE;
 
 /// Self-test passed response (OSDev / IBM AT).
 pub const SELF_TEST_OK: u8 = 0x55;
@@ -366,6 +369,10 @@ pub struct I8042 {
     pending: PendingWrite,
     /// Counts of unsupported command bytes seen (for tests / diagnostics).
     pub unsupported_commands: u32,
+    /// Counts of controller pulse-reset commands (`0xFE` on `0x64`) seen.
+    ///
+    /// Spec: OSDev I8042 — accepted and counted; CPU/system reset is not wired.
+    pub pulse_reset_commands: u32,
     /// Last byte the host sent to the auxiliary device via `0xD4`.
     pub last_aux_device_write: Option<u8>,
     /// Count of `0xD4`-routed host→auxiliary-device bytes (tests / diagnostics).
@@ -429,6 +436,7 @@ impl I8042 {
             last_write_was_cmd: false,
             pending: PendingWrite::None,
             unsupported_commands: 0,
+            pulse_reset_commands: 0,
             last_aux_device_write: None,
             aux_device_writes: 0,
             mouse_reporting: false,
@@ -461,6 +469,7 @@ impl I8042 {
         self.last_write_was_cmd = false;
         self.pending = PendingWrite::None;
         self.unsupported_commands = 0;
+        self.pulse_reset_commands = 0;
         self.last_aux_device_write = None;
         self.aux_device_writes = 0;
         self.reset_mouse_defaults();
@@ -1161,6 +1170,11 @@ impl I8042 {
             CMD_WRITE_AUX => {
                 self.pending = PendingWrite::AuxDevice;
             }
+            CMD_PULSE_RESET => {
+                // Spec: OSDev I8042 — pulse output lines / system-reset request.
+                // Counted only; CPU reset is not wired in this stub.
+                self.pulse_reset_commands = self.pulse_reset_commands.saturating_add(1);
+            }
             _ => {
                 self.unsupported_commands = self.unsupported_commands.saturating_add(1);
             }
@@ -1447,16 +1461,18 @@ mod tests {
     }
 
     /// Spec: OSDev I8042 — controller command `0xFE` on port `0x64` is pulse-
-    /// reset (unsupported here), not keyboard Resend on `0x60`.
+    /// reset (counted; no CPU reset), not keyboard Resend on `0x60`.
     #[test]
-    fn controller_cmd_fe_on_64_still_unsupported() {
+    fn controller_cmd_fe_on_64_counts_pulse_reset() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
         write_kbd(&mut k, KBD_CMD_ECHO);
         assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
         let before_unsup = k.unsupported_commands;
-        k.port_write(I8042_STATUS_CMD, 1, 0xFE); // pulse-reset — not implemented
-        assert_eq!(k.unsupported_commands, before_unsup + 1);
+        let before_pulse = k.pulse_reset_commands;
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_PULSE_RESET));
+        assert_eq!(k.pulse_reset_commands, before_pulse + 1);
+        assert_eq!(k.unsupported_commands, before_unsup);
         assert_eq!(k.status() & STATUS_OBF, 0);
         assert_eq!(k.kbd_last_byte(), KBD_ECHO); // keyboard last byte untouched
     }

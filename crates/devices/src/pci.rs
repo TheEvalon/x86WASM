@@ -95,6 +95,10 @@ pub const PCI_PIIX_USB_BAR0_MASK: u32 = 0xFFE0;
 pub const PCI_PIIX_ISA_PIRQRC_OFFSET: u8 = 0x60;
 /// Default PIRQRC byte value (IRQ routing disabled).
 pub const PCI_PIIX_ISA_PIRQRC_DEFAULT: u8 = 0x80;
+/// PIIX ACPI PMBASE config offset (I/O BAR). Spec: Intel 82371AB — dword at `0x40`.
+pub const PCI_PIIX_ACPI_PMBASE_OFFSET: u8 = 0x40;
+/// PMBASE I/O decode mask — 64-byte aligned (bits 15:6); bit0 = I/O space.
+pub const PCI_PIIX_ACPI_PMBASE_MASK: u32 = 0xFFC0;
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -386,6 +390,7 @@ impl PciConfig {
         let off = base + lane;
         let is_piix_ide = self.bus() == 0 && self.device() == 1 && self.function() == 1;
         let is_piix_usb = self.bus() == 0 && self.device() == 1 && self.function() == 2;
+        let is_piix_acpi = self.bus() == 0 && self.device() == 1 && self.function() == 3;
         // Identity / class / header type are read-only in this stub.
         let readonly = |o: usize| matches!(o, 0x00..=0x03 | 0x08..=0x0B | 0x0E);
         let Some(cfg) = self.selected_cfg_mut() else {
@@ -433,6 +438,15 @@ impl PciConfig {
             let masked = (value & PCI_PIIX_USB_BAR0_MASK) | PCI_BAR_IO_SPACE;
             let bytes = masked.to_le_bytes();
             cfg[PCI_PIIX_USB_BAR0_OFFSET as usize..PCI_PIIX_USB_BAR0_OFFSET as usize + 4]
+                .copy_from_slice(&bytes);
+        }
+        // Spec: Intel 82371AB / PCI — PIIX ACPI PMBASE at config 0x40 is an I/O
+        // BAR: bit0 hardwired 1; bits 15:6 programmable (64-byte align).
+        // Store/readback only — no ACPI PM I/O decode yet.
+        if is_piix_acpi && base == PCI_PIIX_ACPI_PMBASE_OFFSET as usize && lane == 0 && size == 4 {
+            let masked = (value & PCI_PIIX_ACPI_PMBASE_MASK) | PCI_BAR_IO_SPACE;
+            let bytes = masked.to_le_bytes();
+            cfg[PCI_PIIX_ACPI_PMBASE_OFFSET as usize..PCI_PIIX_ACPI_PMBASE_OFFSET as usize + 4]
                 .copy_from_slice(&bytes);
         }
     }
@@ -703,6 +717,27 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: Intel 82371AB — PMBASE at ACPI config `0x40` is an I/O BAR
+    /// (bit0=1); bits 15:6 hold the 64-byte-aligned I/O base.
+    #[test]
+    fn piix_acpi_pmbase_io_bar_store_readback() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 3, PCI_PIIX_ACPI_PMBASE_OFFSET, true),
+        );
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0);
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_B03E);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 4),
+            0x0000_B001,
+            "PMBASE: bits15:6 kept, bit0=1, bits5:1=0"
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_4000);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x0000_4001);
     }
 
     /// Spec: Intel 82371SB — PIRQRC[A:D] at ISA config `0x60`–`0x63` default
