@@ -1320,6 +1320,15 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "SGDT/SIDT/LGDT/LIDT/SMSW/LMSW",
     },
+    // CLTS — Spec: Intel SDM Vol. 2 "CLTS—Clear Task-Switched Flag in CR0"
+    // (opcode map 2 — 0F 06). No ModR/M. Clears CR0.TS (bit 3) only.
+    InstrDef {
+        mnemonic: "CLTS",
+        opcode: 0x06,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "CLTS",
+    },
     InstrDef {
         mnemonic: "IMUL",
         opcode: 0xAF,

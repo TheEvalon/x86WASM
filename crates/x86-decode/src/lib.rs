@@ -639,6 +639,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_clts() {
+        // Spec: Intel SDM Vol. 2 "CLTS—Clear Task-Switched Flag in CR0" — 0F 06.
+        let clts = decode(&[0x0F, 0x06]).unwrap();
+        assert!(clts.two_byte);
+        assert_eq!(clts.opcode, 0x06);
+        assert_eq!(clts.mnemonic, "CLTS");
+        assert!(clts.modrm.is_none());
+        assert_eq!(clts.length, 2);
+    }
+
+    #[test]
     fn decode_mov_cr0() {
         // Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers" — 0F 20/22 /r.
         let mov_eax_cr0 = decode(&[0x0F, 0x20, 0xC0]).unwrap(); // MOV EAX, CR0
