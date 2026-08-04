@@ -28,7 +28,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - IBM PC/AT CMOS BCD century byte at index `0x32`, later standardized as the ACPI FADT `CENTURY` index field (century is **not** part of the MC146818 register file)
 - PS/2 and 8042 controller references — OSDev Wiki "I8042 PS/2 Controller" (<https://wiki.osdev.org/I8042_PS/2_Controller>) + IBM PS/2 keyboard-controller programming model: data `0x60` / status-command `0x64`; status bit0 OBF, bit1 IBF, bit2 system flag, bit3 command/data, bit5 AUX OBF (PS/2; transmit/receive timeout on the original AT); command byte (config) bit0 first-port interrupt (IRQ1), bit1 second-port interrupt (IRQ12), bit4 first-port clock disable, bit5 second-port clock disable, bit6 translation; controller commands `0x20`/`0x60` read/write command byte, `0xAA` self-test → `0x55`, `0xAD`/`0xAE` disable/enable first port, `0xA7`/`0xA8` disable/enable second (auxiliary) port, `0xA9` test second port → `0x00` = no error, `0xD0`/`0xD1` read/write output port (bit1 = A20), `0xD4` write next data byte to the auxiliary device
 - Intel SDM Vol. 3 §6.3.3 / §6.7 / §6.15 — `#NMI` (interrupt vector 2; not maskable by `IF`)
-- Intel 8237A Programmable DMA Controller datasheet (addr/count/mode/mask/flip-flop)
+- Intel 8237A Programmable DMA Controller datasheet (addr/count/mode/mask/flip-flop; status register bits 3:0 terminal count per channel, cleared by status read or master clear; bits 7:4 request pending — DREQ path not modeled)
 - OSDev Wiki ISA DMA — AT port map and page registers (not port `0x80`)
 - IBM VGA / classic PC color text frame buffer at physical `0xB8000` (80×25, char+attr)
 - OSDev Text UI — VGA text-mode memory layout
