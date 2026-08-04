@@ -117,6 +117,10 @@
 //!   US), ST1 NW (Not Writable — §6.2 lists FORMAT TRACK), ST2=0, four
 //!   undefined result bytes = 0; asserts IRQ6 (cleared on first result byte);
 //!   SC latched into `sc_eot`.
+//! - 1.44MB media image attach/eject + CHS→offset/`read_sector` helpers (PC
+//!   MFM geometry); DIR bit7 DSKCHG stub on attach/eject; `reset()` preserves
+//!   media like IDE. READ DATA command path still uses the no-media ND stub
+//!   (no DMA/success transfer yet).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
@@ -124,10 +128,11 @@
 //! - WRITE DELETED DATA / READ TRACK / READ ID / VERIFY and other transfer
 //!   commands; READ DELETED DATA media/deleted-address-mark engine; FORMAT
 //!   TRACK media write / per-sector ID DMA
-//! - Media image, seek step timing, real sector transfers
-//! - DMA channel 2 transfers (ND bit / Specify stored only; not enforced)
+//! - READ/WRITE DATA success path with media; DMA channel 2 transfers
+//!   (ND bit / Specify stored only; not enforced)
+//! - Seek step timing; real DIR disk-change edge timing (DSKCHG stub only)
 //! - Implied seek from Configure EIS; multi-sector TC termination
-//! - Drive sensing, disk-change edge timing
+//! - Drive sensing beyond DSKCHG attach/eject stub
 //! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
 //! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
 //!   implied seek, poll disable enforcement); DSR software-reset path
@@ -148,6 +153,27 @@ pub const FDC_MSR: u16 = 0x3F4;
 pub const FDC_FIFO: u16 = 0x3F5;
 /// Digital Input Register (read) / Configuration Control Register (write).
 pub const FDC_DIR_CCR: u16 = 0x3F7;
+
+/// DIR bit7 — Disk Changed (DSKCHG). Spec: Intel 82077AA DIR; OSDev FDC.
+///
+/// Hardware latches a media-change edge and typically clears after drive
+/// select / recalibrate / step sequencing. This emulator's stub only sets the
+/// bit on [`Fdc82077::eject`] (and preserves it across `reset` when no media)
+/// and clears it on successful [`Fdc82077::attach_image`] — not full DIR timing.
+pub const FDC_DIR_DSKCHG: u8 = 0x80;
+
+/// PC 1.44MB MFM floppy cylinders. Spec: IBM PC / OSDev Floppy Disk.
+pub const FDC_1440_CYLINDERS: u8 = 80;
+/// PC 1.44MB MFM floppy heads (sides). Spec: IBM PC / OSDev Floppy Disk.
+pub const FDC_1440_HEADS: u8 = 2;
+/// PC 1.44MB MFM sectors per track. Spec: IBM PC / OSDev Floppy Disk.
+pub const FDC_1440_SECTORS_PER_TRACK: u8 = 18;
+/// Sector size in bytes for N=2 (`128 << N`). Spec: Intel 82077AA / IBM PC.
+pub const FDC_SECTOR_SIZE: usize = 512;
+/// Sector-size code N for 512-byte sectors (`128 << 2`). Spec: 82077AA.
+pub const FDC_SECTOR_N: u8 = 2;
+/// Exact raw image size for a 1.44MB floppy (80×2×18×512). Spec: IBM PC MFM.
+pub const FDC_1440_IMAGE_SIZE: usize = 1_474_560;
 
 /// MSR bit7 RQM — FIFO ready for host byte exchange. Spec: Intel 82077AA / OSDev.
 pub const FDC_MSR_RQM: u8 = 0x80;
@@ -442,6 +468,9 @@ pub struct Fdc82077 {
     /// READ/READ DELETED/WRITE DATA / FORMAT TRACK result bytes (ST0..). Spec:
     /// §5.1.1 / §5.1.3 / §5.1.2 / §5.1.7.
     read_result: [u8; FDC_READ_DATA_RESULT_LEN as usize],
+    /// Attached 1.44MB raw floppy image (`None` = no media). Preserved across
+    /// [`Self::reset`] like [`crate::IdePrimary`]'s backing image.
+    image: Option<Vec<u8>>,
 }
 
 impl Default for Fdc82077 {
@@ -482,11 +511,92 @@ impl Fdc82077 {
             sense_st3: 0,
             read_params: [0; FDC_READ_DATA_PARAM_LEN as usize],
             read_result: [0; FDC_READ_DATA_RESULT_LEN as usize],
+            image: None,
         }
     }
 
+    /// Attach a raw 1.44MB floppy image (exact [`FDC_1440_IMAGE_SIZE`] bytes).
+    ///
+    /// Rejects other sizes. Clears DIR DSKCHG (stub). Spec: IBM PC 1.44MB MFM;
+    /// DIR bit7 semantics are stubbed (see [`FDC_DIR_DSKCHG`]).
+    pub fn attach_image(&mut self, image: Vec<u8>) -> Result<(), &'static str> {
+        if image.len() != FDC_1440_IMAGE_SIZE {
+            return Err("FDC attach_image requires exact 1.44MB (1_474_560) image");
+        }
+        self.image = Some(image);
+        self.dir &= !FDC_DIR_DSKCHG;
+        Ok(())
+    }
+
+    /// Construct an FDC with a 1.44MB image already attached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `image.len() != FDC_1440_IMAGE_SIZE`.
+    pub fn with_image(image: Vec<u8>) -> Self {
+        let mut fdc = Self::new();
+        fdc.attach_image(image)
+            .expect("FDC with_image requires exact 1.44MB image");
+        fdc
+    }
+
+    /// Eject media and set DIR DSKCHG (stub). Spec: OSDev FDC disk-change bit.
+    pub fn eject(&mut self) {
+        self.image = None;
+        self.dir |= FDC_DIR_DSKCHG;
+    }
+
+    /// True when a 1.44MB image is attached.
+    pub fn has_media(&self) -> bool {
+        self.image.is_some()
+    }
+
+    /// CHS → byte offset in a linear 1.44MB image. `r` is 1-based (sector ID).
+    ///
+    /// Spec: IBM PC / OSDev Floppy — offset =
+    /// `((c * Heads + h) * Spt + (r - 1)) * 512`. Out-of-range → `None`.
+    pub fn chs_byte_offset(c: u8, h: u8, r: u8) -> Option<usize> {
+        if c >= FDC_1440_CYLINDERS
+            || h >= FDC_1440_HEADS
+            || r == 0
+            || r > FDC_1440_SECTORS_PER_TRACK
+        {
+            return None;
+        }
+        let lba = (usize::from(c) * usize::from(FDC_1440_HEADS) + usize::from(h))
+            * usize::from(FDC_1440_SECTORS_PER_TRACK)
+            + (usize::from(r) - 1);
+        Some(lba * FDC_SECTOR_SIZE)
+    }
+
+    /// Read one 512-byte sector from the attached image at CHS `(c,h,r)`.
+    ///
+    /// Returns `None` if no media or CHS is out of range.
+    pub fn read_sector(&self, c: u8, h: u8, r: u8) -> Option<[u8; FDC_SECTOR_SIZE]> {
+        let image = self.image.as_ref()?;
+        let off = Self::chs_byte_offset(c, h, r)?;
+        let end = off.checked_add(FDC_SECTOR_SIZE)?;
+        if end > image.len() {
+            return None;
+        }
+        let mut sector = [0u8; FDC_SECTOR_SIZE];
+        sector.copy_from_slice(&image[off..end]);
+        Some(sector)
+    }
+
+    /// Hardware reset: clears programmed controller state; preserves attached
+    /// media (and DSKCHG when ejected), matching [`crate::IdePrimary::reset`].
     pub fn reset(&mut self) {
+        let image = self.image.take();
+        let dskchg = self.dir & FDC_DIR_DSKCHG;
         *self = Self::new();
+        self.image = image;
+        if self.has_media() {
+            self.dir &= !FDC_DIR_DSKCHG;
+        } else {
+            // Preserve eject-history DSKCHG; never-attached stays 0.
+            self.dir |= dskchg;
+        }
     }
 
     /// True if this device owns the I/O port.
@@ -3567,5 +3677,144 @@ mod tests {
             FDC_CMD_READ_DATA & FDC_CMD_OPCODE_MASK,
             FDC_CMD_READ_DELETED_DATA & FDC_CMD_OPCODE_MASK
         );
+    }
+
+    /// Spec: IBM PC 1.44MB MFM geometry — exact image size attaches; wrong size rejected.
+    #[test]
+    fn attach_1440k_image_accepts_exact_size_rejects_wrong() {
+        let mut f = Fdc82077::new();
+        assert!(!f.has_media());
+        assert_eq!(FDC_1440_IMAGE_SIZE, 1_474_560);
+        assert_eq!(
+            FDC_1440_CYLINDERS as usize
+                * FDC_1440_HEADS as usize
+                * FDC_1440_SECTORS_PER_TRACK as usize
+                * FDC_SECTOR_SIZE,
+            FDC_1440_IMAGE_SIZE
+        );
+        assert_eq!(FDC_SECTOR_N, 2, "N=2 → 128<<2 = 512-byte sectors");
+
+        assert!(f.attach_image(vec![0u8; 512]).is_err());
+        assert!(!f.has_media());
+
+        assert!(f.attach_image(vec![0u8; FDC_1440_IMAGE_SIZE]).is_ok());
+        assert!(f.has_media());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            0,
+            "DSKCHG cleared while media attached"
+        );
+
+        let f2 = Fdc82077::with_image(vec![0xABu8; FDC_1440_IMAGE_SIZE]);
+        assert!(f2.has_media());
+    }
+
+    /// Spec: IBM PC 1.44MB CHS layout — R is 1-based; linear MFM image order C→H→R.
+    #[test]
+    fn chs_byte_offset_1440k_geometry() {
+        assert_eq!(Fdc82077::chs_byte_offset(0, 0, 1), Some(0));
+        assert_eq!(Fdc82077::chs_byte_offset(0, 0, 2), Some(512));
+        assert_eq!(
+            Fdc82077::chs_byte_offset(0, 1, 1),
+            Some(18 * FDC_SECTOR_SIZE)
+        );
+        assert_eq!(
+            Fdc82077::chs_byte_offset(1, 0, 1),
+            Some(2 * 18 * FDC_SECTOR_SIZE)
+        );
+        assert_eq!(Fdc82077::chs_byte_offset(0, 0, 0), None, "R is 1-based");
+        assert_eq!(Fdc82077::chs_byte_offset(0, 0, 19), None);
+        assert_eq!(Fdc82077::chs_byte_offset(0, 2, 1), None);
+        assert_eq!(Fdc82077::chs_byte_offset(80, 0, 1), None);
+    }
+
+    /// Spec: OSDev/IBM 1.44MB — `read_sector` returns image bytes at CHS; OOR → None.
+    #[test]
+    fn read_sector_returns_image_bytes() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        // Mark (0,0,1), (0,0,2), (0,1,1), (1,0,1).
+        img[0] = 0x11;
+        img[511] = 0x22;
+        img[512] = 0x33;
+        img[18 * FDC_SECTOR_SIZE] = 0x44;
+        img[2 * 18 * FDC_SECTOR_SIZE] = 0x55;
+
+        let f = Fdc82077::with_image(img);
+        let s001 = f.read_sector(0, 0, 1).expect("sector 0,0,1");
+        assert_eq!(s001[0], 0x11);
+        assert_eq!(s001[511], 0x22);
+        assert_eq!(f.read_sector(0, 0, 2).unwrap()[0], 0x33);
+        assert_eq!(f.read_sector(0, 1, 1).unwrap()[0], 0x44);
+        assert_eq!(f.read_sector(1, 0, 1).unwrap()[0], 0x55);
+        assert!(f.read_sector(0, 0, 19).is_none());
+        assert!(f.read_sector(80, 0, 1).is_none());
+
+        let empty = Fdc82077::new();
+        assert!(empty.read_sector(0, 0, 1).is_none(), "no media → None");
+    }
+
+    /// Stub DIR bit7 DSKCHG: set on eject / no-media after attach history; clear on attach.
+    /// Spec note: Intel 82077AA DIR DSKCHG is a latched change line cleared by
+    /// drive-select/step sequencing — this stub only tracks attach/eject.
+    #[test]
+    fn eject_sets_dskchg_reset_preserves_media() {
+        let mut f = Fdc82077::with_image(vec![0x7Eu8; FDC_1440_IMAGE_SIZE]);
+        assert!(f.has_media());
+        assert_eq!(f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG, 0);
+
+        f.eject();
+        assert!(!f.has_media());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG,
+            "eject sets DSKCHG"
+        );
+
+        // Re-attach clears DSKCHG.
+        assert!(f.attach_image(vec![0x7Eu8; FDC_1440_IMAGE_SIZE]).is_ok());
+        assert_eq!(f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG, 0);
+
+        // reset() preserves backing image like IdePrimary.
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.specify_srt_hut = 0xDF;
+        f.reset();
+        assert!(f.has_media(), "reset preserves attached image");
+        assert_eq!(f.read_sector(0, 0, 1).unwrap()[0], 0x7E);
+        assert_eq!(f.dor, 0, "reset clears programmed DOR");
+        assert_eq!(f.specify_srt_hut, 0);
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            0,
+            "media still attached → DSKCHG clear"
+        );
+
+        f.eject();
+        f.reset();
+        assert!(!f.has_media());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG,
+            "reset preserves DSKCHG after eject history"
+        );
+    }
+
+    /// READ DATA path remains the no-media ND stub when no image is attached.
+    #[test]
+    fn finish_read_data_still_nd_without_media() {
+        let mut f = Fdc82077::new();
+        assert!(!f.has_media());
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
     }
 }
