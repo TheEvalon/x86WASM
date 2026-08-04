@@ -40,7 +40,8 @@ pub struct Machine {
     pub pit: Pit8254,
     /// MC146818 CMOS/RTC (ports 0x70/0x71); PIE/AIE/UIE → IRQ8.
     pub cmos: CmosRtc,
-    /// 8042 / PS/2 controller (ports 0x60/0x64); OBF+INT1 → IRQ1.
+    /// 8042 / PS/2 controller (ports 0x60/0x64); OBF+INT1 → IRQ1,
+    /// AUX OBF+INT12 → IRQ12 (second-port controller side; no mouse device).
     pub kbd: I8042,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
@@ -297,6 +298,28 @@ impl Machine {
         self.pic.set_irq_line(1, self.kbd.irq1_line());
     }
 
+    /// Inject an auxiliary (second PS/2 port) byte and sync AUX OBF∧INT12 → IRQ12.
+    ///
+    /// Spec: IBM PS/2 keyboard controller — second-port data sets AUX OBF and
+    /// raises IRQ12 (8259A slave IR4) when config bit1 is set. Dropped when the
+    /// aux clock is disabled (config bit5). Returns true on IRQ12 rising edge.
+    /// No mouse device is modeled; the caller supplies the byte.
+    pub fn kbd_inject_aux_byte(&mut self, value: u8) -> bool {
+        let rising = self.kbd.inject_aux_byte(value);
+        if rising {
+            self.pic.set_irq_line(12, false);
+            self.pic.set_irq_line(12, true);
+        } else {
+            self.sync_kbd_irq12();
+        }
+        rising
+    }
+
+    /// Drive PIC IRQ12 from the current 8042 IRQ12 line (level follow).
+    pub fn sync_kbd_irq12(&mut self) {
+        self.pic.set_irq_line(12, self.kbd.irq12_line());
+    }
+
     /// Whether the platform NMI delivery path is unmasked.
     ///
     /// Spec: IBM PC/AT — CMOS index port `0x70` bit7 = 1 disables NMI.
@@ -483,15 +506,17 @@ impl Bus for MachineBus<'_> {
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
     /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, FDC IRQ6, CMOS IRQF → IRQ8,
-    /// primary IDE INTRQ∧¬nIEN → IRQ14, and secondary IDE → IRQ15 (level follow)
-    /// before acknowledge so edges from prior [`Machine::tick_pit`] /
-    /// [`Machine::kbd_place_output`] / [`Machine::tick_cmos`] / FDC
+    /// 8042 AUX OBF∧INT12 → IRQ12, primary IDE INTRQ∧¬nIEN → IRQ14, and secondary
+    /// IDE → IRQ15 (level follow) before acknowledge so edges from prior
+    /// [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
+    /// [`Machine::kbd_inject_aux_byte`] / [`Machine::tick_cmos`] / FDC
     /// [`Fdc82077::assert_irq6`] / IDE completion are visible.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());
         self.pic.set_irq_line(6, self.fdc.irq_line());
         self.pic.set_irq_line(8, self.cmos.irq_line());
+        self.pic.set_irq_line(12, self.kbd.irq12_line());
         self.pic.set_irq_line(14, self.ide.irq_line());
         self.pic.set_irq_line(15, self.ide_secondary.irq_line());
         self.pic.poll_irq()
@@ -502,17 +527,17 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, CFG_INT1, CFG_TRANSLATE, CMD_ENABLE_KBD,
-        CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA,
-        CMOS_INDEX, FDC_CMD_CONFIGURE, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK,
+        CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, CFG_INT1, CFG_INT12, CFG_TRANSLATE,
+        CMD_ENABLE_KBD, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT,
+        CMOS_DATA, CMOS_INDEX, FDC_CMD_CONFIGURE, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK,
         FDC_CMD_SENSE_DRIVE_STATUS, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_DOR, FDC_DOR_DMA_IRQ,
         FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, FDC_ST0_SEEK_END,
         FDC_ST3_RESERVED_BIT3, FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042, I8042_DATA,
         I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA,
         PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
         PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B,
-        REG_STATUS_C, SELF_TEST_OK, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF,
-        VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ,
+        REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
+        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ,
         VGA_MISC_OUTPUT_WRITE,
     };
 
@@ -629,6 +654,20 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFD); // unmask IR1
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR2 and slave IR4 (IRQ12).
+    fn init_at_pic_unmask_irq12(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0xEF); // unmask slave IR4 (IRQ12)
     }
 
     /// Helper: classic AT DualPic cascade + unmask master IR2 and slave IR6 (IRQ14).
@@ -850,6 +889,74 @@ mod tests {
         assert!(!m.kbd.irq1_line());
         {
             let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+    }
+
+    /// Spec: IBM PS/2 KBC — AUX OBF + config INT12 → IRQ12 → slave vector 0x74;
+    /// EOI + read `0x60` clears the path. Keyboard IRQ1 stays idle.
+    #[test]
+    fn kbd_aux_byte_with_int12_asserts_irq12_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq12(&mut m);
+        // Enable second-port interrupt in the 8042 config (bit1).
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        m.kbd.port_write(I8042_DATA, 1, u32::from(CFG_INT12));
+        assert!(m.kbd_inject_aux_byte(0x08));
+        assert!(m.kbd.irq12_line());
+        assert!(!m.kbd.irq1_line());
+        assert_ne!(m.kbd.status() & STATUS_AUX_OBF, 0);
+        {
+            let mut bus = m.bus_mut();
+            // Spec: AT slave ICW2 base 0x70 → IRQ12 (slave IR4) vector 0x74.
+            assert_eq!(bus.poll_external_irq(), Some(0x74));
+            assert_eq!(bus.poll_external_irq(), None);
+            assert_eq!(bus.port_in_u8(I8042_DATA).unwrap(), 0x08);
+            assert!(!bus.kbd.irq12_line());
+            // Non-specific EOI slave then master (PC AT cascade convention).
+            bus.port_out_u8(PIC_SLAVE_CMD, 0x20).unwrap();
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.slave.isr, 0);
+        assert_eq!(m.pic.master.isr, 0);
+        assert!(!m.kbd.irq12_line());
+    }
+
+    /// Spec: IBM PS/2 KBC — AUX OBF without config INT12 does not deliver IRQ12.
+    #[test]
+    fn kbd_aux_byte_without_int12_no_irq12() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq12(&mut m);
+        // Default config: INT12 clear (aux clock enabled).
+        assert!(!m.kbd_inject_aux_byte(0x08));
+        assert_ne!(m.kbd.status() & STATUS_AUX_OBF, 0);
+        assert!(!m.kbd.irq12_line());
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+    }
+
+    /// Spec: IBM PS/2 KBC — keyboard data raises IRQ1 only, never IRQ12, even
+    /// with both interrupt enables set.
+    #[test]
+    fn kbd_scancode_does_not_deliver_irq12() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq12(&mut m);
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        // Both enables set; both clocks enabled (config bits 4/5 clear).
+        m.kbd
+            .port_write(I8042_DATA, 1, u32::from(CFG_INT1 | CFG_INT12));
+        assert!(m.kbd_inject_scancode(0x1C));
+        assert!(m.kbd.irq1_line());
+        assert!(!m.kbd.irq12_line());
+        assert_eq!(m.kbd.status() & STATUS_AUX_OBF, 0);
+        {
+            let mut bus = m.bus_mut();
+            // Slave IR4 idle: only master IR1 is unmasked-and-pending here, and
+            // this helper masks IR1, so no vector is delivered.
             assert_eq!(bus.poll_external_irq(), None);
         }
     }

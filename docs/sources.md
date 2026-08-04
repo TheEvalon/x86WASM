@@ -22,7 +22,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - ACPI specifications (for later machine/firmware work)
 - ATA / ATAPI specifications (IDENTIFY DEVICE `0xEC`, IDENTIFY PACKET DEVICE `0xA1`, READ SECTORS `0x20`, WRITE SECTORS `0x30`, task-file / status bits, error ABRT, LBA28 PIO, device-control nIEN / INTRQ)
 - OSDev Wiki ATA PIO Mode — primary ports `0x1F0`–`0x1F7` / `0x3F6` (IRQ14), secondary `0x170`–`0x177` / `0x376` (IRQ15), IDENTIFY/READ/WRITE polling (status clears IRQ; alt status does not); ATAPI probe via `0xA1`
-- PS/2 and 8042 controller references
+- PS/2 and 8042 controller references — OSDev Wiki "I8042 PS/2 Controller" (<https://wiki.osdev.org/I8042_PS/2_Controller>) + IBM PS/2 keyboard-controller programming model: data `0x60` / status-command `0x64`; status bit0 OBF, bit1 IBF, bit2 system flag, bit3 command/data, bit5 AUX OBF (PS/2; transmit/receive timeout on the original AT); command byte (config) bit0 first-port interrupt (IRQ1), bit1 second-port interrupt (IRQ12), bit4 first-port clock disable, bit5 second-port clock disable, bit6 translation; controller commands `0x20`/`0x60` read/write command byte, `0xAA` self-test → `0x55`, `0xAD`/`0xAE` disable/enable first port, `0xA7`/`0xA8` disable/enable second (auxiliary) port, `0xA9` test second port → `0x00` = no error, `0xD0`/`0xD1` read/write output port (bit1 = A20), `0xD4` write next data byte to the auxiliary device
 - Intel 8259A Programmable Interrupt Controller datasheet (ICW1–ICW4 / OCW)
 - Intel 8254 Programmable Interval Timer datasheet
 - Motorola MC146818 / IBM PC AT CMOS RTC register map (ports `0x70`/`0x71`; index bit7 = NMI disable)
