@@ -210,6 +210,9 @@ pub const MOUSE_CMD_STATUS_REQUEST: u8 = 0xE9;
 pub const MOUSE_CMD_SET_SCALING_1_1: u8 = 0xE6;
 /// PS/2 mouse command: Set Scaling 2:1 → ACK.
 pub const MOUSE_CMD_SET_SCALING_2_1: u8 = 0xE7;
+/// PS/2 mouse Resend — requeue last AUX OBF byte.
+/// Spec: OSDev PS/2 Mouse — `0xFE` Resend.
+pub const MOUSE_CMD_RESEND: u8 = 0xFE;
 
 /// Default sample rate after Reset (OSDev PS/2 Mouse defaults).
 pub const MOUSE_DEFAULT_SAMPLE_RATE: u8 = 100;
@@ -400,6 +403,8 @@ pub struct I8042 {
     /// reset clears it back to `0`. Controller responses via [`Self::push_output`]
     /// (self-test, read-config, …) do **not** update this field.
     kbd_last_byte: u8,
+    /// Last byte presented on AUX OBF (for mouse Resend).
+    mouse_last_byte: u8,
     /// Set 2 break prefix (`0xF0`) seen while config bit6 translation is on;
     /// the next keyboard byte is translated then OR'd with `0x80` (Set 1 break).
     translate_pending_break: bool,
@@ -432,6 +437,7 @@ impl I8042 {
             kbd_resp: [0; KBD_RESP_QUEUE_CAP],
             kbd_resp_len: 0,
             kbd_last_byte: 0,
+            mouse_last_byte: 0,
             translate_pending_break: false,
         };
         s.apply_reset_defaults();
@@ -483,6 +489,7 @@ impl I8042 {
         self.mouse_resolution = MOUSE_DEFAULT_RESOLUTION;
         self.mouse_scaling_21 = false;
         self.mouse_pending_param = MousePendingParam::None;
+        self.mouse_last_byte = 0;
     }
 
     pub fn reset(&mut self) {
@@ -758,6 +765,7 @@ impl I8042 {
             return false;
         }
         let prev = self.irq12_line();
+        self.mouse_last_byte = value;
         self.output = Some(value);
         self.output_from_aux = true;
         !prev && self.irq12_line()
@@ -866,6 +874,7 @@ impl I8042 {
             return;
         }
         if let Some(b) = self.pop_aux_response() {
+            self.mouse_last_byte = b;
             self.output = Some(b);
             self.output_from_aux = true;
         }
@@ -939,6 +948,11 @@ impl I8042 {
             MOUSE_CMD_SET_SCALING_2_1 => {
                 self.mouse_scaling_21 = true;
                 self.begin_mouse_response(&[MOUSE_ACK]);
+            }
+            MOUSE_CMD_RESEND => {
+                // Spec: OSDev PS/2 Mouse — Resend last byte on AUX OBF.
+                let last = self.mouse_last_byte;
+                self.begin_mouse_response(&[last]);
             }
             _ => {
                 // Unsupported mouse command: recorded, no response (see module docs).
@@ -1902,6 +1916,18 @@ mod tests {
     }
 
     /// Helper: send one host→aux byte via controller command `0xD4`.
+
+    /// Spec: OSDev PS/2 Mouse — Resend (`0xFE`) via `0xD4` requeues last AUX byte.
+    #[test]
+    fn mouse_resend_fe_requeues_last_aux_byte() {
+        let mut k = I8042::new();
+        write_aux(&mut k, MOUSE_CMD_GET_DEVICE_ID);
+        assert_eq!(read_aux_byte(&mut k), KBD_ACK);
+        assert_eq!(read_aux_byte(&mut k), 0x00); // device ID
+        write_aux(&mut k, MOUSE_CMD_RESEND);
+        assert_eq!(read_aux_byte(&mut k), 0x00, "resend last AUX byte (ID)");
+    }
+
     fn write_aux(k: &mut I8042, byte: u8) {
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_AUX));
         k.port_write(I8042_DATA, 1, u32::from(byte));
