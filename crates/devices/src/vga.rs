@@ -570,14 +570,26 @@ pub const VGA_ATC_OVERSCAN_COLOR: u8 = 0x11;
 /// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Overscan Color `0x00`.
 /// Store/readback only; no overscan-display / ATC→DAC side effects.
 pub const VGA_ATC_OVERSCAN_COLOR_DEFAULT: u8 = 0x00;
+/// Attribute Controller Color Plane Enable Register index.
+///
+/// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x12`.
+/// Bits 3:0 enable color planes 0–3 (display path). Plane-enable display side
+/// effects and ATC→DAC remap are out of scope (store/readback only).
+pub const VGA_ATC_COLOR_PLANE_ENABLE: u8 = 0x12;
+/// Mode-03h-class Color Plane Enable reset default (`0x0F` = all planes on).
+///
+/// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Color Plane Enable `0x0F`.
+/// Store/readback only; no plane-enable display / ATC→DAC side effects.
+pub const VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT: u8 = 0x0F;
 
 /// Mode-03h-class Attribute Controller reset defaults (store/readback only).
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-set palette — internal palette
 /// `00/01/02/03/04/05/14/07/38/39/3A/3B/3C/3D/3E/3F`; Mode Control
 /// [`VGA_ATC_MODE_CONTROL_DEFAULT`] (BLINK|LGE, alphanumeric); Overscan Color
-/// [`VGA_ATC_OVERSCAN_COLOR_DEFAULT`]; Color Plane Enable `0x0F`; Horizontal
-/// PEL Panning `0x08`; Color Select `0x00`.
+/// [`VGA_ATC_OVERSCAN_COLOR_DEFAULT`]; Color Plane Enable
+/// [`VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT`]; Horizontal PEL Panning `0x08`; Color
+/// Select `0x00`.
 pub const VGA_ATC_DEFAULTS: [u8; VGA_ATC_REG_COUNT] = [
     0x00,
     0x01,
@@ -597,7 +609,7 @@ pub const VGA_ATC_DEFAULTS: [u8; VGA_ATC_REG_COUNT] = [
     0x3F,
     VGA_ATC_MODE_CONTROL_DEFAULT,
     VGA_ATC_OVERSCAN_COLOR_DEFAULT,
-    0x0F,
+    VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT,
     0x08,
     0x00,
 ];
@@ -610,6 +622,12 @@ const _: () = assert!(
     VGA_ATC_OVERSCAN_COLOR == 0x11
         && VGA_ATC_OVERSCAN_COLOR_DEFAULT == 0x00
         && VGA_ATC_DEFAULTS[VGA_ATC_OVERSCAN_COLOR as usize] == VGA_ATC_OVERSCAN_COLOR_DEFAULT
+);
+const _: () = assert!(
+    VGA_ATC_COLOR_PLANE_ENABLE == 0x12
+        && VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT == 0x0F
+        && VGA_ATC_DEFAULTS[VGA_ATC_COLOR_PLANE_ENABLE as usize]
+            == VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
 );
 
 /// DAC / PEL Mask Register (R/W).
@@ -2695,6 +2713,83 @@ mod tests {
         );
     }
 
+    /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — Color Plane
+    /// Enable (index `0x12`) store/readback via `0x3C0`/`0x3C1`. Mode-03h reset
+    /// default is [`VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT`] (`0x0F`).
+    #[test]
+    fn atc_color_plane_enable_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_COLOR_PLANE_ENABLE)],
+            VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_COLOR_PLANE_ENABLE),
+        );
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
+        );
+
+        // Non-default Color Plane Enable programming (display side effects deferred).
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_COLOR_PLANE_ENABLE),
+        );
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x05);
+        assert_eq!(v.atc_regs[usize::from(VGA_ATC_COLOR_PLANE_ENABLE)], 0x05);
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_COLOR_PLANE_ENABLE),
+        );
+        assert_eq!(v.port_read(VGA_ATC_DATA_READ, 1) as u8, 0x05);
+
+        // Word write path (lo=index, hi=data) also updates Color Plane Enable.
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            2,
+            (u32::from(0x0Fu8) << 8) | u32::from(VGA_ATC_COLOR_PLANE_ENABLE),
+        );
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_COLOR_PLANE_ENABLE)],
+            VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_COLOR_PLANE_ENABLE),
+        );
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
+        );
+
+        v.reset();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_COLOR_PLANE_ENABLE)],
+            VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
+        );
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_COLOR_PLANE_ENABLE),
+        );
+        assert_eq!(
+            v.port_read(VGA_ATC_DATA_READ, 1) as u8,
+            VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
+        );
+    }
+
     /// Spec: FreeVGA Attribute Controller Registers — Mode Control (index `0x10`)
     /// store/readback via `0x3C0`/`0x3C1`. Mode-03h reset default is
     /// [`VGA_ATC_MODE_CONTROL_DEFAULT`] (`0x0C`).
@@ -3101,7 +3196,7 @@ mod tests {
     fn attribute_controller_reset_defaults_mode03h() {
         // Spec: FreeVGA / IBM VGA / Abrash mode-03h-class ATC — palette
         // 00..05/14/07/38..3F, Mode Control [`VGA_ATC_MODE_CONTROL_DEFAULT`],
-        // plane enable 0x0F, pan 0x08.
+        // Color Plane Enable [`VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT`], pan 0x08.
         let v = VgaText::new();
         assert_eq!(v.atc_index, VGA_ATC_INDEX_DEFAULT);
         assert!(!v.atc_flip_flop_data);
@@ -3111,7 +3206,10 @@ mod tests {
             v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)],
             VGA_ATC_MODE_CONTROL_DEFAULT
         );
-        assert_eq!(v.atc_regs[0x12], 0x0F);
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_COLOR_PLANE_ENABLE)],
+            VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT
+        );
         assert_eq!(v.atc_regs[0x13], 0x08);
     }
 
