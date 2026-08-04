@@ -9,7 +9,8 @@
 //!   SMART (`0xB0`), READ DMA (`0xC8`), WRITE DMA (`0xCA`), SECURITY SET
 //!   PASSWORD (`0xF1`), SECURITY UNLOCK (`0xF2`), SECURITY ERASE PREPARE
 //!   (`0xF3`), SECURITY ERASE UNIT (`0xF4`), SECURITY FREEZE LOCK (`0xF5`),
-//!   DOWNLOAD MICROCODE (`0x92`), READ LOG EXT (`0x2F`), WRITE LOG EXT (`0x3F`),
+//!   SECURITY DISABLE PASSWORD (`0xF6`), DOWNLOAD MICROCODE (`0x92`), READ LOG
+//!   EXT (`0x2F`), WRITE LOG EXT (`0x3F`),
 //!   DATA SET MANAGEMENT (`0x06`), TRUSTED RECEIVE (`0x5C`), TRUSTED SEND
 //!   (`0x5E`), task-file registers, status bits BSY/DRDY/DRQ/ERR, error ABRT,
 //!   LBA28 addressing;
@@ -47,6 +48,9 @@
 //!   SECURITY ERASE PREPARE
 //! - SECURITY FREEZE LOCK (`0xF5`): ATA master → ERR+ABRT (no SECURITY feature
 //!   set / freeze state); absent/slave → status 0; INTRQ follows nIEN like SMART
+//! - SECURITY DISABLE PASSWORD (`0xF6`): ATA master → ERR+ABRT (no SECURITY
+//!   password disable / password PIO); absent/slave → status 0; INTRQ follows
+//!   nIEN like SECURITY ERASE UNIT
 //! - DOWNLOAD MICROCODE (`0x92`): ATA master → ERR+ABRT (no microcode download /
 //!   vendor transfer); absent/slave → status 0; INTRQ follows nIEN like SMART
 //! - READ LOG EXT (`0x2F`): ATA master → ERR+ABRT (no GPL / log page PIO);
@@ -234,6 +238,9 @@ pub const ATA_CMD_SECURITY_ERASE_UNIT: u8 = 0xF4;
 /// SECURITY FREEZE LOCK — SECURITY feature-set command; this stub aborts.
 /// Spec: ATA/ATAPI Command Set — SECURITY FREEZE LOCK (`0xF5`).
 pub const ATA_CMD_SECURITY_FREEZE_LOCK: u8 = 0xF5;
+/// SECURITY DISABLE PASSWORD — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY DISABLE PASSWORD (`0xF6`).
+pub const ATA_CMD_SECURITY_DISABLE_PASSWORD: u8 = 0xF6;
 /// DOWNLOAD MICROCODE — vendor microcode transfer; this stub aborts.
 /// Spec: ATA/ATAPI Command Set — DOWNLOAD MICROCODE (`0x92`).
 pub const ATA_CMD_DOWNLOAD_MICROCODE: u8 = 0x92;
@@ -828,6 +835,24 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
+    /// SECURITY DISABLE PASSWORD (`0xF6`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY DISABLE PASSWORD is a SECURITY
+    /// feature-set command that clears a user/master password via a password
+    /// PIO transfer. This stub does not implement SECURITY passwords; ATA disks
+    /// abort with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows
+    /// nIEN like SECURITY ERASE UNIT abort.
+    fn exec_security_disable_password(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// DOWNLOAD MICROCODE (`0x92`) on ATA master — ABRT stub.
     ///
     /// Spec: ATA/ATAPI Command Set — DOWNLOAD MICROCODE transfers vendor
@@ -1128,6 +1153,7 @@ impl IdePrimary {
             ATA_CMD_SECURITY_ERASE_PREPARE => self.exec_security_erase_prepare(),
             ATA_CMD_SECURITY_ERASE_UNIT => self.exec_security_erase_unit(),
             ATA_CMD_SECURITY_FREEZE_LOCK => self.exec_security_freeze_lock(),
+            ATA_CMD_SECURITY_DISABLE_PASSWORD => self.exec_security_disable_password(),
             ATA_CMD_DOWNLOAD_MICROCODE => self.exec_download_microcode(),
             ATA_CMD_READ_LOG_EXT => self.exec_read_log_ext(),
             ATA_CMD_WRITE_LOG_EXT => self.exec_write_log_ext(),
@@ -2337,6 +2363,70 @@ mod tests {
             IDE_PRIMARY_STATUS,
             1,
             u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY DISABLE PASSWORD (`0xF6`) is a
+    /// SECURITY feature-set command that clears passwords via PIO. This stub
+    /// has no SECURITY password PIO; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn security_disable_password_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_disable_password_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match ERASE UNIT).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_disable_password_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match ERASE UNIT abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_disable_password_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
         );
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
