@@ -150,8 +150,10 @@
 //!   ST1 ND, C/H/R/N=0; asserts IRQ6 (cleared on first result byte). Full IDAM
 //!   track scan deferred.
 //! - 1.44MB media image attach/eject + CHS→offset/`read_sector`/
-//!   `write_sector` helpers (PC MFM geometry); DIR bit7 DSKCHG stub on
-//!   attach/eject; `write_protected` / [`Self::set_write_protected`] for ST3
+//!   `write_sector` helpers (PC MFM geometry); DIR bit7 DSKCHG stub: set on
+//!   eject, preserved across re-attach/`reset`, cleared by successful
+//!   Recalibrate/Seek when media present (classic disk-change clear);
+//!   `write_protected` / [`Self::set_write_protected`] for ST3
 //!   WP; `reset()` preserves media and write-protect flag like IDE. READ DATA
 //!   success path latches one sector in `last_sector` and arms
 //!   `dma_read_pending` when DOR bit3 is set for MachineBus auto DMA ch2 Write
@@ -196,10 +198,11 @@ pub const FDC_DIR_CCR: u16 = 0x3F7;
 
 /// DIR bit7 — Disk Changed (DSKCHG). Spec: Intel 82077AA DIR; OSDev FDC.
 ///
-/// Hardware latches a media-change edge and typically clears after drive
-/// select / recalibrate / step sequencing. This emulator's stub only sets the
-/// bit on [`Fdc82077::eject`] (and preserves it across `reset` when no media)
-/// and clears it on successful [`Fdc82077::attach_image`] — not full DIR timing.
+/// Hardware latches a media-change edge; classic PC firmware clears it by
+/// Recalibrate/Seek (head step) while media is present. This stub sets the bit
+/// on [`Fdc82077::eject`], preserves it across re-[`Fdc82077::attach_image`]
+/// and `reset`, and clears it on successful Recalibrate/Seek when
+/// [`Fdc82077::has_media`] — not full drive-select/step-pulse timing.
 pub const FDC_DIR_DSKCHG: u8 = 0x80;
 
 /// PC 1.44MB MFM floppy cylinders. Spec: IBM PC / OSDev Floppy Disk.
@@ -605,15 +608,15 @@ impl Fdc82077 {
 
     /// Attach a raw 1.44MB floppy image (exact [`FDC_1440_IMAGE_SIZE`] bytes).
     ///
-    /// Rejects other sizes. Clears DIR DSKCHG (stub). Spec: IBM PC 1.44MB MFM;
-    /// DIR bit7 semantics are stubbed (see [`FDC_DIR_DSKCHG`]). Does not change
+    /// Rejects other sizes. Does **not** clear DIR DSKCHG — classic media-change
+    /// remains latched until successful Recalibrate/Seek with media (see
+    /// [`FDC_DIR_DSKCHG`]). Spec: IBM PC 1.44MB MFM. Does not change
     /// [`Self::write_protected`].
     pub fn attach_image(&mut self, image: Vec<u8>) -> Result<(), &'static str> {
         if image.len() != FDC_1440_IMAGE_SIZE {
             return Err("FDC attach_image requires exact 1.44MB (1_474_560) image");
         }
         self.image = Some(image);
-        self.dir &= !FDC_DIR_DSKCHG;
         Ok(())
     }
 
@@ -775,8 +778,8 @@ impl Fdc82077 {
     }
 
     /// Hardware reset: clears programmed controller state; preserves attached
-    /// media, write-protect flag, and DSKCHG when ejected, matching
-    /// [`crate::IdePrimary::reset`].
+    /// media, write-protect flag, and latched DSKCHG (media or eject history),
+    /// matching [`crate::IdePrimary::reset`] for media/WP.
     pub fn reset(&mut self) {
         let image = self.image.take();
         let write_protected = self.write_protected;
@@ -784,12 +787,9 @@ impl Fdc82077 {
         *self = Self::new();
         self.image = image;
         self.write_protected = write_protected;
-        if self.has_media() {
-            self.dir &= !FDC_DIR_DSKCHG;
-        } else {
-            // Preserve eject-history DSKCHG; never-attached stays 0.
-            self.dir |= dskchg;
-        }
+        // Preserve latched DSKCHG; never-attached stays 0. Recalibrate/Seek
+        // with media clears — not hardware reset.
+        self.dir |= dskchg;
     }
 
     /// True if this device owns the I/O port.
@@ -896,12 +896,26 @@ impl Fdc82077 {
     /// Spec: Intel 82077AA Recalibrate — retracts selected unit head to track 0;
     /// on completion that unit's PCN=0, ST0 SE|US (`0x20 | unit`), interrupt
     /// asserted; host uses Sense Interrupt Status (no Recalibrate result phase).
+    /// Classic PC disk-change: successful step with media present clears DIR
+    /// DSKCHG (OSDev FDC / 82077AA DIR bit7).
     fn finish_recalibrate(&mut self, param: u8) {
         let unit = (param & 0x03) as usize;
         self.pcn[unit] = 0;
+        self.clear_dskchg_if_media();
         self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | (unit as u8));
         self.irq_pending = true;
         self.phase = Phase::Command;
+    }
+
+    /// Clear DIR DSKCHG when media is present (classic disk-change clear stub).
+    ///
+    /// Spec: Intel 82077AA DIR bit7 / OSDev FDC — firmware Recalibrate/Seek
+    /// while a disk is inserted clears the latched change line. No-media leaves
+    /// the bit set so guests can detect empty drives.
+    fn clear_dskchg_if_media(&mut self) {
+        if self.has_media() {
+            self.dir &= !FDC_DIR_DSKCHG;
+        }
     }
 
     /// Begin Seek parameter phase (2 bytes). Spec: Intel 82077AA Seek.
@@ -915,10 +929,12 @@ impl Fdc82077 {
     /// Spec: Intel 82077AA Seek — steps selected unit to NCN; on completion that
     /// unit's PCN=NCN, ST0 SE|US (`0x20 | unit`; H in ST0 always 0), interrupt
     /// asserted; host uses Sense Interrupt Status (no Seek result phase).
-    /// OSDev: param0 = (HD<<2)|US.
+    /// OSDev: param0 = (HD<<2)|US. Classic disk-change: step with media clears
+    /// DIR DSKCHG (same stub as Recalibrate).
     fn finish_seek(&mut self, ncn: u8) {
         let unit = (self.seek_head_unit & 0x03) as usize;
         self.pcn[unit] = ncn;
+        self.clear_dskchg_if_media();
         self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | (unit as u8));
         self.irq_pending = true;
         self.phase = Phase::Command;
@@ -4266,7 +4282,7 @@ mod tests {
         assert_eq!(
             f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
             0,
-            "DSKCHG cleared while media attached"
+            "first attach leaves DSKCHG clear (never latched)"
         );
 
         let f2 = Fdc82077::with_image(vec![0xABu8; FDC_1440_IMAGE_SIZE]);
@@ -4317,9 +4333,10 @@ mod tests {
         assert!(empty.read_sector(0, 0, 1).is_none(), "no media → None");
     }
 
-    /// Stub DIR bit7 DSKCHG: set on eject / no-media after attach history; clear on attach.
-    /// Spec note: Intel 82077AA DIR DSKCHG is a latched change line cleared by
-    /// drive-select/step sequencing — this stub only tracks attach/eject.
+    /// Stub DIR bit7 DSKCHG: set on eject; re-attach/`reset` preserve latch;
+    /// Recalibrate/Seek with media clear (classic disk-change).
+    /// Spec: Intel 82077AA DIR DSKCHG / OSDev FDC — latched change cleared by
+    /// head step while media present, not by insert alone.
     #[test]
     fn eject_sets_dskchg_reset_preserves_media() {
         let mut f = Fdc82077::with_image(vec![0x7Eu8; FDC_1440_IMAGE_SIZE]);
@@ -4334,11 +4351,15 @@ mod tests {
             "eject sets DSKCHG"
         );
 
-        // Re-attach clears DSKCHG.
+        // Re-attach keeps DSKCHG latched until Recalibrate/Seek with media.
         assert!(f.attach_image(vec![0x7Eu8; FDC_1440_IMAGE_SIZE]).is_ok());
-        assert_eq!(f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG, 0);
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG,
+            "re-attach preserves latched DSKCHG"
+        );
 
-        // reset() preserves backing image like IdePrimary.
+        // reset() preserves backing image and latched DSKCHG (even with media).
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         f.specify_srt_hut = 0xDF;
         f.reset();
@@ -4348,8 +4369,8 @@ mod tests {
         assert_eq!(f.specify_srt_hut, 0);
         assert_eq!(
             f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
-            0,
-            "media still attached → DSKCHG clear"
+            FDC_DIR_DSKCHG,
+            "reset preserves latched DSKCHG with media"
         );
 
         f.eject();
@@ -4359,6 +4380,75 @@ mod tests {
             f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
             FDC_DIR_DSKCHG,
             "reset preserves DSKCHG after eject history"
+        );
+    }
+
+    /// Spec: Intel 82077AA DIR / OSDev FDC — Recalibrate with media clears DSKCHG.
+    #[test]
+    fn recalibrate_clears_dskchg_when_media_present() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.eject();
+        assert!(f.attach_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]).is_ok());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG,
+            "precondition: DSKCHG latched after re-insert"
+        );
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RECALIBRATE));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert!(f.irq_line(), "Recalibrate still asserts IRQ");
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            0,
+            "Recalibrate with media clears DSKCHG"
+        );
+    }
+
+    /// Spec: no-media Recalibrate must leave DSKCHG set (empty-drive detect).
+    #[test]
+    fn recalibrate_leaves_dskchg_when_no_media() {
+        let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
+        f.eject();
+        assert!(!f.has_media());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG
+        );
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RECALIBRATE));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert!(f.irq_line());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG,
+            "no-media Recalibrate must not clear DSKCHG"
+        );
+    }
+
+    /// Spec: Intel 82077AA Seek step with media also clears DSKCHG (classic clear).
+    #[test]
+    fn seek_clears_dskchg_when_media_present() {
+        let mut f = Fdc82077::with_image(vec![0x55u8; FDC_1440_IMAGE_SIZE]);
+        f.eject();
+        assert!(f.attach_image(vec![0x55u8; FDC_1440_IMAGE_SIZE]).is_ok());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG
+        );
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x00); // HD|US
+        f.port_write(FDC_FIFO, 1, 0x10); // NCN
+        assert!(f.irq_line());
+        assert_eq!(f.pcn[0], 0x10);
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            0,
+            "Seek with media clears DSKCHG"
         );
     }
 
