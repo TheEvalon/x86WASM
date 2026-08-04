@@ -1,5 +1,5 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
-//! Sense Int/Sense Drive/Version/Configure/LOCK/DUMPREG + IRQ6.
+//! Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -17,14 +17,17 @@
 //!   `0x90` (82077AA identification); Configure (`0x13`) three parameter bytes
 //!   (unused, EIS|FIFO_DIS|POLL_DIS|FIFOTHR, PRETRK), no result/IRQ; LOCK
 //!   (`0x14`/`0x94`, §5.3.2) no params, LOCK in command bit7, result
-//!   `LOCK<<4`, no IRQ; DUMPREG (`0x0E`, §5.2.10 / §5.3.3) no params, 10-byte
-//!   result (PCN0–3, SRT|HUT, HLT|ND, SC/EOT, LOCK|perp, Configure, PRETRK),
-//!   no IRQ; DOR bit3 DMA/IRQ enable; IRQ6 on command / reset completion.
+//!   `LOCK<<4`, no IRQ; PERPENDICULAR Mode (`0x12`, §5.2.11 / §5.3.1) one
+//!   parameter byte `OW|0|D3–D0|GAP|WGATE`, no result/IRQ; DUMPREG (`0x0E`,
+//!   §5.2.10 / §5.3.3) no params, 10-byte result (PCN0–3, SRT|HUT, HLT|ND,
+//!   SC/EOT, LOCK|perp, Configure, PRETRK), no IRQ; DOR bit3 DMA/IRQ enable;
+//!   IRQ6 on command / reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
 //!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
 //!   Version returns `0x90` for 82077AA-class controllers; Configure stores
 //!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes; Lock/Unlock via MT bit;
+//!   Perpendicular Mode configures GAP/WGATE (and enhanced Dn bits);
 //!   DUMPREG dumps internal registers.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
@@ -60,21 +63,29 @@
 //!   soft reset restores Configure EFIFO/FIFOTHR/PRETRK stub defaults (0);
 //!   when LOCK=1 those Configure fields survive soft reset. Full `reset()`
 //!   (hardware) clears LOCK and all Configure fields.
+//! - PERPENDICULAR Mode (`0x12`): Spec Intel 82077AA §5.2.11 / Table 5-1 /
+//!   §5.3.1 — command byte → one parameter `OW|0|D3 D2 D1 D0|GAP|WGATE`;
+//!   always stores GAP|WGATE; updates D3–D0 only when OW=1; no result phase;
+//!   no IRQ. Soft DOR reset clears GAP|WGATE only and **preserves** D3–D0
+//!   (independent of LOCK). Hardware/`reset()` clears GAP|WGATE and D3–D0.
+//!   Gap2/WGATE timing side effects are not enforced (no media engine).
 //! - DUMPREG (`0x0E`): Spec Intel 82077AA §5.2.10 / Table 5-1 / §5.3.3 — no
 //!   parameters; 10-byte result from stored state with MSR RQM|DIO; no IRQ.
 //!   Result order: PCN0–3, SRT|HUT, HLT|ND, SC/EOT, LOCK|0|D3–D0|GAP|WGATE,
 //!   0|EIS|EFIFO|POLL|FIFOTHR, PRETRK. Stub: single shared `pcn` mirrored to
 //!   all four PCN bytes; `sc_eot` defaults 0 (no READ/WRITE/FORMAT yet);
-//!   perpendicular D3–D0/GAP/WGATE always 0 until PERPENDICULAR exists.
+//!   byte7 bits 5:0 reflect stored PERPENDICULAR D3–D0|GAP|WGATE (OW not
+//!   returned).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - Other commands (READ/WRITE/FORMAT/PERPENDICULAR/…)
+//! - Other commands (READ/WRITE/FORMAT/…)
 //! - Media image, seek step timing, format/read/write transfers
 //! - DMA channel 2 transfers (ND bit stored only; not enforced)
 //! - Automatic IRQ on real media command completion (host may still use assert API)
-//! - Drive sensing, disk-change edge timing, perpendicular mode
+//! - Drive sensing, disk-change edge timing
+//! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
 //! - Per-drive PCN (DUMPREG mirrors shared `pcn`); SC/EOT update from media cmds
 //! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
 //!   implied seek, poll disable enforcement); DSR software-reset path
@@ -124,6 +135,9 @@ pub const FDC_CMD_SEEK: u8 = 0x0F;
 /// Version command opcode. Spec: Intel 82077AA / OSDev FDC — no parameters,
 /// 1-byte result identifying the controller class.
 pub const FDC_CMD_VERSION: u8 = 0x10;
+/// PERPENDICULAR Mode command opcode. Spec: Intel 82077AA §5.2.11 / Table 5-1
+/// / §5.3.1 / OSDev — 1 parameter byte `OW|0|D3–D0|GAP|WGATE`, no result, no IRQ.
+pub const FDC_CMD_PERPENDICULAR: u8 = 0x12;
 /// Configure command opcode. Spec: Intel 82077AA / OSDev FDC — 3 parameter
 /// bytes, no result phase, no IRQ.
 pub const FDC_CMD_CONFIGURE: u8 = 0x13;
@@ -180,6 +194,8 @@ enum Phase {
     /// Configure parameters: byte0 unused, byte1 EIS|FIFO_DIS|POLL_DIS|FIFOTHR,
     /// byte2 PRETRK.
     ConfigureParams { index: u8 },
+    /// PERPENDICULAR Mode parameter: `OW|0|D3–D0|GAP|WGATE`. Spec: 82077AA §5.3.1.
+    PerpendicularParam,
     /// LOCK result: single status byte (`LOCK<<4`). Spec: 82077AA §5.3.2.
     LockResult,
     /// DUMPREG result: 10 bytes (index 0..9). Spec: 82077AA §5.2.10 / §5.3.3.
@@ -187,7 +203,7 @@ enum Phase {
 }
 
 /// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/
-/// Configure/LOCK/DUMPREG + IRQ6.
+/// Configure/LOCK/PERPENDICULAR/DUMPREG + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -219,8 +235,17 @@ pub struct Fdc82077 {
     pub configure_pretrk: u8,
     /// LOCK bit from LOCK command (`0x14`/`0x94`). Spec: Intel 82077AA §5.3.2 —
     /// when set, soft DOR/DSR reset must not restore Configure EFIFO/FIFOTHR/
-    /// PRETRK defaults; hardware/`reset()` clears LOCK.
+    /// PRETRK defaults; hardware/`reset()` clears LOCK. LOCK does **not**
+    /// protect PERPENDICULAR D3–D0 (those survive soft reset independently).
     pub lock: bool,
+    /// PERPENDICULAR Mode drive bits D3–D0 (nibble). Spec: Intel 82077AA
+    /// §5.3.1 — updated only when OW=1; soft DOR reset preserves; hardware
+    /// reset clears; appear in DUMPREG byte7 bits 5:2 (OW not returned).
+    pub perp_d3_d0: u8,
+    /// PERPENDICULAR Mode GAP (bit1) | WGATE (bit0). Spec: Intel 82077AA
+    /// §5.2.11 / Table 5-11 / §5.3.1 — always updated by the command; soft DOR
+    /// reset clears to 0; appear in DUMPREG byte7 bits 1:0.
+    pub perp_gap_wgate: u8,
     /// Last SC (FORMAT) or EOT (READ/WRITE/…) parameter. Spec: Intel 82077AA
     /// Table 5-1 note — DUMPREG result byte 6. Stub defaults to 0 until media
     /// commands exist.
@@ -264,6 +289,8 @@ impl Fdc82077 {
             configure_eis_fifo_poll_thr: 0x00,
             configure_pretrk: 0x00,
             lock: false,
+            perp_d3_d0: 0x00,
+            perp_gap_wgate: 0x00,
             sc_eot: 0x00,
             irq_pending: false,
             phase: Phase::Command,
@@ -303,7 +330,8 @@ impl Fdc82077 {
                 | Phase::RecalibrateParams
                 | Phase::SeekParams { .. }
                 | Phase::SenseDriveStatusParam
-                | Phase::ConfigureParams { .. } => FDC_MSR_RQM,
+                | Phase::ConfigureParams { .. }
+                | Phase::PerpendicularParam => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. }
                 | Phase::SenseDriveStatusResult
                 | Phase::VersionResult
@@ -345,6 +373,9 @@ impl Fdc82077 {
             self.configure_eis_fifo_poll_thr = 0;
             self.configure_pretrk = 0;
         }
+        // Spec: Intel 82077AA §5.3.1 — soft DOR/DSR reset clears GAP|WGATE only;
+        // D3–D0 retain (independent of LOCK).
+        self.perp_gap_wgate = 0;
     }
 
     /// Begin Specify parameter phase (2 bytes). Spec: Intel 82077AA Specify.
@@ -437,6 +468,24 @@ impl Fdc82077 {
         self.phase = Phase::ConfigureParams { index: 0 };
     }
 
+    /// Begin PERPENDICULAR Mode parameter phase (1 byte). Spec: 82077AA §5.2.11.
+    fn start_perpendicular(&mut self) {
+        self.phase = Phase::PerpendicularParam;
+    }
+
+    /// Complete PERPENDICULAR Mode after the parameter byte.
+    ///
+    /// Spec: Intel 82077AA §5.2.11 / Table 5-1 / §5.3.1 — param =
+    /// `OW|0|D3 D2 D1 D0|GAP|WGATE`; always store GAP|WGATE; update D3–D0 only
+    /// when OW=1; no result phase; no IRQ. OW is write-side only (not in DUMPREG).
+    fn finish_perpendicular(&mut self, param: u8) {
+        self.perp_gap_wgate = param & 0x03;
+        if param & 0x80 != 0 {
+            self.perp_d3_d0 = (param >> 2) & 0x0F;
+        }
+        self.phase = Phase::Command;
+    }
+
     /// Begin LOCK result phase. Spec: Intel 82077AA §5.3.2 / OSDev Lock.
     ///
     /// Command byte encodes LOCK in bit7 (`0x14` unlock / `0x94` lock); no
@@ -461,8 +510,12 @@ impl Fdc82077 {
             4 => self.specify_srt_hut,
             5 => self.specify_hlt_nd,
             6 => self.sc_eot,
-            // LOCK | 0 | D3 D2 D1 D0 | GAP | WGATE — perp bits stub 0.
-            7 => u8::from(self.lock) << 7,
+            // LOCK | 0 | D3 D2 D1 D0 | GAP | WGATE. Spec: 82077AA §5.3.3.
+            7 => {
+                (u8::from(self.lock) << 7)
+                    | ((self.perp_d3_d0 & 0x0F) << 2)
+                    | (self.perp_gap_wgate & 0x03)
+            }
             8 => self.configure_eis_fifo_poll_thr & 0x7F, // bit7 always 0
             9 => self.configure_pretrk,
             _ => 0xFF,
@@ -471,13 +524,15 @@ impl Fdc82077 {
 
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
-            // Spec: Specify/Recalibrate/Seek/Configure have no result phase; open-bus when idle/params.
+            // Spec: Specify/Recalibrate/Seek/Configure/PERPENDICULAR have no result
+            // phase; open-bus when idle/params.
             Phase::Command
             | Phase::SpecifyParams { .. }
             | Phase::RecalibrateParams
             | Phase::SeekParams { .. }
             | Phase::SenseDriveStatusParam
-            | Phase::ConfigureParams { .. } => 0xFF,
+            | Phase::ConfigureParams { .. }
+            | Phase::PerpendicularParam => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
@@ -544,6 +599,9 @@ impl Fdc82077 {
                 } else if v == FDC_CMD_CONFIGURE {
                     // Spec: Intel 82077AA Configure — three params; no result/IRQ.
                     self.start_configure();
+                } else if v == FDC_CMD_PERPENDICULAR {
+                    // Spec: Intel 82077AA §5.2.11 / §5.3.1 — one param; no result/IRQ.
+                    self.start_perpendicular();
                 } else if v == FDC_CMD_LOCK || v == FDC_CMD_LOCK_SET {
                     // Spec: Intel 82077AA §5.3.2 — LOCK in bit7; no params; result LOCK<<4.
                     self.start_lock(v);
@@ -600,6 +658,10 @@ impl Fdc82077 {
                         self.phase = Phase::Command;
                     }
                 }
+            }
+            Phase::PerpendicularParam => {
+                // Spec: Intel 82077AA §5.2.11 / §5.3.1 — OW|0|D3–D0|GAP|WGATE.
+                self.finish_perpendicular(v);
             }
             Phase::SenseIntResult { .. }
             | Phase::SenseDriveStatusResult
@@ -1632,7 +1694,7 @@ mod tests {
         assert_eq!(result[4], 0xDF, "SRT|HUT");
         assert_eq!(result[5], 0x02, "HLT|ND");
         assert_eq!(result[6], 0x12, "SC/EOT stub");
-        assert_eq!(result[7], 0x80, "LOCK<<7; perp bits stub 0");
+        assert_eq!(result[7], 0x80, "LOCK<<7; perp bits default 0");
         assert_eq!(result[8], 0x57, "0|EIS|EFIFO|POLL|FIFOTHR");
         assert_eq!(result[9], 0x0A, "PRETRK");
         assert_eq!(f.phase, Phase::Command);
@@ -1722,6 +1784,159 @@ mod tests {
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 1u8 << FDC_LOCK_RESULT_SHIFT);
         assert!(f.lock);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA §5.2.11 / Table 5-1 / §5.3.1 — PERPENDICULAR Mode
+    /// (`0x12`) takes one parameter `OW|0|D3–D0|GAP|WGATE`; no result; no IRQ.
+    #[test]
+    fn perpendicular_accepts_one_param_returns_to_command() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        assert_eq!(f.phase, Phase::PerpendicularParam);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "param phase: RQM, !DIO"
+        );
+        assert!(f.irq_line(), "PERPENDICULAR must not clear IRQ latch");
+
+        // OW=1, D0+D1 set, GAP=1, WGATE=1 → 0x80 | (0b0011<<2) | 0x03 = 0x8F
+        f.port_write(FDC_FIFO, 1, 0x8F);
+        assert_eq!(f.perp_d3_d0, 0x03);
+        assert_eq!(f.perp_gap_wgate, 0x03);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "idle command phase after PERPENDICULAR"
+        );
+        assert!(f.irq_line(), "PERPENDICULAR must not assert/clear IRQ");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0xFF, "no result phase");
+    }
+
+    /// Spec: 82077AA §5.3.1 — when OW=0, only GAP|WGATE are considered; D3–D0
+    /// retain previously programmed values.
+    #[test]
+    fn perpendicular_ow_zero_preserves_drive_bits() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // Seed Dn with OW=1.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        f.port_write(FDC_FIFO, 1, 0x80 | (0x0A << 2)); // OW=1, D3+D1, GAP=WGATE=0
+        assert_eq!(f.perp_d3_d0, 0x0A);
+        assert_eq!(f.perp_gap_wgate, 0);
+
+        // OW=0: update GAP|WGATE only; Dn unchanged even if param bits 5:2 differ.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        f.port_write(FDC_FIFO, 1, (0x0F << 2) | 0x03); // OW=0, would-be Dn=0xF, GAP|WGATE=11
+        assert_eq!(f.perp_d3_d0, 0x0A, "Dn must not change when OW=0");
+        assert_eq!(f.perp_gap_wgate, 0x03);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: PERPENDICULAR has no execution/result phase and must not assert IRQ.
+    #[test]
+    fn perpendicular_does_not_touch_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        f.port_write(FDC_FIFO, 1, 0x83); // OW=1, D0, GAP|WGATE=11
+        assert!(!f.irq_line(), "PERPENDICULAR never asserts IRQ");
+    }
+
+    #[test]
+    fn perpendicular_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        f.port_write(FDC_FIFO, 1, 0x8F);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.perp_d3_d0, 0);
+        assert_eq!(f.perp_gap_wgate, 0);
+    }
+
+    #[test]
+    fn dor_reset_aborts_perpendicular_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        assert_eq!(f.phase, Phase::PerpendicularParam);
+
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.perp_d3_d0, 0);
+        assert_eq!(f.perp_gap_wgate, 0);
+        // Mid-command abort: a lone param write must not be treated as a command.
+        f.port_write(FDC_FIFO, 1, 0x8F);
+        assert_eq!(f.perp_d3_d0, 0);
+        assert_eq!(f.perp_gap_wgate, 0);
+    }
+
+    /// Spec: 82077AA §5.3.1 — soft DOR reset clears GAP|WGATE only; D3–D0
+    /// retain. LOCK does not gate this (LOCK protects Configure fields only).
+    #[test]
+    fn soft_reset_clears_gap_wgate_preserves_drive_bits() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        f.port_write(FDC_FIFO, 1, 0x80 | (0x05 << 2) | 0x03); // OW=1, D0+D2, GAP|WGATE=11
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(f.lock);
+
+        f.port_write(FDC_DOR, 1, 0); // soft reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(f.lock, "LOCK survives soft reset");
+        assert_eq!(f.perp_d3_d0, 0x05, "Dn survive soft reset");
+        assert_eq!(f.perp_gap_wgate, 0, "GAP|WGATE cleared by soft reset");
+    }
+
+    /// Spec: 82077AA §5.3.1 — hardware reset clears GAP, WGATE, and D0–D3.
+    #[test]
+    fn hardware_reset_clears_all_perp_bits() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        f.port_write(FDC_FIFO, 1, 0x8F);
+        assert_eq!(f.perp_d3_d0, 0x03);
+        assert_eq!(f.perp_gap_wgate, 0x03);
+
+        f.reset();
+        assert_eq!(f.perp_d3_d0, 0);
+        assert_eq!(f.perp_gap_wgate, 0);
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: 82077AA §5.3.3 — DUMPREG eighth result byte =
+    /// `LOCK|0|D3 D2 D1 D0|GAP|WGATE` from stored PERPENDICULAR state.
+    #[test]
+    fn dumpreg_reflects_perpendicular_bits() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+        f.port_write(FDC_FIFO, 1, 0x80 | (0x09 << 2) | 0x02); // OW=1, D0+D3, GAP=1
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+        let _ = f.port_read(FDC_FIFO, 1);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_DUMPREG));
+        let mut result = [0u8; FDC_DUMPREG_RESULT_LEN as usize];
+        for byte in &mut result {
+            *byte = f.port_read(FDC_FIFO, 1) as u8;
+        }
+        // LOCK<<7 | D3–D0<<2 | GAP|WGATE = 0x80 | (0x09<<2) | 0x02 = 0xA6
+        assert_eq!(result[7], 0xA6, "LOCK|0|D3–D0|GAP|WGATE");
         assert_eq!(f.phase, Phase::Command);
     }
 }
