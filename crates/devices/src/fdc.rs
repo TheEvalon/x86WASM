@@ -1,6 +1,6 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
 //! Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
-//! READ DATA / WRITE DATA / FORMAT TRACK (no-media stubs) + IRQ6.
+//! READ DATA / READ DELETED DATA / WRITE DATA / FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -24,6 +24,9 @@
 //!   SC/EOT, LOCK|perp, Configure, PRETRK), no IRQ; READ DATA (`0x06` with
 //!   optional MT/MFM/SK in bits 7:5, §5.1.1 / Table 5-1) eight parameter
 //!   bytes then 7-byte result; no-media stub completes with ST0 IC=01 +
+//!   ST1 ND + C/H/R/N ENDaddress and IRQ6; READ DELETED DATA (`0x0C` with
+//!   optional MT/MFM/SK in bits 7:5, §5.1.3 / Table 5-1) same 8-param /
+//!   7-result shape as READ DATA; no-media stub completes with ST0 IC=01 +
 //!   ST1 ND + C/H/R/N ENDaddress and IRQ6; WRITE DATA (`0x05` with optional
 //!   MT/MFM in bits 7:6, §5.1.2 / Table 5-1) same 8-param / 7-result shape;
 //!   no-media stub completes with ST0 IC=01 + ST1 NW + C/H/R/N ENDaddress
@@ -37,8 +40,8 @@
 //!   Version returns `0x90` for 82077AA-class controllers; Configure stores
 //!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes; Lock/Unlock via MT bit;
 //!   Perpendicular Mode configures GAP/WGATE (and enhanced Dn bits);
-//!   DUMPREG dumps internal registers; READ/WRITE DATA / FORMAT TRACK
-//!   MT/MFM(/SK) forms → IRQ then 7-byte result (not Sense Interrupt).
+//!   DUMPREG dumps internal registers; READ/READ DELETED/WRITE DATA /
+//!   FORMAT TRACK MT/MFM(/SK) forms → IRQ then 7-byte result (not Sense Interrupt).
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -85,8 +88,8 @@
 //!   parameters; 10-byte result from stored state with MSR RQM|DIO; no IRQ.
 //!   Result order: PCN0–3 (per-drive Present Cylinder Numbers), SRT|HUT, HLT|ND,
 //!   SC/EOT, LOCK|0|D3–D0|GAP|WGATE, 0|EIS|EFIFO|POLL|FIFOTHR, PRETRK.
-//!   `sc_eot` updated from READ/WRITE DATA EOT or FORMAT TRACK SC; byte7 bits
-//!   5:0 reflect stored PERPENDICULAR D3–D0|GAP|WGATE (OW not returned).
+//!   `sc_eot` updated from READ/READ DELETED/WRITE DATA EOT or FORMAT TRACK SC;
+//!   byte7 bits 5:0 reflect stored PERPENDICULAR D3–D0|GAP|WGATE (OW not returned).
 //! - READ DATA (`0x06` | MT/MFM/SK): Spec Intel 82077AA §5.1.1 / Table 5-1 —
 //!   command byte lower 5 bits `00110`; optional MT (`0x80`)/MFM (`0x40`)/
 //!   SK (`0x20`); eight params (HD|US, C, H, R, N, EOT, GPL, DTL); no media
@@ -94,6 +97,13 @@
 //!   US), ST1 ND (No Data / sector not found), ST2=0, C/H/R/N = command
 //!   ENDaddress; asserts IRQ6 (cleared on first result byte); MSR RQM during
 //!   params, RQM|DIO during result. No DMA channel 2 transfer engine.
+//! - READ DELETED DATA (`0x0C` | MT/MFM/SK): Spec Intel 82077AA §5.1.3 /
+//!   Table 5-1 — command byte lower 5 bits `01100`; optional MT/MFM/SK; same
+//!   eight params and 7-byte result as READ DATA; no media image → skip
+//!   execution/DMA, immediate result ST0 (IC=01 abnormal | H | US), ST1 ND
+//!   (same honest no-media ST1 as READ DATA stub), ST2=0, C/H/R/N = command
+//!   ENDaddress; asserts IRQ6 (cleared on first result byte); EOT latched
+//!   into `sc_eot`.
 //! - WRITE DATA (`0x05` | MT/MFM): Spec Intel 82077AA §5.1.2 / Table 5-1 —
 //!   command byte lower 5 bits `00101`; optional MT (`0x80`)/MFM (`0x40`);
 //!   same eight params and 7-byte result as READ DATA; no media image → skip
@@ -111,8 +121,9 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - READ DELETED DATA / WRITE DELETED / READ TRACK / READ ID / VERIFY and
-//!   other transfer commands; FORMAT TRACK media write / per-sector ID DMA
+//! - WRITE DELETED DATA / READ TRACK / READ ID / VERIFY and other transfer
+//!   commands; READ DELETED DATA media/deleted-address-mark engine; FORMAT
+//!   TRACK media write / per-sector ID DMA
 //! - Media image, seek step timing, real sector transfers
 //! - DMA channel 2 transfers (ND bit / Specify stored only; not enforced)
 //! - Implied seek from Configure EIS; multi-sector TC termination
@@ -158,6 +169,10 @@ pub const FDC_CMD_WRITE_DATA: u8 = 0x05;
 /// READ DATA base opcode (bits 4:0). Spec: Intel 82077AA §5.1.1 / Table 5-1 —
 /// command byte is `MT|MFM|SK|0 0 1 1 0`; match with [`FDC_CMD_OPCODE_MASK`].
 pub const FDC_CMD_READ_DATA: u8 = 0x06;
+/// READ DELETED DATA base opcode (bits 4:0). Spec: Intel 82077AA §5.1.3 /
+/// Table 5-1 — command byte is `MT|MFM|SK|0 1 1 0 0`; match with
+/// [`FDC_CMD_OPCODE_MASK`].
+pub const FDC_CMD_READ_DELETED_DATA: u8 = 0x0C;
 /// Mask for FDC command opcode bits (excludes MT/MFM/SK). Spec: 82077AA Table 5-1.
 pub const FDC_CMD_OPCODE_MASK: u8 = 0x1F;
 /// Command bit7 Multi-Track (MT). Spec: Intel 82077AA Table 5-1 symbol MT.
@@ -171,6 +186,9 @@ pub const FDC_CMD_WRITE_DATA_MT_MFM: u8 = FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_WRI
 /// SeaBIOS-common READ DATA form: MT|MFM|SK|0x06. Spec: 82077AA Table 5-1.
 pub const FDC_CMD_READ_DATA_MT_MFM_SK: u8 =
     FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_SK | FDC_CMD_READ_DATA;
+/// Documented READ DELETED DATA form: MT|MFM|SK|0x0C. Spec: 82077AA Table 5-1.
+pub const FDC_CMD_READ_DELETED_DATA_MT_MFM_SK: u8 =
+    FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_SK | FDC_CMD_READ_DELETED_DATA;
 /// WRITE DATA parameter count after the command byte. Spec: 82077AA §5.1.2.
 pub const FDC_WRITE_DATA_PARAM_LEN: u8 = 8;
 /// WRITE DATA result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA §5.1.2.
@@ -179,6 +197,11 @@ pub const FDC_WRITE_DATA_RESULT_LEN: u8 = 7;
 pub const FDC_READ_DATA_PARAM_LEN: u8 = 8;
 /// READ DATA result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA §5.1.1.
 pub const FDC_READ_DATA_RESULT_LEN: u8 = 7;
+/// READ DELETED DATA parameter count after the command byte. Spec: 82077AA §5.1.3 —
+/// same as READ DATA.
+pub const FDC_READ_DELETED_DATA_PARAM_LEN: u8 = 8;
+/// READ DELETED DATA result byte count (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.3.
+pub const FDC_READ_DELETED_DATA_RESULT_LEN: u8 = 7;
 /// Recalibrate command opcode. Spec: Intel 82077AA / OSDev FDC — 1 unit parameter.
 pub const FDC_CMD_RECALIBRATE: u8 = 0x07;
 /// Sense Interrupt Status command opcode. Spec: Intel 82077AA / OSDev FDC.
@@ -283,6 +306,11 @@ enum Phase {
     ReadDataParams { index: u8 },
     /// READ DATA result: 7 bytes (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.1.
     ReadDataResult { index: u8 },
+    /// READ DELETED DATA parameters: 8 bytes (same as READ DATA).
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1.
+    ReadDeletedDataParams { index: u8 },
+    /// READ DELETED DATA result: 7 bytes (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.3.
+    ReadDeletedDataResult { index: u8 },
     /// WRITE DATA parameters: 8 bytes (HD|US, C, H, R, N, EOT, GPL, DTL).
     /// Spec: Intel 82077AA §5.1.2 / Table 5-1.
     WriteDataParams { index: u8 },
@@ -296,8 +324,8 @@ enum Phase {
 }
 
 /// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/
-/// Configure/LOCK/PERPENDICULAR/DUMPREG/READ·WRITE DATA/FORMAT TRACK
-/// (no-media) + IRQ6.
+/// Configure/LOCK/PERPENDICULAR/DUMPREG/READ·READ DELETED·WRITE DATA/FORMAT
+/// TRACK (no-media) + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -343,9 +371,9 @@ pub struct Fdc82077 {
     /// §5.2.11 / Table 5-11 / §5.3.1 — always updated by the command; soft DOR
     /// reset clears to 0; appear in DUMPREG byte7 bits 1:0.
     pub perp_gap_wgate: u8,
-    /// Last SC (FORMAT TRACK) or EOT (READ/WRITE/…) parameter. Spec: Intel
-    /// 82077AA Table 5-1 note — DUMPREG result byte 6. Updated by READ/WRITE
-    /// DATA EOT or FORMAT TRACK SC.
+    /// Last SC (FORMAT TRACK) or EOT (READ/READ DELETED/WRITE/…) parameter.
+    /// Spec: Intel 82077AA Table 5-1 note — DUMPREG result byte 6. Updated by
+    /// READ/READ DELETED/WRITE DATA EOT or FORMAT TRACK SC.
     pub sc_eot: u8,
     /// Latched IRQ request (command-complete / reset stub). Spec: 82077AA → ISA IRQ6.
     irq_pending: bool,
@@ -360,12 +388,13 @@ pub struct Fdc82077 {
     sense_pcn: u8,
     /// Sense Drive Status ST3 result byte (set when entering result phase).
     sense_st3: u8,
-    /// READ/WRITE DATA / FORMAT TRACK parameter bytes. Spec: Intel 82077AA
-    /// §5.1.1 / §5.1.2 / §5.1.7. Shared — transfer commands are mutually
-    /// exclusive in the command stream (FORMAT uses the first 5 slots).
+    /// READ/READ DELETED/WRITE DATA / FORMAT TRACK parameter bytes. Spec:
+    /// Intel 82077AA §5.1.1 / §5.1.3 / §5.1.2 / §5.1.7. Shared — transfer
+    /// commands are mutually exclusive in the command stream (FORMAT uses the
+    /// first 5 slots).
     read_params: [u8; FDC_READ_DATA_PARAM_LEN as usize],
-    /// READ/WRITE DATA / FORMAT TRACK result bytes (ST0..). Spec: §5.1.1 /
-    /// §5.1.2 / §5.1.7.
+    /// READ/READ DELETED/WRITE DATA / FORMAT TRACK result bytes (ST0..). Spec:
+    /// §5.1.1 / §5.1.3 / §5.1.2 / §5.1.7.
     read_result: [u8; FDC_READ_DATA_RESULT_LEN as usize],
 }
 
@@ -442,6 +471,7 @@ impl Fdc82077 {
                 | Phase::ConfigureParams { .. }
                 | Phase::PerpendicularParam
                 | Phase::ReadDataParams { .. }
+                | Phase::ReadDeletedDataParams { .. }
                 | Phase::WriteDataParams { .. }
                 | Phase::FormatTrackParams { .. } => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. }
@@ -450,6 +480,7 @@ impl Fdc82077 {
                 | Phase::LockResult
                 | Phase::DumpRegResult { .. }
                 | Phase::ReadDataResult { .. }
+                | Phase::ReadDeletedDataResult { .. }
                 | Phase::WriteDataResult { .. }
                 | Phase::FormatTrackResult { .. } => FDC_MSR_RQM | FDC_MSR_DIO,
             }
@@ -662,6 +693,47 @@ impl Fdc82077 {
         self.phase = Phase::ReadDataResult { index: 0 };
     }
 
+    /// Begin READ DELETED DATA parameter phase (8 bytes). Spec: Intel 82077AA §5.1.3.
+    fn start_read_deleted_data(&mut self) {
+        self.read_params = [0; FDC_READ_DELETED_DATA_PARAM_LEN as usize];
+        self.phase = Phase::ReadDeletedDataParams { index: 0 };
+    }
+
+    /// Complete READ DELETED DATA after eight parameters — no-media stub.
+    ///
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1 / §6.1 / §6.2 — same parameter and
+    /// result shape as READ DATA. With no media image this stub skips the
+    /// execution/DMA transfer phase and enters result immediately: ST0 IC=01
+    /// (abnormal termination) | H | US; ST1 ND (No Data — honest no-media
+    /// equivalent consistent with the READ DATA stub); ST2=0; C/H/R/N reflect
+    /// command ENDaddress; latches EOT into `sc_eot`; asserts IRQ (cleared when
+    /// the host reads the first result byte). No Sense Interrupt.
+    fn finish_read_deleted_data(&mut self) {
+        let head_unit = self.read_params[0];
+        let unit = head_unit & 0x03;
+        let head = (head_unit >> 2) & 0x01;
+        let c = self.read_params[1];
+        let h = self.read_params[2];
+        let r = self.read_params[3];
+        let n = self.read_params[4];
+        let eot = self.read_params[5];
+        // GPL (params[6]) and DTL (params[7]) accepted; unused without media.
+
+        self.sc_eot = eot;
+        let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        self.read_result = [
+            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST1_ND,
+            0x00,
+            c,
+            h,
+            r,
+            n,
+        ];
+        self.irq_pending = true;
+        self.phase = Phase::ReadDeletedDataResult { index: 0 };
+    }
+
     /// Begin WRITE DATA parameter phase (8 bytes). Spec: Intel 82077AA §5.1.2.
     fn start_write_data(&mut self) {
         self.read_params = [0; FDC_WRITE_DATA_PARAM_LEN as usize];
@@ -710,6 +782,15 @@ impl Fdc82077 {
     fn is_read_data_command(cmd: u8) -> bool {
         // Compare against opcode nibble of the documented MT|MFM|SK|READ form.
         cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_READ_DATA_MT_MFM_SK & FDC_CMD_OPCODE_MASK)
+    }
+
+    /// True if `cmd` is READ DELETED DATA including optional MT/MFM/SK modifiers.
+    ///
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1 — opcode bits 4:0 = `01100`;
+    /// bits 7:5 are MT/MFM/SK (`FDC_CMD_MT` / `FDC_CMD_MFM` / `FDC_CMD_SK`).
+    #[inline]
+    fn is_read_deleted_data_command(cmd: u8) -> bool {
+        cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_READ_DELETED_DATA_MT_MFM_SK & FDC_CMD_OPCODE_MASK)
     }
 
     /// True if `cmd` is WRITE DATA including optional MT/MFM modifiers.
@@ -800,6 +881,7 @@ impl Fdc82077 {
             | Phase::ConfigureParams { .. }
             | Phase::PerpendicularParam
             | Phase::ReadDataParams { .. }
+            | Phase::ReadDeletedDataParams { .. }
             | Phase::WriteDataParams { .. }
             | Phase::FormatTrackParams { .. } => 0xFF,
             Phase::SenseIntResult { index } => {
@@ -846,6 +928,20 @@ impl Fdc82077 {
                     self.phase = Phase::Command;
                 } else {
                     self.phase = Phase::ReadDataResult { index: index + 1 };
+                }
+                v
+            }
+            Phase::ReadDeletedDataResult { index } => {
+                // Spec: 82077AA / OSDev — IRQ for read/write cleared as the host
+                // begins reading the result phase (first byte).
+                if index == 0 {
+                    self.irq_pending = false;
+                }
+                let v = self.read_result[index as usize];
+                if index + 1 >= FDC_READ_DELETED_DATA_RESULT_LEN {
+                    self.phase = Phase::Command;
+                } else {
+                    self.phase = Phase::ReadDeletedDataResult { index: index + 1 };
                 }
                 v
             }
@@ -919,6 +1015,9 @@ impl Fdc82077 {
                 } else if Self::is_read_data_command(v) {
                     // Spec: Intel 82077AA §5.1.1 — MT/MFM/SK | 00110; eight params.
                     self.start_read_data();
+                } else if Self::is_read_deleted_data_command(v) {
+                    // Spec: Intel 82077AA §5.1.3 — MT/MFM/SK | 01100; eight params.
+                    self.start_read_deleted_data();
                 } else if Self::is_write_data_command(v) {
                     // Spec: Intel 82077AA §5.1.2 — MT/MFM | 00101; eight params.
                     self.start_write_data();
@@ -992,6 +1091,15 @@ impl Fdc82077 {
                     self.phase = Phase::ReadDataParams { index: index + 1 };
                 }
             }
+            Phase::ReadDeletedDataParams { index } => {
+                // Spec: Intel 82077AA §5.1.3 — HD|US, C, H, R, N, EOT, GPL, DTL.
+                self.read_params[index as usize] = v;
+                if index + 1 >= FDC_READ_DELETED_DATA_PARAM_LEN {
+                    self.finish_read_deleted_data();
+                } else {
+                    self.phase = Phase::ReadDeletedDataParams { index: index + 1 };
+                }
+            }
             Phase::WriteDataParams { index } => {
                 // Spec: Intel 82077AA §5.1.2 — HD|US, C, H, R, N, EOT, GPL, DTL.
                 self.read_params[index as usize] = v;
@@ -1016,6 +1124,7 @@ impl Fdc82077 {
             | Phase::LockResult
             | Phase::DumpRegResult { .. }
             | Phase::ReadDataResult { .. }
+            | Phase::ReadDeletedDataResult { .. }
             | Phase::WriteDataResult { .. }
             | Phase::FormatTrackResult { .. } => {
                 // Host must not write during result phase (stub ignores).
@@ -2782,5 +2891,172 @@ mod tests {
 
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1 — READ DELETED DATA opcode `0x0C`
+    /// with MFM (`0x4C`); eight parameter bytes (same as READ DATA); no media →
+    /// immediate result ST0 IC=01 (abnormal) | H | US, ST1 ND, ST2=0, C/H/R/N =
+    /// ENDaddress; IRQ6 when DOR DMA/IRQ enable (not Sense Interrupt).
+    #[test]
+    fn read_deleted_data_mfm_no_media_abnormal_result_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(!f.irq_line());
+
+        // SeaBIOS-style MFM READ DELETED DATA: MT=0 MFM=1 SK=0 | 0x0C.
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_READ_DELETED_DATA),
+        );
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::ReadDeletedDataParams { index: 0 });
+
+        // Params: HD|US, C, H, R, N, EOT, GPL, DTL.
+        let params = [0x04u8, 0x12, 0x01, 0x01, 0x02, 0x12, 0x1B, 0xFF]; // head1/unit0
+        for (i, &p) in params.iter().enumerate() {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+            if i + 1 < params.len() {
+                assert_eq!(
+                    f.phase,
+                    Phase::ReadDeletedDataParams {
+                        index: (i + 1) as u8
+                    }
+                );
+                assert!(!f.irq_line(), "IRQ only after all 8 params");
+            }
+        }
+
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(
+            f.irq_line(),
+            "READ DELETED DATA asserts IRQ6 on no-media completion"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=01 | H | US"
+        );
+        let st1 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(
+            st1, FDC_ST1_ND,
+            "ST1 ND — sector/media not found (same as READ DATA stub)"
+        );
+        let st2 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st2, 0);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x12); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12, "EOT latched for DUMPREG");
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 — MT|MFM|SK|READ DELETED DATA (`0xEC`) uses
+    /// the same 8-param / 7-result shape as plain READ DELETED DATA / READ DATA.
+    #[test]
+    fn read_deleted_data_mt_mfm_sk_opcode_form_accepted() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        assert_eq!(FDC_CMD_READ_DELETED_DATA_MT_MFM_SK, 0xEC);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_DELETED_DATA_MT_MFM_SK));
+        for p in [0x01u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(st0 & 0x03, 0x01, "US from param0");
+        // Drain remaining result bytes.
+        for _ in 0..6 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA DOR bit3 — IRQ line gated; pending still latched.
+    #[test]
+    fn read_deleted_data_irq_pending_gated_by_dor_dma_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N)); // DMA/IRQ disabled
+
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_READ_DELETED_DATA),
+        );
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(!f.irq_line(), "DOR DMA/IRQ clear → line inactive");
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM | FDC_MSR_DIO);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(f.irq_line(), "enabling DMA/IRQ reveals latched pending");
+    }
+
+    /// Spec: Intel 82077AA — held in DOR reset ignores command stream.
+    #[test]
+    fn read_deleted_data_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        assert_eq!(f.dor & FDC_DOR_RESET_N, 0);
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_READ_DELETED_DATA),
+        );
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, 0);
+    }
+
+    /// Spec: Intel 82077AA — DOR soft reset aborts in-progress READ DELETED DATA params.
+    #[test]
+    fn dor_reset_aborts_read_deleted_data_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_READ_DELETED_DATA),
+        );
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert_eq!(f.phase, Phase::ReadDeletedDataParams { index: 1 });
+
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        assert_eq!(f.phase, Phase::Command);
+        assert!(!f.irq_line());
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+    }
+
+    /// Unrelated opcodes (e.g. READ DATA `0x06`) remain distinct from READ DELETED DATA.
+    #[test]
+    fn read_deleted_data_unrelated_opcodes_unchanged() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        assert_eq!(f.phase, Phase::ReadDataParams { index: 0 });
+        // Soft-reset abort and start READ DELETED DATA instead.
+        f.port_write(FDC_DOR, 1, 0);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MFM | FDC_CMD_READ_DELETED_DATA),
+        );
+        assert_eq!(f.phase, Phase::ReadDeletedDataParams { index: 0 });
+        // Opcode masks are distinct: 0x06 vs 0x0C under FDC_CMD_OPCODE_MASK.
+        assert_ne!(
+            FDC_CMD_READ_DATA & FDC_CMD_OPCODE_MASK,
+            FDC_CMD_READ_DELETED_DATA & FDC_CMD_OPCODE_MASK
+        );
     }
 }
