@@ -2217,9 +2217,11 @@ fn step_two_byte(
                     Ok(())
                 }
                 6 => {
-                    // LMSW r/m16 — Spec: SDM Vol. 2 "LMSW"; loads CR0[15:0].
-                    // Cannot clear PE once set. Does not enter protected-mode
-                    // execution in this emulator (segment model stays real-mode).
+                    // LMSW r/m16 — Spec: SDM Vol. 2 "LMSW"; Vol. 3 §2.5 (CR0.PE).
+                    // Loads CR0[15:0]. Cannot clear PE once set. Setting PE here
+                    // is sticky in CR0 only — this emulator does **not** switch
+                    // to protected-mode descriptor loads (segment MOV / far JMP
+                    // stay real-mode / sticky-unreal `selector << 4`).
                     let src = read_rm_u16(cpu, bus, insn)?;
                     let pe_was = cpu.cr0 & 1 != 0;
                     let mut low = u64::from(src);
@@ -10265,6 +10267,85 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap(); // MOV AX,0x10
         step(&mut cpu, &mut bus).unwrap(); // LMSW AX with PE sticky
         assert_eq!(cpu.cr0 & 0xFFFF, 0x0011, "ET loaded; PE remains set");
+    }
+
+    /// LMSW PE sticky keeps real-mode / sticky-unreal segment semantics.
+    /// Spec: Intel SDM Vol. 2 "LMSW"; Vol. 3 §2.5 (CR0.PE); §3.4.2–§3.4.3
+    /// (real-address `base = selector << 4` + unreal descriptor cache).
+    /// Out of scope: GDT descriptor loads, far jump into protected mode, paging.
+    #[test]
+    fn lmsw_pe_sticky_keeps_real_mode_segment_and_far_jmp() {
+        let mut mem = vec![0u8; 0x30000];
+        let code = 0x1000usize;
+        // +0: B8 01 00         MOV AX, 1
+        // +3: 0F 01 F0         LMSW AX            (CR0.PE ← 1)
+        // +6: B8 34 12         MOV AX, 0x1234
+        // +9: 8E D8            MOV DS, AX         (still selector<<4 + sticky limit)
+        // +B: EA 00 02 00 20   JMP 2000:0200      (far JMP still real-mode CS)
+        // Target linear = 0x2000<<4 + 0x0200 = 0x20200 → HLT
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x01;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x0F;
+        mem[code + 4] = 0x01;
+        mem[code + 5] = 0xF0; // LMSW AX
+        mem[code + 6] = 0xB8;
+        mem[code + 7] = 0x34;
+        mem[code + 8] = 0x12;
+        mem[code + 9] = 0x8E;
+        mem[code + 10] = 0xD8; // MOV DS, AX
+        mem[code + 11] = 0xEA;
+        mem[code + 12] = 0x00;
+        mem[code + 13] = 0x02;
+        mem[code + 14] = 0x00;
+        mem[code + 15] = 0x20; // JMP far 2000:0200
+        mem[0x20200] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        // Expanded unreal cached limit must survive MOV DS after LMSW PE=1.
+        cpu.ds.limit = 0xFFFF_FFFF;
+        cpu.ds.flags = 0x0093;
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        assert_eq!(cpu.cr0 & 1, 0, "reset starts with PE clear");
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 1
+        step(&mut cpu, &mut bus).unwrap(); // LMSW AX → set PE
+        assert_eq!(cpu.cr0 & 1, 1, "LMSW sets CR0.PE");
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 0x1234
+        step(&mut cpu, &mut bus).unwrap(); // MOV DS, AX
+        assert_eq!(cpu.cr0 & 1, 1, "MOV DS must not clear PE");
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(
+            cpu.ds.base,
+            0x1234u64 << 4,
+            "after LMSW PE=1, DS base is still selector<<4 (no GDT load)"
+        );
+        assert_eq!(
+            cpu.ds.limit, 0xFFFF_FFFF,
+            "sticky unreal DS limit preserved under LMSW PE=1"
+        );
+        assert_eq!(cpu.ds.flags, 0x0093);
+
+        step(&mut cpu, &mut bus).unwrap(); // JMP far
+        assert_eq!(cpu.cr0 & 1, 1, "far JMP must not clear PE");
+        assert_eq!(cpu.cs.selector, 0x2000);
+        assert_eq!(
+            cpu.cs.base,
+            0x2000u64 << 4,
+            "after LMSW PE=1, far JMP still uses real-mode CS base"
+        );
+        assert_eq!(cpu.ip16(), 0x0200);
+        assert_eq!(
+            cpu.gpr_u16(CpuState::RSP),
+            0xFFFE,
+            "far JMP does not touch stack"
+        );
     }
 
     /// CLTS — opcode 0F 06. Clears CR0.TS (bit 3) only; all other CR0 bits preserved.
