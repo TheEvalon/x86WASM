@@ -1,4 +1,5 @@
-//! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/Sense Int + IRQ6.
+//! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
+//! Sense Int/Sense Drive/Version + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -12,11 +13,13 @@
 //!   Sense Interrupt Status (`0x08`) result ST0+PCN; Sense Drive Status
 //!   (`0x04`, §5.2.5) HD|US parameter, no execution phase, result ST3 (§6.4:
 //!   bit7 unused=0, bit6 WP, bit5 unused=1, bit4 T0, bit3 unused=1, bit2 HD,
-//!   bits1:0 DS1/DS0), no IRQ; DOR bit3 DMA/IRQ enable; IRQ6 on command /
+//!   bits1:0 DS1/DS0), no IRQ; Version (`0x10`) no parameters, 1-byte result
+//!   `0x90` (82077AA identification); DOR bit3 DMA/IRQ enable; IRQ6 on command /
 //!   reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
-//!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields.
+//!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
+//!   Version returns `0x90` for 82077AA-class controllers.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -40,11 +43,13 @@
 //!   assert/clear; T0 stub reflects `pcn == 0` (single shared `pcn`, not
 //!   per-drive); WP stub always 0 (no media); reserved bits 3/5 always 1 per
 //!   82077AA §6.4; MSR RQM during parameter, RQM|DIO during result phase
+//! - Version (`0x10`): command byte → 1-byte result `0x90` (82077AA id); no
+//!   parameters, no IRQ assert/clear; MSR RQM|DIO during result phase
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - Other commands (READ/WRITE/FORMAT/VERSION/Relative Seek/…)
+//! - Other commands (READ/WRITE/FORMAT/Configure/LOCK/PERPENDICULAR/DUMPREG/…)
 //! - Media image, seek step timing, format/read/write transfers
 //! - DMA channel 2 transfers (ND bit stored only; not enforced)
 //! - Automatic IRQ on real media command completion (host may still use assert API)
@@ -88,6 +93,12 @@ pub const FDC_CMD_RECALIBRATE: u8 = 0x07;
 pub const FDC_CMD_SENSE_INT: u8 = 0x08;
 /// Seek command opcode. Spec: Intel 82077AA / OSDev FDC — HD|US + NCN.
 pub const FDC_CMD_SEEK: u8 = 0x0F;
+/// Version command opcode. Spec: Intel 82077AA / OSDev FDC — no parameters,
+/// 1-byte result identifying the controller class.
+pub const FDC_CMD_VERSION: u8 = 0x10;
+/// Version result byte for 82077AA-class controllers. Spec: Intel 82077AA /
+/// OSDev FDC — `0x90` identifies enhanced/82077AA (vs `0x80` for older 8272A).
+pub const FDC_VERSION_82077AA: u8 = 0x90;
 /// ST0 Seek End (SE) bit. Spec: Intel 82077AA status register 0.
 pub const FDC_ST0_SEEK_END: u8 = 0x20;
 /// ST0 Interrupt Code = 11 (abnormal/ready-line-changed stub). Spec: 82077AA / OSDev.
@@ -125,9 +136,11 @@ enum Phase {
     SenseDriveStatusParam,
     /// Sense Drive Status result: ST3 (single byte).
     SenseDriveStatusResult,
+    /// Version result: single identification byte (`0x90` for 82077AA).
+    VersionResult,
 }
 
-/// 82077AA-class FDC port stub with Specify + Recalibrate + Seek + Sense Interrupt + IRQ6.
+/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -223,9 +236,9 @@ impl Fdc82077 {
                 | Phase::RecalibrateParams
                 | Phase::SeekParams { .. }
                 | Phase::SenseDriveStatusParam => FDC_MSR_RQM,
-                Phase::SenseIntResult { .. } | Phase::SenseDriveStatusResult => {
-                    FDC_MSR_RQM | FDC_MSR_DIO
-                }
+                Phase::SenseIntResult { .. }
+                | Phase::SenseDriveStatusResult
+                | Phase::VersionResult => FDC_MSR_RQM | FDC_MSR_DIO,
             }
         }
     }
@@ -336,6 +349,13 @@ impl Fdc82077 {
         self.phase = Phase::SenseDriveStatusResult;
     }
 
+    /// Begin Version result phase. Spec: Intel 82077AA / OSDev FDC Version.
+    ///
+    /// No parameters; one result byte `0x90` (82077AA identification). No IRQ.
+    fn start_version(&mut self) {
+        self.phase = Phase::VersionResult;
+    }
+
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
             // Spec: Specify/Recalibrate/Seek have no result phase; open-bus when idle/params.
@@ -359,6 +379,10 @@ impl Fdc82077 {
             Phase::SenseDriveStatusResult => {
                 self.phase = Phase::Command;
                 self.sense_st3
+            }
+            Phase::VersionResult => {
+                self.phase = Phase::Command;
+                FDC_VERSION_82077AA
             }
         }
     }
@@ -384,6 +408,9 @@ impl Fdc82077 {
                 } else if v == FDC_CMD_SENSE_DRIVE_STATUS {
                     // Spec: Intel 82077AA §5.2.5 — expect HD|US param; no IRQ.
                     self.start_sense_drive_status();
+                } else if v == FDC_CMD_VERSION {
+                    // Spec: Intel 82077AA Version — no params; result 0x90; no IRQ.
+                    self.start_version();
                 }
                 // Other opcodes: accept/drop until a command engine exists.
             }
@@ -420,7 +447,7 @@ impl Fdc82077 {
                 // Spec: Intel 82077AA §5.2.5 — HD|US param, no execution phase.
                 self.finish_sense_drive_status(v);
             }
-            Phase::SenseIntResult { .. } | Phase::SenseDriveStatusResult => {
+            Phase::SenseIntResult { .. } | Phase::SenseDriveStatusResult | Phase::VersionResult => {
                 // Host must not write during result phase (stub ignores).
             }
         }
@@ -1011,5 +1038,84 @@ mod tests {
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_READY_CHANGE);
         let _ = f.port_read(FDC_FIFO, 1);
+    }
+
+    /// Spec: Intel 82077AA / OSDev FDC Version — opcode `0x10`, no params,
+    /// result byte `0x90` (82077AA identification); no IRQ.
+    #[test]
+    fn version_returns_82077aa_id_byte() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        assert_eq!(f.phase, Phase::VersionResult);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(!f.irq_line(), "Version must not assert IRQ");
+
+        let version = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(version, FDC_VERSION_82077AA, "82077AA identification byte");
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "idle command phase after result byte read"
+        );
+        assert_eq!(f.phase, Phase::Command);
+        assert!(!f.irq_line());
+    }
+
+    /// Spec: Version has no execution phase and must not assert or clear IRQ.
+    #[test]
+    fn version_does_not_touch_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        assert!(f.irq_line(), "command byte must not clear IRQ");
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(f.irq_line(), "result read must not clear IRQ");
+
+        f.clear_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert!(!f.irq_line(), "Version never asserts IRQ");
+    }
+
+    #[test]
+    fn version_ignored_while_held_in_dor_reset() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0xFF,
+            "no Version result latched while held in reset"
+        );
+    }
+
+    #[test]
+    fn dor_reset_aborts_version_result_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        assert_eq!(f.phase, Phase::VersionResult);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM | FDC_MSR_DIO);
+        f.port_write(FDC_DOR, 1, 0); // enter reset
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0xFF,
+            "aborted Version result is discarded"
+        );
     }
 }
