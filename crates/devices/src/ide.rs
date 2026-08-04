@@ -104,6 +104,11 @@ pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
 /// FLUSH CACHE — non-data command; completes with success on ATA master.
 /// Spec: ATA/ATAPI Command Set — FLUSH CACHE (`0xE7`).
 pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+/// EXECUTE DEVICE DIAGNOSTIC — error=0x01 means passed (master).
+/// Spec: ATA/ATAPI Command Set — EXECUTE DEVICE DIAGNOSTIC (`0x90`).
+pub const ATA_CMD_DIAGNOSTIC: u8 = 0x90;
+/// Diagnostic passed code in error register.
+pub const ATA_DIAG_PASSED: u8 = 0x01;
 
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
@@ -472,6 +477,26 @@ impl IdePrimary {
     /// Spec: ATA/ATAPI Command Set — FLUSH CACHE writes volatile cache to media.
     /// This stub has no volatile cache; it completes immediately with
     /// DRDY|DSC, error=0, no DRQ, and raises INTRQ when nIEN=0 (SeaBIOS-friendly).
+    /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
+    ///
+    /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
+    /// This stub always reports passed on present master; absent/slave → status 0.
+    fn exec_diagnostic(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = ATA_DIAG_PASSED;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
     fn exec_flush_cache(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -496,6 +521,7 @@ impl IdePrimary {
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
             ATA_CMD_FLUSH_CACHE => self.exec_flush_cache(),
+            ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             _ => self.abort_command(ATA_ER_ABRT), // unsupported command
         }
     }
@@ -1244,6 +1270,29 @@ mod tests {
     }
 
     #[test]
+
+    /// Spec: ATA — EXECUTE DEVICE DIAGNOSTIC (`0x90`) → error=0x01 passed.
+    #[test]
+    fn diagnostic_passes_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DIAGNOSTIC));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_DIAG_PASSED);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+    }
+
+    #[test]
+    fn diagnostic_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DIAGNOSTIC));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+    }
+
     fn flush_cache_absent_drive_status_zero() {
         let mut ide = IdePrimary::new();
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
