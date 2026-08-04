@@ -1,7 +1,7 @@
 //! VGA color text-mode frame buffer MMIO stub (physical `0xB8000`) plus CRTC
 //! index/data port stub (`0x3D4`/`0x3D5`), Sequencer index/data stub
-//! (`0x3C4`/`0x3C5`), and Miscellaneous Output Register stub (`0x3C2` write /
-//! `0x3CC` readback).
+//! (`0x3C4`/`0x3C5`), Graphics Controller index/data stub (`0x3CE`/`0x3CF`),
+//! and Miscellaneous Output Register stub (`0x3C2` write / `0x3CC` readback).
 //!
 //! # Spec refs
 //!
@@ -15,6 +15,10 @@
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode).
+//! - OSDev VGA Hardware / FreeVGA Graphics Registers — Address `0x3CE`, Data
+//!   `0x3CF`; indexes `0x00`–`0x08` (Set/Reset, Enable Set/Reset, Color Compare,
+//!   Data Rotate, Read Map Select, Graphics Mode, Miscellaneous, Color Don't
+//!   Care, Bit Mask).
 //! - OSDev VGA Hardware / FreeVGA Miscellaneous Output Register — write port
 //!   `0x3C2`, readback port `0x3CC` (write-only at `0x3C2`).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.6 / §21 VGA text mode.
@@ -28,13 +32,17 @@
 //!   `0x3D5` (no timing, cursor render, or protect-bit enforcement)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults (no timing/plane side effects)
+//! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
+//!   register file on `0x3CF` with mode-03h-class reset defaults (no write-mode /
+//!   map / bitmask side effects)
 //! - Misc Output store/readback only (`0x3C2`/`0x3CC`); bits do not change
 //!   clock, IOAS, or RAM-enable behavior yet
 //!
 //! # Unsupported (explicit)
 //!
-//! - Graphics Controller (`0x3CE`/`0x3CF`) / attribute controller port programming
-//! - Sequencer timing / map-mask / memory-mode side effects on the text plane
+//! - Attribute controller (`0x3C0`/`0x3C1`) port programming
+//! - Sequencer / GC timing, map-mask, write-mode, read-map, or bitmask side
+//!   effects on the text plane
 //! - CRTC protect bit (index `0x11` bit7), mono map at `0x3B4`/`0x3B5`
 //! - Misc Output bit side effects (IOAS remap, clock select, RAM enable)
 //! - Planar graphics, VBE, host canvas rendering, dirty tracking
@@ -98,7 +106,27 @@ pub const VGA_MISC_OUTPUT_READ: u16 = 0x3CC;
 /// (`0x67` = color + enable RAM + typical text-mode polarity/clock nibble).
 pub const VGA_MISC_OUTPUT_DEFAULT: u8 = 0x67;
 
-/// Color text-mode frame buffer + CRTC + Sequencer + Misc Output stubs.
+/// Graphics Controller Address (index) Register.
+///
+/// Spec: FreeVGA / OSDev VGA Hardware / IBM VGA — Graphics Address at `0x3CE`,
+/// Data at `0x3CF`.
+pub const VGA_GC_INDEX: u16 = 0x3CE;
+/// Graphics Controller Data Register.
+pub const VGA_GC_DATA: u16 = 0x3CF;
+/// Number of standard VGA Graphics Controller registers (indexes `0x00`–`0x08`).
+pub const VGA_GC_REG_COUNT: usize = 9;
+
+/// Mode-03h-class Graphics Controller reset defaults (store/readback only).
+///
+/// Spec: FreeVGA Graphics Registers / OSDev VGA Hardware / IBM VGA mode-03h —
+/// SeaBIOS-class text programming: Set/Reset `0x00`, Enable Set/Reset `0x00`,
+/// Color Compare `0x00`, Data Rotate `0x00`, Read Map Select `0x00`,
+/// Graphics Mode `0x10` (host odd/even), Miscellaneous `0x0E` (odd/even +
+/// memory map `B8000`), Color Don't Care `0x00`, Bit Mask `0xFF`.
+pub const VGA_GC_DEFAULTS: [u8; VGA_GC_REG_COUNT] =
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF];
+
+/// Color text-mode frame buffer + CRTC + Sequencer + GC + Misc Output stubs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VgaText {
     /// Raw plane bytes (char/attr interleaved).
@@ -111,6 +139,10 @@ pub struct VgaText {
     pub seq_index: u8,
     /// Sequencer register file (noop store/readback).
     pub seq_regs: [u8; VGA_SEQ_REG_COUNT],
+    /// Latched Graphics Controller index (written via `0x3CE`).
+    pub gc_index: u8,
+    /// Graphics Controller register file (noop store/readback).
+    pub gc_regs: [u8; VGA_GC_REG_COUNT],
     /// Miscellaneous Output Register (store via `0x3C2`, read via `0x3CC`).
     pub misc_output: u8,
 }
@@ -129,6 +161,8 @@ impl VgaText {
             crtc_regs: [0; VGA_CRTC_REG_COUNT],
             seq_index: 0,
             seq_regs: VGA_SEQ_DEFAULTS,
+            gc_index: 0,
+            gc_regs: VGA_GC_DEFAULTS,
             misc_output: VGA_MISC_OUTPUT_DEFAULT,
         };
         v.reset();
@@ -136,8 +170,8 @@ impl VgaText {
     }
 
     /// Reset text plane: 80×25 → space/`0x07`; remainder cleared; CRTC cleared;
-    /// Sequencer restored to [`VGA_SEQ_DEFAULTS`]; Misc Output restored to
-    /// [`VGA_MISC_OUTPUT_DEFAULT`].
+    /// Sequencer restored to [`VGA_SEQ_DEFAULTS`]; Graphics Controller restored
+    /// to [`VGA_GC_DEFAULTS`]; Misc Output restored to [`VGA_MISC_OUTPUT_DEFAULT`].
     ///
     /// Spec: IBM VGA text — cells are (char, attr) pairs starting at `0xB8000`.
     pub fn reset(&mut self) {
@@ -152,6 +186,8 @@ impl VgaText {
         self.crtc_regs = [0; VGA_CRTC_REG_COUNT];
         self.seq_index = 0;
         self.seq_regs = VGA_SEQ_DEFAULTS;
+        self.gc_index = 0;
+        self.gc_regs = VGA_GC_DEFAULTS;
         self.misc_output = VGA_MISC_OUTPUT_DEFAULT;
     }
 
@@ -160,7 +196,7 @@ impl VgaText {
         (VGA_TEXT_BASE..VGA_TEXT_END).contains(&addr)
     }
 
-    /// True if this device owns the I/O port (color CRTC + Sequencer + Misc Output).
+    /// True if this device owns the I/O port (color CRTC + Sequencer + GC + Misc).
     pub fn owns_port(port: u16) -> bool {
         matches!(
             port,
@@ -168,6 +204,8 @@ impl VgaText {
                 | VGA_CRTC_DATA
                 | VGA_SEQ_INDEX
                 | VGA_SEQ_DATA
+                | VGA_GC_INDEX
+                | VGA_GC_DATA
                 | VGA_MISC_OUTPUT_WRITE
                 | VGA_MISC_OUTPUT_READ
         )
@@ -275,6 +313,36 @@ impl VgaText {
             .unwrap_or(0)
     }
 
+    fn gc_index_masked(index: u8) -> Option<usize> {
+        let i = usize::from(index);
+        if i < VGA_GC_REG_COUNT {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    fn write_gc_index(&mut self, value: u8) {
+        self.gc_index = value;
+    }
+
+    fn write_gc_data(&mut self, value: u8) {
+        // Store only — write-mode / map / bitmask bits are not enforced.
+        if let Some(i) = Self::gc_index_masked(self.gc_index) {
+            self.gc_regs[i] = value;
+        }
+    }
+
+    fn read_gc_index(&self) -> u8 {
+        self.gc_index
+    }
+
+    fn read_gc_data(&self) -> u8 {
+        Self::gc_index_masked(self.gc_index)
+            .map(|i| self.gc_regs[i])
+            .unwrap_or(0)
+    }
+
     fn write_misc_output(&mut self, value: u8) {
         // Store only — IOAS/clock/RAM-enable bits are not enforced yet.
         self.misc_output = value;
@@ -292,6 +360,8 @@ impl PortDevice for VgaText {
             VGA_CRTC_DATA => u32::from(self.read_crtc_data()),
             VGA_SEQ_INDEX => u32::from(self.read_seq_index()),
             VGA_SEQ_DATA => u32::from(self.read_seq_data()),
+            VGA_GC_INDEX => u32::from(self.read_gc_index()),
+            VGA_GC_DATA => u32::from(self.read_gc_data()),
             // Spec: FreeVGA / OSDev — `0x3C2` is write-only; read is undefined.
             // Stub returns open-bus-style `0xFF` (use `0x3CC` for readback).
             VGA_MISC_OUTPUT_WRITE => 0xFF,
@@ -323,6 +393,16 @@ impl PortDevice for VgaText {
                 }
             }
             VGA_SEQ_DATA => self.write_seq_data(value as u8),
+            VGA_GC_INDEX => {
+                // Mirror CRTC/Sequencer: 16-bit write to 0x3CE (lo=index, hi=data).
+                if size >= 2 {
+                    self.write_gc_index(value as u8);
+                    self.write_gc_data((value >> 8) as u8);
+                } else {
+                    self.write_gc_index(value as u8);
+                }
+            }
+            VGA_GC_DATA => self.write_gc_data(value as u8),
             VGA_MISC_OUTPUT_WRITE => self.write_misc_output(value as u8),
             // Spec: FreeVGA / OSDev — `0x3CC` is read-only; writes ignored.
             VGA_MISC_OUTPUT_READ => {}
@@ -349,6 +429,7 @@ mod tests {
         assert_eq!(v.crtc_index, 0);
         assert_eq!(v.crtc_regs, [0; VGA_CRTC_REG_COUNT]);
         assert_eq!(v.seq_regs, VGA_SEQ_DEFAULTS);
+        assert_eq!(v.gc_regs, VGA_GC_DEFAULTS);
         assert_eq!(v.misc_output, VGA_MISC_OUTPUT_DEFAULT);
     }
 
@@ -487,11 +568,90 @@ mod tests {
     #[test]
     fn sequencer_owns_ports() {
         // Spec: FreeVGA / OSDev VGA Hardware / IBM VGA — Sequencer Address
-        // `0x3C4`, Data `0x3C5`; GC `0x3CE`/`0x3CF` not owned in this slice.
+        // `0x3C4`, Data `0x3C5`.
         assert!(VgaText::owns_port(VGA_SEQ_INDEX));
         assert!(VgaText::owns_port(VGA_SEQ_DATA));
-        assert!(!VgaText::owns_port(0x3CE));
-        assert!(!VgaText::owns_port(0x3CF));
+    }
+
+    #[test]
+    fn graphics_controller_owns_ports() {
+        // Spec: FreeVGA / OSDev VGA Hardware / IBM VGA — GC Address `0x3CE`,
+        // Data `0x3CF`; ATC `0x3C0`/`0x3C1` not owned in this slice.
+        assert!(VgaText::owns_port(VGA_GC_INDEX));
+        assert!(VgaText::owns_port(VGA_GC_DATA));
+        assert!(!VgaText::owns_port(0x3C0));
+        assert!(!VgaText::owns_port(0x3C1));
+    }
+
+    #[test]
+    fn graphics_controller_index_data_round_trip() {
+        // Spec: FreeVGA Graphics Registers — write index 0x3CE, data 0x3CF;
+        // indexes 0x00–0x08 (Set/Reset … Bit Mask).
+        let mut v = VgaText::new();
+        v.port_write(VGA_GC_INDEX, 1, 0x05); // Graphics Mode
+        v.port_write(VGA_GC_DATA, 1, 0x00);
+        v.port_write(VGA_GC_INDEX, 1, 0x08); // Bit Mask
+        v.port_write(VGA_GC_DATA, 1, 0xAA);
+        assert_eq!(v.gc_regs[0x05], 0x00);
+        assert_eq!(v.gc_regs[0x08], 0xAA);
+        assert_eq!(v.port_read(VGA_GC_INDEX, 1) as u8, 0x08);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0xAA);
+        v.port_write(VGA_GC_INDEX, 1, 0x05);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x00);
+    }
+
+    #[test]
+    fn graphics_controller_word_write_index_and_data() {
+        // Mirror CRTC/Sequencer: 16-bit write to address port (lo=index, hi=data).
+        let mut v = VgaText::new();
+        v.port_write(VGA_GC_INDEX, 2, 0x0F_06);
+        assert_eq!(v.gc_index, 0x06);
+        assert_eq!(v.gc_regs[0x06], 0x0F);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x0F);
+    }
+
+    #[test]
+    fn graphics_controller_out_of_range_index_ignored_on_data() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_GC_INDEX, 1, 0x09);
+        v.port_write(VGA_GC_DATA, 1, 0x55);
+        // Index 0x09 is beyond the 9 standard registers; data write ignored,
+        // read returns 0 (same CRTC/Sequencer out-of-range policy).
+        assert_eq!(v.gc_regs, VGA_GC_DEFAULTS);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0);
+        v.port_write(VGA_GC_INDEX, 1, 0x05);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x10);
+        v.port_write(VGA_GC_INDEX, 1, 0x08);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0xFF);
+    }
+
+    #[test]
+    fn graphics_controller_reset_defaults_mode03h() {
+        // Spec: FreeVGA / OSDev / IBM VGA mode-03h-class GC programming SeaBIOS
+        // probes — Mode `0x10`, Misc `0x0E`, Bit Mask `0xFF` (store/readback only).
+        let v = VgaText::new();
+        assert_eq!(v.gc_index, 0);
+        assert_eq!(v.gc_regs, VGA_GC_DEFAULTS);
+        assert_eq!(
+            v.gc_regs,
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF]
+        );
+    }
+
+    #[test]
+    fn reset_restores_graphics_controller_defaults() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_GC_INDEX, 1, 0x05);
+        v.port_write(VGA_GC_DATA, 1, 0x40);
+        v.port_write(VGA_GC_INDEX, 1, 0x08);
+        v.port_write(VGA_GC_DATA, 1, 0x00);
+        v.reset();
+        assert_eq!(v.gc_index, 0);
+        assert_eq!(v.gc_regs, VGA_GC_DEFAULTS);
+        v.port_write(VGA_GC_INDEX, 1, 0x05);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x10);
+        v.port_write(VGA_GC_INDEX, 1, 0x08);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0xFF);
     }
 
     #[test]
