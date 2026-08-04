@@ -1347,7 +1347,7 @@ Progress against implement list:
 - [ ] Initial VGA graphics
 - [ ] Initial VBE
 - [ ] SeaBIOS integration
-- [ ] Floppy boot — **partial:** `devices::Fdc82077` port stub `0x3F0`–`0x3F5`/`0x3F7` (DOR/MSR/FIFO/DIR/CCR accept; MSR RQM when out of DOR reset; Specify `0x03` → 2 param bytes stored, no result/IRQ; Recalibrate stub `0x07` → unit param, `pcn=0`, Seek End ST0 latch + IRQ6; Seek stub `0x0F` → HD|US + NCN, `pcn=NCN`, Seek End ST0 latch + IRQ6; Sense Interrupt Status `0x08` → ST0+PCN result + IRQ clear; Sense Drive Status `0x04` → HD|US param, no execution phase, ST3 result stub (T0 when shared `pcn==0`, WP always 0, no IRQ); Version stub `0x10` → no params, result `0x90` (82077AA id), no IRQ; `assert_irq6`→DualPic IRQ6 when DOR DMA/IRQ enable); **not** READ/WRITE/media engine/DMA ch2 transfers/SeaBIOS floppy path
+- [ ] Floppy boot — **partial:** `devices::Fdc82077` port stub `0x3F0`–`0x3F5`/`0x3F7` (DOR/MSR/FIFO/DIR/CCR accept; MSR RQM when out of DOR reset; Specify `0x03` → 2 param bytes stored, no result/IRQ; Recalibrate stub `0x07` → unit param, `pcn=0`, Seek End ST0 latch + IRQ6; Seek stub `0x0F` → HD|US + NCN, `pcn=NCN`, Seek End ST0 latch + IRQ6; Sense Interrupt Status `0x08` → ST0+PCN result + IRQ clear; Sense Drive Status `0x04` → HD|US param, no execution phase, ST3 result stub (T0 when shared `pcn==0`, WP always 0, no IRQ); Version stub `0x10` → no params, result `0x90` (82077AA id), no IRQ; Configure stub `0x13` → 3 params stored (EIS|FIFO_DIS|POLL_DIS|FIFOTHR/PRETRK), no result/IRQ; `assert_irq6`→DualPic IRQ6 when DOR DMA/IRQ enable); **not** READ/WRITE/LOCK/Configure bit enforcement/media engine/DMA ch2 transfers/SeaBIOS floppy path
 - [ ] Hard-disk boot
 - [ ] CD-ROM boot
 

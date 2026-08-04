@@ -1,5 +1,5 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
-//! Sense Int/Sense Drive/Version + IRQ6.
+//! Sense Int/Sense Drive/Version/Configure + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -14,12 +14,14 @@
 //!   (`0x04`, §5.2.5) HD|US parameter, no execution phase, result ST3 (§6.4:
 //!   bit7 unused=0, bit6 WP, bit5 unused=1, bit4 T0, bit3 unused=1, bit2 HD,
 //!   bits1:0 DS1/DS0), no IRQ; Version (`0x10`) no parameters, 1-byte result
-//!   `0x90` (82077AA identification); DOR bit3 DMA/IRQ enable; IRQ6 on command /
-//!   reset completion.
+//!   `0x90` (82077AA identification); Configure (`0x13`) three parameter bytes
+//!   (unused, EIS|FIFO_DIS|POLL_DIS|FIFOTHR, PRETRK), no result/IRQ; DOR bit3
+//!   DMA/IRQ enable; IRQ6 on command / reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
 //!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
-//!   Version returns `0x90` for 82077AA-class controllers.
+//!   Version returns `0x90` for 82077AA-class controllers; Configure stores
+//!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes.
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
 //!
@@ -45,16 +47,21 @@
 //!   82077AA §6.4; MSR RQM during parameter, RQM|DIO during result phase
 //! - Version (`0x10`): command byte → 1-byte result `0x90` (82077AA id); no
 //!   parameters, no IRQ assert/clear; MSR RQM|DIO during result phase
+//! - Configure (`0x13`): command byte → three parameter bytes stored
+//!   (`configure_byte0`, `configure_eis_fifo_poll_thr`, `configure_pretrk`);
+//!   no result phase; no IRQ; MSR RQM (!DIO) during parameter phase. Soft
+//!   `reset()` clears stored fields to 0 (stub default; real post-hardware-reset
+//!   often has FIFO disabled / thr=1 — not modeled until LOCK/engine work).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - Other commands (READ/WRITE/FORMAT/Configure/LOCK/PERPENDICULAR/DUMPREG/…)
+//! - Other commands (READ/WRITE/FORMAT/LOCK/PERPENDICULAR/DUMPREG/…)
 //! - Media image, seek step timing, format/read/write transfers
 //! - DMA channel 2 transfers (ND bit stored only; not enforced)
 //! - Automatic IRQ on real media command completion (host may still use assert API)
 //! - Drive sensing, disk-change edge timing, perpendicular mode
-//! - FIFO threshold / implied seek
+//! - Configure bit side effects (FIFO enable, implied seek, poll disable enforcement)
 
 use crate::PortDevice;
 
@@ -96,6 +103,9 @@ pub const FDC_CMD_SEEK: u8 = 0x0F;
 /// Version command opcode. Spec: Intel 82077AA / OSDev FDC — no parameters,
 /// 1-byte result identifying the controller class.
 pub const FDC_CMD_VERSION: u8 = 0x10;
+/// Configure command opcode. Spec: Intel 82077AA / OSDev FDC — 3 parameter
+/// bytes, no result phase, no IRQ.
+pub const FDC_CMD_CONFIGURE: u8 = 0x13;
 /// Version result byte for 82077AA-class controllers. Spec: Intel 82077AA /
 /// OSDev FDC — `0x90` identifies enhanced/82077AA (vs `0x80` for older 8272A).
 pub const FDC_VERSION_82077AA: u8 = 0x90;
@@ -138,9 +148,12 @@ enum Phase {
     SenseDriveStatusResult,
     /// Version result: single identification byte (`0x90` for 82077AA).
     VersionResult,
+    /// Configure parameters: byte0 unused, byte1 EIS|FIFO_DIS|POLL_DIS|FIFOTHR,
+    /// byte2 PRETRK.
+    ConfigureParams { index: u8 },
 }
 
-/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version + IRQ6.
+/// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Sense/Version/Configure + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
     /// Digital Output Register (motors, select, nRESET, DMA/IRQ enable).
@@ -163,6 +176,13 @@ pub struct Fdc82077 {
     pub specify_srt_hut: u8,
     /// Specify parameter 2: HLT (bits 7–1) | ND (bit 0). Spec: 82077AA.
     pub specify_hlt_nd: u8,
+    /// Configure parameter 0 (typically 0; stored). Spec: Intel 82077AA / OSDev.
+    pub configure_byte0: u8,
+    /// Configure parameter 1: EIS (bit6) | FIFO_DIS (bit5) | POLL_DIS (bit4) |
+    /// FIFOTHR (bits 3:0 = threshold−1). Spec: Intel 82077AA / OSDev Configure.
+    pub configure_eis_fifo_poll_thr: u8,
+    /// Configure parameter 2: PRETRK (write precompensation start track).
+    pub configure_pretrk: u8,
     /// Latched IRQ request (command-complete / reset stub). Spec: 82077AA → ISA IRQ6.
     irq_pending: bool,
     phase: Phase,
@@ -198,6 +218,9 @@ impl Fdc82077 {
             pcn: 0x00,
             specify_srt_hut: 0x00,
             specify_hlt_nd: 0x00,
+            configure_byte0: 0x00,
+            configure_eis_fifo_poll_thr: 0x00,
+            configure_pretrk: 0x00,
             irq_pending: false,
             phase: Phase::Command,
             pending_sense_st0: None,
@@ -235,7 +258,8 @@ impl Fdc82077 {
                 | Phase::SpecifyParams { .. }
                 | Phase::RecalibrateParams
                 | Phase::SeekParams { .. }
-                | Phase::SenseDriveStatusParam => FDC_MSR_RQM,
+                | Phase::SenseDriveStatusParam
+                | Phase::ConfigureParams { .. } => FDC_MSR_RQM,
                 Phase::SenseIntResult { .. }
                 | Phase::SenseDriveStatusResult
                 | Phase::VersionResult => FDC_MSR_RQM | FDC_MSR_DIO,
@@ -356,14 +380,20 @@ impl Fdc82077 {
         self.phase = Phase::VersionResult;
     }
 
+    /// Begin Configure parameter phase (3 bytes). Spec: Intel 82077AA Configure.
+    fn start_configure(&mut self) {
+        self.phase = Phase::ConfigureParams { index: 0 };
+    }
+
     fn fifo_read(&mut self) -> u8 {
         match self.phase {
-            // Spec: Specify/Recalibrate/Seek have no result phase; open-bus when idle/params.
+            // Spec: Specify/Recalibrate/Seek/Configure have no result phase; open-bus when idle/params.
             Phase::Command
             | Phase::SpecifyParams { .. }
             | Phase::RecalibrateParams
             | Phase::SeekParams { .. }
-            | Phase::SenseDriveStatusParam => 0xFF,
+            | Phase::SenseDriveStatusParam
+            | Phase::ConfigureParams { .. } => 0xFF,
             Phase::SenseIntResult { index } => {
                 let v = match index {
                     0 => self.sense_st0,
@@ -411,6 +441,9 @@ impl Fdc82077 {
                 } else if v == FDC_CMD_VERSION {
                     // Spec: Intel 82077AA Version — no params; result 0x90; no IRQ.
                     self.start_version();
+                } else if v == FDC_CMD_CONFIGURE {
+                    // Spec: Intel 82077AA Configure — three params; no result/IRQ.
+                    self.start_configure();
                 }
                 // Other opcodes: accept/drop until a command engine exists.
             }
@@ -446,6 +479,24 @@ impl Fdc82077 {
             Phase::SenseDriveStatusParam => {
                 // Spec: Intel 82077AA §5.2.5 — HD|US param, no execution phase.
                 self.finish_sense_drive_status(v);
+            }
+            Phase::ConfigureParams { index } => {
+                // Spec: Intel 82077AA / OSDev Configure — param0 unused, param1
+                // EIS|FIFO_DIS|POLL_DIS|FIFOTHR, param2 PRETRK; no result/IRQ.
+                match index {
+                    0 => {
+                        self.configure_byte0 = v;
+                        self.phase = Phase::ConfigureParams { index: 1 };
+                    }
+                    1 => {
+                        self.configure_eis_fifo_poll_thr = v;
+                        self.phase = Phase::ConfigureParams { index: 2 };
+                    }
+                    _ => {
+                        self.configure_pretrk = v;
+                        self.phase = Phase::Command;
+                    }
+                }
             }
             Phase::SenseIntResult { .. } | Phase::SenseDriveStatusResult | Phase::VersionResult => {
                 // Host must not write during result phase (stub ignores).
@@ -1117,5 +1168,147 @@ mod tests {
             0xFF,
             "aborted Version result is discarded"
         );
+    }
+
+    /// Spec: Intel 82077AA / OSDev FDC Configure — opcode `0x13`, three params
+    /// (unused, EIS|FIFO_DIS|POLL_DIS|FIFOTHR, PRETRK), no result, no IRQ.
+    #[test]
+    fn configure_stores_three_params_returns_to_command() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "param phase: RQM, DIO clear"
+        );
+        assert!(f.irq_line(), "Configure must not clear IRQ latch");
+
+        // param0 typically 0 (ignored by hardware; stored by stub).
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert_eq!(f.configure_byte0, 0x00);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "still param phase after byte0"
+        );
+
+        // param1: EIS=1, FIFO_DIS=0, POLL_DIS=1, FIFOTHR=7 → 0x57.
+        f.port_write(FDC_FIFO, 1, 0x57);
+        assert_eq!(f.configure_eis_fifo_poll_thr, 0x57);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "still param phase after byte1"
+        );
+
+        // param2: PRETRK write precompensation start track.
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert_eq!(f.configure_pretrk, 0x00);
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM,
+            "idle command phase after Configure"
+        );
+        assert_eq!(f.phase, Phase::Command);
+        assert!(f.irq_line(), "Configure must not assert/clear IRQ");
+
+        // No result bytes — FIFO read stays open-bus style.
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0xFF);
+    }
+
+    /// Spec: Configure has no execution/result phase and must not assert or clear IRQ.
+    #[test]
+    fn configure_does_not_touch_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.assert_irq6();
+        assert!(f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        assert!(f.irq_line(), "command byte must not clear IRQ");
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x08);
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert!(f.irq_line(), "params must not clear IRQ");
+
+        f.clear_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x08);
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert!(!f.irq_line(), "Configure never asserts IRQ");
+    }
+
+    #[test]
+    fn dor_reset_aborts_configure_param_phase() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        f.port_write(FDC_FIFO, 1, 0xAB);
+        assert_eq!(f.configure_byte0, 0xAB);
+        assert_eq!(f.phase, Phase::ConfigureParams { index: 1 });
+        f.port_write(FDC_DOR, 1, 0); // enter reset — aborts mid-command
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        // Soft DOR reset aborts phase (partial command discarded); stored fields
+        // survive until full `reset()` — same policy as Specify.
+        assert_eq!(f.configure_byte0, 0xAB);
+        assert_eq!(f.configure_eis_fifo_poll_thr, 0);
+        assert_eq!(f.configure_pretrk, 0);
+    }
+
+    /// After Configure, probe commands Version / Sense Interrupt still work.
+    #[test]
+    fn configure_then_version_and_sense_int_still_work() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x57);
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.configure_eis_fifo_poll_thr, 0x57);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_VERSION_82077AA);
+        assert_eq!(f.phase, Phase::Command);
+
+        f.assert_irq6();
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST0_IC_READY_CHANGE,
+            "Sense Int ST0 after Configure"
+        );
+        let _pcn = f.port_read(FDC_FIFO, 1);
+        assert_eq!(f.phase, Phase::Command);
+        assert!(!f.irq_line());
+    }
+
+    #[test]
+    fn reset_clears_configure_params() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        f.port_write(FDC_FIFO, 1, 0x01);
+        f.port_write(FDC_FIFO, 1, 0x57);
+        f.port_write(FDC_FIFO, 1, 0x12);
+        assert_eq!(f.configure_byte0, 0x01);
+        assert_eq!(f.configure_eis_fifo_poll_thr, 0x57);
+        assert_eq!(f.configure_pretrk, 0x12);
+        f.reset();
+        // Soft reset defaults: zeros (like Specify). Real 82077AA post-hardware-
+        // reset often has FIFO disabled / thr=1; this stub stores 0 until programmed.
+        assert_eq!(f.configure_byte0, 0);
+        assert_eq!(f.configure_eis_fifo_poll_thr, 0);
+        assert_eq!(f.configure_pretrk, 0);
+        assert_eq!(f.phase, Phase::Command);
     }
 }
