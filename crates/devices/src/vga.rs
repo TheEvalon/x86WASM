@@ -1,10 +1,11 @@
 //! VGA color text-mode frame buffer MMIO stub (physical `0xB8000`) plus CRTC
-//! index/data port stub (`0x3D4`/`0x3D5`), Sequencer index/data stub
-//! (`0x3C4`/`0x3C5`), Graphics Controller index/data stub (`0x3CE`/`0x3CF`),
-//! Attribute Controller address/data flip-flop stub (`0x3C0`/`0x3C1` + Input
-//! Status #1 flip-flop reset and status bits at `0x3DA`/`0x3BA` via Misc IOAS),
-//! Miscellaneous Output Register stub (`0x3C2` write / `0x3CC` readback), and
-//! DAC / PEL color RAM stub (`0x3C7`/`0x3C8`/`0x3C9`) and PEL Mask (`0x3C6`).
+//! index/data port stub (`0x3D4`/`0x3D5` color / `0x3B4`/`0x3B5` mono via Misc
+//! IOAS), Sequencer index/data stub (`0x3C4`/`0x3C5`), Graphics Controller
+//! index/data stub (`0x3CE`/`0x3CF`), Attribute Controller address/data
+//! flip-flop stub (`0x3C0`/`0x3C1` + Input Status #1 flip-flop reset and status
+//! bits at `0x3DA`/`0x3BA` via Misc IOAS), Miscellaneous Output Register stub
+//! (`0x3C2` write / `0x3CC` readback), and DAC / PEL color RAM stub
+//! (`0x3C7`/`0x3C8`/`0x3C9`) and PEL Mask (`0x3C6`).
 //!
 //! # Spec refs
 //!
@@ -12,12 +13,12 @@
 //!   80×25 cells, 2 bytes per cell (ASCII character, attribute).
 //! - OSDev Text UI — memory layout for mode 03h text (char at even offset,
 //!   attribute at odd); window commonly treated as 32 KiB (`0xB8000`–`0xBFFFF`).
-//! - OSDev VGA Hardware / FreeVGA CRT Controller / IBM VGA — color CRTC Address
-//!   Register at `0x3D4`, Data Register at `0x3D5`; standard VGA has 25 CRTC
-//!   registers (indexes `0x00`–`0x18`). Cursor Start `0x0A` (bits 4:0 scanline
-//!   start; bit5 Cursor Disable), Cursor End `0x0B` (bits 4:0 scanline end),
-//!   Cursor Location High `0x0E` / Low `0x0F` (16-bit character address into
-//!   the refresh buffer).
+//! - OSDev VGA Hardware / FreeVGA CRT Controller / IBM VGA — CRTC Address/Data
+//!   at color `0x3D4`/`0x3D5` or mono `0x3B4`/`0x3B5` per Misc Output IOAS;
+//!   standard VGA has 25 CRTC registers (indexes `0x00`–`0x18`). Cursor Start
+//!   `0x0A` (bits 4:0 scanline start; bit5 Cursor Disable), Cursor End `0x0B`
+//!   (bits 4:0 scanline end), Cursor Location High `0x0E` / Low `0x0F` (16-bit
+//!   character address into the refresh buffer).
 //! - OSDev VGA Hardware / FreeVGA Sequencer Registers — Address `0x3C4`, Data
 //!   `0x3C5`; indexes `0x00`–`0x04` (Reset, Clocking Mode, Map Mask, Character
 //!   Map Select, Memory Mode).
@@ -52,10 +53,11 @@
 //! - 32 KiB text plane buffer at `VGA_TEXT_BASE`…`VGA_TEXT_END`
 //! - Byte R/W; reset fills first 80×25 with space + attribute `0x07`
 //! - Helpers for tests (`char_at` / `attr_at` / `put_char`)
-//! - CRTC index/data: latch index on `0x3D4`, store/read register file on
-//!   `0x3D5`; cursor registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback
-//!   plus helpers for text-mode cursor character offset / row-col (no host
-//!   cursor glyph render, CRTC timing, or protect-bit enforcement)
+//! - CRTC index/data: latch index / store/read register file on the IOAS-selected
+//!   map (`0x3D4`/`0x3D5` color or `0x3B4`/`0x3B5` mono; shared file); cursor
+//!   registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback plus helpers for
+//!   text-mode cursor character offset / row-col (no host cursor glyph render,
+//!   CRTC timing, or protect-bit enforcement)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults (no timing/plane side effects)
 //! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
@@ -68,7 +70,7 @@
 //!   vertical-retrace status bits (read-phase counter); port selected by Misc
 //!   Output IOAS (`0x3DA` color / `0x3BA` mono)
 //! - Misc Output store/readback (`0x3C2`/`0x3CC`); IOAS bit remaps Input Status
-//!   #1 ownership only (not CRTC mono map, clock, or RAM-enable)
+//!   #1 and CRTC index/data ownership (not clock or RAM-enable)
 //! - DAC / PEL store/readback: write index `0x3C8`, data `0x3C9` (R→G→B), read
 //!   index write / state read `0x3C7`; 256×3 RAM with mode-03h-ish defaults
 //! - PEL Mask `0x3C6` R/W store/readback (default `0xFF`); display-path AND is
@@ -84,9 +86,8 @@
 //!   deferred until host render; hidden-DAC unlock via repeated `0x3C6` reads
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
-//! - CRTC protect bit (index `0x11` bit7), full CRTC timing/blanking, mono CRTC
-//!   map at `0x3B4`/`0x3B5`
-//! - Misc Output bit side effects beyond Input Status #1 IOAS (clock select,
+//! - CRTC protect bit (index `0x11` bit7), full CRTC timing/blanking
+//! - Misc Output bit side effects beyond IOAS CRTC/status remap (clock select,
 //!   RAM enable)
 //! - Planar graphics, VBE, host canvas rendering, dirty tracking
 //! - Font ROM / host rendering of the hardware cursor glyph from CRTC start/end
@@ -115,6 +116,13 @@ pub const VGA_DEFAULT_CHAR: u8 = b' ';
 pub const VGA_CRTC_INDEX: u16 = 0x3D4;
 /// Color CRTC Data Register.
 pub const VGA_CRTC_DATA: u16 = 0x3D5;
+/// Mono CRTC Address (index) Register — active when Misc Output IOAS selects mono.
+///
+/// Spec: FreeVGA / IBM VGA Misc Output bit0 (IOAS) — mono I/O map places CRTC
+/// Address/Data at `0x3B4`/`0x3B5` (same register file as color).
+pub const VGA_CRTC_INDEX_MONO: u16 = 0x3B4;
+/// Mono CRTC Data Register — active when Misc Output IOAS selects mono.
+pub const VGA_CRTC_DATA_MONO: u16 = 0x3B5;
 /// Number of standard VGA CRTC registers (indexes `0x00`–`0x18`).
 pub const VGA_CRTC_REG_COUNT: usize = 0x19;
 
@@ -177,7 +185,7 @@ pub const VGA_MISC_OUTPUT_DEFAULT: u8 = 0x67;
 ///
 /// Spec: FreeVGA / IBM VGA Misc Output — `1` = color I/O map (`0x3Dx` CRTC +
 /// Input Status #1 `0x3DA`); `0` = mono I/O map (`0x3Bx` CRTC + Input Status #1
-/// `0x3BA`). This stub remaps Input Status #1 ownership only.
+/// `0x3BA`). This stub remaps CRTC index/data and Input Status #1 ownership.
 pub const VGA_MISC_IOAS: u8 = 0x01;
 
 /// Graphics Controller Address (index) Register.
@@ -329,7 +337,7 @@ pub fn vga_dac_default_ram() -> [[u8; 3]; VGA_DAC_ENTRY_COUNT] {
 pub struct VgaText {
     /// Raw plane bytes (char/attr interleaved).
     pub mem: Vec<u8>,
-    /// Latched CRTC index (written via `0x3D4`).
+    /// Latched CRTC index (written via active IOAS CRTC index port).
     pub crtc_index: u8,
     /// CRTC register file (store/readback; cursor indexes have helpers).
     pub crtc_regs: [u8; VGA_CRTC_REG_COUNT],
@@ -455,19 +463,18 @@ impl VgaText {
         self.misc_output & VGA_MISC_IOAS != 0
     }
 
-    /// True if this device owns the I/O port (color CRTC + Sequencer + GC + ATC
-    /// + DAC PEL / PEL Mask + Input Status #1 at the IOAS-selected address + Misc).
+    /// True if this device owns the I/O port (CRTC + Sequencer + GC + ATC +
+    /// DAC PEL / PEL Mask + Input Status #1 at the IOAS-selected addresses + Misc).
     ///
-    /// Spec: FreeVGA / IBM — Input Status #1 is `0x3DA` when IOAS=1 (color) and
-    /// `0x3BA` when IOAS=0 (mono). CRTC remains color `0x3D4`/`0x3D5` in this
-    /// stub (mono CRTC remap is unsupported).
+    /// Spec: FreeVGA / IBM — Misc Output IOAS selects color (`0x3D4`/`0x3D5`,
+    /// `0x3DA`) vs mono (`0x3B4`/`0x3B5`, `0x3BA`) for CRTC and Input Status #1.
     pub fn owns_port(&self, port: u16) -> bool {
         match port {
-            VGA_INPUT_STATUS_1 => self.misc_ioas_color(),
-            VGA_INPUT_STATUS_1_MONO => !self.misc_ioas_color(),
-            VGA_CRTC_INDEX
-            | VGA_CRTC_DATA
-            | VGA_SEQ_INDEX
+            VGA_CRTC_INDEX | VGA_CRTC_DATA | VGA_INPUT_STATUS_1 => self.misc_ioas_color(),
+            VGA_CRTC_INDEX_MONO | VGA_CRTC_DATA_MONO | VGA_INPUT_STATUS_1_MONO => {
+                !self.misc_ioas_color()
+            }
+            VGA_SEQ_INDEX
             | VGA_SEQ_DATA
             | VGA_GC_INDEX
             | VGA_GC_DATA
@@ -660,8 +667,8 @@ impl VgaText {
     }
 
     fn write_misc_output(&mut self, value: u8) {
-        // Store; IOAS (bit0) remaps Input Status #1 ownership. Clock select and
-        // RAM-enable bits are not enforced; mono CRTC `0x3B4`/`0x3B5` is not.
+        // Store; IOAS (bit0) remaps CRTC index/data and Input Status #1
+        // ownership. Clock select and RAM-enable bits are not enforced.
         self.misc_output = value;
     }
 
@@ -799,8 +806,10 @@ impl VgaText {
 impl PortDevice for VgaText {
     fn port_read(&mut self, port: u16, _size: u8) -> u32 {
         match port {
-            VGA_CRTC_INDEX => u32::from(self.read_crtc_index()),
-            VGA_CRTC_DATA => u32::from(self.read_crtc_data()),
+            VGA_CRTC_INDEX if self.misc_ioas_color() => u32::from(self.read_crtc_index()),
+            VGA_CRTC_DATA if self.misc_ioas_color() => u32::from(self.read_crtc_data()),
+            VGA_CRTC_INDEX_MONO if !self.misc_ioas_color() => u32::from(self.read_crtc_index()),
+            VGA_CRTC_DATA_MONO if !self.misc_ioas_color() => u32::from(self.read_crtc_data()),
             VGA_SEQ_INDEX => u32::from(self.read_seq_index()),
             VGA_SEQ_DATA => u32::from(self.read_seq_data()),
             VGA_GC_INDEX => u32::from(self.read_gc_index()),
@@ -828,7 +837,7 @@ impl PortDevice for VgaText {
 
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
         match port {
-            VGA_CRTC_INDEX => {
+            VGA_CRTC_INDEX if self.misc_ioas_color() => {
                 // Spec: OSDev VGA Hardware — some guests write index+data as a
                 // single word to 0x3D4 (low = index, high = data).
                 if size >= 2 {
@@ -838,7 +847,17 @@ impl PortDevice for VgaText {
                     self.write_crtc_index(value as u8);
                 }
             }
-            VGA_CRTC_DATA => self.write_crtc_data(value as u8),
+            VGA_CRTC_DATA if self.misc_ioas_color() => self.write_crtc_data(value as u8),
+            VGA_CRTC_INDEX_MONO if !self.misc_ioas_color() => {
+                // Spec: FreeVGA / IBM — mono map mirrors color word write at 0x3B4.
+                if size >= 2 {
+                    self.write_crtc_index(value as u8);
+                    self.write_crtc_data((value >> 8) as u8);
+                } else {
+                    self.write_crtc_index(value as u8);
+                }
+            }
+            VGA_CRTC_DATA_MONO if !self.misc_ioas_color() => self.write_crtc_data(value as u8),
             VGA_SEQ_INDEX => {
                 // Mirror CRTC: 16-bit write to 0x3C4 (lo=index, hi=data).
                 if size >= 2 {
@@ -968,7 +987,7 @@ mod tests {
         let mut v = VgaText::new();
         assert!(v.owns_port(VGA_CRTC_INDEX));
         assert!(v.owns_port(VGA_CRTC_DATA));
-        assert!(!v.owns_port(0x3B4));
+        assert!(!v.owns_port(VGA_CRTC_INDEX_MONO));
         v.port_write(VGA_CRTC_INDEX, 1, 0x0E); // cursor location high
         v.port_write(VGA_CRTC_DATA, 1, 0x12);
         v.port_write(VGA_CRTC_INDEX, 1, 0x0F); // cursor location low
@@ -1104,16 +1123,122 @@ mod tests {
     }
 
     #[test]
-    fn misc_output_owns_ports_with_crtc_not_mono() {
+    fn misc_output_owns_ports_color_crtc_by_default() {
         // Spec: FreeVGA / OSDev — Misc Output write `0x3C2`, read `0x3CC`;
-        // color CRTC remains `0x3D4`/`0x3D5`; mono `0x3B4`/`0x3B5` not owned.
+        // default IOAS=1 owns color CRTC `0x3D4`/`0x3D5`; mono `0x3B4`/`0x3B5`
+        // not owned until IOAS is cleared.
         let v = VgaText::new();
         assert!(v.owns_port(VGA_MISC_OUTPUT_WRITE));
         assert!(v.owns_port(VGA_MISC_OUTPUT_READ));
         assert!(v.owns_port(VGA_CRTC_INDEX));
         assert!(v.owns_port(VGA_CRTC_DATA));
-        assert!(!v.owns_port(0x3B4));
-        assert!(!v.owns_port(0x3B5));
+        assert!(!v.owns_port(VGA_CRTC_INDEX_MONO));
+        assert!(!v.owns_port(VGA_CRTC_DATA_MONO));
+    }
+
+    #[test]
+    fn crtc_mono_ports_owned_when_misc_ioas_cleared() {
+        // Spec: FreeVGA / IBM VGA Misc Output bit0 (IOAS) — clear selects mono
+        // I/O map; CRTC Address/Data move to `0x3B4`/`0x3B5`. Color `0x3D4`/
+        // `0x3D5` are not owned.
+        let mut v = VgaText::new();
+        assert!(v.misc_ioas_color());
+        assert!(v.owns_port(VGA_CRTC_INDEX));
+        assert!(v.owns_port(VGA_CRTC_DATA));
+        assert!(!v.owns_port(VGA_CRTC_INDEX_MONO));
+        assert!(!v.owns_port(VGA_CRTC_DATA_MONO));
+
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_IOAS),
+        );
+        assert!(!v.misc_ioas_color());
+        assert!(!v.owns_port(VGA_CRTC_INDEX));
+        assert!(!v.owns_port(VGA_CRTC_DATA));
+        assert!(v.owns_port(VGA_CRTC_INDEX_MONO));
+        assert!(v.owns_port(VGA_CRTC_DATA_MONO));
+    }
+
+    #[test]
+    fn crtc_mono_index_data_round_trip_same_register_file() {
+        // Spec: FreeVGA CRT Controller / Misc Output IOAS — mono `0x3B4`/`0x3B5`
+        // address the same CRTC register file as color `0x3D4`/`0x3D5`.
+        let mut v = VgaText::new();
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_IOAS),
+        );
+
+        v.port_write(VGA_CRTC_INDEX_MONO, 1, 0x0E);
+        v.port_write(VGA_CRTC_DATA_MONO, 1, 0x12);
+        v.port_write(VGA_CRTC_INDEX_MONO, 1, 0x0F);
+        v.port_write(VGA_CRTC_DATA_MONO, 1, 0x34);
+        assert_eq!(v.crtc_regs[0x0E], 0x12);
+        assert_eq!(v.crtc_regs[0x0F], 0x34);
+
+        v.port_write(VGA_CRTC_INDEX_MONO, 1, 0x0E);
+        assert_eq!(v.port_read(VGA_CRTC_INDEX_MONO, 1) as u8, 0x0E);
+        assert_eq!(v.port_read(VGA_CRTC_DATA_MONO, 1) as u8, 0x12);
+        v.port_write(VGA_CRTC_INDEX_MONO, 1, 0x0F);
+        assert_eq!(v.port_read(VGA_CRTC_DATA_MONO, 1) as u8, 0x34);
+
+        // Inactive color alias must not touch the shared file.
+        assert_eq!(v.port_read(VGA_CRTC_INDEX, 1), 0xFFFF_FFFF);
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1), 0xFFFF_FFFF);
+        v.port_write(VGA_CRTC_INDEX, 1, 0x0E);
+        v.port_write(VGA_CRTC_DATA, 1, 0x99);
+        assert_eq!(v.crtc_regs[0x0E], 0x12);
+
+        // Switching back to color sees the same register file.
+        v.port_write(VGA_MISC_OUTPUT_WRITE, 1, u32::from(VGA_MISC_OUTPUT_DEFAULT));
+        v.port_write(VGA_CRTC_INDEX, 1, 0x0E);
+        assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x12);
+        assert!(!v.owns_port(VGA_CRTC_INDEX_MONO));
+        assert_eq!(v.port_read(VGA_CRTC_INDEX_MONO, 1), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn crtc_mono_word_write_index_and_data() {
+        // Spec: OSDev VGA Hardware — 16-bit write to CRTC index (lo=index,
+        // hi=data) also applies on the mono map at `0x3B4`.
+        let mut v = VgaText::new();
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_IOAS),
+        );
+        v.port_write(VGA_CRTC_INDEX_MONO, 2, 0xAB_0C);
+        assert_eq!(v.crtc_index, 0x0C);
+        assert_eq!(v.crtc_regs[0x0C], 0xAB);
+        assert_eq!(v.port_read(VGA_CRTC_DATA_MONO, 1) as u8, 0xAB);
+    }
+
+    #[test]
+    fn crtc_cursor_helpers_via_mono_ports() {
+        // Spec: FreeVGA cursor location + Misc IOAS — helpers read the shared
+        // CRTC file whether programmed through color or mono ports.
+        let mut v = VgaText::new();
+        v.port_write(
+            VGA_MISC_OUTPUT_WRITE,
+            1,
+            u32::from(VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_IOAS),
+        );
+
+        v.port_write(VGA_CRTC_INDEX_MONO, 1, u32::from(VGA_CRTC_CURSOR_LOC_HIGH));
+        v.port_write(VGA_CRTC_DATA_MONO, 1, 0x01);
+        v.port_write(VGA_CRTC_INDEX_MONO, 1, u32::from(VGA_CRTC_CURSOR_LOC_LOW));
+        v.port_write(VGA_CRTC_DATA_MONO, 1, 0x4F); // 0x014F → row 4, col 15
+        v.port_write(VGA_CRTC_INDEX_MONO, 2, 0x0E_0A); // start scanline 0x0E
+        v.port_write(VGA_CRTC_INDEX_MONO, 2, 0x0F_0B); // end scanline 0x0F
+
+        assert_eq!(v.crtc_cursor_location(), 0x014F);
+        assert_eq!(v.crtc_cursor_plane_offset(), 0x014F * VGA_CELL_BYTES);
+        assert_eq!(v.crtc_cursor_row_col(), (4, 15));
+        assert_eq!(v.crtc_cursor_start_scanline(), 0x0E);
+        assert_eq!(v.crtc_cursor_end_scanline(), 0x0F);
+        assert!(!v.crtc_cursor_disabled());
     }
 
     #[test]
