@@ -212,6 +212,9 @@ pub const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
 /// READ NATIVE MAX ADDRESS — returns max LBA28 in task-file registers.
 /// Spec: ATA/ATAPI Command Set — READ NATIVE MAX ADDRESS (`0xF8`).
 pub const ATA_CMD_READ_NATIVE_MAX: u8 = 0xF8;
+/// SET MAX ADDRESS — Host Protected Area set; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SET MAX ADDRESS (`0xF9`).
+pub const ATA_CMD_SET_MAX_ADDRESS: u8 = 0xF9;
 /// SET MULTIPLE MODE — ABRT stub (multiple block count not stored).
 /// Spec: ATA/ATAPI Command Set — SET MULTIPLE MODE (`0xC6`).
 pub const ATA_CMD_SET_MULTIPLE_MODE: u8 = 0xC6;
@@ -1122,6 +1125,24 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// SET MAX ADDRESS (`0xF9`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SET MAX ADDRESS sets the Host Protected
+    /// Area maximum address from the task-file LBA (paired with READ NATIVE
+    /// MAX ADDRESS `0xF8`). This stub does not implement HPA; ATA disks abort
+    /// with ERR+ABRT and leave capacity unchanged. Absent/slave → status 0.
+    /// INTRQ follows nIEN like WRITE BUFFER abort.
+    fn exec_set_max_address(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) — success noop (no tray lock state).
     fn exec_media_lock_unlock(&mut self) {
         if !self.present || self.is_slave_selected() {
@@ -1219,6 +1240,7 @@ impl IdePrimary {
             ATA_CMD_RECALIBRATE | ATA_CMD_SEEK => self.exec_recalibrate_seek_success(),
             ATA_CMD_INIT_DEV_PARAMS => self.exec_init_dev_params(),
             ATA_CMD_READ_NATIVE_MAX => self.exec_read_native_max(),
+            ATA_CMD_SET_MAX_ADDRESS => self.exec_set_max_address(),
             ATA_CMD_MEDIA_LOCK | ATA_CMD_MEDIA_UNLOCK => self.exec_media_lock_unlock(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             ATA_CMD_SET_FEATURES => self.exec_set_features(),
@@ -3079,6 +3101,61 @@ mod tests {
         assert_eq!(ide.port_read(IDE_PRIMARY_DRIVE, 1) as u8 & 0x0F, 0);
         let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
         assert_eq!(st & ATA_SR_ERR, 0);
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SET MAX ADDRESS (`0xF9`) sets HPA max from
+    /// task-file LBA (paired with READ NATIVE MAX `0xF8` success). This stub has
+    /// no HPA path; ATA master → ERR+ABRT, no DRQ, capacity unchanged.
+    #[test]
+    fn set_max_address_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        // Attempt to shrink max below native (would be HPA if implemented).
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        // Capacity unchanged: READ NATIVE MAX still reports LBA 3.
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_NATIVE_MAX));
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8, 3);
+    }
+
+    #[test]
+    fn set_max_address_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match WRITE BUFFER).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn set_max_address_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match WRITE BUFFER abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn set_max_address_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
     }
 
     /// Spec: ATA — SET MULTIPLE MODE (`0xC6`) → ERR+ABRT (no multiple state).
