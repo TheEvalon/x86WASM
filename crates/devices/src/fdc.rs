@@ -1,7 +1,8 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
 //! Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
-//! READ DATA (media single-sector + no-media ND) / READ DELETED DATA / WRITE DATA /
-//! WRITE DELETED DATA / VERIFY / FORMAT TRACK (no-media stubs) + IRQ6.
+//! READ DATA (media single-sector + no-media ND) / READ ID (media sector-ID
+//! stub + no-media ND) / READ DELETED DATA / WRITE DATA / WRITE DELETED DATA /
+//! VERIFY / FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -36,14 +37,18 @@
 //!   IC=01 + ST1 NW + C/H/R/N ENDaddress and IRQ6; FORMAT TRACK (`0x0D` with optional MFM in bit6, §5.1.7 /
 //!   Table 5-1) five parameter bytes then 7-byte result; no-media stub
 //!   completes with ST0 IC=01 + ST1 NW + four undefined zeros and IRQ6;
-//!   DOR bit3 DMA/IRQ enable; IRQ6 on command / reset completion.
+//!   READ ID (`0x0A` with optional MFM in bit6, Table 5-1 / §5.1.8) one HD|US
+//!   parameter then 7-byte result; with media → ST0 IC=00 + ST1=0 + sector-ID
+//!   stub C=`pcn[unit]` / H from HD / R=1 / N=2 + IRQ6; no-media → ST0 IC=01
+//!   with ST1 ND and C/H/R/N=0 + IRQ6; DOR bit3 DMA/IRQ enable; IRQ6 on
+//!   command / reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
 //!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
 //!   Version returns `0x90` for 82077AA-class controllers; Configure stores
 //!   EIS/FIFO/POLL/FIFOTHR/PRETRK with no result bytes; Lock/Unlock via MT bit;
 //!   Perpendicular Mode configures GAP/WGATE (and enhanced Dn bits);
-//!   DUMPREG dumps internal registers; READ/READ DELETED/WRITE DATA /
+//!   DUMPREG dumps internal registers; READ/READ ID/READ DELETED/WRITE DATA /
 //!   FORMAT TRACK MT/MFM(/SK) forms → IRQ then 7-byte result (not Sense Interrupt).
 //! - IBM PC/AT — floppy controller → IRQ6 (8259 master IR6).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §21 Floppy boot (foundation stub).
@@ -132,6 +137,12 @@
 //!   US), ST1 NW (Not Writable — §6.2 lists FORMAT TRACK), ST2=0, four
 //!   undefined result bytes = 0; asserts IRQ6 (cleared on first result byte);
 //!   SC latched into `sc_eot`.
+//! - READ ID (`0x0A` | MFM): Spec Intel 82077AA Table 5-1 / §5.1.8 — command
+//!   byte lower 5 bits `01010`; optional MFM (`0x40`); one HD|US param; 7-byte
+//!   result. With media → ST0 IC=00 | H | US, ST1=ST2=0, sector-ID stub
+//!   C=`pcn[unit]`, H from HD bit, R=1, N=2; no media → ST0 IC=01 | H | US,
+//!   ST1 ND, C/H/R/N=0; asserts IRQ6 (cleared on first result byte). Full IDAM
+//!   track scan deferred.
 //! - 1.44MB media image attach/eject + CHS→offset/`read_sector`/
 //!   `write_sector` helpers (PC MFM geometry); DIR bit7 DSKCHG stub on
 //!   attach/eject; `write_protected` / [`Self::set_write_protected`] for ST3
@@ -146,9 +157,10 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - WRITE DELETED DATA / READ TRACK / READ ID / VERIFY and other transfer
-//!   commands; READ DELETED DATA media/deleted-address-mark engine; FORMAT
-//!   TRACK media write / per-sector ID DMA
+//! - WRITE DELETED DATA / READ TRACK / VERIFY and other transfer commands;
+//!   READ ID full IDAM track scan (sector-ID stub only); READ DELETED DATA
+//!   media/deleted-address-mark engine; FORMAT TRACK media write / per-sector
+//!   ID DMA
 //! - Multi-sector / full MT engine; DREQ/DACK cycle timing; FORMAT media
 //! - Seek step timing; real DIR disk-change edge timing (DSKCHG stub only)
 //! - Implied seek from Configure EIS; multi-sector TC termination
@@ -1351,23 +1363,41 @@ impl Fdc82077 {
         self.phase = Phase::ReadIdParam;
     }
 
-    /// Complete READ ID — no-media stub.
+    /// Complete READ ID after HD|US parameter.
     ///
-    /// Spec: Intel 82077AA READ ID — one HD|US param; no media → ST0 IC=01|H|US,
-    /// ST1 ND, ST2=0, C/H/R/N=0; IRQ6 when DOR enables.
+    /// Spec: Intel 82077AA Table 5-1 / §5.1.8 — one HD|US param; 7-byte result
+    /// ST0/ST1/ST2/C/H/R/N; IRQ6 when DOR enables (cleared on first result byte).
+    ///
+    /// - With media: normal termination (ST0 IC=00 | H | US), ST1=ST2=0, and a
+    ///   sector-ID stub: C = `pcn[unit]`, H from the HD bit of the param, R=1,
+    ///   N=`FDC_SECTOR_N` (512-byte / IBM 1.44MB). Full IDAM track scan deferred.
+    /// - No media: ST0 IC=01 | H | US, ST1 ND, ST2=0, C/H/R/N=0.
     fn finish_read_id(&mut self, head_unit: u8) {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
-        self.read_result = [
-            FDC_ST0_IC_ABNORMAL | st0_head | unit,
-            FDC_ST1_ND,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-        ];
+        if self.has_media() {
+            let c = self.pcn[unit as usize];
+            self.read_result = [
+                FDC_ST0_IC_NORMAL | st0_head | unit,
+                0x00,
+                0x00,
+                c,
+                head,
+                0x01,
+                FDC_SECTOR_N,
+            ];
+        } else {
+            self.read_result = [
+                FDC_ST0_IC_ABNORMAL | st0_head | unit,
+                FDC_ST1_ND,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+            ];
+        }
         self.irq_pending = true;
         self.phase = Phase::ReadIdResult { index: 0 };
     }
@@ -3629,6 +3659,76 @@ mod tests {
             assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0); // C/H/R/N
         }
         assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 / §5.1.8 — READ ID with media: normal ST0
+    /// (IC=00 | H | US), ST1=ST2=0, sector-ID stub C=`pcn[unit]`, H from HD|US
+    /// param, R=1, N=2; IRQ6. No full IDAM scan this slice.
+    #[test]
+    fn read_id_with_media_normal_sector_id_stub() {
+        let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // Seek unit0 to cylinder 12 so READ ID C reflects pcn[0].
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SEEK));
+        f.port_write(FDC_FIFO, 1, 0x00); // HD|US unit0
+        f.port_write(FDC_FIFO, 1, 12); // NCN
+        assert!(f.irq_line());
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        let _ = f.port_read(FDC_FIFO, 1);
+        let _ = f.port_read(FDC_FIFO, 1);
+        assert_eq!(f.pcn[0], 12);
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_ID_MFM));
+        assert_eq!(f.phase, Phase::ReadIdParam);
+        f.port_write(FDC_FIFO, 1, 0x04); // head1 / unit0
+        assert!(
+            f.irq_line(),
+            "READ ID asserts IRQ6 on media success completion"
+        );
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ6");
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_NORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=00 | H=1 | US=0"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST1 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 12, "C = pcn[unit]");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01, "H from HD param bit");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01, "R=1 sector-ID stub");
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_SECTOR_N,
+            "N=2 (512-byte)"
+        );
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA — READ ID media path still uses ND abnormal when
+    /// media is ejected (no-media stub preserved).
+    #[test]
+    fn read_id_after_eject_still_nd_abnormal() {
+        let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.eject();
+        assert!(!f.has_media());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_ID_MFM));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        assert!(f.irq_line());
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        for _ in 0..5 {
+            assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0);
+        }
     }
 
     /// Spec: Intel 82077AA Table 5-1 — VERIFY (`0x16`) no-media stub.
