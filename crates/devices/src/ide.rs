@@ -8,10 +8,10 @@
 //!   WRITE SECTORS (`0x30`), PACKET (`0xA0`), IDENTIFY PACKET DEVICE (`0xA1`),
 //!   SMART (`0xB0`), READ DMA (`0xC8`), WRITE DMA (`0xCA`), SECURITY SET
 //!   PASSWORD (`0xF1`), SECURITY UNLOCK (`0xF2`), SECURITY ERASE PREPARE
-//!   (`0xF3`), SECURITY FREEZE LOCK (`0xF5`), DOWNLOAD MICROCODE (`0x92`), READ
-//!   LOG EXT (`0x2F`), WRITE LOG EXT (`0x3F`), DATA SET MANAGEMENT (`0x06`),
-//!   TRUSTED RECEIVE (`0x5C`), TRUSTED SEND (`0x5E`), task-file
-//!   registers, status bits BSY/DRDY/DRQ/ERR, error ABRT,
+//!   (`0xF3`), SECURITY ERASE UNIT (`0xF4`), SECURITY FREEZE LOCK (`0xF5`),
+//!   DOWNLOAD MICROCODE (`0x92`), READ LOG EXT (`0x2F`), WRITE LOG EXT (`0x3F`),
+//!   DATA SET MANAGEMENT (`0x06`), TRUSTED RECEIVE (`0x5C`), TRUSTED SEND
+//!   (`0x5E`), task-file registers, status bits BSY/DRDY/DRQ/ERR, error ABRT,
 //!   LBA28 addressing;
 //!   device control nIEN; INTRQ when drive needs attention.
 //! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ/WRITE IRQ+PIO sequence,
@@ -42,6 +42,9 @@
 //! - SECURITY ERASE PREPARE (`0xF3`): ATA master → ERR+ABRT (no SECURITY erase
 //!   prepare / password state); absent/slave → status 0; INTRQ follows nIEN like
 //!   SECURITY SET PASSWORD
+//! - SECURITY ERASE UNIT (`0xF4`): ATA master → ERR+ABRT (no SECURITY erase /
+//!   password PIO); absent/slave → status 0; INTRQ follows nIEN like
+//!   SECURITY ERASE PREPARE
 //! - SECURITY FREEZE LOCK (`0xF5`): ATA master → ERR+ABRT (no SECURITY feature
 //!   set / freeze state); absent/slave → status 0; INTRQ follows nIEN like SMART
 //! - DOWNLOAD MICROCODE (`0x92`): ATA master → ERR+ABRT (no microcode download /
@@ -68,7 +71,7 @@
 //! - ATAPI PACKET media engine / CD-ROM / ISO boot / slave ATAPI identify buffer
 //! - SMART feature set (thresholds, return data, enable/disable subcommands)
 //! - SECURITY feature set (passwords, SET PASSWORD PIO, FREEZE LOCK state,
-//!   unlock/ERASE PREPARE/erase unit)
+//!   unlock/ERASE PREPARE/ERASE UNIT)
 //! - DOWNLOAD MICROCODE transfer / vendor microcode apply (ABRT-only stub)
 //! - READ/WRITE LOG EXT / General Purpose Logging (log pages, LBA48 HOB) (ABRT-only stubs)
 //! - DATA SET MANAGEMENT / TRIM range-list PIO (ABRT-only stub)
@@ -225,6 +228,9 @@ pub const ATA_CMD_SECURITY_UNLOCK: u8 = 0xF2;
 /// SECURITY ERASE PREPARE — SECURITY feature-set command; this stub aborts.
 /// Spec: ATA/ATAPI Command Set — SECURITY ERASE PREPARE (`0xF3`).
 pub const ATA_CMD_SECURITY_ERASE_PREPARE: u8 = 0xF3;
+/// SECURITY ERASE UNIT — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY ERASE UNIT (`0xF4`).
+pub const ATA_CMD_SECURITY_ERASE_UNIT: u8 = 0xF4;
 /// SECURITY FREEZE LOCK — SECURITY feature-set command; this stub aborts.
 /// Spec: ATA/ATAPI Command Set — SECURITY FREEZE LOCK (`0xF5`).
 pub const ATA_CMD_SECURITY_FREEZE_LOCK: u8 = 0xF5;
@@ -786,6 +792,24 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
+    /// SECURITY ERASE UNIT (`0xF4`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY ERASE UNIT is a SECURITY
+    /// feature-set command that erases user data after SECURITY ERASE PREPARE.
+    /// This stub does not implement SECURITY erase/password PIO; ATA disks abort
+    /// with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SECURITY ERASE PREPARE abort.
+    fn exec_security_erase_unit(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
     /// SECURITY FREEZE LOCK (`0xF5`) on ATA master — ABRT stub.
     ///
     /// Spec: ATA/ATAPI Command Set — SECURITY FREEZE LOCK is a SECURITY
@@ -1102,6 +1126,7 @@ impl IdePrimary {
             ATA_CMD_SECURITY_SET_PASSWORD => self.exec_security_set_password(),
             ATA_CMD_SECURITY_UNLOCK => self.exec_security_unlock(),
             ATA_CMD_SECURITY_ERASE_PREPARE => self.exec_security_erase_prepare(),
+            ATA_CMD_SECURITY_ERASE_UNIT => self.exec_security_erase_unit(),
             ATA_CMD_SECURITY_FREEZE_LOCK => self.exec_security_freeze_lock(),
             ATA_CMD_DOWNLOAD_MICROCODE => self.exec_download_microcode(),
             ATA_CMD_READ_LOG_EXT => self.exec_read_log_ext(),
@@ -2248,6 +2273,70 @@ mod tests {
             IDE_PRIMARY_STATUS,
             1,
             u32::from(ATA_CMD_SECURITY_ERASE_PREPARE),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY ERASE UNIT (`0xF4`) is a
+    /// SECURITY feature-set command that follows SECURITY ERASE PREPARE. This
+    /// stub has no SECURITY erase/password PIO; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn security_erase_unit_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_erase_unit_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match ERASE PREPARE).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_erase_unit_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match ERASE PREPARE abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_erase_unit_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
         );
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
