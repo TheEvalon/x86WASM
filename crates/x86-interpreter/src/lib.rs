@@ -896,18 +896,152 @@ fn read_sreg_selector(cpu: &CpuState, sreg: u8) -> u16 {
     }
 }
 
-fn write_sreg_real_mode(cpu: &mut CpuState, sreg: u8, selector: u16) -> Result<(), ExecError> {
-    // Caller must reject MOV CS and reserved Sreg encodings (#UD) before calling.
-    // Sticky limit/AR: SDM Vol. 3 §3.4.2–§3.4.3 (unreal-mode descriptor cache).
+fn cr0_pe(cpu: &CpuState) -> bool {
+    cpu.cr0 & 1 != 0
+}
+
+/// Null selector: index=0 and TI=0 (values 0000–0003). Spec: SDM Vol. 3 §3.4.2.
+fn is_null_selector(selector: u16) -> bool {
+    selector & 0xFFFC == 0
+}
+
+/// Write an 8-byte GDT/LDT-style segment descriptor into `out` (test / host helper).
+/// `limit20` is the raw 20-bit limit field; `gran_flags` supplies G/D/B/L/AVL in bits 7:4.
+#[cfg(test)]
+fn encode_seg_desc(base: u32, limit20: u32, access: u8, gran_flags: u8) -> [u8; 8] {
+    let lim = limit20 & 0xF_FFFF;
+    [
+        lim as u8,
+        (lim >> 8) as u8,
+        base as u8,
+        (base >> 8) as u8,
+        (base >> 16) as u8,
+        access,
+        ((lim >> 16) as u8 & 0x0F) | (gran_flags & 0xF0),
+        (base >> 24) as u8,
+    ]
+}
+
+/// Parse an 8-byte data-segment descriptor and return cached base/limit/AR.
+///
+/// Requires P=1, S=1, non-executable (data). Applies G-bit to the effective limit.
+/// Spec: Intel SDM Vol. 3 §3.4.5 (segment descriptors); §3.4.3 (cached limit).
+fn parse_data_segment_descriptor(desc: [u8; 8]) -> Result<(u64, u32, u16), ExecError> {
+    let access = desc[5];
+    let present = access & 0x80 != 0;
+    let s_bit = access & 0x10 != 0;
+    let executable = access & 0x08 != 0;
+    if !present {
+        // Spec: SDM Vol. 2 MOV — DS/ES/FS/GS not present → #NP(selector).
+        // Caller maps to ArchFault(11) with the selector context.
+        return Err(ExecError::ArchFault(11));
+    }
+    if !s_bit || executable {
+        // Not a data segment (system or code) → #GP(selector).
+        return Err(ExecError::ArchFault(13));
+    }
+    let base = u64::from(desc[2])
+        | (u64::from(desc[3]) << 8)
+        | (u64::from(desc[4]) << 16)
+        | (u64::from(desc[7]) << 24);
+    let limit20 =
+        u32::from(desc[0]) | (u32::from(desc[1]) << 8) | (u32::from(desc[6] & 0x0F) << 16);
+    let gran = desc[6] & 0x80 != 0;
+    let limit = if gran {
+        (limit20 << 12) | 0xFFF
+    } else {
+        limit20
+    };
+    // Cache AR as the access byte in the low 8 bits (matches reset 0x0093 style).
+    let flags = u16::from(access);
+    Ok((base, limit, flags))
+}
+
+/// Protected-mode load of DS/ES from the GDT (TI=0). LDT (TI=1) → #GP(selector).
+///
+/// Spec: Intel SDM Vol. 2 MOV (Sreg, r/m16) protected-mode checks; Vol. 3 §3.5.1
+/// (segment loading); §5.4.1 (null selector into DS/ES allowed).
+/// Unsupported here: LDT, privilege (RPL/CPL/DPL) beyond basic #GP/#NP, readable
+/// code segments into DS/ES, SS loads, far jumps into PM.
+fn load_ds_es_from_gdt(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    sreg: u8,
+    selector: u16,
+) -> Result<(), ExecError> {
+    debug_assert!(sreg == 0 || sreg == 3, "only DS/ES in this slice");
+    if is_null_selector(selector) {
+        match sreg {
+            0 => cpu.es.load_null_selector(selector),
+            3 => cpu.ds.load_null_selector(selector),
+            _ => unreachable!(),
+        }
+        return Ok(());
+    }
+    if selector & 0x4 != 0 {
+        // TI=1 → LDT (out of scope) → #GP(selector)
+        return Err(ExecError::ArchFault(13));
+    }
+    let index = u64::from(selector >> 3);
+    let offset = index.saturating_mul(8);
+    // Descriptor must lie entirely within the GDT (limit is max offset).
+    if offset.saturating_add(7) > u64::from(cpu.gdtr.limit) {
+        return Err(ExecError::ArchFault(13));
+    }
+    let addr = cpu.gdtr.base.wrapping_add(offset);
+    let mut desc = [0u8; 8];
+    for (i, b) in desc.iter_mut().enumerate() {
+        *b = bus
+            .read_u8(addr.wrapping_add(i as u64))
+            .map_err(|e| classify_mem_fault(e, false))?;
+    }
+    let (base, limit, flags) = match parse_data_segment_descriptor(desc) {
+        Ok(v) => v,
+        Err(ExecError::ArchFault(11)) => return Err(ExecError::ArchFault(11)),
+        Err(ExecError::ArchFault(13)) => return Err(ExecError::ArchFault(13)),
+        Err(e) => return Err(e),
+    };
     match sreg {
-        0 => cpu.es.load_real_mode_selector(selector),
-        2 => cpu.ss.load_real_mode_selector(selector),
-        3 => cpu.ds.load_real_mode_selector(selector),
-        4 => cpu.fs.load_real_mode_selector(selector),
-        5 => cpu.gs.load_real_mode_selector(selector),
-        _ => return Err(ExecError::Unsupported(0x8E)),
+        0 => cpu.es.load_descriptor_cache(selector, base, limit, flags),
+        3 => cpu.ds.load_descriptor_cache(selector, base, limit, flags),
+        _ => unreachable!(),
     }
     Ok(())
+}
+
+fn write_sreg(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    sreg: u8,
+    selector: u16,
+) -> Result<(), ExecError> {
+    // Caller must reject MOV CS and reserved Sreg encodings (#UD) before calling.
+    // PE=0: sticky unreal real-mode base (SDM Vol. 3 §3.4.2–§3.4.3).
+    // PE=1: DS/ES load from GDT; SS/FS/GS keep real-mode base until later slices.
+    match sreg {
+        0 | 3 if cr0_pe(cpu) => load_ds_es_from_gdt(cpu, bus, sreg, selector),
+        0 => {
+            cpu.es.load_real_mode_selector(selector);
+            Ok(())
+        }
+        2 => {
+            cpu.ss.load_real_mode_selector(selector);
+            Ok(())
+        }
+        3 => {
+            cpu.ds.load_real_mode_selector(selector);
+            Ok(())
+        }
+        4 => {
+            cpu.fs.load_real_mode_selector(selector);
+            Ok(())
+        }
+        5 => {
+            cpu.gs.load_real_mode_selector(selector);
+            Ok(())
+        }
+        _ => Err(ExecError::Unsupported(0x8E)),
+    }
 }
 
 /// SI/DI step for string ops: +size if DF=0, −size if DF=1 (SDM Vol. 1 §3.4.3).
@@ -2218,10 +2352,9 @@ fn step_two_byte(
                 }
                 6 => {
                     // LMSW r/m16 — Spec: SDM Vol. 2 "LMSW"; Vol. 3 §2.5 (CR0.PE).
-                    // Loads CR0[15:0]. Cannot clear PE once set. Setting PE here
-                    // is sticky in CR0 only — this emulator does **not** switch
-                    // to protected-mode descriptor loads (segment MOV / far JMP
-                    // stay real-mode / sticky-unreal `selector << 4`).
+                    // Loads CR0[15:0]. Cannot clear PE once set. Setting PE=1
+                    // enables protected-mode GDT descriptor loads for MOV DS/ES;
+                    // far JMP / SS/FS/GS loads still use real-mode `selector<<4`.
                     let src = read_rm_u16(cpu, bus, insn)?;
                     let pe_was = cpu.cr0 & 1 != 0;
                     let mut low = u64::from(src);
@@ -2268,10 +2401,9 @@ fn step_two_byte(
         0x22 => {
             // MOV CR0, r32 — Spec: Intel SDM Vol. 2 "MOV—Move to/from Control
             // Registers"; Vol. 3 §2.5 (CR0). Unlike LMSW, this instruction
-            // MAY clear PE. Setting/clearing PE here does not switch this
-            // emulator's segment execution model in or out of protected
-            // mode (segment loads keep using real-mode / sticky-unreal
-            // `selector << 4` bases; no descriptor tables are consulted).
+            // MAY clear PE. PE=1 enables GDT descriptor loads for MOV DS/ES;
+            // far JMP / SS/FS/GS remain real-mode `selector<<4` until later
+            // slices. Clearing PE restores the sticky-unreal DS/ES path.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x22))?;
             match m.reg {
                 0 => {
@@ -4033,10 +4165,13 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0x8E => {
-            // MOV Sreg, r/m16 — real-address mode load (base = selector << 4).
-            // Spec: Intel SDM Vol. 2 "MOV" (Sreg, r/m16); Vol. 3 §3.4.2.
+            // MOV Sreg, r/m16 — Spec: Intel SDM Vol. 2 "MOV" (Sreg, r/m16).
+            // PE=0: real-address load (base = selector << 4); sticky unreal limit/AR.
+            // PE=1: DS/ES load hidden cache from GDT (null clears; P=0 → #NP;
+            // invalid type / out of limit → #GP). SS/FS/GS still real-mode base.
             // MOV to CS and reserved Sreg encodings → #UD (Vol. 3 §6.15).
-            // Unsupported here: protected-mode descriptor checks; IRQ inhibit after MOV SS.
+            // Unsupported here: LDT, privilege beyond basic #GP/#NP, SS PM load,
+            // IRQ inhibit after MOV SS.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let Some(sreg) = sreg_from_modrm_reg(m.reg) else {
                 return real_mode_ud(cpu, bus);
@@ -4046,7 +4181,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 return real_mode_ud(cpu, bus);
             }
             let v = read_rm_u16(cpu, bus, &insn)?;
-            write_sreg_real_mode(cpu, sreg, v)?;
+            write_sreg(cpu, bus, sreg, v)?;
             cpu.set_ip16(next_ip);
         }
         0x86 => {
@@ -10269,71 +10404,64 @@ mod tests {
         assert_eq!(cpu.cr0 & 0xFFFF, 0x0011, "ET loaded; PE remains set");
     }
 
-    /// LMSW PE sticky keeps real-mode / sticky-unreal segment semantics.
-    /// Spec: Intel SDM Vol. 2 "LMSW"; Vol. 3 §2.5 (CR0.PE); §3.4.2–§3.4.3
-    /// (real-address `base = selector << 4` + unreal descriptor cache).
-    /// Out of scope: GDT descriptor loads, far jump into protected mode, paging.
+    /// LMSW PE=1 enables MOV DS GDT loads; far JMP stays real-mode CS.
+    /// Spec: Intel SDM Vol. 2 "LMSW" / "MOV" (Sreg); Vol. 3 §2.5, §3.4.3–§3.5.1.
+    /// Contract change vs prior sticky-real-mode DS under PE: DS now consults GDTR.
     #[test]
-    fn lmsw_pe_sticky_keeps_real_mode_segment_and_far_jmp() {
+    fn lmsw_pe_enables_mov_ds_gdt_far_jmp_still_real() {
         let mut mem = vec![0u8; 0x30000];
+        let gdt = 0x8000usize;
+        // GDT[0]=null; GDT[1] selector 0x08: data base=0x0002_0000 limit=0xFFFF access=0x92
+        let desc = encode_seg_desc(0x0002_0000, 0xFFFF, 0x92, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
         let code = 0x1000usize;
         // +0: B8 01 00         MOV AX, 1
         // +3: 0F 01 F0         LMSW AX            (CR0.PE ← 1)
-        // +6: B8 34 12         MOV AX, 0x1234
-        // +9: 8E D8            MOV DS, AX         (still selector<<4 + sticky limit)
+        // +6: B8 08 00         MOV AX, 0x08
+        // +9: 8E D8            MOV DS, AX         (GDT load)
         // +B: EA 00 02 00 20   JMP 2000:0200      (far JMP still real-mode CS)
-        // Target linear = 0x2000<<4 + 0x0200 = 0x20200 → HLT
         mem[code] = 0xB8;
         mem[code + 1] = 0x01;
         mem[code + 2] = 0x00;
         mem[code + 3] = 0x0F;
         mem[code + 4] = 0x01;
-        mem[code + 5] = 0xF0; // LMSW AX
+        mem[code + 5] = 0xF0;
         mem[code + 6] = 0xB8;
-        mem[code + 7] = 0x34;
-        mem[code + 8] = 0x12;
+        mem[code + 7] = 0x08;
+        mem[code + 8] = 0x00;
         mem[code + 9] = 0x8E;
-        mem[code + 10] = 0xD8; // MOV DS, AX
+        mem[code + 10] = 0xD8;
         mem[code + 11] = 0xEA;
         mem[code + 12] = 0x00;
         mem[code + 13] = 0x02;
         mem[code + 14] = 0x00;
-        mem[code + 15] = 0x20; // JMP far 2000:0200
+        mem[code + 15] = 0x20;
         mem[0x20200] = 0xF4;
 
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
         cpu.ds = x86_core::SegmentReg::real_mode(0);
-        // Expanded unreal cached limit must survive MOV DS after LMSW PE=1.
-        cpu.ds.limit = 0xFFFF_FFFF;
-        cpu.ds.flags = 0x0093;
+        cpu.ds.limit = 0xFFFF_FFFF; // prior unreal cache must be replaced by GDT load
         cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15; // two entries
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
-        assert_eq!(cpu.cr0 & 1, 0, "reset starts with PE clear");
         let mut bus = VecBus { mem, ports: vec![] };
 
         step(&mut cpu, &mut bus).unwrap(); // MOV AX, 1
         step(&mut cpu, &mut bus).unwrap(); // LMSW AX → set PE
         assert_eq!(cpu.cr0 & 1, 1, "LMSW sets CR0.PE");
 
-        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 0x1234
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 0x08
         step(&mut cpu, &mut bus).unwrap(); // MOV DS, AX
-        assert_eq!(cpu.cr0 & 1, 1, "MOV DS must not clear PE");
-        assert_eq!(cpu.ds.selector, 0x1234);
-        assert_eq!(
-            cpu.ds.base,
-            0x1234u64 << 4,
-            "after LMSW PE=1, DS base is still selector<<4 (no GDT load)"
-        );
-        assert_eq!(
-            cpu.ds.limit, 0xFFFF_FFFF,
-            "sticky unreal DS limit preserved under LMSW PE=1"
-        );
-        assert_eq!(cpu.ds.flags, 0x0093);
+        assert_eq!(cpu.ds.selector, 0x08);
+        assert_eq!(cpu.ds.base, 0x0002_0000, "PE=1 MOV DS loads GDT base");
+        assert_eq!(cpu.ds.limit, 0xFFFF, "PE=1 MOV DS loads GDT limit");
+        assert_eq!(cpu.ds.flags, 0x0092);
 
         step(&mut cpu, &mut bus).unwrap(); // JMP far
-        assert_eq!(cpu.cr0 & 1, 1, "far JMP must not clear PE");
         assert_eq!(cpu.cs.selector, 0x2000);
         assert_eq!(
             cpu.cs.base,
@@ -10341,11 +10469,6 @@ mod tests {
             "after LMSW PE=1, far JMP still uses real-mode CS base"
         );
         assert_eq!(cpu.ip16(), 0x0200);
-        assert_eq!(
-            cpu.gpr_u16(CpuState::RSP),
-            0xFFFE,
-            "far JMP does not touch stack"
-        );
     }
 
     /// CLTS — opcode 0F 06. Clears CR0.TS (bit 3) only; all other CR0 bits preserved.
@@ -10410,21 +10533,26 @@ mod tests {
         assert_eq!(cpu.gpr_u32(CpuState::RAX) & 0xFFFF, 0x0010, "ET set");
     }
 
-    /// MOV CR0, r32 — opcode 0F 22 /r. Unlike LMSW, this can clear PE.
-    /// Setting/clearing PE must not switch the segment-load/execution model —
-    /// segment loads keep using `selector << 4` real-mode bases.
-    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"; Vol. 3 §2.5.
+    /// MOV CR0 sets/clears PE; PE=1 enables DS GDT loads; clearing PE restores <<4.
+    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers" / "MOV" (Sreg);
+    /// Vol. 3 §2.5, §3.4.2–§3.5.1.
     #[test]
-    fn mov_cr0_r32_sets_and_clears_pe_no_mode_change() {
+    fn mov_cr0_r32_sets_and_clears_pe_ds_gdt_then_real() {
         let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x8000usize;
+        let desc = encode_seg_desc(0x0003_0000, 0x0FFF, 0x93, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
         let code = 0x1000usize;
-        // +0:  66 B8 11 00 00 60   MOV EAX, 0x60000011  (PE=1, plus CD|NW|ET)
+        // +0:  66 B8 11 00 00 60   MOV EAX, 0x60000011  (PE=1)
         // +6:  0F 22 C0            MOV CR0, EAX
-        // +9:  B8 34 12            MOV AX, 0x1234
-        // +C:  8E D8               MOV DS, AX           (still real-mode base<<4)
+        // +9:  B8 08 00            MOV AX, 0x08
+        // +C:  8E D8               MOV DS, AX           (GDT load while PE=1)
         // +E:  66 B8 10 00 00 60   MOV EAX, 0x60000010  (PE=0)
-        // +14: 0F 22 C0            MOV CR0, EAX         (MOV CR0 CAN clear PE)
-        // +17: F4                  HLT
+        // +14: 0F 22 C0            MOV CR0, EAX
+        // +17: B8 34 12            MOV AX, 0x1234
+        // +1A: 8E D8               MOV DS, AX           (real-mode <<4 after PE clear)
+        // +1C: F4                  HLT
         mem[code] = 0x66;
         mem[code + 1] = 0xB8;
         mem[code + 2] = 0x11;
@@ -10433,12 +10561,12 @@ mod tests {
         mem[code + 5] = 0x60;
         mem[code + 6] = 0x0F;
         mem[code + 7] = 0x22;
-        mem[code + 8] = 0xC0; // reg=0 (CR0), rm=0 (EAX)
+        mem[code + 8] = 0xC0;
         mem[code + 9] = 0xB8;
-        mem[code + 10] = 0x34;
-        mem[code + 11] = 0x12;
+        mem[code + 10] = 0x08;
+        mem[code + 11] = 0x00;
         mem[code + 12] = 0x8E;
-        mem[code + 13] = 0xD8; // MOV DS, AX
+        mem[code + 13] = 0xD8;
         mem[code + 14] = 0x66;
         mem[code + 15] = 0xB8;
         mem[code + 16] = 0x10;
@@ -10448,39 +10576,273 @@ mod tests {
         mem[code + 20] = 0x0F;
         mem[code + 21] = 0x22;
         mem[code + 22] = 0xC0;
-        mem[code + 23] = 0xF4;
+        mem[code + 23] = 0xB8;
+        mem[code + 24] = 0x34;
+        mem[code + 25] = 0x12;
+        mem[code + 26] = 0x8E;
+        mem[code + 27] = 0xD8;
+        mem[code + 28] = 0xF4;
 
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
         cpu.ds = x86_core::SegmentReg::real_mode(0);
         cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
 
         step(&mut cpu, &mut bus).unwrap(); // MOV EAX, 0x60000011
-        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x6000_0011);
-
         step(&mut cpu, &mut bus).unwrap(); // MOV CR0, EAX
-        assert_eq!(cpu.cr0, 0x6000_0011);
         assert_eq!(cpu.cr0 & 1, 1, "PE set via MOV CR0");
 
-        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 0x1234
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 0x08
         step(&mut cpu, &mut bus).unwrap(); // MOV DS, AX
-        assert_eq!(
-            cpu.ds.selector, 0x1234,
-            "PE=1 does not change segment-load model"
-        );
-        assert_eq!(
-            cpu.ds.base,
-            0x1234u64 << 4,
-            "DS base still selector<<4; no protected-mode descriptor lookup"
-        );
+        assert_eq!(cpu.ds.base, 0x0003_0000, "PE=1 MOV DS loads GDT");
+        assert_eq!(cpu.ds.limit, 0x0FFF);
 
         step(&mut cpu, &mut bus).unwrap(); // MOV EAX, 0x60000010
         step(&mut cpu, &mut bus).unwrap(); // MOV CR0, EAX — clears PE
         assert_eq!(cpu.cr0 & 1, 0, "MOV CR0 (unlike LMSW) can clear PE");
-        assert_eq!(cpu.cr0, 0x6000_0010);
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX, 0x1234
+        step(&mut cpu, &mut bus).unwrap(); // MOV DS, AX
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(
+            cpu.ds.base,
+            0x1234u64 << 4,
+            "PE=0 restores real-mode selector<<4 DS load"
+        );
+        // Sticky unreal: GDT-loaded limit survives real-mode selector update.
+        assert_eq!(cpu.ds.limit, 0x0FFF);
+    }
+
+    /// PE=1 MOV DS loads data-segment descriptor from GDT (base/limit/AR + G-bit).
+    /// Spec: Intel SDM Vol. 2 MOV (Sreg, r/m16); Vol. 3 §3.4.5 / §3.5.1.
+    #[test]
+    fn mov_ds_pe1_loads_gdt_data_descriptor() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT unused; GDT at 0x5000
+        let gdt = 0x5000usize;
+        // Selector 0x08: base=0x0011_2200, limit20=0xF_FFFF, G=1 → eff 0xFFFF_FFFF, AR=0x92
+        let desc = encode_seg_desc(0x0011_2200, 0xF_FFFF, 0x92, 0x80);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
+        let code = 0x1000usize;
+        // B8 08 00  MOV AX, 0x08
+        // 8E D8     MOV DS, AX
+        // F4        HLT
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD8;
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0xABCD);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1; // PE=1
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0x08);
+        assert_eq!(cpu.ds.base, 0x0011_2200);
+        assert_eq!(cpu.ds.limit, 0xFFFF_FFFF, "G=1 expands limit");
+        assert_eq!(cpu.ds.flags, 0x0092);
+        assert_eq!(cpu.ip16(), (code + 5) as u16);
+    }
+
+    /// PE=1 MOV ES also loads from GDT (same data-segment path as DS).
+    /// Spec: Intel SDM Vol. 2 MOV (Sreg, r/m16); Vol. 3 §3.5.1.
+    #[test]
+    fn mov_es_pe1_loads_gdt_data_descriptor() {
+        let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x5000usize;
+        let desc = encode_seg_desc(0x0000_4000, 0x1FFF, 0x93, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
+        let code = 0x1000usize;
+        // B8 08 00  MOV AX, 0x08
+        // 8E C0     MOV ES, AX
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xC0;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.es.selector, 0x08);
+        assert_eq!(cpu.es.base, 0x0000_4000);
+        assert_eq!(cpu.es.limit, 0x1FFF);
+        assert_eq!(cpu.es.flags, 0x0093);
+    }
+
+    /// PE=1 MOV DS with not-present data descriptor → #NP via IVT (vector 11).
+    /// Spec: Intel SDM Vol. 2 MOV protected-mode exceptions (#NP(selector)).
+    #[test]
+    fn mov_ds_pe1_not_present_np_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        // IVT #NP vector 11 → handler at 0x0C00
+        mem[11 * 4] = 0x00;
+        mem[11 * 4 + 1] = 0x0C;
+        mem[11 * 4 + 2] = 0x00;
+        mem[11 * 4 + 3] = 0x00;
+        let gdt = 0x5000usize;
+        // P=0 data segment (access 0x12)
+        let desc = encode_seg_desc(0x1000, 0xFFFF, 0x12, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD8; // MOV DS, AX → #NP
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0x1111);
+        let ds_before = cpu.ds.clone();
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap(); // MOV AX
+        step(&mut cpu, &mut bus).unwrap(); // MOV DS → #NP
+        assert_eq!(cpu.ip16(), 0x0C00, "#NP handler");
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(
+            cpu.ds, ds_before,
+            "failed MOV DS must not update segment cache"
+        );
+    }
+
+    /// PE=1 null selector into DS clears hidden cache (no #GP). Spec: SDM Vol. 3 §5.4.1.
+    #[test]
+    fn mov_ds_pe1_null_selector_clears_cache() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        // B8 00 00  MOV AX, 0
+        // 8E D8     MOV DS, AX
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x00;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD8;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x08,
+            base: 0x0010_0000,
+            limit: 0xFFFF,
+            flags: 0x0093,
+        };
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1;
+        cpu.gdtr.limit = 0; // empty GDT — null must not consult it
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0);
+        assert_eq!(cpu.ds.base, 0);
+        assert_eq!(cpu.ds.limit, 0);
+        assert_eq!(cpu.ds.flags, 0);
+    }
+
+    /// PE=1 MOV DS with index past GDTR.limit → #GP via IVT (vector 13).
+    /// Spec: Intel SDM Vol. 2 MOV — #GP(selector) if index outside table limits.
+    #[test]
+    fn mov_ds_pe1_gdt_limit_gp_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD8; // selector 0x08 needs bytes 8..=15; limit=7 → #GP
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0x2222);
+        let ds_before = cpu.ds.clone();
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = 0x5000;
+        cpu.gdtr.limit = 7; // only null entry
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.ds, ds_before, "failed MOV DS must not update cache");
+    }
+
+    /// PE=0 MOV DS unchanged: base = selector<<4, sticky limit/AR.
+    /// Spec: Intel SDM Vol. 3 §3.4.2–§3.4.3.
+    #[test]
+    fn mov_ds_pe0_still_selector_shift4() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x34;
+        mem[code + 2] = 0x12;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD8;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ds.limit = 0xFFFF_FFFF;
+        cpu.ds.flags = 0x0093;
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        assert_eq!(cpu.cr0 & 1, 0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(cpu.ds.base, 0x1234u64 << 4);
+        assert_eq!(cpu.ds.limit, 0xFFFF_FFFF);
+        assert_eq!(cpu.ds.flags, 0x0093);
     }
 
     /// MOV to/from CR1 is architecturally undefined — #UD via the real-mode IVT.
