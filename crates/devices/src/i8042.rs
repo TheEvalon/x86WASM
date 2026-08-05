@@ -37,10 +37,11 @@
 //! - IBM PS/2 keyboard-controller port tests / second (auxiliary) port: commands
 //!   `0xA7` (disable aux interface), `0xA8` (enable aux interface), `0xA9` (test
 //!   aux interface → result byte, `0x00` = no error), `0xAB` (test keyboard
-//!   interface → `0x00` = no error; same result codes as `0xA9`), `0xD4` (write
-//!   next data-port byte to the aux device); status bit 5 = AUX OBF; command
-//!   byte bit 1 = aux interrupt enable (IRQ12 / 8259A slave IR4), bit 5 = aux
-//!   clock disable.
+//!   interface → `0x00` = no error; same result codes as `0xA9`), `0xAC`
+//!   (diagnostic dump → [`DIAG_DUMP_LEN`] stub bytes on normal OBF), `0xD4`
+//!   (write next data-port byte to the aux device); status bit 5 = AUX OBF;
+//!   command byte bit 1 = aux interrupt enable (IRQ12 / 8259A slave IR4),
+//!   bit 5 = aux clock disable.
 //! - `docs/sources.md` (PS/2 and 8042 references), `docs/machine-model-pc-v1.md`,
 //!   `plan.md` §15.4.
 //!
@@ -72,6 +73,10 @@
 //!
 //! Controller port tests: `0xA9` (aux) and `0xAB` (keyboard) each answer
 //! `0x00` (no error) on the **normal** output buffer (OBF, not AUX OBF).
+//! Diagnostic dump `0xAC` returns a fixed [`DIAG_DUMP_LEN`]-byte stub
+//! ([`DIAG_DUMP_STUB`] zeros — internal RAM beyond the config byte is not
+//! modeled) on normal OBF, one byte per `0x60` read (not gated by keyboard
+//! clock disable).
 //!
 //! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xD4`
 //! routes the next data-port byte to the aux device when the aux clock is
@@ -112,8 +117,8 @@
 //!   set)
 //! - Pulse-reset lines (controller command `0xFE` on `0x64` / output-port bit0
 //!   system-reset) — distinct from keyboard Resend `0xFE` on data port `0x60`
-//! - Diagnostic dump `0xAC`; interface-test electrical fault codes beyond the
-//!   success stub `0x00` for `0xA9`/`0xAB`
+//! - Interface-test electrical fault codes beyond the success stub `0x00` for
+//!   `0xA9`/`0xAB`; authentic AT ASCII/scancode dump encoding for `0xAC`
 
 use crate::PortDevice;
 
@@ -153,6 +158,12 @@ pub const CMD_SELF_TEST: u8 = 0xAA;
 ///
 /// Spec: OSDev I8042 — same result codes as `0xA9`; `0x00` = no error.
 pub const CMD_TEST_KBD: u8 = 0xAB;
+/// Controller command: diagnostic dump (read internal RAM) → multi-byte on data port.
+///
+/// Spec: OSDev I8042 — `0xAC` Diagnostic dump; response size/content is
+/// controller-specific. This emulator returns [`DIAG_DUMP_LEN`] fixed stub bytes
+/// ([`DIAG_DUMP_STUB`]) on normal OBF.
+pub const CMD_DIAG_DUMP: u8 = 0xAC;
 /// Controller command: disable first PS/2 port (keyboard clock inhibit).
 pub const CMD_DISABLE_KBD: u8 = 0xAD;
 /// Controller command: enable first PS/2 port.
@@ -173,6 +184,18 @@ pub const SELF_TEST_OK: u8 = 0x55;
 pub const TEST_AUX_OK: u8 = 0x00;
 /// First-port (keyboard) interface test result: no error (IBM PS/2 `0xAB`).
 pub const TEST_KBD_OK: u8 = 0x00;
+
+/// Byte count for the [`CMD_DIAG_DUMP`] (`0xAC`) stub response.
+///
+/// Spec: OSDev I8042 — diagnostic dump reads internal RAM; common 8042 models
+/// expose about 16 RAM bytes. Exact silicon maps vary.
+pub const DIAG_DUMP_LEN: usize = 16;
+/// Fixed diagnostic-dump stub payload (all zeros).
+///
+/// Documents that controller internal RAM beyond the configuration byte is not
+/// modeled; firmware that only checks that `0xAC` produces a bounded OBF stream
+/// still observes a SeaBIOS-friendly success path.
+pub const DIAG_DUMP_STUB: [u8; DIAG_DUMP_LEN] = [0; DIAG_DUMP_LEN];
 
 /// PS/2 mouse / keyboard ACK response (OSDev PS/2 Keyboard / Mouse).
 pub const MOUSE_ACK: u8 = 0xFA;
@@ -338,6 +361,10 @@ const HOST_AUX_QUEUE_CAP: usize = 16;
 /// Capacity of the pending keyboard → host response queue
 /// (Get ID needs ACK + 2 ID bytes; Reset needs ACK + BAT).
 const KBD_RESP_QUEUE_CAP: usize = 8;
+
+/// Capacity of the pending controller → host response queue
+/// (diagnostic dump `0xAC` returns [`DIAG_DUMP_LEN`] bytes).
+const CTRL_RESP_QUEUE_CAP: usize = DIAG_DUMP_LEN;
 
 /// Next host→aux byte expected as a parameter for a prior mouse command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -509,12 +536,18 @@ pub struct I8042 {
     /// (and an enabled keyboard clock) before presentation on keyboard OBF.
     kbd_resp: [u8; KBD_RESP_QUEUE_CAP],
     kbd_resp_len: u8,
+    /// Pending controller → host response bytes (e.g. diagnostic dump `0xAC`)
+    /// waiting for an empty output buffer. Presented via [`Self::push_output`]
+    /// (normal OBF, not AUX; not gated by keyboard/aux clock disable; does not
+    /// update [`Self::kbd_last_byte`]).
+    ctrl_resp: [u8; CTRL_RESP_QUEUE_CAP],
+    ctrl_resp_len: u8,
     /// Last byte presented on the keyboard OBF path (ACK/ID/Echo/BAT/scancode).
     ///
     /// Spec: OSDev PS/2 Keyboard — Resend (`0xFE`) requeues this byte. Starts at
     /// `0` until the first keyboard-path presentation; keyboard Reset / controller
     /// reset clears it back to `0`. Controller responses via [`Self::push_output`]
-    /// (self-test, read-config, …) do **not** update this field.
+    /// (self-test, read-config, diagnostic dump, …) do **not** update this field.
     kbd_last_byte: u8,
     /// Last byte presented on AUX OBF (for mouse Resend).
     mouse_last_byte: u8,
@@ -557,6 +590,8 @@ impl I8042 {
             kbd_pending_param: KbdPendingParam::None,
             kbd_resp: [0; KBD_RESP_QUEUE_CAP],
             kbd_resp_len: 0,
+            ctrl_resp: [0; CTRL_RESP_QUEUE_CAP],
+            ctrl_resp_len: 0,
             kbd_last_byte: 0,
             mouse_last_byte: 0,
             translate_pending_break: false,
@@ -584,6 +619,8 @@ impl I8042 {
         self.reset_kbd_defaults();
         self.kbd_resp = [0; KBD_RESP_QUEUE_CAP];
         self.kbd_resp_len = 0;
+        self.ctrl_resp = [0; CTRL_RESP_QUEUE_CAP];
+        self.ctrl_resp_len = 0;
         self.translate_pending_break = false;
     }
 
@@ -940,13 +977,58 @@ impl I8042 {
     }
 
     /// Pop the output buffer, clearing OBF and AUX OBF (`0x60` read), then
-    /// present the next queued keyboard or mouse response byte if any.
+    /// present the next queued controller, keyboard, or mouse response byte if any.
     fn take_output(&mut self) -> Option<u8> {
         let v = self.output.take();
         self.output_from_aux = false;
+        self.flush_ctrl_response_queue();
         self.flush_kbd_response_queue();
         self.flush_aux_response_queue();
         v
+    }
+
+    /// Append bytes to the controller → host queue (does not present).
+    fn push_ctrl_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if (self.ctrl_resp_len as usize) < CTRL_RESP_QUEUE_CAP {
+                self.ctrl_resp[self.ctrl_resp_len as usize] = b;
+                self.ctrl_resp_len = self.ctrl_resp_len.saturating_add(1);
+            }
+        }
+    }
+
+    /// Queue a controller command response (replaces any pending ctrl queue) and
+    /// present the first byte when the buffer is free.
+    ///
+    /// Spec: OSDev I8042 — controller responses (self-test, port tests, dump)
+    /// use the normal output buffer and are not inhibited by keyboard/aux clock
+    /// disable bits.
+    fn begin_ctrl_response(&mut self, bytes: &[u8]) {
+        self.ctrl_resp_len = 0;
+        self.push_ctrl_bytes(bytes);
+        self.flush_ctrl_response_queue();
+    }
+
+    fn pop_ctrl_response(&mut self) -> Option<u8> {
+        if self.ctrl_resp_len == 0 {
+            return None;
+        }
+        let b = self.ctrl_resp[0];
+        let n = self.ctrl_resp_len as usize;
+        self.ctrl_resp.copy_within(1..n, 0);
+        self.ctrl_resp_len -= 1;
+        Some(b)
+    }
+
+    /// Present the next queued controller response on normal OBF when the
+    /// buffer is empty (not gated by keyboard/aux clock).
+    fn flush_ctrl_response_queue(&mut self) {
+        if self.output.is_some() {
+            return;
+        }
+        if let Some(b) = self.pop_ctrl_response() {
+            self.push_output(b);
+        }
     }
 
     /// Append bytes to the keyboard → host queue (does not present).
@@ -1398,6 +1480,12 @@ impl I8042 {
                 // Spec: OSDev I8042 / IBM PS/2 — test first (keyboard) port;
                 // same result codes as 0xA9; response on normal OBF (not AUX).
                 self.push_output(TEST_KBD_OK);
+            }
+            CMD_DIAG_DUMP => {
+                // Spec: OSDev I8042 — `0xAC` diagnostic dump (internal RAM).
+                // Stub: fixed DIAG_DUMP_LEN zero bytes on normal OBF (not AUX),
+                // one per 0x60 read; not gated by keyboard clock disable.
+                self.begin_ctrl_response(&DIAG_DUMP_STUB);
             }
             CMD_SELF_TEST => {
                 // Success response; keep config (firmware may re-read/write it).
@@ -2356,6 +2444,31 @@ mod tests {
         assert_eq!(k.status() & STATUS_AUX_OBF, 0);
         assert!(!k.aux_obf());
         assert_eq!(k.port_read(I8042_DATA, 1) as u8, TEST_KBD_OK);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.unsupported_commands, 0);
+    }
+
+    /// Spec: OSDev I8042 — `0xAC` diagnostic dump (read internal RAM). Stub
+    /// returns [`DIAG_DUMP_LEN`] (`16`) fixed zero bytes ([`DIAG_DUMP_STUB`]) on
+    /// normal OBF (not AUX), one byte per `0x60` read. Must present even when
+    /// the keyboard clock is disabled (reset default config bit4).
+    #[test]
+    fn diag_dump_ac_returns_16_zero_bytes_on_normal_output_buffer() {
+        let mut k = I8042::new();
+        assert!(k.keyboard_clock_disabled());
+        assert_eq!(DIAG_DUMP_STUB.len(), DIAG_DUMP_LEN);
+        assert_eq!(DIAG_DUMP_LEN, 16);
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_DIAG_DUMP));
+        for (i, &expected) in DIAG_DUMP_STUB.iter().enumerate() {
+            assert_ne!(k.status() & STATUS_OBF, 0, "byte {i}: OBF expected");
+            assert_eq!(k.status() & STATUS_AUX_OBF, 0, "byte {i}: not AUX OBF");
+            assert!(!k.aux_obf(), "byte {i}: aux_obf clear");
+            assert_eq!(
+                k.port_read(I8042_DATA, 1) as u8,
+                expected,
+                "byte {i} of diagnostic dump"
+            );
+        }
         assert_eq!(k.status() & STATUS_OBF, 0);
         assert_eq!(k.unsupported_commands, 0);
     }
