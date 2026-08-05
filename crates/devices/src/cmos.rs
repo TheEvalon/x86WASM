@@ -21,8 +21,9 @@
 //! cascade: seconds → minutes → hours → date of month → month → year → century
 //! `0x32`, with day-of-week 1–7 and Gregorian leap years). Status B `DM`
 //! (bit 2) selects BCD (`DM=0`, reset default) or binary (`DM=1`) encoding for
-//! the time/calendar registers during that cascade; 24-hour mode remains the
-//! only supported hour format.
+//! the time/calendar registers during that cascade; Status B `24/12` (bit 1)
+//! selects 24-hour hours `0–23` (set; reset default) or 12-hour hours `1–12`
+//! with AM/PM in bit7 of the hours byte (clear).
 //! Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
 //! `Machine::nmi_delivery_enabled` / `Machine::inject_nmi` gate CPU `#NMI`.
 //!
@@ -32,6 +33,8 @@
 //! `0x00` / weekday `0x00` are reachable but are not valid dates. The cascade is
 //! total and never panics or wraps arithmetically: see [`FALLBACK_MONTH_DAYS`]
 //! for the documented fallback month length and resynchronization rules.
+//! Changing `24/12` without reinitializing the hour register is undefined on
+//! real silicon; this model increments whatever encoding the current bit selects.
 //!
 //! # Unsupported (explicit)
 //!
@@ -40,8 +43,7 @@
 //!   (`Machine::inject_nmi` + interpreter vector-2 stub covers the pin path)
 //! - Exact crystal divider / UIP pulse width (UIP is set for the duration of
 //!   the modeled update call, or until `end_update_for_test`)
-//! - 12-hour mode (status B bit 1): reset default is 24-hour; the bit is stored
-//!   but hour counting stays 0–23 (BCD or binary per `DM`)
+//! - Automatic hour-register conversion when Status B `24/12` is toggled
 //! - ACPI extended CMOS beyond 128 bytes
 //! - Square-wave output (SQWE)
 
@@ -89,15 +91,24 @@ const INDEX_MASK: u8 = 0x7F;
 /// Spec: MC146818 Status Register A bit7.
 pub const STATUS_A_UIP: u8 = 1 << 7;
 
-/// Status B: SET (inhibit update), PIE, AIE, UIE, DM (binary data mode).
+/// Status B: SET (inhibit update), PIE, AIE, UIE, DM (binary data mode), 24/12.
 ///
 /// Spec: MC146818 Status Register B — bit 2 (`DM`) selects calendar encoding:
-/// 0 = BCD (reset default), 1 = binary. See also OSDev CMOS / IBM PC AT RTC.
+/// 0 = BCD (reset default), 1 = binary. Bit 1 (`24/12`) selects hour format:
+/// 1 = 24-hour `0–23` (reset default), 0 = 12-hour `1–12` with AM/PM.
+/// See also OSDev CMOS / IBM PC AT RTC.
 pub const STB_SET: u8 = 1 << 7;
 pub const STB_PIE: u8 = 1 << 6;
 pub const STB_AIE: u8 = 1 << 5;
 pub const STB_UIE: u8 = 1 << 4;
 pub const STB_DM: u8 = 1 << 2;
+/// Status B bit 1: 1 = 24-hour mode, 0 = 12-hour mode.
+pub const STB_24_12: u8 = 1 << 1;
+/// Hours register bit7 in 12-hour mode: 1 = PM, 0 = AM.
+///
+/// Spec: MC146818 — "when the 12-hour format is selected the high order bit of
+/// the hours byte represents PM when it is a 1".
+pub const HOUR_PM: u8 = 1 << 7;
 
 /// Status C: IRQF, PF, AF, UF (bits 3:0 reserved 0).
 pub const STC_IRQF: u8 = 1 << 7;
@@ -108,8 +119,8 @@ pub const STC_UF: u8 = 1 << 4;
 /// Default Status A: UIP=0, divider=010 (32.768 kHz), rate=0110 (1024 Hz).
 /// Common AT POST default.
 const DEFAULT_STATUS_A: u8 = 0x26;
-/// Default Status B: 24-hour mode bit (DM/binary cleared → BCD; PIE/AIE/UIE off).
-const DEFAULT_STATUS_B: u8 = 0x02;
+/// Default Status B: 24-hour (`STB_24_12`); DM/binary cleared → BCD; PIE/AIE/UIE off.
+const DEFAULT_STATUS_B: u8 = STB_24_12;
 /// Default Status C: no IRQ flags pending.
 const DEFAULT_STATUS_C: u8 = 0x00;
 /// Default Status D: VRT=1 (valid RAM and time / battery OK).
@@ -265,6 +276,11 @@ impl CmosRtc {
         self.ram[REG_STATUS_B as usize] & STB_DM != 0
     }
 
+    /// Spec: MC146818 Status B bit 1 (`24/12`) — 1 = 24-hour, 0 = 12-hour.
+    fn hour_mode_24(&self) -> bool {
+        self.ram[REG_STATUS_B as usize] & STB_24_12 != 0
+    }
+
     /// Observability helper: set UIP without finishing the cycle.
     ///
     /// Returns false when Status B SET inhibits the update (UIP left clear).
@@ -297,12 +313,13 @@ impl CmosRtc {
     /// Full time + calendar advance for one update cycle.
     ///
     /// Spec (MC146818, "Time, Calendar, and Alarm Locations" + update cycle;
-    /// Status B `DM`): seconds 59→00 carry into minutes, minutes 59→00 into
-    /// hours, hours 23→00 into the date of month, the date rolls per month
-    /// length (with automatic leap-year compensation for February), month
-    /// 12→01 carries into the year, and the day-of-week counter advances on
-    /// every date rollover. Field storage is BCD when `DM=0` and binary when
-    /// `DM=1` (hour range remains 0–23; 12-hour mode is unsupported).
+    /// Status B `DM` / `24/12`): seconds 59→00 carry into minutes, minutes
+    /// 59→00 into hours; hours advance in 24-hour (`0–23`) or 12-hour
+    /// (`1–12` with AM/PM bit7) form per Status B bit 1 and carry into the
+    /// date of month at midnight; the date rolls per month length (with
+    /// automatic leap-year compensation for February), month 12→01 carries
+    /// into the year, and the day-of-week counter advances on every date
+    /// rollover. Field storage is BCD when `DM=0` and binary when `DM=1`.
     fn advance_calendar(&mut self) {
         let binary = self.data_mode_binary();
         let (sec, carry_min) = field_inc_mod(self.ram[REG_SEC as usize], 59, binary);
@@ -315,8 +332,8 @@ impl CmosRtc {
         if !carry_hour {
             return;
         }
-        let (hour, carry_day) = field_inc_mod(self.ram[REG_HOUR as usize], 23, binary);
-        self.ram[REG_HOUR as usize] = hour;
+        let mode_24 = self.hour_mode_24();
+        let carry_day = advance_hour_reg(&mut self.ram[REG_HOUR as usize], binary, mode_24);
         if !carry_day {
             return;
         }
@@ -495,6 +512,52 @@ impl PortDevice for CmosRtc {
             _ => {}
         }
     }
+}
+
+/// Advance the hours register for one minute carry; returns date-of-month carry.
+///
+/// Spec: MC146818 Status B `24/12` + `DM` — 24-hour wraps 23→00; 12-hour advances
+/// 1–12 with bit7 = PM (BCD AM `$01`–`$12` / PM `$81`–`$92`; binary AM `$01`–`$0C`
+/// / PM `$81`–`$8C`). Day carry only on 11 PM → 12 AM.
+fn advance_hour_reg(hour_reg: &mut u8, binary: bool, mode_24: bool) -> bool {
+    if mode_24 {
+        let (hour, carry_day) = field_inc_mod(*hour_reg, 23, binary);
+        *hour_reg = hour;
+        carry_day
+    } else {
+        let (hour, carry_day) = hour_inc_12(*hour_reg, binary);
+        *hour_reg = hour;
+        carry_day
+    }
+}
+
+/// Spec: MC146818 12-hour hour increment (hours 1–12; bit7 = PM).
+fn hour_inc_12(value: u8, binary: bool) -> (u8, bool) {
+    let pm = value & HOUR_PM;
+    let hour_bits = value & !HOUR_PM;
+    let h = if binary {
+        hour_bits
+    } else {
+        match bcd_to_bin(hour_bits) {
+            Some(v) => v,
+            // Invalid BCD nibble(s): resync to 1 AM, no day carry.
+            None => return (encode_field(1, false), false),
+        }
+    };
+    if !(1..=12).contains(&h) {
+        // Unrecognized hour (e.g. reset zero): resync to 1, preserve AM/PM.
+        return (encode_field(1, binary) | pm, false);
+    }
+    let (next_h, next_pm, carry_day) = if h == 11 {
+        // 11 AM → 12 PM; 11 PM → 12 AM (+ day).
+        (12, pm ^ HOUR_PM, pm != 0)
+    } else if h == 12 {
+        // 12 AM → 1 AM; 12 PM → 1 PM.
+        (1, pm, false)
+    } else {
+        (h + 1, pm, false)
+    };
+    (encode_field(next_h, binary) | next_pm, carry_day)
 }
 
 /// Increment a calendar field; `max` is the inclusive decimal maximum (59, 23, 99).
@@ -1025,7 +1088,7 @@ mod tests {
         let c = CmosRtc::new();
         assert_eq!(c.read_reg(REG_STATUS_B), DEFAULT_STATUS_B);
         assert_eq!(c.read_reg(REG_STATUS_B) & STB_DM, 0);
-        assert_ne!(c.read_reg(REG_STATUS_B) & 0x02, 0); // 24-hour
+        assert_ne!(c.read_reg(REG_STATUS_B) & STB_24_12, 0); // 24-hour
     }
 
     /// Spec: DM=0 keeps the existing BCD cascade (regression vs binary path).
@@ -1141,5 +1204,193 @@ mod tests {
         assert!(c.irq_line());
         assert_ne!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
         assert_ne!(c.read_reg(REG_STATUS_C) & STC_IRQF, 0);
+    }
+
+    // --- Status B 24/12 (12-hour mode) --------------------------------------
+    // Spec: MC146818 Status Register B bit 1 (`24/12`) — 1 = 24-hour (0–23),
+    // 0 = 12-hour (1–12) with bit7 of the hours byte = PM. Encoding interacts
+    // with `DM`: BCD AM $01–$12 / PM $81–$92; binary AM $01–$0C / PM $81–$8C.
+
+    /// Spec: reset Status B has 24/12 set (24-hour) and DM clear.
+    #[test]
+    fn reset_defaults_24_hour_bit_set() {
+        let c = CmosRtc::new();
+        assert_eq!(c.read_reg(REG_STATUS_B), DEFAULT_STATUS_B);
+        assert_ne!(c.read_reg(REG_STATUS_B) & STB_24_12, 0);
+        assert_eq!(c.read_reg(REG_STATUS_B) & STB_DM, 0);
+    }
+
+    /// Spec: 12-hour + BCD — minutes cascade into hours (10:59:59 AM → 11:00:00 AM).
+    #[test]
+    fn twelve_hour_bcd_tick_cascades_sec_min_hour() {
+        let mut c = CmosRtc::new();
+        // Clear 24/12 → 12-hour; DM remains BCD.
+        c.write_reg(REG_STATUS_B, 0x00);
+        c.write_reg(REG_HOUR, 0x10); // 10 AM
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 0x00);
+        assert_eq!(c.read_reg(REG_MIN), 0x00);
+        assert_eq!(c.read_reg(REG_HOUR), 0x11); // 11 AM
+        assert_eq!(c.read_reg(REG_HOUR) & HOUR_PM, 0);
+    }
+
+    /// Spec: 12-hour + BCD — 11:59:59 AM → 12:00:00 PM (noon; bit7 set, no day carry).
+    #[test]
+    fn twelve_hour_bcd_noon_edge() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, 0x00);
+        c.write_reg(REG_CENTURY, 0x20);
+        c.write_reg(REG_YEAR, 0x24);
+        c.write_reg(REG_MONTH, 0x06);
+        c.write_reg(REG_DAY_OF_MONTH, 0x15);
+        c.write_reg(REG_DAY_OF_WEEK, 0x03);
+        c.write_reg(REG_HOUR, 0x11); // 11 AM
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 0x92); // 12 PM (BCD 12 | PM)
+        assert_eq!(c.read_reg(REG_MIN), 0x00);
+        assert_eq!(c.read_reg(REG_SEC), 0x00);
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 0x15);
+        assert_eq!(c.read_reg(REG_DAY_OF_WEEK), 0x03);
+    }
+
+    /// Spec: 12-hour + BCD — 12:59:59 PM → 1:00:00 PM (keep PM; no day carry).
+    #[test]
+    fn twelve_hour_bcd_noon_to_one_pm() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, 0x00);
+        c.write_reg(REG_HOUR, 0x92); // 12 PM
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 0x81); // 1 PM
+        assert_eq!(c.read_reg(REG_MIN), 0x00);
+        assert_eq!(c.read_reg(REG_SEC), 0x00);
+    }
+
+    /// Spec: 12-hour + BCD — 11:59:59 PM → 12:00:00 AM (midnight) + date/weekday carry.
+    #[test]
+    fn twelve_hour_bcd_midnight_edge_carries_calendar() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, 0x00);
+        c.write_reg(REG_CENTURY, 0x20);
+        c.write_reg(REG_YEAR, 0x23);
+        c.write_reg(REG_MONTH, 0x12);
+        c.write_reg(REG_DAY_OF_MONTH, 0x31);
+        c.write_reg(REG_DAY_OF_WEEK, 0x06);
+        c.write_reg(REG_HOUR, 0x91); // 11 PM (BCD 11 | PM)
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 0x12); // 12 AM
+        assert_eq!(c.read_reg(REG_HOUR) & HOUR_PM, 0);
+        assert_eq!(c.read_reg(REG_MIN), 0x00);
+        assert_eq!(c.read_reg(REG_SEC), 0x00);
+        assert_eq!(c.read_reg(REG_CENTURY), 0x20);
+        assert_eq!(c.read_reg(REG_YEAR), 0x24);
+        assert_eq!(c.read_reg(REG_MONTH), 0x01);
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 0x01);
+        assert_eq!(c.read_reg(REG_DAY_OF_WEEK), 0x07);
+    }
+
+    /// Spec: 12-hour + BCD — 12:59:59 AM → 1:00:00 AM (no day carry).
+    #[test]
+    fn twelve_hour_bcd_midnight_to_one_am() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, 0x00);
+        c.write_reg(REG_DAY_OF_MONTH, 0x10);
+        c.write_reg(REG_DAY_OF_WEEK, 0x02);
+        c.write_reg(REG_HOUR, 0x12); // 12 AM
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 0x01); // 1 AM
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 0x10);
+        assert_eq!(c.read_reg(REG_DAY_OF_WEEK), 0x02);
+    }
+
+    /// Spec: 12-hour + binary (`DM=1`) — 11:59:59 AM → 12:00:00 PM (`0x8C`).
+    #[test]
+    fn twelve_hour_binary_noon_edge() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, STB_DM); // 12-hour + binary
+        c.write_reg(REG_DAY_OF_MONTH, 15);
+        c.write_reg(REG_HOUR, 11); // 11 AM binary
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_SEC, 59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 0x8C); // 12 | PM
+        assert_eq!(c.read_reg(REG_MIN), 0);
+        assert_eq!(c.read_reg(REG_SEC), 0);
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 15);
+    }
+
+    /// Spec: 12-hour + binary — 11:59:59 PM → 12:00:00 AM + day carry.
+    #[test]
+    fn twelve_hour_binary_midnight_edge_carries_calendar() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, STB_DM);
+        c.write_reg(REG_CENTURY, 20);
+        c.write_reg(REG_YEAR, 23);
+        c.write_reg(REG_MONTH, 12);
+        c.write_reg(REG_DAY_OF_MONTH, 31);
+        c.write_reg(REG_DAY_OF_WEEK, 6);
+        c.write_reg(REG_HOUR, 0x8B); // 11 | PM
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_SEC, 59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 12); // 12 AM
+        assert_eq!(c.read_reg(REG_HOUR) & HOUR_PM, 0);
+        assert_eq!(c.read_reg(REG_YEAR), 24);
+        assert_eq!(c.read_reg(REG_MONTH), 1);
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 1);
+        assert_eq!(c.read_reg(REG_DAY_OF_WEEK), 7);
+    }
+
+    /// Spec: 12-hour + binary cascade through sec/min into hour (10→11 AM).
+    #[test]
+    fn twelve_hour_binary_tick_cascades_sec_min_hour() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, STB_DM);
+        c.write_reg(REG_HOUR, 10);
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_SEC, 59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 11);
+        assert_eq!(c.read_reg(REG_MIN), 0);
+        assert_eq!(c.read_reg(REG_SEC), 0);
+    }
+
+    /// Spec: Status B SET inhibits the update cycle in 12-hour mode too.
+    #[test]
+    fn twelve_hour_set_inhibits_calendar_advance() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, STB_SET); // 12-hour + SET
+        c.write_reg(REG_HOUR, 0x11);
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+        assert!(!c.tick_second());
+        assert_eq!(c.read_reg(REG_HOUR), 0x11);
+        assert_eq!(c.read_reg(REG_MIN), 0x59);
+        assert_eq!(c.read_reg(REG_SEC), 0x59);
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
+        assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+    }
+
+    /// Spec: with 24/12 set, hour counting stays 0–23 (regression vs 12-hour path).
+    #[test]
+    fn twenty_four_hour_bit_keeps_0_23_cascade() {
+        let mut c = CmosRtc::new();
+        assert_ne!(c.read_reg(REG_STATUS_B) & STB_24_12, 0);
+        c.write_reg(REG_HOUR, 0x23);
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_SEC, 0x59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_HOUR), 0x00);
+        assert_eq!(c.read_reg(REG_MIN), 0x00);
+        assert_eq!(c.read_reg(REG_SEC), 0x00);
     }
 }
