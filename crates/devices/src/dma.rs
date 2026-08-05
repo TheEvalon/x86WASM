@@ -22,8 +22,11 @@
 //! - Base Address / Base Word Count loaded whenever Current is programmed
 //!   (Intel 8237A programming model).
 //! - Status register TC bits (3:0) clear-on-read + `latch_tc` device/test API.
+//! - Mode register programming (including Cascade bits 7:6 = `11`) on master
+//!   channels 0–3 and slave channels 0–3 (ISA 4–7); ISA channel 4 is the AT
+//!   cascade channel and may be programmed like any other channel.
 //! - `transfer_block` software helper for 8-bit channels 0–3 and 16-bit
-//!   channels 4–7: Demand/Single/Block + Increment/Decrement + Verify/Read/Write,
+//!   channels 5–7: Demand/Single/Block + Increment/Decrement + Verify/Read/Write,
 //!   Autoinitialize optional. Read/Write use `mem_read` / `mem_write`
 //!   callbacks; Verify advances address/count and latches TC without memory
 //!   R/W (`io_buf` length still checked; payload bytes left untouched). With
@@ -34,8 +37,8 @@
 //!   the same TC/mask/autoinit rules as Single (DREQ hold/release not modeled).
 //!   - 8-bit (ch0–3): length `count+1` bytes; phys `(page << 16) | addr`;
 //!     address steps ±1 per byte within the 64 KiB page.
-//!   - 16-bit (ch4–7, AT cascade slave): length `2*(count+1)` bytes; Current
-//!     Address is a word address; phys `(page << 16) | (addr << 1)` (A0=0);
+//!   - 16-bit (ch5–7, AT cascade slave data channels): length `2*(count+1)` bytes;
+//!     Current Address is a word address; phys `(page << 16) | (addr << 1)` (A0=0);
 //!     address steps ±1 per word; page register pairing as for AT page ports.
 //! - Page address register R/W for the eight AT channels above.
 //! - `PortDevice` for MachineBus wiring.
@@ -44,6 +47,7 @@
 //!
 //! - Hardware DREQ/DACK handshake / cycle-accurate bus timing
 //! - Cascade mode (mode bits 7:6 = `11`) for `transfer_block`
+//! - ISA channel 4 `transfer_block` (AT cascade reserved; programming only)
 //! - Floppy / IDE automatic DMA engine / DREQ path (Machine PhysMem wiring lives in
 //!   `machine-pc::Machine::dma_transfer`; no SeaBIOS floppy DMA)
 
@@ -57,10 +61,10 @@ pub enum DmaTransferError {
     /// Channel mask bit is set (masked channels do not transfer).
     Masked,
     /// Mode register outside Demand/Single/Block + Inc/Dec + Verify/Read/Write
-    /// (+ optional Autoinitialize); Cascade is rejected.
+    /// (+ optional Autoinitialize); Cascade and ISA channel 4 are rejected.
     UnsupportedMode,
     /// `io_buf` shorter than programmed transfer length in bytes
-    /// (`count+1` for 8-bit ch0–3; `2*(count+1)` for 16-bit ch4–7).
+    /// (`count+1` for 8-bit ch0–3; `2*(count+1)` for 16-bit ch5–7).
     BufferTooShort,
 }
 
@@ -308,9 +312,12 @@ impl Dma8237 {
     ///
     /// - **8-bit channels 0–3:** unit = byte; phys = `(page << 16) | addr`;
     ///   returns `count+1` bytes.
-    /// - **16-bit channels 4–7:** unit = word; Current Address is a word address;
+    /// - **16-bit channels 5–7:** unit = word; Current Address is a word address;
     ///   phys = `(page << 16) | (addr << 1)` (A0 forced 0); each unit moves two
     ///   LE bytes; returns `2*(count+1)` bytes. Word address wraps as `u16`.
+    /// - **ISA channel 4:** AT cascade reserved (OSDev ISA DMA / IBM PC/AT); mode
+    ///   and page/addr/count may be programmed, but this helper always returns
+    ///   [`DmaTransferError::UnsupportedMode`].
     ///
     /// # Mode subset honored
     ///
@@ -326,6 +333,7 @@ impl Dma8237 {
     /// - bits 1:0 must match the controller channel index (master 0–3 / slave 0–3)
     ///
     /// Cascade mode returns [`DmaTransferError::UnsupportedMode`].
+    /// ISA channel 4 returns [`DmaTransferError::UnsupportedMode`].
     /// ISA channel `> 7` returns [`BadChannel`].
     ///
     /// This is a software helper for device/unit tests — **not** DREQ/DACK timing.
@@ -343,7 +351,12 @@ impl Dma8237 {
         if isa_channel > 7 {
             return Err(DmaTransferError::BadChannel);
         }
-        let word16 = isa_channel >= 4;
+        // Spec: OSDev ISA DMA / IBM PC/AT — channel 4 cascades the 8-bit master
+        // through the 16-bit slave; it is not a data-transfer channel.
+        if isa_channel == 4 {
+            return Err(DmaTransferError::UnsupportedMode);
+        }
+        let word16 = isa_channel >= 5;
         let ctrl_ch = if word16 { isa_channel - 4 } else { isa_channel };
         let (mask, mode, count, addr0) = if word16 {
             let ch = &self.slave.channels[ctrl_ch];
@@ -633,6 +646,87 @@ mod tests {
         let mut d = Dma8237::new();
         d.port_write(0x0B, 1, 0x46); // ch2, single mode style pattern
         assert_eq!(d.master.channels[2].mode, 0x46);
+    }
+
+    #[test]
+    fn cascade_mode_master_and_ch4_program_and_readback() {
+        // Spec: Intel 8237A mode bits 7:6 = Cascade (`11`); OSDev ISA DMA — ISA
+        // channel 4 is the AT cascade channel (slave controller channel 0).
+        // Programming (mode set + struct readback) is accepted; no transfer.
+        let mut d = Dma8237::new();
+
+        // Master mode port 0x0B: Cascade | channel 0.
+        d.port_write(0x0B, 1, 0xC0);
+        assert_eq!(d.master.channels[0].mode, 0xC0);
+
+        // Slave mode port 0xD6: Cascade | slave ch0 → ISA channel 4.
+        d.port_write(0xD6, 1, 0xC0);
+        assert_eq!(d.slave.channels[0].mode, 0xC0);
+
+        // Page / addr / count for ISA ch4 remain programmable beside cascade mode.
+        d.port_write(0xD8, 1, 0); // clear slave flip-flop
+        d.port_write(0xC0, 1, 0x34); // ch4 addr low
+        d.port_write(0xC0, 1, 0x12);
+        d.port_write(0xD8, 1, 0);
+        d.port_write(0xC2, 1, 0x01); // count low
+        d.port_write(0xC2, 1, 0x00);
+        d.port_write(DMA_PAGE_CH4, 1, 0xAB);
+        assert_eq!(d.slave.channels[0].addr, 0x1234);
+        assert_eq!(d.slave.channels[0].count, 0x0001);
+        assert_eq!(d.page[4], 0xAB);
+        assert_eq!(d.slave.channels[0].mode, 0xC0);
+    }
+
+    #[test]
+    fn transfer_block_rejects_cascade_mode_and_isa_ch4() {
+        // Spec: Intel 8237A Cascade is not a data-transfer mode; ISA ch4 is the
+        // AT cascade reserved channel (OSDev ISA DMA).
+        let mut d = Dma8237::new();
+        let mut io = [0u8; 4];
+
+        // Master cascade mode: stored, transfer rejected, state unchanged.
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x00, 1, 0x00);
+        d.port_write(0x00, 1, 0x10);
+        d.port_write(0x0C, 1, 0);
+        d.port_write(0x01, 1, 0x00);
+        d.port_write(0x01, 1, 0x00);
+        d.port_write(DMA_PAGE_CH0, 1, 0x00);
+        d.port_write(0x0B, 1, 0xC0); // Cascade | ch0
+        d.port_write(0x0A, 1, 0x00); // unmask ch0
+        assert_eq!(d.master.channels[0].mode, 0xC0);
+        assert_eq!(
+            d.transfer_block(0, &mut io, |_| 0, |_, _| {}),
+            Err(DmaTransferError::UnsupportedMode)
+        );
+        assert_eq!(d.master.channels[0].count, 0);
+        assert_eq!(d.master.status & 0x0F, 0);
+
+        // ISA ch4: even Single+Write (data-looking mode) is not transferable.
+        d.port_write(0xD8, 1, 0);
+        d.port_write(0xC0, 1, 0x00);
+        d.port_write(0xC0, 1, 0x00);
+        d.port_write(0xD8, 1, 0);
+        d.port_write(0xC2, 1, 0x00);
+        d.port_write(0xC2, 1, 0x00);
+        d.port_write(DMA_PAGE_CH4, 1, 0x00);
+        d.port_write(0xD6, 1, 0x44); // Single | Inc | Write | slave ch0
+        d.port_write(0xD4, 1, 0x00); // unmask slave ch0
+        assert_eq!(d.slave.channels[0].mode, 0x44);
+        assert_eq!(
+            d.transfer_block(4, &mut io, |_| 0, |_, _| {}),
+            Err(DmaTransferError::UnsupportedMode)
+        );
+        assert_eq!(d.slave.channels[0].count, 0);
+        assert_eq!(d.slave.status & 0x0F, 0);
+
+        // Cascade mode on ch4: programming readback + transfer reject.
+        d.port_write(0xD6, 1, 0xC0);
+        assert_eq!(d.slave.channels[0].mode, 0xC0);
+        assert_eq!(
+            d.transfer_block(4, &mut io, |_| 0, |_, _| {}),
+            Err(DmaTransferError::UnsupportedMode)
+        );
     }
 
     /// Program master ch2: page, addr, count=N−1, Single+Inc+Write (`0x46`), unmasked.
