@@ -75,7 +75,10 @@
 //!   follows nIEN like other PIO data-out commands (WRITE SECTORS)
 //! - SET MULTIPLE MODE (`0xC6`): store Sector Count block factor when a power of
 //!   two in `1..=16` (IDENTIFY word 47 max); IDENTIFY word 59 reports setting;
-//!   invalid → ERR+ABRT; READ/WRITE MULTIPLE multi-sector DRQ still ABRT
+//!   invalid → ERR+ABRT
+//! - READ MULTIPLE (`0xC4`) / WRITE MULTIPLE (`0xC5`): LBA28 PIO using stored
+//!   `multiple_count` sectors per DRQ block (last block may be shorter);
+//!   `multiple_count==0` → ERR+ABRT; INTRQ once per block / completion when nIEN=0
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
@@ -94,15 +97,14 @@
 //! - TRUSTED RECEIVE / TRUSTED SEND Security Protocol PIO (ABRT-only stubs for
 //!   `0x5C` / `0x5E`)
 //! - Real BM-DMA / UDMA/MDMA / PRD engine (READ/WRITE DMA are ABRT-only)
-//! - READ/WRITE MULTIPLE multi-sector DRQ PIO (SET MULTIPLE MODE stores the
-//!   block factor; transfer commands remain ABRT-only)
 //! - LBA48
 //! - Slave drive on either channel
 //! - SeaBIOS / PCI IDE BAR remapping
 //!
 //! Secondary channel (`IdeSecondary`) remaps the same ATA PIO stub — including
-//! READ BUFFER (`0xE4`) / WRITE BUFFER (`0xE8`) sector-buffer PIO — to ports
-//! `0x170`–`0x177` / `0x376` and ISA IRQ15 (see below).
+//! READ BUFFER (`0xE4`) / WRITE BUFFER (`0xE8`) sector-buffer PIO and
+//! READ/WRITE MULTIPLE multi-sector DRQ — to ports `0x170`–`0x177` / `0x376`
+//! and ISA IRQ15 (see below).
 
 use crate::PortDevice;
 
@@ -185,10 +187,10 @@ pub const ATA_CMD_SET_FEATURES: u8 = 0xEF;
 /// NOP — non-data success on ATA master (no side effects).
 /// Spec: ATA/ATAPI Command Set — NOP (`0x00`).
 pub const ATA_CMD_NOP: u8 = 0x00;
-/// READ MULTIPLE — multi-sector PIO; this stub aborts (block count not configured).
+/// READ MULTIPLE — LBA28 multi-sector PIO (`multiple_count` sectors per DRQ).
 /// Spec: ATA/ATAPI Command Set — READ MULTIPLE (`0xC4`).
 pub const ATA_CMD_READ_MULTIPLE: u8 = 0xC4;
-/// WRITE MULTIPLE — multi-sector PIO; this stub aborts (block count not configured).
+/// WRITE MULTIPLE — LBA28 multi-sector PIO (`multiple_count` sectors per DRQ).
 /// Spec: ATA/ATAPI Command Set — WRITE MULTIPLE (`0xC5`).
 pub const ATA_CMD_WRITE_MULTIPLE: u8 = 0xC5;
 /// IDLE IMMEDIATE — non-data success.
@@ -349,6 +351,11 @@ pub struct IdePrimary {
     /// Spec: ATA SET MULTIPLE MODE — Sector Count selects sectors per
     /// READ/WRITE MULTIPLE DRQ; IDENTIFY word 59 reports the current setting.
     pub multiple_count: u8,
+    /// True while READ/WRITE MULTIPLE multi-sector DRQ transfer is active.
+    multiple_xfer: bool,
+    /// Sectors remaining in the current READ/WRITE MULTIPLE DRQ block
+    /// (including the sector currently under DRQ).
+    block_left: u32,
 }
 
 impl Default for IdePrimary {
@@ -382,6 +389,8 @@ impl IdePrimary {
             pio_in: false,
             sector_buffer_write: false,
             multiple_count: 0,
+            multiple_xfer: false,
+            block_left: 0,
         }
     }
 
@@ -431,6 +440,8 @@ impl IdePrimary {
         self.pio_in = false;
         self.sector_buffer_write = false;
         self.multiple_count = 0;
+        self.multiple_xfer = false;
+        self.block_left = 0;
         self.status = if self.present {
             ATA_SR_DRDY | ATA_SR_DSC
         } else {
@@ -582,10 +593,20 @@ impl IdePrimary {
         self.transferring = false;
         self.pio_in = false;
         self.sector_buffer_write = false;
+        self.multiple_xfer = false;
+        self.block_left = 0;
         self.sectors_left = 0;
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_ERR;
         // Spec: ATA — INTRQ on error completion when interrupts enabled.
         self.raise_irq();
+    }
+
+    /// Sectors in the next READ/WRITE MULTIPLE DRQ block.
+    ///
+    /// Spec: ATA — block size is `multiple_count`, except the final block may
+    /// be shorter when Sector Count is not divisible by the block factor.
+    fn multiple_block_len(&self, sectors_remaining: u32) -> u32 {
+        u32::from(self.multiple_count).min(sectors_remaining)
     }
 
     fn exec_identify(&mut self) {
@@ -597,6 +618,8 @@ impl IdePrimary {
             return;
         }
         self.fill_identify();
+        self.multiple_xfer = false;
+        self.block_left = 0;
         self.sectors_left = 1;
         self.next_lba = 0;
         self.begin_pio_out();
@@ -651,6 +674,8 @@ impl IdePrimary {
             self.abort_command(0x10); // IDNF / sector not found style
             return;
         }
+        self.multiple_xfer = false;
+        self.block_left = 0;
         self.sectors_left = count;
         self.next_lba = lba.wrapping_add(1);
         self.begin_pio_out();
@@ -676,6 +701,8 @@ impl IdePrimary {
             self.abort_command(0x10); // IDNF
             return;
         }
+        self.multiple_xfer = false;
+        self.block_left = 0;
         self.sectors_left = count;
         self.next_lba = lba;
         self.begin_pio_in();
@@ -757,11 +784,13 @@ impl IdePrimary {
         self.raise_irq();
     }
 
-    /// READ MULTIPLE (`0xC4`) on ATA master — ABRT stub.
+    /// READ MULTIPLE (`0xC4`) on ATA master — LBA28 multi-sector DRQ PIO.
     ///
-    /// Spec: ATA READ MULTIPLE transfers `multiple_count` sectors per DRQ after
-    /// SET MULTIPLE MODE. Block factor may be stored (`multiple_count`), but
-    /// multi-sector DRQ PIO is not implemented yet → ERR+ABRT.
+    /// Spec: ATA/ATAPI Command Set — READ MULTIPLE transfers up to
+    /// `multiple_count` sectors per DRQ interrupt after SET MULTIPLE MODE.
+    /// `multiple_count==0` (not configured) → ERR+ABRT. Final DRQ block may be
+    /// shorter when Sector Count is not divisible by the block factor. INTRQ
+    /// once per DRQ block ready and on command completion when nIEN=0.
     fn exec_read_multiple(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -770,15 +799,35 @@ impl IdePrimary {
             self.clear_irq();
             return;
         }
-        // Unsupported: multi-sector DRQ transfer (even when `multiple_count` set).
-        self.abort_command(ATA_ER_ABRT);
+        // Spec: ATA — READ MULTIPLE invalid if Multiple mode not set.
+        if self.multiple_count == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT); // CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        if !self.load_sector_into_pio(lba) {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.multiple_xfer = true;
+        self.sectors_left = count;
+        self.block_left = self.multiple_block_len(count);
+        self.next_lba = lba.wrapping_add(1);
+        self.begin_pio_out();
     }
 
-    /// WRITE MULTIPLE (`0xC5`) on ATA master — ABRT stub.
+    /// WRITE MULTIPLE (`0xC5`) on ATA master — LBA28 multi-sector DRQ PIO.
     ///
-    /// Spec: ATA WRITE MULTIPLE transfers `multiple_count` sectors per DRQ after
-    /// SET MULTIPLE MODE. Block factor may be stored (`multiple_count`), but
-    /// multi-sector DRQ PIO is not implemented yet → ERR+ABRT.
+    /// Spec: ATA/ATAPI Command Set — WRITE MULTIPLE transfers up to
+    /// `multiple_count` sectors per DRQ interrupt after SET MULTIPLE MODE.
+    /// `multiple_count==0` (not configured) → ERR+ABRT. Final DRQ block may be
+    /// shorter when Sector Count is not divisible by the block factor. INTRQ
+    /// once per DRQ block ready and on command completion when nIEN=0.
     fn exec_write_multiple(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -787,8 +836,27 @@ impl IdePrimary {
             self.clear_irq();
             return;
         }
-        // Unsupported: multi-sector DRQ transfer (even when `multiple_count` set).
-        self.abort_command(ATA_ER_ABRT);
+        // Spec: ATA — WRITE MULTIPLE invalid if Multiple mode not set.
+        if self.multiple_count == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT); // CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.multiple_xfer = true;
+        self.sectors_left = count;
+        self.block_left = self.multiple_block_len(count);
+        self.next_lba = lba;
+        self.begin_pio_in();
     }
 
     /// SMART (`0xB0`) on ATA master — ABRT stub.
@@ -1069,6 +1137,8 @@ impl IdePrimary {
             return;
         }
         self.pio = self.sector_buffer;
+        self.multiple_xfer = false;
+        self.block_left = 0;
         self.sectors_left = 1;
         self.next_lba = 0;
         self.begin_pio_out();
@@ -1089,6 +1159,8 @@ impl IdePrimary {
             self.clear_irq();
             return;
         }
+        self.multiple_xfer = false;
+        self.block_left = 0;
         self.sectors_left = 1;
         self.next_lba = 0;
         self.sector_buffer_write = true;
@@ -1182,7 +1254,7 @@ impl IdePrimary {
     /// sectors per interrupt for READ/WRITE MULTIPLE. Accepted values are
     /// powers of two in `1..=ATA_MULTIPLE_MAX_SECTORS` (IDENTIFY word 47).
     /// Invalid → ERR+ABRT (prior `multiple_count` unchanged). Completes with
-    /// DRDY|DSC and INTRQ when nIEN=0. READ/WRITE MULTIPLE transfer remains ABRT.
+    /// DRDY|DSC and INTRQ when nIEN=0.
     fn exec_set_multiple_mode(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -1408,9 +1480,14 @@ impl IdePrimary {
         if self.sectors_left > 0 {
             self.sectors_left -= 1;
         }
+        if self.multiple_xfer && self.block_left > 0 {
+            self.block_left -= 1;
+        }
         if self.sectors_left == 0 {
             self.transferring = false;
             self.pio_in = false;
+            self.multiple_xfer = false;
+            self.block_left = 0;
             self.pio_off = 0;
             self.status = ATA_SR_DRDY | ATA_SR_DSC;
             self.sector_count = 0;
@@ -1418,7 +1495,7 @@ impl IdePrimary {
             self.raise_irq();
             return;
         }
-        // Multi-sector READ: present next sector.
+        // Multi-sector READ / READ MULTIPLE: present next sector.
         if !self.load_sector_into_pio(self.next_lba) {
             self.abort_command(0x10);
             return;
@@ -1430,8 +1507,17 @@ impl IdePrimary {
         if self.sector_count != 0 {
             self.sector_count = self.sector_count.wrapping_sub(1);
         }
-        // Spec: OSDev ATA PIO — IRQ again when next sector DRQ ready.
-        self.raise_irq();
+        if self.multiple_xfer {
+            if self.block_left == 0 {
+                // Spec: ATA READ MULTIPLE — IRQ when next multi-sector DRQ ready.
+                self.block_left = self.multiple_block_len(self.sectors_left);
+                self.raise_irq();
+            }
+            // Within a Multiple DRQ block: keep DRQ, no IRQ between sectors.
+        } else {
+            // Spec: OSDev ATA PIO — IRQ again when next sector DRQ ready.
+            self.raise_irq();
+        }
     }
 
     fn finish_sector_pio_in(&mut self) {
@@ -1449,7 +1535,7 @@ impl IdePrimary {
             self.raise_irq();
             return;
         }
-        // Spec: ATA WRITE SECTORS — commit filled sector, then next DRQ or complete.
+        // Spec: ATA WRITE SECTORS / WRITE MULTIPLE — commit filled sector.
         let lba = self.next_lba;
         if !self.store_sector_from_pio(lba) {
             self.abort_command(0x10);
@@ -1458,9 +1544,14 @@ impl IdePrimary {
         if self.sectors_left > 0 {
             self.sectors_left -= 1;
         }
+        if self.multiple_xfer && self.block_left > 0 {
+            self.block_left -= 1;
+        }
         if self.sectors_left == 0 {
             self.transferring = false;
             self.pio_in = false;
+            self.multiple_xfer = false;
+            self.block_left = 0;
             self.pio_off = 0;
             self.status = ATA_SR_DRDY | ATA_SR_DSC;
             self.sector_count = 0;
@@ -1479,8 +1570,17 @@ impl IdePrimary {
         if self.sector_count != 0 {
             self.sector_count = self.sector_count.wrapping_sub(1);
         }
-        // Spec: OSDev ATA PIO WRITE — IRQ when next sector DRQ ready.
-        self.raise_irq();
+        if self.multiple_xfer {
+            if self.block_left == 0 {
+                // Spec: ATA WRITE MULTIPLE — IRQ when next multi-sector DRQ ready.
+                self.block_left = self.multiple_block_len(self.sectors_left);
+                self.raise_irq();
+            }
+            // Within a Multiple DRQ block: keep DRQ, no IRQ between sectors.
+        } else {
+            // Spec: OSDev ATA PIO WRITE — IRQ when next sector DRQ ready.
+            self.raise_irq();
+        }
     }
 
     fn write_dev_ctrl(&mut self, value: u8) {
@@ -3547,24 +3647,184 @@ mod tests {
         assert!(!ide.irq_line());
     }
 
-    /// Spec: ATA — READ/WRITE MULTIPLE still ABRT until multi-sector DRQ is
-    /// implemented, even after a successful SET MULTIPLE MODE.
-    #[test]
-    fn read_write_multiple_still_abort_after_set_multiple() {
-        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 16]);
-        clear_nien(&mut ide);
-        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
-        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 16);
+    fn set_multiple_mode(ide: &mut IdePrimary, factor: u8) {
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, u32::from(factor));
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
-        assert_eq!(ide.multiple_count, 16);
+        assert_eq!(ide.multiple_count, factor);
         assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_ERR, 0);
+    }
 
-        for cmd in [ATA_CMD_READ_MULTIPLE, ATA_CMD_WRITE_MULTIPLE] {
-            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
-            assert!(ide.irq_line());
-            assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
-            assert_eq!(ide.multiple_count, 16);
+    fn drain_pio_sector_after_first_word(ide: &mut IdePrimary) {
+        for _ in 1..256 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
         }
+    }
+
+    /// Spec: ATA READ MULTIPLE (`0xC4`) — after SET MULTIPLE MODE, transfer
+    /// `multiple_count` sectors per DRQ; IRQ once per block (not per sector).
+    #[test]
+    fn read_multiple_multi_sector_drq_and_irq_per_block() {
+        let mut img = vec![0u8; SECTOR_SIZE * 4];
+        img[0] = 0xA1;
+        img[SECTOR_SIZE] = 0xA2;
+        img[SECTOR_SIZE * 2] = 0xA3;
+        img[SECTOR_SIZE * 3] = 0xA4;
+        let mut ide = IdePrimary::with_image(img);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 2);
+
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 4);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1); // ack first-block IRQ
+        assert!(!ide.irq_line());
+
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA1);
+        drain_pio_sector_after_first_word(&mut ide);
+        // Still inside first DRQ block — no IRQ between sectors.
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA2);
+        drain_pio_sector_after_first_word(&mut ide);
+
+        // Second block ready → IRQ.
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA3);
+        drain_pio_sector_after_first_word(&mut ide);
+        assert!(!ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA4);
+        drain_pio_sector_after_first_word(&mut ide);
+        // Completion IRQ after final sector; alt status does not clear INTRQ.
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    /// Spec: ATA READ MULTIPLE — short final DRQ when count % multiple_count != 0.
+    #[test]
+    fn read_multiple_short_final_block() {
+        let mut img = vec![0u8; SECTOR_SIZE * 5];
+        for (i, chunk) in img.chunks_mut(SECTOR_SIZE).enumerate() {
+            chunk[0] = 0xB0 + i as u8;
+        }
+        let mut ide = IdePrimary::with_image(img);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 4);
+
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 5);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+
+        for expected in [0xB0u8, 0xB1, 0xB2, 0xB3] {
+            assert!(!ide.irq_line(), "no IRQ mid-block before {expected:#x}");
+            assert_eq!(
+                ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF,
+                u16::from(expected)
+            );
+            drain_pio_sector_after_first_word(&mut ide);
+        }
+        // Final 1-sector block → IRQ then data.
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xB4);
+        drain_pio_sector_after_first_word(&mut ide);
+        assert!(ide.irq_line()); // completion
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    /// Spec: ATA WRITE MULTIPLE (`0xC5`) — multi-sector DRQ commits media; IRQ/block.
+    #[test]
+    fn write_multiple_multi_sector_drq_commits_media() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 2);
+
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 3);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+
+        write_sector_words(&mut ide, 0x1111, 0x2222);
+        // Mid-block: still DRQ, no IRQ.
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+        write_sector_words(&mut ide, 0x3333, 0x4444);
+        // Short final block ready → IRQ.
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        write_sector_words(&mut ide, 0x5555, 0x6666);
+        assert!(ide.irq_line()); // completion
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+
+        assert_eq!(ide.image[0], 0x11);
+        assert_eq!(ide.image[1], 0x11);
+        assert_eq!(ide.image[510], 0x22);
+        assert_eq!(ide.image[511], 0x22);
+        assert_eq!(ide.image[SECTOR_SIZE], 0x33);
+        assert_eq!(ide.image[SECTOR_SIZE + 1], 0x33);
+        assert_eq!(ide.image[SECTOR_SIZE * 2], 0x55);
+        assert_eq!(ide.image[SECTOR_SIZE * 2 + 1], 0x55);
+    }
+
+    /// Spec: ATA — nIEN gates INTRQ for READ MULTIPLE DRQ / completion.
+    #[test]
+    fn read_multiple_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        // Leave nIEN set (reset default).
+        set_multiple_mode(&mut ide, 2);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — nIEN gates INTRQ for WRITE MULTIPLE DRQ.
+    #[test]
+    fn write_multiple_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        set_multiple_mode(&mut ide, 2);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_multiple_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA READ MULTIPLE OOB LBA → ERR+IDNF (error bit 4 style `0x10`).
+    #[test]
+    fn read_multiple_oob_sets_err() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 1);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
     }
 
     /// Spec: ATA — MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) success noop.
