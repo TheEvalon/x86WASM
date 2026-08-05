@@ -1642,9 +1642,9 @@ impl Fdc82077 {
     ///   - MT=1 starting on head 0: after EOT under head 0, continue at sector
     ///     1 under head 1 on the same cylinder through EOT (Multi-Track;
     ///     mirror READ/WRITE DATA). Starting on head 1 does not wrap to head 0.
-    ///   ST0 IC=00 (normal) | H | US with ST0.H = **final** head, ST1=0,
-    ///   ST2=0, C/H/R/N = ENDaddress of the **last** sector verified. Does
-    ///   **not** latch `last_sector` or arm DMA.
+    ///     ST0 IC=00 (normal) | H | US with ST0.H = **final** head, ST1=0,
+    ///     ST2=0, C/H/R/N = ENDaddress of the **last** sector verified. Does
+    ///     **not** latch `last_sector` or arm DMA.
     /// - Otherwise (no media / wrong N / OOR CHS): ST0 IC=01 | H | US (command
     ///   head), ST1 ND, ST2=0, C/H/R/N from command start.
     ///
