@@ -23,7 +23,7 @@ use firmware_interface::RomImage;
 use ports::PortBus;
 use thiserror::Error;
 use x86_core::CpuState;
-use x86_interpreter::{run, step, Bus, ExecError};
+use x86_interpreter::{step, Bus, ExecError};
 
 #[derive(Debug, Error)]
 pub enum MachineError {
@@ -140,6 +140,21 @@ impl Machine {
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
 
+    /// Apply a latched 8042 pulse-reset (`0xFE` on `0x64`) via [`Self::reset`].
+    ///
+    /// Spec: OSDev I8042 — controller command `0xFE` pulses the system-reset
+    /// line. Returns `true` when a request was taken and reset ran. Called
+    /// automatically after each [`Self::step`]. Distinct from keyboard Resend
+    /// `0xFE` on data port `0x60`.
+    pub fn service_8042_pulse_reset(&mut self) -> bool {
+        if self.kbd.take_system_reset_request() {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Borrow the decode view for tests (`step`/`run` keep split borrows of `cpu`).
     #[cfg(test)]
     fn bus_mut(&mut self) -> MachineBus<'_> {
@@ -168,44 +183,39 @@ impl Machine {
 
     pub fn step(&mut self) -> Result<(), MachineError> {
         // Constructed inline so `cpu` stays independently borrowable from the bus view.
-        let mut view = MachineBus {
-            mem: &mut self.mem,
-            com1: &mut self.com1,
-            debug: &mut self.debug,
-            pic: &mut self.pic,
-            pit: &mut self.pit,
-            cmos: &mut self.cmos,
-            kbd: &mut self.kbd,
-            dma: &mut self.dma,
-            vga: &mut self.vga,
-            pci: &mut self.pci,
-            ide: &mut self.ide,
-            ide_secondary: &mut self.ide_secondary,
-            fdc: &mut self.fdc,
-            ports: &mut self.ports,
-        };
-        step(&mut self.cpu, &mut view)?;
+        {
+            let mut view = MachineBus {
+                mem: &mut self.mem,
+                com1: &mut self.com1,
+                debug: &mut self.debug,
+                pic: &mut self.pic,
+                pit: &mut self.pit,
+                cmos: &mut self.cmos,
+                kbd: &mut self.kbd,
+                dma: &mut self.dma,
+                vga: &mut self.vga,
+                pci: &mut self.pci,
+                ide: &mut self.ide,
+                ide_secondary: &mut self.ide_secondary,
+                fdc: &mut self.fdc,
+                ports: &mut self.ports,
+            };
+            step(&mut self.cpu, &mut view)?;
+        }
+        // Spec: OSDev I8042 — pulse-reset after the OUT completes (CPU not in bus view).
+        let _ = self.service_8042_pulse_reset();
         Ok(())
     }
 
     pub fn run(&mut self, max_steps: u64) -> Result<u64, MachineError> {
-        let mut view = MachineBus {
-            mem: &mut self.mem,
-            com1: &mut self.com1,
-            debug: &mut self.debug,
-            pic: &mut self.pic,
-            pit: &mut self.pit,
-            cmos: &mut self.cmos,
-            kbd: &mut self.kbd,
-            dma: &mut self.dma,
-            vga: &mut self.vga,
-            pci: &mut self.pci,
-            ide: &mut self.ide,
-            ide_secondary: &mut self.ide_secondary,
-            fdc: &mut self.fdc,
-            ports: &mut self.ports,
-        };
-        Ok(run(&mut self.cpu, &mut view, max_steps)?)
+        // Per-instruction loop so 8042 pulse-reset can restore the CPU between
+        // steps (interpreter `run` cannot observe Machine-level reset).
+        let mut n = 0u64;
+        while n < max_steps && !self.cpu.halted {
+            self.step()?;
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// Combined guest console (COM1 then debug port bytes are tracked separately).
@@ -641,6 +651,8 @@ impl MachineBus<'_> {
             I8042_DATA | I8042_STATUS_CMD => {
                 self.kbd.port_write(port, size, value);
                 // Spec: IBM PC AT 8042 output port bit1 → A20 gate on phys mem.
+                // Pulse-reset `0xFE` on `0x64` latches on `kbd` for
+                // [`Machine::service_8042_pulse_reset`] after the bus borrow ends.
                 self.mem.set_a20_enabled(self.kbd.a20_enabled());
             }
             0x3F8..0x400 => self.com1.port_write(port, size, value),
@@ -734,7 +746,7 @@ mod tests {
     use super::*;
     use devices::{
         CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, CFG_INT1, CFG_INT12, CFG_TRANSLATE,
-        CMD_ENABLE_KBD, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT,
+        CMD_ENABLE_KBD, CMD_PULSE_RESET, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT,
         CMOS_DATA, CMOS_INDEX, FDC_1440_IMAGE_SIZE, FDC_CMD_CONFIGURE, FDC_CMD_MFM,
         FDC_CMD_READ_DATA, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK, FDC_CMD_SENSE_DRIVE_STATUS,
         FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA, FDC_DOR, FDC_DOR_DMA_IRQ,
@@ -1554,6 +1566,59 @@ mod tests {
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
         assert_eq!(m.debug_text(), "");
+    }
+
+    /// Spec: OSDev I8042 — OUT 0x64,0xFE latches pulse-reset; service → Machine::reset
+    /// restores CS:IP / reset-vector CPU state and device defaults.
+    #[test]
+    fn machine_bus_8042_pulse_reset_restores_cpu_reset_vector() {
+        let mut m = Machine::new(64 * 1024);
+        m.cpu.set_ip16(0x1234);
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x1000);
+        m.cpu.gpr[CpuState::RAX] = 0xDEAD_BEEF;
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
+        assert_ne!(m.kbd, I8042::new());
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_PULSE_RESET).unwrap();
+        }
+        assert!(m.service_8042_pulse_reset());
+        let fresh = CpuState::reset();
+        assert_eq!(m.cpu.rip, fresh.rip);
+        assert_eq!(m.cpu.cs.selector, fresh.cs.selector);
+        assert_eq!(m.cpu.cs.base, fresh.cs.base);
+        assert_eq!(m.cpu.gpr[CpuState::RAX], 0);
+        assert_eq!(m.kbd, I8042::new());
+        assert!(!m.service_8042_pulse_reset());
+    }
+
+    /// Spec: OSDev I8042 — guest OUT 0x64,0xFE after step restores reset vector.
+    #[test]
+    fn guest_out_8042_pulse_reset_restores_reset_vector() {
+        let mut m = Machine::new(64 * 1024);
+        let prog: &[u8] = &[
+            0xB0,
+            CMD_PULSE_RESET, // mov al, 0xFE
+            0xE6,
+            0x64, // out 0x64, al
+        ];
+        for (i, b) in prog.iter().enumerate() {
+            m.mem.write_u8(i as u64, *b).unwrap();
+        }
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.halted = false;
+        m.cpu.gpr[CpuState::RAX] = 0x1111;
+        m.step().unwrap(); // mov al, 0xFE
+        assert_eq!(m.cpu.al(), CMD_PULSE_RESET);
+        m.step().unwrap(); // out → pulse-reset → Machine::reset
+        let fresh = CpuState::reset();
+        assert_eq!(m.cpu.rip, fresh.rip);
+        assert_eq!(m.cpu.cs.selector, fresh.cs.selector);
+        assert_eq!(m.cpu.cs.base, fresh.cs.base);
+        assert_eq!(m.kbd, I8042::new());
     }
 
     /// Spec: IBM PC AT — OUT 0x64,0xD1 / OUT 0x60,data updates A20 on PhysMem.
