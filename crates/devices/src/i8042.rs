@@ -34,11 +34,13 @@
 //!   reporting is enabled.
 //! - IBM PC/AT 8042 keyboard-controller programming model (command/status/data);
 //!   output-buffer-full with IRQ enable → ISA IRQ1 (8259A master IR1).
-//! - IBM PS/2 keyboard-controller second (auxiliary) port: commands `0xA7`
-//!   (disable aux interface), `0xA8` (enable aux interface), `0xA9` (test aux
-//!   interface → result byte, `0x00` = no error), `0xD4` (write next data-port
-//!   byte to the aux device); status bit 5 = AUX OBF; command byte bit 1 = aux
-//!   interrupt enable (IRQ12 / 8259A slave IR4), bit 5 = aux clock disable.
+//! - IBM PS/2 keyboard-controller port tests / second (auxiliary) port: commands
+//!   `0xA7` (disable aux interface), `0xA8` (enable aux interface), `0xA9` (test
+//!   aux interface → result byte, `0x00` = no error), `0xAB` (test keyboard
+//!   interface → `0x00` = no error; same result codes as `0xA9`), `0xD4` (write
+//!   next data-port byte to the aux device); status bit 5 = AUX OBF; command
+//!   byte bit 1 = aux interrupt enable (IRQ12 / 8259A slave IR4), bit 5 = aux
+//!   clock disable.
 //! - `docs/sources.md` (PS/2 and 8042 references), `docs/machine-model-pc-v1.md`,
 //!   `plan.md` §15.4.
 //!
@@ -68,16 +70,19 @@
 //! holds presentation until `0xAE`. Other host→kbd bytes are accepted and left
 //! unanswered.
 //!
-//! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xA9`
-//! answers `0x00` on the normal output buffer, `0xD4` routes the next data-port
-//! byte to the aux device when the aux clock is enabled (recorded in
-//! [`I8042::last_aux_device_write`] / [`I8042::aux_device_writes`]). When aux
-//! clock is disabled (`0xA7` / config bit 5), host→aux bytes via `0xD4` are
-//! **dropped** (controller still consumes the pending write; mouse stub is not
-//! invoked — no ACK, no recorded traffic, no IRQ12), matching
-//! [`I8042::inject_aux_byte`]. A minimal PS/2 **mouse stub** answers the common
-//! identify/reset/enable commands with ACK/`0xFA` (and BAT/ID where required) on
-//! AUX OBF → IRQ12 when config bit 1 is set. Parameter commands
+//! Controller port tests: `0xA9` (aux) and `0xAB` (keyboard) each answer
+//! `0x00` (no error) on the **normal** output buffer (OBF, not AUX OBF).
+//!
+//! Second (auxiliary) PS/2 **port**: `0xA7`/`0xA8` toggle config bit 5, `0xD4`
+//! routes the next data-port byte to the aux device when the aux clock is
+//! enabled (recorded in [`I8042::last_aux_device_write`] /
+//! [`I8042::aux_device_writes`]). When aux clock is disabled (`0xA7` / config
+//! bit 5), host→aux bytes via `0xD4` are **dropped** (controller still
+//! consumes the pending write; mouse stub is not invoked — no ACK, no recorded
+//! traffic, no IRQ12), matching [`I8042::inject_aux_byte`]. A minimal PS/2
+//! **mouse stub** answers the common identify/reset/enable commands with
+//! ACK/`0xFA` (and BAT/ID where required) on AUX OBF → IRQ12 when config bit 1
+//! is set. Parameter commands
 //! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`/`0xEA`/`0xF0`/`0xEE`/`0xEC`/`0xEB`/`0xF6`)
 //! store rate/resolution/scaling/mode/wrap and answer Status Request / Read Data
 //! with the OSDev packets; while wrap is set, non-`0xEC`/`0xFF` host→aux bytes
@@ -105,7 +110,8 @@
 //!   set)
 //! - Pulse-reset lines (controller command `0xFE` on `0x64` / output-port bit0
 //!   system-reset) — distinct from keyboard Resend `0xFE` on data port `0x60`
-//! - Interface test `0xAB`, diagnostic dump `0xAC`
+//! - Diagnostic dump `0xAC`; interface-test electrical fault codes beyond the
+//!   success stub `0x00` for `0xA9`/`0xAB`
 //! - Host→aux queue-for-later while aux clock disabled (bytes are **dropped**,
 //!   not deferred until `0xA8`)
 
@@ -143,6 +149,10 @@ pub const CMD_ENABLE_AUX: u8 = 0xA8;
 pub const CMD_TEST_AUX: u8 = 0xA9;
 /// Controller command: self-test; success response `0x55`.
 pub const CMD_SELF_TEST: u8 = 0xAA;
+/// Controller command: test first PS/2 port (keyboard) → result byte on data port.
+///
+/// Spec: OSDev I8042 — same result codes as `0xA9`; `0x00` = no error.
+pub const CMD_TEST_KBD: u8 = 0xAB;
 /// Controller command: disable first PS/2 port (keyboard clock inhibit).
 pub const CMD_DISABLE_KBD: u8 = 0xAD;
 /// Controller command: enable first PS/2 port.
@@ -161,6 +171,8 @@ pub const CMD_PULSE_RESET: u8 = 0xFE;
 pub const SELF_TEST_OK: u8 = 0x55;
 /// Second-port interface test result: no error (IBM PS/2 `0xA9`).
 pub const TEST_AUX_OK: u8 = 0x00;
+/// First-port (keyboard) interface test result: no error (IBM PS/2 `0xAB`).
+pub const TEST_KBD_OK: u8 = 0x00;
 
 /// PS/2 mouse / keyboard ACK response (OSDev PS/2 Keyboard / Mouse).
 pub const MOUSE_ACK: u8 = 0xFA;
@@ -1329,6 +1341,11 @@ impl I8042 {
                 // buffer (OBF, not AUX OBF); 0x00 = no error detected.
                 self.push_output(TEST_AUX_OK);
             }
+            CMD_TEST_KBD => {
+                // Spec: OSDev I8042 / IBM PS/2 — test first (keyboard) port;
+                // same result codes as 0xA9; response on normal OBF (not AUX).
+                self.push_output(TEST_KBD_OK);
+            }
             CMD_SELF_TEST => {
                 // Success response; keep config (firmware may re-read/write it).
                 // Documented side effects of a full KBC reset are not modeled.
@@ -2229,6 +2246,21 @@ mod tests {
         assert_eq!(k.status() & STATUS_AUX_OBF, 0);
         assert!(!k.aux_obf());
         assert_eq!(k.port_read(I8042_DATA, 1) as u8, TEST_AUX_OK);
+        assert_eq!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.unsupported_commands, 0);
+    }
+
+    /// Spec: OSDev I8042 / IBM PS/2 KBC — `0xAB` (test first/keyboard PS/2 port)
+    /// returns a result byte (`0x00` = no error). Same presentation as `0xA9`:
+    /// controller response on normal OBF, not AUX OBF.
+    #[test]
+    fn test_kbd_ab_returns_00_on_normal_output_buffer() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_TEST_KBD));
+        assert_ne!(k.status() & STATUS_OBF, 0);
+        assert_eq!(k.status() & STATUS_AUX_OBF, 0);
+        assert!(!k.aux_obf());
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, TEST_KBD_OK);
         assert_eq!(k.status() & STATUS_OBF, 0);
         assert_eq!(k.unsupported_commands, 0);
     }
