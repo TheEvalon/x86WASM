@@ -36,23 +36,21 @@
 //! - Mode 3 sub-CLK / decrement-by-two CE micro-timing (OUT uses an approximate
 //!   N/2 high + N/2 low split; odd N uses the datasheet (N+1)/2 high + (N−1)/2 low
 //!   asymmetry; latched CE during mode 3 is half-phase remaining, not hardware CE)
-//! - GATE/trigger one-CLK CE-load delay: GATE rising-edge reload (modes 1/2/3/5)
-//!   still transfers CR→CE on the same model clock as the edge (not the following
-//!   CLK). Count-write load delay for modes 0/2/3/4 is modeled (see below).
 //! - Channel 1 DRAM refresh; host PC-speaker audio output
 //! - Host-real-time wall-clock rate (callers choose tick quantum)
 //! - Port `0x61` NMI/parity/refresh toggle side effects (bits other than 0/1/5)
 //! - Invalid BCD digit programming (nibbles A–F): decode treats each nibble as a
 //!   weighted decade digit; hardware behavior for illegal BCD is unspecified
 //!
-//! # Count-load delay (modes 0 / 2 / 3 / 4)
+//! # Count-load / GATE-load delay
 //!
-//! Spec: Intel 8254 — after a new count is written, the first CLK loads CR into
-//! CE (NULL COUNT clears on that load CLK); countdown / OUT sequencing starts on
-//! later clocks. This model arms `pending_load` on a full count write in modes
-//! 0/2/3/4 and performs the CR→CE transfer on the next gated tick. Modes 1/5
-//! still preload CE when idle (GATE trigger starts the one-shot/strobe); periodic
-//! mode-2/3 reloads at terminal count remain same-clock.
+//! Spec: Intel 8254 — after a new count is written (modes 0/2/3/4), the first CLK
+//! loads CR into CE (NULL COUNT clears on that load CLK); countdown / OUT
+//! sequencing starts on later clocks. GATE rising-edge reload (modes 1/2/3/5)
+//! likewise arms a one-CLK CR→CE transfer: Mode 1 also drives OUT low on that
+//! load CLK. This model uses `pending_load` for both count-write and GATE-armed
+//! loads. Modes 1/5 still preload CE when idle (GATE trigger re-arms the load);
+//! periodic mode-2/3 reloads at terminal count remain same-clock.
 
 use crate::PortDevice;
 
@@ -188,7 +186,8 @@ pub struct PitChannel {
     status_latched: Option<u8>,
     /// NULL COUNT (status bit6): set until the last written CR is loaded into CE.
     null_count: bool,
-    /// One-CLK CR→CE load pending after a full count write (modes 0/2/3/4).
+    /// One-CLK CR→CE load pending after a full count write (modes 0/2/3/4) or a
+    /// GATE rising-edge arm (modes 1/2/3/5).
     pending_load: bool,
     /// Whether a full count has been written since the last mode program.
     pub count_loaded: bool,
@@ -385,7 +384,7 @@ impl PitChannel {
         self.counting = self.gate;
     }
 
-    /// Transfer pending CR into CE on the load CLK (modes 0/2/3/4).
+    /// Transfer pending CR into CE on the load CLK (count-write or GATE-armed).
     fn apply_pending_load(&mut self) {
         self.pending_load = false;
         self.ce = if self.mode == 3 {
@@ -395,6 +394,18 @@ impl PitChannel {
         };
         self.null_count = false;
         self.out_low_pulse = false;
+        // Spec: Intel 8254 Mode 1 — OUT goes low on the CLK following GATE trigger.
+        if self.mode == 1 {
+            self.out_level = false;
+        }
+    }
+
+    /// Arm a one-CLK CR→CE load after a GATE rising edge (modes 1/2/3/5).
+    fn arm_gate_pending_load(&mut self) {
+        self.pending_load = true;
+        self.null_count = true;
+        self.out_low_pulse = false;
+        self.counting = true;
     }
 
     /// Update GATE. Spec: Intel 8254 GATE-pin operations summary — GATE low
@@ -429,14 +440,8 @@ impl PitChannel {
                 }
             }
             1 => {
-                // Retriggerable one-shot: reload CE, OUT low until terminal count.
-                // Honesty: GATE trigger still same-clock CR→CE (no one-CLK delay).
-                self.pending_load = false;
-                self.ce = self.reload_ce();
-                self.null_count = false;
-                self.out_low_pulse = false;
-                self.out_level = false;
-                self.counting = true;
+                // Retriggerable one-shot: next CLK loads CR→CE and drives OUT low.
+                self.arm_gate_pending_load();
             }
             2 | 3 => {
                 self.out_level = true;
@@ -444,27 +449,15 @@ impl PitChannel {
                     // Count written while GATE low: next tick performs CR→CE load.
                     self.counting = true;
                 } else {
-                    // Honesty: GATE-rising reload is still same-clock (no delay).
-                    self.ce = if self.mode == 3 {
-                        self.mode3_high_clks()
-                    } else {
-                        self.reload_ce()
-                    };
-                    self.null_count = false;
-                    self.out_low_pulse = false;
-                    self.counting = true;
+                    // GATE-rising reload: one-CLK delay before CR→CE.
+                    self.arm_gate_pending_load();
                 }
             }
             5 => {
-                // Hardware triggered strobe: reload CE; OUT stays high until the
-                // one-CLK strobe at terminal count.
-                // Honesty: GATE trigger still same-clock CR→CE (no one-CLK delay).
-                self.pending_load = false;
-                self.ce = self.reload_ce();
-                self.null_count = false;
-                self.out_low_pulse = false;
+                // Hardware triggered strobe: next CLK loads CR→CE; OUT stays high
+                // until the one-CLK strobe at terminal count.
                 self.out_level = true;
-                self.counting = true;
+                self.arm_gate_pending_load();
             }
             _ => {}
         }
@@ -543,8 +536,9 @@ impl PitChannel {
     /// Advance one model CLK. Returns true if OUT had a rising edge this clock.
     ///
     /// Spec: Intel 8254 modes 0–5 OUT. Per the GATE-pin operations summary, GATE
-    /// low disables counting in modes 0/2/3/4 but not in modes 1/5. Modes 0/2/3/4
-    /// spend the first CLK after a count write loading CR→CE (no decrement).
+    /// low disables counting in modes 0/2/3/4 but not in modes 1/5. A pending
+    /// CR→CE load (count write or GATE-armed) consumes the first CLK with no
+    /// decrement; Mode 1 also drives OUT low on that load CLK.
     fn tick_one(&mut self) -> bool {
         if !self.counting {
             return false;
@@ -579,11 +573,12 @@ impl PitChannel {
         !prev && self.out_level
     }
 
-    /// Mode 1 — hardware retriggerable one-shot: OUT (already driven low by the
-    /// GATE trigger in [`PitChannel::set_gate`]) returns high at terminal count.
+    /// Mode 1 — hardware retriggerable one-shot: OUT is driven low on the
+    /// GATE-armed load CLK ([`PitChannel::apply_pending_load`]) and returns high
+    /// at terminal count.
     ///
     /// Same counting cadence as mode 0; the modes differ only in what starts the
-    /// count and drives OUT low (control word vs GATE trigger).
+    /// count and drives OUT low (control word vs GATE-triggered load).
     fn tick_mode1(&mut self) -> bool {
         self.tick_mode0()
     }
@@ -1512,6 +1507,134 @@ mod tests {
         assert!(pit.out_ch2());
     }
 
+    /// Spec: Intel 8254 Mode 1 — GATE rising edge arms a one-CLK CR→CE load;
+    /// OUT goes low on that load CLK (not on the GATE edge itself).
+    #[test]
+    fn ch2_mode1_gate_one_clk_ce_load_delay() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xB2); // ch2 lohi mode 1
+        pit.port_write(PIT_CH2_DATA, 1, 0x03);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 3
+        assert!(!pit.channel2().counting);
+
+        pit.port61_write(PORT61_GATE2); // GATE rising: arm load, OUT still high
+        assert!(pit.channel2().counting);
+        assert!(pit.channel2().pending_load);
+        assert!(pit.channel2().null_count);
+        assert!(pit.out_ch2());
+
+        // Load CLK: CR→CE, NULL COUNT clears, OUT goes low (one-shot starts).
+        assert!(!pit.tick_ch2(1));
+        assert!(!pit.channel2().pending_load);
+        assert!(!pit.channel2().null_count);
+        assert_eq!(pit.channels[2].ce, 3);
+        assert!(!pit.out_ch2());
+
+        assert!(!pit.tick_ch2(2));
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1)); // terminal → OUT high
+        assert!(pit.out_ch2());
+    }
+
+    /// Spec: Intel 8254 Mode 5 — GATE rising arms one-CLK CR→CE load; countdown
+    /// and terminal strobe follow on later clocks.
+    #[test]
+    fn ch2_mode5_gate_one_clk_ce_load_delay() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xBA); // ch2 lohi mode 5
+        pit.port_write(PIT_CH2_DATA, 1, 0x03);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 3
+        assert!(!pit.channel2().counting);
+
+        pit.port61_write(PORT61_GATE2);
+        assert!(pit.channel2().counting);
+        assert!(pit.channel2().pending_load);
+        assert!(pit.out_ch2());
+
+        assert!(!pit.tick_ch2(1)); // load CE=3
+        assert_eq!(pit.channels[2].ce, 3);
+        assert!(!pit.channel2().pending_load);
+        assert!(pit.out_ch2());
+
+        assert!(!pit.tick_ch2(2)); // countdown 3→1
+        assert_eq!(pit.channels[2].ce, 1);
+        assert!(!pit.tick_ch2(1)); // terminal strobe
+        assert!(!pit.out_ch2());
+        assert!(pit.tick_ch2(1));
+        assert!(pit.out_ch2());
+    }
+
+    /// Spec: Intel 8254 Mode 2 — GATE rising-edge reload uses the same one-CLK
+    /// CR→CE delay as a count-write load (not same-clock as the edge).
+    #[test]
+    fn ch2_mode2_gate_rising_reload_one_clk_delay() {
+        let mut pit = Pit8254::new();
+        pit.port61_write(PORT61_GATE2);
+        pit.port_write(PIT_CONTROL, 1, 0xB4); // ch2 lohi mode 2
+        pit.port_write(PIT_CH2_DATA, 1, 0x06);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 6
+        assert!(!pit.tick_ch2(1)); // count-write load
+        assert!(!pit.tick_ch2(2)); // CE 6 → 4
+        assert_eq!(pit.channels[2].ce, 4);
+
+        pit.port61_write(0); // GATE low: force OUT high, stop
+        assert!(pit.out_ch2());
+        pit.port61_write(PORT61_GATE2); // rising reload armed
+        assert!(pit.channel2().pending_load);
+        assert!(pit.channel2().null_count);
+        assert_eq!(pit.channels[2].ce, 4); // CE unchanged until load CLK
+
+        assert!(!pit.tick_ch2(1)); // GATE-armed CR→CE
+        assert!(!pit.channel2().pending_load);
+        assert_eq!(pit.channels[2].ce, 6);
+        assert!(pit.out_ch2());
+    }
+
+    /// Spec: Intel 8254 Mode 3 — GATE rising reload arms one-CLK load into the
+    /// high half-period (coexists with approximate 50% duty).
+    #[test]
+    fn ch2_mode3_gate_rising_reload_one_clk_delay_duty() {
+        let mut pit = Pit8254::new();
+        pit.port61_write(PORT61_GATE2);
+        pit.port_write(PIT_CONTROL, 1, 0xB6); // ch2 lohi mode 3
+        pit.port_write(PIT_CH2_DATA, 1, 0x08);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // even N=8 → high half = 4
+        assert!(!pit.tick_ch2(1)); // count-write load → CE = 4
+        assert_eq!(pit.channels[2].ce, 4);
+        assert!(!pit.tick_ch2(2));
+        assert_eq!(pit.channels[2].ce, 2);
+
+        pit.port61_write(0);
+        pit.port61_write(PORT61_GATE2);
+        assert!(pit.channel2().pending_load);
+        assert_eq!(pit.channels[2].ce, 2);
+
+        assert!(!pit.tick_ch2(1)); // load high half again
+        assert_eq!(pit.channels[2].ce, 4);
+        assert!(pit.out_ch2());
+        assert!(!pit.channel2().pending_load);
+    }
+
+    /// Spec: Intel 8254 Mode 1 BCD — GATE-armed one-CLK load coexists with BCD
+    /// decade countdown (written BCD `0x05` → 5 clocks after the load CLK).
+    #[test]
+    fn ch2_mode1_bcd_gate_one_clk_load_delay() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0xB3); // ch2 lohi mode 1 BCD
+        pit.port_write(PIT_CH2_DATA, 1, 0x05);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // BCD count = 5
+        pit.port61_write(PORT61_GATE2);
+        assert!(pit.channel2().pending_load);
+        assert!(pit.out_ch2());
+
+        assert!(!pit.tick_ch2(1)); // load
+        assert_eq!(pit.channels[2].ce, 5);
+        assert!(!pit.out_ch2());
+        assert!(!pit.tick_ch2(4));
+        assert!(pit.tick_ch2(1));
+        assert!(pit.out_ch2());
+    }
+
     /// Spec: Intel 8254 "Mode Definitions" — Mode 5 (Hardware Triggered
     /// Strobe): OUT high after the control word; counting starts on the GATE
     /// rising edge (not on the count write); OUT low one CLK at terminal count.
@@ -1529,7 +1652,9 @@ mod tests {
 
         pit.port61_write(PORT61_GATE2); // GATE rising edge triggers
         assert!(pit.channel2().counting);
+        assert!(pit.channel2().pending_load);
         assert!(pit.out_ch2());
+        assert!(!pit.tick_ch2(1)); // one-CLK CR→CE load
         assert!(!pit.tick_ch2(2));
         assert!(pit.out_ch2());
         assert!(!pit.tick_ch2(1)); // terminal count → OUT low one clock
@@ -1548,6 +1673,7 @@ mod tests {
         pit.port_write(PIT_CH2_DATA, 1, 0x04);
         pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 4
         pit.port61_write(PORT61_GATE2);
+        assert!(!pit.tick_ch2(1)); // GATE-armed load
         assert!(!pit.tick_ch2(2)); // CE 4 → 2
         assert_eq!(pit.channels[2].ce, 2);
 
@@ -1555,7 +1681,10 @@ mod tests {
         assert!(!pit.tick_ch2(1));
         assert_eq!(pit.channels[2].ce, 1);
 
-        pit.port61_write(PORT61_GATE2); // retrigger → full count again
+        pit.port61_write(PORT61_GATE2); // retrigger arms one-CLK reload
+        assert!(pit.channel2().pending_load);
+        assert_eq!(pit.channels[2].ce, 1); // CE unchanged until load CLK
+        assert!(!pit.tick_ch2(1)); // load CE=4
         assert_eq!(pit.channels[2].ce, 4);
         assert!(!pit.tick_ch2(3)); // would have strobed at CE 1 without reload
         assert!(pit.out_ch2());
@@ -1566,8 +1695,8 @@ mod tests {
     }
 
     /// Spec: Intel 8254 "Mode Definitions" — Mode 1 (Hardware Retriggerable
-    /// One-Shot): OUT high after the control word, low on the GATE trigger,
-    /// low until terminal count, then high.
+    /// One-Shot): OUT high after the control word; GATE rising arms load; OUT
+    /// goes low on the following CLK until terminal count, then high.
     #[test]
     fn ch2_mode1_one_shot_low_until_terminal_count() {
         let mut pit = Pit8254::new();
@@ -1580,8 +1709,11 @@ mod tests {
         assert!(!pit.tick_ch2(10));
         assert!(pit.out_ch2());
 
-        pit.port61_write(PORT61_GATE2); // trigger → OUT low
+        pit.port61_write(PORT61_GATE2); // trigger arms load; OUT still high
         assert!(pit.channel2().counting);
+        assert!(pit.channel2().pending_load);
+        assert!(pit.out_ch2());
+        assert!(!pit.tick_ch2(1)); // load CLK → OUT low
         assert!(!pit.out_ch2());
         assert!(!pit.tick_ch2(2));
         assert!(!pit.out_ch2());
@@ -1592,7 +1724,7 @@ mod tests {
     }
 
     /// Spec: Intel 8254 Mode 1 — retriggerable: a GATE rising edge while OUT is
-    /// low reloads the counter and restarts the low period.
+    /// low arms a one-CLK reload and restarts the low period.
     #[test]
     fn ch2_mode1_gate_rising_edge_restarts_one_shot() {
         let mut pit = Pit8254::new();
@@ -1600,12 +1732,17 @@ mod tests {
         pit.port_write(PIT_CH2_DATA, 1, 0x04);
         pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 4
         pit.port61_write(PORT61_GATE2);
+        assert!(!pit.tick_ch2(1)); // load → OUT low, CE=4
+        assert!(!pit.out_ch2());
         assert!(!pit.tick_ch2(2)); // CE 4 → 2, OUT still low
         assert!(!pit.out_ch2());
 
         pit.port61_write(0);
         pit.port61_write(PORT61_GATE2); // retrigger mid one-shot
         assert!(!pit.out_ch2());
+        assert!(pit.channel2().pending_load);
+        assert_eq!(pit.channels[2].ce, 2);
+        assert!(!pit.tick_ch2(1)); // load CE=4
         assert_eq!(pit.channels[2].ce, 4);
         assert!(!pit.tick_ch2(3)); // full count from the retrigger
         assert!(!pit.out_ch2());
@@ -1614,14 +1751,17 @@ mod tests {
     }
 
     /// Spec: Intel 8254 Mode 1 — writing a new count does not affect the
-    /// in-progress one-shot; it is loaded on the next trigger.
+    /// in-progress one-shot; it is loaded on the next trigger (one-CLK delay).
     #[test]
     fn ch2_mode1_new_count_applies_on_next_trigger() {
         let mut pit = Pit8254::new();
         pit.port_write(PIT_CONTROL, 1, 0xB2); // ch2 lohi mode 1
         pit.port_write(PIT_CH2_DATA, 1, 0x02);
         pit.port_write(PIT_CH2_DATA, 1, 0x00); // count = 2
-        pit.port61_write(PORT61_GATE2); // trigger → CE = 2
+        pit.port61_write(PORT61_GATE2); // trigger arms load
+        assert!(!pit.tick_ch2(1)); // load CE=2, OUT low
+        assert_eq!(pit.channels[2].ce, 2);
+        assert!(!pit.out_ch2());
 
         pit.port_write(PIT_CH2_DATA, 1, 0x05);
         pit.port_write(PIT_CH2_DATA, 1, 0x00); // new count = 5 mid one-shot
@@ -1632,7 +1772,10 @@ mod tests {
         assert!(pit.out_ch2());
 
         pit.port61_write(0);
-        pit.port61_write(PORT61_GATE2); // next trigger loads the new count
+        pit.port61_write(PORT61_GATE2); // next trigger arms load of new count
+        assert!(pit.channel2().pending_load);
+        assert!(pit.out_ch2()); // OUT still high until the load CLK
+        assert!(!pit.tick_ch2(1)); // load CE=5, OUT low
         assert_eq!(pit.channels[2].ce, 5);
         assert!(!pit.out_ch2());
         assert!(!pit.tick_ch2(4));
