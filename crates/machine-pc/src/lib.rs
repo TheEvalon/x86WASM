@@ -170,10 +170,11 @@ impl Machine {
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
 
-    /// Apply a latched 8042 pulse-reset (`0xFE` on `0x64`) via [`Self::reset`].
+    /// Apply a latched 8042 system-reset request via [`Self::reset`].
     ///
-    /// Spec: OSDev I8042 — controller command `0xFE` pulses the system-reset
-    /// line. Returns `true` when a request was taken and reset ran. Called
+    /// Spec: OSDev I8042 / IBM PC AT — controller command `0xFE` on `0x64`, or
+    /// output-port write (`0xD1`) with bit0 clear, pulses the system-reset line.
+    /// Returns `true` when a request was taken and reset ran. Called
     /// automatically after each [`Self::step`]. Distinct from keyboard Resend
     /// `0xFE` on data port `0x60`.
     pub fn service_8042_pulse_reset(&mut self) -> bool {
@@ -699,8 +700,9 @@ impl MachineBus<'_> {
             I8042_DATA | I8042_STATUS_CMD => {
                 self.kbd.port_write(port, size, value);
                 // Spec: IBM PC AT 8042 output port bit1 → A20 gate on phys mem.
-                // Pulse-reset `0xFE` on `0x64` latches on `kbd` for
-                // [`Machine::service_8042_pulse_reset`] after the bus borrow ends.
+                // Pulse-reset `0xFE` on `0x64` and `0xD1` writes with bit0 clear
+                // latch on `kbd` for [`Machine::service_8042_pulse_reset`] after
+                // the bus borrow ends.
                 self.mem.set_a20_enabled(self.kbd.a20_enabled());
             }
             0x3F8..0x400 => self.com1.port_write(port, size, value),
@@ -1675,6 +1677,33 @@ mod tests {
         {
             let mut bus = m.bus_mut();
             bus.port_out_u8(I8042_STATUS_CMD, CMD_PULSE_RESET).unwrap();
+        }
+        assert!(m.service_8042_pulse_reset());
+        let fresh = CpuState::reset();
+        assert_eq!(m.cpu.rip, fresh.rip);
+        assert_eq!(m.cpu.cs.selector, fresh.cs.selector);
+        assert_eq!(m.cpu.cs.base, fresh.cs.base);
+        assert_eq!(m.cpu.gpr[CpuState::RAX], 0);
+        assert_eq!(m.kbd, I8042::new());
+        assert!(!m.service_8042_pulse_reset());
+    }
+
+    /// Spec: IBM PC AT / OSDev I8042 — OUT 0x64,0xD1 / OUT 0x60 with bit0 clear
+    /// latches the same system-reset path as pulse-reset `0xFE`.
+    #[test]
+    fn machine_bus_8042_d1_bit0_low_restores_cpu_reset_vector() {
+        let mut m = Machine::new(64 * 1024);
+        m.cpu.set_ip16(0x1234);
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x1000);
+        m.cpu.gpr[CpuState::RAX] = 0xDEAD_BEEF;
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
+        assert_ne!(m.kbd, I8042::new());
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(I8042_STATUS_CMD, CMD_WRITE_OUTPUT_PORT)
+                .unwrap();
+            bus.port_out_u8(I8042_DATA, 0xDE).unwrap(); // bit0 low → system reset
         }
         assert!(m.service_8042_pulse_reset());
         let fresh = CpuState::reset();
