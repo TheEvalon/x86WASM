@@ -6,13 +6,15 @@
 //! PCI configuration mechanism #1 stub (0xCF8/0xCFC) + PIIX ISA/IDE/USB/ACPI functions;
 //! Primary IDE IDENTIFY + READ/WRITE SECTORS PIO + IRQ14 + 0xA1 ABRT stub (1F0–1F7/3F6);
 //! Secondary IDE thin remap (170–177/376) + IRQ15;
-//! 82077AA FDC port stub (0x3F0–0x3F5/0x3F7; Specify/Recalibrate/Seek/Sense Int; IRQ6; no media).
+//! 82077AA FDC port stub (0x3F0–0x3F5/0x3F7; Specify/Recalibrate/Seek/Sense Int; IRQ6; no media);
+//! QEMU fw_cfg I/O subset (0x510/0x511; signature + file store).
 
 #![forbid(unsafe_code)]
 
 mod cmos;
 mod dma;
 mod fdc;
+mod fw_cfg;
 mod i8042;
 mod ide;
 mod pci;
@@ -42,6 +44,11 @@ pub use fdc::{
     FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST1_ND, FDC_ST1_NW, FDC_ST3_HEAD, FDC_ST3_RESERVED_BIT3,
     FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FDC_ST3_UNIT_MASK, FDC_ST3_WRITE_PROTECT, FDC_TDR,
     FDC_VERSION_82077AA,
+};
+pub use fw_cfg::{
+    FwCfg, FwCfgItem, FW_CFG_DATA, FW_CFG_FILE_DIR, FW_CFG_FILE_FIRST, FW_CFG_SELECTOR,
+    FW_CFG_SEL_WRITE, FW_CFG_SIGNATURE, FW_CFG_SIGNATURE_BYTES, FW_CFG_TEST_FILE_BYTES,
+    FW_CFG_TEST_FILE_NAME,
 };
 pub use i8042::{
     CFG_AUX_CLOCK_DISABLE, CFG_INT1, CFG_INT12, CFG_KBD_CLOCK_DISABLE, CFG_TRANSLATE,

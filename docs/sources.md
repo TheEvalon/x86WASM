@@ -52,7 +52,8 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 
 ## Firmware
 
-- SeaBIOS documentation — memory map: legacy BIOS ROM is mapped at the top of the 32-bit physical address space (last `N` bytes ending at `0xFFFF_FFFF`); the last up to 128 KiB is also visible in the first mebibyte (`0xE0000`–`0xFFFFF`, so a 64 KiB image aliases at `0xF0000`). Reset vector fetch uses `CS.base=0xFFFF_0000` + `IP=0xFFF0` → `0xFFFF_FFF0`. This tree implements placement via `firmware_interface::prepare_bios_rom` / `Machine::load_bios_rom` (synthetic test blobs only; GPL SeaBIOS binaries stay under `firmware/`, not in crates). SeaBIOS POST / option ROMs / fw_cfg not claimed.
+- SeaBIOS documentation — memory map: legacy BIOS ROM is mapped at the top of the 32-bit physical address space (last `N` bytes ending at `0xFFFF_FFFF`); the last up to 128 KiB is also visible in the first mebibyte (`0xE0000`–`0xFFFFF`, so a 64 KiB image aliases at `0xF0000`). Reset vector fetch uses `CS.base=0xFFFF_0000` + `IP=0xFFF0` → `0xFFFF_FFF0`. This tree implements placement via `firmware_interface::prepare_bios_rom` / `Machine::load_bios_rom` (synthetic test blobs only; GPL SeaBIOS binaries stay under `firmware/`, not in crates). SeaBIOS POST / option ROMs not claimed.
+- QEMU Firmware Configuration (fw_cfg) Device — https://www.qemu.org/docs/master/specs/fw_cfg.html — x86 I/O selector `0x510` (16-bit LE) + data `0x511` (8-bit); signature key `0x0000` → ASCII `QEMU`; file directory key `0x0019`; named files from `0x0020`; traditional data-port writes ignored (QEMU ≥2.4). This tree: `devices::FwCfg` signature + one test file on `MachineBus`; **not** DMA interface `0x514` / full firmware blob set.
 - OVMF / EDK II documentation
 
 ## Oracles and tooling (behavior reference — do not copy source)
