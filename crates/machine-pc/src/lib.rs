@@ -177,20 +177,21 @@ impl Machine {
         self.ide.reset();
         self.ide_secondary.reset();
         self.fdc.reset();
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
-    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
-    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
-    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+        self.fw_cfg.reset();
+        // Spec: IBM PC AT — A20 open at reset; follow 8042 / port 0x92 defaults.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
         self.port92.set_a20_enabled(self.kbd.a20_enabled());
     }
-
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
-    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
-    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
-    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    /// Apply a latched system-reset via [`Self::reset`].
+    ///
+    /// Sources (OR'd; shared latch pattern):
+    /// - 8042 pulse-reset `0xFE` on `0x64` ([`I8042::take_system_reset_request`])
+    /// - 8042 output-port write (`0xD1`) with bit0 clear (same kbd latch)
+    /// - System Control Port A `0x92` bit0 write-1 ([`Port92::take_system_reset_request`])
+    ///
+    /// Spec: OSDev I8042 / IBM PC AT + OSDev A20 Line (fast reset). Returns `true` when a
+    /// request was taken and reset ran. Called automatically after each
+    /// [`Self::step`]. Distinct from keyboard Resend `0xFE` on data port `0x60`.
     pub fn service_8042_pulse_reset(&mut self) -> bool {
         let from_kbd = self.kbd.take_system_reset_request();
         let from_port92 = self.port92.take_system_reset_request();
@@ -772,11 +773,15 @@ impl MachineBus<'_> {
             CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
             I8042_DATA | I8042_STATUS_CMD => {
                 self.kbd.port_write(port, size, value);
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
-    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
-    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
-    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+                // Spec: IBM PC AT 8042 output port bit1 → A20 gate on phys mem;
+                // Spec: IBM PC AT 8042 output port bit1 → A20 gate on phys mem;
+                // mirror to System Control Port A (`0x92`) bit1.
+                // Pulse-reset `0xFE` on `0x64` and `0xD1` writes with bit0 clear
+                // latch on `kbd` for [`Machine::service_8042_pulse_reset`] after
+                // the bus borrow ends.
+                let enabled = self.kbd.a20_enabled();
+                self.mem.set_a20_enabled(enabled);
+                self.port92.set_a20_enabled(enabled);
             }
             0x2F8..0x300 => self.com2.port_write(port, size, value),
             0x3F8..0x400 => self.com1.port_write(port, size, value),
@@ -876,11 +881,15 @@ mod tests {
         FDC_CMD_SENSE_DRIVE_STATUS, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA,
         FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM,
         FDC_SECTOR_SIZE, FDC_ST0_IC_ABNORMAL, FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST3_RESERVED_BIT3,
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
-    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
-    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
-    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FW_CFG_DATA, FW_CFG_SELECTOR, FW_CFG_SIGNATURE,
+        FW_CFG_SIGNATURE_BYTES, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS,
+        PCI_CONFIG_DATA, PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA,
+        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA,
+        PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT92_A20,
+        PORT92_RESET, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A, REG_STATUS_A, REG_STATUS_B,
+        REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
+        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
+        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
