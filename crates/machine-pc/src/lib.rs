@@ -1853,6 +1853,48 @@ mod tests {
         assert_eq!(m.pic.elcr_level_mask(), (0, 0));
     }
 
+    /// Spec: Intel 82371 / IFB ELCR — IRQ0/1/2/8/13 reserved hardwired edge;
+    /// MachineBus write of 0xFF must not level those IRQs.
+    #[test]
+    fn machine_bus_elcr_reserved_irqs_stay_edge() {
+        use devices::{PIIX_ELCR_MASTER_WRITABLE, PIIX_ELCR_SLAVE_WRITABLE};
+
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PIIX_ELCR_MASTER, 0xFF).unwrap();
+            bus.port_out_u8(PIIX_ELCR_SLAVE, 0xFF).unwrap();
+            assert_eq!(
+                bus.port_in_u8(PIIX_ELCR_MASTER).unwrap(),
+                PIIX_ELCR_MASTER_WRITABLE
+            );
+            assert_eq!(
+                bus.port_in_u8(PIIX_ELCR_SLAVE).unwrap(),
+                PIIX_ELCR_SLAVE_WRITABLE
+            );
+        }
+        assert_eq!(
+            m.pci.elcr,
+            [PIIX_ELCR_MASTER_WRITABLE, PIIX_ELCR_SLAVE_WRITABLE]
+        );
+        assert_eq!(
+            m.pic.elcr_level_mask(),
+            (PIIX_ELCR_MASTER_WRITABLE, PIIX_ELCR_SLAVE_WRITABLE)
+        );
+        assert!(!m.pic.master.ir_is_level(0));
+        assert!(!m.pic.master.ir_is_level(1));
+        assert!(!m.pic.master.ir_is_level(2));
+        assert!(!m.pic.slave.ir_is_level(0));
+        assert!(!m.pic.slave.ir_is_level(5));
+
+        // Held-high IRQ0: edge semantics (no post-EOI redelivery).
+        m.pic.set_irq_line(0, true);
+        assert_eq!(m.pic.poll_irq(), Some(0x08));
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(m.pic.poll_irq(), None);
+    }
+
     /// Spec: PCI Local Bus Mechanism #1 — host bridge vendor/device via MachineBus.
     #[test]
     fn machine_bus_pci_host_bridge_vendor() {

@@ -57,6 +57,8 @@
 //! - Enable bit clear: data-port reads return `0xFFFFFFFF` (open-bus style).
 //! - Byte/word/dword access via `0xCFC` + offset.
 //! - PIIX ELCR `0x4D0`/`0x4D1` byte store/readback (reset `0x00`/`0x00`).
+//!   Reserved IRQ0/1/2/8/13 bits are hardwired 0 (always edge) via
+//!   [`PIIX_ELCR_MASTER_WRITABLE`] / [`PIIX_ELCR_SLAVE_WRITABLE`].
 //!   `MachineBus` syncs writes into `DualPic::set_elcr_level_mask` (per-IR level
 //!   vs edge; OR'd with ICW1.LTIM inside `Pic8259`).
 //!
@@ -70,7 +72,6 @@
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (Command + Status + PMBASE config only)
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
-//! - PIIX ELCR reserved-bit hardwiring (IRQ0/1/2/8/13 always-edge on real silicon)
 
 use crate::PortDevice;
 
@@ -266,6 +267,20 @@ pub const PIIX_ELCR_MASTER: u16 = 0x4D0;
 /// PIIX ISA Edge/Level Control Register — slave PIC (IRQs 8–15).
 /// Spec: Intel 82371 / OSDev 8259 PIC ELCR — I/O port `0x4D1`.
 pub const PIIX_ELCR_SLAVE: u16 = 0x4D1;
+/// Writable bits in master ELCR (`0x4D0`): IRQ3–7.
+///
+/// Spec: Intel 82371 / IFB — IRQ0 (timer), IRQ1 (keyboard), and IRQ2 (cascade)
+/// are reserved / hardwired edge-triggered; software cannot select level.
+pub const PIIX_ELCR_MASTER_WRITABLE: u8 = 0xF8;
+/// Writable bits in slave ELCR (`0x4D1`): all except IRQ8 and IRQ13.
+///
+/// Spec: Intel 82371 / IFB — IRQ8# (RTC) and IRQ13 (FPU error) are reserved /
+/// hardwired edge-triggered; software cannot select level.
+pub const PIIX_ELCR_SLAVE_WRITABLE: u8 = 0xDE;
+const _: () = assert!(PIIX_ELCR_MASTER_WRITABLE == 0xF8);
+const _: () = assert!(PIIX_ELCR_SLAVE_WRITABLE == 0xDE);
+const _: () = assert!(PIIX_ELCR_MASTER_WRITABLE & 0x07 == 0);
+const _: () = assert!(PIIX_ELCR_SLAVE_WRITABLE & 0x21 == 0);
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -297,8 +312,20 @@ pub struct PciConfig {
     /// PIIX ACPI at `00:01.3` (identity stub only; `8086:7113`).
     piix_acpi: [u8; 256],
     /// PIIX ISA ELCR bytes at `0x4D0`/`0x4D1` (master/slave); reset `0x00`.
+    /// Reserved IRQ0/1/2/8/13 bits are always 0 (hardwired edge).
     /// `MachineBus` applies these to `DualPic::set_elcr_level_mask` on write.
     pub elcr: [u8; 2],
+}
+
+/// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
+///
+/// Spec: Intel 82371 / IFB — those IRQs cannot be programmed level-sensitive.
+#[inline]
+pub fn sanitize_piix_elcr(master: u8, slave: u8) -> (u8, u8) {
+    (
+        master & PIIX_ELCR_MASTER_WRITABLE,
+        slave & PIIX_ELCR_SLAVE_WRITABLE,
+    )
 }
 
 impl Default for PciConfig {
@@ -798,15 +825,31 @@ impl PortDevice for PciConfig {
             self.write_data(size, port, value);
             return;
         }
-        // Spec: Intel 82371 / OSDev ELCR — store/readback; MachineBus syncs DualPic.
+        // Spec: Intel 82371 / OSDev ELCR — store/readback; reserved IRQ0/1/2/8/13
+        // bits hardwired 0 (always edge). MachineBus syncs DualPic.
         if port == PIIX_ELCR_MASTER || port == PIIX_ELCR_SLAVE {
             let idx = (port - PIIX_ELCR_MASTER) as usize;
             match size {
-                1 => self.elcr[idx] = value as u8,
-                2 if port == PIIX_ELCR_MASTER => {
-                    self.elcr = (value as u16).to_le_bytes();
+                1 => {
+                    let mask = if idx == 0 {
+                        PIIX_ELCR_MASTER_WRITABLE
+                    } else {
+                        PIIX_ELCR_SLAVE_WRITABLE
+                    };
+                    self.elcr[idx] = (value as u8) & mask;
                 }
-                _ => self.elcr[idx] = value as u8,
+                2 if port == PIIX_ELCR_MASTER => {
+                    let (m, s) = sanitize_piix_elcr(value as u8, (value >> 8) as u8);
+                    self.elcr = [m, s];
+                }
+                _ => {
+                    let mask = if idx == 0 {
+                        PIIX_ELCR_MASTER_WRITABLE
+                    } else {
+                        PIIX_ELCR_SLAVE_WRITABLE
+                    };
+                    self.elcr[idx] = (value as u8) & mask;
+                }
             }
         }
     }
@@ -937,6 +980,7 @@ mod tests {
 
     /// Spec: Intel 82371 / OSDev 8259 PIC ELCR — SeaBIOS/PIIX programs
     /// `0x4D0`/`0x4D1` for edge/level; store/readback (DualPic sync on MachineBus).
+    /// Reserved IRQ0/1/2/8/13 bits are hardwired 0 (always edge) on write.
     #[test]
     fn piix_elcr_store_readback_and_reset() {
         let mut pci = PciConfig::new();
@@ -949,15 +993,52 @@ mod tests {
         assert_eq!(pci.port_read(PIIX_ELCR_SLAVE, 1) as u8, 0x0C);
         assert_eq!(pci.elcr, [0x28, 0x0C]);
 
-        // Word access at 0x4D0 covers both ELCR bytes (LE).
+        // Word access at 0x4D0 covers both ELCR bytes (LE); reserved bits masked.
+        // 0x5A → 0x58 (clear IRQ1); 0xA5 → 0x84 (clear IRQ8/IRQ13).
         pci.port_write(PIIX_ELCR_MASTER, 2, 0xA5_5A);
-        assert_eq!(pci.port_read(PIIX_ELCR_MASTER, 2) as u16, 0xA5_5A);
-        assert_eq!(pci.elcr, [0x5A, 0xA5]);
+        assert_eq!(
+            pci.port_read(PIIX_ELCR_MASTER, 2) as u16,
+            u16::from_le_bytes([
+                0x5A & PIIX_ELCR_MASTER_WRITABLE,
+                0xA5 & PIIX_ELCR_SLAVE_WRITABLE,
+            ])
+        );
+        assert_eq!(
+            pci.elcr,
+            [
+                0x5A & PIIX_ELCR_MASTER_WRITABLE,
+                0xA5 & PIIX_ELCR_SLAVE_WRITABLE,
+            ]
+        );
 
         pci.reset();
         assert_eq!(pci.elcr, [0x00, 0x00]);
         assert_eq!(pci.port_read(PIIX_ELCR_MASTER, 1) as u8, 0x00);
         assert_eq!(pci.port_read(PIIX_ELCR_SLAVE, 1) as u8, 0x00);
+    }
+
+    /// Spec: Intel 82371 / IFB ELCR — IRQ0/1/2/8/13 cannot be programmed for
+    /// level-sensitive mode; reserved bits are hardwired 0 (always edge).
+    #[test]
+    fn piix_elcr_reserved_irqs_hardwired_edge_on_write() {
+        let mut pci = PciConfig::new();
+        pci.port_write(PIIX_ELCR_MASTER, 1, 0xFF);
+        pci.port_write(PIIX_ELCR_SLAVE, 1, 0xFF);
+        assert_eq!(
+            pci.port_read(PIIX_ELCR_MASTER, 1) as u8,
+            PIIX_ELCR_MASTER_WRITABLE
+        );
+        assert_eq!(
+            pci.port_read(PIIX_ELCR_SLAVE, 1) as u8,
+            PIIX_ELCR_SLAVE_WRITABLE
+        );
+        assert_eq!(
+            pci.elcr,
+            [PIIX_ELCR_MASTER_WRITABLE, PIIX_ELCR_SLAVE_WRITABLE]
+        );
+        // Explicit reserved-bit checks.
+        assert_eq!(pci.elcr[0] & 0x07, 0, "IRQ0/1/2 reserved");
+        assert_eq!(pci.elcr[1] & 0x21, 0, "IRQ8/13 reserved");
     }
 
     #[test]
