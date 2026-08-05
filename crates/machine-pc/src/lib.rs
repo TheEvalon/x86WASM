@@ -14,10 +14,10 @@ pub use mem::PhysMem;
 
 use devices::{
     CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
-    IdeSecondary, PciConfig, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
+    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
     FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
     PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
-    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{prepare_bios_rom, BiosRomError, RomImage};
 use ports::PortBus;
@@ -51,6 +51,8 @@ pub struct Machine {
     /// 8042 / PS/2 controller (ports 0x60/0x64); OBF+INT1 → IRQ1,
     /// AUX OBF+INT12 → IRQ12 (second-port controller side; no mouse device).
     pub kbd: I8042,
+    /// System Control Port A (`0x92`) — Fast Gate A20 + fast reset pulse.
+    pub port92: Port92,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
     /// VGA color text plane at 0xB8000 + CRTC/Seq/GC/ATC/DAC/Misc stubs.
@@ -80,6 +82,7 @@ impl Machine {
             pit: Pit8254::new(),
             cmos: CmosRtc::new(),
             kbd: I8042::new(),
+            port92: Port92::new(),
             dma: Dma8237::new(),
             vga: VgaText::new(),
             pci: PciConfig::new(),
@@ -167,26 +170,31 @@ impl Machine {
         self.pit.reset();
         self.cmos.reset();
         self.kbd.reset();
+        self.port92.reset();
         self.dma.reset();
         self.vga.reset();
         self.pci.reset();
         self.ide.reset();
         self.ide_secondary.reset();
         self.fdc.reset();
-        self.fw_cfg.reset();
-        // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
+    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
+    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
+        self.port92.set_a20_enabled(self.kbd.a20_enabled());
     }
 
-    /// Apply a latched 8042 system-reset request via [`Self::reset`].
-    ///
-    /// Spec: OSDev I8042 / IBM PC AT — controller command `0xFE` on `0x64`, or
-    /// output-port write (`0xD1`) with bit0 clear, pulses the system-reset line.
-    /// Returns `true` when a request was taken and reset ran. Called
-    /// automatically after each [`Self::step`]. Distinct from keyboard Resend
-    /// `0xFE` on data port `0x60`.
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
+    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
+    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
     pub fn service_8042_pulse_reset(&mut self) -> bool {
-        if self.kbd.take_system_reset_request() {
+        let from_kbd = self.kbd.take_system_reset_request();
+        let from_port92 = self.port92.take_system_reset_request();
+        if from_kbd || from_port92 {
             self.reset();
             true
         } else {
@@ -206,6 +214,7 @@ impl Machine {
             pit: &mut self.pit,
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
+            port92: &mut self.port92,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
@@ -217,9 +226,11 @@ impl Machine {
         }
     }
 
-    /// Sync [`PhysMem`] A20 mask from the 8042 output-port bit1.
+    /// Sync [`PhysMem`] A20 mask from the 8042 output-port bit1 and mirror to port `0x92`.
     pub fn sync_a20_from_kbd(&mut self) {
-        self.mem.set_a20_enabled(self.kbd.a20_enabled());
+        let enabled = self.kbd.a20_enabled();
+        self.mem.set_a20_enabled(enabled);
+        self.port92.set_a20_enabled(enabled);
     }
 
     pub fn step(&mut self) -> Result<(), MachineError> {
@@ -234,6 +245,7 @@ impl Machine {
                 pit: &mut self.pit,
                 cmos: &mut self.cmos,
                 kbd: &mut self.kbd,
+                port92: &mut self.port92,
                 dma: &mut self.dma,
                 vga: &mut self.vga,
                 pci: &mut self.pci,
@@ -245,7 +257,7 @@ impl Machine {
             };
             step(&mut self.cpu, &mut view)?;
         }
-        // Spec: OSDev I8042 — pulse-reset after the OUT completes (CPU not in bus view).
+        // Spec: OSDev I8042 / A20 Line — system-reset after OUT (CPU not in bus view).
         let _ = self.service_8042_pulse_reset();
         Ok(())
     }
@@ -562,6 +574,7 @@ struct MachineBus<'a> {
     pit: &'a mut Pit8254,
     cmos: &'a mut CmosRtc,
     kbd: &'a mut I8042,
+    port92: &'a mut Port92,
     dma: &'a mut Dma8237,
     vga: &'a mut VgaText,
     pci: &'a mut PciConfig,
@@ -676,6 +689,7 @@ impl MachineBus<'_> {
                 self.pit.port_read(port, size)
             }
             PORT_SYSTEM_CONTROL => u32::from(self.pit.port61_read()),
+            PORT_SYSTEM_CONTROL_A => self.port92.port_read(port, size),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
             0x2F8..0x300 => self.com2.port_read(port, size),
@@ -746,14 +760,23 @@ impl MachineBus<'_> {
                 self.pit.port_write(port, size, value);
             }
             PORT_SYSTEM_CONTROL => self.pit.port61_write(value as u8),
+            PORT_SYSTEM_CONTROL_A => {
+                self.port92.port_write(port, size, value);
+                // Spec: OSDev A20 Line — Fast Gate A20 (bit1) → PhysMem; mirror
+                // to 8042 output-port bit1. Bit0 reset latches on `port92` for
+                // [`Machine::service_8042_pulse_reset`] after the bus borrow ends.
+                let enabled = self.port92.a20_enabled();
+                self.mem.set_a20_enabled(enabled);
+                self.kbd.set_a20_enabled(enabled);
+            }
             CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
             I8042_DATA | I8042_STATUS_CMD => {
                 self.kbd.port_write(port, size, value);
-                // Spec: IBM PC AT 8042 output port bit1 → A20 gate on phys mem.
-                // Pulse-reset `0xFE` on `0x64` and `0xD1` writes with bit0 clear
-                // latch on `kbd` for [`Machine::service_8042_pulse_reset`] after
-                // the bus borrow ends.
-                self.mem.set_a20_enabled(self.kbd.a20_enabled());
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
+    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
+    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
             }
             0x2F8..0x300 => self.com2.port_write(port, size, value),
             0x3F8..0x400 => self.com1.port_write(port, size, value),
@@ -846,22 +869,18 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, CFG_INT1, CFG_INT12, CFG_TRANSLATE,
+        CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, Port92, CFG_INT1, CFG_INT12, CFG_TRANSLATE,
         CMD_ENABLE_KBD, CMD_PULSE_RESET, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG,
         CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, FDC_1440_IMAGE_SIZE, FDC_CMD_CONFIGURE,
         FDC_CMD_MFM, FDC_CMD_READ_DATA, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK,
         FDC_CMD_SENSE_DRIVE_STATUS, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA,
         FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM,
         FDC_SECTOR_SIZE, FDC_ST0_IC_ABNORMAL, FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST3_RESERVED_BIT3,
-        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FW_CFG_DATA, FW_CFG_SELECTOR, FW_CFG_SIGNATURE,
-        FW_CFG_SIGNATURE_BYTES, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS,
-        PCI_CONFIG_DATA, PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA,
-        PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA,
-        PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
-        STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
-        VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
-        VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
+    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
+    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
     };
 
     #[test]
@@ -1729,6 +1748,7 @@ mod tests {
         assert_eq!(m.pit, Pit8254::new());
         assert_eq!(m.cmos, CmosRtc::new());
         assert_eq!(m.kbd, I8042::new());
+        assert_eq!(m.port92, Port92::new());
         assert_eq!(m.pci, PciConfig::new());
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
@@ -1872,6 +1892,87 @@ mod tests {
         assert!(steps > 0);
         assert!(m.cpu.halted);
         assert!(!m.mem.a20_enabled());
+        assert!(!m.port92.a20_enabled());
+        assert_eq!(m.mem.read_u8(MARK | (1 << 20)).unwrap(), 0xAA);
+    }
+
+    /// Spec: OSDev A20 Line — OUT 0x92 bit1 Fast Gate A20 masks PhysMem bit20;
+    /// mirrors to 8042 output-port bit1.
+    #[test]
+    fn machine_bus_port92_a20_gate_masks_phys_bit20() {
+        let mut m = Machine::new(2 * 1024 * 1024);
+        assert!(m.mem.a20_enabled());
+        assert!(m.port92.a20_enabled());
+        m.mem.write_u8(0, 0x11).unwrap();
+        m.mem.write_u8(1 << 20, 0x22).unwrap();
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PORT_SYSTEM_CONTROL_A, 0x00).unwrap(); // A20 off
+        }
+        assert!(!m.port92.a20_enabled());
+        assert!(!m.kbd.a20_enabled());
+        assert!(!m.mem.a20_enabled());
+        assert_eq!(m.mem.read_u8(1 << 20).unwrap(), 0x11);
+
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PORT_SYSTEM_CONTROL_A, PORT92_A20).unwrap();
+        }
+        assert!(m.mem.a20_enabled());
+        assert!(m.kbd.a20_enabled());
+        assert_eq!(m.mem.read_u8(1 << 20).unwrap(), 0x22);
+    }
+
+    /// Spec: OSDev A20 Line — port 0x92 bit0 write-1 latches system-reset → Machine::reset.
+    #[test]
+    fn machine_bus_port92_bit0_restores_cpu_reset_vector() {
+        let mut m = Machine::new(64 * 1024);
+        m.cpu.set_ip16(0x1234);
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x1000);
+        m.cpu.gpr[CpuState::RAX] = 0xDEAD_BEEF;
+        m.kbd
+            .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
+        assert_ne!(m.kbd, I8042::new());
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PORT_SYSTEM_CONTROL_A, PORT92_RESET | PORT92_A20)
+                .unwrap();
+        }
+        assert!(m.service_8042_pulse_reset());
+        let fresh = CpuState::reset();
+        assert_eq!(m.cpu.rip, fresh.rip);
+        assert_eq!(m.cpu.cs.selector, fresh.cs.selector);
+        assert_eq!(m.cpu.cs.base, fresh.cs.base);
+        assert_eq!(m.cpu.gpr[CpuState::RAX], 0);
+        assert_eq!(m.kbd, I8042::new());
+        assert_eq!(m.port92, Port92::new());
+        assert!(!m.service_8042_pulse_reset());
+    }
+
+    /// Guest OUT path: port 0x92 clears A20 then pulses fast reset.
+    #[test]
+    fn guest_out_port92_disables_a20_then_reset() {
+        let mut m = Machine::new(2 * 1024 * 1024);
+        const MARK: u64 = 0x1000;
+        m.mem.write_u8(MARK, 0xAA).unwrap();
+        m.mem.write_u8(MARK | (1 << 20), 0xBB).unwrap();
+        let prog: &[u8] = &[
+            0xB0, 0x00, // mov al, 0 (A20 off)
+            0xE6, 0x92, // out 0x92, al
+            0xF4, // hlt
+        ];
+        for (i, b) in prog.iter().enumerate() {
+            m.mem.write_u8(i as u64, *b).unwrap();
+        }
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.halted = false;
+        let steps = m.run(100).unwrap();
+        assert!(steps > 0);
+        assert!(m.cpu.halted);
+        assert!(!m.mem.a20_enabled());
+        assert!(!m.kbd.a20_enabled());
         assert_eq!(m.mem.read_u8(MARK | (1 << 20)).unwrap(), 0xAA);
     }
 

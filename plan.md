@@ -827,9 +827,9 @@ pc-i440fx-v1
 - ROM regions
 - Port I/O bus
 - MMIO bus
-- A20 gate
-- Port 0x92
-- Reset control
+- A20 gate — **partial:** `PhysMem` bit20 mask; 8042 output-port bit1 (`0xD1`) and System Control Port A (`0x92`) bit1 Fast Gate A20 (mirrored on `MachineBus`)
+- Port 0x92 — **partial:** `devices::Port92` on `MachineBus`; bit1 Fast Gate A20 → `PhysMem` (mirrored to 8042); bit0 write-1 fast reset → `take_system_reset_request` / `Machine::service_8042_pulse_reset` (same latch as 8042 `0xFE`); other bits RMW store only
+- Reset control — **partial:** 8042 pulse-reset `0xFE` + port `0x92` bit0 → `Machine::reset` after each `step`
 - ISA bus
 - PCI configuration space
 - i440FX host bridge subset
