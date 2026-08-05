@@ -62,10 +62,17 @@
 //!   `MachineBus` syncs writes into `DualPic::set_elcr_level_mask` (per-IR level
 //!   vs edge; OR'd with ICW1.LTIM inside `Pic8259`).
 //!
+//! - PIIX IDE BMIDE I/O BAR decode: when Command.IO is set and BMIBA has I/O
+//!   form (bit0), the 16-byte Bus Master IDE register block at
+//!   `BMIBA & 0xFFF0` is a noop store/readback (command/status/PRD pointers;
+//!   primary + secondary). No DMA engine.
+//!
 //! # Unsupported (explicit)
 //!
-//! - BAR MMIO/IO decode, bus mastering engine, INTx routing tables
-//! - Host-bridge / PIIX ISA / PIIX IDE / PIIX USB / PIIX ACPI Command side effects (IO/MEM decode, bus-master DMA)
+//! - BAR MMIO decode (other than PIIX IDE BMIDE I/O stub above), bus mastering
+//!   DMA engine / PRD walks, INTx routing tables
+//! - Host-bridge / PIIX ISA / PIIX USB / PIIX ACPI Command decode side effects;
+//!   PIIX IDE Command side effects beyond BMIDE I/O enable
 //! - Status error *signaling* (host / ISA / IDE / USB / ACPI never latch RW1C bits from real aborts yet)
 //! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI)
 //! - USB host controller (UHCI frame list / ports / IRQ)
@@ -239,6 +246,22 @@ pub const PCI_BAR_IO_SPACE: u32 = 0x01;
 /// BMIBA size decode mask — 16-byte aligned I/O base (bits 15:4); low nibble
 /// forced to `0001` (I/O space). Spec: PCI I/O BAR + PIIX BMIBA.
 pub const PCI_PIIX_IDE_BMIBA_MASK: u32 = 0xFFF0;
+/// Bus Master IDE I/O register block size at BMIBA.
+/// Spec: Intel 82371SB — primary + secondary command/status/PRD (16 bytes).
+pub const PCI_PIIX_IDE_BMIDE_IO_SIZE: u16 = 16;
+/// Primary Bus Master IDE Command (BMICOM) offset within BMIBA.
+pub const PCI_PIIX_IDE_BMICOM_PRIMARY: u8 = 0x00;
+/// Primary Bus Master IDE Status (BMISTA) offset within BMIBA.
+pub const PCI_PIIX_IDE_BMISTA_PRIMARY: u8 = 0x02;
+/// Primary Bus Master IDE Descriptor Table Pointer (BMIDTP) offset within BMIBA.
+pub const PCI_PIIX_IDE_BMIDTP_PRIMARY: u8 = 0x04;
+/// Secondary Bus Master IDE Command offset within BMIBA.
+pub const PCI_PIIX_IDE_BMICOM_SECONDARY: u8 = 0x08;
+/// Secondary Bus Master IDE Status offset within BMIBA.
+pub const PCI_PIIX_IDE_BMISTA_SECONDARY: u8 = 0x0A;
+/// Secondary Bus Master IDE Descriptor Table Pointer offset within BMIBA.
+pub const PCI_PIIX_IDE_BMIDTP_SECONDARY: u8 = 0x0C;
+const _: () = assert!(PCI_PIIX_IDE_BMIDE_IO_SIZE == 16);
 /// PIIX USB UHCI BAR0 config offset (I/O space).
 /// Spec: Intel 82371SB — UHCI I/O BAR at PCI config `0x20` (bit0=1).
 pub const PCI_PIIX_USB_BAR0_OFFSET: u8 = 0x20;
@@ -315,6 +338,10 @@ pub struct PciConfig {
     /// Reserved IRQ0/1/2/8/13 bits are always 0 (hardwired edge).
     /// `MachineBus` applies these to `DualPic::set_elcr_level_mask` on write.
     pub elcr: [u8; 2],
+    /// PIIX IDE Bus Master IDE I/O register file (16 bytes at BMIBA).
+    /// Spec: Intel 82371SB — BMICOM/BMISTA/BMIDTP primary + secondary.
+    /// Store/readback only; no DMA/PRD engine. Reset all zeros.
+    pub bmide_io: [u8; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
 }
 
 /// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
@@ -345,6 +372,8 @@ impl PciConfig {
             piix_acpi: Self::init_piix_acpi(),
             // Spec: PIIX ELCR power-on / reset defaults to edge-triggered (0).
             elcr: [0, 0],
+            // Spec: Intel 82371SB — BMIDE I/O registers power-on / reset to 0.
+            bmide_io: [0; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
         }
     }
 
@@ -733,7 +762,7 @@ impl PciConfig {
         }
         // Spec: Intel 82371SB / PCI — PIIX IDE BMIBA at config 0x20 is an I/O BAR:
         // bit0 hardwired 1; address bits 15:4 programmable; bits 3:1 zero.
-        // Store/readback only — no BMIDE port decode yet.
+        // Port decode of the 16-byte BMIDE block is gated by Command.IO.
         if is_piix_ide && base == PCI_PIIX_IDE_BMIBA_OFFSET as usize && lane == 0 && size == 4 {
             let masked = (value & PCI_PIIX_IDE_BMIBA_MASK) | PCI_BAR_IO_SPACE;
             let bytes = masked.to_le_bytes();
@@ -770,6 +799,100 @@ impl PciConfig {
             a |= ADDR_ENABLE;
         }
         a
+    }
+
+    fn piix_ide_command(&self) -> u16 {
+        let off = PCI_COMMAND_OFFSET as usize;
+        u16::from_le_bytes([self.piix_ide[off], self.piix_ide[off + 1]])
+    }
+
+    fn piix_ide_bmiba(&self) -> u32 {
+        let off = PCI_PIIX_IDE_BMIBA_OFFSET as usize;
+        u32::from_le_bytes([
+            self.piix_ide[off],
+            self.piix_ide[off + 1],
+            self.piix_ide[off + 2],
+            self.piix_ide[off + 3],
+        ])
+    }
+
+    /// Programmed BMIDE I/O base when Command.IO is set and BMIBA has I/O form.
+    ///
+    /// Spec: PCI Local Bus — I/O Space Enable gates BAR decode; Intel 82371SB —
+    /// BMIBA bits 15:4 are the 16-byte-aligned I/O base (bit0 = I/O space).
+    pub fn bmide_io_base(&self) -> Option<u16> {
+        if self.piix_ide_command() & PCI_COMMAND_IO == 0 {
+            return None;
+        }
+        let bar = self.piix_ide_bmiba();
+        if bar & PCI_BAR_IO_SPACE == 0 {
+            return None;
+        }
+        Some((bar & PCI_PIIX_IDE_BMIBA_MASK) as u16)
+    }
+
+    /// True when `port` falls in the decoded BMIDE I/O range.
+    pub fn bmide_owns_port(&self, port: u16) -> bool {
+        let Some(base) = self.bmide_io_base() else {
+            return false;
+        };
+        port.wrapping_sub(base) < PCI_PIIX_IDE_BMIDE_IO_SIZE
+    }
+
+    fn bmide_port_read(&self, port: u16, size: u8) -> u32 {
+        let Some(base) = self.bmide_io_base() else {
+            return 0xFFFFFFFF;
+        };
+        let off = (port - base) as usize;
+        match size {
+            1 => u32::from(self.bmide_io.get(off).copied().unwrap_or(0xFF)),
+            2 => {
+                let b0 = self.bmide_io.get(off).copied().unwrap_or(0xFF);
+                let b1 = self.bmide_io.get(off + 1).copied().unwrap_or(0xFF);
+                u32::from(u16::from_le_bytes([b0, b1]))
+            }
+            4 => {
+                let mut bytes = [0xFFu8; 4];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    if let Some(v) = self.bmide_io.get(off + i) {
+                        *b = *v;
+                    }
+                }
+                u32::from_le_bytes(bytes)
+            }
+            _ => 0xFFFFFFFF,
+        }
+    }
+
+    fn bmide_port_write(&mut self, port: u16, size: u8, value: u32) {
+        let Some(base) = self.bmide_io_base() else {
+            return;
+        };
+        let off = (port - base) as usize;
+        match size {
+            1 => {
+                if let Some(slot) = self.bmide_io.get_mut(off) {
+                    *slot = value as u8;
+                }
+            }
+            2 => {
+                let bytes = (value as u16).to_le_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    if let Some(slot) = self.bmide_io.get_mut(off + i) {
+                        *slot = *b;
+                    }
+                }
+            }
+            4 => {
+                let bytes = value.to_le_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    if let Some(slot) = self.bmide_io.get_mut(off + i) {
+                        *slot = *b;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -813,6 +936,10 @@ impl PortDevice for PciConfig {
                 _ => u32::from(self.elcr[idx]),
             };
         }
+        // Spec: Intel 82371SB — BMIDE I/O at BMIBA when Command.IO + BAR programmed.
+        if self.bmide_owns_port(port) {
+            return self.bmide_port_read(port, size);
+        }
         0xFFFFFFFF
     }
 
@@ -851,6 +978,11 @@ impl PortDevice for PciConfig {
                     self.elcr[idx] = (value as u8) & mask;
                 }
             }
+            return;
+        }
+        // Spec: Intel 82371SB — BMIDE noop register file (no DMA).
+        if self.bmide_owns_port(port) {
+            self.bmide_port_write(port, size, value);
         }
     }
 }
@@ -1120,6 +1252,123 @@ mod tests {
 
         pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_C000);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x0000_C001);
+    }
+
+    /// Spec: Intel 82371SB — BMIDE I/O regs reset to 0; no decode until BMIBA+IO.
+    #[test]
+    fn piix_ide_bmide_reset_default_no_decode() {
+        let pci = PciConfig::new();
+        assert_eq!(pci.bmide_io, [0; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize]);
+        assert_eq!(pci.bmide_io_base(), None);
+        assert!(!pci.bmide_owns_port(0xF000));
+        assert!(!pci.bmide_owns_port(0x0000));
+    }
+
+    /// Spec: Intel 82371SB BMIDE — command/status/PRD store/readback at BMIBA.
+    #[test]
+    fn piix_ide_bmide_store_readback_when_io_enabled() {
+        let mut pci = PciConfig::new();
+        // Program BMIBA = 0xF000 (I/O form → 0xF001).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F000);
+        // Enable I/O Space.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+
+        assert_eq!(pci.bmide_io_base(), Some(0xF000));
+        assert!(pci.bmide_owns_port(0xF000));
+        assert!(pci.bmide_owns_port(0xF00F));
+        assert!(!pci.bmide_owns_port(0xF010));
+
+        // Primary command / status / PRD pointer.
+        pci.port_write(0xF000 + u16::from(PCI_PIIX_IDE_BMICOM_PRIMARY), 1, 0x09);
+        pci.port_write(0xF000 + u16::from(PCI_PIIX_IDE_BMISTA_PRIMARY), 1, 0x60);
+        pci.port_write(
+            0xF000 + u16::from(PCI_PIIX_IDE_BMIDTP_PRIMARY),
+            4,
+            0x0011_2233,
+        );
+        // Secondary channel.
+        pci.port_write(0xF000 + u16::from(PCI_PIIX_IDE_BMICOM_SECONDARY), 1, 0x01);
+        pci.port_write(0xF000 + u16::from(PCI_PIIX_IDE_BMISTA_SECONDARY), 1, 0x20);
+        pci.port_write(
+            0xF000 + u16::from(PCI_PIIX_IDE_BMIDTP_SECONDARY),
+            4,
+            0xAABB_CCDD,
+        );
+
+        assert_eq!(
+            pci.port_read(0xF000 + u16::from(PCI_PIIX_IDE_BMICOM_PRIMARY), 1) as u8,
+            0x09
+        );
+        assert_eq!(
+            pci.port_read(0xF000 + u16::from(PCI_PIIX_IDE_BMISTA_PRIMARY), 1) as u8,
+            0x60
+        );
+        assert_eq!(
+            pci.port_read(0xF000 + u16::from(PCI_PIIX_IDE_BMIDTP_PRIMARY), 4),
+            0x0011_2233
+        );
+        assert_eq!(
+            pci.port_read(0xF000 + u16::from(PCI_PIIX_IDE_BMICOM_SECONDARY), 1) as u8,
+            0x01
+        );
+        assert_eq!(
+            pci.port_read(0xF000 + u16::from(PCI_PIIX_IDE_BMISTA_SECONDARY), 1) as u8,
+            0x20
+        );
+        assert_eq!(
+            pci.port_read(0xF000 + u16::from(PCI_PIIX_IDE_BMIDTP_SECONDARY), 4),
+            0xAABB_CCDD
+        );
+
+        pci.reset();
+        assert_eq!(pci.bmide_io, [0; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize]);
+        assert_eq!(pci.bmide_io_base(), None);
+    }
+
+    /// Spec: PCI Command I/O Space Enable — clear → BMIDE BAR not decoded.
+    #[test]
+    fn piix_ide_bmide_disabled_when_io_command_clear() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_C000);
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+        assert_eq!(pci.bmide_io_base(), Some(0xC000));
+        pci.port_write(0xC000, 1, 0x55);
+        assert_eq!(pci.port_read(0xC000, 1) as u8, 0x55);
+
+        // Clear IO; BusMaster alone must not enable decode.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_BUS_MASTER));
+        assert_eq!(pci.bmide_io_base(), None);
+        assert!(!pci.bmide_owns_port(0xC000));
+        // Writes while disabled must not mutate the register file.
+        pci.port_write(0xC000, 1, 0xAA);
+        // Re-enable IO — prior store while disabled discarded; last good value remains.
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+        assert_eq!(pci.port_read(0xC000, 1) as u8, 0x55);
     }
 
     #[test]
