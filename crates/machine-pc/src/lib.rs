@@ -437,7 +437,17 @@ impl Machine {
             return None;
         }
         let mut buf = self.fdc.take_pending_dma_sector()?;
-        Some(self.dma_transfer(2, &mut buf))
+        let expected = buf.len();
+        match self.dma_transfer(2, &mut buf) {
+            Ok(n) => {
+                // Spec: 8237A TC before full FDC latch → documented ST1 EN early-stop.
+                if n < expected {
+                    let _ = self.fdc.apply_dma_read_tc_early_stop(n);
+                }
+                Some(Ok(n))
+            }
+            Err(e) => Some(Err(e)),
+        }
     }
 
     /// If FDC has a pending WRITE DATA DMA arm (DOR DMA/IRQ at command complete),
@@ -463,7 +473,8 @@ impl Machine {
         let mut buf = vec![0u8; len];
         match self.dma_transfer(2, &mut buf) {
             Ok(n) => {
-                let _ = self.fdc.commit_dma_write_sector(&buf);
+                // Prefix only: short TC → partial commit + ST1 EN inside FDC.
+                let _ = self.fdc.commit_dma_write_sector(&buf[..n]);
                 Some(Ok(n))
             }
             Err(e) => Some(Err(e)),
@@ -521,9 +532,15 @@ impl MachineBus<'_> {
         let Some(mut buf) = self.fdc.take_pending_dma_sector() else {
             return;
         };
+        let expected = buf.len();
         // Guest must have programmed ch2 (page/addr/count/mode Write|Single).
         // Errors (masked/wrong mode) leave PhysMem unchanged; latch already consumed.
-        let _ = self.dma_transfer(2, &mut buf);
+        // Spec: 8237A TC before full FDC pending length → ST1 EN early-stop model.
+        if let Ok(n) = self.dma_transfer(2, &mut buf) {
+            if n < expected {
+                let _ = self.fdc.apply_dma_read_tc_early_stop(n);
+            }
+        }
     }
 
     /// Auto-wire: pending FDC WRITE DATA → ISA DMA ch2 Read → buffer → image.
@@ -544,8 +561,9 @@ impl MachineBus<'_> {
         let mut buf = vec![0u8; len];
         // Guest must have programmed ch2 (page/addr/count/mode Read|Single).
         // Errors leave the image unchanged; pending arm already consumed.
-        if self.dma_transfer(2, &mut buf).is_ok() {
-            let _ = self.fdc.commit_dma_write_sector(&buf);
+        // Short TC commits a prefix and rewrites ST1 EN / partial ENDaddress.
+        if let Ok(n) = self.dma_transfer(2, &mut buf) {
+            let _ = self.fdc.commit_dma_write_sector(&buf[..n]);
         }
     }
 
@@ -751,7 +769,7 @@ mod tests {
         FDC_CMD_READ_DATA, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK, FDC_CMD_SENSE_DRIVE_STATUS,
         FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA, FDC_DOR, FDC_DOR_DMA_IRQ,
         FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, FDC_SECTOR_SIZE,
-        FDC_ST0_SEEK_END, FDC_ST3_RESERVED_BIT3, FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042,
+        FDC_ST0_IC_ABNORMAL, FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST3_RESERVED_BIT3, FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042,
         I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
         PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
         PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
@@ -2812,6 +2830,123 @@ mod tests {
             m.fdc.take_pending_dma_sector().is_none(),
             "pending arm consumed by auto-wire"
         );
+    }
+
+    /// Spec: Intel 82077AA TC (§4.2.5) + §6.2 ST1 EN + Intel 8237A TC —
+    /// MachineBus auto-wire: ch2 Word Count covers only the first of two READ
+    /// DATA sectors → PhysMem gets 512 bytes, TC latches, FDC result is
+    /// abnormal + ST1 EN with ENDaddress R=1 (documented early-stop model).
+    #[test]
+    fn machine_bus_fdc_read_data_dma_tc_early_stop_st1_en() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        for (i, b) in img[FDC_SECTOR_SIZE..2 * FDC_SECTOR_SIZE]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = 0x80 | ((i & 0x7F) as u8);
+        }
+        let mut m = Machine::with_floppy(256 * 1024, img).expect("1.44MB image");
+        // DMA count = 511 → 512 bytes only (FDC pending = 1024).
+        program_dma_ch2_write(&mut m, 0x01, 0x1000, 511);
+        for i in 0..(2 * FDC_SECTOR_SIZE) {
+            m.mem.write_u8(0x1_1000 + i as u64, 0xEE).unwrap();
+        }
+
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(FDC_DOR, FDC_DOR_MOTOR0_DMA).unwrap();
+            bus.port_out_u8(FDC_FIFO, FDC_CMD_MFM | FDC_CMD_READ_DATA)
+                .unwrap();
+            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+                bus.port_out_u8(FDC_FIFO, p).unwrap();
+            }
+        }
+
+        for i in 0..FDC_SECTOR_SIZE {
+            assert_eq!(
+                m.mem.read_u8(0x1_1000 + i as u64).unwrap(),
+                (i & 0xFF) as u8,
+                "first sector DMA'd"
+            );
+        }
+        // Bytes beyond TC must remain poison.
+        for i in FDC_SECTOR_SIZE..(2 * FDC_SECTOR_SIZE) {
+            assert_eq!(
+                m.mem.read_u8(0x1_1000 + i as u64).unwrap(),
+                0xEE,
+                "past-TC PhysMem untouched"
+            );
+        }
+        assert_eq!(m.dma.master.status & 0x0F, 0x04, "TC latched");
+        assert_eq!(m.fdc.last_sector_byte_count(), FDC_SECTOR_SIZE);
+
+        {
+            let mut bus = m.bus_mut();
+            let st0 = bus.port_in_u8(FDC_FIFO).unwrap();
+            assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), FDC_ST1_EN);
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x00); // ST2
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x00); // C
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x00); // H
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x01); // R
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x02); // N
+        }
+    }
+
+    /// Spec: Intel 82077AA TC + §6.2 EN + 8237A — WRITE DATA auto-wire with
+    /// DMA Word Count for one sector while EOT requests two: only sector 1 is
+    /// written; result ST1 EN / ENDaddress R=1.
+    #[test]
+    fn machine_bus_fdc_write_data_dma_tc_early_stop_st1_en() {
+        let mut m = Machine::new(256 * 1024);
+        m.fdc
+            .attach_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE])
+            .expect("1.44MB image");
+        program_dma_ch2_read(&mut m, 0x01, 0x1000, 511); // 512 bytes only
+        for i in 0..FDC_SECTOR_SIZE {
+            m.mem
+                .write_u8(0x1_1000 + i as u64, (i & 0xFF) as u8)
+                .unwrap();
+        }
+
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(FDC_DOR, FDC_DOR_MOTOR0_DMA).unwrap();
+            bus.port_out_u8(FDC_FIFO, FDC_CMD_MFM | FDC_CMD_WRITE_DATA)
+                .unwrap();
+            for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+                bus.port_out_u8(FDC_FIFO, p).unwrap();
+            }
+        }
+
+        let s1 = m.fdc.read_sector(0, 0, 1).expect("s1");
+        for (i, &b) in s1.iter().enumerate() {
+            assert_eq!(b, (i & 0xFF) as u8, "sector1 from short DMA");
+        }
+        assert!(
+            m.fdc
+                .read_sector(0, 0, 2)
+                .expect("s2")
+                .iter()
+                .all(|&b| b == 0xAA),
+            "sector2 untouched on early TC"
+        );
+        assert_eq!(m.dma.master.status & 0x0F, 0x04, "TC latched");
+
+        {
+            let mut bus = m.bus_mut();
+            let st0 = bus.port_in_u8(FDC_FIFO).unwrap();
+            assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), FDC_ST1_EN);
+            let _ = bus.port_in_u8(FDC_FIFO).unwrap(); // ST2
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x00);
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x00);
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x01);
+            assert_eq!(bus.port_in_u8(FDC_FIFO).unwrap(), 0x02);
+        }
     }
 
     /// Spec: 82077AA — no media → ND result, no `last_sector`, MachineBus must

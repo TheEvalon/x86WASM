@@ -131,8 +131,11 @@
 //!   [`Self::take_pending_dma_sector`] → ISA DMA ch2 Write;
 //!   [`Self::pending_dma_byte_count`] reports total bytes), result ST0
 //!   (IC=00 normal | H | US with H = final head), ST1=0, ST2=0, C/H/R/N =
-//!   ENDaddress of the **last** sector transferred. No media / wrong N / OOR
-//!   CHS (any sector in the range) → ST0 IC=01 abnormal | H | US, ST1 ND,
+//!   ENDaddress of the **last** sector transferred. When ISA DMA ch2 reaches
+//!   TC before that full pending length, Machine calls
+//!   [`Self::apply_dma_read_tc_early_stop`]: ST0 IC=01 | ST1 EN | partial
+//!   ENDaddress (documented model; 82077AA TC + §6.2 EN). No media / wrong N /
+//!   OOR CHS (any sector in the range) → ST0 IC=01 abnormal | H | US, ST1 ND,
 //!   ST2=0. Asserts IRQ6 (cleared on first result byte); EOT→`sc_eot`; MSR RQM
 //!   during params, RQM|DIO during result.
 //! - READ DELETED DATA (`0x0C` | MT/MFM/SK): Spec Intel 82077AA §5.1.3 /
@@ -162,11 +165,14 @@
 //!   total bytes), then [`Self::commit_dma_write_sector`] /
 //!   [`Self::write_sector`] into the image, latch bytes in `last_write`,
 //!   result ST0 (IC=00 normal | H | US; H = final head), ST1=0, ST2=0,
-//!   C/H/R/N = ENDaddress of the **last** sector written. Media +
-//!   `write_protected` (WP pin) → ST0 IC=01 abnormal | H | US, ST1 NW (Not
-//!   Writable, §6.2), ST2=0; clear `last_write` / `dma_write_pending`; no image
-//!   write. No media / wrong N / OOR CHS (any sector in the range) / wrong
-//!   latch length → same NW abnormal. Asserts IRQ6 (cleared on first result
+//!   C/H/R/N = ENDaddress of the **last** sector written. When DMA TC delivers
+//!   fewer than the pending byte count, `commit_dma_write_sector` writes only
+//!   complete sectors from the prefix and sets ST0 IC=01 | ST1 EN | partial
+//!   ENDaddress (documented model). Media + `write_protected` (WP pin) → ST0
+//!   IC=01 abnormal | H | US, ST1 NW (Not Writable, §6.2), ST2=0; clear
+//!   `last_write` / `dma_write_pending`; no image write. No media / wrong N /
+//!   OOR CHS (any sector in the range) / wrong latch length (device pre-latch
+//!   longer/shorter than expected) → same NW abnormal. Asserts IRQ6 (cleared on first result
 //!   byte); EOT latched into `sc_eot`.
 //! - WRITE DELETED DATA (`0x09` | MT/MFM): Spec Intel 82077AA §5.1.4 /
 //!   Table 5-1 — command byte lower 5 bits `01001`; optional MT/MFM; same
@@ -433,6 +439,13 @@ pub const FDC_ST0_HEAD: u8 = 0x04;
 pub const FDC_ST1_NW: u8 = 0x02;
 /// ST1 bit2 No Data (ND) — specified sector not found. Spec: Intel 82077AA §6.2.
 pub const FDC_ST1_ND: u8 = 0x04;
+/// ST1 bit7 End of Cylinder (EN). Spec: Intel 82077AA §6.2.
+///
+/// Also used by this emulator's documented model when ISA DMA ch2 asserts TC
+/// before the full pending READ/WRITE DATA byte count is moved (partial
+/// ENDaddress); see [`Fdc82077::apply_dma_read_tc_early_stop`] /
+/// [`Fdc82077::commit_dma_write_sector`].
+pub const FDC_ST1_EN: u8 = 0x80;
 
 /// ST3 bits 1:0 — Drive Select (DS1, DS0), status of the DS1/DS0 pins.
 /// Spec: Intel 82077AA §6.4 Status Register 3.
@@ -838,41 +851,132 @@ impl Fdc82077 {
     ///
     /// Spec: Intel 82077AA §5.1.2 WRITE DATA multi-sector / Multi-Track / EOT +
     /// IBM 1.44MB geometry. MT=0: same-head R..=EOT. MT=1 starting on head 0:
-    /// head0 R..=EOT then head1 1..=EOT. `data.len()` must equal sector_count ×
-    /// [`FDC_SECTOR_SIZE`]. Returns `false` if length/CHS/media reject the write.
+    /// head0 R..=EOT then head1 1..=EOT.
+    ///
+    /// - `data.len() == expected` (sector_count × [`FDC_SECTOR_SIZE`]): write all
+    ///   sectors; leave the already-latched normal result unchanged.
+    /// - `data.len() < expected`: ISA DMA ch2 reached TC early (8237A Word Count).
+    ///   Write only complete 512-byte sectors from the prefix; mid-sector trailing
+    ///   bytes are not committed. Rewrite result to ST0 IC=01 | ST1
+    ///   [`FDC_ST1_EN`] | partial ENDaddress (documented model; 82077AA TC pin
+    ///   §4.2.5 terminates the transfer; §6.2 EN). Returns `true` when the
+    ///   early-stop result is applied (including `data.len() == 0`).
+    /// - `data.len() > expected`: rejected (`false`).
     pub fn commit_dma_write_sector(&mut self, data: &[u8]) -> bool {
         let c = self.read_params[1];
         let h = self.read_params[2];
         let r = self.read_params[3];
         let eot = self.read_params[5];
+        let unit = self.read_params[0] & 0x03;
         let end_r = if eot >= r { eot } else { r };
         let mt_switch = self.read_cmd_mt && h == 0 && eot >= r;
         let head0_count = usize::from(end_r - r) + 1;
         let head1_count = if mt_switch { usize::from(end_r) } else { 0 };
         let expected = (head0_count + head1_count) * FDC_SECTOR_SIZE;
-        if data.len() != expected {
+        if data.len() > expected {
             return false;
         }
-        for (i, sec) in (r..=end_r).enumerate() {
+        let early = data.len() < expected;
+        let complete = data.len() / FDC_SECTOR_SIZE;
+        for i in 0..complete {
             let start = i * FDC_SECTOR_SIZE;
             let mut chunk = [0u8; FDC_SECTOR_SIZE];
             chunk.copy_from_slice(&data[start..start + FDC_SECTOR_SIZE]);
-            if !self.write_sector(c, h, sec, &chunk) {
+            let (wh, sec) = if i < head0_count {
+                (h, r + (i as u8))
+            } else {
+                let h1_i = i - head0_count;
+                (1u8, 1 + (h1_i as u8))
+            };
+            if !self.write_sector(c, wh, sec, &chunk) {
                 return false;
             }
         }
-        if mt_switch {
-            for (i, sec) in (1..=end_r).enumerate() {
-                let start = (head0_count + i) * FDC_SECTOR_SIZE;
-                let mut chunk = [0u8; FDC_SECTOR_SIZE];
-                chunk.copy_from_slice(&data[start..start + FDC_SECTOR_SIZE]);
-                if !self.write_sector(c, 1, sec, &chunk) {
-                    return false;
-                }
-            }
+        if early {
+            self.last_write = if complete > 0 {
+                Some(data[..complete * FDC_SECTOR_SIZE].to_vec())
+            } else {
+                None
+            };
+            let (end_c, end_h, end_r_id, end_n) = self.end_chs_after_dma_bytes(data.len());
+            let st0_head = if end_h != 0 { FDC_ST0_HEAD } else { 0 };
+            self.read_result = [
+                FDC_ST0_IC_ABNORMAL | st0_head | unit,
+                FDC_ST1_EN,
+                0x00,
+                end_c,
+                end_h,
+                end_r_id,
+                end_n,
+            ];
+            true
+        } else {
+            self.last_write = Some(data.to_vec());
+            true
         }
-        self.last_write = Some(data.to_vec());
+    }
+
+    /// After ISA DMA ch2 Write transferred only `bytes` of a pending READ DATA
+    /// latch (device→memory), rewrite the result for early TC.
+    ///
+    /// Spec: Intel 82077AA TC pin (§4.2.5) terminates the disk transfer when the
+    /// 8237A asserts terminal count; Intel 8237A status TC. When `bytes` is less
+    /// than [`Self::last_sector`] length, this documented model sets ST0 IC=01
+    /// abnormal | H | US, ST1 [`FDC_ST1_EN`], ST2=0, and C/H/R/N = ENDaddress of
+    /// the last sector that received at least one byte. Truncates
+    /// [`Self::last_sector`] to `bytes`. Returns `false` when there is no latch
+    /// or `bytes >= latch.len()` (full transfer — leave normal result).
+    pub fn apply_dma_read_tc_early_stop(&mut self, bytes: usize) -> bool {
+        let Some(latch) = self.last_sector.as_mut() else {
+            return false;
+        };
+        if bytes >= latch.len() {
+            return false;
+        }
+        latch.truncate(bytes);
+        let unit = self.read_params[0] & 0x03;
+        let (end_c, end_h, end_r, end_n) = self.end_chs_after_dma_bytes(bytes);
+        let st0_head = if end_h != 0 { FDC_ST0_HEAD } else { 0 };
+        self.read_result = [
+            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST1_EN,
+            0x00,
+            end_c,
+            end_h,
+            end_r,
+            end_n,
+        ];
         true
+    }
+
+    /// ENDaddress C/H/R/N after `bytes` of a READ/WRITE DATA DMA transfer.
+    ///
+    /// Uses the sector that received at least one byte (`(bytes.max(1) - 1) /
+    /// 512` when `bytes > 0`; starting CHS when `bytes == 0`). Honors MT head0→
+    /// head1 ordering from [`Self::read_cmd_mt`] / `read_params`.
+    fn end_chs_after_dma_bytes(&self, bytes: usize) -> (u8, u8, u8, u8) {
+        let c = self.read_params[1];
+        let h = self.read_params[2];
+        let r = self.read_params[3];
+        let n = self.read_params[4];
+        let eot = self.read_params[5];
+        let end_r = if eot >= r { eot } else { r };
+        let mt_switch = self.read_cmd_mt && h == 0 && eot >= r;
+        let head0_count = usize::from(end_r - r) + 1;
+        let sector_idx = if bytes == 0 {
+            0
+        } else {
+            (bytes - 1) / FDC_SECTOR_SIZE
+        };
+        if sector_idx < head0_count {
+            (c, h, r.wrapping_add(sector_idx as u8), n)
+        } else if mt_switch {
+            let h1_i = sector_idx - head0_count;
+            (c, 1, 1u8.wrapping_add(h1_i as u8), n)
+        } else {
+            // Past programmed range without MT — clamp to last head0 sector.
+            (c, h, end_r, n)
+        }
     }
 
     /// CHS → byte offset in a linear 1.44MB image. `r` is 1-based (sector ID).
@@ -6415,6 +6519,118 @@ mod tests {
         assert!(f.commit_dma_write_sector(&data));
         assert_eq!(f.last_write().expect("commit latches"), data.as_slice());
         assert_eq!(f.read_sector(0, 0, 1).expect("written"), data);
+    }
+
+    /// Spec: Intel 82077AA TC (§4.2.5) + §6.2 ST1 EN + Intel 8237A TC —
+    /// when DMA moves fewer than the pending multi-sector READ DATA bytes,
+    /// `apply_dma_read_tc_early_stop` rewrites abnormal + ST1 EN with
+    /// ENDaddress of the last sector that received data, and truncates the
+    /// inspection latch (documented early-stop model).
+    #[test]
+    fn read_data_dma_tc_early_stop_sets_st1_en_partial_endaddress() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        for (i, b) in img[FDC_SECTOR_SIZE..2 * FDC_SECTOR_SIZE]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = 0x80 | ((i & 0x7F) as u8);
+        }
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        // R=1 EOT=2 → 1024-byte latch; simulate DMA TC after first sector only.
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert_eq!(f.pending_dma_byte_count(), 2 * FDC_SECTOR_SIZE);
+        let _ = f
+            .take_pending_dma_sector()
+            .expect("DMA arm before early TC");
+        assert!(f.apply_dma_read_tc_early_stop(FDC_SECTOR_SIZE));
+        assert_eq!(f.last_sector_byte_count(), FDC_SECTOR_SIZE);
+        let latch = f.last_sector().expect("truncated latch");
+        for (i, &b) in latch.iter().enumerate() {
+            assert_eq!(b, (i & 0xFF) as u8, "first sector retained at [{i}]");
+        }
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_EN);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // ST2
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R = first sector
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+    }
+
+    /// Spec: Intel 82077AA TC + §6.2 EN — mid-sector DMA TC (256 of 512) keeps
+    /// ENDaddress on the in-progress sector and sets ST1 EN.
+    #[test]
+    fn read_data_dma_tc_mid_sector_sets_st1_en() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        let _ = f.take_pending_dma_sector().expect("armed");
+        assert!(f.apply_dma_read_tc_early_stop(256));
+        assert_eq!(f.last_sector_byte_count(), 256);
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8 & FDC_ST0_IC_ABNORMAL,
+            FDC_ST0_IC_ABNORMAL
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_EN);
+        let _ = f.port_read(FDC_FIFO, 1); // ST2
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R in-progress
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+    }
+
+    /// Spec: Intel 82077AA TC + §6.2 EN + 8237A — WRITE DATA DMA TC after one
+    /// of two programmed sectors commits only the complete sector and sets
+    /// ST1 EN with ENDaddress R of that sector (sector 2 stays untouched).
+    #[test]
+    fn write_data_dma_tc_early_stop_commits_partial_sets_st1_en() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_WRITE_DATA));
+        // R=1 EOT=2 → 1024 pending; deliver only first 512 via short TC.
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert_eq!(f.pending_dma_write_byte_count(), 2 * FDC_SECTOR_SIZE);
+        assert!(f.take_pending_dma_write());
+        let mut data = vec![0u8; FDC_SECTOR_SIZE];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        assert!(f.commit_dma_write_sector(&data));
+        assert_eq!(f.read_sector(0, 0, 1).expect("s1"), data.as_slice());
+        assert!(
+            f.read_sector(0, 0, 2)
+                .expect("s2")
+                .iter()
+                .all(|&b| b == 0xAA),
+            "second sector must not be written on early TC"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_EN);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
     }
 
     /// Spec: Intel 82077AA §5.1.2 / §6.2 — out-of-range sector ID (R>18 on
