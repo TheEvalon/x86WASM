@@ -84,14 +84,16 @@
 //!   map (`0x3D4`/`0x3D5` color or `0x3B4`/`0x3B5` mono; shared file); cursor
 //!   registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback plus helpers for
 //!   text-mode cursor character offset / row-col; Start Address High/Low
-//!   `0x0C`/`0x0D` store/readback with [`VgaText::text_start_address`] helper
-//!   and mode-03h reset default `0x0000` (Protect does not block); Maximum Scan
-//!   Line `0x09` store/readback with mode-03h reset default `0x0F` (Protect does
-//!   not block); Overflow `0x07` store/readback with FreeVGA bit consts (under
-//!   Protect only bit4 / Line Compare bit8 remains writable); Vertical Retrace
-//!   End `0x11` bit7 Protect blocks writes to indexes `0x00`–`0x07` (Overflow
-//!   bit4 still writable; no host cursor glyph render, start-address scroll/pan,
-//!   max-scan glyph height, Line Compare split-screen, or CRTC timing)
+//!   `0x0C`/`0x0D` store/readback with [`VgaText::text_start_address`] /
+//!   [`VgaText::text_start_plane_offset`] helpers and mode-03h reset default
+//!   `0x0000` (Protect does not block; host `char_at`/`attr_at`/`put_char`
+//!   viewport is relative to start; CPU `0xB8000` MMIO stays absolute); Maximum
+//!   Scan Line `0x09` store/readback with mode-03h reset default `0x0F` (Protect
+//!   does not block); Overflow `0x07` store/readback with FreeVGA bit consts
+//!   (under Protect only bit4 / Line Compare bit8 remains writable); Vertical
+//!   Retrace End `0x11` bit7 Protect blocks writes to indexes `0x00`–`0x07`
+//!   (Overflow bit4 still writable; no host cursor glyph render, max-scan glyph
+//!   height, Line Compare split-screen, or CRTC timing)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults; Map Mask `0x02` store/readback
 //!   with mode-03h reset default `0x03`; Character Map Select `0x03` store/readback
@@ -188,8 +190,8 @@ pub const VGA_CRTC_CURSOR_END: u8 = 0x0B;
 /// Spec: FreeVGA CRT Controller Registers / IBM VGA — high byte of the 16-bit
 /// start address (character offset of the first displayed cell in the refresh
 /// buffer). Protect (Vertical Retrace End bit7) does **not** block this index
-/// (`>= 0x08`). Scroll/pan render side effects are out of scope
-/// (store/readback + helper only).
+/// (`>= 0x08`). Host text viewport helpers apply the combined start address;
+/// CPU plane MMIO stays absolute.
 pub const VGA_CRTC_START_ADDR_HIGH: u8 = 0x0C;
 /// CRTC Start Address Low Register index.
 ///
@@ -1054,25 +1056,35 @@ impl VgaText {
         true
     }
 
-    fn cell_offset(row: usize, col: usize) -> Option<usize> {
+    /// Byte offset of a visible text cell relative to CRTC Start Address.
+    ///
+    /// Spec: FreeVGA CRT Controller — Start Address is the character index of
+    /// the first displayed cell. Host viewport helpers index `(row, col)` as
+    /// `start + row*cols + col`. When that index exceeds the 32 KiB plane,
+    /// wrap within the plane (FreeVGA notes display wrap in video memory).
+    /// CPU MMIO (`read_u8`/`write_u8`) stays absolute at `0xB8000`.
+    fn cell_offset(&self, row: usize, col: usize) -> Option<usize> {
         if row >= VGA_TEXT_ROWS || col >= VGA_TEXT_COLS {
             return None;
         }
-        Some((row * VGA_TEXT_COLS + col) * VGA_CELL_BYTES)
+        let chars_in_plane = VGA_TEXT_SIZE / VGA_CELL_BYTES;
+        let cell =
+            (usize::from(self.text_start_address()) + row * VGA_TEXT_COLS + col) % chars_in_plane;
+        Some(cell * VGA_CELL_BYTES)
     }
 
     pub fn char_at(&self, row: usize, col: usize) -> Option<u8> {
-        let off = Self::cell_offset(row, col)?;
+        let off = self.cell_offset(row, col)?;
         Some(self.mem[off])
     }
 
     pub fn attr_at(&self, row: usize, col: usize) -> Option<u8> {
-        let off = Self::cell_offset(row, col)?;
+        let off = self.cell_offset(row, col)?;
         Some(self.mem[off + 1])
     }
 
     pub fn put_char(&mut self, row: usize, col: usize, ch: u8, attr: u8) -> bool {
-        let Some(off) = Self::cell_offset(row, col) else {
+        let Some(off) = self.cell_offset(row, col) else {
             return false;
         };
         self.mem[off] = ch;
@@ -1084,11 +1096,20 @@ impl VgaText {
     ///
     /// Spec: FreeVGA CRT Controller / IBM VGA — Start Address High/Low form a
     /// linear character offset into the refresh buffer (not a byte offset).
-    /// Mode 03h defaults to `0`. Scroll/pan side effects are out of scope.
+    /// Mode 03h defaults to `0`. Host text helpers apply this as the visible
+    /// viewport origin; CPU `0xB8000` MMIO remains absolute.
     pub fn text_start_address(&self) -> u16 {
         let high = self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)];
         let low = self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)];
         (u16::from(high) << 8) | u16::from(low)
+    }
+
+    /// Byte offset of the first displayed cell in the text plane (`start * 2`).
+    ///
+    /// Spec: IBM VGA / FreeVGA — each alphanumeric cell is two bytes
+    /// (character + attribute). Used by host text viewport helpers.
+    pub fn text_start_plane_offset(&self) -> usize {
+        usize::from(self.text_start_address()) * VGA_CELL_BYTES
     }
 
     /// 16-bit CRTC cursor character address (`0x0E`:`0x0F`).
@@ -1729,6 +1750,68 @@ mod tests {
         assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x50);
         v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
         assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x00);
+    }
+
+    /// Spec: FreeVGA CRT Controller — Start Address is the character index of the
+    /// first displayed cell. Host text helpers (`char_at` / `attr_at` / `put_char`)
+    /// index the visible 80×25 viewport relative to that origin; CPU MMIO at
+    /// `0xB8000` remains an absolute plane aperture (not remapped).
+    #[test]
+    fn crtc_start_address_offsets_host_text_viewport() {
+        let mut v = VgaText::new();
+        assert_eq!(v.text_start_plane_offset(), 0);
+
+        // Scroll origin to character 80 (one 80-col row).
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        v.port_write(VGA_CRTC_DATA, 1, 0x00);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        v.port_write(VGA_CRTC_DATA, 1, 80);
+        assert_eq!(v.text_start_address(), 80);
+        assert_eq!(v.text_start_plane_offset(), 80 * VGA_CELL_BYTES);
+
+        // Absolute CPU write at plane cell 80 appears at visible (0,0).
+        let abs = VGA_TEXT_BASE + (80 * VGA_CELL_BYTES) as u64;
+        assert!(v.write_u8(abs, b'S'));
+        assert!(v.write_u8(abs + 1, 0x1E));
+        assert_eq!(v.char_at(0, 0), Some(b'S'));
+        assert_eq!(v.attr_at(0, 0), Some(0x1E));
+
+        // Host put_char writes into the scrolled plane origin; MMIO absolute
+        // base cell (start=0) stays unchanged.
+        assert!(v.put_char(0, 0, b'T', 0x2F));
+        assert_eq!(v.read_u8(abs), Some(b'T'));
+        assert_eq!(v.read_u8(abs + 1), Some(0x2F));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(VGA_DEFAULT_CHAR));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE + 1), Some(VGA_DEFAULT_ATTR));
+
+        // Visible (1,0) is character index 160 under start=80.
+        assert!(v.put_char(1, 0, b'U', 0x4E));
+        let row1 = VGA_TEXT_BASE + (160 * VGA_CELL_BYTES) as u64;
+        assert_eq!(v.read_u8(row1), Some(b'U'));
+        assert_eq!(v.char_at(1, 0), Some(b'U'));
+    }
+
+    /// Spec: FreeVGA — Start Address writes remain accepted under Protect; reset
+    /// restores mode-03h `0x0000` so the host viewport origin returns to plane 0.
+    #[test]
+    fn crtc_start_address_viewport_respects_protect_and_reset() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_VERTICAL_RETRACE_END));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_PROTECT));
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        v.port_write(VGA_CRTC_DATA, 1, 0x00);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        v.port_write(VGA_CRTC_DATA, 1, 40);
+        assert_eq!(v.text_start_address(), 40);
+        assert!(v.put_char(0, 0, b'P', 0x07));
+        let abs = VGA_TEXT_BASE + (40 * VGA_CELL_BYTES) as u64;
+        assert_eq!(v.read_u8(abs), Some(b'P'));
+
+        v.reset();
+        assert_eq!(v.text_start_address(), 0);
+        assert_eq!(v.text_start_plane_offset(), 0);
+        assert_eq!(v.char_at(0, 0), Some(VGA_DEFAULT_CHAR));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(VGA_DEFAULT_CHAR));
     }
 
     /// Spec: FreeVGA CRT Controller — Maximum Scan Line (index `0x09`)
