@@ -896,7 +896,8 @@ Later:
 
 ### 15.7 Debug devices
 
-- COM1 serial port
+- COM1 serial port (`0x3F8`–`0x3FF`, 16550 THR/RBR/LSR stub)
+- COM2 serial port (`0x2F8`–`0x2FF`, same stub / separate sink)
 - Debug port 0x402
 - Guest log capture
 - Register viewer
@@ -1285,6 +1286,7 @@ Implement:
 - Prefix parser framework
 - Opcode decoder framework
 - COM1 serial port
+- COM2 serial port (same 16550 stub; added in M2)
 - Debug port 0x402
 - Custom ROM test harness
 - Native and browser execution
@@ -1928,6 +1930,7 @@ Implement enough instructions to:
 - Perform basic arithmetic
 - Call functions
 - Write bytes to COM1
+- Write bytes to COM2 (same 16550 THR path)
 - Write bytes to port 0x402
 - Halt cleanly
 
@@ -2027,6 +2030,7 @@ Month-one definition of done:
 ### Epic F: Debug output
 
 - COM1 model
+- COM2 model (same 16550 debug-UART stub as COM1)
 - Port 0x402 model
 - Browser serial-output event
 - CLI serial output

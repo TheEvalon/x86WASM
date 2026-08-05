@@ -39,6 +39,8 @@ pub struct Machine {
     pub cpu: CpuState,
     pub mem: PhysMem,
     pub com1: Serial16550,
+    /// COM2 (`0x2F8`–`0x2FF`) — same 16550 debug-UART stub as COM1.
+    pub com2: Serial16550,
     pub debug: DebugConsole,
     /// Dual 8259A — ICW + OCW/IRQ (ports 0x20/0x21/0xA0/0xA1).
     pub pic: DualPic,
@@ -70,6 +72,7 @@ impl Machine {
             cpu: CpuState::reset(),
             mem: PhysMem::new(ram_size),
             com1: Serial16550::new(0x3F8),
+            com2: Serial16550::new(0x2F8),
             debug: DebugConsole::new(),
             pic: DualPic::new(),
             pit: Pit8254::new(),
@@ -155,6 +158,7 @@ impl Machine {
     pub fn reset(&mut self) {
         self.cpu = CpuState::reset();
         self.com1 = Serial16550::new(0x3F8);
+        self.com2 = Serial16550::new(0x2F8);
         self.debug = DebugConsole::new();
         self.pic.reset();
         self.pit.reset();
@@ -191,6 +195,7 @@ impl Machine {
         MachineBus {
             mem: &mut self.mem,
             com1: &mut self.com1,
+            com2: &mut self.com2,
             debug: &mut self.debug,
             pic: &mut self.pic,
             pit: &mut self.pit,
@@ -217,6 +222,7 @@ impl Machine {
             let mut view = MachineBus {
                 mem: &mut self.mem,
                 com1: &mut self.com1,
+                com2: &mut self.com2,
                 debug: &mut self.debug,
                 pic: &mut self.pic,
                 pit: &mut self.pit,
@@ -251,6 +257,11 @@ impl Machine {
     /// Combined guest console (COM1 then debug port bytes are tracked separately).
     pub fn com1_text(&self) -> String {
         self.com1.output().as_str_lossy()
+    }
+
+    /// COM2 THR sink (separate from COM1 / debug port).
+    pub fn com2_text(&self) -> String {
+        self.com2.output().as_str_lossy()
     }
 
     pub fn debug_text(&self) -> String {
@@ -515,6 +526,7 @@ impl Machine {
 struct MachineBus<'a> {
     mem: &'a mut PhysMem,
     com1: &'a mut Serial16550,
+    com2: &'a mut Serial16550,
     debug: &'a mut DebugConsole,
     pic: &'a mut DualPic,
     pit: &'a mut Pit8254,
@@ -632,6 +644,7 @@ impl MachineBus<'_> {
             PORT_SYSTEM_CONTROL => u32::from(self.pit.port61_read()),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
+            0x2F8..0x300 => self.com2.port_read(port, size),
             0x3F8..0x400 => self.com1.port_read(port, size),
             0x402 => self.debug.port_read(port, size),
             _ => self.ports.port_read(port, size),
@@ -703,6 +716,7 @@ impl MachineBus<'_> {
                 // [`Machine::service_8042_pulse_reset`] after the bus borrow ends.
                 self.mem.set_a20_enabled(self.kbd.a20_enabled());
             }
+            0x2F8..0x300 => self.com2.port_write(port, size, value),
             0x3F8..0x400 => self.com1.port_write(port, size, value),
             0x402 => self.debug.port_write(port, size, value),
             _ => self.ports.port_write(port, size, value),
@@ -1485,7 +1499,7 @@ mod tests {
         assert_eq!(m.cpu.al(), 0xA5);
     }
 
-    /// Unrelated ports stay open-bus; COM1 / debug port 0x402 unchanged.
+    /// Unrelated ports stay open-bus; COM1 / COM2 / debug port 0x402 unchanged.
     /// Spec: 0x60 is owned by I8042 — empty-buffer read returns 0, status OBF/IBF clear.
     #[test]
     fn unrelated_ports_open_bus_serial_unchanged() {
@@ -1501,14 +1515,33 @@ mod tests {
             assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF); // POST — unimplemented
             bus.port_out_u8(0x80, 0xAA).unwrap(); // ignored
             bus.port_out_u8(0x3F8, b'Z').unwrap();
+            bus.port_out_u8(0x2F8, b'Y').unwrap();
             bus.port_out_u8(0x402, b'!').unwrap();
-            // LSR THR empty bit still present on COM1
+            // LSR THR empty bit still present on COM1 / COM2
             assert_ne!(bus.port_in_u8(0x3FD).unwrap() & 0x20, 0);
+            assert_ne!(bus.port_in_u8(0x2FD).unwrap() & 0x20, 0);
         }
         assert_eq!(m.com1_text(), "Z");
+        assert_eq!(m.com2_text(), "Y");
         assert_eq!(m.debug_text(), "!");
         assert!(!m.pic.master.initialized);
         assert!(!m.pit.channel0().count_loaded);
+    }
+
+    /// Spec: NS16550A / classic PC COM2 `0x2F8`–`0x2FF` — THR OUT + LSR poll on MachineBus.
+    #[test]
+    fn machine_bus_com2_thr_and_lsr() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.port_in_u8(0x2FD).unwrap() & 0x60, 0x60);
+            bus.port_out_u8(0x2F8, b'O').unwrap();
+            bus.port_out_u8(0x2F8, b'K').unwrap();
+            // COM1 sink stays independent.
+            bus.port_out_u8(0x3F8, b'1').unwrap();
+        }
+        assert_eq!(m.com2_text(), "OK");
+        assert_eq!(m.com1_text(), "1");
     }
 
     /// Spec: OSDev I8042 — OUT 0x64,0xAA → IN 0x60 == 0x55; OBF around the path.
@@ -1649,6 +1682,7 @@ mod tests {
             PciConfig::make_address(0, 0, 0, 0x00, true),
         );
         m.com1.port_write(0x3F8, 1, u32::from(b'X'));
+        m.com2.port_write(0x2F8, 1, u32::from(b'Y'));
 
         m.reset();
         assert_eq!(m.pic, DualPic::new());
@@ -1658,6 +1692,7 @@ mod tests {
         assert_eq!(m.pci, PciConfig::new());
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
+        assert_eq!(m.com2_text(), "");
         assert_eq!(m.debug_text(), "");
     }
 

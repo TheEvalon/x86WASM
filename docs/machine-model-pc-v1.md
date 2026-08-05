@@ -13,7 +13,8 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 
 | Port | Device |
 |---|---|
-| `0x3F8`?`0x3FF` | COM1 (THR write emits guest serial bytes) |
+| `0x3F8`–`0x3FF` | COM1 (THR write emits guest serial bytes; 16550 THR/RBR/LSR stub) |
+| `0x2F8`–`0x2FF` | COM2 (same 16550 debug-UART stub as COM1; separate sink) |
 | `0x402` | Debug console (Bochs/QEMU-style; write = one output byte) |
 | `0x20` / `0x21` | 8259A master PIC (command / data) ? ICW + OCW1/EOI/IRR/ISR/poll |
 | `0xA0` / `0xA1` | 8259A slave PIC (command / data) ? ICW + OCW1/EOI/IRR/ISR/poll |
@@ -49,7 +50,7 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 
 Unimplemented ports: read `0xFF?`, write ignored (traced when tracing is enabled). Unused page holes (`0x84`?`0x86`, `0x88`, `0x8C`?`0x8E`) stay open-bus.
 
-Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO + CRTC/Sequencer/GC/ATC/DAC/Misc ports), `devices::PciConfig` (`pci.rs`, field `Machine::pci`), `devices::IdePrimary` (`ide.rs`, field `Machine::ide`), `devices::IdeSecondary` (`ide.rs`, field `Machine::ide_secondary`), `devices::Fdc82077` (`fdc.rs`, field `Machine::fdc`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE/FDC like serial (IDE and FDC keep attached images). No snapshot schema for these devices yet (serial has none either).
+Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices::Serial16550` (`serial.rs`, fields `Machine::com1` / `Machine::com2`), `devices::DualPic` (`pic.rs`), `devices::Pit8254` (`pit.rs`), `devices::CmosRtc` (`cmos.rs`), `devices::I8042` (`i8042.rs`, field `Machine::kbd`), `devices::Dma8237` (`dma.rs`, field `Machine::dma`), `devices::VgaText` (`vga.rs`, field `Machine::vga`, MMIO + CRTC/Sequencer/GC/ATC/DAC/Misc ports), `devices::PciConfig` (`pci.rs`, field `Machine::pci`), `devices::IdePrimary` (`ide.rs`, field `Machine::ide`), `devices::IdeSecondary` (`ide.rs`, field `Machine::ide_secondary`), `devices::Fdc82077` (`fdc.rs`, field `Machine::fdc`). Reset clears PIC/PIT/CMOS/8042/DMA/VGA/PCI/IDE/FDC like serial (IDE and FDC keep attached images). No snapshot schema for these devices yet (serial has none either).
 
 ## MMIO
 
@@ -79,7 +80,7 @@ Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices
 
 ## Spec / oracle notes
 
-- Serial: 16550-compatible programming model (subset).
+- Serial: NS16550A-compatible programming model (subset) — COM1 `0x3F8`–`0x3FF` and COM2 `0x2F8`–`0x2FF`; THR (DLAB=0) emits host-captured bytes; RBR empty; LSR THR/transmitter empty bits always set for polling OUT. No IRQ line / FIFO / modem side effects yet.
 - Debug port `0x402`: widely used by SeaBIOS/QEMU guests for early console; treat as write-only byte sink for M1.
 - 8259A: Intel 8259A Programmable Interrupt Controller datasheet (ICW1â€“ICW4 incl. ICW1.LTIM level/edge trigger, AEOI + SFNM, OCW1â€“OCW3 EOI/IMR/IRR/ISR, OCW2 Automatic Rotation + Specific Rotation, OCW3 format + Poll Command + Special Mask Mode `ESMM`/`SMM`, DEFAULT IR7 when IR drops before first INTA); classic PC cascade on IRQ2.
 - 8254: Intel 8254 PIT datasheet â€” channel 0/2 control word, lo/hi access, counter latch, Read-Back command (`SC=11` COUNT/STATUS/CNTn + status byte OUT/NULL COUNT/RW/M/BCD), BCD=1 four-decade counting (written 0 â†’ 10_000), "Mode Definitions" modes 0/1/2/3/4/5 OUT + GATE-pin operations summary; ch0 OUT â†’ IRQ0 via `Machine::tick_pit` / `poll_external_irq` level follow; ch2 GATE/OUT via port `0x61`. No host audio / DRAM-refresh / host-real-time claims.

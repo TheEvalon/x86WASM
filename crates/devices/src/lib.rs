@@ -1,4 +1,5 @@
 //! Device models. Milestone 1: COM1 data port + debug port 0x402.
+//! Milestone 2 (serial): COM2 (`0x2F8`–`0x2FF`) mirrors COM1 16550 debug UART.
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! 8237A DMA register/page stubs (no transfer engine);
