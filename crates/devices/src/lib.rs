@@ -24,6 +24,7 @@ mod vga;
 pub use cmos::{
     CmosRtc, CMOS_DATA, CMOS_INDEX, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, REG_STATUS_D,
     STATUS_A_UIP, STB_AIE, STB_PIE, STB_SET, STB_UIE, STC_AF, STC_IRQF, STC_PF, STC_UF,
+    UIP_WINDOW_PERIODS,
 };
 pub use dma::{
     Dma8237, DmaChannel, DmaController, DmaTransferError, DMA_MASTER_BASE, DMA_PAGE_CH0,

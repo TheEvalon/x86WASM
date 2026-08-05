@@ -17,9 +17,10 @@
 //! 128-byte register bank with index/data port access, NMI-mask bit tracking
 //! (port `0x70` bit7), status B PIE/AIE/UIE subset, model `tick` that sets
 //! PF/UF (and AF on alarm match), IRQF → IRQ line for MachineBus → DualPic
-//! IRQ8, plus a `tick_second` update cycle (Status A UIP + the full calendar
-//! cascade: seconds → minutes → hours → date of month → month → year → century
-//! `0x32`, with day-of-week 1–7 and Gregorian leap years). Status B `DM`
+//! IRQ8, plus a `tick_second` update cycle (Status A UIP approximate high window
+//! of [`UIP_WINDOW_PERIODS`] `tick` periods + the full calendar cascade: seconds →
+//! minutes → hours → date of month → month → year → century `0x32`, with
+//! day-of-week 1–7 and Gregorian leap years). Status B `DM`
 //! (bit 2) selects BCD (`DM=0`, reset default) or binary (`DM=1`) encoding for
 //! the time/calendar registers during that cascade; Status B `24/12` (bit 1)
 //! selects 24-hour hours `0–23` (set; reset default) or 12-hour hours `1–12`
@@ -44,8 +45,8 @@
 //! - Host wall-clock sync / NTP-style host time
 //! - Full NMI nesting / SMRAM/SMI / post-delivery NMI blocking window
 //!   (`Machine::inject_nmi` + interpreter vector-2 stub covers the pin path)
-//! - Exact crystal divider / UIP pulse width (UIP is set for the duration of
-//!   the modeled update call, or until `end_update_for_test`)
+//! - Exact crystal divider / UIP pulse timing (approximate
+//!   [`UIP_WINDOW_PERIODS`]-tick hold after `tick_second` only; not µs-accurate)
 //! - Automatic hour-register conversion when Status B `24/12` is toggled
 //! - ACPI extended CMOS beyond 128 bytes
 //! - Square-wave output (SQWE)
@@ -93,6 +94,17 @@ const INDEX_MASK: u8 = 0x7F;
 /// Status A: UIP (Update In Progress) — hardware-driven, read-only to guest.
 /// Spec: MC146818 Status Register A bit7.
 pub const STATUS_A_UIP: u8 = 1 << 7;
+
+/// Approximate Status A UIP high window after [`CmosRtc::tick_second`], in model
+/// periodic quanta ([`CmosRtc::tick`] periods).
+///
+/// Spec (MC146818): UIP rises ~244 µs before the update and stays high for the
+/// ~1984 µs update cycle. This model sets UIP at the start of `tick_second`,
+/// advances the calendar and latches UF immediately, then leaves UIP set for
+/// this many subsequent `tick` periods before clearing it — an order-of-magnitude
+/// match at the common RS=0110 / 1024 Hz rate (~976 µs/period), not an exact
+/// crystal-timed pulse.
+pub const UIP_WINDOW_PERIODS: u8 = 2;
 
 /// Status B: SET (inhibit update), PIE, AIE, UIE, DM (binary data mode), 24/12.
 ///
@@ -159,6 +171,9 @@ pub struct CmosRtc {
     /// Spec: IBM PC/AT — writing `0x70` bit7 disables NMI; this stub stores the
     /// bit and exposes it via [`Self::nmi_masked`] for `Machine::inject_nmi`.
     pub nmi_disabled: bool,
+    /// Remaining [`CmosRtc::tick`] periods while Status A UIP stays high after an
+    /// update cycle. Zero when UIP is clear (or held only by a test begin).
+    uip_hold_periods: u8,
 }
 
 impl CmosRtc {
@@ -167,6 +182,7 @@ impl CmosRtc {
             ram: [0; 128],
             index: 0,
             nmi_disabled: false,
+            uip_hold_periods: 0,
         };
         s.apply_reset_defaults();
         s
@@ -180,6 +196,7 @@ impl CmosRtc {
         self.ram[REG_STATUS_D as usize] = DEFAULT_STATUS_D;
         self.index = 0;
         self.nmi_disabled = false;
+        self.uip_hold_periods = 0;
     }
 
     pub fn reset(&mut self) {
@@ -235,7 +252,8 @@ impl CmosRtc {
     /// also sets UF (update-ended colocated with the quantum — honesty note:
     /// calendar fields are not advanced here; use [`Self::tick_second`] for the
     /// UIP + calendar update cycle). Alarm match sets AF (don't-care `C0h`–`FFh`);
-    /// AIE gates IRQF only.
+    /// AIE gates IRQF only. Each period also decays an outstanding UIP hold from
+    /// [`Self::tick_second`] (see [`UIP_WINDOW_PERIODS`]).
     /// IRQF = (PF∧PIE) ∨ (AF∧AIE) ∨ (UF∧UIE). Returns true on IRQ pin rising edge.
     pub fn tick(&mut self, periods: u64) -> bool {
         if periods == 0 {
@@ -255,24 +273,29 @@ impl CmosRtc {
                 self.ram[REG_STATUS_C as usize] |= STC_UF;
             }
             self.maybe_set_alarm_flag();
+            self.decay_uip_window();
         }
         self.recompute_irqf();
         !prev && self.irq_line()
     }
 
-    /// One second update cycle: UIP → calendar advance → clear UIP → UF.
+    /// One second update cycle: UIP → calendar advance → UF → UIP hold window.
     ///
     /// Spec (MC146818): when Status B SET=0, the chip runs an update cycle each
     /// second; Status A UIP is set while the cycle runs and cleared when done;
     /// UF is set at update-ended. SET=1 inhibits the cycle (no UIP/UF/advance).
     /// Status B `DM` selects BCD (`0`) or binary (`1`) field encoding.
+    ///
+    /// Model: UIP remains set after return for [`UIP_WINDOW_PERIODS`] subsequent
+    /// [`Self::tick`] periods (approximate pulse; not crystal-timed). UF and
+    /// alarm match still latch at calendar update-ended inside this call.
     /// Returns true on IRQ pin rising edge (e.g. UIE∧UF).
     pub fn tick_second(&mut self) -> bool {
         if !self.begin_update_cycle() {
             return false;
         }
         self.advance_calendar();
-        self.finish_update_cycle()
+        self.finish_update_cycle_with_uip_window()
     }
 
     /// Spec: MC146818 Status B bit 2 (`DM`) — 1 = binary calendar, 0 = BCD.
@@ -305,13 +328,38 @@ impl CmosRtc {
         true
     }
 
+    /// Clear UIP immediately, set UF, recompute IRQF (test helper / abort path).
     fn finish_update_cycle(&mut self) -> bool {
+        self.uip_hold_periods = 0;
         let prev = self.irq_line();
         self.ram[REG_STATUS_A as usize] &= !STATUS_A_UIP;
         self.ram[REG_STATUS_C as usize] |= STC_UF;
         self.maybe_set_alarm_flag();
         self.recompute_irqf();
         !prev && self.irq_line()
+    }
+
+    /// End of `tick_second`: latch UF/alarm while leaving UIP set for the
+    /// approximate [`UIP_WINDOW_PERIODS`] hold (cleared by later [`Self::tick`]).
+    fn finish_update_cycle_with_uip_window(&mut self) -> bool {
+        let prev = self.irq_line();
+        // UIP already set by `begin_update_cycle`.
+        self.uip_hold_periods = UIP_WINDOW_PERIODS;
+        self.ram[REG_STATUS_C as usize] |= STC_UF;
+        self.maybe_set_alarm_flag();
+        self.recompute_irqf();
+        !prev && self.irq_line()
+    }
+
+    /// Decrement the post-`tick_second` UIP hold; clear Status A UIP at zero.
+    fn decay_uip_window(&mut self) {
+        if self.uip_hold_periods == 0 {
+            return;
+        }
+        self.uip_hold_periods -= 1;
+        if self.uip_hold_periods == 0 {
+            self.ram[REG_STATUS_A as usize] &= !STATUS_A_UIP;
+        }
     }
 
     /// Full time + calendar advance for one update cycle.
@@ -964,8 +1012,39 @@ mod tests {
         assert_ne!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
         let _ = c.end_update_for_test();
         assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
-        // Full second tick leaves UIP clear (UIE off → no IRQ rising edge).
+    }
+
+    /// Spec: MC146818 Status A UIP is readable high during the update window, then low.
+    ///
+    /// Model (approximate, not crystal-timed): `tick_second` leaves UIP set; each
+    /// subsequent `tick` period decays the hold; after [`UIP_WINDOW_PERIODS`]
+    /// periods UIP clears. UF still latches at calendar update-ended.
+    #[test]
+    fn uip_high_after_tick_second_then_low_after_window() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SEC, 0x10);
+        assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+        assert!(!c.tick_second()); // UIE off → no IRQ rising edge
+        assert_eq!(c.read_reg(REG_SEC), 0x11);
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
+        // UIP stays high and is guest-readable via the data port.
+        assert_ne!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+        c.port_write(CMOS_INDEX, 1, u32::from(REG_STATUS_A));
+        assert_ne!(c.port_read(CMOS_DATA, 1) as u8 & STATUS_A_UIP, 0);
+        // Mid-window: first period of the hold leaves UIP set; final period clears.
+        let _ = c.tick(1);
+        assert_ne!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+        let _ = c.tick(u64::from(UIP_WINDOW_PERIODS) - 1);
+        assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+    }
+
+    /// Model: a single `tick(UIP_WINDOW_PERIODS)` call also clears the UIP window.
+    #[test]
+    fn uip_window_clears_in_one_multi_period_tick() {
+        let mut c = CmosRtc::new();
         assert!(!c.tick_second());
+        assert_ne!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+        let _ = c.tick(u64::from(UIP_WINDOW_PERIODS));
         assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
     }
 
@@ -1191,6 +1270,7 @@ mod tests {
     }
 
     /// Spec: UIE + update-ended from `tick_second` asserts IRQF (same IRQ pin as PIE path).
+    /// UIP remains high for the approximate window; UF still latches immediately.
     #[test]
     fn uie_tick_second_asserts_irq_line() {
         let mut c = CmosRtc::new();
@@ -1198,6 +1278,8 @@ mod tests {
         assert!(c.tick_second());
         assert!(c.irq_line());
         assert_ne!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
+        assert_ne!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+        let _ = c.tick(u64::from(UIP_WINDOW_PERIODS));
         assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
     }
 
