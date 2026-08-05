@@ -87,13 +87,16 @@
 //!   `0x0C`/`0x0D` store/readback with [`VgaText::text_start_address`] /
 //!   [`VgaText::text_start_plane_offset`] helpers and mode-03h reset default
 //!   `0x0000` (Protect does not block; host `char_at`/`attr_at`/`put_char`
-//!   viewport is relative to start; CPU `0xB8000` MMIO stays absolute); Maximum
-//!   Scan Line `0x09` store/readback with mode-03h reset default `0x0F` (Protect
-//!   does not block); Overflow `0x07` store/readback with FreeVGA bit consts
-//!   (under Protect only bit4 / Line Compare bit8 remains writable); Vertical
-//!   Retrace End `0x11` bit7 Protect blocks writes to indexes `0x00`–`0x07`
-//!   (Overflow bit4 still writable; no host cursor glyph render, max-scan glyph
-//!   height, Line Compare split-screen, or CRTC timing)
+//!   viewport is relative to start; CPU `0xB8000` MMIO stays absolute); Offset
+//!   `0x13` store/readback with mode-03h reset default `0x28` and
+//!   [`VgaText::text_row_pitch_chars`] (words→character cells; host helpers use
+//!   pitch as row stride; Protect does not block); Maximum Scan Line `0x09`
+//!   store/readback with mode-03h reset default `0x0F` (Protect does not block);
+//!   Overflow `0x07` store/readback with FreeVGA bit consts (under Protect only
+//!   bit4 / Line Compare bit8 remains writable); Vertical Retrace End `0x11`
+//!   bit7 Protect blocks writes to indexes `0x00`–`0x07` (Overflow bit4 still
+//!   writable; no host cursor glyph render, max-scan glyph height, Line Compare
+//!   split-screen, or CRTC timing)
 //! - Sequencer index/data noop: latch index on `0x3C4`, store/read register file
 //!   on `0x3C5` with mode-03h-class reset defaults; Map Mask `0x02` store/readback
 //!   with mode-03h reset default `0x03`; Character Map Select `0x03` store/readback
@@ -316,14 +319,13 @@ const _: () = assert!(
 /// Spec: FreeVGA CRT Controller Registers / IBM VGA — index `0x13`. Bits 7:0 =
 /// Offset (logical line width of the screen, in words when byte addressing is
 /// used). Protect (Vertical Retrace End bit7) does **not** block this index
-/// (`>= 0x08`). Pitch/render side effects are out of scope (store/readback
-/// only).
+/// (`>= 0x08`). Host text helpers convert words→character cells (`Offset * 2`)
+/// for row stride ([`VgaText::text_row_pitch_chars`]).
 pub const VGA_CRTC_OFFSET: u8 = 0x13;
 /// Mode-03h-class Offset reset default (`0x28` = 40 words → 80 columns).
 ///
 /// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Offset `0x28` for 80-column
-/// text (next character row starts 40 words after the previous). Store/readback
-/// only; no pitch side effects in host render.
+/// text (`0x28 * 2` = 80 character cells between adjacent rows).
 pub const VGA_CRTC_OFFSET_DEFAULT: u8 = 0x28;
 const _: () = assert!(VGA_CRTC_OFFSET_DEFAULT == 0x28 && VGA_CRTC_OFFSET == 0x13);
 /// CRTC Underline Location Register index.
@@ -1061,17 +1063,20 @@ impl VgaText {
     /// Byte offset of a visible text cell relative to CRTC Start Address.
     ///
     /// Spec: FreeVGA CRT Controller — Start Address is the character index of
-    /// the first displayed cell. Host viewport helpers index `(row, col)` as
-    /// `start + row*cols + col`. When that index exceeds the 32 KiB plane,
-    /// wrap within the plane (FreeVGA notes display wrap in video memory).
-    /// CPU MMIO (`read_u8`/`write_u8`) stays absolute at `0xB8000`.
+    /// the first displayed cell; Offset is the logical line width in words.
+    /// Host viewport helpers index `(row, col)` as
+    /// `start + row*pitch + col` where `pitch = Offset * 2` character cells
+    /// ([`VgaText::text_row_pitch_chars`]). When that index exceeds the 32 KiB
+    /// plane, wrap within the plane (FreeVGA notes display wrap in video
+    /// memory). CPU MMIO (`read_u8`/`write_u8`) stays absolute at `0xB8000`.
     fn cell_offset(&self, row: usize, col: usize) -> Option<usize> {
         if row >= VGA_TEXT_ROWS || col >= VGA_TEXT_COLS {
             return None;
         }
         let chars_in_plane = VGA_TEXT_SIZE / VGA_CELL_BYTES;
         let cell =
-            (usize::from(self.text_start_address()) + row * VGA_TEXT_COLS + col) % chars_in_plane;
+            (usize::from(self.text_start_address()) + row * self.text_row_pitch_chars() + col)
+                % chars_in_plane;
         Some(cell * VGA_CELL_BYTES)
     }
 
@@ -1112,6 +1117,18 @@ impl VgaText {
     /// (character + attribute). Used by host text viewport helpers.
     pub fn text_start_plane_offset(&self) -> usize {
         usize::from(self.text_start_address()) * VGA_CELL_BYTES
+    }
+
+    /// Logical text row pitch in character cells from CRTC Offset (`0x13`).
+    ///
+    /// Spec: FreeVGA CRT Controller — Offset is the logical line width in
+    /// words (byte addressing). Each alphanumeric cell is one word (char +
+    /// attribute), so character-cell pitch is `Offset * 2`. Mode-03h reset
+    /// [`VGA_CRTC_OFFSET_DEFAULT`] (`0x28`) yields 80 cells — identity with
+    /// [`VGA_TEXT_COLS`]. Host `char_at`/`attr_at`/`put_char` use this as the
+    /// row stride; CPU `0xB8000` MMIO remains absolute.
+    pub fn text_row_pitch_chars(&self) -> usize {
+        usize::from(self.crtc_regs[usize::from(VGA_CRTC_OFFSET)]) * 2
     }
 
     /// Apply PEL Mask to a display-path color/palette index before DAC lookup.
@@ -1913,6 +1930,112 @@ mod tests {
         assert_eq!(v.crtc_regs[usize::from(VGA_CRTC_OFFSET)], 0x40);
         v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
         assert_eq!(v.port_read(VGA_CRTC_DATA, 1) as u8, 0x40);
+    }
+
+    /// Spec: FreeVGA CRT Controller — Offset is logical line width in words;
+    /// host text helpers convert words→character cells (`Offset * 2`). Mode-03h
+    /// reset `0x28` → 80-character row stride (identity with [`VGA_TEXT_COLS`]).
+    #[test]
+    fn crtc_offset_default_pitch_matches_80_col_stride() {
+        let mut v = VgaText::new();
+        assert_eq!(v.text_row_pitch_chars(), VGA_TEXT_COLS);
+        assert_eq!(
+            v.text_row_pitch_chars(),
+            usize::from(VGA_CRTC_OFFSET_DEFAULT) * 2
+        );
+
+        assert!(v.put_char(1, 0, b'R', 0x1E));
+        let row1 = VGA_TEXT_BASE + (VGA_TEXT_COLS * VGA_CELL_BYTES) as u64;
+        assert_eq!(v.read_u8(row1), Some(b'R'));
+        assert_eq!(v.read_u8(row1 + 1), Some(0x1E));
+        assert_eq!(v.char_at(1, 0), Some(b'R'));
+        assert_eq!(v.attr_at(1, 0), Some(0x1E));
+        // Absolute base cell unchanged.
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(VGA_DEFAULT_CHAR));
+    }
+
+    /// Spec: FreeVGA — non-default Offset widens logical pitch so adjacent
+    /// character rows are farther apart in the refresh buffer. Host
+    /// `char_at`/`attr_at`/`put_char` use that stride; CPU `0xB8000` MMIO stays
+    /// absolute.
+    #[test]
+    fn crtc_offset_nondefault_pitch_changes_host_text_row_stride() {
+        let mut v = VgaText::new();
+        // Offset 0x50 = 80 words → 160 character cells between rows.
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        v.port_write(VGA_CRTC_DATA, 1, 0x50);
+        assert_eq!(v.text_row_pitch_chars(), 160);
+
+        assert!(v.put_char(0, 0, b'A', 0x07));
+        assert!(v.put_char(1, 0, b'B', 0x1F));
+        assert!(v.put_char(2, 3, b'C', 0x2E));
+
+        let row0 = VGA_TEXT_BASE;
+        let row1 = VGA_TEXT_BASE + (160 * VGA_CELL_BYTES) as u64;
+        let row2_col3 = VGA_TEXT_BASE + ((160 * 2 + 3) * VGA_CELL_BYTES) as u64;
+        assert_eq!(v.read_u8(row0), Some(b'A'));
+        assert_eq!(v.read_u8(row1), Some(b'B'));
+        assert_eq!(v.read_u8(row1 + 1), Some(0x1F));
+        assert_eq!(v.read_u8(row2_col3), Some(b'C'));
+        assert_eq!(v.read_u8(row2_col3 + 1), Some(0x2E));
+
+        // Classic 80-col neighbor is not row 1 under wide pitch.
+        let classic_row1 = VGA_TEXT_BASE + (VGA_TEXT_COLS * VGA_CELL_BYTES) as u64;
+        assert_eq!(v.read_u8(classic_row1), Some(VGA_DEFAULT_CHAR));
+
+        assert_eq!(v.char_at(1, 0), Some(b'B'));
+        assert_eq!(v.attr_at(1, 0), Some(0x1F));
+        assert_eq!(v.char_at(2, 3), Some(b'C'));
+        assert_eq!(v.attr_at(2, 3), Some(0x2E));
+    }
+
+    /// Spec: FreeVGA — Offset pitch combines with Start Address: visible cell
+    /// `(row, col)` is at character index `start + row*pitch + col`.
+    #[test]
+    fn crtc_offset_pitch_combines_with_start_address() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_HIGH));
+        v.port_write(VGA_CRTC_DATA, 1, 0x00);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_START_ADDR_LOW));
+        v.port_write(VGA_CRTC_DATA, 1, 10);
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        v.port_write(VGA_CRTC_DATA, 1, 0x40); // 64 words → 128 chars/row
+        assert_eq!(v.text_start_address(), 10);
+        assert_eq!(v.text_row_pitch_chars(), 128);
+
+        assert!(v.put_char(1, 2, b'X', 0x4E));
+        let abs = VGA_TEXT_BASE + ((10 + 128 + 2) * VGA_CELL_BYTES) as u64;
+        assert_eq!(v.read_u8(abs), Some(b'X'));
+        assert_eq!(v.read_u8(abs + 1), Some(0x4E));
+        assert_eq!(v.char_at(1, 2), Some(b'X'));
+        assert_eq!(v.attr_at(1, 2), Some(0x4E));
+    }
+
+    /// Spec: FreeVGA — Offset remains writable under Protect; reset restores
+    /// mode-03h `0x28` pitch (80-col stride).
+    #[test]
+    fn crtc_offset_pitch_respects_protect_and_reset() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_VERTICAL_RETRACE_END));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_PROTECT));
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        v.port_write(VGA_CRTC_DATA, 1, 0x50);
+        assert_eq!(v.text_row_pitch_chars(), 160);
+        assert!(v.put_char(1, 0, b'P', 0x07));
+        let wide = VGA_TEXT_BASE + (160 * VGA_CELL_BYTES) as u64;
+        assert_eq!(v.read_u8(wide), Some(b'P'));
+
+        v.reset();
+        assert_eq!(
+            v.crtc_regs[usize::from(VGA_CRTC_OFFSET)],
+            VGA_CRTC_OFFSET_DEFAULT
+        );
+        assert_eq!(v.text_row_pitch_chars(), VGA_TEXT_COLS);
+        assert_eq!(v.char_at(1, 0), Some(VGA_DEFAULT_CHAR));
+        assert_eq!(
+            v.read_u8(VGA_TEXT_BASE + (VGA_TEXT_COLS * VGA_CELL_BYTES) as u64),
+            Some(VGA_DEFAULT_CHAR)
+        );
     }
 
     /// Spec: FreeVGA CRT Controller — Underline Location (index `0x14`)
