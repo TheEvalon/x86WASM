@@ -9,7 +9,11 @@
 //!   SET/DM/24-12 + PIE/AIE/UIE, status C PF/AF/UF/IRQF (read-to-clear), IRQ pin.
 //! - IBM PC/AT Technical Reference — CMOS index port `0x70` (bit7 = NMI mask),
 //!   data port `0x71`; RTC IRQ → ISA IRQ8 (8259A slave IR0); BCD century at
-//!   index `0x32` (later standardized as the ACPI FADT `CENTURY` index byte).
+//!   index `0x32` (later standardized as the ACPI FADT `CENTURY` index byte);
+//!   CMOS map index `0x0F` shutdown status / reset code (ordinary CMOS RAM,
+//!   not MC146818 status A–D; see [`REG_SHUTDOWN`]).
+//! - Ralf Brown's Interrupt List — CMOS 0Fh "Shutdown Status Byte" / reset-code
+//!   values used by POST after CPU reset (SeaBIOS soft-reset).
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 RTC.
 //!
 //! # Scope (this slice)
@@ -32,6 +36,11 @@
 //! AF sets on match regardless of AIE; AIE gates IRQF only.
 //! Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
 //! `Machine::nmi_delivery_enabled` / `Machine::inject_nmi` gate CPU `#NMI`.
+//! IBM PC/AT CMOS index [`REG_SHUTDOWN`] (`0x0F`) is ordinary R/W CMOS RAM
+//! (store/readback) used as the POST shutdown / reset code; SeaBIOS writes it
+//! before a soft CPU reset. This model preserves that byte across
+//! [`CmosRtc::reset`] (battery-backed); other general CMOS config bytes are
+//! still cleared by model reset.
 //!
 //! # Model note: invalid calendar state
 //!
@@ -54,6 +63,9 @@
 //!   [`UIP_WINDOW_PERIODS`]-tick hold after `tick_second` only; not µs-accurate)
 //! - ACPI extended CMOS beyond 128 bytes
 //! - Square-wave output (SQWE)
+//! - Full battery-backed preserve of all non-volatile CMOS (only shutdown
+//!   `0x0F` survives [`CmosRtc::reset`] today; POST action on the code is
+//!   firmware/Machine, not this device)
 
 use crate::PortDevice;
 
@@ -70,6 +82,39 @@ pub const REG_STATUS_B: u8 = 0x0B;
 pub const REG_STATUS_C: u8 = 0x0C;
 /// Status Register D (valid RAM / battery).
 pub const REG_STATUS_D: u8 = 0x0D;
+
+/// IBM PC/AT CMOS shutdown status / reset code (index `0x0F`).
+///
+/// Spec: IBM PC/AT Technical Reference CMOS map + RBIL CMOS 0Fh — ordinary
+/// battery CMOS RAM (not MC146818 status A–D). BIOS POST reads this byte after
+/// CPU reset to choose cold POST vs resume (SeaBIOS soft-reset writes
+/// [`SHUTDOWN_JMP`] / similar before pulse-reset). Store/readback via
+/// `0x70`/`0x71`; preserved across [`CmosRtc::reset`].
+///
+/// Documented reset-code values (RBIL Table C006 / PC AT):
+/// - `00h` — soft reset or unexpected shutdown ([`SHUTDOWN_SOFT_OR_UNEXPECTED`])
+/// - `01h` — after memory size check
+/// - `02h` — after successful memory test
+/// - `03h` — after failed memory test
+/// - `04h` — INT 19h reboot ([`SHUTDOWN_INT19`])
+/// - `05h` — EOI keyboard + jump via BDA `40:67` ([`SHUTDOWN_JMP_WITH_EOI`])
+/// - `06h`–`08h` — protected-mode test / POST return paths
+/// - `09h` — INT 15h/87h block move ([`SHUTDOWN_BLOCK_MOVE`])
+/// - `0Ah` — jump via BDA `40:67` ([`SHUTDOWN_JMP`]; common SeaBIOS soft-reset)
+/// - `0Bh` / `0Ch` — resume via IRET / RETF via `40:67`
+/// - other — treated as power-on reset by classic POST
+pub const REG_SHUTDOWN: u8 = 0x0F;
+
+/// Shutdown status `00h`: soft reset or unexpected shutdown.
+pub const SHUTDOWN_SOFT_OR_UNEXPECTED: u8 = 0x00;
+/// Shutdown status `04h`: INT 19h reboot request.
+pub const SHUTDOWN_INT19: u8 = 0x04;
+/// Shutdown status `05h`: flush keyboard (EOI) and jump via BDA `40:67`.
+pub const SHUTDOWN_JMP_WITH_EOI: u8 = 0x05;
+/// Shutdown status `09h`: INT 15h/87h block-move return.
+pub const SHUTDOWN_BLOCK_MOVE: u8 = 0x09;
+/// Shutdown status `0Ah`: jump via BDA `40:67` (SeaBIOS soft-reset code).
+pub const SHUTDOWN_JMP: u8 = 0x0A;
 
 /// Seconds / minutes / hours (time).
 const REG_SEC: u8 = 0x00;
@@ -193,11 +238,15 @@ impl CmosRtc {
     }
 
     fn apply_reset_defaults(&mut self) {
+        // Spec: IBM PC/AT — CMOS `0x0F` is battery-backed; SeaBIOS soft-reset
+        // relies on the shutdown code surviving CPU/device reset.
+        let shutdown = self.ram[REG_SHUTDOWN as usize];
         self.ram = [0; 128];
         self.ram[REG_STATUS_A as usize] = DEFAULT_STATUS_A;
         self.ram[REG_STATUS_B as usize] = DEFAULT_STATUS_B;
         self.ram[REG_STATUS_C as usize] = DEFAULT_STATUS_C;
         self.ram[REG_STATUS_D as usize] = DEFAULT_STATUS_D;
+        self.ram[REG_SHUTDOWN as usize] = shutdown;
         self.index = 0;
         self.nmi_disabled = false;
         self.uip_hold_periods = 0;
@@ -216,6 +265,15 @@ impl CmosRtc {
     /// Spec: IBM PC/AT Technical Reference — CMOS index bit7 masks NMI.
     pub fn nmi_masked(&self) -> bool {
         self.nmi_disabled
+    }
+
+    /// IBM PC/AT CMOS shutdown status byte (index [`REG_SHUTDOWN`] / `0x0F`).
+    ///
+    /// Spec: RBIL CMOS 0Fh — POST reset code. Ordinary R/W CMOS RAM; see
+    /// [`REG_SHUTDOWN`] for value meanings. Exposed for a future Machine soft-
+    /// reset path without requiring MachineBus port I/O.
+    pub fn shutdown_status(&self) -> u8 {
+        self.ram[REG_SHUTDOWN as usize]
     }
 
     pub fn read_reg(&self, index: u8) -> u8 {
@@ -784,6 +842,7 @@ mod tests {
         assert_eq!(c.read_reg(REG_STATUS_B), DEFAULT_STATUS_B);
         assert_eq!(c.read_reg(REG_STATUS_C), DEFAULT_STATUS_C);
         assert_eq!(c.read_reg(REG_STATUS_D), DEFAULT_STATUS_D);
+        assert_eq!(c.shutdown_status(), SHUTDOWN_SOFT_OR_UNEXPECTED);
         assert!(!c.nmi_disabled);
         assert_eq!(c.selected_index(), 0);
         assert!(!c.irq_line());
@@ -793,6 +852,49 @@ mod tests {
         c2.port_write(CMOS_DATA, 1, 0xAB);
         c2.reset();
         assert_eq!(c2, CmosRtc::new());
+    }
+
+    /// Spec: IBM PC/AT CMOS map `0x0F` — shutdown status R/W store/readback.
+    #[test]
+    fn shutdown_status_store_readback() {
+        let mut c = CmosRtc::new();
+        assert_eq!(c.read_reg(REG_SHUTDOWN), SHUTDOWN_SOFT_OR_UNEXPECTED);
+        assert_eq!(c.shutdown_status(), SHUTDOWN_SOFT_OR_UNEXPECTED);
+
+        c.port_write(CMOS_INDEX, 1, u32::from(REG_SHUTDOWN));
+        c.port_write(CMOS_DATA, 1, u32::from(SHUTDOWN_JMP));
+        assert_eq!(c.port_read(CMOS_DATA, 1) as u8, SHUTDOWN_JMP);
+        assert_eq!(c.read_reg(REG_SHUTDOWN), SHUTDOWN_JMP);
+        assert_eq!(c.shutdown_status(), SHUTDOWN_JMP);
+
+        // Other common SeaBIOS / POST codes also store/read back.
+        for code in [
+            SHUTDOWN_INT19,
+            SHUTDOWN_JMP_WITH_EOI,
+            SHUTDOWN_BLOCK_MOVE,
+            0x01,
+            0x0B,
+            0x0C,
+            0xFF,
+        ] {
+            c.write_reg(REG_SHUTDOWN, code);
+            assert_eq!(c.shutdown_status(), code);
+            c.port_write(CMOS_INDEX, 1, u32::from(REG_SHUTDOWN));
+            assert_eq!(c.port_read(CMOS_DATA, 1) as u8, code);
+        }
+    }
+
+    /// Spec: battery-backed shutdown byte survives model reset (SeaBIOS soft-reset).
+    #[test]
+    fn shutdown_status_survives_reset() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SHUTDOWN, SHUTDOWN_JMP);
+        c.write_reg(0x10, 0xAB); // ordinary config RAM — still cleared on reset
+        c.reset();
+        assert_eq!(c.shutdown_status(), SHUTDOWN_JMP);
+        assert_eq!(c.read_reg(REG_SHUTDOWN), SHUTDOWN_JMP);
+        assert_eq!(c.read_reg(0x10), 0);
+        assert_eq!(c.read_reg(REG_STATUS_A), DEFAULT_STATUS_A);
     }
 
     #[test]
