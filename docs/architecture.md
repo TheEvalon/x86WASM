@@ -31,7 +31,7 @@ emulator-cli (native) ───────────────────�
 | `x86-ir` | Typed IR placeholder (JIT later) |
 | `x86-interpreter` | Reference execution |
 | `machine-pc` | Wire CPU, memory, buses, devices |
-| `devices` | COM1, debug port `0x402`, future PIC/PIT/… |
+| `devices` | COM1/COM2 16550 stubs, debug port `0x402`, PIC/PIT/… |
 | `firmware-interface` | Firmware load hooks (stub in M1) |
 | `emulator-cli` | Native runner |
 | `emulator-web` | Wasm exports for the browser worker |

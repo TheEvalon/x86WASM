@@ -1,7 +1,8 @@
-//! COM1 (0x3F8) and Bochs/QEMU-style debug port 0x402.
+//! COM1 (`0x3F8`), COM2 (`0x2F8`), and Bochs/QEMU-style debug port `0x402`.
 //!
-//! 16550 programming model is intentionally minimal for M1: writes to the
-//! COM1 THR (when DLAB=0) and writes to 0x402 append bytes to a shared sink.
+//! 16550 programming model is intentionally minimal (M1/M2 debug UART): writes
+//! to THR (when DLAB=0) and writes to `0x402` append bytes to a per-port sink.
+//! Spec: NS16550A / classic PC COM1–COM2 I/O map (THR/RBR/LSR subset for OUT).
 
 use crate::PortDevice;
 
@@ -33,7 +34,7 @@ impl SerialOutput {
     }
 }
 
-/// Very small 16550 subset at base `0x3F8`.
+/// Very small 16550 subset at a classic COM base (`0x3F8` COM1 / `0x2F8` COM2).
 #[derive(Clone, Debug)]
 pub struct Serial16550 {
     pub base: u16,
@@ -171,6 +172,17 @@ mod tests {
         assert_eq!(s.output().as_bytes(), b"H");
     }
 
+    /// Spec: NS16550A THR at COM2 base `0x2F8` (DLAB=0) — same debug-UART model as COM1.
+    #[test]
+    fn com2_thr_emits_byte() {
+        let mut s = Serial16550::new(0x2F8);
+        s.port_write(0x2F8, 1, u32::from(b'C'));
+        assert_eq!(s.output().as_bytes(), b"C");
+        // COM1 range must not be owned by a COM2 instance.
+        s.port_write(0x3F8, 1, u32::from(b'X'));
+        assert_eq!(s.output().as_bytes(), b"C");
+    }
+
     #[test]
     fn debug_port_emits_byte() {
         let mut d = DebugConsole::new();
@@ -182,5 +194,14 @@ mod tests {
     fn lsr_reports_thr_empty() {
         let mut s = Serial16550::new(0x3F8);
         assert_eq!(s.port_read(0x3FD, 1) & 0x60, 0x60);
+    }
+
+    /// Spec: NS16550A LSR offset +5 — THR empty (bit5) + transmitter empty (bit6).
+    #[test]
+    fn com2_lsr_reports_thr_empty() {
+        let mut s = Serial16550::new(0x2F8);
+        assert_eq!(s.port_read(0x2FD, 1) & 0x60, 0x60);
+        // RBR empty (offset 0) — enough for polling OUT loops.
+        assert_eq!(s.port_read(0x2F8, 1), 0);
     }
 }
