@@ -200,11 +200,12 @@
 //! - VERIFY (`0x16` | MT/MFM/SK): Spec Intel 82077AA Table 5-1 — command byte
 //!   lower 5 bits `10110`; optional MT/MFM/SK; same eight params and 7-byte
 //!   result as READ DATA. VERIFY compares/reads without a host DMA buffer:
-//!   with media + `N=2` + readable C/H/R for MT=0 **R..=EOT** → ST0 IC=00 |
-//!   H | US, ST1=ST2=0, C/H/R/N = ENDaddress of last sector verified (no
-//!   `last_sector` / DMA arm; MT head-switch deferred). No media / wrong N /
-//!   OOR → ST0 IC=01 | H | US, ST1 ND. Asserts IRQ6 (cleared on first result
-//!   byte); EOT→`sc_eot`.
+//!   with media + `N=2` + readable CHS for MT=0 **R..=EOT**, or MT=1 starting
+//!   on head 0 continuing head 1 after EOT (same Multi-Track rule as
+//!   READ/WRITE DATA) → ST0 IC=00 | H | US (ST0.H = final head), ST1=ST2=0,
+//!   C/H/R/N = ENDaddress of last sector verified (no `last_sector` / DMA
+//!   arm). No media / wrong N / OOR → ST0 IC=01 | H | US, ST1 ND. Asserts
+//!   IRQ6 (cleared on first result byte); EOT→`sc_eot`.
 //! - 1.44MB media image attach/eject + CHS→offset/`read_sector`/
 //!   `write_sector` helpers (PC MFM geometry); DIR bit7 DSKCHG stub: set on
 //!   eject, preserved across re-attach/`reset`, cleared by successful
@@ -225,13 +226,12 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - READ TRACK and other transfer commands; VERIFY EC/CRC compare beyond
-//!   readable-sector stub; READ ID full IDAM track scan
+//! - READ TRACK and other transfer commands; READ ID full IDAM track scan
 //!   (sector-ID stub only); READ DELETED DATA deleted address-mark engine
 //!   (media path remains honest ST1 ND); WRITE DELETED DATA deleted
 //!   address-mark / write engine (media path remains honest ST1 NW); FORMAT
 //!   TRACK per-sector C/H/R/N ID DMA stream (programmed fill only this slice)
-//! - VERIFY MT head-switch / DMA; DREQ/DACK cycle timing
+//! - VERIFY DMA / EC/CRC host compare beyond readable-sector stub; DREQ/DACK cycle timing
 //! - Seek / Relative Seek step timing; Relative Seek ST0 EC when stepping out
 //!   beyond track 0 (PCN clamp only this slice); real DIR disk-change edge
 //!   timing (DSKCHG stub only)
@@ -1624,8 +1624,10 @@ impl Fdc82077 {
     }
 
     /// Begin VERIFY parameter phase (8 bytes). Spec: Intel 82077AA Table 5-1.
-    fn start_verify(&mut self) {
+    fn start_verify(&mut self, cmd: u8) {
         self.read_params = [0; FDC_VERIFY_PARAM_LEN as usize];
+        // Spec: Intel 82077AA Table 5-1 — MT in command bit7 (same as READ DATA).
+        self.read_cmd_mt = cmd & FDC_CMD_MT != 0;
         self.phase = Phase::VerifyParams { index: 0 };
     }
 
@@ -1634,13 +1636,17 @@ impl Fdc82077 {
     /// Spec: Intel 82077AA VERIFY / Table 5-1 / §6.1 / §6.2 — same param/result
     /// shape as READ DATA. VERIFY compares/reads without a host DMA buffer:
     ///
-    /// - With media, `N == 2`, and every C/H/R in MT=0 **R..=EOT** readable via
-    ///   [`Self::read_sector`]: ST0 IC=00 (normal) | H | US, ST1=0, ST2=0,
-    ///   C/H/R/N = ENDaddress of the **last** sector verified (EOT==R → one;
-    ///   EOT<R → starting R only). Does **not** latch `last_sector` or arm DMA.
-    ///   MT head-switch deferred.
-    /// - Otherwise (no media / wrong N / OOR CHS): ST0 IC=01 | H | US, ST1 ND,
-    ///   ST2=0, C/H/R/N from command start.
+    /// - With media, `N == 2`, and every CHS in range readable via
+    ///   [`Self::read_sector`]:
+    ///   - MT=0: same-head **R..=EOT** (EOT < R → starting R only).
+    ///   - MT=1 starting on head 0: after EOT under head 0, continue at sector
+    ///     1 under head 1 on the same cylinder through EOT (Multi-Track;
+    ///     mirror READ/WRITE DATA). Starting on head 1 does not wrap to head 0.
+    ///   ST0 IC=00 (normal) | H | US with ST0.H = **final** head, ST1=0,
+    ///   ST2=0, C/H/R/N = ENDaddress of the **last** sector verified. Does
+    ///   **not** latch `last_sector` or arm DMA.
+    /// - Otherwise (no media / wrong N / OOR CHS): ST0 IC=01 | H | US (command
+    ///   head), ST1 ND, ST2=0, C/H/R/N from command start.
     ///
     /// Latches EOT into `sc_eot`; asserts IRQ6 (cleared on first result byte).
     fn finish_verify(&mut self) {
@@ -1652,11 +1658,14 @@ impl Fdc82077 {
         let r = self.read_params[3];
         let n = self.read_params[4];
         let eot = self.read_params[5];
-        // GPL (params[6]) and DTL (params[7]) accepted; MT head-switch deferred.
+        // GPL (params[6]) and DTL (params[7]) accepted.
         self.sc_eot = eot;
-        let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
-        // Spec: 82077AA — MT=0 same-head R..=EOT (mirror READ DATA range).
+        let st0_head_start = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        // Spec: 82077AA VERIFY — MT=0 same-head R..=EOT (mirror READ DATA range).
         let end_r = if eot >= r { eot } else { r };
+        // Spec: 82077AA Multi-Track — after last sector under head 0 (EOT),
+        // continue at first sector under head 1 (same cylinder).
+        let mt_switch = self.read_cmd_mt && h == 0 && eot >= r;
 
         // Spec: 82077AA VERIFY — no host buffer; stub success if sectors readable.
         if n == FDC_SECTOR_N {
@@ -1667,13 +1676,23 @@ impl Fdc82077 {
                     break;
                 }
             }
+            if ok && mt_switch {
+                for sec in 1..=end_r {
+                    if self.read_sector(c, 1, sec).is_none() {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
             if ok {
+                let end_h = if mt_switch { 1 } else { h };
+                let st0_head = if end_h != 0 { FDC_ST0_HEAD } else { 0 };
                 self.read_result = [
                     FDC_ST0_IC_NORMAL | st0_head | unit,
                     0x00,
                     0x00,
                     c,
-                    h,
+                    end_h,
                     end_r,
                     n,
                 ];
@@ -1684,7 +1703,7 @@ impl Fdc82077 {
         }
 
         self.read_result = [
-            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST0_IC_ABNORMAL | st0_head_start | unit,
             FDC_ST1_ND,
             0x00,
             c,
@@ -2153,10 +2172,10 @@ impl Fdc82077 {
                     self.start_read_deleted_data();
                 } else if Self::is_verify_command(v) {
                     // Spec: Intel 82077AA Table 5-1 — MT/MFM/SK | 10110; eight params.
-                    self.start_verify();
+                    self.start_verify(v);
                 } else if Self::is_scan_command(v) {
-                    // Spec: Intel 82077AA Table 5-1 — SCAN *; reuse VERIFY no-media path.
-                    self.start_verify();
+                    // Spec: Intel 82077AA Table 5-1 — SCAN *; reuse VERIFY path.
+                    self.start_verify(v);
                 } else if Self::is_write_data_command(v) {
                     // Spec: Intel 82077AA §5.1.2 — MT/MFM | 00101; eight params.
                     self.start_write_data(v);
@@ -4627,8 +4646,7 @@ mod tests {
     }
 
     /// Spec: Intel 82077AA VERIFY — MT=0 same-head R..=EOT multi-sector; result
-    /// ENDaddress is last sector verified; no DMA/`last_sector` latch. MT bit
-    /// does not enable head-switch this slice (still same-head R..=EOT).
+    /// ENDaddress is last sector verified; no DMA/`last_sector` latch.
     #[test]
     fn verify_with_media_multi_sector_r_to_eot() {
         let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
@@ -4657,14 +4675,14 @@ mod tests {
         assert!(f.take_pending_dma_sector().is_none());
     }
 
-    /// Spec: Intel 82077AA VERIFY — MT bit set still verifies same-head R..=EOT
-    /// (head-switch deferred); ENDaddress is EOT on the selected head.
+    /// Spec: Intel 82077AA VERIFY / Multi-Track — starting on head 1 with MT=1
+    /// does not wrap back to head 0; verifies same-head R..=EOT only.
     #[test]
     fn verify_with_media_mt_same_head_r_to_eot() {
         let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
 
-        // MT|MFM|SK|VERIFY with EOT=R+1 on head 1.
+        // MT|MFM|SK|VERIFY with EOT=R+1 on head 1 — no head wrap.
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERIFY_MT_MFM_SK));
         for p in [0x04u8, 0x00, 0x01, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
             f.port_write(FDC_FIFO, 1, u32::from(p));
@@ -4675,7 +4693,7 @@ mod tests {
         assert_eq!(
             st0,
             FDC_ST0_IC_NORMAL | FDC_ST0_HEAD,
-            "ST0 = IC=00 | H=1 | US=0; MT head-switch deferred"
+            "ST0 = IC=00 | H=1 | US=0; MT start on head 1 stays head 1"
         );
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST1 clear");
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
@@ -4684,6 +4702,90 @@ mod tests {
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // R = ENDaddress (EOT)
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
         assert_eq!(f.sc_eot, 0x02);
+        assert!(f.last_sector().is_none());
+        assert!(f.take_pending_dma_sector().is_none());
+    }
+
+    /// Spec: Intel 82077AA VERIFY / Multi-Track — when MT=1 and the transfer
+    /// starts on head 0, after EOT under head 0 continue at sector 1 under
+    /// head 1 on the same cylinder (mirror READ/WRITE DATA MT). Here
+    /// R=EOT=2 on H=0 → sectors (0,0,2), (0,1,1), (0,1,2); ENDaddress of the
+    /// **last** sector verified is C=0,H=1,R=2; ST0.H reflects final head;
+    /// still no DMA/`last_sector` latch.
+    #[test]
+    fn verify_mt1_head0_past_eot_continues_head1() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // VERIFY MT|MFM: C=0,H=0,R=2,N=2,EOT=2 — past EOT on head0 → head1.
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_VERIFY),
+        );
+        for p in [0x00u8, 0x00, 0x00, 0x02, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line(), "MT VERIFY asserts IRQ6");
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_NORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=00 | H=1 (final head after MT switch) | US=0"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST1 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "C ENDaddress");
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x01,
+            "H ENDaddress = head 1 after MT switch"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x02,
+            "R ENDaddress = last sector on head 1 (EOT)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02, "N");
+        assert_eq!(f.sc_eot, 0x02);
+        assert!(
+            f.last_sector().is_none(),
+            "VERIFY must not latch a host/DMA sector buffer"
+        );
+        assert!(
+            f.take_pending_dma_sector().is_none(),
+            "VERIFY must not arm DMA pending"
+        );
+    }
+
+    /// Spec: Intel 82077AA VERIFY — MT=0 with the same C/H/R/EOT as the MT=1
+    /// head-switch case verifies only same-head R..=EOT (here one sector on
+    /// head 0); does **not** continue onto head 1.
+    #[test]
+    fn verify_mt0_same_params_stops_at_eot_head0() {
+        let mut f = Fdc82077::with_image(vec![0xAAu8; FDC_1440_IMAGE_SIZE]);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // VERIFY MFM MT=0: C=0,H=0,R=2,N=2,EOT=2 — single head0 sector only.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_VERIFY));
+        for p in [0x00u8, 0x00, 0x00, 0x02, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0, FDC_ST0_IC_NORMAL, "ST0 H remains 0 (no MT switch)");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // ST1
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // ST2
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x00,
+            "H ENDaddress stays head 0"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
         assert!(f.last_sector().is_none());
         assert!(f.take_pending_dma_sector().is_none());
     }
