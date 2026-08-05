@@ -117,8 +117,10 @@
 //!   blink-off half); Overscan Color `0x11` store/readback with mode-03h reset
 //!   default `0x00`; Color Plane Enable `0x12` store/readback with mode-03h
 //!   reset default `0x0F`; Horizontal PEL Panning `0x13` store/readback with
-//!   mode-03h reset default `0x08`; Color Select `0x14` store/readback with
-//!   mode-03h reset default `0x00` (no palette / PEL-pan display /
+//!   mode-03h reset default `0x08` + host [`VgaText::text_pel_pan`] (9-dot
+//!   Pixel Shift Count → left-shift pels within the character cell for render;
+//!   `char_at`/`attr_at`/`put_char` stay on the character grid); Color Select
+//!   `0x14` store/readback with mode-03h reset default `0x00` (no palette /
 //!   overscan-display / ATC→DAC remap / host canvas render / VR÷32 blink timer)
 //! - Input Status #1: ATC flip-flop reset + deterministic display-enable /
 //!   vertical-retrace status bits (read-phase counter); port selected by Misc
@@ -136,9 +138,10 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - ATC / Sequencer / GC timing, ATC→DAC remap side effects, PEL pan,
-//!   plane-enable, map-mask, write-mode, read-map, or bitmask side effects on
-//!   the text plane; no vertical-retrace÷32 blink timer (host supplies phase)
+//! - ATC / Sequencer / GC timing, ATC→DAC remap side effects, plane-enable,
+//!   map-mask, write-mode, read-map, or bitmask side effects on the text plane;
+//!   PEL pan is exposed as [`VgaText::text_pel_pan`] for host render (no canvas
+//!   pixel shift yet); no vertical-retrace÷32 blink timer (host supplies phase)
 //! - Hidden-DAC unlock via repeated `0x3C6` reads; host canvas pixel render
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
@@ -658,8 +661,8 @@ pub const VGA_ATC_INDEX_DEFAULT: u8 = VGA_ATC_PAS;
 /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x10`.
 /// Selects graphics/alphanumeric mode, Line Graphics Enable (LGE/ELG), blink
 /// enable, and related Attribute Controller display controls. Host text helpers
-/// apply bit3 (BLINK) to attribute interpretation; PEL-pan / ATC→DAC remap
-/// side effects remain out of scope.
+/// apply bit3 (BLINK) to attribute interpretation; ATC→DAC remap remains out of
+/// scope. Horizontal PEL Panning is index `0x13` ([`VgaText::text_pel_pan`]).
 pub const VGA_ATC_MODE_CONTROL: u8 = 0x10;
 /// Mode Control bit3 — Blink Enable (FreeVGA `BLINK`).
 ///
@@ -671,7 +674,7 @@ pub const VGA_ATC_MODE_BLINK: u8 = 0x08;
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Mode Control `0x0C` enables
 /// Line Graphics Enable and blink for alphanumeric text. Host text attr→DAC
-/// helpers honor [`VGA_ATC_MODE_BLINK`]; PEL-pan / ATC→DAC remap remain out.
+/// helpers honor [`VGA_ATC_MODE_BLINK`]; ATC→DAC remap remains out of scope.
 pub const VGA_ATC_MODE_CONTROL_DEFAULT: u8 = 0x0C;
 /// Attribute Controller Overscan Color Register index.
 ///
@@ -698,15 +701,17 @@ pub const VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT: u8 = 0x0F;
 /// Attribute Controller Horizontal PEL Panning Register index.
 ///
 /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x13`.
-/// Bits 3:0 = Pixel Shift Count (pels shifted left). In 9-dot text modes,
-/// programmed value `8` selects a zero-pixel shift. Pan display side effects
-/// are out of scope (store/readback only).
+/// Bits 3:0 = Pixel Shift Count. In 9-dot alphanumeric text, programmed value
+/// `8` selects a zero-pixel left shift; values `0`..=`7` select a left shift of
+/// `n+1` pels within the character cell (soft-scroll sequence). Host helpers
+/// expose the decoded shift via [`VgaText::text_pel_pan`]; canvas pixel render
+/// remains out of scope.
 pub const VGA_ATC_HORIZONTAL_PEL_PANNING: u8 = 0x13;
 /// Mode-03h-class Horizontal PEL Panning reset default (`0x08` = 9-dot zero-shift).
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Horizontal PEL Panning `0x08`
-/// (9-bit text: shift-count encoding maps `8` → 0 pels). Store/readback only;
-/// no pan display side effects.
+/// (9-dot text: shift-count encoding maps `8` → 0 pels). Host
+/// [`VgaText::text_pel_pan`] applies this decode.
 pub const VGA_ATC_HORIZONTAL_PEL_PANNING_DEFAULT: u8 = 0x08;
 /// Attribute Controller Color Select Register index.
 ///
@@ -1142,6 +1147,21 @@ impl VgaText {
     /// row stride; CPU `0xB8000` MMIO remains absolute.
     pub fn text_row_pitch_chars(&self) -> usize {
         usize::from(self.crtc_regs[usize::from(VGA_CRTC_OFFSET)]) * 2
+    }
+
+    /// Horizontal left-shift in pels from ATC Horizontal PEL Panning (`0x13`).
+    ///
+    /// Spec: FreeVGA Attribute Controller Registers — bits 3:0 are the Pixel
+    /// Shift Count. For mode-03h-class 9-dot alphanumeric text, register value
+    /// `8` (and `9`..=`15`) maps to 0 pels; values `0`..=`7` map to `n+1` pels
+    /// (BIOS soft-scroll sequence `8,0,1,…,7` then bump CRTC start). Host
+    /// `char_at`/`attr_at`/`put_char` remain on the character grid; this helper
+    /// is the observable sub-cell offset for future canvas render.
+    pub fn text_pel_pan(&self) -> u8 {
+        match self.atc_regs[usize::from(VGA_ATC_HORIZONTAL_PEL_PANNING)] & 0x0F {
+            n @ 0..=7 => n + 1,
+            _ => 0,
+        }
     }
 
     /// Apply PEL Mask to a display-path color/palette index before DAC lookup.
@@ -3442,7 +3462,7 @@ mod tests {
             VGA_ATC_HORIZONTAL_PEL_PANNING_DEFAULT
         );
 
-        // Non-default PEL Panning programming (display side effects deferred).
+        // Non-default PEL Panning programming (host text_pel_pan observes decode).
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         v.port_write(
             VGA_ATC_ADDRESS_DATA,
@@ -3499,6 +3519,92 @@ mod tests {
             v.port_read(VGA_ATC_DATA_READ, 1) as u8,
             VGA_ATC_HORIZONTAL_PEL_PANNING_DEFAULT
         );
+    }
+
+    /// Spec: FreeVGA Attribute Controller — Horizontal PEL Panning (index `0x13`)
+    /// bits 3:0 Pixel Shift Count for 9-dot alphanumeric text. Mode-03h reset
+    /// default `0x08` maps to a zero-pixel left shift on the host text path.
+    #[test]
+    fn atc_pel_panning_default_is_zero_pixel_shift() {
+        let v = VgaText::new();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_HORIZONTAL_PEL_PANNING)],
+            VGA_ATC_HORIZONTAL_PEL_PANNING_DEFAULT
+        );
+        assert_eq!(v.text_pel_pan(), 0);
+    }
+
+    /// Spec: FreeVGA — in 9-dot text modes the soft-scroll sequence is
+    /// register `8` (0 pels), then `0`..=`7` → left shift of `n+1` pels within
+    /// the character cell. Host `char_at` stays on the character grid (pan is
+    /// sub-cell for render).
+    #[test]
+    fn atc_pel_panning_host_text_path_decodes_9dot_shift() {
+        let mut v = VgaText::new();
+        assert!(v.put_char(0, 0, b'A', 0x07));
+        assert_eq!(v.char_at(0, 0), Some(b'A'));
+        assert_eq!(v.text_pel_pan(), 0);
+
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_HORIZONTAL_PEL_PANNING),
+        );
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x00);
+        assert_eq!(v.text_pel_pan(), 1);
+        assert_eq!(v.char_at(0, 0), Some(b'A'));
+
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_HORIZONTAL_PEL_PANNING),
+        );
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x03);
+        assert_eq!(v.text_pel_pan(), 4);
+        assert_eq!(v.char_at(0, 0), Some(b'A'));
+
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_HORIZONTAL_PEL_PANNING),
+        );
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x07);
+        assert_eq!(v.text_pel_pan(), 8);
+        assert_eq!(v.char_at(0, 0), Some(b'A'));
+
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_HORIZONTAL_PEL_PANNING),
+        );
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x08);
+        assert_eq!(v.text_pel_pan(), 0);
+        assert_eq!(v.char_at(0, 0), Some(b'A'));
+    }
+
+    /// Spec: FreeVGA — reset restores Horizontal PEL Panning `0x08` (9-dot
+    /// zero-shift) so [`VgaText::text_pel_pan`] returns 0.
+    #[test]
+    fn atc_pel_panning_reset_restores_zero_pixel_shift() {
+        let mut v = VgaText::new();
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_HORIZONTAL_PEL_PANNING),
+        );
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x05);
+        assert_eq!(v.text_pel_pan(), 6);
+        v.reset();
+        assert_eq!(
+            v.atc_regs[usize::from(VGA_ATC_HORIZONTAL_PEL_PANNING)],
+            VGA_ATC_HORIZONTAL_PEL_PANNING_DEFAULT
+        );
+        assert_eq!(v.text_pel_pan(), 0);
     }
 
     /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — Color Select
@@ -3575,7 +3681,7 @@ mod tests {
             VGA_ATC_MODE_CONTROL_DEFAULT
         );
 
-        // Non-default Mode Control programming (PEL-pan / ATC→DAC remap deferred).
+        // Non-default Mode Control programming (ATC→DAC remap deferred).
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x41);
