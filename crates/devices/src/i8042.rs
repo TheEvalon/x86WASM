@@ -77,12 +77,14 @@
 //! routes the next data-port byte to the aux device when the aux clock is
 //! enabled (recorded in [`I8042::last_aux_device_write`] /
 //! [`I8042::aux_device_writes`]). When aux clock is disabled (`0xA7` / config
-//! bit 5), host→aux bytes via `0xD4` are **dropped** (controller still
-//! consumes the pending write; mouse stub is not invoked — no ACK, no recorded
-//! traffic, no IRQ12), matching [`I8042::inject_aux_byte`]. A minimal PS/2
-//! **mouse stub** answers the common identify/reset/enable commands with
-//! ACK/`0xFA` (and BAT/ID where required) on AUX OBF → IRQ12 when config bit 1
-//! is set. Parameter commands
+//! bit 5), host→aux bytes via `0xD4` are **queued** (controller still consumes
+//! the pending write; mouse stub is not invoked yet — no ACK, no recorded
+//! traffic, no IRQ12). Re-enabling the aux clock (`0xA8` or write-config
+//! clearing bit5) **flushes** the FIFO to the mouse stub in order. Raw
+//! [`I8042::inject_aux_byte`] still **drops** while the clock is disabled.
+//! A minimal PS/2 **mouse stub** answers the common identify/reset/enable
+//! commands with ACK/`0xFA` (and BAT/ID where required) on AUX OBF → IRQ12 when
+//! config bit 1 is set. Parameter commands
 //! (`0xF3`/`0xE8`/`0xE9`/`0xE6`/`0xE7`/`0xEA`/`0xF0`/`0xEE`/`0xEC`/`0xEB`/`0xF6`)
 //! store rate/resolution/scaling/mode/wrap and answer Status Request / Read Data
 //! with the OSDev packets; while wrap is set, non-`0xEC`/`0xFF` host→aux bytes
@@ -112,8 +114,6 @@
 //!   system-reset) — distinct from keyboard Resend `0xFE` on data port `0x60`
 //! - Diagnostic dump `0xAC`; interface-test electrical fault codes beyond the
 //!   success stub `0x00` for `0xA9`/`0xAB`
-//! - Host→aux queue-for-later while aux clock disabled (bytes are **dropped**,
-//!   not deferred until `0xA8`)
 
 use crate::PortDevice;
 
@@ -331,6 +331,10 @@ pub const MOUSE_PKT_Y_OVERFLOW: u8 = 1 << 7;
 /// allow a few packets without dropping).
 const AUX_RESP_QUEUE_CAP: usize = 16;
 
+/// Capacity of the pending host → aux-device queue while aux clock is disabled
+/// (`0xA7` / config bit5). Overflow silently drops new bytes.
+const HOST_AUX_QUEUE_CAP: usize = 16;
+
 /// Capacity of the pending keyboard → host response queue
 /// (Get ID needs ACK + 2 ID bytes; Reset needs ACK + BAT).
 const KBD_RESP_QUEUE_CAP: usize = 8;
@@ -482,6 +486,10 @@ pub struct I8042 {
     /// (and an enabled aux clock) before presentation on AUX OBF.
     aux_resp: [u8; AUX_RESP_QUEUE_CAP],
     aux_resp_len: u8,
+    /// Host→aux bytes accepted via `0xD4` while aux clock was disabled; flushed
+    /// to the mouse stub when the clock is re-enabled (`0xA8` / config clear bit5).
+    host_aux: [u8; HOST_AUX_QUEUE_CAP],
+    host_aux_len: u8,
     /// Keyboard stub: scanning enabled (`0xF4` / cleared by `0xF5`; Reset → on).
     ///
     /// When false, [`I8042::inject_scancode`] drops make/break traffic.
@@ -540,6 +548,8 @@ impl I8042 {
             mouse_pending_param: MousePendingParam::None,
             aux_resp: [0; AUX_RESP_QUEUE_CAP],
             aux_resp_len: 0,
+            host_aux: [0; HOST_AUX_QUEUE_CAP],
+            host_aux_len: 0,
             kbd_scanning: true,
             kbd_leds: 0,
             kbd_typematic: KBD_DEFAULT_TYPEMATIC,
@@ -569,6 +579,8 @@ impl I8042 {
         self.reset_mouse_defaults();
         self.aux_resp = [0; AUX_RESP_QUEUE_CAP];
         self.aux_resp_len = 0;
+        self.host_aux = [0; HOST_AUX_QUEUE_CAP];
+        self.host_aux_len = 0;
         self.reset_kbd_defaults();
         self.kbd_resp = [0; KBD_RESP_QUEUE_CAP];
         self.kbd_resp_len = 0;
@@ -1020,14 +1032,54 @@ impl I8042 {
         }
     }
 
+    /// Queue a host→aux byte accepted while the aux clock was disabled.
+    ///
+    /// Spec: OSDev I8042 — disabled second-port clock inhibits the interface;
+    /// this emulator defers `0xD4` bytes in a FIFO until the clock is re-enabled.
+    /// Overflow silently drops the new byte.
+    fn enqueue_host_aux(&mut self, byte: u8) {
+        if (self.host_aux_len as usize) < HOST_AUX_QUEUE_CAP {
+            self.host_aux[self.host_aux_len as usize] = byte;
+            self.host_aux_len = self.host_aux_len.saturating_add(1);
+        }
+    }
+
+    fn pop_host_aux(&mut self) -> Option<u8> {
+        if self.host_aux_len == 0 {
+            return None;
+        }
+        let b = self.host_aux[0];
+        let n = self.host_aux_len as usize;
+        self.host_aux.copy_within(1..n, 0);
+        self.host_aux_len -= 1;
+        Some(b)
+    }
+
+    /// Deliver queued host→aux bytes to the mouse stub (aux clock must be enabled).
+    fn flush_host_aux_queue(&mut self) {
+        if self.aux_clock_disabled() {
+            return;
+        }
+        while let Some(b) = self.pop_host_aux() {
+            self.handle_aux_device_byte(b);
+        }
+    }
+
+    /// Aux clock just transitioned disabled→enabled: deliver deferred host→aux
+    /// bytes, then present any held device→host responses.
+    fn on_aux_clock_enabled(&mut self) {
+        self.flush_host_aux_queue();
+        self.flush_aux_response_queue();
+    }
+
     /// Handle a host→auxiliary-device byte routed by controller command `0xD4`.
     ///
     /// Spec: OSDev [PS/2 Mouse](https://wiki.osdev.org/PS/2_Mouse) "Mouse
     /// Commands" + IBM PS/2 KBC `0xD4` routing. Caller must only invoke this when
-    /// the aux clock is enabled; with bit5 / `0xA7` set the port write path
-    /// drops the byte instead. Supported stub commands answer with ACK/`0xFA`
-    /// (and BAT/ID / status bytes where required) on AUX OBF. `0xF3` / `0xE8`
-    /// arm a one-byte parameter expected on the next `0xD4`.
+    /// the aux clock is enabled (or when flushing the host→aux queue after
+    /// re-enable). Supported stub commands answer with ACK/`0xFA` (and BAT/ID /
+    /// status bytes where required) on AUX OBF. `0xF3` / `0xE8` arm a one-byte
+    /// parameter expected on the next `0xD4`.
     fn handle_aux_device_byte(&mut self, cmd: u8) {
         self.last_aux_device_write = Some(cmd);
         self.aux_device_writes = self.aux_device_writes.saturating_add(1);
@@ -1333,8 +1385,9 @@ impl I8042 {
             }
             CMD_ENABLE_AUX => {
                 self.config &= !CFG_AUX_CLOCK_DISABLE;
-                // Spec: re-enable aux clock — present any held mouse responses.
-                self.flush_aux_response_queue();
+                // Spec: re-enable aux clock — deliver queued host→aux `0xD4`
+                // bytes, then present any held mouse responses.
+                self.on_aux_clock_enabled();
             }
             CMD_TEST_AUX => {
                 // Spec: IBM PS/2 — controller response on the normal output
@@ -1405,8 +1458,14 @@ impl PortDevice for I8042 {
                 self.last_write_was_cmd = false;
                 match self.pending {
                     PendingWrite::ConfigByte => {
+                        let was_disabled = self.aux_clock_disabled();
                         self.config = v;
                         self.pending = PendingWrite::None;
+                        // Spec: clearing config bit5 re-enables aux clock —
+                        // same flush as `0xA8`.
+                        if was_disabled && !self.aux_clock_disabled() {
+                            self.on_aux_clock_enabled();
+                        }
                     }
                     PendingWrite::OutputPort => {
                         // Spec: IBM PC AT — output port bit1 = A20 gate.
@@ -1414,14 +1473,16 @@ impl PortDevice for I8042 {
                         self.pending = PendingWrite::None;
                     }
                     PendingWrite::AuxDevice => {
-                        // Spec: IBM PS/2 `0xD4` — when aux clock is enabled, the
-                        // byte is sent to the aux device (mouse stub). When
-                        // config bit5 / `0xA7` disables the aux clock, the
-                        // interface is inhibited: drop the byte (do not deliver
-                        // to the stub, do not ACK / raise IRQ12). The pending
-                        // write is still consumed. Device→host responses already
-                        // queued remain held until `0xA8` (see flush path).
-                        if !self.aux_clock_disabled() {
+                        // Spec: IBM PS/2 `0xD4` / OSDev I8042 — when aux clock
+                        // is enabled, the byte is sent to the aux device (mouse
+                        // stub). When config bit5 / `0xA7` disables the aux
+                        // clock, the interface is inhibited: queue the byte for
+                        // delivery on re-enable (`0xA8` / config clear bit5).
+                        // The pending write is still consumed. Device→host
+                        // responses already queued remain held until enable.
+                        if self.aux_clock_disabled() {
+                            self.enqueue_host_aux(v);
+                        } else {
                             self.handle_aux_device_byte(v);
                         }
                         self.pending = PendingWrite::None;
@@ -2170,12 +2231,12 @@ mod tests {
     }
 
     /// Spec: OSDev I8042 / IBM PS/2 KBC — aux clock disable (`0xA7` / config bit5)
-    /// inhibits the second-port interface. Host→aux bytes via `0xD4` are
-    /// **dropped** (not delivered to the mouse stub): no recorded aux traffic,
-    /// no ACK / AUX OBF, and no spurious IRQ12. The controller still consumes
-    /// the pending `0xD4` write (next data byte is not keyboard-bound).
+    /// inhibits immediate host→aux delivery. Bytes via `0xD4` are **queued** (not
+    /// delivered to the mouse stub yet): no recorded aux traffic, no ACK / AUX
+    /// OBF, and no spurious IRQ12 while disabled. The controller still consumes
+    /// the pending `0xD4` write. `0xA8` flushes the queue to the mouse stub.
     #[test]
-    fn write_aux_d4_dropped_when_aux_clock_disabled_via_a7() {
+    fn write_aux_d4_queued_when_aux_clock_disabled_via_a7_flushed_on_a8() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
         k.port_write(I8042_DATA, 1, u32::from(CFG_INT12));
@@ -2198,12 +2259,23 @@ mod tests {
         k.port_write(I8042_DATA, 1, 0xF1);
         assert_eq!(k.aux_device_writes, 0);
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+
+        // Spec: `0xA8` re-enables aux clock and delivers queued host→aux bytes.
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_AUX));
+        assert!(!k.aux_clock_disabled());
+        assert_eq!(k.last_aux_device_write, Some(MOUSE_CMD_RESET));
+        assert_eq!(k.aux_device_writes, 1);
+        assert!(k.irq12_line());
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_BAT_OK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
+        assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
     }
 
-    /// Spec: OSDev I8042 — config bit5 set via write-config also drops host→aux
-    /// `0xD4` delivery (same inhibit as `0xA7`).
+    /// Spec: OSDev I8042 — config bit5 set via write-config queues host→aux
+    /// `0xD4` (same inhibit as `0xA7`); clearing bit5 via write-config flushes.
     #[test]
-    fn write_aux_d4_dropped_when_aux_clock_disabled_via_config() {
+    fn write_aux_d4_queued_when_aux_clock_disabled_via_config_flushed_on_enable() {
         let mut k = I8042::new();
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
         k.port_write(I8042_DATA, 1, u32::from(CFG_INT12 | CFG_AUX_CLOCK_DISABLE));
@@ -2214,18 +2286,23 @@ mod tests {
         assert_eq!(k.last_aux_device_write, None);
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
+
+        // Clear bit5 via write-config — flush queued Get Device ID.
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        k.port_write(I8042_DATA, 1, u32::from(CFG_INT12));
+        assert!(!k.aux_clock_disabled());
+        assert_eq!(k.last_aux_device_write, Some(MOUSE_CMD_GET_DEVICE_ID));
+        assert_eq!(k.aux_device_writes, 1);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
     }
 
     /// Spec: OSDev I8042 / PS/2 Mouse — with aux clock enabled (`0xA8` / default),
-    /// host→aux Reset (`0xFF`) via `0xD4` still answers ACK + BAT + ID on AUX OBF.
+    /// host→aux Reset (`0xFF`) via `0xD4` answers ACK + BAT + ID on AUX OBF
+    /// immediately (no queue).
     #[test]
     fn write_aux_d4_reset_works_when_aux_clock_enabled() {
         let mut k = I8042::new();
-        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_DISABLE_AUX));
-        write_aux(&mut k, MOUSE_CMD_RESET);
-        assert_eq!(k.aux_device_writes, 0);
-
-        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_AUX));
         assert!(!k.aux_clock_disabled());
         write_aux(&mut k, MOUSE_CMD_RESET);
         assert_eq!(k.last_aux_device_write, Some(MOUSE_CMD_RESET));
@@ -2234,6 +2311,24 @@ mod tests {
         assert_eq!(read_aux_byte(&mut k), MOUSE_BAT_OK);
         assert_eq!(read_aux_byte(&mut k), MOUSE_ID_STANDARD);
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
+    }
+
+    /// Spec: OSDev I8042 — multi-byte host→aux (Set Sample Rate + value) queued
+    /// while clock disabled is delivered in order on `0xA8`.
+    #[test]
+    fn write_aux_d4_sample_rate_param_queued_while_disabled_flushed_on_a8() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_DISABLE_AUX));
+        write_aux(&mut k, MOUSE_CMD_SET_SAMPLE_RATE);
+        write_aux(&mut k, 200);
+        assert_eq!(k.aux_device_writes, 0);
+        assert_eq!(k.mouse_sample_rate(), MOUSE_DEFAULT_SAMPLE_RATE);
+
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_AUX));
+        assert_eq!(k.aux_device_writes, 2);
+        assert_eq!(k.mouse_sample_rate(), 200);
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK); // ACK for 0xF3
+        assert_eq!(read_aux_byte(&mut k), MOUSE_ACK); // ACK for rate
     }
 
     /// Spec: OSDev I8042 / IBM PS/2 KBC — `0xA9` (test second PS/2 port) returns a
@@ -3022,8 +3117,8 @@ mod tests {
 
     /// Spec: aux clock disable (config bit5) inhibits presenting mouse responses
     /// already accepted while the clock was enabled; enabling the port flushes
-    /// the held queue. (Host→aux `0xD4` while disabled is dropped — see
-    /// `write_aux_d4_dropped_when_aux_clock_disabled_via_a7`.)
+    /// the held device→host queue. (Host→aux `0xD4` while disabled is queued —
+    /// see `write_aux_d4_queued_when_aux_clock_disabled_via_a7_flushed_on_a8`.)
     #[test]
     fn mouse_response_held_while_aux_clock_disabled_flushed_on_enable() {
         let mut k = I8042::new();
