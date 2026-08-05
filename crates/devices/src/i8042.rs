@@ -758,6 +758,18 @@ impl I8042 {
         self.output_port & OUTPUT_PORT_A20 != 0
     }
 
+    /// Mirror A20 into output-port bit1 without a `0xD1` sequence.
+    ///
+    /// Used by `MachineBus` when System Control Port A (`0x92`) Fast Gate A20
+    /// changes so both gates stay coordinated. Does not pulse system reset.
+    pub fn set_a20_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.output_port |= OUTPUT_PORT_A20;
+        } else {
+            self.output_port &= !OUTPUT_PORT_A20;
+        }
+    }
+
     /// Place a byte in the output buffer (device/controller → host).
     ///
     /// Used by tests and keyboard inject. Tracks the byte as the last keyboard

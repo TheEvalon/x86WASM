@@ -1,6 +1,7 @@
 //! Device models. Milestone 1: COM1 data port + debug port 0x402.
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
+//! System Control Port A 0x92 (Fast Gate A20 + fast reset);
 //! 8237A DMA register/page stubs (no transfer engine);
 //! VGA text frame buffer MMIO stub at 0xB8000 + CRTC 0x3D4/0x3D5 noop;
 //! PCI configuration mechanism #1 stub (0xCF8/0xCFC) + PIIX ISA/IDE/USB/ACPI functions;
@@ -18,6 +19,7 @@ mod ide;
 mod pci;
 mod pic;
 mod pit;
+mod port92;
 mod serial;
 mod vga;
 
@@ -92,6 +94,7 @@ pub use pit::{
     Pit8254, PitChannel, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
     PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL,
 };
+pub use port92::{Port92, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL_A};
 pub use serial::{DebugConsole, Serial16550, SerialOutput};
 pub use vga::{
     vga_dac_default_ram, VgaText, VGA_CELL_BYTES, VGA_CRTC_CURSOR_DISABLE, VGA_CRTC_CURSOR_END,
