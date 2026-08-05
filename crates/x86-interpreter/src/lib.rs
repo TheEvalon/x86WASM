@@ -962,7 +962,7 @@ fn parse_data_segment_descriptor(desc: [u8; 8]) -> Result<(u64, u32, u16), ExecE
 /// Spec: Intel SDM Vol. 2 MOV (Sreg, r/m16) protected-mode checks; Vol. 3 §3.5.1
 /// (segment loading); §5.4.1 (null selector into DS/ES/FS/GS allowed).
 /// Unsupported here: LDT, privilege (RPL/CPL/DPL) beyond basic #GP/#NP, readable
-/// code segments into DS/ES/FS/GS, SS loads, far jumps into PM.
+/// code segments into DS/ES/FS/GS, far jumps into PM.
 fn load_data_sreg_from_gdt(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -971,7 +971,7 @@ fn load_data_sreg_from_gdt(
 ) -> Result<(), ExecError> {
     debug_assert!(
         matches!(sreg, 0 | 3 | 4 | 5),
-        "only DS/ES/FS/GS in this slice"
+        "only DS/ES/FS/GS in this helper"
     );
     if is_null_selector(selector) {
         match sreg {
@@ -1016,6 +1016,74 @@ fn load_data_sreg_from_gdt(
     Ok(())
 }
 
+/// Parse an 8-byte stack-segment descriptor (writable data / expand-down).
+///
+/// Requires P=1, S=1, non-executable, writable (W=1). Applies G-bit to limit.
+/// Spec: Intel SDM Vol. 2 MOV — SS must be writable data; Vol. 3 §3.4.5.
+/// Not present → `#SS(selector)` (vector 12), not `#NP`.
+fn parse_stack_segment_descriptor(desc: [u8; 8]) -> Result<(u64, u32, u16), ExecError> {
+    let access = desc[5];
+    let present = access & 0x80 != 0;
+    let s_bit = access & 0x10 != 0;
+    let executable = access & 0x08 != 0;
+    let writable = access & 0x02 != 0;
+    if !present {
+        // Spec: SDM Vol. 2 MOV — SS not present → #SS(selector).
+        return Err(ExecError::ArchFault(12));
+    }
+    if !s_bit || executable || !writable {
+        // Not a writable data segment → #GP(selector).
+        return Err(ExecError::ArchFault(13));
+    }
+    let base = u64::from(desc[2])
+        | (u64::from(desc[3]) << 8)
+        | (u64::from(desc[4]) << 16)
+        | (u64::from(desc[7]) << 24);
+    let limit20 =
+        u32::from(desc[0]) | (u32::from(desc[1]) << 8) | (u32::from(desc[6] & 0x0F) << 16);
+    let gran = desc[6] & 0x80 != 0;
+    let limit = if gran {
+        (limit20 << 12) | 0xFFF
+    } else {
+        limit20
+    };
+    let flags = u16::from(access);
+    Ok((base, limit, flags))
+}
+
+/// Protected-mode load of SS from the GDT (TI=0).
+///
+/// Spec: Intel SDM Vol. 2 MOV (SS, r/m16); Vol. 3 §3.5.1 / §5.4.1.
+/// Null selector → `#GP(0)`; P=0 → `#SS(selector)`; non-writable/code/system →
+/// `#GP(selector)`; index outside GDTR.limit → `#GP(selector)`.
+/// Unsupported here: LDT (TI=1 → `#GP`), RPL/CPL/DPL privilege matching, IRQ
+/// inhibit after MOV SS, POP SS PM path, far jumps into PM.
+fn load_ss_from_gdt(cpu: &mut CpuState, bus: &mut dyn Bus, selector: u16) -> Result<(), ExecError> {
+    if is_null_selector(selector) {
+        // Spec: SDM Vol. 2 MOV / Vol. 3 §5.4.1 — null into SS → #GP(0).
+        return Err(ExecError::ArchFault(13));
+    }
+    if selector & 0x4 != 0 {
+        // TI=1 → LDT (out of scope) → #GP(selector)
+        return Err(ExecError::ArchFault(13));
+    }
+    let index = u64::from(selector >> 3);
+    let offset = index.saturating_mul(8);
+    if offset.saturating_add(7) > u64::from(cpu.gdtr.limit) {
+        return Err(ExecError::ArchFault(13));
+    }
+    let addr = cpu.gdtr.base.wrapping_add(offset);
+    let mut desc = [0u8; 8];
+    for (i, b) in desc.iter_mut().enumerate() {
+        *b = bus
+            .read_u8(addr.wrapping_add(i as u64))
+            .map_err(|e| classify_mem_fault(e, false))?;
+    }
+    let (base, limit, flags) = parse_stack_segment_descriptor(desc)?;
+    cpu.ss.load_descriptor_cache(selector, base, limit, flags);
+    Ok(())
+}
+
 fn write_sreg(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1024,9 +1092,10 @@ fn write_sreg(
 ) -> Result<(), ExecError> {
     // Caller must reject MOV CS and reserved Sreg encodings (#UD) before calling.
     // PE=0: sticky unreal real-mode base (SDM Vol. 3 §3.4.2–§3.4.3).
-    // PE=1: DS/ES/FS/GS load from GDT; SS keeps real-mode base until later slices.
+    // PE=1: DS/ES/FS/GS/SS load from GDT (SS requires writable data; null → #GP).
     match sreg {
         0 | 3 | 4 | 5 if cr0_pe(cpu) => load_data_sreg_from_gdt(cpu, bus, sreg, selector),
+        2 if cr0_pe(cpu) => load_ss_from_gdt(cpu, bus, selector),
         0 => {
             cpu.es.load_real_mode_selector(selector);
             Ok(())
@@ -2361,8 +2430,7 @@ fn step_two_byte(
                     // LMSW r/m16 — Spec: SDM Vol. 2 "LMSW"; Vol. 3 §2.5 (CR0.PE).
                     // Loads CR0[15:0]. Cannot clear PE once set. Setting PE=1
                     // enables protected-mode GDT descriptor loads for MOV
-                    // DS/ES/FS/GS; far JMP / SS loads still use real-mode
-                    // `selector<<4`.
+                    // DS/ES/FS/GS/SS; far JMP still uses real-mode `selector<<4`.
                     let src = read_rm_u16(cpu, bus, insn)?;
                     let pe_was = cpu.cr0 & 1 != 0;
                     let mut low = u64::from(src);
@@ -2410,7 +2478,7 @@ fn step_two_byte(
             // MOV CR0, r32 — Spec: Intel SDM Vol. 2 "MOV—Move to/from Control
             // Registers"; Vol. 3 §2.5 (CR0). Unlike LMSW, this instruction
             // MAY clear PE. PE=1 enables GDT descriptor loads for MOV
-            // DS/ES/FS/GS; far JMP / SS remain real-mode `selector<<4` until
+            // DS/ES/FS/GS/SS; far JMP remains real-mode `selector<<4` until
             // later slices. Clearing PE restores the sticky-unreal data-seg path.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x22))?;
             match m.reg {
@@ -4175,10 +4243,11 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x8E => {
             // MOV Sreg, r/m16 — Spec: Intel SDM Vol. 2 "MOV" (Sreg, r/m16).
             // PE=0: real-address load (base = selector << 4); sticky unreal limit/AR.
-            // PE=1: DS/ES/FS/GS load hidden cache from GDT (null clears; P=0 → #NP;
-            // invalid type / out of limit → #GP). SS still real-mode base.
+            // PE=1: DS/ES/FS/GS/SS load hidden cache from GDT (DS/ES/FS/GS null
+            // clears; SS null → #GP; P=0 → #NP for data / #SS for SS; invalid
+            // type / out of limit → #GP; SS requires writable data).
             // MOV to CS and reserved Sreg encodings → #UD (Vol. 3 §6.15).
-            // Unsupported here: LDT, privilege beyond basic #GP/#NP, SS PM load,
+            // Unsupported here: LDT, privilege beyond basic #GP/#NP/#SS,
             // IRQ inhibit after MOV SS.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let Some(sreg) = sreg_from_modrm_reg(m.reg) else {
@@ -11156,6 +11225,323 @@ mod tests {
         assert_eq!(cpu.fs.base, 0x1234u64 << 4);
         assert_eq!(cpu.fs.limit, 0xFFFF_FFFF);
         assert_eq!(cpu.fs.flags, 0x0093);
+    }
+
+    /// PE=1 MOV SS loads writable data-segment descriptor from GDT.
+    /// Spec: Intel SDM Vol. 2 MOV (SS, r/m16); Vol. 3 §3.4.5 / §3.5.1.
+    #[test]
+    fn mov_ss_pe1_loads_gdt_writable_data_descriptor() {
+        let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x5000usize;
+        // Selector 0x08: writable data, base=0x0003_0000, limit=0x7FFF, AR=0x92
+        let desc = encode_seg_desc(0x0003_0000, 0x7FFF, 0x92, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
+        let code = 0x1000usize;
+        // B8 08 00  MOV AX, 0x08
+        // 8E D0     MOV SS, AX
+        // F4        HLT
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD0;
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0xABCD);
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ss.selector, 0x08);
+        assert_eq!(cpu.ss.base, 0x0003_0000);
+        assert_eq!(cpu.ss.limit, 0x7FFF);
+        assert_eq!(cpu.ss.flags, 0x0092);
+        assert_eq!(cpu.ip16(), (code + 5) as u16);
+    }
+
+    /// PE=1 MOV SS accepts expand-down writable stack segment (type 6).
+    /// Spec: Intel SDM Vol. 2 MOV — SS writable data or expand-down data.
+    #[test]
+    fn mov_ss_pe1_loads_expand_down_stack_descriptor() {
+        let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x5000usize;
+        // Access 0x96: P=1 S=1 type=6 (expand-down RW)
+        let desc = encode_seg_desc(0x0000_8000, 0x1000, 0x96, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD0;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ss.selector, 0x08);
+        assert_eq!(cpu.ss.base, 0x0000_8000);
+        assert_eq!(cpu.ss.limit, 0x1000);
+        assert_eq!(cpu.ss.flags, 0x0096);
+    }
+
+    /// PE=1 MOV SS, r/m16 memory form loads GDT writable descriptor.
+    /// Spec: Intel SDM Vol. 2 MOV (SS, r/m16).
+    #[test]
+    fn mov_ss_pe1_loads_gdt_from_mem() {
+        let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x5000usize;
+        let desc = encode_seg_desc(0x0000_9000, 0x0FFF, 0x93, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+        mem[0x2000] = 0x08;
+        mem[0x2001] = 0x00;
+
+        let code = 0x1000usize;
+        // BB 00 20  MOV BX, 0x2000
+        // 8E 17     MOV SS, [BX]
+        mem[code] = 0xBB;
+        mem[code + 1] = 0x00;
+        mem[code + 2] = 0x20;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0x17;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ss.selector, 0x08);
+        assert_eq!(cpu.ss.base, 0x0000_9000);
+        assert_eq!(cpu.ss.limit, 0x0FFF);
+        assert_eq!(cpu.ss.flags, 0x0093);
+    }
+
+    /// PE=1 null selector into SS → #GP via IVT (vector 13). Spec: SDM Vol. 3 §5.4.1.
+    #[test]
+    fn mov_ss_pe1_null_selector_gp_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+
+        let code = 0x1000usize;
+        // B8 00 00  MOV AX, 0
+        // 8E D0     MOV SS, AX → #GP
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x00;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD0;
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        // Keep SS base=0 so IVT #GP push stays inside the 64KiB test image.
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0010,
+            base: 0,
+            limit: 0xBEEF,
+            flags: 0x0093,
+        };
+        let ss_before = cpu.ss.clone();
+        cpu.cr0 |= 1;
+        cpu.gdtr.limit = 0;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.ss, ss_before, "failed MOV SS must not update cache");
+    }
+
+    /// PE=1 MOV SS with not-present writable data → #SS via IVT (vector 12).
+    /// Spec: Intel SDM Vol. 2 MOV protected-mode exceptions (#SS(selector)).
+    #[test]
+    fn mov_ss_pe1_not_present_ss_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[12 * 4] = 0x00;
+        mem[12 * 4 + 1] = 0x0C;
+        mem[12 * 4 + 2] = 0x00;
+        mem[12 * 4 + 3] = 0x00;
+        let gdt = 0x5000usize;
+        // P=0 writable data (access 0x12)
+        let desc = encode_seg_desc(0x1000, 0xFFFF, 0x12, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD0; // MOV SS, AX → #SS
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0020,
+            base: 0,
+            limit: 0xCAFE,
+            flags: 0x0093,
+        };
+        let ss_before = cpu.ss.clone();
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0C00, "#SS handler");
+        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(
+            cpu.ss, ss_before,
+            "failed MOV SS must not update segment cache"
+        );
+    }
+
+    /// PE=1 MOV SS with read-only data descriptor → #GP via IVT.
+    /// Spec: Intel SDM Vol. 2 MOV — SS must be writable data.
+    #[test]
+    fn mov_ss_pe1_readonly_data_gp_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+        let gdt = 0x5000usize;
+        // Access 0x90: P=1 S=1 type=0 (data RO) — not valid for SS
+        let desc = encode_seg_desc(0x1000, 0xFFFF, 0x90, 0x00);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD0;
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0030,
+            base: 0,
+            limit: 0xDEAD,
+            flags: 0x0093,
+        };
+        let ss_before = cpu.ss.clone();
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.ss, ss_before, "failed MOV SS must not update cache");
+    }
+
+    /// PE=1 MOV SS with index past GDTR.limit → #GP via IVT (vector 13).
+    /// Spec: Intel SDM Vol. 2 MOV — #GP(selector) if index outside table limits.
+    #[test]
+    fn mov_ss_pe1_gdt_limit_gp_via_ivt() {
+        let mut mem = vec![0u8; 0x10000];
+        mem[13 * 4] = 0x00;
+        mem[13 * 4 + 1] = 0x0D;
+        mem[13 * 4 + 2] = 0x00;
+        mem[13 * 4 + 3] = 0x00;
+
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x08;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD0;
+        mem[code + 5] = 0xF4;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0040,
+            base: 0,
+            limit: 0xF00D,
+            flags: 0x0093,
+        };
+        let ss_before = cpu.ss.clone();
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = 0x5000;
+        cpu.gdtr.limit = 7; // only null entry
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.ss, ss_before, "failed MOV SS must not update cache");
+    }
+
+    /// PE=0 MOV SS unchanged: base = selector<<4, sticky limit/AR.
+    /// Spec: Intel SDM Vol. 3 §3.4.2–§3.4.3.
+    #[test]
+    fn mov_ss_pe0_still_selector_shift4() {
+        let mut mem = vec![0u8; 0x10000];
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x34;
+        mem[code + 2] = 0x12;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD0;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.ss.limit = 0xFFFF_FFFF;
+        cpu.ss.flags = 0x0093;
+        assert_eq!(cpu.cr0 & 1, 0);
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ss.selector, 0x1234);
+        assert_eq!(cpu.ss.base, 0x1234u64 << 4);
+        assert_eq!(cpu.ss.limit, 0xFFFF_FFFF);
+        assert_eq!(cpu.ss.flags, 0x0093);
     }
 
     /// MOV to/from CR1 is architecturally undefined — #UD via the real-mode IVT.
