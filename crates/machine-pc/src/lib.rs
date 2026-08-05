@@ -13,11 +13,11 @@ pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, IdePrimary, IdeSecondary,
-    PciConfig, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, FDC_DOR_DMA_IRQ,
-    I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
-    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
-    PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
+    IdeSecondary, PciConfig, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX,
+    FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::{prepare_bios_rom, BiosRomError, RomImage};
 use ports::PortBus;
@@ -63,6 +63,8 @@ pub struct Machine {
     pub ide_secondary: IdeSecondary,
     /// 82077AA FDC — ports 0x3F0–0x3F5 / 0x3F7; media READ DATA + DMA ch2 wire.
     pub fdc: Fdc82077,
+    /// QEMU fw_cfg — selector/data `0x510`/`0x511` (signature + test file).
+    pub fw_cfg: FwCfg,
     ports: PortBus,
 }
 
@@ -84,6 +86,7 @@ impl Machine {
             ide: IdePrimary::new(),
             ide_secondary: IdeSecondary::new(),
             fdc: Fdc82077::new(),
+            fw_cfg: FwCfg::new(),
             ports: PortBus::new(),
         }
     }
@@ -170,6 +173,7 @@ impl Machine {
         self.ide.reset();
         self.ide_secondary.reset();
         self.fdc.reset();
+        self.fw_cfg.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 output-port default.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
     }
@@ -207,6 +211,7 @@ impl Machine {
             ide: &mut self.ide,
             ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
+            fw_cfg: &mut self.fw_cfg,
             ports: &mut self.ports,
         }
     }
@@ -234,6 +239,7 @@ impl Machine {
                 ide: &mut self.ide,
                 ide_secondary: &mut self.ide_secondary,
                 fdc: &mut self.fdc,
+                fw_cfg: &mut self.fw_cfg,
                 ports: &mut self.ports,
             };
             step(&mut self.cpu, &mut view)?;
@@ -561,6 +567,7 @@ struct MachineBus<'a> {
     ide: &'a mut IdePrimary,
     ide_secondary: &'a mut IdeSecondary,
     fdc: &'a mut Fdc82077,
+    fw_cfg: &'a mut FwCfg,
     ports: &'a mut PortBus,
 }
 
@@ -643,6 +650,9 @@ impl MachineBus<'_> {
         if Fdc82077::owns_port(port) {
             return self.fdc.port_read(port, size);
         }
+        if FwCfg::owns_port(port) {
+            return self.fw_cfg.port_read(port, size);
+        }
         if Dma8237::owns_port(port) {
             return self.dma.port_read(port, size);
         }
@@ -691,6 +701,10 @@ impl MachineBus<'_> {
             // Spec: 82077AA DMA mode — after WRITE DATA FIFO completion with media
             // + DOR DMA/IRQ, pull via ISA DMA ch2 Read (mem→I/O) into the image.
             self.try_fdc_dma_ch2_read();
+            return;
+        }
+        if FwCfg::owns_port(port) {
+            self.fw_cfg.port_write(port, size, value);
             return;
         }
         if Dma8237::owns_port(port) {
@@ -837,10 +851,11 @@ mod tests {
         FDC_CMD_SENSE_DRIVE_STATUS, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA,
         FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM,
         FDC_SECTOR_SIZE, FDC_ST0_IC_ABNORMAL, FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST3_RESERVED_BIT3,
-        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042, I8042_DATA, I8042_STATUS_CMD,
-        PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD,
-        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE,
-        PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA,
+        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FW_CFG_DATA, FW_CFG_SELECTOR, FW_CFG_SIGNATURE,
+        FW_CFG_SIGNATURE_BYTES, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS,
+        PCI_CONFIG_DATA, PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA,
+        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA,
+        PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA,
         PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
         STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
         VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
@@ -3248,5 +3263,18 @@ mod tests {
         assert!(!m.fdc.take_pending_dma_write());
         assert_eq!(m.dma.master.status & 0x0F, 0);
         assert_eq!(m.dma.master.channels[2].count, 511);
+    }
+
+    /// Spec: QEMU fw_cfg — MachineBus wires `0x510`/`0x511`; signature `QEMU`.
+    #[test]
+    fn machine_bus_fw_cfg_signature() {
+        let mut m = Machine::new(64 * 1024);
+        let mut bus = m.bus_mut();
+        bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_SIGNATURE).unwrap();
+        let mut sig = [0u8; 4];
+        for b in &mut sig {
+            *b = bus.port_in_u8(FW_CFG_DATA).unwrap();
+        }
+        assert_eq!(&sig, FW_CFG_SIGNATURE_BYTES);
     }
 }
