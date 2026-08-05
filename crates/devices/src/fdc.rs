@@ -29,8 +29,9 @@
 //!   SC/EOT, LOCK|perp, Configure, PRETRK), no IRQ; READ DATA (`0x06` with
 //!   optional MT/MFM/SK in bits 7:5, §5.1.1 / Table 5-1) eight parameter
 //!   bytes then 7-byte result; with media + N=2 + valid CHS → ST0 IC=00 +
-//!   ST1=0 + `last_sector` latch (MT=0 same-head sectors R..=EOT concatenated;
-//!   EOT==R → one sector) + IRQ6; else no-media/wrong-N/
+//!   ST1=0 + `last_sector` latch (MT=0 same-head R..=EOT; MT=1 from head 0
+//!   continues onto head 1 after EOT, same cylinder; EOT==R → one sector on
+//!   that head before any MT switch) + IRQ6; else no-media/wrong-N/
 //!   OOR → ST0 IC=01 + ST1 ND + C/H/R/N ENDaddress and IRQ6; READ DELETED DATA
 //!   (`0x0C` with optional MT/MFM/SK in bits 7:5, §5.1.3 / Table 5-1) same
 //!   8-param / 7-result shape as READ DATA; with or without media → ST0 IC=01
@@ -123,15 +124,17 @@
 //!   SK (`0x20`); eight params (HD|US, C, H, R, N, EOT, GPL, DTL). With
 //!   attached 1.44MB media, `N=2`, and C/H/R in geometry: MT=0 same-head
 //!   transfer of consecutive sectors **R..=EOT** (EOT==R → one sector; EOT>R
-//!   → multi-sector; EOT<R → treat as single R), concatenate into
-//!   `last_sector`, arm `dma_read_pending` when DOR DMA/IRQ enable is set
-//!   (Machine consumes via [`Self::take_pending_dma_sector`] → ISA DMA ch2
-//!   Write; [`Self::pending_dma_byte_count`] reports total bytes), result ST0
-//!   (IC=00 normal | H | US), ST1=0, ST2=0, C/H/R/N = ENDaddress of the **last**
-//!   sector transferred. MT head-switch deferred. No media / wrong N / OOR CHS
-//!   (any sector in the range) → ST0 IC=01 abnormal | H | US, ST1 ND, ST2=0.
-//!   Asserts IRQ6 (cleared on first result byte); EOT→`sc_eot`; MSR RQM during
-//!   params, RQM|DIO during result.
+//!   → multi-sector; EOT<R → treat as single R); MT=1 starting on head 0
+//!   continues after EOT onto head 1 sectors **1..=EOT** (same cylinder;
+//!   starting head 1 does not wrap); concatenate into `last_sector`, arm
+//!   `dma_read_pending` when DOR DMA/IRQ enable is set (Machine consumes via
+//!   [`Self::take_pending_dma_sector`] → ISA DMA ch2 Write;
+//!   [`Self::pending_dma_byte_count`] reports total bytes), result ST0
+//!   (IC=00 normal | H | US with H = final head), ST1=0, ST2=0, C/H/R/N =
+//!   ENDaddress of the **last** sector transferred. No media / wrong N / OOR
+//!   CHS (any sector in the range) → ST0 IC=01 abnormal | H | US, ST1 ND,
+//!   ST2=0. Asserts IRQ6 (cleared on first result byte); EOT→`sc_eot`; MSR RQM
+//!   during params, RQM|DIO during result.
 //! - READ DELETED DATA (`0x0C` | MT/MFM/SK): Spec Intel 82077AA §5.1.3 /
 //!   Table 5-1 — command byte lower 5 bits `01100`; optional MT/MFM/SK; same
 //!   eight params and 7-byte result as READ DATA. Spec seeks sectors with a
@@ -207,10 +210,10 @@
 //!   `write_protected` / [`Self::set_write_protected`] for ST3 WP and WRITE
 //!   DATA / WRITE DELETED DATA / FORMAT TRACK ST1 NW; `reset()` preserves media
 //!   and write-protect flag like IDE.
-//!   READ DATA success path latches concatenated sectors R..=EOT (MT=0) in
-//!   `last_sector` and arms `dma_read_pending` when DOR bit3 is set for
-//!   MachineBus auto DMA ch2 Write (device→memory; buffer length =
-//!   sector_count×512). WRITE DATA success path accepts R..=EOT via
+//!   READ DATA success path latches concatenated sectors (MT=0 R..=EOT;
+//!   MT=1 head0→head1 after EOT) in `last_sector` and arms `dma_read_pending`
+//!   when DOR bit3 is set for MachineBus auto DMA ch2 Write (device→memory;
+//!   buffer length = sector_count×512). WRITE DATA success path accepts R..=EOT via
 //!   `latch_write_data` / `latch_write_sector` → `last_write` / `write_sector`,
 //!   or arms `dma_write_pending` for MachineBus ISA DMA ch2 Read
 //!   (memory→device; [`Self::pending_dma_write_byte_count`] = sector_count×512)
@@ -225,7 +228,8 @@
 //!   (media path remains honest ST1 ND); WRITE DELETED DATA deleted
 //!   address-mark / write engine (media path remains honest ST1 NW); FORMAT
 //!   TRACK per-sector C/H/R/N ID DMA stream (programmed fill only this slice)
-//! - MT head-switch multi-track; VERIFY DMA; DREQ/DACK cycle timing
+//! - WRITE DATA MT head-switch multi-track; VERIFY MT head-switch / DMA;
+//!   DREQ/DACK cycle timing
 //! - Seek / Relative Seek step timing; Relative Seek ST0 EC when stepping out
 //!   beyond track 0 (PCN clamp only this slice); real DIR disk-change edge
 //!   timing (DSKCHG stub only)
@@ -568,6 +572,10 @@ pub struct Fdc82077 {
     seek_head_unit: u8,
     /// Relative Seek DIR from command bit6: true = step in (+RCN), false = step out (−RCN).
     relative_seek_dir_in: bool,
+    /// READ DATA command MT (Multi-Track) bit. Spec: Intel 82077AA Table 5-1 /
+    /// §5.1.1 — when set and transfer starts on head 0, continue onto head 1
+    /// after EOT. WRITE DATA MT head-switch remains deferred.
+    read_cmd_mt: bool,
     /// Sense Interrupt ST0 result byte (set when entering result phase).
     sense_st0: u8,
     /// Sense Interrupt PCN result byte (PCN of unit in `sense_st0` US bits).
@@ -593,9 +601,10 @@ pub struct Fdc82077 {
     /// force WRITE DATA ST1 NW from the pin.
     pub write_protected: bool,
     /// Sector bytes transferred by a successful READ DATA (MT=0 same-head
-    /// R..=EOT concatenated; length = sector_count × [`FDC_SECTOR_SIZE`]).
-    /// Cleared on ND/abnormal completion. Inspect via [`Self::last_sector`];
-    /// Machine DMA consumes a one-shot pending arm via [`Self::take_pending_dma_sector`].
+    /// R..=EOT, or MT=1 head0→head1 after EOT; length = sector_count ×
+    /// [`FDC_SECTOR_SIZE`]). Cleared on ND/abnormal completion. Inspect via
+    /// [`Self::last_sector`]; Machine DMA consumes a one-shot pending arm via
+    /// [`Self::take_pending_dma_sector`].
     last_sector: Option<Vec<u8>>,
     /// Armed when READ DATA media success latches `last_sector` and DOR DMA/IRQ
     /// enable (bit3) is set. Cleared by [`Self::take_pending_dma_sector`] or
@@ -650,6 +659,7 @@ impl Fdc82077 {
             pending_sense_st0: None,
             seek_head_unit: 0,
             relative_seek_dir_in: false,
+            read_cmd_mt: false,
             sense_st0: 0,
             sense_pcn: 0,
             sense_st3: 0,
@@ -714,7 +724,7 @@ impl Fdc82077 {
     /// sectors concatenated), if any.
     ///
     /// Inspection latch — not cleared by Machine DMA. See [`Self::take_pending_dma_sector`].
-    /// Spec: Intel 82077AA §5.1.1 — MT=0 same-head R..=EOT.
+    /// Spec: Intel 82077AA §5.1.1 — MT=0 same-head R..=EOT; MT=1 may include head1.
     pub fn last_sector(&self) -> Option<&[u8]> {
         self.last_sector.as_deref()
     }
@@ -989,6 +999,7 @@ impl Fdc82077 {
         self.pending_sense_st0 = None;
         self.seek_head_unit = 0;
         self.relative_seek_dir_in = false;
+        self.read_cmd_mt = false;
         self.sense_st0 = 0;
         self.sense_st3 = 0;
         // Spec: Intel 82077AA §5.3.2 — soft DOR reset does not clear LOCK; when
@@ -1187,8 +1198,10 @@ impl Fdc82077 {
     }
 
     /// Begin READ DATA parameter phase (8 bytes). Spec: Intel 82077AA §5.1.1.
-    fn start_read_data(&mut self) {
+    fn start_read_data(&mut self, cmd: u8) {
         self.read_params = [0; FDC_READ_DATA_PARAM_LEN as usize];
+        // Spec: Intel 82077AA Table 5-1 / §5.1.1 — MT in command bit7.
+        self.read_cmd_mt = cmd & FDC_CMD_MT != 0;
         self.phase = Phase::ReadDataParams { index: 0 };
     }
 
@@ -1196,11 +1209,16 @@ impl Fdc82077 {
     ///
     /// Spec: Intel 82077AA §5.1.1 / Table 5-1 / §6.1 / §6.2 / IBM 1.44MB geometry:
     ///
-    /// - With media, `N == 2` (512-byte sectors), and every CHS in range: MT=0
-    ///   same-head transfer of consecutive sectors **R..=EOT** (when EOT < R,
-    ///   transfer only R). Concatenate into [`Self::last_sector`]; result ST0
-    ///   IC=00 (normal) | H | US, ST1=0, ST2=0, C/H/R/N = ENDaddress of the
-    ///   **last** sector transferred. MT head-switch deferred.
+    /// - With media, `N == 2` (512-byte sectors), and every CHS in range:
+    ///   - MT=0: same-head transfer of consecutive sectors **R..=EOT** (when
+    ///     EOT < R, transfer only R).
+    ///   - MT=1 starting on head 0: after EOT under head 0, continue at sector
+    ///     1 under head 1 on the same cylinder through EOT (Multi-Track).
+    ///     Starting on head 1 does not wrap back to head 0.
+    ///
+    ///   Concatenate into [`Self::last_sector`]; result ST0 IC=00 (normal) |
+    ///   H | US (H = final head), ST1=0, ST2=0, C/H/R/N = ENDaddress of the
+    ///   **last** sector transferred.
     /// - Otherwise (no media / wrong N / out-of-range CHS for any sector in the
     ///   range): skip execution, ST0 IC=01 (abnormal) | H | US, ST1 ND, ST2=0,
     ///   C/H/R/N command ENDaddress; clear `last_sector`.
@@ -1218,16 +1236,26 @@ impl Fdc82077 {
         let r = self.read_params[3];
         let n = self.read_params[4];
         let eot = self.read_params[5];
-        // GPL (params[6]) and DTL (params[7]) accepted; MT head-switch deferred.
+        // GPL (params[6]) and DTL (params[7]) accepted.
 
         self.sc_eot = eot;
-        let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+        let st0_head_start = if head != 0 { FDC_ST0_HEAD } else { 0 };
         // Spec: 82077AA §5.1.1 — MT=0 stops at EOT on the current head.
         // EOT < R is not a multi-sector range; transfer the starting sector only.
         let end_r = if eot >= r { eot } else { r };
+        // Spec: 82077AA §5.1.1 Multi-Track — after last sector under head 0
+        // (EOT reached), continue at first sector under head 1 (same cylinder).
+        // When EOT < R the single-sector stub does not reach track end → no switch.
+        let mt_switch = self.read_cmd_mt && h == 0 && eot >= r;
 
         if n == FDC_SECTOR_N {
-            let sector_count = usize::from(end_r - r) + 1;
+            let head0_count = usize::from(end_r - r) + 1;
+            let head1_count = if mt_switch {
+                usize::from(end_r) // sectors 1..=EOT on head 1
+            } else {
+                0
+            };
+            let sector_count = head0_count + head1_count;
             let mut buf = Vec::with_capacity(sector_count * FDC_SECTOR_SIZE);
             let mut ok = true;
             for sec in r..=end_r {
@@ -1239,7 +1267,20 @@ impl Fdc82077 {
                     }
                 }
             }
+            if ok && mt_switch {
+                for sec in 1..=end_r {
+                    match self.read_sector(c, 1, sec) {
+                        Some(sector) => buf.extend_from_slice(&sector),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
             if ok && !buf.is_empty() {
+                let end_h = if mt_switch { 1 } else { h };
+                let st0_head = if end_h != 0 { FDC_ST0_HEAD } else { 0 };
                 self.last_sector = Some(buf);
                 // Spec: 82077AA DOR bit3 — DMA/IRQ enable; arm one-shot for Machine.
                 self.dma_read_pending = self.dor & FDC_DOR_DMA_IRQ != 0;
@@ -1249,7 +1290,7 @@ impl Fdc82077 {
                     0x00,
                     0x00,
                     c,
-                    h,
+                    end_h,
                     end_r,
                     n,
                 ];
@@ -1263,7 +1304,7 @@ impl Fdc82077 {
         self.last_sector = None;
         self.dma_read_pending = false;
         self.read_result = [
-            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST0_IC_ABNORMAL | st0_head_start | unit,
             FDC_ST1_ND,
             0x00,
             c,
@@ -2040,7 +2081,7 @@ impl Fdc82077 {
                     self.start_lock(v);
                 } else if Self::is_read_data_command(v) {
                     // Spec: Intel 82077AA §5.1.1 — MT/MFM/SK | 00110; eight params.
-                    self.start_read_data();
+                    self.start_read_data(v);
                 } else if Self::is_read_deleted_data_command(v) {
                     // Spec: Intel 82077AA §5.1.3 — MT/MFM/SK | 01100; eight params.
                     self.start_read_deleted_data();
@@ -5603,7 +5644,7 @@ mod tests {
     /// concatenated `last_sector` latch; ST0 IC=00 normal; ST1=ST2=0; result
     /// C/H/R/N = ENDaddress of the **last** sector transferred; EOT→`sc_eot`;
     /// `pending_dma_byte_count` / `take_pending_dma_sector` expose total bytes
-    /// (2×512 here). IBM 1.44MB geometry; MT head-switch out of scope.
+    /// (2×512 here). IBM 1.44MB geometry.
     #[test]
     fn read_data_multi_sector_same_head_eot_r_plus_one() {
         let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
@@ -5669,6 +5710,129 @@ mod tests {
         assert!(
             f.take_pending_dma_sector().is_none(),
             "pending arm is one-shot"
+        );
+    }
+
+    /// Spec: Intel 82077AA §5.1.1 Multi-Track (MT) — when MT=1 and transfer
+    /// starts on head 0, after the last sector under head 0 (EOT) the FDC
+    /// continues at sector 1 under head 1 on the same cylinder. Here
+    /// R=EOT=2 on H=0 → sectors (0,0,2), (0,1,1), (0,1,2); ENDaddress of the
+    /// **last** sector transferred is C=0,H=1,R=2; ST0.H reflects final head;
+    /// `last_sector` / `pending_dma_byte_count` = 3×512.
+    #[test]
+    fn read_data_mt1_head0_past_eot_continues_head1() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        let patterns: [(u8, u8, u8, u8); 3] = [
+            (0, 0, 2, 0x10), // head0 R=2
+            (0, 1, 1, 0x20), // head1 R=1 after switch
+            (0, 1, 2, 0x30), // head1 R=2 (final)
+        ];
+        for &(c, h, r, tag) in &patterns {
+            let off = Fdc82077::chs_byte_offset(c, h, r).expect("CHS in geometry");
+            for (i, b) in img[off..off + FDC_SECTOR_SIZE].iter_mut().enumerate() {
+                *b = tag.wrapping_add((i & 0x0F) as u8);
+            }
+        }
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // READ DATA MT|MFM: C=0,H=0,R=2,N=2,EOT=2 — past EOT on head0 → head1.
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_MT | FDC_CMD_MFM | FDC_CMD_READ_DATA),
+        );
+        for p in [0x00u8, 0x00, 0x00, 0x02, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line(), "MT READ DATA asserts IRQ6");
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_NORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=00 | H=1 (final head after MT switch) | US=0"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST1 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "C ENDaddress");
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x01,
+            "H ENDaddress = head 1 after MT switch"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x02,
+            "R ENDaddress = last sector on head 1 (EOT)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02, "N");
+        assert_eq!(f.sc_eot, 0x02);
+
+        let expected_len = 3 * FDC_SECTOR_SIZE;
+        assert_eq!(f.last_sector_byte_count(), expected_len);
+        assert_eq!(f.pending_dma_byte_count(), expected_len);
+        let latch = f
+            .last_sector()
+            .expect("MT READ DATA latches head0+head1 sectors")
+            .to_vec();
+        assert_eq!(latch.len(), expected_len);
+        for (sec_i, &(_, _, _, tag)) in patterns.iter().enumerate() {
+            let base = sec_i * FDC_SECTOR_SIZE;
+            for i in 0..FDC_SECTOR_SIZE {
+                assert_eq!(
+                    latch[base + i],
+                    tag.wrapping_add((i & 0x0F) as u8),
+                    "MT latch sector[{sec_i}][{i}]"
+                );
+            }
+        }
+        let pending = f
+            .take_pending_dma_sector()
+            .expect("DOR DMA arms MT multi-head pending");
+        assert_eq!(pending, latch);
+        assert_eq!(f.pending_dma_byte_count(), 0);
+    }
+
+    /// Spec: Intel 82077AA §5.1.1 — MT=0 with the same C/H/R/EOT as the MT=1
+    /// head-switch case transfers only same-head R..=EOT (here one sector on
+    /// head 0); does **not** continue onto head 1.
+    #[test]
+    fn read_data_mt0_same_params_stops_at_eot_head0() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        let off_h0 = Fdc82077::chs_byte_offset(0, 0, 2).unwrap();
+        let off_h1 = Fdc82077::chs_byte_offset(0, 1, 1).unwrap();
+        img[off_h0..off_h0 + FDC_SECTOR_SIZE].fill(0xA5);
+        img[off_h1..off_h1 + FDC_SECTOR_SIZE].fill(0x5A);
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // READ DATA MFM MT=0: C=0,H=0,R=2,N=2,EOT=2 — single head0 sector only.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_MFM | FDC_CMD_READ_DATA));
+        for p in [0x00u8, 0x00, 0x00, 0x02, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0, FDC_ST0_IC_NORMAL, "ST0 H remains 0 (no MT switch)");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // ST1
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // ST2
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x00,
+            "H ENDaddress stays head 0"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+
+        assert_eq!(f.last_sector_byte_count(), FDC_SECTOR_SIZE);
+        assert_eq!(f.pending_dma_byte_count(), FDC_SECTOR_SIZE);
+        let latch = f.last_sector().expect("MT=0 latches one sector").to_vec();
+        assert!(
+            latch.iter().all(|&b| b == 0xA5),
+            "MT=0 must not include head1 bytes"
         );
     }
 
