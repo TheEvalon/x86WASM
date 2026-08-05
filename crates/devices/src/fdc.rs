@@ -5235,7 +5235,11 @@ mod tests {
         );
 
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
-        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RELATIVE_SEEK | FDC_CMD_RELATIVE_SEEK_DIR));
+        f.port_write(
+            FDC_FIFO,
+            1,
+            u32::from(FDC_CMD_RELATIVE_SEEK | FDC_CMD_RELATIVE_SEEK_DIR),
+        );
         f.port_write(FDC_FIFO, 1, 0x00);
         f.port_write(FDC_FIFO, 1, 0x01);
         assert!(f.irq_line());

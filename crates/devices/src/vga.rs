@@ -2421,10 +2421,7 @@ mod tests {
             VGA_GC_SET_RESET_DEFAULT
         );
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_SET_RESET));
-        assert_eq!(
-            v.port_read(VGA_GC_DATA, 1) as u8,
-            VGA_GC_SET_RESET_DEFAULT
-        );
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_SET_RESET_DEFAULT);
 
         // Planes 0+2 Set/Reset value (bits 3:0).
         v.port_write(VGA_GC_DATA, 1, 0x05);
@@ -2447,10 +2444,7 @@ mod tests {
             VGA_GC_SET_RESET_DEFAULT
         );
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_SET_RESET));
-        assert_eq!(
-            v.port_read(VGA_GC_DATA, 1) as u8,
-            VGA_GC_SET_RESET_DEFAULT
-        );
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, VGA_GC_SET_RESET_DEFAULT);
     }
 
     /// Spec: FreeVGA Graphics Registers — Data Rotate / Function Select (index

@@ -2013,7 +2013,11 @@ mod tests {
         ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
         ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
         ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
-        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
         assert!(ide.irq_line());
         let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
         assert_eq!(st & ATA_SR_ERR, 0);
@@ -2030,7 +2034,11 @@ mod tests {
         ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
         ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
         ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
-        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
         let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
         assert_ne!(st & ATA_SR_ERR, 0);
         assert_eq!(st & ATA_SR_DRQ, 0);
@@ -2044,7 +2052,11 @@ mod tests {
         ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
         ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
         ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1); // LBA 1..2 needs 2 sectors; only 0..1 exist
-        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
         let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
         assert_ne!(st & ATA_SR_ERR, 0);
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
@@ -2058,7 +2070,11 @@ mod tests {
         ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
         ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
         ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
-        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
         assert!(!ide.irq_line());
     }
