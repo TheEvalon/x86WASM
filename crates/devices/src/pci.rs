@@ -66,17 +66,22 @@
 //!   form (bit0), the 16-byte Bus Master IDE register block at
 //!   `BMIBA & 0xFFF0` is a noop store/readback (command/status/PRD pointers;
 //!   primary + secondary). No DMA engine.
+//! - PIIX ACPI PM I/O decode: when Command.IO is set and PMBASE has I/O form
+//!   (bit0), the 64-byte PM register block at `PMBASE & 0xFFC0` is a noop
+//!   store/readback (`PM1a_EVT` / `PM1a_CNT` / `PM_TMR` + remainder). No SCI,
+//!   SMI, or power-state machine.
 //!
 //! # Unsupported (explicit)
 //!
-//! - BAR MMIO decode (other than PIIX IDE BMIDE I/O stub above), bus mastering
-//!   DMA engine / PRD walks, INTx routing tables
-//! - Host-bridge / PIIX ISA / PIIX USB / PIIX ACPI Command decode side effects;
-//!   PIIX IDE Command side effects beyond BMIDE I/O enable
+//! - BAR MMIO decode (other than PIIX IDE BMIDE / ACPI PM I/O stubs above), bus
+//!   mastering DMA engine / PRD walks, INTx routing tables
+//! - Host-bridge / PIIX ISA / PIIX USB Command decode side effects;
+//!   PIIX IDE Command side effects beyond BMIDE I/O enable;
+//!   PIIX ACPI Command side effects beyond PM I/O enable
 //! - Status error *signaling* (host / ISA / IDE / USB / ACPI never latch RW1C bits from real aborts yet)
 //! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI)
 //! - USB host controller (UHCI frame list / ports / IRQ)
-//! - ACPI PM I/O block / SMI / GPE / ACPI tables (Command + Status + PMBASE config only)
+//! - ACPI SCI/SMI / GPE / real power transitions / ACPI tables
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
 
@@ -284,6 +289,22 @@ pub const PCI_PIIX_USB_LEGSUP_OFFSET: u8 = 0xC0;
 const _: () = assert!(PCI_PIIX_USB_LEGSUP_OFFSET == 0xC0);
 /// PMBASE I/O decode mask — 64-byte aligned (bits 15:6); bit0 = I/O space.
 pub const PCI_PIIX_ACPI_PMBASE_MASK: u32 = 0xFFC0;
+/// ACPI PM I/O register block size at PMBASE.
+/// Spec: Intel 82371AB — PM I/O footprint is 64 bytes.
+pub const PCI_PIIX_ACPI_PM_IO_SIZE: u16 = 64;
+/// PM1a Event block offset within PMBASE (`PM1_STS` at +0, `PM1_EN` at +2).
+/// Spec: Intel 82371AB / ACPI — `PM1a_EVT_BLK`.
+pub const PCI_PIIX_ACPI_PM1A_EVT: u8 = 0x00;
+/// PM1a Control register offset within PMBASE.
+/// Spec: Intel 82371AB / ACPI — `PM1a_CNT_BLK`.
+pub const PCI_PIIX_ACPI_PM1A_CNT: u8 = 0x04;
+/// Power Management Timer offset within PMBASE.
+/// Spec: Intel 82371AB / ACPI — `PM_TMR_BLK` (24-bit timer; dword access).
+pub const PCI_PIIX_ACPI_PM_TMR: u8 = 0x08;
+const _: () = assert!(PCI_PIIX_ACPI_PM_IO_SIZE == 64);
+const _: () = assert!(PCI_PIIX_ACPI_PM1A_EVT == 0x00);
+const _: () = assert!(PCI_PIIX_ACPI_PM1A_CNT == 0x04);
+const _: () = assert!(PCI_PIIX_ACPI_PM_TMR == 0x08);
 /// PIIX ISA Edge/Level Control Register — master PIC (IRQs 0–7).
 /// Spec: Intel 82371 / OSDev 8259 PIC ELCR — I/O port `0x4D0`.
 pub const PIIX_ELCR_MASTER: u16 = 0x4D0;
@@ -342,6 +363,10 @@ pub struct PciConfig {
     /// Spec: Intel 82371SB — BMICOM/BMISTA/BMIDTP primary + secondary.
     /// Store/readback only; no DMA/PRD engine. Reset all zeros.
     pub bmide_io: [u8; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
+    /// PIIX ACPI PM I/O register file (64 bytes at PMBASE).
+    /// Spec: Intel 82371AB — `PM1a_EVT` / `PM1a_CNT` / `PM_TMR` (+ remainder).
+    /// Store/readback only; no SCI/SMI/power-state machine. Reset all zeros.
+    pub acpi_pm_io: [u8; PCI_PIIX_ACPI_PM_IO_SIZE as usize],
 }
 
 /// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
@@ -374,6 +399,8 @@ impl PciConfig {
             elcr: [0, 0],
             // Spec: Intel 82371SB — BMIDE I/O registers power-on / reset to 0.
             bmide_io: [0; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
+            // Spec: Intel 82371AB — ACPI PM I/O registers power-on / reset to 0.
+            acpi_pm_io: [0; PCI_PIIX_ACPI_PM_IO_SIZE as usize],
         }
     }
 
@@ -780,7 +807,7 @@ impl PciConfig {
         }
         // Spec: Intel 82371AB / PCI — PIIX ACPI PMBASE at config 0x40 is an I/O
         // BAR: bit0 hardwired 1; bits 15:6 programmable (64-byte align).
-        // Store/readback only — no ACPI PM I/O decode yet.
+        // Port decode of the PM block is gated by Command.IO (see acpi_pm_io_base).
         if is_piix_acpi && base == PCI_PIIX_ACPI_PMBASE_OFFSET as usize && lane == 0 && size == 4 {
             let masked = (value & PCI_PIIX_ACPI_PMBASE_MASK) | PCI_BAR_IO_SPACE;
             let bytes = masked.to_le_bytes();
@@ -894,6 +921,100 @@ impl PciConfig {
             _ => {}
         }
     }
+
+    fn piix_acpi_command(&self) -> u16 {
+        let off = PCI_COMMAND_OFFSET as usize;
+        u16::from_le_bytes([self.piix_acpi[off], self.piix_acpi[off + 1]])
+    }
+
+    fn piix_acpi_pmbase(&self) -> u32 {
+        let off = PCI_PIIX_ACPI_PMBASE_OFFSET as usize;
+        u32::from_le_bytes([
+            self.piix_acpi[off],
+            self.piix_acpi[off + 1],
+            self.piix_acpi[off + 2],
+            self.piix_acpi[off + 3],
+        ])
+    }
+
+    /// Programmed ACPI PM I/O base when Command.IO is set and PMBASE has I/O form.
+    ///
+    /// Spec: PCI Local Bus — I/O Space Enable gates BAR decode; Intel 82371AB —
+    /// PMBASE bits 15:6 are the 64-byte-aligned I/O base (bit0 = I/O space).
+    pub fn acpi_pm_io_base(&self) -> Option<u16> {
+        if self.piix_acpi_command() & PCI_COMMAND_IO == 0 {
+            return None;
+        }
+        let bar = self.piix_acpi_pmbase();
+        if bar & PCI_BAR_IO_SPACE == 0 {
+            return None;
+        }
+        Some((bar & PCI_PIIX_ACPI_PMBASE_MASK) as u16)
+    }
+
+    /// True when `port` falls in the decoded ACPI PM I/O range.
+    pub fn acpi_pm_owns_port(&self, port: u16) -> bool {
+        let Some(base) = self.acpi_pm_io_base() else {
+            return false;
+        };
+        port.wrapping_sub(base) < PCI_PIIX_ACPI_PM_IO_SIZE
+    }
+
+    fn acpi_pm_port_read(&self, port: u16, size: u8) -> u32 {
+        let Some(base) = self.acpi_pm_io_base() else {
+            return 0xFFFFFFFF;
+        };
+        let off = (port - base) as usize;
+        match size {
+            1 => u32::from(self.acpi_pm_io.get(off).copied().unwrap_or(0xFF)),
+            2 => {
+                let b0 = self.acpi_pm_io.get(off).copied().unwrap_or(0xFF);
+                let b1 = self.acpi_pm_io.get(off + 1).copied().unwrap_or(0xFF);
+                u32::from(u16::from_le_bytes([b0, b1]))
+            }
+            4 => {
+                let mut bytes = [0xFFu8; 4];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    if let Some(v) = self.acpi_pm_io.get(off + i) {
+                        *b = *v;
+                    }
+                }
+                u32::from_le_bytes(bytes)
+            }
+            _ => 0xFFFFFFFF,
+        }
+    }
+
+    fn acpi_pm_port_write(&mut self, port: u16, size: u8, value: u32) {
+        let Some(base) = self.acpi_pm_io_base() else {
+            return;
+        };
+        let off = (port - base) as usize;
+        match size {
+            1 => {
+                if let Some(slot) = self.acpi_pm_io.get_mut(off) {
+                    *slot = value as u8;
+                }
+            }
+            2 => {
+                let bytes = (value as u16).to_le_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    if let Some(slot) = self.acpi_pm_io.get_mut(off + i) {
+                        *slot = *b;
+                    }
+                }
+            }
+            4 => {
+                let bytes = value.to_le_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    if let Some(slot) = self.acpi_pm_io.get_mut(off + i) {
+                        *slot = *b;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Bits written into Status (`0x06`/`0x07`) by a CONFIG_DATA store (0 = lane not touched).
@@ -940,6 +1061,10 @@ impl PortDevice for PciConfig {
         if self.bmide_owns_port(port) {
             return self.bmide_port_read(port, size);
         }
+        // Spec: Intel 82371AB — ACPI PM I/O at PMBASE when Command.IO + BAR programmed.
+        if self.acpi_pm_owns_port(port) {
+            return self.acpi_pm_port_read(port, size);
+        }
         0xFFFFFFFF
     }
 
@@ -983,6 +1108,11 @@ impl PortDevice for PciConfig {
         // Spec: Intel 82371SB — BMIDE noop register file (no DMA).
         if self.bmide_owns_port(port) {
             self.bmide_port_write(port, size, value);
+            return;
+        }
+        // Spec: Intel 82371AB — ACPI PM noop register file (no SCI/SMI).
+        if self.acpi_pm_owns_port(port) {
+            self.acpi_pm_port_write(port, size, value);
         }
     }
 }
@@ -2369,6 +2499,110 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_4000);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x0000_4001);
+    }
+
+    /// Spec: Intel 82371AB — ACPI PM I/O regs reset to 0; no decode until PMBASE+IO.
+    #[test]
+    fn piix_acpi_pm_reset_default_no_decode() {
+        let pci = PciConfig::new();
+        assert_eq!(pci.acpi_pm_io, [0; PCI_PIIX_ACPI_PM_IO_SIZE as usize]);
+        assert_eq!(pci.acpi_pm_io_base(), None);
+        assert!(!pci.acpi_pm_owns_port(0xB000));
+        assert!(!pci.acpi_pm_owns_port(0x0000));
+    }
+
+    /// Spec: Intel 82371AB PM — `PM1a_EVT` / `PM1a_CNT` / `PM_TMR` store/readback.
+    #[test]
+    fn piix_acpi_pm_store_readback_when_io_enabled() {
+        let mut pci = PciConfig::new();
+        // Program PMBASE = 0xB000 (I/O form → 0xB001).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 3, PCI_PIIX_ACPI_PMBASE_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_B000);
+        // Enable I/O Space.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 3, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+
+        assert_eq!(pci.acpi_pm_io_base(), Some(0xB000));
+        assert!(pci.acpi_pm_owns_port(0xB000));
+        assert!(pci.acpi_pm_owns_port(0xB03F));
+        assert!(!pci.acpi_pm_owns_port(0xB040));
+
+        // PM1a_EVT (STS+EN), PM1a_CNT, PM_TMR.
+        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2, 0x0101);
+        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2, 2, 0x0202);
+        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2, 0x0001);
+        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM_TMR), 4, 0x00AB_CDEF);
+
+        assert_eq!(
+            pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2) as u16,
+            0x0101
+        );
+        assert_eq!(
+            pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2, 2) as u16,
+            0x0202
+        );
+        assert_eq!(
+            pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2) as u16,
+            0x0001
+        );
+        assert_eq!(
+            pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM_TMR), 4),
+            0x00AB_CDEF
+        );
+
+        pci.reset();
+        assert_eq!(pci.acpi_pm_io, [0; PCI_PIIX_ACPI_PM_IO_SIZE as usize]);
+        assert_eq!(pci.acpi_pm_io_base(), None);
+    }
+
+    /// Spec: PCI Command I/O Space Enable — clear → ACPI PM BAR not decoded.
+    #[test]
+    fn piix_acpi_pm_disabled_when_io_command_clear() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 3, PCI_PIIX_ACPI_PMBASE_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_4000);
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 3, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+        assert_eq!(pci.acpi_pm_io_base(), Some(0x4000));
+        pci.port_write(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2, 0x0005);
+        assert_eq!(
+            pci.port_read(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2) as u16,
+            0x0005
+        );
+
+        // Clear IO; BusMaster alone must not enable decode.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 3, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_BUS_MASTER));
+        assert_eq!(pci.acpi_pm_io_base(), None);
+        assert!(!pci.acpi_pm_owns_port(0x4000));
+        // Writes while disabled must not mutate the register file.
+        pci.port_write(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2, 0x00AA);
+        // Re-enable IO — prior store while disabled discarded; last good value remains.
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+        assert_eq!(
+            pci.port_read(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2) as u16,
+            0x0005
+        );
     }
 
     /// Spec: Intel 82371SB — PIRQRC[A:D] at ISA config `0x60`–`0x63` default
