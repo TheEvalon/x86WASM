@@ -33,6 +33,9 @@ Desktop.ini
 *.vmdk
 *.iso
 firmware/seabios/*.bin
+firmware/seabios/.src/
+firmware/seabios/manifest.json
+firmware/seabios/COPYING.SeaBIOS
 firmware/seavgabios/*.bin
 firmware/ovmf/*.fd
 !firmware/manifests/**

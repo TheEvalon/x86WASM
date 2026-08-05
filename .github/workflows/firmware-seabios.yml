@@ -1,0 +1,56 @@
+# Optional Linux CI: reproduce SeaBIOS fetch/build (does not upload or commit bios.bin).
+name: Firmware SeaBIOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware-seabios.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware-seabios.yml"
+  workflow_dispatch:
+
+jobs:
+  build-seabios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SeaBIOS build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-multilib python3 git make
+
+      - name: Build SeaBIOS into firmware/seabios/
+        run: |
+          chmod +x firmware/build-scripts/build-seabios.sh
+          ./firmware/build-scripts/build-seabios.sh
+
+      - name: Verify artifacts
+        run: |
+          test -f firmware/seabios/bios.bin
+          test -f firmware/seabios/manifest.json
+          test -f firmware/seabios/COPYING.SeaBIOS
+          python3 - <<'PY'
+          import json, pathlib
+          pin = json.loads(pathlib.Path("firmware/manifests/seabios.json").read_text())
+          built = json.loads(pathlib.Path("firmware/seabios/manifest.json").read_text())
+          assert pin["commit"] == built["commit"] == "a6ed6b701f0a57db0569ab98b0661c12a6ec3ff8"
+          assert built["size_bytes"] > 0
+          print("ok", built["size_bytes"], built["sha256"])
+          PY
+
+      - name: Upload bios.bin artifact (ephemeral; not committed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: seabios-bios-bin
+          path: |
+            firmware/seabios/bios.bin
+            firmware/seabios/manifest.json
+            firmware/seabios/COPYING.SeaBIOS
+          if-no-files-found: error
+          retention-days: 7

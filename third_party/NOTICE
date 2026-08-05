@@ -3,10 +3,27 @@
 This file records provenance for third-party binaries and substantial third-party
 code that ships with or is built alongside x86WASM.
 
-No third-party firmware or emulator binaries are vendored in the initial
-bootstrap. When SeaBIOS, OVMF, or other firmware is added under `firmware/`,
-record license, version, and source URL here and in `docs/sources.md` /
-`docs/licensing.md`.
+## SeaBIOS (build-time / optional firmware binary)
+
+- Project: SeaBIOS
+- Purpose: Legacy x86 BIOS ROM for the classic PC boot path (Milestone 2+)
+- Upstream: https://www.seabios.org/
+- Source (QEMU mirror): https://gitlab.com/qemu-project/seabios.git
+- Pinned revision: rel-1.16.3 (commit a6ed6b701f0a57db0569ab98b0661c12a6ec3ff8)
+- License: LGPL-3.0-or-later (see firmware/seabios/LICENSE.notice and
+  firmware/seabios/COPYING.SeaBIOS after build)
+- Build script: firmware/build-scripts/build-seabios.sh
+- Output location: firmware/seabios/bios.bin (gitignored; not vendored into
+  MIT/Apache Rust crates)
+- Manifest pin: firmware/manifests/seabios.json
+
+No SeaBIOS sources are embedded in crates/. Building or loading the ROM does
+not constitute a SeaBIOS POST integration claim.
+
+## OVMF / other firmware
+
+OVMF and other firmware blobs are not yet added. When they are, record license,
+version, and source URL here and in docs/sources.md / docs/licensing.md.
 
 Project code is dual-licensed Apache-2.0 OR MIT unless a subdirectory says
 otherwise.
