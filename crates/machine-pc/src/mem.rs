@@ -12,7 +12,8 @@ pub struct RomWindow {
 #[derive(Clone, Debug)]
 pub struct PhysMem {
     ram: Vec<u8>,
-    rom: Option<RomWindow>,
+    /// One or more ROM windows (e.g. BIOS high map + below-1 MiB alias).
+    roms: Vec<RomWindow>,
     /// A20 gate: when false, physical bit 20 is forced clear (IBM PC AT).
     /// Power-on / reset default is enabled (open gate).
     a20_enabled: bool,
@@ -28,7 +29,7 @@ impl PhysMem {
     pub fn new(ram_size: usize) -> Self {
         Self {
             ram: vec![0; ram_size],
-            rom: None,
+            roms: Vec::new(),
             a20_enabled: true,
         }
     }
@@ -55,21 +56,33 @@ impl PhysMem {
         }
     }
 
+    /// Replace all ROM windows with a single mapping (HELLO / lab ROMs).
     pub fn map_rom(&mut self, base: u64, data: Vec<u8>) {
-        self.rom = Some(RomWindow { base, data });
+        self.roms.clear();
+        self.roms.push(RomWindow { base, data });
+    }
+
+    /// Clear every ROM window.
+    pub fn clear_roms(&mut self) {
+        self.roms.clear();
+    }
+
+    /// Append a ROM window without clearing existing ones (BIOS dual-map).
+    pub fn add_rom(&mut self, base: u64, data: Vec<u8>) {
+        self.roms.push(RomWindow { base, data });
     }
 
     fn rom_read(&self, addr: u64) -> Option<u8> {
-        let rom = self.rom.as_ref()?;
-        if addr < rom.base {
-            return None;
+        for rom in &self.roms {
+            if addr < rom.base {
+                continue;
+            }
+            let off = (addr - rom.base) as usize;
+            if off < rom.data.len() {
+                return Some(rom.data[off]);
+            }
         }
-        let off = (addr - rom.base) as usize;
-        if off < rom.data.len() {
-            Some(rom.data[off])
-        } else {
-            None
-        }
+        None
     }
 
     pub fn read_u8(&self, addr: u64) -> Result<u8, MemError> {
@@ -113,6 +126,17 @@ mod tests {
         m.map_rom(0, vec![0xF4]);
         assert_eq!(m.read_u8(0).unwrap(), 0xF4);
         assert_eq!(m.write_u8(0, 0x00), Err(MemError::RomWrite));
+    }
+
+    /// Spec: machine-model — BIOS may appear at high map and `0xF0000` alias.
+    #[test]
+    fn dual_rom_windows_high_and_low_alias() {
+        let mut m = PhysMem::new(1024 * 1024);
+        m.add_rom(0xFFFF_0000, vec![0xAA; 4]);
+        m.add_rom(0x000F_0000, vec![0xBB; 4]);
+        assert_eq!(m.read_u8(0xFFFF_0000).unwrap(), 0xAA);
+        assert_eq!(m.read_u8(0x000F_0000).unwrap(), 0xBB);
+        assert_eq!(m.write_u8(0x000F_0001, 0x00), Err(MemError::RomWrite));
     }
 
     /// Spec: IBM PC AT A20 gate — when disabled, phys bit 20 is forced clear.

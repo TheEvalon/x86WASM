@@ -5,8 +5,8 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 ## Memory (Milestone 1 lab)
 
 - Contiguous RAM from physical `0` (default size configurable; CLI default 16 MiB).
-- ROM window mapped at `0xFFFF_0000` (64 KiB) so the Intel reset vector at `CS.base + 0xFFF0` = `0xFFFF_FFF0` fetches ROM.
-- Optional alias of the same ROM image at `0x000F_0000` for real-mode `F000:xxxx` tooling later.
+- ROM window mapped at `0xFFFF_0000` (64 KiB) so the Intel reset vector at `CS.base + 0xFFF0` = `0xFFFF_FFF0` fetches ROM (HELLO / `load_rom`).
+- BIOS path (`Machine::load_bios_rom` / `with_bios_rom` via `firmware_interface::prepare_bios_rom`): image right-aligned under 4 GiB; last ≤128 KiB also aliased below 1 MiB (`0x000F_0000` for 64 KiB, `0x000E_0000` for 128 KiB). Mapping only — not SeaBIOS POST.
 - A20 gate on `PhysMem`: when disabled, physical address bit 20 is forced clear on CPU bus read/write. Controlled by 8042 output-port bit1 (`0xD1` write / `0xD0` read). Reset default: A20 enabled.
 
 ## Port I/O (M1 + M2 partial)
