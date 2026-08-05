@@ -19,7 +19,7 @@ use devices::{
     PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
     PIT_CONTROL, PORT_SYSTEM_CONTROL,
 };
-use firmware_interface::RomImage;
+use firmware_interface::{prepare_bios_rom, BiosRomError, RomImage};
 use ports::PortBus;
 use thiserror::Error;
 use x86_core::CpuState;
@@ -31,6 +31,8 @@ pub enum MachineError {
     Exec(#[from] ExecError),
     #[error("ROM too large for window")]
     RomTooLarge,
+    #[error(transparent)]
+    BiosRom(#[from] BiosRomError),
 }
 
 pub struct Machine {
@@ -101,6 +103,9 @@ impl Machine {
     }
 
     /// Load a 64 KiB (or smaller) ROM at `0xFFFF_0000` for the Intel reset vector.
+    ///
+    /// Lab / HELLO path — high map only. Prefer [`Self::load_bios_rom`] when a
+    /// classic below-1 MiB (`0xF0000`) alias is required.
     pub fn load_rom(&mut self, data: &[u8]) -> Result<(), MachineError> {
         if data.len() > 64 * 1024 {
             return Err(MachineError::RomTooLarge);
@@ -120,6 +125,31 @@ impl Machine {
     pub fn load_rom_image(&mut self, image: &RomImage) -> Result<(), MachineError> {
         self.mem.map_rom(image.phys_base, image.data.clone());
         Ok(())
+    }
+
+    /// Map a legacy BIOS image at top-of-4 GiB and the below-1 MiB alias.
+    ///
+    /// Uses [`firmware_interface::prepare_bios_rom`]: a 64 KiB image lands at
+    /// `0xFFFF_0000` and `0x000F_0000` (same reset-vector region as HELLO ROM).
+    /// Does not boot SeaBIOS POST — mapping only.
+    ///
+    /// Spec: `docs/machine-model-pc-v1.md` ROM alias; SeaBIOS memory map notes
+    /// in `docs/sources.md`.
+    pub fn load_bios_rom(&mut self, data: &[u8]) -> Result<(), MachineError> {
+        let map = prepare_bios_rom(data)?;
+        self.mem.clear_roms();
+        self.mem.add_rom(map.high.phys_base, map.high.data);
+        self.mem.add_rom(map.low.phys_base, map.low.data);
+        Ok(())
+    }
+
+    /// Construct a machine with a BIOS ROM already dual-mapped.
+    ///
+    /// Wraps [`Self::new`] + [`Self::load_bios_rom`].
+    pub fn with_bios_rom(ram_size: usize, data: &[u8]) -> Result<Self, MachineError> {
+        let mut m = Self::new(ram_size);
+        m.load_bios_rom(data)?;
+        Ok(m)
     }
 
     pub fn reset(&mut self) {
@@ -798,6 +828,50 @@ mod tests {
         m.reset();
         let b = m.mem.read_u8(0xFFFF_FFF0).unwrap();
         assert_eq!(b, 0xE9, "near JMP at reset vector");
+    }
+
+    /// Tiny synthetic BIOS (not SeaBIOS) — signature + HLT at reset offset.
+    fn synthetic_bios_64k() -> Vec<u8> {
+        let mut rom = vec![0u8; 64 * 1024];
+        rom[0] = 0xEA;
+        rom[0xFFF0] = 0xF4; // HLT at Intel reset vector offset
+        rom[0xFFFF] = 0x55;
+        rom
+    }
+
+    /// Spec: SeaBIOS / classic PC — BIOS dual-mapped at top-of-4 GiB and `0xF0000`.
+    #[test]
+    fn load_bios_rom_maps_high_and_f0000_alias() {
+        let mut m = Machine::new(1024 * 1024);
+        m.load_bios_rom(&synthetic_bios_64k()).unwrap();
+
+        assert_eq!(m.mem.read_u8(0xFFFF_0000).unwrap(), 0xEA);
+        assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0xEA);
+        assert_eq!(m.mem.read_u8(0xFFFF_FFF0).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(0x000F_FFF0).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(0xFFFF_FFFF).unwrap(), 0x55);
+        assert_eq!(m.mem.read_u8(0x000F_FFFF).unwrap(), 0x55);
+        assert_eq!(
+            m.mem.write_u8(0x000F_0000, 0x00),
+            Err(crate::mem::MemError::RomWrite)
+        );
+    }
+
+    /// Spec: `with_bios_rom` mirrors [`Machine::with_floppy`] constructor shape.
+    #[test]
+    fn with_bios_rom_constructor_maps_alias() {
+        let m = Machine::with_bios_rom(1024 * 1024, &synthetic_bios_64k()).unwrap();
+        assert_eq!(m.mem.read_u8(0xFFFF_FFF0).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(0x000F_FFF0).unwrap(), 0xF4);
+    }
+
+    #[test]
+    fn load_bios_rom_rejects_empty() {
+        let mut m = Machine::new(64 * 1024);
+        assert!(matches!(
+            m.load_bios_rom(&[]),
+            Err(MachineError::BiosRom(BiosRomError::Empty))
+        ));
     }
 
     /// Spec: classic PC PIC ports on MachineBus (Intel 8259A ICW1–ICW4; docs/machine-model-pc-v1.md).
