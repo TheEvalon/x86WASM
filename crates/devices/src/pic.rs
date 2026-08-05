@@ -37,9 +37,13 @@
 //! - Special Fully Nested Mode (ICW4.SFNM on master): a slave-connected in-service
 //!   IR does not lock that cascade line out of the master's priority logic, so a
 //!   higher-priority IR on the same slave can be delivered without a master EOI
-//! - Edge-triggered IR line assert (ICW1.LTIM=0): rising edge latches IRR
-//! - Level-triggered IR line assert (ICW1.LTIM=1): IRR follows IR level; deassert
-//!   clears IRR; acknowledge while still high re-pending IRR for post-EOI delivery
+//! - Edge-triggered IR line assert (ICW1.LTIM=0 and ELCR bit clear): rising edge
+//!   latches IRR
+//! - Level-triggered IR line assert (ICW1.LTIM=1 **or** ELCR bit set for that IR):
+//!   IRR follows IR level; deassert clears IRR; acknowledge while still high
+//!   re-pending IRR for post-EOI delivery
+//! - PIIX ELCR per-IR mask via [`DualPic::set_elcr_level_mask`] (SeaBIOS/PIIX
+//!   edge/level select; survives ICW1 — ELCR is outside the 8259)
 //! - Spurious / DEFAULT IR7 when IR pin is low at first INTA (vector IR7, ISR
 //!   bit7 not set); cascade master IR is never remapped — empty/spurious slave
 //!   still sets master cascade IS
@@ -49,6 +53,7 @@
 //! # Unsupported (explicit)
 //!
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
+//! - PIIX ELCR reserved-bit hardwiring (IRQ0/1/2/8/13 always-edge on real silicon)
 
 use crate::PortDevice;
 
@@ -116,12 +121,22 @@ pub struct Pic8259 {
     pub expect_icw4: bool,
     /// ICW1.SNGL — single (no cascade / no ICW3).
     pub single: bool,
-    /// ICW1.LTIM — level-triggered when true (edge-triggered when false).
+    /// ICW1.LTIM — chip-wide level-triggered when true.
     ///
     /// Spec: Intel 8259A datasheet — LTIM=1 disables edge detect; a high level
     /// on IR is a valid request. The request must be removed before EOI (or
     /// before IF is re-enabled) to avoid a second interrupt.
+    ///
+    /// Interaction with PIIX ELCR: an individual IR is level-sensitive when
+    /// `level_triggered` **or** the corresponding bit in [`Self::elcr_level_mask`]
+    /// is set (SeaBIOS typically leaves LTIM=0 and selects PCI IRQs via ELCR).
     pub level_triggered: bool,
+    /// Per-IR level-sensitive mask from PIIX ELCR (`0x4D0` master / `0x4D1` slave).
+    ///
+    /// Bit N = IRN level-triggered. Spec: Intel 82371 / OSDev 8259 PIC ELCR.
+    /// Survives ICW1 (ELCR lives in the ISA bridge, not the 8259). Cleared by
+    /// [`Pic8259::reset`] / [`DualPic::reset`].
+    pub elcr_level_mask: u8,
     /// Raw ICW1 byte from the last started sequence (0 after reset).
     pub icw1: u8,
     /// ICW2 vector base (8086: bits 7:3 select base; IRQ n → base|n).
@@ -201,6 +216,7 @@ impl Pic8259 {
             expect_icw4: false,
             single: false,
             level_triggered: false,
+            elcr_level_mask: 0,
             icw1: 0,
             vector_base: 0,
             icw3: 0,
@@ -252,21 +268,33 @@ impl Pic8259 {
         Some((self.vector_base & 0xF8) | (irq & 0x07))
     }
 
+    /// True if IR`irq` uses level-sensitive semantics.
+    ///
+    /// Spec: Intel 8259A ICW1.LTIM (chip-wide) **or** PIIX ELCR bit for that IR
+    /// (Intel 82371 / OSDev ELCR). Either source makes the IR level-sensitive.
+    pub fn ir_is_level(&self, irq: u8) -> bool {
+        if irq > 7 {
+            return false;
+        }
+        self.level_triggered || (self.elcr_level_mask & (1u8 << irq)) != 0
+    }
+
     /// Drive IR`irq` (0–7).
     ///
-    /// Spec: Intel 8259A ICW1.LTIM —
-    /// - Edge (LTIM=0): low→high latches IRR; holding high does not re-request;
-    ///   deassert does not clear a latched IRR bit.
-    /// - Level (LTIM=1): high level sets IRR; deassert clears that IRR bit.
+    /// Spec: Intel 8259A ICW1.LTIM / PIIX ELCR —
+    /// - Edge (`!ir_is_level`): low→high latches IRR; holding high does not
+    ///   re-request; deassert does not clear a latched IRR bit.
+    /// - Level (`ir_is_level`): high level sets IRR; deassert clears that IRR bit.
     pub fn set_irq_line(&mut self, irq: u8, high: bool) {
         if irq > 7 {
             return;
         }
         let bit = 1u8 << irq;
         let was_high = self.ir_level & bit != 0;
+        let level = self.ir_is_level(irq);
         if high {
             self.ir_level |= bit;
-            if self.level_triggered {
+            if level {
                 self.irr |= bit;
             } else if !was_high {
                 // Edge sense: rising edge latches IRR (datasheet ICW1 / edge mode).
@@ -274,8 +302,25 @@ impl Pic8259 {
             }
         } else {
             self.ir_level &= !bit;
-            if self.level_triggered {
+            if level {
                 // Level mode: removing the IR level removes the request.
+                self.irr &= !bit;
+            }
+        }
+    }
+
+    /// After ELCR mask changes, sync IRR for pins that are now level-sensitive.
+    ///
+    /// Level IRs follow the pin; edge IRs keep any latched IRR unchanged.
+    fn refresh_level_irr_from_pins(&mut self) {
+        for ir in 0u8..8 {
+            if !self.ir_is_level(ir) {
+                continue;
+            }
+            let bit = 1u8 << ir;
+            if self.ir_level & bit != 0 {
+                self.irr |= bit;
+            } else {
                 self.irr &= !bit;
             }
         }
@@ -416,7 +461,7 @@ impl Pic8259 {
             return 7;
         }
         self.isr |= bit;
-        if self.level_triggered && self.ir_level & bit != 0 {
+        if self.ir_is_level(ir) && self.ir_level & bit != 0 {
             self.irr |= bit;
         }
         if self.auto_eoi {
@@ -645,6 +690,25 @@ impl DualPic {
         self.slave.reset();
     }
 
+    /// Set PIIX ELCR per-IR level-sensitive masks (master `0x4D0`, slave `0x4D1`).
+    ///
+    /// Spec: Intel 82371 / OSDev 8259 PIC ELCR — bit N selects level (1) vs edge
+    /// (0) for that IR. Combined with ICW1.LTIM via [`Pic8259::ir_is_level`]:
+    /// LTIM=1 makes the whole chip level; with LTIM=0 only ELCR-selected IRs are
+    /// level. ELCR is not cleared by ICW1.
+    pub fn set_elcr_level_mask(&mut self, master: u8, slave: u8) {
+        self.master.elcr_level_mask = master;
+        self.slave.elcr_level_mask = slave;
+        self.master.refresh_level_irr_from_pins();
+        self.slave.refresh_level_irr_from_pins();
+        self.sync_cascade();
+    }
+
+    /// Current ELCR level masks `(master 0x4D0, slave 0x4D1)`.
+    pub fn elcr_level_mask(&self) -> (u8, u8) {
+        (self.master.elcr_level_mask, self.slave.elcr_level_mask)
+    }
+
     /// Assert/deassert a global ISA IRQ line (0–15). IRQ8–15 → slave IR0–7.
     pub fn set_irq_line(&mut self, irq: u8, high: bool) {
         if irq < 8 {
@@ -838,6 +902,9 @@ mod tests {
         assert_eq!(pic.slave.lowest_priority, 7);
         assert!(!pic.master.rotate_on_auto_eoi);
         assert!(!pic.slave.rotate_on_auto_eoi);
+        assert_eq!(pic.master.elcr_level_mask, 0);
+        assert_eq!(pic.slave.elcr_level_mask, 0);
+        assert_eq!(pic.elcr_level_mask(), (0, 0));
         assert!(pic.master.is_master);
         assert!(!pic.slave.is_master);
         assert_eq!(pic.master.imr, 0xFF);
@@ -1974,5 +2041,103 @@ mod tests {
         pic.port_write(PIC_MASTER_CMD, 1, 0x0C); // OCW3 P=1
         assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 7);
         assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 82371 / OSDev ELCR — ELCR bit selects level for that IR while
+    /// ICW1.LTIM stays 0 (SeaBIOS/PIIX model). Held-high redelivers after EOI.
+    #[test]
+    fn elcr_bit_selects_level_redelivery_for_irq() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        assert!(!pic.master.level_triggered);
+        // Master ELCR bit3 → IRQ3 level; other IRs remain edge.
+        pic.set_elcr_level_mask(1 << 3, 0);
+        assert_eq!(pic.elcr_level_mask(), (1 << 3, 0));
+        assert!(pic.master.ir_is_level(3));
+        assert!(!pic.master.ir_is_level(0));
+
+        pic.port_write(PIC_MASTER_DATA, 1, 0xF7); // unmask IR3
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+        assert_eq!(pic.master.isr, 1 << 3);
+        assert_eq!(pic.master.irr & (1 << 3), 1 << 3); // level re-pend
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // EOI
+                                                 // No new edge: level still asserted → second delivery.
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+    }
+
+    /// Spec: clearing the ELCR bit restores edge semantics for that IR.
+    #[test]
+    fn elcr_clear_restores_edge_for_irq() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.set_elcr_level_mask(1 << 3, 0);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xF7);
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.poll_irq(), Some(0x0B)); // still level
+
+        // Drop line, clear ELCR, re-edge: held-high must not redeliver after EOI.
+        pic.set_irq_line(3, false);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        pic.set_elcr_level_mask(0, 0);
+        assert!(!pic.master.ir_is_level(3));
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.poll_irq(), None); // edge: need a new rising edge
+        pic.set_irq_line(3, false);
+        pic.set_irq_line(3, true);
+        assert_eq!(pic.poll_irq(), Some(0x0B));
+    }
+
+    /// Spec: DualPic::reset clears ELCR masks (with PciConfig.elcr on machine reset).
+    #[test]
+    fn reset_clears_elcr_level_mask() {
+        let mut pic = DualPic::new();
+        pic.set_elcr_level_mask(0x28, 0x0C);
+        assert_eq!(pic.elcr_level_mask(), (0x28, 0x0C));
+        pic.reset();
+        assert_eq!(pic.elcr_level_mask(), (0, 0));
+        assert!(!pic.master.ir_is_level(3));
+    }
+
+    /// Spec: ELCR is outside the 8259 — ICW1 does not clear the per-IR mask.
+    #[test]
+    fn icw1_does_not_clear_elcr_level_mask() {
+        let mut pic = DualPic::new();
+        pic.set_elcr_level_mask(1 << 5, 1 << 1);
+        init_at_cascade(&mut pic);
+        assert_eq!(pic.elcr_level_mask(), (1 << 5, 1 << 1));
+        assert!(!pic.master.level_triggered);
+        assert!(pic.master.ir_is_level(5));
+        assert!(pic.slave.ir_is_level(1));
+    }
+
+    /// Spec: ICW1.LTIM=1 still forces chip-wide level even when ELCR is 0.
+    #[test]
+    fn icw1_ltim_still_levels_all_irs_with_elcr_zero() {
+        let mut pic = DualPic::new();
+        init_at_cascade_level(&mut pic);
+        assert_eq!(pic.elcr_level_mask(), (0, 0));
+        assert!(pic.master.ir_is_level(0));
+        assert!(pic.master.ir_is_level(7));
+    }
+
+    /// Spec: ELCR slave byte selects level for IRQ8–15 (slave IR0–7).
+    #[test]
+    fn elcr_slave_bit_level_redelivers_irq9() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.set_elcr_level_mask(0, 1 << 1); // IRQ9 = slave IR1
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        assert_eq!(pic.slave.irr & (1 << 1), 1 << 1);
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.poll_irq(), Some(0x71));
     }
 }

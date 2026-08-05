@@ -57,6 +57,8 @@
 //! - Enable bit clear: data-port reads return `0xFFFFFFFF` (open-bus style).
 //! - Byte/word/dword access via `0xCFC` + offset.
 //! - PIIX ELCR `0x4D0`/`0x4D1` byte store/readback (reset `0x00`/`0x00`).
+//!   `MachineBus` syncs writes into `DualPic::set_elcr_level_mask` (per-IR level
+//!   vs edge; OR'd with ICW1.LTIM inside `Pic8259`).
 //!
 //! # Unsupported (explicit)
 //!
@@ -68,7 +70,7 @@
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (Command + Status + PMBASE config only)
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
-//! - ELCR bits driving `DualPic` LTIM / per-IRQ edge vs level (store only)
+//! - PIIX ELCR reserved-bit hardwiring (IRQ0/1/2/8/13 always-edge on real silicon)
 
 use crate::PortDevice;
 
@@ -295,7 +297,7 @@ pub struct PciConfig {
     /// PIIX ACPI at `00:01.3` (identity stub only; `8086:7113`).
     piix_acpi: [u8; 256],
     /// PIIX ISA ELCR bytes at `0x4D0`/`0x4D1` (master/slave); reset `0x00`.
-    /// Store/readback only — not wired to `DualPic` LTIM yet.
+    /// `MachineBus` applies these to `DualPic::set_elcr_level_mask` on write.
     pub elcr: [u8; 2],
 }
 
@@ -796,7 +798,7 @@ impl PortDevice for PciConfig {
             self.write_data(size, port, value);
             return;
         }
-        // Spec: Intel 82371 / OSDev ELCR — store/readback; DualPic LTIM not wired.
+        // Spec: Intel 82371 / OSDev ELCR — store/readback; MachineBus syncs DualPic.
         if port == PIIX_ELCR_MASTER || port == PIIX_ELCR_SLAVE {
             let idx = (port - PIIX_ELCR_MASTER) as usize;
             match size {
@@ -934,7 +936,7 @@ mod tests {
     }
 
     /// Spec: Intel 82371 / OSDev 8259 PIC ELCR — SeaBIOS/PIIX programs
-    /// `0x4D0`/`0x4D1` for edge/level; store/readback stub (LTIM not wired).
+    /// `0x4D0`/`0x4D1` for edge/level; store/readback (DualPic sync on MachineBus).
     #[test]
     fn piix_elcr_store_readback_and_reset() {
         let mut pci = PciConfig::new();
