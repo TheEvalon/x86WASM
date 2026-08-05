@@ -17,9 +17,12 @@
 //! 128-byte register bank with index/data port access, NMI-mask bit tracking
 //! (port `0x70` bit7), status B PIE/AIE/UIE subset, model `tick` that sets
 //! PF/UF (and AF on alarm match), IRQF → IRQ line for MachineBus → DualPic
-//! IRQ8, plus a `tick_second` update cycle (Status A UIP + the full BCD
-//! calendar cascade: seconds → minutes → hours → date of month → month → year
-//! → century `0x32`, with day-of-week 1–7 and Gregorian leap years).
+//! IRQ8, plus a `tick_second` update cycle (Status A UIP + the full calendar
+//! cascade: seconds → minutes → hours → date of month → month → year → century
+//! `0x32`, with day-of-week 1–7 and Gregorian leap years). Status B `DM`
+//! (bit 2) selects BCD (`DM=0`, reset default) or binary (`DM=1`) encoding for
+//! the time/calendar registers during that cascade; 24-hour mode remains the
+//! only supported hour format.
 //! Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
 //! `Machine::nmi_delivery_enabled` / `Machine::inject_nmi` gate CPU `#NMI`.
 //!
@@ -37,10 +40,8 @@
 //!   (`Machine::inject_nmi` + interpreter vector-2 stub covers the pin path)
 //! - Exact crystal divider / UIP pulse width (UIP is set for the duration of
 //!   the modeled update call, or until `end_update_for_test`)
-//! - Binary (non-BCD) data mode (status B `DM`, bit 2) and 12-hour mode
-//!   (status B bit 1): the reset default is BCD / 24-hour and the update cycle
-//!   always interprets the registers that way; the bits are stored but do not
-//!   change the counting format
+//! - 12-hour mode (status B bit 1): reset default is 24-hour; the bit is stored
+//!   but hour counting stays 0–23 (BCD or binary per `DM`)
 //! - ACPI extended CMOS beyond 128 bytes
 //! - Square-wave output (SQWE)
 
@@ -88,11 +89,15 @@ const INDEX_MASK: u8 = 0x7F;
 /// Spec: MC146818 Status Register A bit7.
 pub const STATUS_A_UIP: u8 = 1 << 7;
 
-/// Status B: SET (inhibit update), PIE, AIE, UIE.
+/// Status B: SET (inhibit update), PIE, AIE, UIE, DM (binary data mode).
+///
+/// Spec: MC146818 Status Register B — bit 2 (`DM`) selects calendar encoding:
+/// 0 = BCD (reset default), 1 = binary. See also OSDev CMOS / IBM PC AT RTC.
 pub const STB_SET: u8 = 1 << 7;
 pub const STB_PIE: u8 = 1 << 6;
 pub const STB_AIE: u8 = 1 << 5;
 pub const STB_UIE: u8 = 1 << 4;
+pub const STB_DM: u8 = 1 << 2;
 
 /// Status C: IRQF, PF, AF, UF (bits 3:0 reserved 0).
 pub const STC_IRQF: u8 = 1 << 7;
@@ -215,7 +220,7 @@ impl CmosRtc {
     /// Spec (MC146818): when RS≠0, each period sets PF; when SET=0 each period
     /// also sets UF (update-ended colocated with the quantum — honesty note:
     /// calendar fields are not advanced here; use [`Self::tick_second`] for the
-    /// UIP + BCD calendar update cycle). AIE sets AF when alarm regs match time.
+    /// UIP + calendar update cycle). AIE sets AF when alarm regs match time.
     /// IRQF = (PF∧PIE) ∨ (AF∧AIE) ∨ (UF∧UIE). Returns true on IRQ pin rising edge.
     pub fn tick(&mut self, periods: u64) -> bool {
         if periods == 0 {
@@ -240,11 +245,12 @@ impl CmosRtc {
         !prev && self.irq_line()
     }
 
-    /// One second update cycle: UIP → BCD calendar advance → clear UIP → UF.
+    /// One second update cycle: UIP → calendar advance → clear UIP → UF.
     ///
     /// Spec (MC146818): when Status B SET=0, the chip runs an update cycle each
     /// second; Status A UIP is set while the cycle runs and cleared when done;
     /// UF is set at update-ended. SET=1 inhibits the cycle (no UIP/UF/advance).
+    /// Status B `DM` selects BCD (`0`) or binary (`1`) field encoding.
     /// Returns true on IRQ pin rising edge (e.g. UIE∧UF).
     pub fn tick_second(&mut self) -> bool {
         if !self.begin_update_cycle() {
@@ -252,6 +258,11 @@ impl CmosRtc {
         }
         self.advance_calendar();
         self.finish_update_cycle()
+    }
+
+    /// Spec: MC146818 Status B bit 2 (`DM`) — 1 = binary calendar, 0 = BCD.
+    fn data_mode_binary(&self) -> bool {
+        self.ram[REG_STATUS_B as usize] & STB_DM != 0
     }
 
     /// Observability helper: set UIP without finishing the cycle.
@@ -283,25 +294,28 @@ impl CmosRtc {
         !prev && self.irq_line()
     }
 
-    /// Full BCD time + calendar advance for one update cycle.
+    /// Full time + calendar advance for one update cycle.
     ///
-    /// Spec (MC146818, "Time, Calendar, and Alarm Locations" + update cycle):
-    /// seconds 59→00 carry into minutes, minutes 59→00 into hours, hours 23→00
-    /// into the date of month, the date rolls per month length (with automatic
-    /// leap-year compensation for February), month 12→01 carries into the year,
-    /// and the day-of-week counter advances on every date rollover.
+    /// Spec (MC146818, "Time, Calendar, and Alarm Locations" + update cycle;
+    /// Status B `DM`): seconds 59→00 carry into minutes, minutes 59→00 into
+    /// hours, hours 23→00 into the date of month, the date rolls per month
+    /// length (with automatic leap-year compensation for February), month
+    /// 12→01 carries into the year, and the day-of-week counter advances on
+    /// every date rollover. Field storage is BCD when `DM=0` and binary when
+    /// `DM=1` (hour range remains 0–23; 12-hour mode is unsupported).
     fn advance_calendar(&mut self) {
-        let (sec, carry_min) = bcd_inc_mod(self.ram[REG_SEC as usize], 0x59);
+        let binary = self.data_mode_binary();
+        let (sec, carry_min) = field_inc_mod(self.ram[REG_SEC as usize], 59, binary);
         self.ram[REG_SEC as usize] = sec;
         if !carry_min {
             return;
         }
-        let (min, carry_hour) = bcd_inc_mod(self.ram[REG_MIN as usize], 0x59);
+        let (min, carry_hour) = field_inc_mod(self.ram[REG_MIN as usize], 59, binary);
         self.ram[REG_MIN as usize] = min;
         if !carry_hour {
             return;
         }
-        let (hour, carry_day) = bcd_inc_mod(self.ram[REG_HOUR as usize], 0x23);
+        let (hour, carry_day) = field_inc_mod(self.ram[REG_HOUR as usize], 23, binary);
         self.ram[REG_HOUR as usize] = hour;
         if !carry_day {
             return;
@@ -314,7 +328,8 @@ impl CmosRtc {
     ///
     /// Spec: MC146818 day-of-week register 0x06 counts 1–7 independently of the
     /// date arithmetic. Any other stored value is not a valid weekday and is
-    /// resynchronized to 1 (see [`FALLBACK_MONTH_DAYS`] model note).
+    /// resynchronized to 1 (see [`FALLBACK_MONTH_DAYS`] model note). Encoding
+    /// is the same in BCD and binary modes (values 1–7).
     fn advance_day_of_week(&mut self) {
         let dow = self.ram[REG_DAY_OF_WEEK as usize];
         self.ram[REG_DAY_OF_WEEK as usize] = if (1..DAYS_PER_WEEK).contains(&dow) {
@@ -326,14 +341,22 @@ impl CmosRtc {
 
     /// Date of month, carrying into month/year/century at the end of the month.
     fn advance_date(&mut self) {
-        let days_in_month = month_length(self.ram[REG_MONTH as usize], self.full_year());
-        let next_day = bcd_to_bin(self.ram[REG_DAY_OF_MONTH as usize])
-            .filter(|day| *day < days_in_month)
-            .map(|day| bin_to_bcd(day + 1));
-        match next_day {
-            Some(day) => self.ram[REG_DAY_OF_MONTH as usize] = day,
+        let binary = self.data_mode_binary();
+        let days_in_month = month_length(self.decode_field(REG_MONTH), self.full_year());
+        // Day `0` (reset / invalid) still increments to 1 without a month carry —
+        // same total fallback as the BCD path (see [`FALLBACK_MONTH_DAYS`]).
+        let next = if binary {
+            let day = self.ram[REG_DAY_OF_MONTH as usize];
+            (day < days_in_month).then_some(day + 1)
+        } else {
+            bcd_to_bin(self.ram[REG_DAY_OF_MONTH as usize])
+                .filter(|day| *day < days_in_month)
+                .map(|day| day + 1)
+        };
+        match next {
+            Some(day) => self.ram[REG_DAY_OF_MONTH as usize] = encode_field(day, binary),
             None => {
-                self.ram[REG_DAY_OF_MONTH as usize] = bin_to_bcd(1);
+                self.ram[REG_DAY_OF_MONTH as usize] = encode_field(1, binary);
                 self.advance_month();
             }
         }
@@ -343,15 +366,16 @@ impl CmosRtc {
     ///
     /// An unrecognized month resets to January without a year carry.
     fn advance_month(&mut self) {
-        let month = match bcd_to_bin(self.ram[REG_MONTH as usize]) {
-            Some(month) if (1..MONTHS_PER_YEAR).contains(&month) => month + 1,
-            Some(MONTHS_PER_YEAR) => {
+        let binary = self.data_mode_binary();
+        let month = match self.decode_field(REG_MONTH) {
+            month if (1..MONTHS_PER_YEAR).contains(&month) => month + 1,
+            MONTHS_PER_YEAR => {
                 self.advance_year();
                 1
             }
             _ => 1,
         };
-        self.ram[REG_MONTH as usize] = bin_to_bcd(month);
+        self.ram[REG_MONTH as usize] = encode_field(month, binary);
     }
 
     /// Year 00–99, carrying into the century register (`0x32`).
@@ -359,22 +383,34 @@ impl CmosRtc {
     /// Spec: PC/AT CMOS convention, standardized by the ACPI FADT `CENTURY`
     /// index byte; the base MC146818 has no century register.
     fn advance_year(&mut self) {
-        let (year, carry_century) = bcd_inc_mod(self.ram[REG_YEAR as usize], 0x99);
+        let binary = self.data_mode_binary();
+        let (year, carry_century) = field_inc_mod(self.ram[REG_YEAR as usize], 99, binary);
         self.ram[REG_YEAR as usize] = year;
         if !carry_century {
             return;
         }
-        let century = bcd_to_bin(self.ram[REG_CENTURY as usize]).unwrap_or(0);
-        self.ram[REG_CENTURY as usize] = bin_to_bcd((century + 1) % 100);
+        let century = self.decode_field(REG_CENTURY);
+        self.ram[REG_CENTURY as usize] = encode_field((century + 1) % 100, binary);
     }
 
     /// Full Gregorian year from the century register (`0x32`) and year register.
     ///
-    /// Non-BCD digits in either byte read as 00 (model note, not spec).
+    /// In BCD mode, non-BCD digits in either byte read as 00 (model note, not
+    /// spec). In binary mode the stored bytes are used directly (0–99).
     fn full_year(&self) -> u16 {
-        let century = bcd_to_bin(self.ram[REG_CENTURY as usize]).unwrap_or(0);
-        let year = bcd_to_bin(self.ram[REG_YEAR as usize]).unwrap_or(0);
+        let century = self.decode_field(REG_CENTURY);
+        let year = self.decode_field(REG_YEAR);
         u16::from(century) * 100 + u16::from(year)
+    }
+
+    /// Decode a calendar/time field byte per Status B `DM`.
+    fn decode_field(&self, reg: u8) -> u8 {
+        let raw = self.ram[reg as usize];
+        if self.data_mode_binary() {
+            raw
+        } else {
+            bcd_to_bin(raw).unwrap_or(0)
+        }
     }
 
     fn maybe_set_alarm_flag(&mut self) {
@@ -461,6 +497,35 @@ impl PortDevice for CmosRtc {
     }
 }
 
+/// Increment a calendar field; `max` is the inclusive decimal maximum (59, 23, 99).
+///
+/// Spec: MC146818 Status B `DM` — BCD when `binary=false`, binary when `true`.
+fn field_inc_mod(value: u8, max: u8, binary: bool) -> (u8, bool) {
+    if binary {
+        bin_inc_mod(value, max)
+    } else {
+        bcd_inc_mod(value, bin_to_bcd(max))
+    }
+}
+
+/// Encode a 0–99 calendar value per Status B `DM`.
+fn encode_field(value: u8, binary: bool) -> u8 {
+    if binary {
+        value % 100
+    } else {
+        bin_to_bcd(value)
+    }
+}
+
+/// Increment a binary field; wrap to 0 and report carry when past `max` (inclusive).
+fn bin_inc_mod(value: u8, max: u8) -> (u8, bool) {
+    if value >= max {
+        (0, true)
+    } else {
+        (value.wrapping_add(1), false)
+    }
+}
+
 /// Increment a BCD field; wrap to 0 and report carry when past `max_bcd` (inclusive).
 fn bcd_inc_mod(value: u8, max_bcd: u8) -> (u8, bool) {
     let ones = value & 0x0F;
@@ -496,16 +561,16 @@ fn bin_to_bcd(value: u8) -> u8 {
     ((value / 10) << 4) | (value % 10)
 }
 
-/// Days in `month_bcd` for `full_year`.
+/// Days in binary `month` (1–12) for `full_year`.
 ///
 /// Spec: MC146818 date-of-month counting with automatic leap-year compensation
 /// for February. Unrecognized months use [`FALLBACK_MONTH_DAYS`].
-fn month_length(month_bcd: u8, full_year: u16) -> u8 {
-    match bcd_to_bin(month_bcd) {
-        Some(1 | 3 | 5 | 7 | 8 | 10 | 12) => 31,
-        Some(4 | 6 | 9 | 11) => 30,
-        Some(2) if is_leap_year(full_year) => 29,
-        Some(2) => 28,
+fn month_length(month: u8, full_year: u16) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(full_year) => 29,
+        2 => 28,
         _ => FALLBACK_MONTH_DAYS,
     }
 }
@@ -946,5 +1011,135 @@ mod tests {
         assert!(c.irq_line());
         assert_ne!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
         assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+    }
+
+    // --- Status B DM (binary calendar mode) ---------------------------------
+    // Spec: MC146818 Status Register B bit 2 (`DM`) — 0 = BCD, 1 = binary.
+    // OSDev CMOS / IBM PC AT RTC: when DM=1, time and calendar registers are
+    // stored and updated as binary integers (sec/min 0–59, hour 0–23 in 24h
+    // mode, date/month/year as binary), not packed BCD.
+
+    /// Spec: reset Status B has DM cleared (BCD) and 24-hour bit set (`0x02`).
+    #[test]
+    fn reset_defaults_dm_cleared_bcd_mode() {
+        let c = CmosRtc::new();
+        assert_eq!(c.read_reg(REG_STATUS_B), DEFAULT_STATUS_B);
+        assert_eq!(c.read_reg(REG_STATUS_B) & STB_DM, 0);
+        assert_ne!(c.read_reg(REG_STATUS_B) & 0x02, 0); // 24-hour
+    }
+
+    /// Spec: DM=0 keeps the existing BCD cascade (regression vs binary path).
+    #[test]
+    fn dm_clear_keeps_bcd_sec_min_cascade() {
+        let mut c = CmosRtc::new();
+        assert_eq!(c.read_reg(REG_STATUS_B) & STB_DM, 0);
+        c.write_reg(REG_SEC, 0x58);
+        c.write_reg(REG_MIN, 0x59);
+        c.write_reg(REG_HOUR, 0x10);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 0x59);
+        assert_eq!(c.read_reg(REG_MIN), 0x59);
+        assert_eq!(c.read_reg(REG_HOUR), 0x10);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 0x00);
+        assert_eq!(c.read_reg(REG_MIN), 0x00);
+        assert_eq!(c.read_reg(REG_HOUR), 0x11);
+    }
+
+    /// Spec: DM=1 — seconds/minutes/hours update and store as binary (not BCD).
+    #[test]
+    fn dm_binary_tick_cascades_sec_min_hour() {
+        let mut c = CmosRtc::new();
+        // DEFAULT_STATUS_B already has 24-hour; add DM.
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM);
+        // Binary values that are not valid packed-BCD digits (0x3A = 58).
+        c.write_reg(REG_SEC, 58);
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_HOUR, 23);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 59);
+        assert_eq!(c.read_reg(REG_MIN), 59);
+        assert_eq!(c.read_reg(REG_HOUR), 23);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 0);
+        assert_eq!(c.read_reg(REG_MIN), 0);
+        assert_eq!(c.read_reg(REG_HOUR), 0);
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
+    }
+
+    /// Spec: DM=1 — midnight binary cascade into date/month/year/century/weekday.
+    #[test]
+    fn dm_binary_midnight_carries_calendar() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM);
+        // 2023-12-31 23:59:59 binary → 2024-01-01 00:00:00, weekday 6→7.
+        c.write_reg(REG_CENTURY, 20);
+        c.write_reg(REG_YEAR, 23);
+        c.write_reg(REG_MONTH, 12);
+        c.write_reg(REG_DAY_OF_MONTH, 31);
+        c.write_reg(REG_DAY_OF_WEEK, 6);
+        c.write_reg(REG_HOUR, 23);
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_SEC, 59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_SEC), 0);
+        assert_eq!(c.read_reg(REG_MIN), 0);
+        assert_eq!(c.read_reg(REG_HOUR), 0);
+        assert_eq!(c.read_reg(REG_CENTURY), 20);
+        assert_eq!(c.read_reg(REG_YEAR), 24);
+        assert_eq!(c.read_reg(REG_MONTH), 1);
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 1);
+        assert_eq!(c.read_reg(REG_DAY_OF_WEEK), 7);
+    }
+
+    /// Spec: DM=1 leap-year February uses binary month/day (29 Feb in 2024).
+    #[test]
+    fn dm_binary_february_leap_year() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM);
+        c.write_reg(REG_CENTURY, 20);
+        c.write_reg(REG_YEAR, 24);
+        c.write_reg(REG_MONTH, 2);
+        c.write_reg(REG_DAY_OF_MONTH, 28);
+        c.write_reg(REG_DAY_OF_WEEK, 4);
+        c.write_reg(REG_HOUR, 23);
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_SEC, 59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_MONTH), 2);
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 29);
+        c.write_reg(REG_HOUR, 23);
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_SEC, 59);
+        let _ = c.tick_second();
+        assert_eq!(c.read_reg(REG_MONTH), 3);
+        assert_eq!(c.read_reg(REG_DAY_OF_MONTH), 1);
+    }
+
+    /// Spec: Status B SET inhibits updates even when DM=1.
+    #[test]
+    fn dm_set_inhibits_binary_calendar_advance() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM | STB_SET);
+        c.write_reg(REG_SEC, 58);
+        c.write_reg(REG_MIN, 59);
+        c.write_reg(REG_HOUR, 23);
+        assert!(!c.tick_second());
+        assert_eq!(c.read_reg(REG_SEC), 58);
+        assert_eq!(c.read_reg(REG_MIN), 59);
+        assert_eq!(c.read_reg(REG_HOUR), 23);
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
+        assert_eq!(c.read_reg(REG_STATUS_A) & STATUS_A_UIP, 0);
+    }
+
+    /// Spec: DM does not change IRQF / UIE / status C semantics.
+    #[test]
+    fn dm_uie_tick_second_still_asserts_irq() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM | STB_UIE);
+        assert!(c.tick_second());
+        assert!(c.irq_line());
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_UF, 0);
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_IRQF, 0);
     }
 }
