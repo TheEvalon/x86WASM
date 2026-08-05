@@ -32,7 +32,9 @@
 //! # Unsupported (explicit)
 //!
 //! - Channel 0/1 gate input (assumed always high)
-//! - Mode 3 exact 50% duty cycle (simplified: one rising OUT edge per period)
+//! - Mode 3 sub-CLK / decrement-by-two CE micro-timing (OUT uses an approximate
+//!   N/2 high + N/2 low split; odd N uses the datasheet (N+1)/2 high + (N−1)/2 low
+//!   asymmetry; latched CE during mode 3 is half-phase remaining, not hardware CE)
 //! - Sub-CLK load delay: a count write (modes 0/2/3/4) or GATE trigger
 //!   (modes 1/5) takes effect on the same model clock, not on the following
 //!   CLK as on real hardware (terminal count lands one CLK early); NULL COUNT
@@ -168,8 +170,8 @@ pub struct PitChannel {
     pub out_level: bool,
     /// True while the counting element is advancing (mode/GATE permitting).
     pub counting: bool,
-    /// OUT is low for this model clock; next clock rises. Used by the mode 2/3
-    /// rate pulse and the mode 4/5 one-CLK strobe.
+    /// OUT is low for this model clock; next clock rises. Used by the mode 2
+    /// rate pulse and the mode 4/5 one-CLK strobe (mode 3 uses half-period `ce`).
     out_low_pulse: bool,
     /// Latched count (output latch / OL) after a counter-latch or Read-Back COUNT.
     latched: Option<u16>,
@@ -238,6 +240,18 @@ impl PitChannel {
         } else {
             u32::from(self.count)
         }
+    }
+
+    /// Mode 3 high-half clocks: even N → N/2; odd N → (N+1)/2.
+    ///
+    /// Spec: Intel 8254 Mode 3 — square wave duty approximates 50%.
+    fn mode3_high_clks(&self) -> u32 {
+        self.reload_ce().div_ceil(2)
+    }
+
+    /// Mode 3 low-half clocks: even N → N/2; odd N → (N−1)/2.
+    fn mode3_low_clks(&self) -> u32 {
+        self.reload_ce() / 2
     }
 
     /// Value captured by a counter-latch / Read-Back COUNT command.
@@ -348,7 +362,12 @@ impl PitChannel {
             return;
         }
         // Spec: Intel 8254 — full count load arms CE; 0 encodes 65536.
-        self.ce = self.reload_ce();
+        // Mode 3: CE tracks the current half-period (start high).
+        self.ce = if self.mode == 3 {
+            self.mode3_high_clks()
+        } else {
+            self.reload_ce()
+        };
         self.null_count = false;
         self.out_low_pulse = false;
         // Modes 0/2/3/4: the count write starts counting when GATE is high.
@@ -393,7 +412,11 @@ impl PitChannel {
                 self.counting = true;
             }
             2 | 3 => {
-                self.ce = self.reload_ce();
+                self.ce = if self.mode == 3 {
+                    self.mode3_high_clks()
+                } else {
+                    self.reload_ce()
+                };
                 self.null_count = false;
                 self.out_low_pulse = false;
                 self.out_level = true;
@@ -545,13 +568,34 @@ impl PitChannel {
         !prev && self.out_level
     }
 
-    /// Mode 3 — square wave (simplified): one rising OUT edge per programmed period.
+    /// Mode 3 — square wave: approximate 50% duty via high/low half-periods.
     ///
-    /// Honesty: exact 50% high/low duty is not modeled; we pulse OUT low for one
-    /// model clock at terminal count then high (same rising-edge cadence as mode 2).
+    /// Spec: Intel 8254 Mode 3 — even N → N/2 high + N/2 low; odd N → (N+1)/2 high
+    /// + (N−1)/2 low. Period and BCD/binary reload use [`Self::reload_ce`].
+    ///
+    /// Honesty: not the hardware decrement-by-two CE micro-sequence; `ce` holds
+    /// clocks remaining in the current OUT half.
     fn tick_mode3(&mut self) -> bool {
-        // Reuse mode-2 edge cadence; duty-cycle asymmetry is documented above.
-        self.tick_mode2()
+        let prev = self.out_level;
+        if self.ce > 1 {
+            self.ce -= 1;
+            return !prev && self.out_level;
+        }
+        // End of current half-period: flip OUT and load the other half.
+        if self.out_level {
+            let low = self.mode3_low_clks();
+            if low == 0 {
+                // Degenerate N=1: datasheet discourages; keep OUT high.
+                self.ce = self.mode3_high_clks().max(1);
+            } else {
+                self.out_level = false;
+                self.ce = low;
+            }
+        } else {
+            self.out_level = true;
+            self.ce = self.mode3_high_clks().max(1);
+        }
+        !prev && self.out_level
     }
 
     /// Modes 4 and 5 — strobe: OUT goes low for exactly one CLK at terminal
@@ -799,7 +843,8 @@ mod tests {
         pit.port_write(PIT_CH0_DATA, 1, 0x12); // high
         assert!(pit.channel0().count_loaded);
         assert_eq!(pit.channel0().count, 0x1234);
-        assert_eq!(pit.channel0().ce, 0x1234);
+        // Mode 3: CE starts as high-half clocks (even N → N/2).
+        assert_eq!(pit.channel0().ce, 0x1234 / 2);
         assert!(pit.channel0().counting);
     }
 
@@ -811,6 +856,9 @@ mod tests {
         pit.port_write(PIT_CH0_DATA, 1, 0x78);
         pit.port_write(PIT_CH0_DATA, 1, 0x56);
         assert_eq!(pit.channel0().count, 0x5678);
+        // Mode 3 even N: CE is high-half remaining at load.
+        let ce_at_load = pit.channel0().ce;
+        assert_eq!(ce_at_load, 0x5678_u32 / 2);
 
         // Latch command: SC=0, RW=00 → 0x00 — captures CE while counting.
         pit.port_write(PIT_CONTROL, 1, 0x00);
@@ -819,7 +867,7 @@ mod tests {
 
         let lo = pit.port_read(PIT_CH0_DATA, 1) as u8;
         let hi = pit.port_read(PIT_CH0_DATA, 1) as u8;
-        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), 0x5678);
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), ce_at_load as u16);
     }
 
     /// Spec: Intel 8254 mode 0 — after count N, OUT rises once and stays high.
@@ -858,7 +906,7 @@ mod tests {
         assert!(pit.out_ch0());
     }
 
-    /// Spec: Intel 8254 mode 3 — square wave; one rising OUT edge per period (simplified duty).
+    /// Spec: Intel 8254 mode 3 — square wave; one rising OUT edge per period (~50% duty).
     #[test]
     fn mode3_tick_rising_edge_per_period() {
         let mut pit = Pit8254::new();
@@ -869,6 +917,82 @@ mod tests {
 
         let rising = pit.tick_ch0(5);
         assert!(rising);
+        assert!(pit.out_ch0());
+    }
+
+    /// Spec: Intel 8254 mode 3 — even N: OUT high N/2 then low N/2 (approx 50% duty).
+    /// Observes OUT after each model CLK for N=4 over two periods.
+    #[test]
+    fn mode3_even_count_approx_50_percent_duty() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x36); // ch0 lohi mode 3
+        pit.port_write(PIT_CH0_DATA, 1, 0x04);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 4
+        assert!(pit.out_ch0());
+
+        // Period 1: HHLL; rising edge into period 2 on clock 4.
+        assert!(!pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0()); // end of high half → low
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0());
+        assert!(pit.tick_ch0(1)); // rising at end of low half
+        assert!(pit.out_ch0());
+
+        // Period 2: same HHLL pattern.
+        assert!(!pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0());
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0());
+        assert!(pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+    }
+
+    /// Spec: Intel 8254 mode 3 — odd N: OUT high (N+1)/2 then low (N−1)/2 (asymmetric).
+    #[test]
+    fn mode3_odd_count_asymmetric_duty() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x36);
+        pit.port_write(PIT_CH0_DATA, 1, 0x05);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 5
+        assert!(pit.out_ch0());
+
+        // High for 3, low for 2; rising on clock 5.
+        assert!(!pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+        assert!(!pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0()); // after 3 high → low
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0());
+        assert!(pit.tick_ch0(1)); // rising after 2 low
+        assert!(pit.out_ch0());
+    }
+
+    /// Spec: Intel 8254 mode 3 + BCD — even BCD count uses same N/2 high / N/2 low split
+    /// (period from BCD decades via [`PitChannel::reload_ce`], not binary).
+    #[test]
+    fn mode3_bcd_even_count_approx_50_percent_duty() {
+        let mut pit = Pit8254::new();
+        // ch0, lohi, mode 3, BCD → 0x37; BCD count 0x0004 → 4 clocks.
+        pit.port_write(PIT_CONTROL, 1, 0x37);
+        pit.port_write(PIT_CH0_DATA, 1, 0x04);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        assert!(pit.channel0().bcd);
+        assert_eq!(pit.channel0().ce, 2); // high half of BCD period 4
+        assert!(pit.out_ch0());
+
+        assert!(!pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0());
+        assert!(!pit.tick_ch0(1));
+        assert!(!pit.out_ch0());
+        assert!(pit.tick_ch0(1));
         assert!(pit.out_ch0());
     }
 
