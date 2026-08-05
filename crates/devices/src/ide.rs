@@ -95,8 +95,8 @@
 //! - SeaBIOS / PCI IDE BAR remapping
 //!
 //! Secondary channel (`IdeSecondary`) remaps the same ATA PIO stub — including
-//! READ BUFFER (`0xE4`) sector-buffer PIO — to ports `0x170`–`0x177` / `0x376`
-//! and ISA IRQ15 (see below).
+//! READ BUFFER (`0xE4`) / WRITE BUFFER (`0xE8`) sector-buffer PIO — to ports
+//! `0x170`–`0x177` / `0x376` and ISA IRQ15 (see below).
 
 use crate::PortDevice;
 
@@ -280,7 +280,7 @@ pub const ATA_CMD_TRUSTED_SEND: u8 = 0x5E;
 /// READ BUFFER — 512-byte sector buffer PIO data-in.
 /// Spec: ATA/ATAPI Command Set — READ BUFFER (`0xE4`).
 pub const ATA_CMD_READ_BUFFER: u8 = 0xE4;
-/// WRITE BUFFER — 512-byte sector buffer write; this stub aborts.
+/// WRITE BUFFER — 512-byte sector buffer PIO data-out.
 /// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`).
 pub const ATA_CMD_WRITE_BUFFER: u8 = 0xE8;
 
@@ -1520,19 +1520,19 @@ impl PortDevice for IdePrimary {
 ///
 /// - OSDev ATA PIO Mode — secondary command block `0x170`–`0x177`, control `0x376`;
 ///   secondary channel → ISA IRQ15.
-/// - ATA / ATAPI — same IDENTIFY / READ / WRITE / READ BUFFER (`0xE4`) PIO
-///   semantics as primary (via inner).
+/// - ATA / ATAPI — same IDENTIFY / READ / WRITE / READ BUFFER (`0xE4`) /
+///   WRITE BUFFER (`0xE8`) PIO semantics as primary (via inner).
 /// - Intel 8259A — DualPic IR15 (slave IR7) via MachineBus.
 ///
 /// # Scope
 ///
-/// - Master only; IDENTIFY / READ / WRITE / READ BUFFER / PACKET+IDENTIFY
-///   PACKET ABRT via inner [`IdePrimary`]
+/// - Master only; IDENTIFY / READ / WRITE / READ BUFFER / WRITE BUFFER /
+///   PACKET+IDENTIFY PACKET ABRT via inner [`IdePrimary`]
 /// - IRQ15 when INTRQ ∧ ¬nIEN (`irq_line`)
 ///
 /// # Unsupported
 ///
-/// - Slave drive, DMA, LBA48, PACKET media engine, WRITE BUFFER PIO, PCI BAR remap
+/// - Slave drive, DMA, LBA48, PACKET media engine, PCI BAR remap
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct IdeSecondary {
     /// Shared ATA PIO engine (ports remapped in [`PortDevice`]).
@@ -3583,6 +3583,91 @@ mod tests {
         let mut ide = IdeSecondary::new();
         ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`) on secondary ports
+    /// (`0x170`–`0x177`) accepts 512 bytes via host→device DRQ PIO into the
+    /// device sector buffer (no LBA / no media write); INTRQ → IRQ15.
+    #[test]
+    fn secondary_write_buffer_pio_fills_sector_buffer() {
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        let image_before = ide.inner.image.clone();
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        let st = ide.port_read(IDE_SECONDARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
+        write_sector_words_secondary(&mut ide, 0x55AA, 0xC300);
+        let st = ide.port_read(IDE_SECONDARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        // Spec: WRITE BUFFER updates the sector buffer only — not backing media.
+        assert_eq!(ide.inner.image, image_before);
+    }
+
+    /// Spec: ATA WRITE BUFFER then READ BUFFER on secondary — round-trip via
+    /// shared sector buffer (IRQ15 path).
+    #[test]
+    fn secondary_write_buffer_read_buffer_round_trip() {
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words_secondary(&mut ide, 0x55AA, 0xC300);
+
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_SECONDARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0xC300);
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn secondary_write_buffer_asserts_irq15_on_drq_and_complete_when_nien_clear() {
+        // Spec: ATA / OSDev PIO WRITE — secondary INTRQ → IRQ15 at DRQ and again
+        // at command complete when nIEN=0.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1); // ack DRQ IRQ
+        assert!(!ide.irq_line());
+        write_sector_words_secondary(&mut ide, 0xBEEF, 0);
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn secondary_write_buffer_nien_masks_irq15_on_drq() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ/IRQ15 during WRITE BUFFER DRQ.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn secondary_write_buffer_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing secondary device → status 0.
+        let mut ide = IdeSecondary::new();
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
         assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
         assert!(!ide.irq_line());
