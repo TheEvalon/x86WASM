@@ -1,9 +1,10 @@
 //! Intel 82077AA floppy disk controller — port stub + Specify/Recalibrate/Seek/
 //! Relative Seek/Sense Int/Sense Drive/Version/Configure/LOCK/PERPENDICULAR/DUMPREG/
-//! READ DATA (media + no-media ND) / READ ID (media sector-ID stub + no-media
-//! ND) / READ DELETED DATA (media + no-media ND; no deleted-AM) / WRITE DATA /
-//! WRITE DELETED DATA (media + no-media NW; no deleted-AM) / VERIFY (media
-//! readable-sector stub + no-media ND) / FORMAT TRACK (no-media stubs) + IRQ6.
+//! READ DATA (media + no-media ND) / READ TRACK (media track subset + no-media
+//! ND) / READ ID (media sector-ID stub + no-media ND) / READ DELETED DATA
+//! (media + no-media ND; no deleted-AM) / WRITE DATA / WRITE DELETED DATA
+//! (media + no-media NW; no deleted-AM) / VERIFY (media readable-sector stub +
+//! no-media ND) / FORMAT TRACK (no-media stubs) + IRQ6.
 //!
 //! Classic PC primary FDC at `0x3F0`–`0x3F7`, **excluding** `0x3F6` (owned by
 //! primary IDE alternate status / device control on AT machines).
@@ -32,7 +33,13 @@
 //!   ST1=0 + `last_sector` latch (MT=0 same-head R..=EOT; MT=1 from head 0
 //!   continues onto head 1 after EOT, same cylinder; EOT==R → one sector on
 //!   that head before any MT switch) + IRQ6; else no-media/wrong-N/
-//!   OOR → ST0 IC=01 + ST1 ND + C/H/R/N ENDaddress and IRQ6; READ DELETED DATA
+//!   OOR → ST0 IC=01 + ST1 ND + C/H/R/N ENDaddress and IRQ6; READ TRACK
+//!   (`0x02` with optional MFM in bit6, §5.1.3 / Table 5-1) eight parameter
+//!   bytes then 7-byte result; with media + N=2 + EOT in `1..=18` → ST0 IC=00 +
+//!   ST1=0 + `last_sector` latch of physical sectors **1..=EOT** on C/H
+//!   (documented index-order track subset; EOT=18 → full 1.44MB track; MT/SK
+//!   ignored) + IRQ6; else no-media/wrong-N/OOR → ST0 IC=01 + ST1 ND +
+//!   C/H/R/N ENDaddress and IRQ6; READ DELETED DATA
 //!   (`0x0C` with optional MT/MFM/SK in bits 7:5, §5.1.3 / Table 5-1) same
 //!   8-param / 7-result shape as READ DATA; with or without media → ST0 IC=01
 //!   | ST1 ND | C/H/R/N ENDaddress and IRQ6 (deleted address-mark engine
@@ -138,6 +145,20 @@
 //!   OOR CHS (any sector in the range) → ST0 IC=01 abnormal | H | US, ST1 ND,
 //!   ST2=0. Asserts IRQ6 (cleared on first result byte); EOT→`sc_eot`; MSR RQM
 //!   during params, RQM|DIO during result.
+//! - READ TRACK (`0x02` | MFM): Spec Intel 82077AA §5.1.3 / Table 5-1 —
+//!   command byte lower 5 bits `00010`; optional MFM (`0x40`); MT and SK
+//!   should be 0 (ignored by this stub). Same eight params and 7-byte result
+//!   as READ DATA. Spec reads every data field after IDX without regard to
+//!   logical sector numbers as the transfer start, for **EOT** sectors. Stub:
+//!   with attached 1.44MB media, `N=2`, and `EOT` in `1..=18`, concatenate
+//!   physical sectors **1..=EOT** on command C/H into `last_sector` (EOT=18 →
+//!   full track; smaller EOT → documented subset), arm `dma_read_pending` when
+//!   DOR DMA/IRQ enable is set, result ST0 IC=00 | H | US, ST1=ST2=0,
+//!   C/H/R/N with R=EOT (last physical sector). Full ID-sequence compare that
+//!   can set ST1 ND while still transferring is deferred (success ⇒ ST1=0 when
+//!   every sector is readable). No media / wrong N / OOR EOT or CHS → ST0
+//!   IC=01 | H | US, ST1 ND, ST2=0, C/H/R/N command ENDaddress. Asserts IRQ6
+//!   (cleared on first result byte); EOT→`sc_eot`.
 //! - READ DELETED DATA (`0x0C` | MT/MFM/SK): Spec Intel 82077AA §5.1.3 /
 //!   Table 5-1 — command byte lower 5 bits `01100`; optional MT/MFM/SK; same
 //!   eight params and 7-byte result as READ DATA. Spec seeks sectors with a
@@ -222,17 +243,19 @@
 //!   READ DATA success path latches concatenated sectors (MT=0 R..=EOT;
 //!   MT=1 head0→head1 after EOT) in `last_sector` and arms `dma_read_pending`
 //!   when DOR bit3 is set for MachineBus auto DMA ch2 Write (device→memory;
-//!   buffer length = sector_count×512). WRITE DATA success path accepts the
-//!   same MT=0 / MT=1 range via `latch_write_data` / `latch_write_sector` →
-//!   `last_write` / `write_sector`, or arms `dma_write_pending` for MachineBus
-//!   ISA DMA ch2 Read (memory→device; [`Self::pending_dma_write_byte_count`] =
-//!   sector_count×512) when no pre-latch and DOR bit3 is set (skipped when
-//!   write-protected).
+//!   buffer length = sector_count×512). READ TRACK success path latches
+//!   physical sectors **1..=EOT** on C/H the same way (EOT×512 bytes). WRITE
+//!   DATA success path accepts the same MT=0 / MT=1 range via
+//!   `latch_write_data` / `latch_write_sector` → `last_write` / `write_sector`,
+//!   or arms `dma_write_pending` for MachineBus ISA DMA ch2 Read
+//!   (memory→device; [`Self::pending_dma_write_byte_count`] = sector_count×512)
+//!   when no pre-latch and DOR bit3 is set (skipped when write-protected).
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - READ TRACK and other transfer commands; READ ID full IDAM track scan
+//! - READ TRACK full IDX/ID-sequence ND compare while transferring (stub
+//!   success ST1=0 when sectors readable); READ ID full IDAM track scan
 //!   (sector-ID stub only); READ DELETED DATA deleted address-mark engine
 //!   (media path remains honest ST1 ND); WRITE DELETED DATA deleted
 //!   address-mark / write engine (media path remains honest ST1 NW); FORMAT
@@ -309,6 +332,10 @@ pub const FDC_CMD_WRITE_DELETED_DATA: u8 = 0x09;
 /// READ DATA base opcode (bits 4:0). Spec: Intel 82077AA §5.1.1 / Table 5-1 —
 /// command byte is `MT|MFM|SK|0 0 1 1 0`; match with [`FDC_CMD_OPCODE_MASK`].
 pub const FDC_CMD_READ_DATA: u8 = 0x06;
+/// READ TRACK base opcode (bits 4:0). Spec: Intel 82077AA §5.1.3 / Table 5-1 —
+/// command byte is `0|MFM|0|0 0 0 1 0`; MT and SK should be 0; match with
+/// [`FDC_CMD_OPCODE_MASK`].
+pub const FDC_CMD_READ_TRACK: u8 = 0x02;
 /// READ DELETED DATA base opcode (bits 4:0). Spec: Intel 82077AA §5.1.3 /
 /// Table 5-1 — command byte is `MT|MFM|SK|0 1 1 0 0`; match with
 /// [`FDC_CMD_OPCODE_MASK`].
@@ -328,6 +355,8 @@ pub const FDC_CMD_SCAN_LOW_OR_EQUAL: u8 = 0x19;
 pub const FDC_CMD_SCAN_HIGH_OR_EQUAL: u8 = 0x1D;
 /// Documented READ ID form: MFM|0x0A. Spec: 82077AA Table 5-1.
 pub const FDC_CMD_READ_ID_MFM: u8 = FDC_CMD_MFM | FDC_CMD_READ_ID;
+/// Documented READ TRACK form: MFM|0x02. Spec: 82077AA §5.1.3 / Table 5-1.
+pub const FDC_CMD_READ_TRACK_MFM: u8 = FDC_CMD_MFM | FDC_CMD_READ_TRACK;
 /// READ ID result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA.
 pub const FDC_READ_ID_RESULT_LEN: u8 = 7;
 /// Mask for FDC command opcode bits (excludes MT/MFM/SK). Spec: 82077AA Table 5-1.
@@ -364,6 +393,11 @@ pub const FDC_WRITE_DELETED_DATA_RESULT_LEN: u8 = 7;
 pub const FDC_READ_DATA_PARAM_LEN: u8 = 8;
 /// READ DATA result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA §5.1.1.
 pub const FDC_READ_DATA_RESULT_LEN: u8 = 7;
+/// READ TRACK parameter count after the command byte. Spec: 82077AA §5.1.3 —
+/// same as READ DATA.
+pub const FDC_READ_TRACK_PARAM_LEN: u8 = 8;
+/// READ TRACK result byte count (ST0, ST1, ST2, C, H, R, N). Spec: 82077AA §5.1.3.
+pub const FDC_READ_TRACK_RESULT_LEN: u8 = 7;
 /// READ DELETED DATA parameter count after the command byte. Spec: 82077AA §5.1.3 —
 /// same as READ DATA.
 pub const FDC_READ_DELETED_DATA_PARAM_LEN: u8 = 8;
@@ -497,6 +531,11 @@ enum Phase {
     ReadDataParams { index: u8 },
     /// READ DATA result: 7 bytes (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.1.
     ReadDataResult { index: u8 },
+    /// READ TRACK parameters: 8 bytes (same as READ DATA).
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1.
+    ReadTrackParams { index: u8 },
+    /// READ TRACK result: 7 bytes (ST0, ST1, ST2, C, H, R, N). Spec: §5.1.3.
+    ReadTrackResult { index: u8 },
     /// READ DELETED DATA parameters: 8 bytes (same as READ DATA).
     /// Spec: Intel 82077AA §5.1.3 / Table 5-1.
     ReadDeletedDataParams { index: u8 },
@@ -527,7 +566,7 @@ enum Phase {
 }
 
 /// 82077AA-class FDC port stub with Specify/Recalibrate/Seek/Relative Seek/Sense/Version/
-/// Configure/LOCK/PERPENDICULAR/DUMPREG/READ·READ DELETED·WRITE DATA/FORMAT
+/// Configure/LOCK/PERPENDICULAR/DUMPREG/READ·READ TRACK·READ DELETED·WRITE DATA/FORMAT
 /// TRACK (no-media) + IRQ6.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fdc82077 {
@@ -1077,6 +1116,7 @@ impl Fdc82077 {
                 | Phase::ConfigureParams { .. }
                 | Phase::PerpendicularParam
                 | Phase::ReadDataParams { .. }
+                | Phase::ReadTrackParams { .. }
                 | Phase::ReadDeletedDataParams { .. }
                 | Phase::VerifyParams { .. }
                 | Phase::WriteDataParams { .. }
@@ -1089,6 +1129,7 @@ impl Fdc82077 {
                 | Phase::LockResult
                 | Phase::DumpRegResult { .. }
                 | Phase::ReadDataResult { .. }
+                | Phase::ReadTrackResult { .. }
                 | Phase::ReadDeletedDataResult { .. }
                 | Phase::VerifyResult { .. }
                 | Phase::WriteDataResult { .. }
@@ -1441,6 +1482,92 @@ impl Fdc82077 {
         self.phase = Phase::ReadDataResult { index: 0 };
     }
 
+    /// Begin READ TRACK parameter phase (8 bytes). Spec: Intel 82077AA §5.1.3.
+    fn start_read_track(&mut self) {
+        self.read_params = [0; FDC_READ_TRACK_PARAM_LEN as usize];
+        self.phase = Phase::ReadTrackParams { index: 0 };
+    }
+
+    /// Complete READ TRACK after eight parameters.
+    ///
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1 / §6.1 / §6.2 / IBM 1.44MB geometry:
+    ///
+    /// - With media, `N == 2`, and `EOT` in `1..=18` with every physical sector
+    ///   **1..=EOT** readable on command C/H: concatenate into
+    ///   [`Self::last_sector`]; result ST0 IC=00 (normal) | H | US, ST1=0,
+    ///   ST2=0, C/H/R/N with **R = EOT** (last physical sector of the stub
+    ///   transfer). Documented model: index-order track subset (EOT=18 → full
+    ///   1.44MB track); command R is accepted but not used as the transfer
+    ///   start (spec reads from IDX without regard to logical sector numbers).
+    ///   Full ID-sequence compare that can set ST1 ND mid-transfer is deferred
+    ///   — success ST1=0 when all sectors are readable. MT/SK ignored.
+    /// - Otherwise (no media / wrong N / OOR EOT or CHS): skip execution, ST0
+    ///   IC=01 (abnormal) | H | US, ST1 ND, ST2=0, C/H/R/N command ENDaddress;
+    ///   clear `last_sector`.
+    ///
+    /// Latches EOT into `sc_eot`; asserts IRQ (cleared on first result byte).
+    /// On media success with DOR DMA/IRQ enable, arms [`Self::dma_read_pending`].
+    fn finish_read_track(&mut self) {
+        let head_unit = self.read_params[0];
+        let unit = head_unit & 0x03;
+        let head = (head_unit >> 2) & 0x01;
+        let c = self.read_params[1];
+        let h = self.read_params[2];
+        let r = self.read_params[3];
+        let n = self.read_params[4];
+        let eot = self.read_params[5];
+        // GPL (params[6]) and DTL (params[7]) accepted; MT/SK ignored.
+
+        self.sc_eot = eot;
+        let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
+
+        // Spec: 82077AA §5.1.3 — terminate after EOT sectors from IDX.
+        // Stub: physical sectors 1..=EOT on C/H (1.44MB SPT = 18).
+        if n == FDC_SECTOR_N && (1..=FDC_1440_SECTORS_PER_TRACK).contains(&eot) {
+            let mut buf = Vec::with_capacity(usize::from(eot) * FDC_SECTOR_SIZE);
+            let mut ok = true;
+            for sec in 1..=eot {
+                match self.read_sector(c, h, sec) {
+                    Some(sector) => buf.extend_from_slice(&sector),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && !buf.is_empty() {
+                self.last_sector = Some(buf);
+                self.dma_read_pending = self.dor & FDC_DOR_DMA_IRQ != 0;
+                self.read_result = [
+                    FDC_ST0_IC_NORMAL | st0_head | unit,
+                    0x00,
+                    0x00,
+                    c,
+                    h,
+                    eot,
+                    n,
+                ];
+                self.irq_pending = true;
+                self.phase = Phase::ReadTrackResult { index: 0 };
+                return;
+            }
+        }
+
+        self.last_sector = None;
+        self.dma_read_pending = false;
+        self.read_result = [
+            FDC_ST0_IC_ABNORMAL | st0_head | unit,
+            FDC_ST1_ND,
+            0x00,
+            c,
+            h,
+            r,
+            n,
+        ];
+        self.irq_pending = true;
+        self.phase = Phase::ReadTrackResult { index: 0 };
+    }
+
     /// Begin READ DELETED DATA parameter phase (8 bytes). Spec: Intel 82077AA §5.1.3.
     fn start_read_deleted_data(&mut self) {
         self.read_params = [0; FDC_READ_DELETED_DATA_PARAM_LEN as usize];
@@ -1716,6 +1843,17 @@ impl Fdc82077 {
     fn is_read_data_command(cmd: u8) -> bool {
         // Compare against opcode nibble of the documented MT|MFM|SK|READ form.
         cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_READ_DATA_MT_MFM_SK & FDC_CMD_OPCODE_MASK)
+    }
+
+    /// True if `cmd` is READ TRACK including optional MFM modifier.
+    ///
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1 — opcode bits 4:0 = `00010`;
+    /// bit6 is MFM (`FDC_CMD_MFM`); MT and SK should be 0 (still matched on
+    /// the opcode nibble only).
+    #[inline]
+    fn is_read_track_command(cmd: u8) -> bool {
+        // Compare against opcode nibble of the documented MFM|READ TRACK form.
+        cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_READ_TRACK_MFM & FDC_CMD_OPCODE_MASK)
     }
 
     /// True if `cmd` is READ DELETED DATA including optional MT/MFM/SK modifiers.
@@ -2091,6 +2229,7 @@ impl Fdc82077 {
             | Phase::ConfigureParams { .. }
             | Phase::PerpendicularParam
             | Phase::ReadDataParams { .. }
+            | Phase::ReadTrackParams { .. }
             | Phase::ReadDeletedDataParams { .. }
             | Phase::VerifyParams { .. }
             | Phase::WriteDataParams { .. }
@@ -2141,6 +2280,20 @@ impl Fdc82077 {
                     self.phase = Phase::Command;
                 } else {
                     self.phase = Phase::ReadDataResult { index: index + 1 };
+                }
+                v
+            }
+            Phase::ReadTrackResult { index } => {
+                // Spec: 82077AA / OSDev — IRQ for read/write cleared as the host
+                // begins reading the result phase (first byte).
+                if index == 0 {
+                    self.irq_pending = false;
+                }
+                let v = self.read_result[index as usize];
+                if index + 1 >= FDC_READ_TRACK_RESULT_LEN {
+                    self.phase = Phase::Command;
+                } else {
+                    self.phase = Phase::ReadTrackResult { index: index + 1 };
                 }
                 v
             }
@@ -2271,6 +2424,9 @@ impl Fdc82077 {
                 } else if Self::is_read_data_command(v) {
                     // Spec: Intel 82077AA §5.1.1 — MT/MFM/SK | 00110; eight params.
                     self.start_read_data(v);
+                } else if Self::is_read_track_command(v) {
+                    // Spec: Intel 82077AA §5.1.3 — MFM | 00010; eight params.
+                    self.start_read_track();
                 } else if Self::is_read_deleted_data_command(v) {
                     // Spec: Intel 82077AA §5.1.3 — MT/MFM/SK | 01100; eight params.
                     self.start_read_deleted_data();
@@ -2371,6 +2527,15 @@ impl Fdc82077 {
                     self.phase = Phase::ReadDataParams { index: index + 1 };
                 }
             }
+            Phase::ReadTrackParams { index } => {
+                // Spec: Intel 82077AA §5.1.3 — HD|US, C, H, R, N, EOT, GPL, DTL.
+                self.read_params[index as usize] = v;
+                if index + 1 >= FDC_READ_TRACK_PARAM_LEN {
+                    self.finish_read_track();
+                } else {
+                    self.phase = Phase::ReadTrackParams { index: index + 1 };
+                }
+            }
             Phase::ReadDeletedDataParams { index } => {
                 // Spec: Intel 82077AA §5.1.3 — HD|US, C, H, R, N, EOT, GPL, DTL.
                 self.read_params[index as usize] = v;
@@ -2426,6 +2591,7 @@ impl Fdc82077 {
             | Phase::LockResult
             | Phase::DumpRegResult { .. }
             | Phase::ReadDataResult { .. }
+            | Phase::ReadTrackResult { .. }
             | Phase::ReadDeletedDataResult { .. }
             | Phase::VerifyResult { .. }
             | Phase::WriteDataResult { .. }
@@ -3967,6 +4133,218 @@ mod tests {
         }
         assert_eq!(&result[0..4], &[0x01, 0x02, 0x03, 0x04], "PCN0–PCN3");
         assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA §5.1.3 / Table 5-1 — READ TRACK opcode `0x02` with
+    /// MFM (`0x42`); eight parameter bytes; no media → immediate result phase
+    /// ST0 IC=01 (abnormal) | H | US, ST1 ND, ST2=0, C/H/R/N = ENDaddress from
+    /// command params; IRQ6 when DOR DMA/IRQ enable (not Sense Interrupt).
+    #[test]
+    fn read_track_mfm_no_media_abnormal_result_and_irq() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert!(!f.irq_line());
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_TRACK_MFM));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert_eq!(f.phase, Phase::ReadTrackParams { index: 0 });
+
+        let params = [0x04u8, 0x00, 0x01, 0x01, 0x02, 0x12, 0x1B, 0xFF]; // head1/unit0
+        for (i, &p) in params.iter().enumerate() {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+            if i + 1 < params.len() {
+                assert_eq!(
+                    f.phase,
+                    Phase::ReadTrackParams {
+                        index: (i + 1) as u8
+                    }
+                );
+                assert!(!f.irq_line(), "IRQ only after all 8 params");
+            }
+        }
+
+        assert_eq!(
+            f.port_read(FDC_MSR, 1) as u8,
+            FDC_MSR_RQM | FDC_MSR_DIO,
+            "result phase: RQM|DIO"
+        );
+        assert!(
+            f.irq_line(),
+            "READ TRACK asserts IRQ6 on no-media completion"
+        );
+
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(
+            st0,
+            FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD,
+            "ST0 = IC=01 | H | US"
+        );
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST1_ND,
+            "ST1 ND — no media"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01); // R
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, 0x12, "EOT latched for DUMPREG");
+        assert!(
+            f.last_sector().is_none(),
+            "no-media ND path must not latch sector bytes"
+        );
+    }
+
+    /// Spec: Intel 82077AA §5.1.3 — with media + N=2 + EOT=18, stub reads all
+    /// physical sectors **1..=18** on C/H (full 1.44MB track), ST0 IC=00,
+    /// ST1=ST2=0, ENDaddress R=EOT, IRQ6; latches 18×512 bytes and arms DMA.
+    #[test]
+    fn read_track_with_media_full_track_eot18() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        for sec in 1u8..=FDC_1440_SECTORS_PER_TRACK {
+            let base = (usize::from(sec) - 1) * FDC_SECTOR_SIZE;
+            for (i, b) in img[base..base + FDC_SECTOR_SIZE].iter_mut().enumerate() {
+                *b = sec.wrapping_add(i as u8);
+            }
+        }
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        // READ TRACK MFM: C=0,H=0,R=1,N=2,EOT=18 — full track.
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_TRACK_MFM));
+        for p in [
+            0x00u8,
+            0x00,
+            0x00,
+            0x01,
+            0x02,
+            FDC_1440_SECTORS_PER_TRACK,
+            0x1B,
+            0xFF,
+        ] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line(), "READ TRACK media success asserts IRQ6");
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert!(!f.irq_line(), "first result byte clears IRQ");
+        assert_eq!(st0, FDC_ST0_IC_NORMAL, "ST0 = IC=00 normal");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST1 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_1440_SECTORS_PER_TRACK,
+            "ENDaddress R = EOT (last physical sector)"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+        assert_eq!(f.phase, Phase::Command);
+        assert_eq!(f.sc_eot, FDC_1440_SECTORS_PER_TRACK);
+
+        let expected_len = usize::from(FDC_1440_SECTORS_PER_TRACK) * FDC_SECTOR_SIZE;
+        let sector = f
+            .last_sector()
+            .expect("media READ TRACK latches track bytes")
+            .to_vec();
+        assert_eq!(sector.len(), expected_len);
+        assert_eq!(f.last_sector_byte_count(), expected_len);
+        assert_eq!(f.pending_dma_byte_count(), expected_len);
+        // Spot-check first byte of each physical sector.
+        for sec in 1u8..=FDC_1440_SECTORS_PER_TRACK {
+            let off = (usize::from(sec) - 1) * FDC_SECTOR_SIZE;
+            assert_eq!(sector[off], sec, "sector {sec} first byte");
+        }
+        let pending = f
+            .take_pending_dma_sector()
+            .expect("DOR DMA/IRQ arms one-shot DMA pending");
+        assert_eq!(pending.len(), expected_len);
+    }
+
+    /// Spec: Intel 82077AA §5.1.3 — documented subset: EOT=2 reads physical
+    /// sectors 1..=2 only (not full track); ENDaddress R=2; IRQ6.
+    #[test]
+    fn read_track_with_media_subset_eot2() {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        for (i, b) in img[..FDC_SECTOR_SIZE].iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        for (i, b) in img[FDC_SECTOR_SIZE..2 * FDC_SECTOR_SIZE]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = 0xA0 | ((i & 0x0F) as u8);
+        }
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_TRACK_MFM));
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x02, 0x02, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+
+        assert!(f.irq_line());
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_NORMAL);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // C
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00); // H
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // R = EOT
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x02); // N
+
+        let buf = f.last_sector().expect("subset latch").to_vec();
+        assert_eq!(buf.len(), 2 * FDC_SECTOR_SIZE);
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(buf[FDC_SECTOR_SIZE], 0xA0);
+    }
+
+    /// Spec: Intel 82077AA Table 5-1 — MFM|READ TRACK (`0x42`) accepted.
+    #[test]
+    fn read_track_mfm_opcode_form_accepted() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        assert_eq!(FDC_CMD_READ_TRACK_MFM, 0x42);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_TRACK_MFM));
+        for p in [0x01u8, 0x00, 0x00, 0x01, 0x02, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        let st0 = f.port_read(FDC_FIFO, 1) as u8;
+        assert_eq!(st0 & FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_ABNORMAL);
+        assert_eq!(st0 & 0x03, 0x01, "US from param0");
+        for _ in 0..6 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
+        assert_eq!(f.phase, Phase::Command);
+    }
+
+    /// Spec: Intel 82077AA §5.1.3 / §6.2 — wrong N with media still ND.
+    #[test]
+    fn read_track_with_media_wrong_n_stays_nd() {
+        let img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        let mut f = Fdc82077::with_image(img);
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_READ_TRACK_MFM));
+        // N=1 (256-byte) unsupported by this stub.
+        for p in [0x00u8, 0x00, 0x00, 0x01, 0x01, 0x12, 0x1B, 0xFF] {
+            f.port_write(FDC_FIFO, 1, u32::from(p));
+        }
+        assert!(f.irq_line());
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            FDC_ST0_IC_ABNORMAL,
+            "wrong N → abnormal"
+        );
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        assert!(f.last_sector().is_none());
+        for _ in 0..5 {
+            let _ = f.port_read(FDC_FIFO, 1);
+        }
     }
 
     /// Spec: Intel 82077AA §5.1.1 / Table 5-1 — READ DATA opcode `0x06` with
