@@ -53,7 +53,8 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
+//! - PIT IRQ0 / CMOS IRQ8 / PIRQRC→ISA / device→PIC wiring (callers use
+//!   `set_irq_line`; PIIX PIRQ routing is applied by `PciConfig::sync_pirq_to_pic`)
 
 use crate::PortDevice;
 

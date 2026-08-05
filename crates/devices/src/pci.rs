@@ -61,6 +61,11 @@
 //!   [`PIIX_ELCR_MASTER_WRITABLE`] / [`PIIX_ELCR_SLAVE_WRITABLE`].
 //!   `MachineBus` syncs writes into `DualPic::set_elcr_level_mask` (per-IR level
 //!   vs edge; OR'd with ICW1.LTIM inside `Pic8259`).
+//! - PIIX ISA PIRQRC `0x60`–`0x63`: store/readback (default `0x80` disabled).
+//!   When bit7 is clear, bits 3:0 select the ISA IRQ for that PIRQ; software
+//!   [`PciConfig::set_pirq_line`] / `Machine::assert_pirq` (PCI INTx stub)
+//!   drives `DualPic` via [`PciConfig::sync_pirq_to_pic`]. Not a full PCI
+//!   device interrupt storm (IDE/UHCI engines remain unwired).
 //!
 //! - PIIX IDE BMIDE I/O BAR decode: when Command.IO is set and BMIBA has I/O
 //!   form (bit0), the 16-byte Bus Master IDE register block at
@@ -79,7 +84,8 @@
 //! # Unsupported (explicit)
 //!
 //! - BAR MMIO decode (other than PIIX IDE BMIDE / ACPI PM I/O stubs above), bus
-//!   mastering DMA engine / PRD walks, INTx routing tables
+//!   mastering DMA engine / PRD walks, full PCI device INTx storm (IDE/UHCI);
+//!   PIRQRC software `assert_pirq` stub only
 //! - Host-bridge / PIIX ISA / PIIX USB Command decode side effects;
 //!   PIIX IDE Command side effects beyond BMIDE I/O enable;
 //!   PIIX ACPI Command side effects beyond PM I/O enable
@@ -304,6 +310,13 @@ const _: () = assert!(PCI_PIIX_USB_UHCI_IO_SIZE == 32);
 pub const PCI_PIIX_ISA_PIRQRC_OFFSET: u8 = 0x60;
 /// Default PIRQRC byte value (IRQ routing disabled).
 pub const PCI_PIIX_ISA_PIRQRC_DEFAULT: u8 = 0x80;
+/// PIRQRC bit7: when set, interrupt routing for that PIRQ is disabled.
+/// Spec: Intel 82371SB — PIRQRC Route Enable (active-low disable).
+pub const PCI_PIIX_ISA_PIRQRC_DISABLE: u8 = 0x80;
+/// PIRQRC bits 3:0 — ISA IRQ select field.
+/// Spec: Intel 82371SB — IRQ Routing.
+pub const PCI_PIIX_ISA_PIRQRC_IRQ_MASK: u8 = 0x0F;
+const _: () = assert!(PCI_PIIX_ISA_PIRQRC_DEFAULT == PCI_PIIX_ISA_PIRQRC_DISABLE);
 /// PIIX IDE IDE Timing Register (IDETIM) config offset. Spec: Intel 82371SB — word at `0x40`.
 pub const PCI_PIIX_IDE_IDETIM_OFFSET: u8 = 0x40;
 /// PIIX ACPI PMBASE config offset (I/O BAR). Spec: Intel 82371AB — dword at `0x40`.
@@ -397,6 +410,13 @@ pub struct PciConfig {
     /// Spec: UHCI 1.1 — USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC.
     /// Store/readback only; no schedule/DMA/port engine. Reset all zeros.
     pub uhci_io: [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    /// Software PIRQA–PIRQD line levels (PCI INTx stub for tests).
+    /// Spec: Intel 82371SB — PIRQ# pins; devices assert via `set_pirq_line`.
+    pub pirq_asserted: [bool; 4],
+    /// ISA IRQ bitmask last driven onto DualPic by [`Self::sync_pirq_to_pic`].
+    /// Used to deassert IRQs that lose their last PIRQ route without touching
+    /// unrelated PIC lines.
+    pub pirq_pic_driven: u16,
 }
 
 /// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
@@ -408,6 +428,21 @@ pub fn sanitize_piix_elcr(master: u8, slave: u8) -> (u8, u8) {
         master & PIIX_ELCR_MASTER_WRITABLE,
         slave & PIIX_ELCR_SLAVE_WRITABLE,
     )
+}
+
+/// Decode a PIRQRC byte to a routed ISA IRQ, or `None` when disabled/invalid.
+///
+/// Spec: Intel 82371SB — bit7 set disables routing; bits 3:0 select IRQ.
+/// Valid routes: 3, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15 (not 0/1/2/8/13).
+#[inline]
+pub fn pirqrc_routed_irq(byte: u8) -> Option<u8> {
+    if byte & PCI_PIIX_ISA_PIRQRC_DISABLE != 0 {
+        return None;
+    }
+    match byte & PCI_PIIX_ISA_PIRQRC_IRQ_MASK {
+        irq @ (3 | 4 | 5 | 6 | 7 | 9 | 10 | 11 | 12 | 14 | 15) => Some(irq),
+        _ => None,
+    }
 }
 
 impl Default for PciConfig {
@@ -433,6 +468,9 @@ impl PciConfig {
             acpi_pm_io: [0; PCI_PIIX_ACPI_PM_IO_SIZE as usize],
             // Spec: UHCI — host-controller I/O registers power-on / reset to 0.
             uhci_io: [0; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+            // Spec: Intel 82371SB — PIRQ# lines idle at reset; routes disabled (0x80).
+            pirq_asserted: [false; 4],
+            pirq_pic_driven: 0,
         }
     }
 
@@ -564,6 +602,71 @@ impl PciConfig {
 
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// PIRQRC byte for PIRQ `pirq` (0=A … 3=D) from ISA config `0x60`–`0x63`.
+    ///
+    /// Spec: Intel 82371SB — PIRQRC[A:D].
+    pub fn pirqrc_byte(&self, pirq: u8) -> u8 {
+        if pirq >= 4 {
+            return PCI_PIIX_ISA_PIRQRC_DEFAULT;
+        }
+        self.piix_isa[PCI_PIIX_ISA_PIRQRC_OFFSET as usize + usize::from(pirq)]
+    }
+
+    /// Assert/deassert software PIRQA–PIRQD (PCI INTx stub). Does not touch PIC
+    /// until [`Self::sync_pirq_to_pic`].
+    ///
+    /// Spec: Intel 82371SB — PIRQ# pin level; callers route via PIRQRC.
+    pub fn set_pirq_line(&mut self, pirq: u8, high: bool) {
+        if pirq < 4 {
+            self.pirq_asserted[usize::from(pirq)] = high;
+        }
+    }
+
+    /// Current software PIRQ line level (`pirq` 0=A … 3=D).
+    pub fn pirq_line(&self, pirq: u8) -> bool {
+        pirq < 4 && self.pirq_asserted[usize::from(pirq)]
+    }
+
+    /// True when a CONFIG_DATA access at `port`/`size` overlaps PIRQRC `0x60`–`0x63`
+    /// on the currently latched Type-1 address (PIIX ISA `00:01.0`).
+    pub fn pirqrc_config_write_overlaps(&self, port: u16, size: u8) -> bool {
+        if !matches!(port, PCI_CONFIG_DATA..=0xCFF) || !self.enable() {
+            return false;
+        }
+        if self.bus() != 0 || self.device() != 1 || self.function() != 0 {
+            return false;
+        }
+        let start = u16::from(self.reg_offset()) + (port - PCI_CONFIG_DATA);
+        let end = start.saturating_add(u16::from(size.max(1)));
+        start < 0x64 && end > 0x60
+    }
+
+    /// Drive DualPic ISA IRQ lines from latched PIRQ levels through PIRQRC routes.
+    ///
+    /// Spec: Intel 82371SB — when PIRQRC bit7 is clear, an asserted PIRQ# connects
+    /// to the selected ISA IRQ. Multiple PIRQs OR onto the same IRQ. Disabled or
+    /// invalid routes do not drive. Only IRQs in the previous or new driven mask
+    /// are updated (avoids stomping unrelated device lines).
+    pub fn sync_pirq_to_pic(&mut self, pic: &mut crate::DualPic) {
+        let mut new_mask = 0u16;
+        for pirq in 0..4u8 {
+            if !self.pirq_asserted[usize::from(pirq)] {
+                continue;
+            }
+            if let Some(irq) = pirqrc_routed_irq(self.pirqrc_byte(pirq)) {
+                new_mask |= 1u16 << irq;
+            }
+        }
+        let changed = self.pirq_pic_driven | new_mask;
+        for irq in 0..16u8 {
+            let bit = 1u16 << irq;
+            if changed & bit != 0 {
+                pic.set_irq_line(irq, new_mask & bit != 0);
+            }
+        }
+        self.pirq_pic_driven = new_mask;
     }
 
     /// True if this device owns the I/O port.
@@ -2740,7 +2843,7 @@ mod tests {
     }
 
     /// Spec: Intel 82371SB — PIRQRC[A:D] at ISA config `0x60`–`0x63` default
-    /// `0x80`; store/readback (routing not wired to PIC yet).
+    /// `0x80`; store/readback.
     #[test]
     fn piix_isa_pirqrc_default_and_store_readback() {
         let mut pci = PciConfig::new();
@@ -2764,6 +2867,109 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 1, 0x05);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 1) as u8, 0x05);
+    }
+
+    /// Spec: Intel 82371SB — PIRQRC bit7 set disables IRQ routing.
+    #[test]
+    fn pirqrc_routed_irq_disabled_when_bit7_set() {
+        assert_eq!(pirqrc_routed_irq(0x80), None);
+        assert_eq!(pirqrc_routed_irq(0x85), None);
+        assert_eq!(pirqrc_routed_irq(PCI_PIIX_ISA_PIRQRC_DEFAULT), None);
+    }
+
+    /// Spec: Intel 82371SB — bit7 clear + bits3:0 select a valid ISA IRQ.
+    #[test]
+    fn pirqrc_routed_irq_selects_valid_isa_irq() {
+        assert_eq!(pirqrc_routed_irq(0x03), Some(3));
+        assert_eq!(pirqrc_routed_irq(0x05), Some(5));
+        assert_eq!(pirqrc_routed_irq(0x0B), Some(11));
+        assert_eq!(pirqrc_routed_irq(0x0E), Some(14));
+        // Reserved / invalid selects: no route.
+        assert_eq!(pirqrc_routed_irq(0x00), None);
+        assert_eq!(pirqrc_routed_irq(0x02), None);
+        assert_eq!(pirqrc_routed_irq(0x08), None);
+        assert_eq!(pirqrc_routed_irq(0x0D), None);
+    }
+
+    /// Spec: Intel 82371SB — asserted PIRQ with disable bit set does not drive PIC.
+    #[test]
+    fn assert_pirq_disabled_does_not_assert_pic() {
+        use crate::DualPic;
+
+        let mut pci = PciConfig::new();
+        let mut pic = DualPic::new();
+        // Default PIRQRC = 0x80 (disabled).
+        pci.set_pirq_line(0, true);
+        pci.sync_pirq_to_pic(&mut pic);
+        assert_eq!(pci.pirq_pic_driven, 0);
+        assert_eq!(pic.poll_irq(), None);
+    }
+
+    /// Spec: Intel 82371SB — unmasked PIRQRC routes asserted PIRQ to ISA IRQ.
+    #[test]
+    fn assert_pirq_routes_to_selected_isa_irq() {
+        use crate::{DualPic, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA};
+
+        let mut pci = PciConfig::new();
+        let mut pic = DualPic::new();
+        // Classic AT cascade + unmask IRQ5 (master IR5).
+        pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xDF); // unmask IR5
+
+        // PIRQA → IRQ5 (bit7 clear).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_PIIX_ISA_PIRQRC_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 1, 0x05);
+        assert_eq!(pirqrc_routed_irq(pci.pirqrc_byte(0)), Some(5));
+
+        pci.set_pirq_line(0, true);
+        pci.sync_pirq_to_pic(&mut pic);
+        assert_eq!(pic.poll_irq(), Some(0x0D)); // vector base 0x08 + IR5
+    }
+
+    /// Spec: Intel 82371SB — writing disable while PIRQ held drops the ISA line.
+    #[test]
+    fn pirqrc_disable_while_asserted_drops_pic_line() {
+        use crate::{DualPic, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA};
+
+        let mut pci = PciConfig::new();
+        let mut pic = DualPic::new();
+        pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xDF);
+
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_PIIX_ISA_PIRQRC_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 1, 0x05);
+        pci.set_pirq_line(0, true);
+        pci.sync_pirq_to_pic(&mut pic);
+        assert_eq!(pic.poll_irq(), Some(0x0D));
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20); // EOI
+
+        // Disable route while still asserted.
+        pci.port_write(PCI_CONFIG_DATA, 1, 0x80);
+        pci.sync_pirq_to_pic(&mut pic);
+        assert_eq!(pci.pirq_pic_driven, 0);
+        assert_eq!(pic.poll_irq(), None);
     }
 
     /// Spec: Intel 82371SB — PIIX USB UHCI BAR0 at PCI config `0x20` is an I/O

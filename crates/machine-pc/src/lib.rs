@@ -341,6 +341,23 @@ impl Machine {
         self.pic.set_irq_line(12, self.kbd.irq12_line());
     }
 
+    /// Assert/deassert a software PIRQA–PIRQD line and sync through PIRQRC to DualPic.
+    ///
+    /// Spec: Intel 82371SB — PIRQ# → ISA IRQ selected by PIRQRC[A:D] when bit7
+    /// is clear. PCI INTx stub for tests (not a full device interrupt storm).
+    /// `pirq` is 0=A … 3=D.
+    pub fn assert_pirq(&mut self, pirq: u8, high: bool) {
+        self.pci.set_pirq_line(pirq, high);
+        self.pci.sync_pirq_to_pic(&mut self.pic);
+    }
+
+    /// Re-apply latched PIRQ levels through current PIRQRC routes onto DualPic.
+    ///
+    /// Spec: Intel 82371SB — call after PIRQRC config writes while a PIRQ is held.
+    pub fn sync_pirq_to_pic(&mut self) {
+        self.pci.sync_pirq_to_pic(&mut self.pic);
+    }
+
     /// Whether the platform NMI delivery path is unmasked.
     ///
     /// Spec: IBM PC/AT — CMOS index port `0x70` bit7 = 1 disables NMI.
@@ -592,12 +609,19 @@ impl MachineBus<'_> {
             || self.pci.uhci_owns_port(port)
             || PciConfig::owns_port(port)
         {
+            // Spec: Intel 82371SB — detect PIRQRC CONFIG_DATA overlap before write
+            // so the latched Type-1 address still describes the target register.
+            let pirqrc_touch = self.pci.pirqrc_config_write_overlaps(port, size);
             self.pci.port_write(port, size, value);
             // Spec: Intel 82371 / OSDev ELCR — 0x4D0/0x4D1 bits select DualPic
             // per-IR level vs edge (SeaBIOS/PIIX); OR'd with ICW1.LTIM in Pic8259.
             if port == PIIX_ELCR_MASTER || port == PIIX_ELCR_SLAVE {
                 let [master, slave] = self.pci.elcr;
                 self.pic.set_elcr_level_mask(master, slave);
+            }
+            // Spec: Intel 82371SB — PIRQRC route change while PIRQ held updates PIC.
+            if pirqrc_touch {
+                self.pci.sync_pirq_to_pic(self.pic);
             }
             return;
         }
@@ -716,13 +740,13 @@ mod tests {
         FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA, FDC_DOR, FDC_DOR_DMA_IRQ,
         FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, FDC_SECTOR_SIZE,
         FDC_ST0_SEEK_END, FDC_ST3_RESERVED_BIT3, FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042,
-        I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD,
-        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE,
-        PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA,
-        PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
-        STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
-        VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
-        VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
+        I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
+        PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+        PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
+        PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B,
+        REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
+        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
+        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -1902,6 +1926,47 @@ mod tests {
         m.pic.set_irq_line(0, true);
         assert_eq!(m.pic.poll_irq(), Some(0x08));
         m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(m.pic.poll_irq(), None);
+    }
+
+    /// Spec: Intel 82371SB PIRQRC — disabled (bit7) `assert_pirq` does not raise DualPic.
+    #[test]
+    fn machine_assert_pirq_disabled_does_not_route() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        // Unmask IRQ5; default PIRQRC[A]=0x80 (disabled).
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xDF);
+        m.assert_pirq(0, true);
+        assert_eq!(m.pic.poll_irq(), None);
+        assert_eq!(m.pci.pirq_pic_driven, 0);
+    }
+
+    /// Spec: Intel 82371SB PIRQRC — unmasked route + `assert_pirq` → DualPic ISA IRQ.
+    #[test]
+    fn machine_assert_pirq_routes_to_isa_irq() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xDF); // unmask IRQ5
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 1, 0, PCI_PIIX_ISA_PIRQRC_OFFSET, true),
+            )
+            .unwrap();
+            bus.port_out_u8(PCI_CONFIG_DATA, 0x05).unwrap(); // PIRQA → IRQ5
+            assert_eq!(bus.port_in_u8(PCI_CONFIG_DATA).unwrap(), 0x05);
+        }
+        m.assert_pirq(0, true);
+        assert_eq!(m.pic.poll_irq(), Some(0x0D));
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+
+        // Disable via MachineBus CONFIG_DATA while still asserted → line drops.
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PCI_CONFIG_DATA, 0x80).unwrap();
+        }
+        assert_eq!(m.pci.pirq_pic_driven, 0);
         assert_eq!(m.pic.poll_irq(), None);
     }
 
