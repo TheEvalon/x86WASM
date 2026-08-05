@@ -16,7 +16,8 @@ use devices::{
     CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, IdePrimary, IdeSecondary,
     PciConfig, Pit8254, PortDevice, Serial16550, VgaText, CMOS_DATA, CMOS_INDEX, FDC_DOR_DMA_IRQ,
     I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
-    PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
+    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
+    PIT_CONTROL, PORT_SYSTEM_CONTROL,
 };
 use firmware_interface::RomImage;
 use ports::PortBus;
@@ -580,6 +581,12 @@ impl MachineBus<'_> {
         }
         if PciConfig::owns_port(port) {
             self.pci.port_write(port, size, value);
+            // Spec: Intel 82371 / OSDev ELCR — 0x4D0/0x4D1 bits select DualPic
+            // per-IR level vs edge (SeaBIOS/PIIX); OR'd with ICW1.LTIM in Pic8259.
+            if port == PIIX_ELCR_MASTER || port == PIIX_ELCR_SLAVE {
+                let [master, slave] = self.pci.elcr;
+                self.pic.set_elcr_level_mask(master, slave);
+            }
             return;
         }
         if self.vga.owns_port(port) {
@@ -698,11 +705,12 @@ mod tests {
         FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM, FDC_SECTOR_SIZE,
         FDC_ST0_SEEK_END, FDC_ST3_RESERVED_BIT3, FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, I8042,
         I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PIC_MASTER_CMD,
-        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL,
-        PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL, REG_STATUS_A,
-        REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE,
-        STC_IRQF, STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
-        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
+        PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE,
+        PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA,
+        PORT_SYSTEM_CONTROL, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
+        STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
+        VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
+        VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -1812,6 +1820,35 @@ mod tests {
         assert_eq!(m.vga.dac_ram[0x10], [0x3F, 0x2A, 0x15]);
         m.reset();
         assert_eq!(m.vga.dac_ram[0x10], [0x00, 0x00, 0x00]);
+    }
+
+    /// Spec: Intel 82371 / OSDev ELCR — MachineBus `0x4D0`/`0x4D1` writes update
+    /// DualPic per-IR level masks; level IRQ redelivers while held after EOI.
+    #[test]
+    fn machine_bus_elcr_wires_dual_pic_level_select() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        // Remask IRQ0; unmask IRQ3 for this test.
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xF7);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PIIX_ELCR_MASTER, 1 << 3).unwrap();
+            bus.port_out_u8(PIIX_ELCR_SLAVE, 0).unwrap();
+            assert_eq!(bus.port_in_u8(PIIX_ELCR_MASTER).unwrap(), 1 << 3);
+        }
+        assert_eq!(m.pci.elcr, [1 << 3, 0]);
+        assert_eq!(m.pic.elcr_level_mask(), (1 << 3, 0));
+        assert!(m.pic.master.ir_is_level(3));
+
+        m.pic.set_irq_line(3, true);
+        assert_eq!(m.pic.poll_irq(), Some(0x0B));
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        // Level still high via ELCR → redelivery without a new edge.
+        assert_eq!(m.pic.poll_irq(), Some(0x0B));
+
+        m.reset();
+        assert_eq!(m.pci.elcr, [0, 0]);
+        assert_eq!(m.pic.elcr_level_mask(), (0, 0));
     }
 
     /// Spec: PCI Local Bus Mechanism #1 — host bridge vendor/device via MachineBus.
