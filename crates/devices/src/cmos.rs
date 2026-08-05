@@ -24,9 +24,11 @@
 //! (bit 2) selects BCD (`DM=0`, reset default) or binary (`DM=1`) encoding for
 //! the time/calendar registers during that cascade; Status B `24/12` (bit 1)
 //! selects 24-hour hours `0–23` (set; reset default) or 12-hour hours `1–12`
-//! with AM/PM in bit7 of the hours byte (clear). Alarm registers (`0x01` /
-//! `0x03` / `0x05`) match by byte equality against current time (works for
-//! BCD, binary, and 12-hour AM/PM bit7); values `C0h`–`FFh` are don't-care.
+//! with AM/PM in bit7 of the hours byte (clear); toggling that bit converts
+//! the current hours and hours-alarm encodings (don't-care alarm `C0h`–`FFh`
+//! unchanged). Alarm registers (`0x01` / `0x03` / `0x05`) match by byte
+//! equality against current time (works for BCD, binary, and 12-hour AM/PM
+//! bit7); values `C0h`–`FFh` are don't-care.
 //! AF sets on match regardless of AIE; AIE gates IRQF only.
 //! Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
 //! `Machine::nmi_delivery_enabled` / `Machine::inject_nmi` gate CPU `#NMI`.
@@ -37,8 +39,11 @@
 //! `0x00` / weekday `0x00` are reachable but are not valid dates. The cascade is
 //! total and never panics or wraps arithmetically: see [`FALLBACK_MONTH_DAYS`]
 //! for the documented fallback month length and resynchronization rules.
-//! Changing `24/12` without reinitializing the hour register is undefined on
-//! real silicon; this model increments whatever encoding the current bit selects.
+//! Silicon treats changing `24/12` without reinitializing the hour locations as
+//! undefined; this model **converts** the current hours and hours-alarm bytes
+//! between 24-hour (`0–23`) and 12-hour (`1–12` + AM/PM bit7) encodings when
+//! Status B bit 1 flips (respecting `DM` BCD/binary; alarm don't-care `C0h`–`FFh`
+//! is left unchanged). Cascade increments use the format selected by the bit.
 //!
 //! # Unsupported (explicit)
 //!
@@ -47,7 +52,6 @@
 //!   (`Machine::inject_nmi` + interpreter vector-2 stub covers the pin path)
 //! - Exact crystal divider / UIP pulse timing (approximate
 //!   [`UIP_WINDOW_PERIODS`]-tick hold after `tick_second` only; not µs-accurate)
-//! - Automatic hour-register conversion when Status B `24/12` is toggled
 //! - ACPI extended CMOS beyond 128 bytes
 //! - Square-wave output (SQWE)
 
@@ -223,10 +227,29 @@ impl CmosRtc {
         if idx == REG_STATUS_C {
             return;
         }
-        self.ram[idx as usize] = Self::mask_status_a_write(idx, value, self.ram[idx as usize]);
         if idx == REG_STATUS_B {
+            let old_b = self.ram[REG_STATUS_B as usize];
+            self.ram[REG_STATUS_B as usize] = value;
+            // Spec: MC146818 — "The 24/12 bit cannot be changed without
+            // reinitializing the hour locations." Silicon leaves conversion to
+            // software; this model converts hours + hours-alarm so a Status B
+            // toggle keeps a coherent wall time (DM BCD/binary respected;
+            // alarm don't-care C0h–FFh unchanged).
+            if (old_b ^ value) & STB_24_12 != 0 {
+                let binary = value & STB_DM != 0;
+                let to_24 = value & STB_24_12 != 0;
+                self.ram[REG_HOUR as usize] =
+                    convert_hour_format(self.ram[REG_HOUR as usize], binary, to_24);
+                let alarm = self.ram[REG_HOUR_ALARM as usize];
+                if alarm < 0xC0 {
+                    self.ram[REG_HOUR_ALARM as usize] =
+                        convert_hour_format(alarm, binary, to_24);
+                }
+            }
             self.recompute_irqf();
+            return;
         }
+        self.ram[idx as usize] = Self::mask_status_a_write(idx, value, self.ram[idx as usize]);
     }
 
     /// Spec: Status A UIP (bit7) is read-only; guest writes must not sticky-set it.
@@ -613,6 +636,57 @@ fn hour_inc_12(value: u8, binary: bool) -> (u8, bool) {
 /// Spec: MC146818 — alarm register matches current field, or is don't-care (C0h–FFh).
 fn alarm_field_matches(alarm: u8, current: u8) -> bool {
     alarm >= 0xC0 || alarm == current
+}
+
+/// Convert a hours (or hours-alarm) byte between 24-hour and 12-hour encodings.
+///
+/// Spec: MC146818 "Time, Calendar, and Alarm Locations" — 24h `0–23`; 12h
+/// `1–12` with bit7 = PM. Mapping (model choice when Status B `24/12` toggles):
+/// `0 ↔ 12 AM`, `1–11 ↔ 1–11 AM`, `12 ↔ 12 PM`, `13–23 ↔ 1–11 PM`.
+/// `DM` selects BCD vs binary for the numeric field. Unrecognized values are
+/// returned unchanged.
+fn convert_hour_format(value: u8, binary: bool, to_24: bool) -> u8 {
+    if to_24 {
+        let pm = value & HOUR_PM != 0;
+        let hour_bits = value & !HOUR_PM;
+        let Some(h) = decode_hour_field(hour_bits, binary) else {
+            return value;
+        };
+        if !(1..=12).contains(&h) {
+            return value;
+        }
+        let h24 = match (h, pm) {
+            (12, false) => 0,
+            (12, true) => 12,
+            (h, false) => h,
+            (h, true) => h + 12,
+        };
+        encode_field(h24, binary)
+    } else {
+        let Some(h) = decode_hour_field(value, binary) else {
+            return value;
+        };
+        if h > 23 {
+            return value;
+        }
+        let (h12, pm) = match h {
+            0 => (12, false),
+            1..=11 => (h, false),
+            12 => (12, true),
+            13..=23 => (h - 12, true),
+            24.. => return value,
+        };
+        encode_field(h12, binary) | if pm { HOUR_PM } else { 0 }
+    }
+}
+
+/// Decode the numeric portion of an hour byte per Status B `DM`.
+fn decode_hour_field(value: u8, binary: bool) -> Option<u8> {
+    if binary {
+        Some(value)
+    } else {
+        bcd_to_bin(value)
+    }
 }
 
 /// Increment a calendar field; `max` is the inclusive decimal maximum (59, 23, 99).
@@ -1599,5 +1673,73 @@ mod tests {
         assert_eq!(c.read_reg(REG_HOUR), 0x00);
         assert_eq!(c.read_reg(REG_MIN), 0x00);
         assert_eq!(c.read_reg(REG_SEC), 0x00);
+    }
+
+    // --- Status B 24/12 toggle: auto hour (+ alarm) conversion ---------------
+    // Spec: MC146818 hour encodings (24h 0–23 vs 12h 1–12 + bit7 PM) under DM.
+    // Silicon requires reinitializing hours after changing 24/12; this model
+    // converts current hour and hour-alarm so guests can toggle the bit safely.
+
+    /// Spec encodings: 24h BCD → 12h BCD (0→12 AM, 13→1 PM, 12→12 PM).
+    #[test]
+    fn status_b_24_to_12_converts_bcd_hour_and_alarm() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_HOUR, 0x13); // 13:00 24h BCD
+        c.write_reg(REG_HOUR_ALARM, 0x00); // midnight alarm
+        // Clear 24/12 → 12-hour; DM remains BCD.
+        c.write_reg(REG_STATUS_B, 0x00);
+        assert_eq!(c.read_reg(REG_STATUS_B) & STB_24_12, 0);
+        assert_eq!(c.read_reg(REG_HOUR), HOUR_PM | 0x01); // 1 PM
+        assert_eq!(c.read_reg(REG_HOUR_ALARM), 0x12); // 12 AM
+    }
+
+    /// Spec encodings: 12h BCD → 24h BCD (1 PM → 13, 12 AM → 0).
+    #[test]
+    fn status_b_12_to_24_converts_bcd_hour_and_alarm() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, 0x00); // enter 12h first (also converts zeros)
+        c.write_reg(REG_HOUR, HOUR_PM | 0x01); // 1 PM
+        c.write_reg(REG_HOUR_ALARM, 0x12); // 12 AM
+        c.write_reg(REG_STATUS_B, STB_24_12); // back to 24h
+        assert_ne!(c.read_reg(REG_STATUS_B) & STB_24_12, 0);
+        assert_eq!(c.read_reg(REG_HOUR), 0x13);
+        assert_eq!(c.read_reg(REG_HOUR_ALARM), 0x00);
+    }
+
+    /// Spec: DM=1 binary hour bytes convert both directions with AM/PM bit7.
+    #[test]
+    fn status_b_24_12_toggle_converts_binary_dm_hours() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM);
+        c.write_reg(REG_HOUR, 0); // midnight binary
+        c.write_reg(REG_HOUR_ALARM, 23); // 11 PM
+        c.write_reg(REG_STATUS_B, STB_DM); // 12h + binary
+        assert_eq!(c.read_reg(REG_HOUR), 12); // 12 AM
+        assert_eq!(c.read_reg(REG_HOUR_ALARM), HOUR_PM | 11); // 11 PM
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM); // 24h + binary
+        assert_eq!(c.read_reg(REG_HOUR), 0);
+        assert_eq!(c.read_reg(REG_HOUR_ALARM), 23);
+    }
+
+    /// Spec: MC146818 alarm don't-care C0h–FFh is left alone on 24/12 toggle.
+    #[test]
+    fn status_b_24_12_toggle_preserves_alarm_dont_care() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_HOUR, 0x12); // noon 24h BCD
+        c.write_reg(REG_HOUR_ALARM, 0xC0);
+        c.write_reg(REG_STATUS_B, 0x00);
+        assert_eq!(c.read_reg(REG_HOUR), HOUR_PM | 0x12); // 12 PM
+        assert_eq!(c.read_reg(REG_HOUR_ALARM), 0xC0);
+    }
+
+    /// Spec: rewriting Status B without flipping 24/12 must not rewrite hours.
+    #[test]
+    fn status_b_write_without_24_12_flip_leaves_hours() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_HOUR, 0x10);
+        c.write_reg(REG_HOUR_ALARM, 0x11);
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_PIE); // still 24h
+        assert_eq!(c.read_reg(REG_HOUR), 0x10);
+        assert_eq!(c.read_reg(REG_HOUR_ALARM), 0x11);
     }
 }
