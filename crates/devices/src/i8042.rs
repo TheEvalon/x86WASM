@@ -115,9 +115,6 @@
 //!   scancode-set / typematic are stored only — no host-visible LED hardware;
 //!   inject still emits the existing Set2-oriented stream regardless of stored
 //!   set)
-//! - Output-port bit0 system-reset pulse via `0xD1` (controller command `0xFE`
-//!   on `0x64` latches [`I8042::take_system_reset_request`] for `Machine` wiring;
-//!   distinct from keyboard Resend `0xFE` on data port `0x60`)
 //! - Interface-test electrical fault codes beyond the success stub `0x00` for
 //!   `0xA9`/`0xAB`; authentic AT ASCII/scancode dump encoding for `0xAC`
 
@@ -171,7 +168,8 @@ pub const CMD_DISABLE_KBD: u8 = 0xAD;
 pub const CMD_ENABLE_KBD: u8 = 0xAE;
 /// Controller command: read output port → response on data port.
 pub const CMD_READ_OUTPUT_PORT: u8 = 0xD0;
-/// Controller command: write next data-port byte to output port (A20 bit1).
+/// Controller command: write next data-port byte to output port (A20 bit1;
+/// system-reset bit0 active-low → [`I8042::take_system_reset_request`]).
 pub const CMD_WRITE_OUTPUT_PORT: u8 = 0xD1;
 /// Controller command: write next data-port byte to the auxiliary device.
 pub const CMD_WRITE_AUX: u8 = 0xD4;
@@ -391,10 +389,15 @@ enum KbdPendingParam {
     KeyTypeScancode,
 }
 
+/// Output-port bit 0: system reset line (1 = normal / not reset; 0 = assert reset).
+///
+/// Spec: IBM PC AT / OSDev I8042 — writing this bit clear via `0xD1` latches
+/// [`I8042::take_system_reset_request`] (same machine path as pulse-reset `0xFE`).
+pub const OUTPUT_PORT_SYSTEM_RESET: u8 = 1 << 0;
 /// Output-port bit 1: A20 gate enable (1 = A20 line high / unmasked).
 pub const OUTPUT_PORT_A20: u8 = 1 << 1;
-/// Power-on / reset default output port: A20 enabled (classic AT open gate).
-/// Other bits are stored but not claimed (system-reset / clock / IRQ lines).
+/// Power-on / reset default output port: A20 enabled, system-reset line high
+/// (classic AT open gate / not in reset). Other bits stored but not claimed.
 const DEFAULT_OUTPUT_PORT: u8 = 0xDF;
 
 /// Configuration bit 0: first PS/2 port interrupt (IRQ1) enable when set.
@@ -462,7 +465,8 @@ enum PendingWrite {
 pub struct I8042 {
     /// Controller configuration byte (RAM byte 0; commands `0x20` / `0x60`).
     pub config: u8,
-    /// Controller output port (commands `0xD0` / `0xD1`); bit1 = A20 gate.
+    /// Controller output port (commands `0xD0` / `0xD1`); bit0 = system reset
+    /// (active low), bit1 = A20 gate.
     pub output_port: u8,
     /// One-byte output buffer (device/controller → host).
     output: Option<u8>,
@@ -479,10 +483,11 @@ pub struct I8042 {
     /// Spec: OSDev I8042 — accepted and counted; [`Self::system_reset_pending`]
     /// latches a request for the machine layer (`Machine::reset`).
     pub pulse_reset_commands: u32,
-    /// Latched when the host writes controller pulse-reset (`0xFE` on `0x64`).
+    /// Latched when the host requests system reset via controller pulse-reset
+    /// (`0xFE` on `0x64`) or output-port write (`0xD1`) with bit0 clear.
     ///
-    /// Spec: OSDev I8042 — pulse output lines / system-reset request. Cleared by
-    /// [`Self::take_system_reset_request`] or controller [`Self::reset`].
+    /// Spec: OSDev I8042 / IBM PC AT — pulse output lines / system-reset request.
+    /// Cleared by [`Self::take_system_reset_request`] or controller [`Self::reset`].
     system_reset_pending: bool,
     /// Last byte the host sent to the auxiliary device via `0xD4`.
     pub last_aux_device_write: Option<u8>,
@@ -672,12 +677,13 @@ impl I8042 {
         self.apply_reset_defaults();
     }
 
-    /// Take a latched pulse-reset (`0xFE` on `0x64`) system-reset request.
+    /// Take a latched system-reset request (`0xFE` on `0x64`, or `0xD1` write
+    /// with output-port bit0 clear).
     ///
-    /// Spec: OSDev I8042 — controller command `0xFE` pulses the reset line.
-    /// Returns `true` once per command; the machine layer should then run its
-    /// CPU/device reset path (e.g. `Machine::reset`). Distinct from keyboard
-    /// Resend `0xFE` on data port `0x60`.
+    /// Spec: OSDev I8042 / IBM PC AT — controller pulse-reset or output-port
+    /// system-reset line. Returns `true` once per latch; the machine layer
+    /// should then run its CPU/device reset path (e.g. `Machine::reset`).
+    /// Distinct from keyboard Resend `0xFE` on data port `0x60`.
     pub fn take_system_reset_request(&mut self) -> bool {
         let pending = self.system_reset_pending;
         self.system_reset_pending = false;
@@ -1578,8 +1584,14 @@ impl PortDevice for I8042 {
                         }
                     }
                     PendingWrite::OutputPort => {
-                        // Spec: IBM PC AT — output port bit1 = A20 gate.
+                        // Spec: IBM PC AT / OSDev I8042 — bit1 = A20 gate;
+                        // bit0 = system reset (active low). Writing bit0 clear
+                        // latches the same system-reset request as pulse-reset
+                        // `0xFE` on `0x64` (Machine::service_8042_pulse_reset).
                         self.output_port = v;
+                        if v & OUTPUT_PORT_SYSTEM_RESET == 0 {
+                            self.system_reset_pending = true;
+                        }
                         self.pending = PendingWrite::None;
                     }
                     PendingWrite::AuxDevice => {
@@ -2257,6 +2269,42 @@ mod tests {
 
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
         assert_eq!(k.port_read(I8042_DATA, 1) as u8, SELF_TEST_OK);
+    }
+
+    /// Spec: IBM PC AT / OSDev I8042 — output-port bit0 is system reset (active low).
+    /// Writing `0xD1` then a data byte with bit0 clear latches the same
+    /// [`I8042::take_system_reset_request`] path as controller pulse-reset `0xFE`.
+    #[test]
+    fn d1_output_port_bit0_low_latches_system_reset() {
+        let mut k = I8042::new();
+        let before_pulse = k.pulse_reset_commands;
+        assert!(!k.take_system_reset_request());
+
+        // 0xDE: A20 on (bit1), system-reset line low (bit0 clear).
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_OUTPUT_PORT));
+        k.port_write(I8042_DATA, 1, 0xDE);
+        assert_eq!(k.output_port, 0xDE);
+        assert!(k.a20_enabled());
+        assert_eq!(k.pulse_reset_commands, before_pulse); // not the 0xFE command
+        assert!(k.take_system_reset_request());
+        assert!(!k.take_system_reset_request());
+    }
+
+    /// Spec: IBM PC AT — output-port writes with bit0 set do not pulse system reset.
+    #[test]
+    fn d1_output_port_bit0_high_does_not_latch_system_reset() {
+        let mut k = I8042::new();
+        assert!(!k.take_system_reset_request());
+
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_OUTPUT_PORT));
+        k.port_write(I8042_DATA, 1, 0xDD); // A20 off, bit0 still high
+        assert_eq!(k.output_port, 0xDD);
+        assert!(!k.take_system_reset_request());
+
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_OUTPUT_PORT));
+        k.port_write(I8042_DATA, 1, 0xDF); // default: A20 on, bit0 high
+        assert_eq!(k.output_port, 0xDF);
+        assert!(!k.take_system_reset_request());
     }
 
     #[test]
