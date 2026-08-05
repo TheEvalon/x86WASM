@@ -421,6 +421,29 @@ impl Machine {
         true
     }
 
+    /// Bounded PIIX BMIDE one-PRD Read stub against [`PhysMem`].
+    ///
+    /// Spec: Intel Programming Interface for Bus Master IDE / 82371SB PRD —
+    /// wraps [`PciConfig::start_bm_read`] with PhysMem callbacks. Optional
+    /// Machine helper (not auto-wired on ATA commands). **Not** a full ATA
+    /// READ DMA engine or multi-PRD walk.
+    pub fn bmide_prd_read(
+        &mut self,
+        device_buf: &[u8],
+    ) -> Result<devices::BmidePrdTransfer, devices::BmidePrdError> {
+        use std::cell::RefCell;
+        let mem = RefCell::new(std::mem::replace(&mut self.mem, PhysMem::new(0)));
+        let result = self.pci.start_bm_read(
+            device_buf,
+            |phys| mem.borrow().read_u8(u64::from(phys)).unwrap_or(0xFF),
+            |phys, b| {
+                let _ = mem.borrow_mut().write_u8(u64::from(phys), b);
+            },
+        );
+        self.mem = mem.into_inner();
+        result
+    }
+
     /// Run [`Dma8237::transfer_block`] for an ISA channel against [`PhysMem`].
     ///
     /// Spec: Intel 8237A + OSDev ISA DMA — 8-bit ch0–3 (`count+1` bytes, phys
@@ -2283,6 +2306,49 @@ mod tests {
         m.reset();
         assert_eq!(m.pci.bmide_io, [0; 16]);
         assert_eq!(m.pci.bmide_io_base(), None);
+    }
+
+    /// Spec: Intel BMIDE PRD — `Machine::bmide_prd_read` one-PRD walk via PhysMem.
+    #[test]
+    fn machine_bmide_prd_read_copies_into_phys_mem() {
+        use devices::{
+            PCI_COMMAND_BUS_MASTER, PCI_COMMAND_IO, PCI_COMMAND_OFFSET, PCI_PIIX_IDE_BMIBA_OFFSET,
+            PCI_PIIX_IDE_BMIDTP_PRIMARY, PCI_PIIX_IDE_PRD_EOT,
+        };
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+            )
+            .unwrap();
+            bus.port_out_u32(PCI_CONFIG_DATA, 0x0000_E000).unwrap();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+            )
+            .unwrap();
+            bus.port_out_u16(PCI_CONFIG_DATA, PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER)
+                .unwrap();
+            bus.port_out_u32(0xE000 + u16::from(PCI_PIIX_IDE_BMIDTP_PRIMARY), 0x1000)
+                .unwrap();
+        }
+        const BUF: u64 = 0x2000;
+        let mut prd = [0u8; 8];
+        prd[0..4].copy_from_slice(&(BUF as u32).to_le_bytes());
+        prd[4..6].copy_from_slice(&4u16.to_le_bytes());
+        prd[7] = PCI_PIIX_IDE_PRD_EOT;
+        for (i, b) in prd.iter().enumerate() {
+            m.mem.write_u8(0x1000 + i as u64, *b).unwrap();
+        }
+        let device = [0xDE, 0xAD, 0xBE, 0xEF];
+        let xfer = m.bmide_prd_read(&device).expect("prd read");
+        assert_eq!(xfer.bytes_copied, 4);
+        assert!(xfer.entry.eot);
+        for (i, expected) in device.iter().enumerate() {
+            assert_eq!(m.mem.read_u8(BUF + i as u64).unwrap(), *expected);
+        }
     }
 
     /// Spec: Intel 82371AB ACPI PM — MachineBus decodes PMBASE when Command.IO set.
