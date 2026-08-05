@@ -66,10 +66,11 @@
 //! - TRUSTED SEND (`0x5E`): ATA master → ERR+ABRT (no Trusted Computing /
 //!   Security Protocol send PIO); absent/slave → status 0; INTRQ follows nIEN
 //!   like TRUSTED RECEIVE
-//! - READ BUFFER (`0xE4`): ATA master → ERR+ABRT (no 512-byte sector buffer
-//!   PIO); absent/slave → status 0; INTRQ follows nIEN like TRUSTED SEND
-//! - WRITE BUFFER (`0xE8`): ATA master → ERR+ABRT (no 512-byte sector buffer
-//!   PIO); absent/slave → status 0; INTRQ follows nIEN like READ BUFFER
+//! - READ BUFFER (`0xE4`): ATA master → 512-byte DRQ PIO from device sector
+//!   buffer (synced from READ/WRITE SECTORS); absent/slave → status 0; INTRQ
+//!   follows nIEN like other PIO data-in commands
+//! - WRITE BUFFER (`0xE8`): ATA master → ERR+ABRT (no WRITE BUFFER PIO yet);
+//!   absent/slave → status 0; INTRQ follows nIEN like TRUSTED SEND
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
@@ -87,8 +88,8 @@
 //! - DATA SET MANAGEMENT / TRIM range-list PIO (ABRT-only stub)
 //! - TRUSTED RECEIVE / TRUSTED SEND Security Protocol PIO (ABRT-only stubs for
 //!   `0x5C` / `0x5E`)
-//! - READ BUFFER / WRITE BUFFER 512-byte sector-buffer PIO (ABRT-only stubs for
-//!   `0xE4` / `0xE8`)
+//! - WRITE BUFFER 512-byte sector-buffer PIO (ABRT-only stub for `0xE8`; READ
+//!   BUFFER `0xE4` is implemented)
 //! - Real BM-DMA / UDMA/MDMA / PRD engine (READ/WRITE DMA are ABRT-only)
 //! - LBA48
 //! - Slave drive on either channel
@@ -276,7 +277,7 @@ pub const ATA_CMD_TRUSTED_RECEIVE: u8 = 0x5C;
 /// TRUSTED SEND — Trusted Computing / Security Protocol send; this stub aborts.
 /// Spec: ATA/ATAPI Command Set — TRUSTED SEND (`0x5E`).
 pub const ATA_CMD_TRUSTED_SEND: u8 = 0x5E;
-/// READ BUFFER — 512-byte sector buffer read; this stub aborts.
+/// READ BUFFER — 512-byte sector buffer PIO data-in.
 /// Spec: ATA/ATAPI Command Set — READ BUFFER (`0xE4`).
 pub const ATA_CMD_READ_BUFFER: u8 = 0xE4;
 /// WRITE BUFFER — 512-byte sector buffer write; this stub aborts.
@@ -317,7 +318,11 @@ pub struct IdePrimary {
     dev_ctrl: u8,
     /// Latched INTRQ request (gated by nIEN on [`Self::irq_line`]).
     irq_pending: bool,
-    /// Current PIO sector payload (512 bytes).
+    /// Persistent ATA sector buffer (READ BUFFER / last READ|WRITE SECTORS).
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ BUFFER returns this 512-byte buffer.
+    sector_buffer: [u8; SECTOR_SIZE],
+    /// Current PIO transfer payload (512 bytes).
     pio: [u8; SECTOR_SIZE],
     pio_off: usize,
     /// Sectors still to present/accept after the current PIO block (incl. current).
@@ -352,6 +357,7 @@ impl IdePrimary {
             status: 0,
             dev_ctrl: ATA_DC_NIEN,
             irq_pending: false,
+            sector_buffer: [0; SECTOR_SIZE],
             pio: [0; SECTOR_SIZE],
             pio_off: 0,
             sectors_left: 0,
@@ -398,6 +404,7 @@ impl IdePrimary {
         self.drive_head = 0xA0;
         self.dev_ctrl = ATA_DC_NIEN;
         self.irq_pending = false;
+        self.sector_buffer = [0; SECTOR_SIZE];
         self.pio = [0; SECTOR_SIZE];
         self.pio_off = 0;
         self.sectors_left = 0;
@@ -525,6 +532,8 @@ impl IdePrimary {
             let n = end - start;
             self.pio[..n].copy_from_slice(&self.image[start..end]);
         }
+        // Spec: ATA — media read updates the sector buffer (READ BUFFER source).
+        self.sector_buffer = self.pio;
         true
     }
 
@@ -539,6 +548,8 @@ impl IdePrimary {
             self.image.resize(end, 0);
         }
         self.image[start..end].copy_from_slice(&self.pio);
+        // Spec: ATA — media write updates the sector buffer (READ BUFFER source).
+        self.sector_buffer = self.pio;
         true
     }
 
@@ -1014,12 +1025,12 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
-    /// READ BUFFER (`0xE4`) on ATA master — ABRT stub.
+    /// READ BUFFER (`0xE4`) on ATA master — 512-byte PIO data-in.
     ///
-    /// Spec: ATA/ATAPI Command Set — READ BUFFER returns the 512-byte sector
-    /// buffer via PIO (no LBA). This stub does not implement the sector buffer;
-    /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
-    /// INTRQ follows nIEN like TRUSTED SEND abort.
+    /// Spec: ATA/ATAPI Command Set — READ BUFFER returns the device sector
+    /// buffer via 256-word PIO (no LBA). Buffer contents track the last
+    /// READ/WRITE SECTORS transfer (zeros after reset). Absent/slave → status 0.
+    /// INTRQ follows nIEN like READ SECTORS / IDENTIFY DRQ.
     fn exec_read_buffer(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -1028,15 +1039,18 @@ impl IdePrimary {
             self.clear_irq();
             return;
         }
-        self.abort_command(ATA_ER_ABRT);
+        self.pio = self.sector_buffer;
+        self.sectors_left = 1;
+        self.next_lba = 0;
+        self.begin_pio_out();
     }
 
     /// WRITE BUFFER (`0xE8`) on ATA master — ABRT stub.
     ///
     /// Spec: ATA/ATAPI Command Set — WRITE BUFFER accepts the 512-byte sector
-    /// buffer via PIO (no LBA). This stub does not implement the sector buffer;
-    /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
-    /// INTRQ follows nIEN like READ BUFFER abort.
+    /// buffer via PIO (no LBA). This stub does not implement WRITE BUFFER PIO
+    /// yet (READ BUFFER is supported); ATA disks abort with ERR+ABRT and no
+    /// data/DRQ. Absent/slave → status 0. INTRQ follows nIEN like TRUSTED SEND.
     fn exec_write_buffer(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
@@ -3083,39 +3097,66 @@ mod tests {
     }
 
     /// Spec: ATA/ATAPI Command Set — READ BUFFER (`0xE4`) returns the 512-byte
-    /// sector buffer via PIO. This stub has no sector-buffer path; ATA master →
-    /// ERR+ABRT, no DRQ.
+    /// sector buffer via PIO (no LBA). Buffer is last WRITE/READ SECTORS payload.
     #[test]
-    fn read_buffer_aborts_on_ata_master() {
+    fn read_buffer_pio_returns_sector_buffer() {
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        // Seed sector buffer via WRITE SECTORS (same device buffer path).
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
         let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
-        assert_ne!(st & ATA_SR_ERR, 0);
-        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRQ, 0);
         assert_ne!(st & ATA_SR_DRDY, 0);
-        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0xC300);
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
     }
 
     #[test]
-    fn read_buffer_asserts_irq_on_abort_when_nien_clear() {
-        // Spec: ATA — INTRQ on error completion when nIEN=0 (match TRUSTED SEND).
+    fn read_buffer_zeros_before_any_transfer() {
+        // Spec: ATA READ BUFFER — sector buffer starts cleared; 256-word PIO of zeros.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        for _ in 0..256 {
+            assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn read_buffer_asserts_irq_on_drq_when_nien_clear() {
+        // Spec: ATA / OSDev PIO — INTRQ when DRQ ready if nIEN=0 (match READ SECTORS).
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
         clear_nien(&mut ide);
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
-        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
         assert!(ide.irq_line());
     }
 
     #[test]
-    fn read_buffer_nien_masks_irq_on_abort() {
-        // Spec: ATA device control — nIEN=1 masks INTRQ (match TRUSTED SEND abort).
+    fn read_buffer_nien_masks_irq_on_drq() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ during READ BUFFER DRQ.
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
         ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
         ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
-        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
         assert!(!ide.irq_line());
     }
 
@@ -3131,8 +3172,8 @@ mod tests {
     }
 
     /// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`) accepts the 512-byte
-    /// sector buffer via PIO. This stub has no sector-buffer path; ATA master →
-    /// ERR+ABRT, no DRQ.
+    /// sector buffer via PIO. WRITE BUFFER PIO is not implemented yet; ATA
+    /// master → ERR+ABRT, no DRQ (READ BUFFER succeeds separately).
     #[test]
     fn write_buffer_aborts_on_ata_master() {
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
@@ -3147,7 +3188,7 @@ mod tests {
 
     #[test]
     fn write_buffer_asserts_irq_on_abort_when_nien_clear() {
-        // Spec: ATA — INTRQ on error completion when nIEN=0 (match READ BUFFER).
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match TRUSTED SEND).
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
         clear_nien(&mut ide);
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
@@ -3158,7 +3199,7 @@ mod tests {
 
     #[test]
     fn write_buffer_nien_masks_irq_on_abort() {
-        // Spec: ATA device control — nIEN=1 masks INTRQ (match READ BUFFER abort).
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match TRUSTED SEND abort).
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
         ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
         ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
