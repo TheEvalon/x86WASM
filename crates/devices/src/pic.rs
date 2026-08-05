@@ -43,7 +43,8 @@
 //!   IRR follows IR level; deassert clears IRR; acknowledge while still high
 //!   re-pending IRR for post-EOI delivery
 //! - PIIX ELCR per-IR mask via [`DualPic::set_elcr_level_mask`] (SeaBIOS/PIIX
-//!   edge/level select; survives ICW1 — ELCR is outside the 8259)
+//!   edge/level select; survives ICW1 — ELCR is outside the 8259; reserved
+//!   IRQ0/1/2/8/13 bits cleared so those IRs stay edge-triggered)
 //! - Spurious / DEFAULT IR7 when IR pin is low at first INTA (vector IR7, ISR
 //!   bit7 not set); cascade master IR is never remapped — empty/spurious slave
 //!   still sets master cascade IS
@@ -53,7 +54,6 @@
 //! # Unsupported (explicit)
 //!
 //! - PIT IRQ0 / CMOS IRQ8 / device→PIC wiring (callers use `set_irq_line`)
-//! - PIIX ELCR reserved-bit hardwiring (IRQ0/1/2/8/13 always-edge on real silicon)
 
 use crate::PortDevice;
 
@@ -696,7 +696,11 @@ impl DualPic {
     /// (0) for that IR. Combined with ICW1.LTIM via [`Pic8259::ir_is_level`]:
     /// LTIM=1 makes the whole chip level; with LTIM=0 only ELCR-selected IRs are
     /// level. ELCR is not cleared by ICW1.
+    ///
+    /// Reserved IRQ0/1/2/8/13 bits are cleared (hardwired edge) via
+    /// [`crate::pci::sanitize_piix_elcr`] even if the caller passes them set.
     pub fn set_elcr_level_mask(&mut self, master: u8, slave: u8) {
+        let (master, slave) = crate::pci::sanitize_piix_elcr(master, slave);
         self.master.elcr_level_mask = master;
         self.slave.elcr_level_mask = slave;
         self.master.refresh_level_irr_from_pins();
@@ -2139,5 +2143,35 @@ mod tests {
         pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
         pic.port_write(PIC_MASTER_CMD, 1, 0x20);
         assert_eq!(pic.poll_irq(), Some(0x71));
+    }
+
+    /// Spec: Intel 82371 / IFB ELCR — IRQ0/1/2/8/13 reserved hardwired edge;
+    /// setting those ELCR bits must not make the IR level-sensitive.
+    #[test]
+    fn elcr_reserved_irqs_remain_edge_despite_mask_bits() {
+        use crate::pci::{PIIX_ELCR_MASTER_WRITABLE, PIIX_ELCR_SLAVE_WRITABLE};
+
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.set_elcr_level_mask(0xFF, 0xFF);
+        assert_eq!(
+            pic.elcr_level_mask(),
+            (PIIX_ELCR_MASTER_WRITABLE, PIIX_ELCR_SLAVE_WRITABLE)
+        );
+        assert!(!pic.master.ir_is_level(0), "IRQ0 always edge");
+        assert!(!pic.master.ir_is_level(1), "IRQ1 always edge");
+        assert!(!pic.master.ir_is_level(2), "IRQ2 always edge");
+        assert!(pic.master.ir_is_level(3), "IRQ3 writable level");
+        assert!(!pic.slave.ir_is_level(0), "IRQ8 always edge");
+        assert!(pic.slave.ir_is_level(1), "IRQ9 writable level");
+        assert!(!pic.slave.ir_is_level(5), "IRQ13 always edge");
+        assert!(pic.slave.ir_is_level(6), "IRQ14 writable level");
+
+        // Behavioral: held-high IRQ0 must not redeliver after EOI (edge).
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.poll_irq(), None, "reserved IRQ0 stays edge");
     }
 }
