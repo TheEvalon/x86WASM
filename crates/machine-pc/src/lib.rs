@@ -536,7 +536,8 @@ impl MachineBus<'_> {
         if Dma8237::owns_port(port) {
             return self.dma.port_read(port, size);
         }
-        if PciConfig::owns_port(port) {
+        // Spec: Intel 82371SB — BMIDE I/O at BMIBA when Command.IO + BAR programmed.
+        if self.pci.bmide_owns_port(port) || PciConfig::owns_port(port) {
             return self.pci.port_read(port, size);
         }
         if self.vga.owns_port(port) {
@@ -581,7 +582,8 @@ impl MachineBus<'_> {
             self.dma.port_write(port, size, value);
             return;
         }
-        if PciConfig::owns_port(port) {
+        // Spec: Intel 82371SB — BMIDE I/O decode; CF8/CFC + ELCR via owns_port.
+        if self.pci.bmide_owns_port(port) || PciConfig::owns_port(port) {
             self.pci.port_write(port, size, value);
             // Spec: Intel 82371 / OSDev ELCR — 0x4D0/0x4D1 bits select DualPic
             // per-IR level vs edge (SeaBIOS/PIIX); OR'd with ICW1.LTIM in Pic8259.
@@ -2003,6 +2005,53 @@ mod tests {
         let acpi_class = bus.port_in_u32(PCI_CONFIG_DATA).unwrap();
         assert_eq!((acpi_class >> 24) as u8, PCI_CLASS_BRIDGE);
         assert_eq!((acpi_class >> 16) as u8, PCI_SUBCLASS_OTHER_BRIDGE);
+    }
+
+    /// Spec: Intel 82371SB BMIDE — MachineBus decodes BMIBA when Command.IO set.
+    #[test]
+    fn machine_bus_piix_ide_bmide_port_decode() {
+        use devices::{PCI_COMMAND_IO, PCI_COMMAND_OFFSET, PCI_PIIX_IDE_BMIBA_OFFSET};
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+            )
+            .unwrap();
+            bus.port_out_u32(PCI_CONFIG_DATA, 0x0000_E000).unwrap();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+            )
+            .unwrap();
+            bus.port_out_u16(PCI_CONFIG_DATA, PCI_COMMAND_IO).unwrap();
+
+            bus.port_out_u8(0xE000, 0x08).unwrap();
+            bus.port_out_u8(0xE002, 0x40).unwrap();
+            bus.port_out_u32(0xE004, 0x1000_2000).unwrap();
+            assert_eq!(bus.port_in_u8(0xE000).unwrap(), 0x08);
+            assert_eq!(bus.port_in_u8(0xE002).unwrap(), 0x40);
+            assert_eq!(bus.port_in_u32(0xE004).unwrap(), 0x1000_2000);
+
+            // Clear IO → decode off (generic port sink, not BMIDE readback).
+            bus.port_out_u16(PCI_CONFIG_DATA, 0).unwrap();
+            bus.port_out_u8(0xE000, 0xFF).unwrap();
+        }
+        // Re-open with IO: prior disabled write must not have overwritten 0x08.
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+            )
+            .unwrap();
+            bus.port_out_u16(PCI_CONFIG_DATA, PCI_COMMAND_IO).unwrap();
+            assert_eq!(bus.port_in_u8(0xE000).unwrap(), 0x08);
+        }
+        m.reset();
+        assert_eq!(m.pci.bmide_io, [0; 16]);
+        assert_eq!(m.pci.bmide_io_base(), None);
     }
 
     /// Spec: ATA/ATAPI + OSDev ATA PIO — MachineBus primary IDE IDENTIFY + READ/WRITE SECTORS.
