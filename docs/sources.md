@@ -53,6 +53,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 ## Firmware
 
 - SeaBIOS documentation — memory map: legacy BIOS ROM is mapped at the top of the 32-bit physical address space (last `N` bytes ending at `0xFFFF_FFFF`); the last up to 128 KiB is also visible in the first mebibyte (`0xE0000`–`0xFFFFF`, so a 64 KiB image aliases at `0xF0000`). Reset vector fetch uses `CS.base=0xFFFF_0000` + `IP=0xFFF0` → `0xFFFF_FFF0`. This tree implements placement via `firmware_interface::prepare_bios_rom` / `Machine::load_bios_rom` (synthetic test blobs only; GPL SeaBIOS binaries stay under `firmware/`, not in crates). SeaBIOS POST / option ROMs / fw_cfg not claimed.
+- IBM PC BIOS boot sequence / OSDev Wiki "Boot Sequence" — INT 19h loads the first sector (MBR/VBR) to physical `0x7C00`, verifies signature bytes `0x55`/`0xAA` at offsets 510–511, and transfers control with `CS:IP = 0000:7C00`. This tree exposes a host-side helper `Machine::load_mbr_to_7c00` (prefer IDE primary LBA0 via `attach_ide_image`/`with_ide`; floppy CHS `(0,0,1)` fallback) for synthetic MBR handoff tests — not a full SeaBIOS INT 13h disk stack.
 - OVMF / EDK II documentation
 
 ## Oracles and tooling (behavior reference — do not copy source)
