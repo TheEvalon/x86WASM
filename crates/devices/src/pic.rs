@@ -50,6 +50,9 @@
 //!   still sets master cascade IS
 //! - IRR→ISR on acknowledge, vector selection
 //! - `DualPic::acknowledge` / `poll_irq` for `MachineBus::poll_external_irq`
+//! - [`DualPic::irr_isr_snapshot`] / [`DualPic::ocw3_read_irr_isr`] — simultaneous
+//!   master+slave IRR/ISR views for cascade-ack consistency checks (OCW3 can
+//!   select only one register per chip at a time on the command port)
 //!
 //! # Unsupported (explicit)
 //!
@@ -678,6 +681,20 @@ pub struct DualPic {
     pub slave: Pic8259,
 }
 
+/// Simultaneous IRR + ISR view of both PICs.
+///
+/// Spec: Intel 8259A — IRR and ISR are distinct registers; OCW3 `RR`/`RIS`
+/// selects only one for a command-port read. This struct captures both chips'
+/// architectural IRR/ISR bytes in one consistent view (host/debug helper, not a
+/// guest-visible atomic bus cycle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DualPicIrrIsrSnapshot {
+    pub master_irr: u8,
+    pub master_isr: u8,
+    pub slave_irr: u8,
+    pub slave_isr: u8,
+}
+
 impl DualPic {
     pub fn new() -> Self {
         Self {
@@ -712,6 +729,43 @@ impl DualPic {
     /// Current ELCR level masks `(master 0x4D0, slave 0x4D1)`.
     pub fn elcr_level_mask(&self) -> (u8, u8) {
         (self.master.elcr_level_mask, self.slave.elcr_level_mask)
+    }
+
+    /// Capture master+slave IRR and ISR in one consistent view.
+    ///
+    /// Spec: Intel 8259A datasheet — IRR (pending) and ISR (in-service) are
+    /// separate; after a cascaded acknowledge both chips update (slave IR →
+    /// slave ISR, master cascade IR → master ISR). Use this when a caller needs
+    /// both registers from both chips without two OCW3 round-trips that could
+    /// observe an intervening line change.
+    pub fn irr_isr_snapshot(&self) -> DualPicIrrIsrSnapshot {
+        DualPicIrrIsrSnapshot {
+            master_irr: self.master.irr,
+            master_isr: self.master.isr,
+            slave_irr: self.slave.irr,
+            slave_isr: self.slave.isr,
+        }
+    }
+
+    /// Read IRR then ISR for one chip via OCW3 select, restoring prior `read_reg`.
+    ///
+    /// Spec: Intel 8259A OCW3 `RR`/`RIS` — `0x0A` selects IRR, `0x0B` selects ISR.
+    /// Does not arm the poll command (`P=1`). Leaves `poll_command_armed`
+    /// unchanged. When no IR line / EOI races occur between the two selects, the
+    /// pair matches [`Self::irr_isr_snapshot`] for that chip.
+    pub fn ocw3_read_irr_isr(&mut self, slave: bool) -> (u8, u8) {
+        let chip = if slave {
+            &mut self.slave
+        } else {
+            &mut self.master
+        };
+        let saved = chip.read_reg;
+        chip.read_reg = ReadReg::Irr;
+        let irr = chip.read_cmd();
+        chip.read_reg = ReadReg::Isr;
+        let isr = chip.read_cmd();
+        chip.read_reg = saved;
+        (irr, isr)
     }
 
     /// Assert/deassert a global ISA IRQ line (0–15). IRQ8–15 → slave IR0–7.
@@ -1114,6 +1168,189 @@ mod tests {
         assert_eq!(pic.master.isr, 1 << 3);
         pic.port_write(PIC_MASTER_CMD, 1, 0x60 | 3); // specific EOI IR3
         assert_eq!(pic.master.isr, 0);
+    }
+
+    /// Spec: Intel 8259A cascade + OCW2 specific EOI — after a cascaded
+    /// acknowledge, specific EOI on the *slave* clears only that slave ISR bit;
+    /// the master's cascade IS bit remains until the master is EOI'd. A
+    /// specific EOI naming a slave IR that is not in service is a no-op on ISR.
+    #[test]
+    fn specific_eoi_slave_ir_preserves_master_cascade_isr() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask master IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD); // unmask slave IR1
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+
+        let after_ack = pic.irr_isr_snapshot();
+        assert_eq!(after_ack.master_isr, 1 << 2);
+        assert_eq!(after_ack.slave_isr, 1 << 1);
+        assert_eq!(after_ack.slave_irr & (1 << 1), 0);
+        assert_eq!(after_ack.master_irr & (1 << 2), 0);
+        assert_eq!(
+            pic.ocw3_read_irr_isr(false),
+            (after_ack.master_irr, after_ack.master_isr)
+        );
+        assert_eq!(
+            pic.ocw3_read_irr_isr(true),
+            (after_ack.slave_irr, after_ack.slave_isr)
+        );
+
+        // Wrong slave level: ISR unchanged; master cascade IS still set.
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x60 | 3);
+        let wrong = pic.irr_isr_snapshot();
+        assert_eq!(wrong.slave_isr, 1 << 1);
+        assert_eq!(wrong.master_isr, 1 << 2);
+
+        // Specific EOI slave IR1 clears slave IS only.
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x60 | 1);
+        let after_slave = pic.irr_isr_snapshot();
+        assert_eq!(after_slave.slave_isr, 0);
+        assert_eq!(after_slave.master_isr, 1 << 2);
+
+        // Wrong master level must not clear cascade IS2.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x60 | 3);
+        assert_eq!(pic.irr_isr_snapshot().master_isr, 1 << 2);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x60 | 2); // specific EOI cascade IR2
+        let done = pic.irr_isr_snapshot();
+        assert_eq!(done.master_isr, 0);
+        assert_eq!(done.slave_isr, 0);
+    }
+
+    /// Spec: Intel 8259A SFNM + specific EOI — with two slave IS bits set,
+    /// specific EOI clears only the named level (not the highest-only
+    /// non-specific rule); master cascade IS stays set until master EOI.
+    #[test]
+    fn specific_eoi_slave_ir_clears_only_named_among_sfnm_nested() {
+        let mut pic = DualPic::new();
+        init_at_cascade_icw4_roles(&mut pic, 0x11, 0x01);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x00);
+
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        pic.set_irq_line(8, true);
+        assert_eq!(pic.poll_irq(), Some(0x70));
+        assert_eq!(pic.irr_isr_snapshot().slave_isr, (1 << 1) | (1 << 0));
+        assert_eq!(pic.irr_isr_snapshot().master_isr, 1 << 2);
+
+        // Clear the *lower* in-service IR first (specific, not non-specific).
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x60 | 1);
+        let mid = pic.irr_isr_snapshot();
+        assert_eq!(mid.slave_isr, 1 << 0, "only named slave IR1 cleared");
+        assert_eq!(mid.master_isr, 1 << 2, "master cascade IS preserved");
+
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x60); // specific EOI slave IR0
+        assert_eq!(pic.irr_isr_snapshot().slave_isr, 0);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x60 | 2);
+        assert_eq!(pic.irr_isr_snapshot().master_isr, 0);
+    }
+
+    /// Spec: after cascaded INTA, atomic IRR/ISR snapshot matches OCW3 pairwise
+    /// reads on each chip (edge-triggered IRQ9).
+    #[test]
+    fn cascade_ack_irr_isr_snapshot_matches_ocw3_reads() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD);
+        pic.set_irq_line(9, true);
+
+        let before = pic.irr_isr_snapshot();
+        assert_ne!(before.slave_irr & (1 << 1), 0);
+        assert_eq!(before.slave_isr, 0);
+
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        let snap = pic.irr_isr_snapshot();
+        assert_eq!(snap.master_isr, 1 << 2);
+        assert_eq!(snap.slave_isr, 1 << 1);
+        assert_eq!(snap.slave_irr & (1 << 1), 0);
+        assert_eq!(snap.master_irr & (1 << 2), 0);
+
+        assert_eq!(
+            pic.ocw3_read_irr_isr(false),
+            (snap.master_irr, snap.master_isr)
+        );
+        assert_eq!(
+            pic.ocw3_read_irr_isr(true),
+            (snap.slave_irr, snap.slave_isr)
+        );
+        // OCW3 helper must restore prior read_reg (default IRR after ICW).
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1) as u8, snap.master_irr);
+        assert_eq!(pic.port_read(PIC_SLAVE_CMD, 1) as u8, snap.slave_irr);
+    }
+
+    /// Spec: level-triggered slave IR + specific EOI — after slave specific EOI
+    /// while the pin stays high, slave IRR remains and sync must rising-edge
+    /// the master's cascade IR so IRR+ISR can both show IR2 until master EOI;
+    /// then INTA redelivers without a new device edge.
+    #[test]
+    fn specific_eoi_slave_ir_level_relatches_master_cascade_irr() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.set_elcr_level_mask(0, 1 << 1); // IRQ9 = slave IR1 level
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD);
+        pic.set_irq_line(9, true);
+        assert_eq!(pic.poll_irq(), Some(0x71));
+        let held = pic.irr_isr_snapshot();
+        assert_eq!(held.slave_isr, 1 << 1);
+        assert_ne!(held.slave_irr & (1 << 1), 0, "level re-pend while pin high");
+        assert_eq!(held.master_isr, 1 << 2);
+        assert_eq!(
+            held.master_irr & (1 << 2),
+            0,
+            "cascade IR dropped after ack"
+        );
+
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x60 | 1); // specific EOI slave IR1
+        let after_slave_eoi = pic.irr_isr_snapshot();
+        assert_eq!(after_slave_eoi.slave_isr, 0);
+        assert_ne!(after_slave_eoi.slave_irr & (1 << 1), 0);
+        assert_eq!(after_slave_eoi.master_isr, 1 << 2);
+        assert_ne!(
+            after_slave_eoi.master_irr & (1 << 2),
+            0,
+            "slave INT rising after specific EOI must re-latch master cascade IRR"
+        );
+        assert_eq!(
+            pic.ocw3_read_irr_isr(false),
+            (after_slave_eoi.master_irr, after_slave_eoi.master_isr)
+        );
+
+        // Master still nested-blocks equal-priority cascade until EOI.
+        assert_eq!(pic.poll_irq(), None);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x60 | 2); // specific EOI IR2
+        assert_eq!(pic.poll_irq(), Some(0x71));
+    }
+
+    /// Spec: OCW3 poll cascade is software-sequenced — after master poll only,
+    /// snapshot shows master cascade IS set while slave IRR is still pending
+    /// (slave IS clear until the slave poll).
+    #[test]
+    fn ocw3_poll_cascade_mid_sequence_irr_isr_snapshot() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFD);
+        pic.set_irq_line(9, true);
+
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1), 0x80 | 2);
+        let mid = pic.irr_isr_snapshot();
+        assert_eq!(mid.master_isr, 1 << 2);
+        assert_eq!(mid.slave_isr, 0);
+        assert_ne!(mid.slave_irr & (1 << 1), 0);
+        assert_eq!(pic.ocw3_read_irr_isr(true), (mid.slave_irr, mid.slave_isr));
+
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x0C);
+        assert_eq!(pic.port_read(PIC_SLAVE_CMD, 1), 0x80 | 1);
+        let done = pic.irr_isr_snapshot();
+        assert_eq!(done.slave_isr, 1 << 1);
+        assert_eq!(done.slave_irr, 0);
+        assert_eq!(done.master_isr, 1 << 2);
     }
 
     /// Spec: masked IR does not deliver (OCW1 / IMR).
