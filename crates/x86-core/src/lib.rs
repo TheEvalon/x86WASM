@@ -55,6 +55,24 @@ impl SegmentReg {
         self.selector = selector;
         self.base = (selector as u64) << 4;
     }
+
+    /// Load visible selector + hidden descriptor cache from a parsed descriptor.
+    ///
+    /// `limit` is the effective inclusive max offset (G-bit already applied).
+    /// Spec: Intel SDM Vol. 3 §3.4.3 (segment descriptor cache).
+    pub fn load_descriptor_cache(&mut self, selector: u16, base: u64, limit: u32, flags: u16) {
+        self.selector = selector;
+        self.base = base;
+        self.limit = limit;
+        self.flags = flags;
+    }
+
+    /// Null data-segment selector load (DS/ES/FS/GS): selector kept, cache cleared.
+    ///
+    /// Spec: Intel SDM Vol. 2 MOV (NULL selector into DS/ES/FS/GS); Vol. 3 §5.4.1.
+    pub fn load_null_selector(&mut self, selector: u16) {
+        self.load_descriptor_cache(selector, 0, 0, 0);
+    }
 }
 
 /// GDTR / IDTR.
