@@ -122,8 +122,10 @@
 //!   `read_u8`/`write_u8` (not clock select)
 //! - DAC / PEL store/readback: write index `0x3C8`, data `0x3C9` (R→G→B), read
 //!   index write / state read `0x3C7`; 256×3 RAM with mode-03h-ish defaults
-//! - PEL Mask `0x3C6` R/W store/readback (default `0xFF`); display-path AND is
-//!   not applied yet (no host render); does **not** alter `0x3C9` palette
+//! - PEL Mask `0x3C6` R/W store/readback (default `0xFF`) + display-path AND on
+//!   host text attr→DAC index helpers ([`VgaText::display_dac_index`] /
+//!   [`VgaText::text_attr_fg_dac_index`] / [`VgaText::text_attr_bg_dac_index`] /
+//!   [`VgaText::display_dac_rgb`]); does **not** alter `0x3C9` palette
 //!   programming (FreeVGA/RBIL/Abrash document mask on pixel-index lookup only)
 //!
 //! # Unsupported (explicit)
@@ -131,8 +133,7 @@
 //! - ATC / Sequencer / GC timing, ATC→DAC remap side effects, blink, PEL pan,
 //!   plane-enable, map-mask, write-mode, read-map, or bitmask side effects on
 //!   the text plane
-//! - PEL Mask display-path application (pixel index AND before DAC lookup) —
-//!   deferred until host render; hidden-DAC unlock via repeated `0x3C6` reads
+//! - Hidden-DAC unlock via repeated `0x3C6` reads; host canvas pixel render
 //! - CRTC-timed Input Status #1 accuracy, vertical-retrace IRQ, Feature Control
 //!   diagnostic bits
 //! - Full CRTC timing/blanking / Maximum Scan Line glyph-height side effects
@@ -772,9 +773,9 @@ const _: () = assert!(
 ///
 /// Spec: FreeVGA Color Registers / OSDev VGA Hardware / IBM VGA / RBIL —
 /// ANDed with the color index of each displayed pixel before DAC lookup.
-/// Default `0xFF` (no masking). Store/readback only in this stub; the display
-/// AND is deferred until host render. Does not affect [`VGA_DAC_DATA`] palette
-/// programming (datasheets describe display-path lookup only).
+/// Default `0xFF` (no masking). Host text helpers apply the AND on the
+/// attr→DAC index path; does not affect [`VGA_DAC_DATA`] palette programming
+/// (datasheets describe display-path lookup only).
 pub const VGA_DAC_PEL_MASK: u16 = 0x3C6;
 /// Reset / power-on default for [`VGA_DAC_PEL_MASK`].
 pub const VGA_DAC_PEL_MASK_DEFAULT: u8 = 0xFF;
@@ -870,8 +871,9 @@ pub struct VgaText {
     /// Bit0 ([`VGA_MISC_IOAS`]) selects CRTC / Input Status #1 port ownership.
     /// Bit1 ([`VGA_MISC_RAM_ENABLE`]) gates CPU text-plane `read_u8`/`write_u8`.
     pub misc_output: u8,
-    /// PEL Mask (`0x3C6`): display-path color-index AND (store/readback; default
-    /// [`VGA_DAC_PEL_MASK_DEFAULT`]). Not applied to [`VGA_DAC_DATA`] R/W.
+    /// PEL Mask (`0x3C6`): display-path color-index AND (default
+    /// [`VGA_DAC_PEL_MASK_DEFAULT`]). Applied by host text attr→DAC helpers;
+    /// not applied to [`VGA_DAC_DATA`] R/W.
     pub dac_pel_mask: u8,
     /// DAC color RAM: 256 entries × RGB (6-bit components stored).
     pub dac_ram: [[u8; 3]; VGA_DAC_ENTRY_COUNT],
@@ -1110,6 +1112,41 @@ impl VgaText {
     /// (character + attribute). Used by host text viewport helpers.
     pub fn text_start_plane_offset(&self) -> usize {
         usize::from(self.text_start_address()) * VGA_CELL_BYTES
+    }
+
+    /// Apply PEL Mask to a display-path color/palette index before DAC lookup.
+    ///
+    /// Spec: FreeVGA Color Registers / RBIL / IBM VGA — the PEL Mask (`0x3C6`)
+    /// is ANDed with the color index of each displayed pixel before the DAC
+    /// RAM is indexed. Default [`VGA_DAC_PEL_MASK_DEFAULT`] (`0xFF`) is identity.
+    /// Does not alter [`VGA_DAC_DATA`] (`0x3C9`) programming.
+    pub fn display_dac_index(&self, color_index: u8) -> u8 {
+        color_index & self.dac_pel_mask
+    }
+
+    /// Foreground color/palette index from a text attribute after PEL Mask.
+    ///
+    /// Spec: IBM VGA / OSDev Text UI — attribute bits 3:0 are the foreground
+    /// color index on the host attr→DAC path (ATC→DAC remap is out of scope).
+    pub fn text_attr_fg_dac_index(&self, attr: u8) -> u8 {
+        self.display_dac_index(attr & 0x0F)
+    }
+
+    /// Background color/palette index from a text attribute after PEL Mask.
+    ///
+    /// Spec: IBM VGA / OSDev Text UI — attribute bits 7:4 are the background
+    /// color index on the host attr→DAC path (ATC blink/Mode Control side
+    /// effects are out of scope).
+    pub fn text_attr_bg_dac_index(&self, attr: u8) -> u8 {
+        self.display_dac_index(attr >> 4)
+    }
+
+    /// DAC RGB for a display-path color index (PEL Mask applied).
+    ///
+    /// Spec: FreeVGA — lookup uses `color_index & pel_mask`. Palette RAM at the
+    /// unmasked index is unchanged.
+    pub fn display_dac_rgb(&self, color_index: u8) -> [u8; 3] {
+        self.dac_ram[usize::from(self.display_dac_index(color_index))]
     }
 
     /// 16-bit CRTC cursor character address (`0x0E`:`0x0F`).
@@ -3837,9 +3874,8 @@ mod tests {
     fn dac_pel_mask_does_not_alter_dac_data_path() {
         // Spec: FreeVGA / RBIL / Abrash — PEL Mask ANDs the *displayed* pixel
         // color index before DAC lookup. It does not transform palette RAM
-        // programming via `0x3C9`. This stub stores the mask only (no host
-        // render yet); verify `0x3C9` store/readback is unchanged under a
-        // non-`0xFF` mask.
+        // programming via `0x3C9`. Verify `0x3C9` store/readback is unchanged
+        // under a non-`0xFF` mask (display AND is separate).
         let mut v = VgaText::new();
         v.port_write(VGA_DAC_PEL_MASK, 1, 0x00);
         v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x10);
@@ -3852,6 +3888,65 @@ mod tests {
         assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x2A);
         assert_eq!(v.port_read(VGA_DAC_DATA, 1) as u8, 0x15);
         assert_eq!(v.port_read(VGA_DAC_PEL_MASK, 1) as u8, 0x00);
+        // Display path sees mask 0x00 → index 0; DAC RAM entry 0x10 unchanged.
+        assert_eq!(v.display_dac_index(0x10), 0x00);
+        assert_eq!(v.display_dac_rgb(0x10), v.dac_ram[0]);
+        assert_eq!(v.dac_ram[0x10], [0x3F, 0x2A, 0x15]);
+    }
+
+    /// Spec: FreeVGA Color Registers / RBIL — PEL Mask default `0xFF` is an
+    /// identity AND on the display-path color index (attr→DAC host helpers).
+    #[test]
+    fn dac_pel_mask_ff_identity_on_host_text_display_path() {
+        let v = VgaText::new();
+        assert_eq!(v.dac_pel_mask, VGA_DAC_PEL_MASK_DEFAULT);
+        assert_eq!(v.display_dac_index(0x00), 0x00);
+        assert_eq!(v.display_dac_index(0x0E), 0x0E);
+        assert_eq!(v.display_dac_index(0xA5), 0xA5);
+        // Attr 0x1E → fg 0x0E / bg 0x01; mask 0xFF passes both through.
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x0E);
+        assert_eq!(v.text_attr_bg_dac_index(0x1E), 0x01);
+        assert_eq!(v.display_dac_rgb(0x0E), VGA_DAC_CGA16_DEFAULTS[0x0E]);
+        assert_eq!(v.display_dac_rgb(0x07), VGA_DAC_CGA16_DEFAULTS[0x07]);
+    }
+
+    /// Spec: FreeVGA — PEL Mask ANDs the color index before DAC lookup.
+    #[test]
+    fn dac_pel_mask_restricts_host_text_display_dac_index() {
+        let mut v = VgaText::new();
+        // Distinct RGB at unmasked index 0x0E and masked index 0x06.
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x0E);
+        v.port_write(VGA_DAC_DATA, 1, 0x3F);
+        v.port_write(VGA_DAC_DATA, 1, 0x00);
+        v.port_write(VGA_DAC_DATA, 1, 0x00);
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x06);
+        v.port_write(VGA_DAC_DATA, 1, 0x00);
+        v.port_write(VGA_DAC_DATA, 1, 0x3F);
+        v.port_write(VGA_DAC_DATA, 1, 0x00);
+
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x07);
+        assert_eq!(v.display_dac_index(0x0E), 0x06);
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x06); // fg 0x0E & 0x07
+        assert_eq!(v.text_attr_bg_dac_index(0x9E), 0x01); // bg 0x09 & 0x07
+        assert_eq!(v.display_dac_rgb(0x0E), [0x00, 0x3F, 0x00]);
+        // Programming path still sees unmasked RAM entries.
+        assert_eq!(v.dac_ram[0x0E], [0x3F, 0x00, 0x00]);
+        assert_eq!(v.dac_ram[0x06], [0x00, 0x3F, 0x00]);
+    }
+
+    /// Spec: FreeVGA / IBM VGA — reset restores PEL Mask `0xFF` so host display
+    /// helpers return to identity AND.
+    #[test]
+    fn dac_pel_mask_reset_restores_display_path_identity() {
+        let mut v = VgaText::new();
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x0F);
+        assert_eq!(v.display_dac_index(0xA5), 0x05);
+        assert_eq!(v.text_attr_fg_dac_index(0x3C), 0x0C);
+        v.reset();
+        assert_eq!(v.dac_pel_mask, VGA_DAC_PEL_MASK_DEFAULT);
+        assert_eq!(v.display_dac_index(0xA5), 0xA5);
+        assert_eq!(v.text_attr_fg_dac_index(0x3C), 0x0C);
+        assert_eq!(v.display_dac_rgb(0x0F), VGA_DAC_CGA16_DEFAULTS[0x0F]);
     }
 
     #[test]
