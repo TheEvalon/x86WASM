@@ -363,11 +363,13 @@ impl Machine {
         true
     }
 
-    /// Run [`Dma8237::transfer_block`] for an ISA 8-bit channel against [`PhysMem`].
+    /// Run [`Dma8237::transfer_block`] for an ISA channel against [`PhysMem`].
     ///
-    /// Spec: Intel 8237A + OSDev ISA DMA — length `count+1`, phys
-    /// `(page << 16) | addr`, Single+Increment+Read/Write mode subset. Memory
-    /// callbacks use [`PhysMem::read_u8`] / [`PhysMem::write_u8`] (A20 applied).
+    /// Spec: Intel 8237A + OSDev ISA DMA — 8-bit ch0–3 (`count+1` bytes, phys
+    /// `(page << 16) | addr`) or 16-bit ch4–7 (`2*(count+1)` bytes, word addr,
+    /// phys `(page << 16) | (addr << 1)`); Single+Inc/Dec+Verify/Read/Write
+    /// (+ optional Autoinit). Memory callbacks use [`PhysMem::read_u8`] /
+    /// [`PhysMem::write_u8`] (A20 applied).
     ///
     /// Used by [`Self::fdc_dma_read_sector`] / [`Self::fdc_dma_write_sector`] /
     /// MachineBus FDC auto-wire (ISA ch2 Write = device→memory, Read =
