@@ -120,8 +120,11 @@
 //!   mode-03h reset default `0x08` + host [`VgaText::text_pel_pan`] (9-dot
 //!   Pixel Shift Count → left-shift pels within the character cell for render;
 //!   `char_at`/`attr_at`/`put_char` stay on the character grid); Color Select
-//!   `0x14` store/readback with mode-03h reset default `0x00` (no palette /
-//!   overscan-display / ATC→DAC remap / host canvas render / VR÷32 blink timer)
+//!   `0x14` store/readback with mode-03h reset default `0x00`; Internal Palette
+//!   `0x00`–`0x0F` remaps host text attr color→DAC via
+//!   [`VgaText::atc_palette_dac_index`] / fg/bg helpers (Color Select composition,
+//!   overscan-display, plane-enable display, host canvas render, and VR÷32 blink
+//!   timer remain out)
 //! - Input Status #1: ATC flip-flop reset + deterministic display-enable /
 //!   vertical-retrace status bits (read-phase counter); port selected by Misc
 //!   Output IOAS (`0x3DA` color / `0x3BA` mono)
@@ -138,8 +141,9 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - ATC / Sequencer / GC timing, ATC→DAC remap side effects, plane-enable,
-//!   map-mask, write-mode, read-map, or bitmask side effects on the text plane;
+//! - ATC / Sequencer / GC timing, Color Select / plane-enable / overscan display
+//!   side effects, map-mask, write-mode, read-map, or bitmask side effects on
+//!   the text plane; Internal Palette attr→DAC remap is on host text helpers;
 //!   PEL pan is exposed as [`VgaText::text_pel_pan`] for host render (no canvas
 //!   pixel shift yet); no vertical-retrace÷32 blink timer (host supplies phase)
 //! - Hidden-DAC unlock via repeated `0x3C6` reads; host canvas pixel render
@@ -661,8 +665,9 @@ pub const VGA_ATC_INDEX_DEFAULT: u8 = VGA_ATC_PAS;
 /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x10`.
 /// Selects graphics/alphanumeric mode, Line Graphics Enable (LGE/ELG), blink
 /// enable, and related Attribute Controller display controls. Host text helpers
-/// apply bit3 (BLINK) to attribute interpretation; ATC→DAC remap remains out of
-/// scope. Horizontal PEL Panning is index `0x13` ([`VgaText::text_pel_pan`]).
+/// apply bit3 (BLINK) to attribute interpretation and Internal Palette
+/// `0x00`–`0x0F` attr→DAC remap. Horizontal PEL Panning is index `0x13`
+/// ([`VgaText::text_pel_pan`]).
 pub const VGA_ATC_MODE_CONTROL: u8 = 0x10;
 /// Mode Control bit3 — Blink Enable (FreeVGA `BLINK`).
 ///
@@ -674,7 +679,7 @@ pub const VGA_ATC_MODE_BLINK: u8 = 0x08;
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Mode Control `0x0C` enables
 /// Line Graphics Enable and blink for alphanumeric text. Host text attr→DAC
-/// helpers honor [`VGA_ATC_MODE_BLINK`]; ATC→DAC remap remains out of scope.
+/// helpers honor [`VGA_ATC_MODE_BLINK`] and Internal Palette remap.
 pub const VGA_ATC_MODE_CONTROL_DEFAULT: u8 = 0x0C;
 /// Attribute Controller Overscan Color Register index.
 ///
@@ -685,18 +690,18 @@ pub const VGA_ATC_OVERSCAN_COLOR: u8 = 0x11;
 /// Mode-03h-class Overscan Color reset default (`0x00` = black border).
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Overscan Color `0x00`.
-/// Store/readback only; no overscan-display / ATC→DAC side effects.
+/// Store/readback only; no overscan-display side effects.
 pub const VGA_ATC_OVERSCAN_COLOR_DEFAULT: u8 = 0x00;
 /// Attribute Controller Color Plane Enable Register index.
 ///
 /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x12`.
 /// Bits 3:0 enable color planes 0–3 (display path). Plane-enable display side
-/// effects and ATC→DAC remap are out of scope (store/readback only).
+/// effects are out of scope (store/readback only).
 pub const VGA_ATC_COLOR_PLANE_ENABLE: u8 = 0x12;
 /// Mode-03h-class Color Plane Enable reset default (`0x0F` = all planes on).
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Color Plane Enable `0x0F`.
-/// Store/readback only; no plane-enable display / ATC→DAC side effects.
+/// Store/readback only; no plane-enable display side effects.
 pub const VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT: u8 = 0x0F;
 /// Attribute Controller Horizontal PEL Panning Register index.
 ///
@@ -717,13 +722,14 @@ pub const VGA_ATC_HORIZONTAL_PEL_PANNING_DEFAULT: u8 = 0x08;
 ///
 /// Spec: FreeVGA Attribute Controller Registers / IBM VGA — index `0x14`.
 /// Bits 1:0 = Color Select 5:4; bits 3:2 = Color Select 7:6 (upper color bits
-/// when Mode Control bit7 / 256-color path selects them). Color-select / ATC→DAC
-/// side effects are out of scope (store/readback only).
+/// when Mode Control bit7 / 256-color path selects them). Color-select
+/// composition into the DAC address is out of scope (store/readback only);
+/// Internal Palette `0x00`–`0x0F` bits 5:0 drive host text attr→DAC remap.
 pub const VGA_ATC_COLOR_SELECT: u8 = 0x14;
 /// Mode-03h-class Color Select reset default (`0x00`).
 ///
 /// Spec: FreeVGA / IBM VGA / Abrash mode-03h — Color Select `0x00`.
-/// Store/readback only; no color-select / ATC→DAC side effects.
+/// Store/readback only; no Color Select DAC-address composition.
 pub const VGA_ATC_COLOR_SELECT_DEFAULT: u8 = 0x00;
 
 /// Mode-03h-class Attribute Controller reset defaults.
@@ -828,7 +834,8 @@ pub const VGA_DAC_STATE_WRITE: u8 = 0x03;
 ///
 /// Spec: IBM VGA / classic CGA–EGA 16-color palette in 6-bit DAC units
 /// (`0x00`/`0x15`/`0x2A`/`0x3F`). Indices `16`–`255` reset to black. Store /
-/// readback only — no ATC→DAC remap or host render.
+/// readback only — host text attr→DAC uses ATC Internal Palette then these
+/// entries; no host canvas render yet.
 pub const VGA_DAC_CGA16_DEFAULTS: [[u8; 3]; 16] = [
     [0x00, 0x00, 0x00], // 0  black
     [0x00, 0x00, 0x2A], // 1  blue
@@ -1164,14 +1171,26 @@ impl VgaText {
         }
     }
 
-    /// Apply PEL Mask to a display-path color/palette index before DAC lookup.
+    /// Apply PEL Mask to a display-path DAC index before DAC RAM lookup.
     ///
     /// Spec: FreeVGA Color Registers / RBIL / IBM VGA — the PEL Mask (`0x3C6`)
     /// is ANDed with the color index of each displayed pixel before the DAC
     /// RAM is indexed. Default [`VGA_DAC_PEL_MASK_DEFAULT`] (`0xFF`) is identity.
-    /// Does not alter [`VGA_DAC_DATA`] (`0x3C9`) programming.
+    /// Does not alter [`VGA_DAC_DATA`] (`0x3C9`) programming. Host text helpers
+    /// remap through [`Self::atc_palette_dac_index`] before calling this.
     pub fn display_dac_index(&self, color_index: u8) -> u8 {
         color_index & self.dac_pel_mask
+    }
+
+    /// Remap a 4-bit attribute color index through ATC Internal Palette to a
+    /// 6-bit DAC index (before PEL Mask).
+    ///
+    /// Spec: FreeVGA Attribute Controller Registers — indexes `0x00`–`0x0F` are
+    /// the Internal Palette; bits 5:0 select the DAC entry used for that
+    /// attribute color. Color Select composition into upper DAC address bits
+    /// remains out of scope (mode-03h Color Select is `0x00`).
+    pub fn atc_palette_dac_index(&self, color_index: u8) -> u8 {
+        self.atc_regs[usize::from(color_index & 0x0F)] & VGA_DAC_COLOR_MASK
     }
 
     /// Whether Attribute Controller Mode Control bit3 (BLINK) is set.
@@ -1189,7 +1208,8 @@ impl VgaText {
         self.atc_blink_enabled() && (attr & 0x80) != 0
     }
 
-    /// Background color/palette index before PEL Mask (Mode Control BLINK applied).
+    /// Background attribute color index before Internal Palette / PEL Mask
+    /// (Mode Control BLINK applied).
     ///
     /// Spec: FreeVGA Attribute Mode Control / VGA Text Mode Operation — when
     /// BLINK is set, attribute bit7 is blink enable and background uses bits
@@ -1203,21 +1223,22 @@ impl VgaText {
         }
     }
 
-    /// Foreground color/palette index from a text attribute after PEL Mask.
+    /// Foreground DAC index from a text attribute (Internal Palette + PEL Mask).
     ///
-    /// Spec: IBM VGA / OSDev Text UI — attribute bits 3:0 are the foreground
-    /// color index on the host attr→DAC path (ATC→DAC remap is out of scope).
+    /// Spec: FreeVGA Attribute Controller / IBM VGA / OSDev Text UI — attribute
+    /// bits 3:0 select Internal Palette `0x00`–`0x0F`; the palette entry
+    /// (bits 5:0) is the DAC index, then PEL Mask is applied.
     pub fn text_attr_fg_dac_index(&self, attr: u8) -> u8 {
-        self.display_dac_index(attr & 0x0F)
+        self.display_dac_index(self.atc_palette_dac_index(attr & 0x0F))
     }
 
-    /// Background color/palette index from a text attribute after Mode Control
-    /// BLINK interpretation and PEL Mask.
+    /// Background DAC index from a text attribute after Mode Control BLINK
+    /// interpretation, Internal Palette remap, and PEL Mask.
     ///
-    /// Spec: FreeVGA Attribute Mode Control / IBM VGA / OSDev Text UI — see
-    /// [`Self::text_attr_bg_color_index`]. ATC→DAC palette remap remains out.
+    /// Spec: FreeVGA Attribute Mode Control / Internal Palette / IBM VGA —
+    /// see [`Self::text_attr_bg_color_index`] then [`Self::atc_palette_dac_index`].
     pub fn text_attr_bg_dac_index(&self, attr: u8) -> u8 {
-        self.display_dac_index(self.text_attr_bg_color_index(attr))
+        self.display_dac_index(self.atc_palette_dac_index(self.text_attr_bg_color_index(attr)))
     }
 
     /// Foreground DAC index for a blink phase on the host text path.
@@ -3624,7 +3645,7 @@ mod tests {
             VGA_ATC_COLOR_SELECT_DEFAULT
         );
 
-        // Non-default Color Select programming (ATC→DAC side effects deferred).
+        // Non-default Color Select programming (DAC-address composition deferred).
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_COLOR_SELECT));
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x05);
@@ -3681,7 +3702,7 @@ mod tests {
             VGA_ATC_MODE_CONTROL_DEFAULT
         );
 
-        // Non-default Mode Control programming (ATC→DAC remap deferred).
+        // Non-default Mode Control programming (graphics/IPS bits unused here).
         let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x41);
@@ -4179,6 +4200,62 @@ mod tests {
         assert_eq!(v.dac_ram[0x10], [0x3F, 0x2A, 0x15]);
     }
 
+    /// Spec: FreeVGA Attribute Controller Internal Palette (indexes `0x00`–`0x0F`)
+    /// — mode-03h defaults remap attribute color indices to DAC indexes
+    /// (`00..05/14/07/38..3F`) before PEL Mask on the host text path.
+    #[test]
+    fn atc_internal_palette_default_remaps_host_text_attr_to_dac() {
+        let v = VgaText::new();
+        // Identity entries stay identity; brown (6) and intense colors remap.
+        assert_eq!(v.atc_palette_dac_index(0x00), 0x00);
+        assert_eq!(v.atc_palette_dac_index(0x05), 0x05);
+        assert_eq!(v.atc_palette_dac_index(0x06), 0x14);
+        assert_eq!(v.atc_palette_dac_index(0x07), 0x07);
+        assert_eq!(v.atc_palette_dac_index(0x08), 0x38);
+        assert_eq!(v.atc_palette_dac_index(0x0E), 0x3E);
+        assert_eq!(v.atc_palette_dac_index(0x0F), 0x3F);
+        // Attr 0x1E → fg 0x0E → ATC[0x0E]=0x3E; bg 0x01 → ATC[0x01]=0x01.
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x3E);
+        assert_eq!(v.text_attr_bg_dac_index(0x1E), 0x01);
+        // Attr 0x16 → fg brown index 6 → DAC 0x14.
+        assert_eq!(v.text_attr_fg_dac_index(0x16), 0x14);
+    }
+
+    /// Spec: FreeVGA — programming Internal Palette `0x00`–`0x0F` changes the
+    /// host text attr→DAC remap; PEL Mask applies after the palette lookup.
+    #[test]
+    fn atc_internal_palette_program_remaps_then_pel_mask() {
+        let mut v = VgaText::new();
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        // Remap attr color 0x0E → DAC 0x2A via ATC palette index 0x0E.
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x0E);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x2A);
+        assert_eq!(v.atc_regs[0x0E], 0x2A);
+        assert_eq!(v.atc_palette_dac_index(0x0E), 0x2A);
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x2A);
+
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x0F);
+        // 0x2A & 0x0F = 0x0A after remap.
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x0A);
+        // Raw display_dac_index stays PEL-mask-only (no ATC).
+        assert_eq!(v.display_dac_index(0x2A), 0x0A);
+    }
+
+    /// Spec: FreeVGA — reset restores Internal Palette mode-03h defaults so
+    /// host text attr→DAC helpers remap through `00..05/14/07/38..3F` again.
+    #[test]
+    fn atc_internal_palette_reset_restores_host_text_remap() {
+        let mut v = VgaText::new();
+        let _ = v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x06);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x11);
+        assert_eq!(v.text_attr_fg_dac_index(0x16), 0x11);
+        v.reset();
+        assert_eq!(v.atc_regs[0x06], 0x14);
+        assert_eq!(v.text_attr_fg_dac_index(0x16), 0x14);
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x3E);
+    }
+
     /// Spec: FreeVGA Attribute Controller Mode Control (index `0x10`) bit3
     /// (BLINK) — mode-03h reset default `0x0C` enables blink, so attribute bit7
     /// is blink enable and background uses bits 6:4 only (not intensity).
@@ -4190,12 +4267,13 @@ mod tests {
             v.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)] & VGA_ATC_MODE_BLINK,
             VGA_ATC_MODE_BLINK
         );
-        // Attr 0x9E: bit7 set, bits 6:4 = 001 → bg index 0x01 (not 0x09).
+        // Attr 0x9E: bit7 set, bits 6:4 = 001 → bg ATC[1]=0x01 (not intensity 0x09).
         assert_eq!(v.text_attr_bg_dac_index(0x9E), 0x01);
         assert_eq!(v.text_attr_bg_dac_index(0x1E), 0x01);
         assert!(v.text_attr_blinks(0x9E));
         assert!(!v.text_attr_blinks(0x1E));
-        assert_eq!(v.text_attr_fg_dac_index(0x9E), 0x0E);
+        // fg 0x0E → ATC[0x0E]=0x3E (mode-03h Internal Palette).
+        assert_eq!(v.text_attr_fg_dac_index(0x9E), 0x3E);
     }
 
     /// Spec: FreeVGA — when Mode Control BLINK is clear, attribute bit7 selects
@@ -4208,12 +4286,13 @@ mod tests {
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x04);
         assert!(!v.atc_blink_enabled());
-        assert_eq!(v.text_attr_bg_dac_index(0x9E), 0x09);
+        // bg index 0x09 → ATC[0x09]=0x39; bg 0x01 → ATC[0x01]=0x01.
+        assert_eq!(v.text_attr_bg_dac_index(0x9E), 0x39);
         assert_eq!(v.text_attr_bg_dac_index(0x1E), 0x01);
         assert!(!v.text_attr_blinks(0x9E));
         // Blink-off phase ignored when Mode Control blink is clear.
-        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x9E, true), 0x0E);
-        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x9E, false), 0x0E);
+        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x9E, true), 0x3E);
+        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x9E, false), 0x3E);
     }
 
     /// Spec: FreeVGA VGA Text Mode Operation — with blink enabled and attr bit7
@@ -4222,12 +4301,12 @@ mod tests {
     fn atc_mode_control_blink_off_half_draws_fg_as_bg() {
         let v = VgaText::new();
         assert!(v.atc_blink_enabled());
-        let attr = 0x9E; // blink + bg bits 6:4 = 1, fg = 0x0E
-        assert_eq!(v.text_attr_fg_dac_index_for_phase(attr, false), 0x0E);
+        let attr = 0x9E; // blink + bg bits 6:4 = 1, fg = 0x0E → DAC 0x3E / 0x01
+        assert_eq!(v.text_attr_fg_dac_index_for_phase(attr, false), 0x3E);
         assert_eq!(v.text_attr_fg_dac_index_for_phase(attr, true), 0x01);
-        // Non-blinking cell keeps fg on both phases.
-        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x1E, true), 0x0E);
-        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x1E, false), 0x0E);
+        // Non-blinking cell keeps remapped fg on both phases.
+        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x1E, true), 0x3E);
+        assert_eq!(v.text_attr_fg_dac_index_for_phase(0x1E, false), 0x3E);
     }
 
     /// Spec: FreeVGA — reset restores Mode Control `0x0C` (BLINK|LGE) so host
@@ -4239,7 +4318,7 @@ mod tests {
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
         v.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x00);
         assert!(!v.atc_blink_enabled());
-        assert_eq!(v.text_attr_bg_dac_index(0x9E), 0x09);
+        assert_eq!(v.text_attr_bg_dac_index(0x9E), 0x39);
         v.reset();
         assert!(v.atc_blink_enabled());
         assert_eq!(
@@ -4251,7 +4330,7 @@ mod tests {
     }
 
     /// Spec: FreeVGA Color Registers / RBIL — PEL Mask default `0xFF` is an
-    /// identity AND on the display-path color index (attr→DAC host helpers).
+    /// identity AND on the post-ATC display-path DAC index.
     #[test]
     fn dac_pel_mask_ff_identity_on_host_text_display_path() {
         let v = VgaText::new();
@@ -4259,19 +4338,19 @@ mod tests {
         assert_eq!(v.display_dac_index(0x00), 0x00);
         assert_eq!(v.display_dac_index(0x0E), 0x0E);
         assert_eq!(v.display_dac_index(0xA5), 0xA5);
-        // Attr 0x1E → fg 0x0E / bg 0x01; mask 0xFF passes both through.
-        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x0E);
+        // Attr 0x1E → fg ATC[0x0E]=0x3E / bg ATC[0x01]=0x01; mask 0xFF passes.
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x3E);
         assert_eq!(v.text_attr_bg_dac_index(0x1E), 0x01);
         assert_eq!(v.display_dac_rgb(0x0E), VGA_DAC_CGA16_DEFAULTS[0x0E]);
         assert_eq!(v.display_dac_rgb(0x07), VGA_DAC_CGA16_DEFAULTS[0x07]);
     }
 
-    /// Spec: FreeVGA — PEL Mask ANDs the color index before DAC lookup.
+    /// Spec: FreeVGA — PEL Mask ANDs the post-ATC DAC index before DAC lookup.
     #[test]
     fn dac_pel_mask_restricts_host_text_display_dac_index() {
         let mut v = VgaText::new();
-        // Distinct RGB at unmasked index 0x0E and masked index 0x06.
-        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x0E);
+        // Distinct RGB at unmasked index 0x3E (ATC remap of fg 0x0E) and 0x06.
+        v.port_write(VGA_DAC_WRITE_INDEX, 1, 0x3E);
         v.port_write(VGA_DAC_DATA, 1, 0x3F);
         v.port_write(VGA_DAC_DATA, 1, 0x00);
         v.port_write(VGA_DAC_DATA, 1, 0x00);
@@ -4282,27 +4361,29 @@ mod tests {
 
         v.port_write(VGA_DAC_PEL_MASK, 1, 0x07);
         assert_eq!(v.display_dac_index(0x0E), 0x06);
-        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x06); // fg 0x0E & 0x07
-                                                          // Default Mode Control blink → bg bits 6:4 = 0x01, then & pel_mask.
+        // fg 0x0E → ATC 0x3E → & 0x07 = 0x06.
+        assert_eq!(v.text_attr_fg_dac_index(0x1E), 0x06);
+        // Default Mode Control blink → bg bits 6:4 = 0x01 → ATC 0x01 & mask.
         assert_eq!(v.text_attr_bg_dac_index(0x9E), 0x01);
-        assert_eq!(v.display_dac_rgb(0x0E), [0x00, 0x3F, 0x00]);
+        assert_eq!(v.display_dac_rgb(0x3E), [0x00, 0x3F, 0x00]);
         // Programming path still sees unmasked RAM entries.
-        assert_eq!(v.dac_ram[0x0E], [0x3F, 0x00, 0x00]);
+        assert_eq!(v.dac_ram[0x3E], [0x3F, 0x00, 0x00]);
         assert_eq!(v.dac_ram[0x06], [0x00, 0x3F, 0x00]);
     }
 
     /// Spec: FreeVGA / IBM VGA — reset restores PEL Mask `0xFF` so host display
-    /// helpers return to identity AND.
+    /// helpers return to identity AND after Internal Palette remap.
     #[test]
     fn dac_pel_mask_reset_restores_display_path_identity() {
         let mut v = VgaText::new();
         v.port_write(VGA_DAC_PEL_MASK, 1, 0x0F);
         assert_eq!(v.display_dac_index(0xA5), 0x05);
+        // Attr fg 0x0C → ATC[0x0C]=0x3C → & 0x0F = 0x0C.
         assert_eq!(v.text_attr_fg_dac_index(0x3C), 0x0C);
         v.reset();
         assert_eq!(v.dac_pel_mask, VGA_DAC_PEL_MASK_DEFAULT);
         assert_eq!(v.display_dac_index(0xA5), 0xA5);
-        assert_eq!(v.text_attr_fg_dac_index(0x3C), 0x0C);
+        assert_eq!(v.text_attr_fg_dac_index(0x3C), 0x3C);
         assert_eq!(v.display_dac_rgb(0x0F), VGA_DAC_CGA16_DEFAULTS[0x0F]);
     }
 
