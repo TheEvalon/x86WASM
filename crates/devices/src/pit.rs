@@ -1,7 +1,9 @@
-//! Intel 8254-compatible Programmable Interval Timer — channel 0 programming + OUT tick.
+//! Intel 8254-compatible Programmable Interval Timer — channel 0/1/2 programming + OUT tick.
 //!
 //! Classic PC ports: counters `0x40`/`0x41`/`0x42`, control word `0x43`.
 //! Channel 0 OUT drives ISA IRQ0 when wired by `machine-pc` (8259A master IR0).
+//! Channel 1 OUT is the classic PC DRAM-refresh request observable
+//! ([`Pit8254::refresh_out`] / [`Pit8254::ch1_out`]); it is **not** wired to any IRQ.
 //!
 //! # Spec refs
 //!
@@ -11,7 +13,8 @@
 //!   LSB/MSB / LSB-then-MSB access, operating modes 0–5; "Mode Definitions"
 //!   for mode 0/1/2/3/4/5 OUT pin behavior and the GATE-pin operations summary.
 //! - Intel 8259A — edge-triggered IR: low→high latches IRR (wired in `machine-pc`).
-//! - Classic IBM PC/AT I/O map: `0x40`–`0x43`; ch0 OUT → IRQ0.
+//! - Classic IBM PC/AT I/O map: `0x40`–`0x43`; ch0 OUT → IRQ0; ch1 OUT → DRAM
+//!   refresh request (mode 2 rate generator on the IBM PC/AT).
 //! - `docs/machine-model-pc-v1.md`, `docs/sources.md`, `plan.md` §15.3 / §21.
 //!
 //! # Scope
@@ -19,12 +22,13 @@
 //! Channel control-word programming (operating modes 0, 1, 2, 3, 4, 5),
 //! access-mode count load, one-CLK CR→CE load delay after count write (modes
 //! 0/2/3/4), counter-latch and Read-Back status/count latches, counting-element
-//! (`ce`) advancement via [`Pit8254::tick_ch0`], BCD countdown when the
-//! control-word BCD bit is set (four decades; written `0` → 10_000), and OUT
-//! pin level / rising-edge reporting for IRQ0. Channel 2: GATE via port
-//! `0x61` bit0, OUT readback on bit5, speaker-data latch bit1 (no host audio),
-//! and [`Pit8254::tick_ch2`]. Channel 1 accepts control words and byte I/O but
-//! is **not** fully supported.
+//! (`ce`) advancement via [`Pit8254::tick_ch0`] / [`Pit8254::tick_ch1`] /
+//! [`Pit8254::tick_ch2`], BCD countdown when the control-word BCD bit is set
+//! (four decades; written `0` → 10_000), and OUT pin level / rising-edge
+//! reporting. Channel 0 OUT is for IRQ0 wiring. Channel 1: mode-2-ish refresh
+//! countdown with [`Pit8254::refresh_out`] / [`Pit8254::ch1_out`] (no IRQ).
+//! Channel 2: GATE via port `0x61` bit0, OUT readback on bit5, speaker-data
+//! latch bit1 (no host audio).
 //!
 //! GATE-triggered modes 1 and 5 need a GATE rising edge to start counting, so
 //! on this machine model they are only reachable on channel 2 (port `0x61`
@@ -36,7 +40,8 @@
 //! - Mode 3 sub-CLK / decrement-by-two CE micro-timing (OUT uses an approximate
 //!   N/2 high + N/2 low split; odd N uses the datasheet (N+1)/2 high + (N−1)/2 low
 //!   asymmetry; latched CE during mode 3 is half-phase remaining, not hardware CE)
-//! - Channel 1 DRAM refresh; host PC-speaker audio output
+//! - DRAM refresh *bus-cycle* side effects (only the ch1 OUT / refresh request
+//!   pin is modeled); host PC-speaker audio output
 //! - Host-real-time wall-clock rate (callers choose tick quantum)
 //! - Port `0x61` NMI/parity/refresh toggle side effects (bits other than 0/1/5)
 //! - Invalid BCD digit programming (nibbles A–F): decode treats each nibble as a
@@ -56,9 +61,9 @@ use crate::PortDevice;
 
 /// Channel 0 counter data port (classic PC).
 pub const PIT_CH0_DATA: u16 = 0x40;
-/// Channel 1 counter data port (stubbed).
+/// Channel 1 counter data port (DRAM refresh timer on classic PC).
 pub const PIT_CH1_DATA: u16 = 0x41;
-/// Channel 2 counter data port (stubbed).
+/// Channel 2 counter data port (PC speaker timer).
 pub const PIT_CH2_DATA: u16 = 0x42;
 /// Control-word / read-back port.
 pub const PIT_CONTROL: u16 = 0x43;
@@ -657,7 +662,7 @@ impl PitChannel {
     }
 }
 
-/// 8254 PIT with three channels; ch0 IRQ0 + ch2 speaker GATE/OUT via port `0x61`.
+/// 8254 PIT with three channels; ch0 IRQ0, ch1 refresh OUT, ch2 speaker via `0x61`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pit8254 {
     pub channels: [PitChannel; 3],
@@ -688,6 +693,10 @@ impl Pit8254 {
         &self.channels[0]
     }
 
+    pub fn channel1(&self) -> &PitChannel {
+        &self.channels[1]
+    }
+
     pub fn channel2(&self) -> &PitChannel {
         &self.channels[2]
     }
@@ -695,6 +704,26 @@ impl Pit8254 {
     /// Channel 0 OUT pin level (Intel 8254 OUT → PC IRQ0 when wired).
     pub fn out_ch0(&self) -> bool {
         self.channels[0].out_level
+    }
+
+    /// Channel 1 OUT pin level (Intel 8254 OUT; classic PC DRAM refresh request).
+    ///
+    /// Not wired to any IRQ — observe via [`Self::refresh_out`] / [`Self::ch1_out`].
+    pub fn out_ch1(&self) -> bool {
+        self.channels[1].out_level
+    }
+
+    /// ISA DRAM-refresh request level (channel 1 OUT). Alias of [`Self::out_ch1`].
+    ///
+    /// Spec: IBM PC/AT — PIT ch1 programmed as a mode-2 rate generator; OUT
+    /// pulses drive the DRAM refresh request. No interrupt line.
+    pub fn refresh_out(&self) -> bool {
+        self.out_ch1()
+    }
+
+    /// Channel 1 OUT alias ([`Self::out_ch1`] / [`Self::refresh_out`]).
+    pub fn ch1_out(&self) -> bool {
+        self.out_ch1()
     }
 
     /// Channel 2 OUT pin level (PC speaker timer; read via port `0x61` bit5).
@@ -742,6 +771,21 @@ impl Pit8254 {
         let mut rising = false;
         for _ in 0..clocks {
             if self.channels[0].tick_one() {
+                rising = true;
+            }
+        }
+        rising
+    }
+
+    /// Advance channel 1 by `clocks` model ticks (DRAM refresh countdown).
+    ///
+    /// Returns `true` if OUT had at least one rising edge during the quantum.
+    /// Rising edges update [`Self::refresh_out`] / [`Self::ch1_out`] only — they
+    /// do **not** assert any IRQ (unlike [`Self::tick_ch0`]).
+    pub fn tick_ch1(&mut self, clocks: u64) -> bool {
+        let mut rising = false;
+        for _ in 0..clocks {
+            if self.channels[1].tick_one() {
                 rising = true;
             }
         }
@@ -1353,15 +1397,68 @@ mod tests {
         assert!(pit.channel0().counting);
     }
 
+    /// Spec: Intel 8254 ch1 + IBM PC/AT DRAM refresh — control/data program accepted.
     #[test]
-    fn channel1_accept_but_undocumented_as_full() {
-        // Honest stub: ch1 control + data accepted; no DRAM-refresh claims.
+    fn channel1_accepts_mode2_programming() {
         let mut pit = Pit8254::new();
-        pit.port_write(PIT_CONTROL, 1, 0x76); // ch1 mode 3 lohi
-        pit.port_write(PIT_CH1_DATA, 1, 0x01);
+        pit.port_write(PIT_CONTROL, 1, 0x74); // ch1 lohi mode 2
+        pit.port_write(PIT_CH1_DATA, 1, 0x12);
         pit.port_write(PIT_CH1_DATA, 1, 0x00);
-        assert!(pit.channels[1].count_loaded);
-        assert_eq!(pit.channels[1].count, 0x0001);
+        assert!(pit.channel1().count_loaded);
+        assert_eq!(pit.channel1().count, 0x0012);
+        assert_eq!(pit.channel1().mode, 2);
+        assert!(pit.refresh_out());
+        assert!(pit.ch1_out());
+        assert!(pit.out_ch1());
+    }
+
+    /// Spec: Intel 8254 mode 2 + IBM PC/AT ch1 refresh — countdown toggles OUT
+    /// (`refresh_out` / `ch1_out`) with a one-CLK low pulse; no IRQ wiring.
+    #[test]
+    fn ch1_mode2_refresh_countdown_toggles_out() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x74); // ch1 lohi mode 2
+        pit.port_write(PIT_CH1_DATA, 1, 0x03);
+        pit.port_write(PIT_CH1_DATA, 1, 0x00); // count = 3
+        assert!(pit.refresh_out());
+        assert!(pit.ch1_out());
+        assert!(pit.channel1().counting);
+        assert!(pit.channel1().null_count);
+
+        assert!(!pit.tick_ch1(1)); // CR→CE load
+        assert_eq!(pit.channel1().ce, 3);
+        assert!(!pit.channel1().null_count);
+        assert!(pit.refresh_out());
+
+        assert!(!pit.tick_ch1(2)); // countdown 3→1
+        assert_eq!(pit.channel1().ce, 1);
+        assert!(pit.ch1_out());
+
+        assert!(!pit.tick_ch1(1)); // terminal → OUT low one clock
+        assert!(!pit.refresh_out());
+        assert!(!pit.ch1_out());
+
+        assert!(pit.tick_ch1(1)); // rise after low pulse (refresh request edge)
+        assert!(pit.refresh_out());
+        assert!(pit.ch1_out());
+        // Still counting periodically (mode 2 rate generator); not an IRQ source.
+        assert!(pit.channel1().counting);
+    }
+
+    /// Spec: Intel 8254 mode 2 — ch1 rising OUT edge once per programmed period.
+    #[test]
+    fn ch1_mode2_refresh_rising_edge_per_period() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x74); // ch1 lohi mode 2
+        pit.port_write(PIT_CH1_DATA, 1, 0x04);
+        pit.port_write(PIT_CH1_DATA, 1, 0x00); // count = 4
+        assert!(pit.refresh_out());
+
+        // Load + period 4 + low-pulse rise: 6 clocks from the write.
+        let rising = pit.tick_ch1(6);
+        assert!(rising);
+        assert!(pit.refresh_out());
+        assert!(pit.ch1_out());
     }
 
     /// Spec: IBM PC/AT port 0x61 — bit0 GATE2, bit1 speaker data, bit5 OUT2.
