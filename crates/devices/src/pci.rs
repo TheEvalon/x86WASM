@@ -66,16 +66,21 @@
 //!   form (bit0), the 16-byte Bus Master IDE register block at
 //!   `BMIBA & 0xFFF0` is a noop store/readback (command/status/PRD pointers;
 //!   primary + secondary). No DMA engine.
+//! - PIIX USB UHCI BAR0 I/O decode: when Command.IO is set and UHCI BAR0 has
+//!   I/O form (bit0), the 32-byte UHCI register block at `BAR0 & 0xFFE0` is a
+//!   noop store/readback (USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC).
+//!   No host-controller schedule/DMA engine. LEGSUP remains PCI config `0xC0`.
 //!
 //! # Unsupported (explicit)
 //!
-//! - BAR MMIO decode (other than PIIX IDE BMIDE I/O stub above), bus mastering
-//!   DMA engine / PRD walks, INTx routing tables
-//! - Host-bridge / PIIX ISA / PIIX USB / PIIX ACPI Command decode side effects;
-//!   PIIX IDE Command side effects beyond BMIDE I/O enable
+//! - BAR MMIO decode (other than PIIX IDE BMIDE + UHCI BAR0 I/O stubs above),
+//!   bus mastering DMA engine / PRD walks / UHCI frame-list walks, INTx routing tables
+//! - Host-bridge / PIIX ISA / PIIX ACPI Command decode side effects;
+//!   PIIX IDE Command side effects beyond BMIDE I/O enable;
+//!   PIIX USB Command side effects beyond UHCI BAR0 I/O enable
 //! - Status error *signaling* (host / ISA / IDE / USB / ACPI never latch RW1C bits from real aborts yet)
 //! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI)
-//! - USB host controller (UHCI frame list / ports / IRQ)
+//! - USB host controller engine (UHCI schedule / TD/QH DMA / port connect / IRQ)
 //! - ACPI PM I/O block / SMI / GPE / ACPI tables (Command + Status + PMBASE config only)
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
@@ -268,6 +273,26 @@ pub const PCI_PIIX_USB_BAR0_OFFSET: u8 = 0x20;
 /// UHCI BAR0 size decode mask — 32-byte aligned I/O base (bits 15:5).
 /// Spec: PCI I/O BAR + UHCI I/O footprint (32 bytes).
 pub const PCI_PIIX_USB_BAR0_MASK: u32 = 0xFFE0;
+/// UHCI host-controller I/O register block size at BAR0.
+/// Spec: Universal Host Controller Interface — 32-byte I/O footprint.
+pub const PCI_PIIX_USB_UHCI_IO_SIZE: u16 = 32;
+/// UHCI USB Command (USBCMD) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_USBCMD: u8 = 0x00;
+/// UHCI USB Status (USBSTS) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_USBSTS: u8 = 0x02;
+/// UHCI USB Interrupt Enable (USBINTR) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_USBINTR: u8 = 0x04;
+/// UHCI Frame Number (FRNUM) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_FRNUM: u8 = 0x06;
+/// UHCI Frame List Base Address (FLBASEADD) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_FLBASEADD: u8 = 0x08;
+/// UHCI Start of Frame Modify (SOFMOD) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_SOFMOD: u8 = 0x0C;
+/// UHCI Port 1 Status/Control (PORTSC1) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_PORTSC1: u8 = 0x10;
+/// UHCI Port 2 Status/Control (PORTSC2) offset within BAR0.
+pub const PCI_PIIX_USB_UHCI_PORTSC2: u8 = 0x12;
+const _: () = assert!(PCI_PIIX_USB_UHCI_IO_SIZE == 32);
 /// PIIX ISA PIRQ route control registers (PIRQRC[A:D]) config offsets `0x60`–`0x63`.
 /// Spec: Intel 82371SB — each byte defaults to `0x80` (route disabled).
 pub const PCI_PIIX_ISA_PIRQRC_OFFSET: u8 = 0x60;
@@ -342,6 +367,10 @@ pub struct PciConfig {
     /// Spec: Intel 82371SB — BMICOM/BMISTA/BMIDTP primary + secondary.
     /// Store/readback only; no DMA/PRD engine. Reset all zeros.
     pub bmide_io: [u8; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
+    /// PIIX USB UHCI I/O register file (32 bytes at BAR0).
+    /// Spec: UHCI 1.1 — USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC.
+    /// Store/readback only; no schedule/DMA/port engine. Reset all zeros.
+    pub uhci_io: [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
 }
 
 /// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
@@ -374,6 +403,8 @@ impl PciConfig {
             elcr: [0, 0],
             // Spec: Intel 82371SB — BMIDE I/O registers power-on / reset to 0.
             bmide_io: [0; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
+            // Spec: UHCI — host-controller I/O registers power-on / reset to 0.
+            uhci_io: [0; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
         }
     }
 
@@ -771,7 +802,7 @@ impl PciConfig {
         }
         // Spec: Intel 82371SB / PCI — PIIX USB UHCI BAR0 at config 0x20 is an
         // I/O BAR: bit0 hardwired 1; bits 15:5 programmable (32-byte align);
-        // bits 4:1 zero. Store/readback only — no UHCI port decode yet.
+        // bits 4:1 zero. Port decode of the 32-byte UHCI block is gated by Command.IO.
         if is_piix_usb && base == PCI_PIIX_USB_BAR0_OFFSET as usize && lane == 0 && size == 4 {
             let masked = (value & PCI_PIIX_USB_BAR0_MASK) | PCI_BAR_IO_SPACE;
             let bytes = masked.to_le_bytes();
@@ -894,6 +925,100 @@ impl PciConfig {
             _ => {}
         }
     }
+
+    fn piix_usb_command(&self) -> u16 {
+        let off = PCI_COMMAND_OFFSET as usize;
+        u16::from_le_bytes([self.piix_usb[off], self.piix_usb[off + 1]])
+    }
+
+    fn piix_usb_bar0(&self) -> u32 {
+        let off = PCI_PIIX_USB_BAR0_OFFSET as usize;
+        u32::from_le_bytes([
+            self.piix_usb[off],
+            self.piix_usb[off + 1],
+            self.piix_usb[off + 2],
+            self.piix_usb[off + 3],
+        ])
+    }
+
+    /// Programmed UHCI I/O base when Command.IO is set and BAR0 has I/O form.
+    ///
+    /// Spec: PCI Local Bus — I/O Space Enable gates BAR decode; Intel 82371SB /
+    /// UHCI — BAR0 bits 15:5 are the 32-byte-aligned I/O base (bit0 = I/O space).
+    pub fn uhci_io_base(&self) -> Option<u16> {
+        if self.piix_usb_command() & PCI_COMMAND_IO == 0 {
+            return None;
+        }
+        let bar = self.piix_usb_bar0();
+        if bar & PCI_BAR_IO_SPACE == 0 {
+            return None;
+        }
+        Some((bar & PCI_PIIX_USB_BAR0_MASK) as u16)
+    }
+
+    /// True when `port` falls in the decoded UHCI I/O range.
+    pub fn uhci_owns_port(&self, port: u16) -> bool {
+        let Some(base) = self.uhci_io_base() else {
+            return false;
+        };
+        port.wrapping_sub(base) < PCI_PIIX_USB_UHCI_IO_SIZE
+    }
+
+    fn uhci_port_read(&self, port: u16, size: u8) -> u32 {
+        let Some(base) = self.uhci_io_base() else {
+            return 0xFFFFFFFF;
+        };
+        let off = (port - base) as usize;
+        match size {
+            1 => u32::from(self.uhci_io.get(off).copied().unwrap_or(0xFF)),
+            2 => {
+                let b0 = self.uhci_io.get(off).copied().unwrap_or(0xFF);
+                let b1 = self.uhci_io.get(off + 1).copied().unwrap_or(0xFF);
+                u32::from(u16::from_le_bytes([b0, b1]))
+            }
+            4 => {
+                let mut bytes = [0xFFu8; 4];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    if let Some(v) = self.uhci_io.get(off + i) {
+                        *b = *v;
+                    }
+                }
+                u32::from_le_bytes(bytes)
+            }
+            _ => 0xFFFFFFFF,
+        }
+    }
+
+    fn uhci_port_write(&mut self, port: u16, size: u8, value: u32) {
+        let Some(base) = self.uhci_io_base() else {
+            return;
+        };
+        let off = (port - base) as usize;
+        match size {
+            1 => {
+                if let Some(slot) = self.uhci_io.get_mut(off) {
+                    *slot = value as u8;
+                }
+            }
+            2 => {
+                let bytes = (value as u16).to_le_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    if let Some(slot) = self.uhci_io.get_mut(off + i) {
+                        *slot = *b;
+                    }
+                }
+            }
+            4 => {
+                let bytes = value.to_le_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    if let Some(slot) = self.uhci_io.get_mut(off + i) {
+                        *slot = *b;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Bits written into Status (`0x06`/`0x07`) by a CONFIG_DATA store (0 = lane not touched).
@@ -940,6 +1065,10 @@ impl PortDevice for PciConfig {
         if self.bmide_owns_port(port) {
             return self.bmide_port_read(port, size);
         }
+        // Spec: Intel 82371SB / UHCI — I/O at BAR0 when Command.IO + BAR programmed.
+        if self.uhci_owns_port(port) {
+            return self.uhci_port_read(port, size);
+        }
         0xFFFFFFFF
     }
 
@@ -983,6 +1112,11 @@ impl PortDevice for PciConfig {
         // Spec: Intel 82371SB — BMIDE noop register file (no DMA).
         if self.bmide_owns_port(port) {
             self.bmide_port_write(port, size, value);
+            return;
+        }
+        // Spec: Intel 82371SB / UHCI — noop register file (no schedule/DMA).
+        if self.uhci_owns_port(port) {
+            self.uhci_port_write(port, size, value);
         }
     }
 }
@@ -2420,6 +2554,128 @@ mod tests {
 
         pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F020);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x0000_F021);
+    }
+
+    /// Spec: Intel 82371SB / UHCI — I/O regs reset to 0; no decode until BAR0+IO.
+    #[test]
+    fn piix_usb_uhci_reset_default_no_decode() {
+        let pci = PciConfig::new();
+        assert_eq!(pci.uhci_io, [0; PCI_PIIX_USB_UHCI_IO_SIZE as usize]);
+        assert_eq!(pci.uhci_io_base(), None);
+        assert!(!pci.uhci_owns_port(0xD000));
+        assert!(!pci.uhci_owns_port(0x0000));
+    }
+
+    /// Spec: Intel UHCI — USBCMD/USBSTS/FRNUM/FLBASEADD/PORTSC store/readback at BAR0.
+    #[test]
+    fn piix_usb_uhci_store_readback_when_io_enabled() {
+        let mut pci = PciConfig::new();
+        // Program UHCI BAR0 = 0xD000 (I/O form → 0xD001).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_PIIX_USB_BAR0_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_D000);
+        // Enable I/O Space.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+
+        assert_eq!(pci.uhci_io_base(), Some(0xD000));
+        assert!(pci.uhci_owns_port(0xD000));
+        assert!(pci.uhci_owns_port(0xD01F));
+        assert!(!pci.uhci_owns_port(0xD020));
+
+        // Spec: UHCI I/O — USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC.
+        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBCMD), 2, 0x0001);
+        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBSTS), 2, 0x0020);
+        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBINTR), 2, 0x000F);
+        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_FRNUM), 2, 0x03FF);
+        pci.port_write(
+            0xD000 + u16::from(PCI_PIIX_USB_UHCI_FLBASEADD),
+            4,
+            0x0011_2200,
+        );
+        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_SOFMOD), 1, 0x40);
+        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_PORTSC1), 2, 0x0080);
+        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_PORTSC2), 2, 0x0083);
+
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBCMD), 2) as u16,
+            0x0001
+        );
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBSTS), 2) as u16,
+            0x0020
+        );
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBINTR), 2) as u16,
+            0x000F
+        );
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_FRNUM), 2) as u16,
+            0x03FF
+        );
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_FLBASEADD), 4),
+            0x0011_2200
+        );
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_SOFMOD), 1) as u8,
+            0x40
+        );
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_PORTSC1), 2) as u16,
+            0x0080
+        );
+        assert_eq!(
+            pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_PORTSC2), 2) as u16,
+            0x0083
+        );
+
+        pci.reset();
+        assert_eq!(pci.uhci_io, [0; PCI_PIIX_USB_UHCI_IO_SIZE as usize]);
+        assert_eq!(pci.uhci_io_base(), None);
+    }
+
+    /// Spec: PCI Command I/O Space Enable — clear → UHCI BAR0 not decoded.
+    #[test]
+    fn piix_usb_uhci_disabled_when_io_command_clear() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_PIIX_USB_BAR0_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_D000);
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+        assert_eq!(pci.uhci_io_base(), Some(0xD000));
+        pci.port_write(0xD000, 1, 0x55);
+        assert_eq!(pci.port_read(0xD000, 1) as u8, 0x55);
+
+        // Clear IO; BusMaster alone must not enable decode.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 2, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_BUS_MASTER));
+        assert_eq!(pci.uhci_io_base(), None);
+        assert!(!pci.uhci_owns_port(0xD000));
+        // Writes while disabled must not mutate the register file.
+        pci.port_write(0xD000, 1, 0xAA);
+        // Re-enable IO — prior store while disabled discarded; last good value remains.
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+        assert_eq!(pci.port_read(0xD000, 1) as u8, 0x55);
     }
 
     #[test]
