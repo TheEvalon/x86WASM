@@ -70,7 +70,11 @@
 //! - PIIX IDE BMIDE I/O BAR decode: when Command.IO is set and BMIBA has I/O
 //!   form (bit0), the 16-byte Bus Master IDE register block at
 //!   `BMIBA & 0xFFF0` is a noop store/readback (command/status/PRD pointers;
-//!   primary + secondary). No DMA engine.
+//!   primary + secondary).
+//! - Bounded BMIDE PRD read stub: [`PciConfig::start_bm_read`] /
+//!   [`PciConfig::run_prd_read_stub`] walks **one** primary PRD at BMIDTP
+//!   (phys addr + size + EOT) and copies device→memory via mem callbacks when
+//!   Command.BusMaster is set. No ATA DMA command engine / multi-PRD walk.
 //! - PIIX ACPI PM I/O decode: when Command.IO is set and PMBASE has I/O form
 //!   (bit0), the 64-byte PM register block at `PMBASE & 0xFFC0` is a noop
 //!   store/readback (`PM1a_EVT` / `PM1a_CNT` / `PM_TMR` + remainder). No SCI,
@@ -83,8 +87,8 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - BAR MMIO decode (other than PIIX IDE BMIDE / ACPI PM I/O stubs above), bus
-//!   mastering DMA engine / PRD walks, full PCI device INTx storm (IDE/UHCI);
+//! - BAR MMIO decode (other than PIIX IDE BMIDE / ACPI PM I/O stubs above), full
+//!   BMIDE multi-PRD / ATA READ DMA engine, full PCI device INTx storm (IDE/UHCI);
 //!   PIRQRC software `assert_pirq` stub only
 //! - Host-bridge / PIIX ISA / PIIX USB Command decode side effects;
 //!   PIIX IDE Command side effects beyond BMIDE I/O enable;
@@ -277,7 +281,27 @@ pub const PCI_PIIX_IDE_BMICOM_SECONDARY: u8 = 0x08;
 pub const PCI_PIIX_IDE_BMISTA_SECONDARY: u8 = 0x0A;
 /// Secondary Bus Master IDE Descriptor Table Pointer offset within BMIBA.
 pub const PCI_PIIX_IDE_BMIDTP_SECONDARY: u8 = 0x0C;
+/// BMICOM Start/Stop Bus Master (SSBM) — bit 0.
+/// Spec: Intel 82371SB §2.7.1 / Programming Interface for Bus Master IDE.
+pub const PCI_PIIX_IDE_BMICOM_SSBM: u8 = 1 << 0;
+/// BMICOM Read/Write Control (RWCON) — bit 3; `0` = Read (IDE→memory), `1` = Write.
+/// Spec: Intel 82371SB §2.7.1.
+pub const PCI_PIIX_IDE_BMICOM_RWCON: u8 = 1 << 3;
+/// BMISTA Bus Master IDE Active (BMIDEA) — bit 0 (RO on silicon).
+/// Spec: Intel 82371SB §2.7.2.
+pub const PCI_PIIX_IDE_BMISTA_ACTIVE: u8 = 1 << 0;
+/// Physical Region Descriptor entry size (8 bytes).
+/// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0 §1.2.
+pub const PCI_PIIX_IDE_PRD_ENTRY_SIZE: usize = 8;
+/// PRD End of Table (EOT / EOL) — bit 7 of the last byte (bit 31 of dword 1).
+/// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0 §1.2;
+/// Intel 82371SB — Physical Region Descriptor Format.
+pub const PCI_PIIX_IDE_PRD_EOT: u8 = 1 << 7;
+/// Zero byte-count field in a PRD means 64 KiB.
+/// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0 §1.2.
+pub const PCI_PIIX_IDE_PRD_BYTE_COUNT_64K: u32 = 0x1_0000;
 const _: () = assert!(PCI_PIIX_IDE_BMIDE_IO_SIZE == 16);
+const _: () = assert!(PCI_PIIX_IDE_PRD_ENTRY_SIZE == 8);
 /// PIIX USB UHCI BAR0 config offset (I/O space).
 /// Spec: Intel 82371SB — UHCI I/O BAR at PCI config `0x20` (bit0=1).
 pub const PCI_PIIX_USB_BAR0_OFFSET: u8 = 0x20;
@@ -400,7 +424,7 @@ pub struct PciConfig {
     pub elcr: [u8; 2],
     /// PIIX IDE Bus Master IDE I/O register file (16 bytes at BMIBA).
     /// Spec: Intel 82371SB — BMICOM/BMISTA/BMIDTP primary + secondary.
-    /// Store/readback only; no DMA/PRD engine. Reset all zeros.
+    /// Port store/readback plus one-PRD [`Self::start_bm_read`] stub. Reset all zeros.
     pub bmide_io: [u8; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
     /// PIIX ACPI PM I/O register file (64 bytes at PMBASE).
     /// Spec: Intel 82371AB — `PM1a_EVT` / `PM1a_CNT` / `PM_TMR` (+ remainder).
@@ -442,6 +466,60 @@ pub fn pirqrc_routed_irq(byte: u8) -> Option<u8> {
     match byte & PCI_PIIX_ISA_PIRQRC_IRQ_MASK {
         irq @ (3 | 4 | 5 | 6 | 7 | 9 | 10 | 11 | 12 | 14 | 15) => Some(irq),
         _ => None,
+    }
+}
+
+/// One Physical Region Descriptor (8 bytes).
+///
+/// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0 §1.2;
+/// Intel 82371SB — Physical Region Descriptor Format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BmidePrdEntry {
+    /// Memory region physical base (bit 0 forced clear — dword-aligned).
+    pub phys_addr: u32,
+    /// Byte count for this region (`0` in the PRD field → [`PCI_PIIX_IDE_PRD_BYTE_COUNT_64K`]).
+    pub byte_count: u32,
+    /// End of Table (EOT / EOL) — last descriptor in the PRDT.
+    pub eot: bool,
+}
+
+/// Result of a bounded one-PRD BMIDE transfer stub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BmidePrdTransfer {
+    pub entry: BmidePrdEntry,
+    /// Bytes copied (≤ PRD `byte_count` and ≤ caller buffer length).
+    pub bytes_copied: usize,
+}
+
+/// Errors from [`PciConfig::start_bm_read`] / [`PciConfig::run_prd_read_stub`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BmidePrdError {
+    /// PIIX IDE Command.BusMaster not set.
+    BusMasterDisabled,
+    /// `device_buf` empty — nothing to transfer.
+    EmptyBuffer,
+}
+
+/// Decode one 8-byte PRD entry.
+///
+/// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0 §1.2 —
+/// dword 0 = Memory Region Physical Base Address \[31:1\]; dword 1 low word =
+/// Byte Count \[15:1\] (`0` → 64 KiB); bit 7 of the last byte = EOT.
+#[inline]
+pub fn decode_bmide_prd(bytes: &[u8; PCI_PIIX_IDE_PRD_ENTRY_SIZE]) -> BmidePrdEntry {
+    let phys_addr = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & !1;
+    let count_raw = u16::from_le_bytes([bytes[4], bytes[5]]);
+    // Spec: Byte Count [15:1] — bit 0 reserved/0; zero field means 64 KiB.
+    let byte_count = if count_raw == 0 {
+        PCI_PIIX_IDE_PRD_BYTE_COUNT_64K
+    } else {
+        u32::from(count_raw & 0xFFFE)
+    };
+    let eot = bytes[7] & PCI_PIIX_IDE_PRD_EOT != 0;
+    BmidePrdEntry {
+        phys_addr,
+        byte_count,
+        eot,
     }
 }
 
@@ -1055,6 +1133,94 @@ impl PciConfig {
             }
             _ => {}
         }
+    }
+
+    /// Primary BMIDTP — Descriptor Table Pointer (dword-aligned).
+    ///
+    /// Spec: Intel 82371SB §2.7.3 — bits \[31:2\] = A\[31:2\]; bits \[1:0\] reserved.
+    pub fn bmide_prd_table_ptr_primary(&self) -> u32 {
+        let o = PCI_PIIX_IDE_BMIDTP_PRIMARY as usize;
+        u32::from_le_bytes([
+            self.bmide_io[o],
+            self.bmide_io[o + 1],
+            self.bmide_io[o + 2],
+            self.bmide_io[o + 3],
+        ]) & !0b11
+    }
+
+    /// Walk **one** primary-channel PRD and copy `device_buf` → guest memory (BMIDE Read).
+    ///
+    /// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0
+    /// §1.1–1.2 + Intel 82371SB BMIDTP/PRD — fetch the first 8-byte PRD at
+    /// BMIDTP via `mem_read`, decode phys addr + size + EOT, then write
+    /// `min(prd.byte_count, device_buf.len())` bytes into that region via
+    /// `mem_write`. Does **not** issue ATA READ DMA, walk further PRDs, or
+    /// model PCI aborts.
+    ///
+    /// Requires PIIX IDE Command.BusMaster. Sets BMICOM.SSBM + clears
+    /// BMICOM.RWCON (Read), sets then clears BMISTA.Active when the walked
+    /// PRD has EOT (stub completion of a single-entry table).
+    pub fn start_bm_read<R, W>(
+        &mut self,
+        device_buf: &[u8],
+        mut mem_read: R,
+        mut mem_write: W,
+    ) -> Result<BmidePrdTransfer, BmidePrdError>
+    where
+        R: FnMut(u32) -> u8,
+        W: FnMut(u32, u8),
+    {
+        if self.piix_ide_command() & PCI_COMMAND_BUS_MASTER == 0 {
+            return Err(BmidePrdError::BusMasterDisabled);
+        }
+        if device_buf.is_empty() {
+            return Err(BmidePrdError::EmptyBuffer);
+        }
+
+        let prdt = self.bmide_prd_table_ptr_primary();
+        let mut prd_bytes = [0u8; PCI_PIIX_IDE_PRD_ENTRY_SIZE];
+        for (i, b) in prd_bytes.iter_mut().enumerate() {
+            *b = mem_read(prdt.wrapping_add(i as u32));
+        }
+        let entry = decode_bmide_prd(&prd_bytes);
+
+        // Spec: BMICOM — SSBM=1 starts; RWCON=0 selects Read (IDE→memory).
+        let cmd_off = PCI_PIIX_IDE_BMICOM_PRIMARY as usize;
+        self.bmide_io[cmd_off] =
+            (self.bmide_io[cmd_off] | PCI_PIIX_IDE_BMICOM_SSBM) & !PCI_PIIX_IDE_BMICOM_RWCON;
+        let st_off = PCI_PIIX_IDE_BMISTA_PRIMARY as usize;
+        self.bmide_io[st_off] |= PCI_PIIX_IDE_BMISTA_ACTIVE;
+
+        let n = (entry.byte_count as usize).min(device_buf.len());
+        for (i, &byte) in device_buf.iter().take(n).enumerate() {
+            mem_write(entry.phys_addr.wrapping_add(i as u32), byte);
+        }
+
+        // Spec: BMISTA.Active clears when the last (EOT) region completes, or when SSBM→0.
+        if entry.eot {
+            self.bmide_io[st_off] &= !PCI_PIIX_IDE_BMISTA_ACTIVE;
+            self.bmide_io[cmd_off] &= !PCI_PIIX_IDE_BMICOM_SSBM;
+        }
+
+        Ok(BmidePrdTransfer {
+            entry,
+            bytes_copied: n,
+        })
+    }
+
+    /// Alias for [`Self::start_bm_read`] — bounded one-PRD BMIDE Read stub.
+    #[inline]
+    pub fn run_prd_read_stub<R, W>(
+        &mut self,
+        device_buf: &[u8],
+        mem_read: R,
+        mem_write: W,
+    ) -> Result<BmidePrdTransfer, BmidePrdError>
+    where
+        R: FnMut(u32) -> u8,
+        W: FnMut(u32, u8),
+    {
+        self.start_bm_read(device_buf, mem_read, mem_write)
     }
 
     fn piix_acpi_command(&self) -> u16 {
@@ -1700,6 +1866,137 @@ mod tests {
         pci.reset();
         assert_eq!(pci.bmide_io, [0; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize]);
         assert_eq!(pci.bmide_io_base(), None);
+    }
+
+    /// Program PIIX IDE BMIBA + Command.IO|BusMaster for PRD stub tests.
+    fn program_bmide_bar_and_bus_master(pci: &mut PciConfig, bmiba: u16) {
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, u32::from(bmiba));
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(
+            PCI_CONFIG_DATA,
+            2,
+            u32::from(PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER),
+        );
+    }
+
+    /// Spec: Intel Programming Interface for Bus Master IDE §1.2 — PRD decode.
+    #[test]
+    fn decode_bmide_prd_addr_size_eot_and_zero_means_64k() {
+        // addr=0x00100000, count=0x0200 (512), EOT set
+        let mut e = [0u8; 8];
+        e[0..4].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        e[4..6].copy_from_slice(&0x0200u16.to_le_bytes());
+        e[7] = PCI_PIIX_IDE_PRD_EOT;
+        let d = decode_bmide_prd(&e);
+        assert_eq!(d.phys_addr, 0x0010_0000);
+        assert_eq!(d.byte_count, 512);
+        assert!(d.eot);
+
+        // Zero count → 64 KiB; EOT clear; odd addr bit forced 0.
+        let mut z = [0u8; 8];
+        z[0..4].copy_from_slice(&0x0000_1001u32.to_le_bytes());
+        let d0 = decode_bmide_prd(&z);
+        assert_eq!(d0.phys_addr, 0x0000_1000);
+        assert_eq!(d0.byte_count, PCI_PIIX_IDE_PRD_BYTE_COUNT_64K);
+        assert!(!d0.eot);
+    }
+
+    /// Spec: Intel 82371SB BMIDE — one-PRD Read stub copies via mem callbacks.
+    #[test]
+    fn start_bm_read_walks_one_prd_and_copies_to_fake_memory() {
+        let mut pci = PciConfig::new();
+        program_bmide_bar_and_bus_master(&mut pci, 0xF000);
+
+        const PRDT: u32 = 0x0000_2000;
+        const BUF: u32 = 0x0000_3000;
+        // Primary BMIDTP ← PRDT.
+        pci.port_write(0xF000 + u16::from(PCI_PIIX_IDE_BMIDTP_PRIMARY), 4, PRDT);
+
+        // Fake guest RAM: PRD at PRDT + destination buffer at BUF.
+        use std::cell::RefCell;
+        let mem = RefCell::new(vec![0u8; 0x4000]);
+        let mut prd = [0u8; 8];
+        prd[0..4].copy_from_slice(&BUF.to_le_bytes());
+        prd[4..6].copy_from_slice(&8u16.to_le_bytes());
+        prd[7] = PCI_PIIX_IDE_PRD_EOT;
+        mem.borrow_mut()[PRDT as usize..PRDT as usize + 8].copy_from_slice(&prd);
+
+        let device = [0xAAu8, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+        let xfer = pci
+            .start_bm_read(
+                &device,
+                |phys| mem.borrow().get(phys as usize).copied().unwrap_or(0xFF),
+                |phys, b| {
+                    if let Some(slot) = mem.borrow_mut().get_mut(phys as usize) {
+                        *slot = b;
+                    }
+                },
+            )
+            .expect("bm read");
+
+        assert_eq!(xfer.entry.phys_addr, BUF);
+        assert_eq!(xfer.entry.byte_count, 8);
+        assert!(xfer.entry.eot);
+        assert_eq!(xfer.bytes_copied, 8);
+        assert_eq!(&mem.borrow()[BUF as usize..BUF as usize + 8], &device);
+        // EOT completion clears Active + SSBM.
+        assert_eq!(
+            pci.bmide_io[PCI_PIIX_IDE_BMISTA_PRIMARY as usize] & PCI_PIIX_IDE_BMISTA_ACTIVE,
+            0
+        );
+        assert_eq!(
+            pci.bmide_io[PCI_PIIX_IDE_BMICOM_PRIMARY as usize] & PCI_PIIX_IDE_BMICOM_SSBM,
+            0
+        );
+
+        // Alias path.
+        mem.borrow_mut()[BUF as usize..BUF as usize + 8].fill(0);
+        let xfer2 = pci
+            .run_prd_read_stub(
+                &device,
+                |phys| mem.borrow().get(phys as usize).copied().unwrap_or(0xFF),
+                |phys, b| {
+                    if let Some(slot) = mem.borrow_mut().get_mut(phys as usize) {
+                        *slot = b;
+                    }
+                },
+            )
+            .expect("alias");
+        assert_eq!(xfer2.bytes_copied, 8);
+        assert_eq!(&mem.borrow()[BUF as usize..BUF as usize + 8], &device);
+    }
+
+    /// Spec: PCI Command Bus Master Enable gates BMIDE DMA.
+    #[test]
+    fn start_bm_read_requires_bus_master_enable() {
+        let mut pci = PciConfig::new();
+        // IO only — no BusMaster.
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F000);
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 1, PCI_COMMAND_OFFSET, true),
+        );
+        pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
+
+        let err = pci
+            .start_bm_read(&[0x01], |_| 0, |_, _| {})
+            .expect_err("BM disabled");
+        assert_eq!(err, BmidePrdError::BusMasterDisabled);
     }
 
     /// Spec: PCI Command I/O Space Enable — clear → BMIDE BAR not decoded.
