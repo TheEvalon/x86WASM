@@ -23,7 +23,10 @@
 //! (bit 2) selects BCD (`DM=0`, reset default) or binary (`DM=1`) encoding for
 //! the time/calendar registers during that cascade; Status B `24/12` (bit 1)
 //! selects 24-hour hours `0–23` (set; reset default) or 12-hour hours `1–12`
-//! with AM/PM in bit7 of the hours byte (clear).
+//! with AM/PM in bit7 of the hours byte (clear). Alarm registers (`0x01` /
+//! `0x03` / `0x05`) match by byte equality against current time (works for
+//! BCD, binary, and 12-hour AM/PM bit7); values `C0h`–`FFh` are don't-care.
+//! AF sets on match regardless of AIE; AIE gates IRQF only.
 //! Index-port bit7 is readable/writable; [`CmosRtc::nmi_masked`] and
 //! `Machine::nmi_delivery_enabled` / `Machine::inject_nmi` gate CPU `#NMI`.
 //!
@@ -231,7 +234,8 @@ impl CmosRtc {
     /// Spec (MC146818): when RS≠0, each period sets PF; when SET=0 each period
     /// also sets UF (update-ended colocated with the quantum — honesty note:
     /// calendar fields are not advanced here; use [`Self::tick_second`] for the
-    /// UIP + calendar update cycle). AIE sets AF when alarm regs match time.
+    /// UIP + calendar update cycle). Alarm match sets AF (don't-care `C0h`–`FFh`);
+    /// AIE gates IRQF only.
     /// IRQF = (PF∧PIE) ∨ (AF∧AIE) ∨ (UF∧UIE). Returns true on IRQ pin rising edge.
     pub fn tick(&mut self, periods: u64) -> bool {
         if periods == 0 {
@@ -431,20 +435,18 @@ impl CmosRtc {
     }
 
     fn maybe_set_alarm_flag(&mut self) {
-        let b = self.ram[REG_STATUS_B as usize];
-        if b & STB_AIE == 0 {
-            return;
-        }
         let sec = self.ram[REG_SEC as usize];
         let min = self.ram[REG_MIN as usize];
         let hour = self.ram[REG_HOUR as usize];
         let a_sec = self.ram[REG_SEC_ALARM as usize];
         let a_min = self.ram[REG_MIN_ALARM as usize];
         let a_hour = self.ram[REG_HOUR_ALARM as usize];
-        // Spec: MC146818 alarm "don't care" when bit7 of an alarm register is set.
-        let sec_ok = (a_sec & 0x80) != 0 || a_sec == sec;
-        let min_ok = (a_min & 0x80) != 0 || a_min == min;
-        let hour_ok = (a_hour & 0x80) != 0 || a_hour == hour;
+        // Spec: MC146818 — alarm bytes programmed C0h–FFh are "don't care".
+        // Byte equality otherwise (BCD or binary per DM; 12-hour hours include AM/PM bit7).
+        // AF is set on match regardless of AIE; AIE only gates IRQF (see recompute_irqf).
+        let sec_ok = alarm_field_matches(a_sec, sec);
+        let min_ok = alarm_field_matches(a_min, min);
+        let hour_ok = alarm_field_matches(a_hour, hour);
         if sec_ok && min_ok && hour_ok {
             self.ram[REG_STATUS_C as usize] |= STC_AF;
         }
@@ -558,6 +560,11 @@ fn hour_inc_12(value: u8, binary: bool) -> (u8, bool) {
         (h + 1, pm, false)
     };
     (encode_field(next_h, binary) | next_pm, carry_day)
+}
+
+/// Spec: MC146818 — alarm register matches current field, or is don't-care (C0h–FFh).
+fn alarm_field_matches(alarm: u8, current: u8) -> bool {
+    alarm >= 0xC0 || alarm == current
 }
 
 /// Increment a calendar field; `max` is the inclusive decimal maximum (59, 23, 99).
@@ -799,6 +806,124 @@ mod tests {
         assert!(c.tick(1));
         assert!(c.irq_line());
         assert_ne!(c.read_reg(REG_STATUS_C) & STC_AF, 0);
+    }
+
+    /// Spec: MC146818 — after `tick_second` advances into the alarm time, AIE → AF/IRQF.
+    #[test]
+    fn aie_tick_second_matching_alarm_asserts_irq() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SEC, 0x29);
+        c.write_reg(REG_MIN, 0x15);
+        c.write_reg(REG_HOUR, 0x10);
+        c.write_reg(REG_SEC_ALARM, 0x30);
+        c.write_reg(REG_MIN_ALARM, 0x15);
+        c.write_reg(REG_HOUR_ALARM, 0x10);
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_AIE);
+        assert!(c.tick_second());
+        assert_eq!(c.read_reg(REG_SEC), 0x30);
+        assert!(c.irq_line());
+        assert_ne!(c.read_reg(REG_STATUS_C) & (STC_AF | STC_IRQF), 0);
+    }
+
+    /// Spec: MC146818 alarm "don't care" is C0h–FFh (not merely bit7).
+    #[test]
+    fn aie_alarm_dont_care_c0_matches_any_field() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SEC, 0x45);
+        c.write_reg(REG_MIN, 0x12);
+        c.write_reg(REG_HOUR, 0x08);
+        c.write_reg(REG_SEC_ALARM, 0xC0);
+        c.write_reg(REG_MIN_ALARM, 0xFF);
+        c.write_reg(REG_HOUR_ALARM, 0xC0);
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_AIE);
+        assert!(c.tick(1));
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_AF, 0);
+        assert!(c.irq_line());
+    }
+
+    /// Spec: values below C0h (e.g. 80h) are not don't-care — needed for 12-hour PM hours.
+    #[test]
+    fn aie_alarm_0x80_is_not_dont_care() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SEC, 0x00);
+        c.write_reg(REG_MIN, 0x00);
+        c.write_reg(REG_HOUR, 0x01);
+        c.write_reg(REG_SEC_ALARM, 0x80); // bit7 set but < C0 → must match exactly
+        c.write_reg(REG_MIN_ALARM, 0x00);
+        c.write_reg(REG_HOUR_ALARM, 0x01);
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_AIE);
+        assert!(!c.tick(1)); // UF may set; AIE∧AF must not
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_AF, 0);
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_IRQF, 0);
+    }
+
+    /// Spec: DM=1 binary time/alarm bytes compare equal on match.
+    #[test]
+    fn aie_tick_second_binary_dm_matching_alarm_asserts_irq() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SEC, 29);
+        c.write_reg(REG_MIN, 15);
+        c.write_reg(REG_HOUR, 16);
+        c.write_reg(REG_SEC_ALARM, 30);
+        c.write_reg(REG_MIN_ALARM, 15);
+        c.write_reg(REG_HOUR_ALARM, 16);
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_DM | STB_AIE);
+        assert!(c.tick_second());
+        assert_eq!(c.read_reg(REG_SEC), 30);
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_AF, 0);
+        assert!(c.irq_line());
+    }
+
+    /// Spec: 12-hour mode matches full hours byte including AM/PM bit7.
+    #[test]
+    fn aie_tick_second_twelve_hour_pm_matching_alarm_asserts_irq() {
+        let mut c = CmosRtc::new();
+        // 12-hour BCD: 3:15:29 PM → alarm at 3:15:30 PM ($83).
+        c.write_reg(REG_SEC, 0x29);
+        c.write_reg(REG_MIN, 0x15);
+        c.write_reg(REG_HOUR, HOUR_PM | 0x03);
+        c.write_reg(REG_SEC_ALARM, 0x30);
+        c.write_reg(REG_MIN_ALARM, 0x15);
+        c.write_reg(REG_HOUR_ALARM, HOUR_PM | 0x03);
+        c.write_reg(REG_STATUS_B, STB_AIE); // 12-hour (bit1 clear) + AIE
+        assert!(c.tick_second());
+        assert_eq!(c.read_reg(REG_HOUR), HOUR_PM | 0x03);
+        assert_eq!(c.read_reg(REG_SEC), 0x30);
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_AF, 0);
+        assert!(c.irq_line());
+    }
+
+    /// Spec: AF sets on time==alarm even when AIE=0; IRQF still requires AIE.
+    #[test]
+    fn alarm_match_sets_af_without_aie_no_irqf() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SEC, 0x30);
+        c.write_reg(REG_MIN, 0x15);
+        c.write_reg(REG_HOUR, 0x10);
+        c.write_reg(REG_SEC_ALARM, 0x30);
+        c.write_reg(REG_MIN_ALARM, 0x15);
+        c.write_reg(REG_HOUR_ALARM, 0x10);
+        // DEFAULT_STATUS_B: AIE clear
+        assert!(!c.tick(1));
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_AF, 0);
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_IRQF, 0);
+        assert!(!c.irq_line());
+    }
+
+    /// Spec: mismatched alarm field → AF clear (AIE alone does not assert).
+    #[test]
+    fn aie_mismatched_alarm_does_not_set_af() {
+        let mut c = CmosRtc::new();
+        c.write_reg(REG_SEC, 0x30);
+        c.write_reg(REG_MIN, 0x15);
+        c.write_reg(REG_HOUR, 0x10);
+        c.write_reg(REG_SEC_ALARM, 0x31);
+        c.write_reg(REG_MIN_ALARM, 0x15);
+        c.write_reg(REG_HOUR_ALARM, 0x10);
+        c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_AIE);
+        assert!(!c.tick(1));
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_AF, 0);
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_IRQF, 0);
     }
 
     /// Spec: RS=0 disables periodic (PF not set from rate).
