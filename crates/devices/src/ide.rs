@@ -5,8 +5,8 @@
 //! # Spec refs
 //!
 //! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
-//!   WRITE SECTORS (`0x30`), READ VERIFY SECTORS (`0x40`), PACKET (`0xA0`),
-//!   IDENTIFY PACKET DEVICE (`0xA1`),
+//!   WRITE SECTORS (`0x30`), WRITE VERIFY SECTORS (`0x3C`), READ VERIFY
+//!   SECTORS (`0x40`), PACKET (`0xA0`), IDENTIFY PACKET DEVICE (`0xA1`),
 //!   SMART (`0xB0`), READ DMA (`0xC8`), WRITE DMA (`0xCA`), SECURITY SET
 //!   PASSWORD (`0xF1`), SECURITY UNLOCK (`0xF2`), SECURITY ERASE PREPARE
 //!   (`0xF3`), SECURITY ERASE UNIT (`0xF4`), SECURITY FREEZE LOCK (`0xF5`),
@@ -158,6 +158,9 @@ pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
 pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
 /// WRITE SECTORS (with retry) — LBA28 PIO.
 pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+/// WRITE VERIFY SECTORS (with retry) — LBA28 non-data; verifies writable range.
+/// Spec: ATA/ATAPI Command Set — WRITE VERIFY SECTORS (`0x3C`).
+pub const ATA_CMD_WRITE_VERIFY_SECTORS: u8 = 0x3C;
 /// READ VERIFY SECTORS (with retry) — LBA28 non-data; verifies range without PIO.
 /// Spec: ATA/ATAPI Command Set — READ VERIFY SECTORS (`0x40`).
 pub const ATA_CMD_READ_VERIFY_SECTORS: u8 = 0x40;
@@ -642,13 +645,15 @@ impl IdePrimary {
         self.begin_pio_in();
     }
 
-    /// READ VERIFY SECTORS (`0x40`) on ATA master — non-data LBA28 range check.
+    /// READ VERIFY SECTORS (`0x40`) / WRITE VERIFY SECTORS (`0x3C`) on ATA master
+    /// — non-data LBA28 range check.
     ///
-    /// Spec: ATA/ATAPI Command Set — READ VERIFY SECTORS verifies media without
-    /// transferring sector data (no DRQ). This stub succeeds when the LBA28
-    /// range lies within the backing image; OOB → ERR+IDNF; CHS → ABRT.
-    /// Absent/slave → status 0. INTRQ follows nIEN like FLUSH CACHE.
-    fn exec_read_verify_sectors(&mut self) {
+    /// Spec: ATA/ATAPI Command Set — READ/WRITE VERIFY SECTORS verify media
+    /// without transferring sector data (no DRQ). This stub succeeds when the
+    /// LBA28 range lies within the backing image; OOB → ERR+IDNF; CHS → ABRT.
+    /// Absent/slave → status 0. INTRQ follows nIEN like FLUSH CACHE. No write
+    /// to media on WRITE VERIFY (range check only).
+    fn exec_verify_sectors(&mut self) {
         if !self.present || self.is_slave_selected() {
             self.status = 0;
             self.transferring = false;
@@ -1246,7 +1251,9 @@ impl IdePrimary {
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
-            ATA_CMD_READ_VERIFY_SECTORS => self.exec_read_verify_sectors(),
+            ATA_CMD_READ_VERIFY_SECTORS | ATA_CMD_WRITE_VERIFY_SECTORS => {
+                self.exec_verify_sectors()
+            }
             ATA_CMD_FLUSH_CACHE | ATA_CMD_FLUSH_CACHE_EXT => self.exec_flush_cache(),
             ATA_CMD_NOP => self.exec_nop(),
             ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
@@ -2077,6 +2084,50 @@ mod tests {
         );
         assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
         assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI — WRITE VERIFY SECTORS (`0x3C`) non-data success for
+    /// in-range LBA28; no DRQ / no media write.
+    #[test]
+    fn write_verify_sectors_succeeds_in_range_no_write() {
+        let img = vec![0x5Au8; SECTOR_SIZE * 2];
+        let mut ide = IdePrimary::with_image(img.clone());
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_WRITE_VERIFY_SECTORS),
+        );
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert_eq!(ide.image, img, "WRITE VERIFY must not alter media");
+    }
+
+    /// Spec: ATA — WRITE VERIFY SECTORS out-of-range → ERR+IDNF.
+    #[test]
+    fn write_verify_sectors_oob_sets_idnf() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 3);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_WRITE_VERIFY_SECTORS),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
     }
 
     #[test]

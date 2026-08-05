@@ -495,6 +495,18 @@ pub const VGA_GC_SET_RESET: u8 = 0x00;
 /// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Set/Reset `0x00`.
 /// Store/readback only; no Set/Reset plane fill side effects on the text plane.
 pub const VGA_GC_SET_RESET_DEFAULT: u8 = 0x00;
+/// Graphics Controller Enable Set/Reset Register index.
+///
+/// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x01`. Bits 3:0 enable
+/// Set/Reset for planes 0–3 in Write Mode 0 (`1` = that plane uses Set/Reset
+/// instead of CPU data). Plane write-path side effects are out of scope
+/// (store/readback only).
+pub const VGA_GC_ENABLE_SET_RESET: u8 = 0x01;
+/// Mode-03h-class Enable Set/Reset reset default (`0x00`).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Enable Set/Reset `0x00`
+/// (CPU data path). Store/readback only; no Enable Set/Reset side effects.
+pub const VGA_GC_ENABLE_SET_RESET_DEFAULT: u8 = 0x00;
 /// Graphics Controller Data Rotate / Function Select Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x03`. Bits 2:0 =
@@ -553,6 +565,9 @@ const _: () = assert!(
     VGA_GC_SET_RESET == 0x00
         && VGA_GC_SET_RESET_DEFAULT == 0x00
         && VGA_GC_DEFAULTS[VGA_GC_SET_RESET as usize] == VGA_GC_SET_RESET_DEFAULT
+        && VGA_GC_ENABLE_SET_RESET == 0x01
+        && VGA_GC_ENABLE_SET_RESET_DEFAULT == 0x00
+        && VGA_GC_DEFAULTS[VGA_GC_ENABLE_SET_RESET as usize] == VGA_GC_ENABLE_SET_RESET_DEFAULT
         && VGA_GC_DATA_ROTATE == 0x03
         && VGA_GC_DATA_ROTATE_DEFAULT == 0x00
         && VGA_GC_MODE == 0x05
@@ -569,14 +584,14 @@ const _: () = assert!(
 ///
 /// Spec: FreeVGA Graphics Registers / OSDev VGA Hardware / IBM VGA mode-03h —
 /// SeaBIOS-class text programming: Set/Reset [`VGA_GC_SET_RESET_DEFAULT`],
-/// Enable Set/Reset `0x00`, Color Compare `0x00`, Data Rotate
-/// [`VGA_GC_DATA_ROTATE_DEFAULT`], Read Map Select `0x00`, Graphics Mode
-/// [`VGA_GC_MODE_DEFAULT`] (host odd/even), Miscellaneous
+/// Enable Set/Reset [`VGA_GC_ENABLE_SET_RESET_DEFAULT`], Color Compare `0x00`,
+/// Data Rotate [`VGA_GC_DATA_ROTATE_DEFAULT`], Read Map Select `0x00`, Graphics
+/// Mode [`VGA_GC_MODE_DEFAULT`] (host odd/even), Miscellaneous
 /// [`VGA_GC_MISC_DEFAULT`] (odd/even + memory map `B8000`), Color Don't Care
 /// `0x00`, Bit Mask [`VGA_GC_BIT_MASK_DEFAULT`].
 pub const VGA_GC_DEFAULTS: [u8; VGA_GC_REG_COUNT] = [
     VGA_GC_SET_RESET_DEFAULT,
-    0x00,
+    VGA_GC_ENABLE_SET_RESET_DEFAULT,
     0x00,
     VGA_GC_DATA_ROTATE_DEFAULT,
     0x00,
@@ -2409,6 +2424,48 @@ mod tests {
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0xAA);
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x00);
+    }
+
+    /// Spec: FreeVGA Graphics Registers — Enable Set/Reset (index `0x01`)
+    /// store/readback. Mode-03h reset default is
+    /// [`VGA_GC_ENABLE_SET_RESET_DEFAULT`] (`0x00`).
+    #[test]
+    fn gc_enable_set_reset_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.gc_regs[usize::from(VGA_GC_ENABLE_SET_RESET)],
+            VGA_GC_ENABLE_SET_RESET_DEFAULT
+        );
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_ENABLE_SET_RESET));
+        assert_eq!(
+            v.port_read(VGA_GC_DATA, 1) as u8,
+            VGA_GC_ENABLE_SET_RESET_DEFAULT
+        );
+
+        // Enable Set/Reset on planes 0+1.
+        v.port_write(VGA_GC_DATA, 1, 0x03);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x03);
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_ENABLE_SET_RESET)], 0x03);
+
+        v.port_write(
+            VGA_GC_INDEX,
+            2,
+            (u32::from(0x0Fu8) << 8) | u32::from(VGA_GC_ENABLE_SET_RESET),
+        );
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_ENABLE_SET_RESET)], 0x0F);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_ENABLE_SET_RESET));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x0F);
+
+        v.reset();
+        assert_eq!(
+            v.gc_regs[usize::from(VGA_GC_ENABLE_SET_RESET)],
+            VGA_GC_ENABLE_SET_RESET_DEFAULT
+        );
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_ENABLE_SET_RESET));
+        assert_eq!(
+            v.port_read(VGA_GC_DATA, 1) as u8,
+            VGA_GC_ENABLE_SET_RESET_DEFAULT
+        );
     }
 
     /// Spec: FreeVGA Graphics Registers — Set/Reset (index `0x00`) store/readback.

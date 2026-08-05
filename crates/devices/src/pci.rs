@@ -31,6 +31,8 @@
 //!   (`PCI_HOST_BRIDGE_COMMAND_MASK` = `0x0007`); other Command bits hardwired 0.
 //! - Host bridge Status (`0x06`) readback stub: CapList=0, FastB2B=1, DevSel=medium
 //!   (`PCI_HOST_BRIDGE_STATUS_STUB` = `0x0280`); RW1C error bits (MDPE/STA/RTA/RMA/SSE/DPE).
+//! - Host bridge Cache Line Size (`0x0C`) byte store/readback (reset `0x00`; no
+//!   cache/burst side effects yet).
 //! - Host bridge Latency Timer (`0x0D`) byte store/readback (reset `0x00`; no
 //!   arbitration side effects yet).
 //! - PIIX ISA bridge (`00:01.0`) Command (`0x04`) store/readback: sticky IO/MEM/BusMaster
@@ -127,6 +129,14 @@ const _: () = assert!(PCI_PIIX_ACPI_COMMAND_MASK == PCI_HOST_BRIDGE_COMMAND_MASK
 /// PCI Status register config offset.
 /// Spec: PCI Local Bus — Type 0 header Status at `0x06`.
 pub const PCI_STATUS_OFFSET: u8 = 0x06;
+/// PCI Cache Line Size config offset (Type 0 header byte).
+/// Spec: PCI Local Bus — Cache Line Size at `0x0C` (units of 32-bit DWORDs).
+/// This stub stores/reads back the byte; cache-line / burst side effects are
+/// out of scope.
+pub const PCI_CACHE_LINE_SIZE_OFFSET: u8 = 0x0C;
+/// Host bridge Cache Line Size reset default.
+pub const PCI_HOST_BRIDGE_CACHE_LINE_SIZE_DEFAULT: u8 = 0x00;
+const _: () = assert!(PCI_CACHE_LINE_SIZE_OFFSET == 0x0C);
 /// PCI Latency Timer config offset (Type 0 header byte).
 /// Spec: PCI Local Bus — Latency Timer at `0x0D` (bus master grant timer, in
 /// PCI clocks / 8). This stub stores/reads back the byte; arbitration timing
@@ -1065,6 +1075,48 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: PCI Local Bus — Cache Line Size at `0x0C`. Host bridge `00:00.0`
+    /// stores/reads back the byte (reset `0x00`); no cache/burst side effects.
+    /// Mechanism #1: CONFIG_ADDRESS dword-aligned at `0x0C`; byte via `0xCFC`.
+    #[test]
+    fn host_bridge_cache_line_size_store_readback() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_CACHE_LINE_SIZE_OFFSET, true),
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 1) as u8,
+            PCI_HOST_BRIDGE_CACHE_LINE_SIZE_DEFAULT,
+            "Cache Line Size defaults to 0 at reset"
+        );
+
+        pci.port_write(PCI_CONFIG_DATA, 1, 0x08);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 1) as u8, 0x08);
+
+        pci.port_write(PCI_CONFIG_DATA, 1, 0x10);
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 1) as u8, 0x10);
+
+        // Word write at 0xCFC must not clobber Latency Timer when only CLS changes
+        // via byte write; dword lane: set CLS=0x20 leaving LT at prior value.
+        pci.port_write(0xCFD, 1, 0x40); // Latency Timer
+        pci.port_write(PCI_CONFIG_DATA, 1, 0x20); // Cache Line Size only
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 1) as u8, 0x20);
+        assert_eq!(pci.port_read(0xCFD, 1) as u8, 0x40);
+
+        pci.reset();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_CACHE_LINE_SIZE_OFFSET, true),
+        );
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_DATA, 1) as u8,
+            PCI_HOST_BRIDGE_CACHE_LINE_SIZE_DEFAULT
+        );
     }
 
     /// Spec: PCI Local Bus — Latency Timer at `0x0D`. Host bridge `00:00.0`
