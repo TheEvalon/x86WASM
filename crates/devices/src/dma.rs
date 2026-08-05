@@ -23,13 +23,15 @@
 //!   (Intel 8237A programming model).
 //! - Status register TC bits (3:0) clear-on-read + `latch_tc` device/test API.
 //! - `transfer_block` software helper for 8-bit channels 0–3 and 16-bit
-//!   channels 4–7: Single + Increment/Decrement + Verify/Read/Write,
+//!   channels 4–7: Demand/Single/Block + Increment/Decrement + Verify/Read/Write,
 //!   Autoinitialize optional. Read/Write use `mem_read` / `mem_write`
 //!   callbacks; Verify advances address/count and latches TC without memory
 //!   R/W (`io_buf` length still checked; payload bytes left untouched). With
 //!   Autoinitialize, after TC Current is reloaded from Base and the channel
 //!   stays unmasked/ready for another helper call. Without Autoinitialize,
 //!   after TC the channel mask bit is set (Intel 8237A hardware auto-mask).
+//!   Demand and Block complete the programmed count in one helper call with
+//!   the same TC/mask/autoinit rules as Single (DREQ hold/release not modeled).
 //!   - 8-bit (ch0–3): length `count+1` bytes; phys `(page << 16) | addr`;
 //!     address steps ±1 per byte within the 64 KiB page.
 //!   - 16-bit (ch4–7, AT cascade slave): length `2*(count+1)` bytes; Current
@@ -41,7 +43,7 @@
 //! # Unsupported (explicit)
 //!
 //! - Hardware DREQ/DACK handshake / cycle-accurate bus timing
-//! - Demand/block/cascade modes (beyond word-channel Single helper)
+//! - Cascade mode (mode bits 7:6 = `11`) for `transfer_block`
 //! - Floppy / IDE automatic DMA engine / DREQ path (Machine PhysMem wiring lives in
 //!   `machine-pc::Machine::dma_transfer`; no SeaBIOS floppy DMA)
 
@@ -54,7 +56,8 @@ pub enum DmaTransferError {
     BadChannel,
     /// Channel mask bit is set (masked channels do not transfer).
     Masked,
-    /// Mode register outside Single + Inc/Dec + Verify/Read/Write (+ optional Autoinitialize).
+    /// Mode register outside Demand/Single/Block + Inc/Dec + Verify/Read/Write
+    /// (+ optional Autoinitialize); Cascade is rejected.
     UnsupportedMode,
     /// `io_buf` shorter than programmed transfer length in bytes
     /// (`count+1` for 8-bit ch0–3; `2*(count+1)` for 16-bit ch4–7).
@@ -311,7 +314,10 @@ impl Dma8237 {
     ///
     /// # Mode subset honored
     ///
-    /// - bits 7:6 = Single mode (`01`)
+    /// - bits 7:6 = Demand (`00`), Single (`01`), or Block (`10`)
+    ///   (Cascade `11` rejected). Spec: Intel 8237A mode register — Demand and
+    ///   Block differ in DREQ service timing; this helper completes all
+    ///   programmed units in one call with Single-equivalent TC/mask/autoinit.
     /// - bit 5 = address increment (`0`) or decrement (`1`)
     /// - bit 4 = Autoinitialize enable (`0` or `1`)
     /// - bits 3:2 = Verify (`00`, no memory R/W; `io_buf` length still checked),
@@ -319,7 +325,7 @@ impl Dma8237 {
     ///   Read (`10`, memory→I/O into `io_buf` via `mem_read`)
     /// - bits 1:0 must match the controller channel index (master 0–3 / slave 0–3)
     ///
-    /// Demand/block/cascade modes return [`DmaTransferError::UnsupportedMode`].
+    /// Cascade mode returns [`DmaTransferError::UnsupportedMode`].
     /// ISA channel `> 7` returns [`BadChannel`].
     ///
     /// This is a software helper for device/unit tests — **not** DREQ/DACK timing.
@@ -425,12 +431,15 @@ impl Dma8237 {
         Ok(byte_len)
     }
 
-    /// Single + Inc/Dec + Verify/Read/Write, Autoinitialize optional, channel matches.
+    /// Demand/Single/Block + Inc/Dec + Verify/Read/Write, Autoinitialize optional,
+    /// channel matches. Spec: Intel 8237A mode bits 7:6 — Cascade (`11`) rejected.
     fn mode_supports_transfer_block(mode: u8, ctrl_channel: usize) -> bool {
         let sel = (mode & 0x03) as usize;
         let xfer = (mode >> 2) & 0x03;
         let mode_sel = (mode >> 6) & 0x03;
-        sel == ctrl_channel && mode_sel == 0b01 && (xfer == 0b00 || xfer == 0b01 || xfer == 0b10)
+        sel == ctrl_channel
+            && (mode_sel == 0b00 || mode_sel == 0b01 || mode_sel == 0b10)
+            && (xfer == 0b00 || xfer == 0b01 || xfer == 0b10)
     }
 
     fn page_channel(port: u16) -> Option<usize> {
@@ -700,8 +709,9 @@ mod tests {
     fn transfer_block_rejects_unsupported_mode_and_masked() {
         let mut d = Dma8237::new();
         program_ch2_write(&mut d, 0, 0x100, 0);
-        // Block mode (bits 7:6 = 10) instead of Single — out of subset.
-        d.port_write(0x0B, 1, 0x86);
+        // Cascade mode (bits 7:6 = 11) — not a data-transfer mode for the helper.
+        // Spec: Intel 8237A mode register — Cascade selects a cascaded controller.
+        d.port_write(0x0B, 1, 0xC6);
         let mut mem = [0u8; 16];
         let mut io = [0x55u8];
         assert_eq!(
@@ -718,6 +728,209 @@ mod tests {
             d.transfer_block(2, &mut io, |_| 0, |i, b| mem[i as usize] = b,),
             Err(DmaTransferError::Masked)
         );
+    }
+
+    /// Program master channel: page/addr/count + mode + unmask.
+    fn program_master_ch_write(
+        d: &mut Dma8237,
+        isa_ch: usize,
+        page: u8,
+        addr: u16,
+        count_minus_one: u16,
+        mode: u8,
+    ) {
+        assert!(isa_ch <= 3);
+        let addr_port = (isa_ch * 2) as u16;
+        let count_port = addr_port + 1;
+        let page_port = match isa_ch {
+            0 => DMA_PAGE_CH0,
+            1 => DMA_PAGE_CH1,
+            2 => DMA_PAGE_CH2,
+            3 => DMA_PAGE_CH3,
+            _ => unreachable!(),
+        };
+        d.port_write(0x0C, 1, 0);
+        d.port_write(addr_port, 1, (addr & 0xFF) as u32);
+        d.port_write(addr_port, 1, (addr >> 8) as u32);
+        d.port_write(0x0C, 1, 0);
+        d.port_write(count_port, 1, (count_minus_one & 0xFF) as u32);
+        d.port_write(count_port, 1, (count_minus_one >> 8) as u32);
+        d.port_write(page_port, 1, u32::from(page));
+        d.port_write(0x0B, 1, u32::from(mode));
+        d.port_write(0x0A, 1, isa_ch as u32); // unmask
+    }
+
+    #[test]
+    fn transfer_block_demand_write_ch0_to_ch3_completes_count_tc_and_masks() {
+        // Spec: Intel 8237A mode bits 7:6 = Demand (`00`). Software helper
+        // completes the programmed count (same TC / post-TC Current / auto-mask
+        // as Single when Autoinitialize is clear). DREQ hold/release not modeled.
+        for isa_ch in 0usize..=3 {
+            let mut d = Dma8237::new();
+            // Demand | Inc | Write | chN — bits 7:6=00, 3:2=01, 1:0=ch
+            let mode = 0x04 | (isa_ch as u8);
+            program_master_ch_write(&mut d, isa_ch, 0x01, 0x1000, 3, mode); // 4 bytes
+            let mem = RefCell::new(vec![0u8; 0x2_0000]);
+            let mut io = [0xAAu8, 0xBB, 0xCC, 0xDD];
+            let n = d
+                .transfer_block(
+                    isa_ch,
+                    &mut io,
+                    |phys| mem.borrow()[phys as usize],
+                    |phys, b| mem.borrow_mut()[phys as usize] = b,
+                )
+                .unwrap_or_else(|e| panic!("demand write ch{isa_ch}: {e:?}"));
+            assert_eq!(n, 4);
+            assert_eq!(&mem.borrow()[0x1_1000..0x1_1004], &[0xAA, 0xBB, 0xCC, 0xDD]);
+            assert_eq!(d.master.channels[isa_ch].addr, 0x1004);
+            assert_eq!(d.master.channels[isa_ch].count, 0xFFFF);
+            assert_eq!(d.master.status & (1 << isa_ch), 1 << isa_ch);
+            assert_eq!(d.master.mask & (1 << isa_ch), 1 << isa_ch);
+        }
+    }
+
+    #[test]
+    fn transfer_block_block_write_ch0_to_ch3_completes_count_tc_and_masks() {
+        // Spec: Intel 8237A mode bits 7:6 = Block (`10`). Helper finishes all
+        // count+1 units in one call; TC + auto-mask match Single (no Autoinit).
+        for isa_ch in 0usize..=3 {
+            let mut d = Dma8237::new();
+            // Block | Inc | Write | chN — bits 7:6=10, 3:2=01, 1:0=ch
+            let mode = 0x84 | (isa_ch as u8);
+            program_master_ch_write(&mut d, isa_ch, 0x02, 0x2000, 1, mode); // 2 bytes
+            let mem = RefCell::new(vec![0u8; 0x4_0000]);
+            let mut io = [0x11u8, 0x22];
+            let n = d
+                .transfer_block(
+                    isa_ch,
+                    &mut io,
+                    |phys| mem.borrow()[phys as usize],
+                    |phys, b| mem.borrow_mut()[phys as usize] = b,
+                )
+                .unwrap_or_else(|e| panic!("block write ch{isa_ch}: {e:?}"));
+            assert_eq!(n, 2);
+            assert_eq!(&mem.borrow()[0x2_2000..0x2_2002], &[0x11, 0x22]);
+            assert_eq!(d.master.channels[isa_ch].addr, 0x2002);
+            assert_eq!(d.master.channels[isa_ch].count, 0xFFFF);
+            assert_eq!(d.master.status & (1 << isa_ch), 1 << isa_ch);
+            assert_eq!(d.master.mask & (1 << isa_ch), 1 << isa_ch);
+        }
+    }
+
+    #[test]
+    fn transfer_block_demand_autoinit_reloads_base_without_mask() {
+        // Spec: Intel 8237A — Autoinitialize (mode bit 4) + Demand: after TC,
+        // Current reloads from Base; channel stays unmasked (same as Single).
+        let mut d = Dma8237::new();
+        program_master_ch_write(&mut d, 2, 0x01, 0x1000, 1, 0x16); // Demand|Auto|Inc|Write|ch2
+        let mem = RefCell::new(vec![0u8; 0x2_0000]);
+        let mut io = [0xAAu8, 0xBB];
+        d.transfer_block(
+            2,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("demand autoinit write");
+        assert_eq!(d.master.channels[2].addr, 0x1000);
+        assert_eq!(d.master.channels[2].count, 1);
+        assert_eq!(d.master.mask & 0x04, 0);
+        assert_eq!(d.master.status & 0x04, 0x04);
+
+        let mut io2 = [0xCCu8, 0xDD];
+        d.transfer_block(
+            2,
+            &mut io2,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("second demand autoinit write");
+        assert_eq!(&mem.borrow()[0x1_1000..0x1_1002], &[0xCC, 0xDD]);
+        assert_eq!(d.master.channels[2].addr, 0x1000);
+        assert_eq!(d.master.mask & 0x04, 0);
+    }
+
+    #[test]
+    fn transfer_block_block_autoinit_reloads_base_without_mask() {
+        // Spec: Intel 8237A — Autoinitialize + Block: TC reloads Base; no auto-mask.
+        let mut d = Dma8237::new();
+        program_master_ch_write(&mut d, 1, 0x00, 0x0100, 0, 0x95); // Block|Auto|Inc|Write|ch1
+        let mem = RefCell::new(vec![0u8; 0x1000]);
+        let mut io = [0xEE];
+        d.transfer_block(
+            1,
+            &mut io,
+            |phys| mem.borrow()[phys as usize],
+            |phys, b| mem.borrow_mut()[phys as usize] = b,
+        )
+        .expect("block autoinit write");
+        assert_eq!(mem.borrow()[0x0100], 0xEE);
+        assert_eq!(d.master.channels[1].addr, 0x0100);
+        assert_eq!(d.master.channels[1].count, 0);
+        assert_eq!(d.master.mask & 0x02, 0);
+        assert_eq!(d.master.status & 0x02, 0x02);
+    }
+
+    #[test]
+    fn transfer_block_block_read_moves_memory_to_io() {
+        // Spec: Intel 8237A Block + Read (bits 3:2 = 10) — memory→device.
+        let mut d = Dma8237::new();
+        program_master_ch_write(&mut d, 2, 0x00, 0x2000, 1, 0x8A); // Block|Inc|Read|ch2
+        let mem = RefCell::new(vec![0u8; 0x3000]);
+        mem.borrow_mut()[0x2000] = 0x33;
+        mem.borrow_mut()[0x2001] = 0x44;
+        let mut io = [0u8; 2];
+        let n = d
+            .transfer_block(
+                2,
+                &mut io,
+                |phys| mem.borrow()[phys as usize],
+                |phys, b| mem.borrow_mut()[phys as usize] = b,
+            )
+            .expect("block read");
+        assert_eq!(n, 2);
+        assert_eq!(io, [0x33, 0x44]);
+        assert_eq!(d.master.channels[2].addr, 0x2002);
+        assert_eq!(d.master.channels[2].count, 0xFFFF);
+        assert_eq!(d.master.mask & 0x04, 0x04);
+    }
+
+    #[test]
+    fn transfer_block_ch5_demand_and_block_word_write_parity() {
+        // Spec: Intel 8237A Demand/Block on 16-bit slave ch1 (ISA ch5): same
+        // word length / phys / TC / auto-mask as Single word helper.
+        for (mode, label) in [(0x05u8, "demand"), (0x85u8, "block")] {
+            let mut d = Dma8237::new();
+            d.port_write(0xD8, 1, 0);
+            d.port_write(0xC4, 1, 0x00);
+            d.port_write(0xC4, 1, 0x10); // word addr 0x1000
+            d.port_write(0xD8, 1, 0);
+            d.port_write(0xC6, 1, 0x01); // 2 words
+            d.port_write(0xC6, 1, 0x00);
+            d.port_write(DMA_PAGE_CH5, 1, 0x01);
+            d.port_write(0xD6, 1, u32::from(mode)); // Demand|Block | Inc | Write | ch1
+            d.port_write(0xD4, 1, 0x01);
+            let mem = RefCell::new(vec![0u8; 0x2_0000]);
+            let mut io = [0xAAu8, 0xBB, 0xCC, 0xDD];
+            let n = d
+                .transfer_block(
+                    5,
+                    &mut io,
+                    |phys| mem.borrow()[phys as usize],
+                    |phys, b| mem.borrow_mut()[phys as usize] = b,
+                )
+                .unwrap_or_else(|e| panic!("ch5 {label} word write: {e:?}"));
+            assert_eq!(n, 4, "{label}");
+            assert_eq!(
+                &mem.borrow()[0x1_2000..0x1_2004],
+                &[0xAA, 0xBB, 0xCC, 0xDD],
+                "{label}"
+            );
+            assert_eq!(d.slave.channels[1].addr, 0x1002, "{label}");
+            assert_eq!(d.slave.channels[1].count, 0xFFFF, "{label}");
+            assert_eq!(d.slave.status & 0x02, 0x02, "{label}");
+            assert_eq!(d.slave.mask & 0x02, 0x02, "{label}");
+        }
     }
 
     #[test]
@@ -1005,7 +1218,8 @@ mod tests {
     fn transfer_block_ch5_rejects_unsupported_mode_and_masked() {
         let mut d = Dma8237::new();
         program_ch5_write(&mut d, 0, 0x100, 0);
-        d.port_write(0xD6, 1, 0x85); // Block mode instead of Single
+        // Spec: Intel 8237A — Cascade (bits 7:6 = 11) is not a data-transfer mode.
+        d.port_write(0xD6, 1, 0xC5); // Cascade | Inc | Write | slave ch1
         let mut io = [0x55u8, 0x66];
         assert_eq!(
             d.transfer_block(5, &mut io, |_| 0, |_, _| {}),
