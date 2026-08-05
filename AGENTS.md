@@ -56,7 +56,7 @@ cargo test --workspace
 
 ## Current phase focus
 
-Until Milestone 1 exit criteria are met: repository, CPU state, buses, decoder framework, minimal interpreter, serial debug ROM. **Not** VGA, IDE, Windows, JIT, networking, audio, or SMP.
+Milestone 0/1 exit (HELLO ROM path) is met. Active work is **Milestone 2** via one bounded slice per chat: real-mode foundation → interrupts/exceptions → legacy PC devices → SeaBIOS/FreeDOS. **Not** VGA/IDE/SeaBIOS as a single slice; **not** Windows, JIT, networking, audio, or SMP.
 
 ## Plan authority
 

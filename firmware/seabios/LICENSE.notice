@@ -1,0 +1,24 @@
+SeaBIOS (when built into this directory)
+========================================
+
+Upstream project: SeaBIOS
+Canonical docs:   https://www.seabios.org/
+Source mirror:    https://gitlab.com/qemu-project/seabios.git
+Pinned release:   rel-1.16.3 (see ../manifests/seabios.json)
+
+License: GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later).
+The full upstream COPYING text is copied beside bios.bin as COPYING.SeaBIOS
+when you run ../build-scripts/build-seabios.sh.
+
+x86WASM project policy
+----------------------
+- Keep SeaBIOS sources and binaries under firmware/ only.
+- Do not vendor SeaBIOS (or other LGPL/GPL firmware) sources into MIT/Apache
+  Rust crates (firmware-interface, machine-pc, devices, …).
+- Do not commit bios.bin until licensing review explicitly allows it
+  (*.bin under this tree is gitignored).
+- Building SeaBIOS here does not imply SeaBIOS POST is integrated in the
+  emulator; ROM mapping helpers may load a blob separately.
+
+See also: docs/licensing.md, docs/adr/0004-firmware-seabios-ovmf.md,
+third_party/NOTICE, firmware/README.md.

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Native CLI runner for x86WASM"
 
+[lib]
+name = "emulator_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "emulator-cli"
 path = "src/main.rs"

@@ -6,13 +6,18 @@
 #![forbid(unsafe_code)]
 
 /// Segment register selector + hidden descriptor cache.
+///
+/// Spec: Intel SDM Vol. 3 §3.4.2–§3.4.3 (visible selector; cached base/limit/AR).
+/// `limit` is the effective inclusive max offset (G-bit already applied if set by a
+/// prior protected-mode load). Unreal/"big real" keeps an expanded data-segment
+/// limit after returning to real-address mode (SeaBIOS flat 4GiB DS/ES/…).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SegmentReg {
     pub selector: u16,
     pub base: u64,
     pub limit: u32,
-    /// Access rights / attributes (opaque to M1 beyond present defaults).
+    /// Access rights / attributes (opaque beyond present defaults).
     pub flags: u16,
 }
 
@@ -24,6 +29,49 @@ impl SegmentReg {
             limit: 0xFFFF,
             flags: 0x0093,
         }
+    }
+
+    /// Real-address mode segment: `base = selector << 4` (Intel SDM Vol. 3 §3.4.2).
+    pub const fn real_mode(selector: u16) -> Self {
+        Self::flat_real(selector, (selector as u64) << 4)
+    }
+
+    /// Real-address mode code segment (same base rule; code access rights).
+    pub const fn real_mode_code(selector: u16) -> Self {
+        Self {
+            selector,
+            base: (selector as u64) << 4,
+            limit: 0xFFFF,
+            flags: 0x009B,
+        }
+    }
+
+    /// Real-address mode data/stack segment load: update selector and base only.
+    ///
+    /// Cached `limit` and `flags` are retained so an expanded unreal-mode limit
+    /// survives `MOV/POP/LDS/LES` of DS/ES/SS/FS/GS. Spec: SDM Vol. 3 §3.4.2
+    /// (`base = selector << 4`); §3.4.3 (descriptor cache).
+    pub fn load_real_mode_selector(&mut self, selector: u16) {
+        self.selector = selector;
+        self.base = (selector as u64) << 4;
+    }
+
+    /// Load visible selector + hidden descriptor cache from a parsed descriptor.
+    ///
+    /// `limit` is the effective inclusive max offset (G-bit already applied).
+    /// Spec: Intel SDM Vol. 3 §3.4.3 (segment descriptor cache).
+    pub fn load_descriptor_cache(&mut self, selector: u16, base: u64, limit: u32, flags: u16) {
+        self.selector = selector;
+        self.base = base;
+        self.limit = limit;
+        self.flags = flags;
+    }
+
+    /// Null data-segment selector load (DS/ES/FS/GS): selector kept, cache cleared.
+    ///
+    /// Spec: Intel SDM Vol. 2 MOV (NULL selector into DS/ES/FS/GS); Vol. 3 §5.4.1.
+    pub fn load_null_selector(&mut self, selector: u16) {
+        self.load_descriptor_cache(selector, 0, 0, 0);
     }
 }
 
@@ -60,6 +108,20 @@ pub struct CpuState {
     pub cr8: u64,
     pub efer: u64,
     pub halted: bool,
+    /// Latched maskable external IRQ vector (PIC stub for later).
+    ///
+    /// Not guest-architectural beyond interrupt delivery. Recognized at
+    /// interpreter poll points when `IF=1` (currently: between REP string
+    /// iterations). Use [`Self::request_interrupt`]. Full 8259 is out of scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_irq: Option<u8>,
+    /// Latched non-maskable interrupt request (platform `#NMI` pin stub).
+    ///
+    /// Delivered at interpreter poll points as IVT vector 2; **not** gated by
+    /// `RFLAGS.IF`. Platform CMOS `0x70` bit7 masking is enforced by the machine
+    /// before calling [`Self::request_nmi`]. No SMRAM/SMI nesting in this stub.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_nmi: bool,
 }
 
 impl Default for CpuState {
@@ -107,7 +169,26 @@ impl CpuState {
             cr8: 0,
             efer: 0,
             halted: false,
+            pending_irq: None,
+            pending_nmi: false,
         }
+    }
+
+    /// Queue a maskable external interrupt vector (test / future PIC hook).
+    ///
+    /// Delivered at architected poll points when `RFLAGS.IF=1`. Does not
+    /// implement 8259 priority, IRR/ISR, or spurious IRQ semantics.
+    pub fn request_interrupt(&mut self, vector: u8) {
+        self.pending_irq = Some(vector);
+    }
+
+    /// Latch a platform `#NMI` request (IVT vector 2).
+    ///
+    /// Spec: Intel SDM Vol. 3 §6.3.3 / §6.7 — NMI is not maskable by `IF`.
+    /// Callers that model IBM PC/AT CMOS index bit7 must drop the request
+    /// before calling this when NMI is masked.
+    pub fn request_nmi(&mut self) {
+        self.pending_nmi = true;
     }
 
     pub fn gpr_u16(&self, idx: usize) -> u16 {
@@ -119,6 +200,19 @@ impl CpuState {
         self.gpr[idx] = (old & !0xFFFF) | u64::from(val);
     }
 
+    /// 32-bit GPR view (EAX…EDI). Spec: Intel SDM Vol. 1 §3.4.1 / §3.6
+    /// (operand-size attribute selects 16 vs 32 in real-address mode).
+    pub fn gpr_u32(&self, idx: usize) -> u32 {
+        self.gpr[idx] as u32
+    }
+
+    /// Write 32-bit GPR; preserves bits 63:32 of the u64 storage
+    /// (same pattern as `set_gpr_u16`; long-mode zero-extend is a later slice).
+    pub fn set_gpr_u32(&mut self, idx: usize, val: u32) {
+        let old = self.gpr[idx];
+        self.gpr[idx] = (old & !0xFFFF_FFFF) | u64::from(val);
+    }
+
     pub fn gpr_u8_low(&self, idx: usize) -> u8 {
         self.gpr[idx] as u8
     }
@@ -126,6 +220,32 @@ impl CpuState {
     pub fn set_gpr_u8_low(&mut self, idx: usize, val: u8) {
         let old = self.gpr[idx];
         self.gpr[idx] = (old & !0xFF) | u64::from(val);
+    }
+
+    /// Legacy 8-bit GPR view for ModR/M.reg / ModR/M.rm / opcodes B0–B7 (no REX).
+    ///
+    /// Indices 0–3 → AL/CL/DL/BL; 4–7 → AH/CH/DH/BH.
+    /// Spec: Intel SDM Vol. 1 §3.4.1.1; Vol. 2 Appendix B (ModR/M byte).
+    pub fn gpr_u8(&self, idx: usize) -> u8 {
+        debug_assert!(idx < 8, "legacy byte GPR index must be 0..7");
+        if idx < 4 {
+            self.gpr_u8_low(idx)
+        } else {
+            (self.gpr[idx - 4] >> 8) as u8
+        }
+    }
+
+    /// Write legacy 8-bit GPR (AL..BH). Preserves the sibling low/high byte and upper bits.
+    /// Spec: Intel SDM Vol. 1 §3.4.1.1; Vol. 2 Appendix B (ModR/M byte).
+    pub fn set_gpr_u8(&mut self, idx: usize, val: u8) {
+        debug_assert!(idx < 8, "legacy byte GPR index must be 0..7");
+        if idx < 4 {
+            self.set_gpr_u8_low(idx, val);
+        } else {
+            let g = idx - 4;
+            let old = self.gpr[g];
+            self.gpr[g] = (old & !0xFF00) | (u64::from(val) << 8);
+        }
     }
 
     pub fn al(&self) -> u8 {
@@ -136,12 +256,28 @@ impl CpuState {
         self.set_gpr_u8_low(Self::RAX, v);
     }
 
+    pub fn ah(&self) -> u8 {
+        self.gpr_u8(4)
+    }
+
+    pub fn set_ah(&mut self, v: u8) {
+        self.set_gpr_u8(4, v);
+    }
+
     pub fn ax(&self) -> u16 {
         self.gpr_u16(Self::RAX)
     }
 
     pub fn set_ax(&mut self, v: u16) {
         self.set_gpr_u16(Self::RAX, v);
+    }
+
+    pub fn eax(&self) -> u32 {
+        self.gpr_u32(Self::RAX)
+    }
+
+    pub fn set_eax(&mut self, v: u32) {
+        self.set_gpr_u32(Self::RAX, v);
     }
 
     pub fn ip16(&self) -> u16 {
@@ -161,6 +297,19 @@ impl CpuState {
             self.rflags |= 1 << 9;
         } else {
             self.rflags &= !(1 << 9);
+        }
+    }
+
+    /// Direction flag (RFLAGS.DF, bit 10) — SDM Vol. 1 §3.4.3.
+    pub fn direction_flag(&self) -> bool {
+        self.rflags & (1 << 10) != 0
+    }
+
+    pub fn set_direction_flag(&mut self, on: bool) {
+        if on {
+            self.rflags |= 1 << 10;
+        } else {
+            self.rflags &= !(1 << 10);
         }
     }
 
@@ -248,6 +397,12 @@ impl CpuState {
         if self.halted != other.halted {
             out.push("halted");
         }
+        if self.pending_irq != other.pending_irq {
+            out.push("pending_irq");
+        }
+        if self.pending_nmi != other.pending_nmi {
+            out.push("pending_nmi");
+        }
         out
     }
 }
@@ -255,6 +410,15 @@ impl CpuState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_mode_segment_base_is_selector_shifted() {
+        let s = SegmentReg::real_mode(0x1234);
+        assert_eq!(s.base, 0x1234u64 << 4);
+        let c = SegmentReg::real_mode_code(0xF000);
+        assert_eq!(c.base, 0xF000u64 << 4);
+        assert_eq!(c.flags, 0x009B);
+    }
 
     #[test]
     fn reset_vector_matches_docs() {
@@ -275,6 +439,47 @@ mod tests {
         assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_ABCD);
         cpu.set_al(0x55);
         assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_AB55);
+    }
+
+    /// 32-bit GPR helpers (opsize attribute / 0x66). Spec: SDM Vol. 1 §3.4.1, §3.6.
+    #[test]
+    fn gpr_u32_helpers_preserve_upper_dword() {
+        let mut cpu = CpuState::reset();
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x3333_4444);
+        cpu.set_gpr_u32(CpuState::RAX, 0xABCD_EF01);
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_ABCD_EF01);
+        cpu.set_eax(0x1234_5678);
+        assert_eq!(cpu.eax(), 0x1234_5678);
+        assert_eq!(cpu.ax(), 0x5678);
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_1234_5678);
+    }
+
+    /// Legacy ModR/M byte regs 4–7 are AH/CH/DH/BH (SDM Vol. 1 §3.4.1.1).
+    #[test]
+    fn gpr_u8_legacy_high_bytes() {
+        let mut cpu = CpuState::reset();
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4455;
+        cpu.gpr[CpuState::RCX] = 0xAAAA_BBBB_CCCC_DDEE;
+        cpu.gpr[CpuState::RDX] = 0x0000_0000_0000_1122;
+        cpu.gpr[CpuState::RBX] = 0x0000_0000_0000_3344;
+
+        assert_eq!(cpu.gpr_u8(0), 0x55); // AL
+        assert_eq!(cpu.gpr_u8(4), 0x44); // AH
+        assert_eq!(cpu.gpr_u8(1), 0xEE); // CL
+        assert_eq!(cpu.gpr_u8(5), 0xDD); // CH
+        assert_eq!(cpu.gpr_u8(2), 0x22); // DL
+        assert_eq!(cpu.gpr_u8(6), 0x11); // DH
+        assert_eq!(cpu.gpr_u8(3), 0x44); // BL
+        assert_eq!(cpu.gpr_u8(7), 0x33); // BH
+
+        cpu.set_gpr_u8(4, 0xAB); // AH
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_AB55);
+        cpu.set_gpr_u8(5, 0x10); // CH
+        assert_eq!(cpu.gpr[CpuState::RCX], 0xAAAA_BBBB_CCCC_10EE);
+        cpu.set_ah(0x99);
+        assert_eq!(cpu.ah(), 0x99);
+        assert_eq!(cpu.al(), 0x55);
     }
 
     #[test]

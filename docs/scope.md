@@ -17,6 +17,6 @@ Summary for agents. Full detail: repository root `plan.md`.
 
 ## Current build focus
 
-Milestone 0–1: docs/ADRs, workspace, CPU state, buses, decoder framework, minimal interpreter, serial debug ROM.
+Milestone 0–1 exit (HELLO ROM) is met on `main`. Active work is **Milestone 2**: real-mode foundation → interrupts/exceptions → legacy PC devices → SeaBIOS/FreeDOS. Track checkboxes in `plan.md` §21 Milestone 2.
 
-**Not yet:** VGA/IDE/Windows/JIT/net/audio/SMP.
+**Not yet:** protected mode, paging, PIC/PIT, VGA/IDE, SeaBIOS boot, Windows, JIT, net, audio, SMP.

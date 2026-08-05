@@ -1,0 +1,4067 @@
+//! Primary ATA IDE channel — IDENTIFY + READ/WRITE SECTORS PIO + IRQ14 stub.
+//!
+//! Classic PC primary command block `0x1F0`–`0x1F7` and control block `0x3F6`.
+//!
+//! # Spec refs
+//!
+//! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
+//!   WRITE SECTORS (`0x30`), WRITE VERIFY SECTORS (`0x3C`), READ VERIFY
+//!   SECTORS (`0x40`), SET MULTIPLE MODE (`0xC6`), READ MULTIPLE (`0xC4`),
+//!   WRITE MULTIPLE (`0xC5`), PACKET (`0xA0`), IDENTIFY PACKET DEVICE (`0xA1`),
+//!   SMART (`0xB0`), READ DMA (`0xC8`), WRITE DMA (`0xCA`), SECURITY SET
+//!   PASSWORD (`0xF1`), SECURITY UNLOCK (`0xF2`), SECURITY ERASE PREPARE
+//!   (`0xF3`), SECURITY ERASE UNIT (`0xF4`), SECURITY FREEZE LOCK (`0xF5`),
+//!   SECURITY DISABLE PASSWORD (`0xF6`), DOWNLOAD MICROCODE (`0x92`), READ LOG
+//!   EXT (`0x2F`), WRITE LOG EXT (`0x3F`),
+//!   DATA SET MANAGEMENT (`0x06`), TRUSTED RECEIVE (`0x5C`), TRUSTED SEND
+//!   (`0x5E`), READ BUFFER (`0xE4`), WRITE BUFFER (`0xE8`), task-file
+//!   registers, status bits BSY/DRDY/DRQ/ERR, error ABRT,
+//!   LBA28 addressing;
+//!   device control nIEN; INTRQ when drive needs attention.
+//! - OSDev ATA PIO Mode — primary port map, IDENTIFY/READ/WRITE IRQ+PIO sequence,
+//!   status read clears IRQ / alternate status does not, 256-word PIO,
+//!   sector-count `0` = 256 sectors; primary channel → ISA IRQ14;
+//!   WRITE: host fills data port after DRQ; ATAPI probe via `0xA1` / PACKET.
+//! - IBM PC/AT IDE — alternate status / device control at `0x3F6`; IRQ14.
+//! - Intel 8259A — DualPic IR14 (slave IR6) vectoring via MachineBus.
+//! - `docs/machine-model-pc-v1.md`, `plan.md` §15.5 / §21 PIIX IDE / ATAPI.
+//!
+//! # Scope (this slice)
+//!
+//! - Primary channel master only; optional backing image (`Vec<u8>`)
+//! - Commands: IDENTIFY (`0xEC`), READ SECTORS (`0x20`), WRITE SECTORS (`0x30`) PIO
+//! - IDENTIFY PACKET DEVICE (`0xA1`): ATA master → ERR+ABRT (no PACKET device);
+//!   SeaBIOS-friendly reject of ATAPI probe on disk master
+//! - PACKET (`0xA0`): ATA master → ERR+ABRT (no 12-byte packet PIO / DRQ);
+//!   absent/slave → status 0; INTRQ follows nIEN like WRITE/IDENTIFY abort
+//! - SMART (`0xB0`): ATA master → ERR+ABRT (no SMART feature-set data);
+//!   absent/slave → status 0; INTRQ follows nIEN like PACKET/READ MULTIPLE abort
+//! - READ DMA (`0xC8`): ATA master → ERR+ABRT (no BM-DMA/PRD engine);
+//!   absent/slave → status 0; INTRQ follows nIEN like SMART/PACKET abort
+//! - WRITE DMA (`0xCA`): ATA master → ERR+ABRT (no BM-DMA/PRD engine);
+//!   absent/slave → status 0; INTRQ follows nIEN like READ DMA abort
+//! - SECURITY SET PASSWORD (`0xF1`): ATA master → ERR+ABRT (no SECURITY feature
+//!   set / password PIO); absent/slave → status 0; INTRQ follows nIEN like
+//!   SECURITY UNLOCK / FREEZE LOCK
+//! - SECURITY ERASE PREPARE (`0xF3`): ATA master → ERR+ABRT (no SECURITY erase
+//!   prepare / password state); absent/slave → status 0; INTRQ follows nIEN like
+//!   SECURITY SET PASSWORD
+//! - SECURITY ERASE UNIT (`0xF4`): ATA master → ERR+ABRT (no SECURITY erase /
+//!   password PIO); absent/slave → status 0; INTRQ follows nIEN like
+//!   SECURITY ERASE PREPARE
+//! - SECURITY FREEZE LOCK (`0xF5`): ATA master → ERR+ABRT (no SECURITY feature
+//!   set / freeze state); absent/slave → status 0; INTRQ follows nIEN like SMART
+//! - SECURITY DISABLE PASSWORD (`0xF6`): ATA master → ERR+ABRT (no SECURITY
+//!   password disable / password PIO); absent/slave → status 0; INTRQ follows
+//!   nIEN like SECURITY ERASE UNIT
+//! - DOWNLOAD MICROCODE (`0x92`): ATA master → ERR+ABRT (no microcode download /
+//!   vendor transfer); absent/slave → status 0; INTRQ follows nIEN like SMART
+//! - READ LOG EXT (`0x2F`): ATA master → ERR+ABRT (no GPL / log page PIO);
+//!   absent/slave → status 0; INTRQ follows nIEN like SMART
+//! - WRITE LOG EXT (`0x3F`): ATA master → ERR+ABRT (no GPL / log page PIO);
+//!   absent/slave → status 0; INTRQ follows nIEN like READ LOG EXT
+//! - DATA SET MANAGEMENT (`0x06`): ATA master → ERR+ABRT (no TRIM / DSM range
+//!   list PIO); absent/slave → status 0; INTRQ follows nIEN like WRITE LOG EXT
+//! - TRUSTED RECEIVE (`0x5C`): ATA master → ERR+ABRT (no Trusted Computing /
+//!   Security Protocol PIO); absent/slave → status 0; INTRQ follows nIEN like DSM
+//! - TRUSTED SEND (`0x5E`): ATA master → ERR+ABRT (no Trusted Computing /
+//!   Security Protocol send PIO); absent/slave → status 0; INTRQ follows nIEN
+//!   like TRUSTED RECEIVE
+//! - READ BUFFER (`0xE4`): ATA master → 512-byte DRQ PIO from device sector
+//!   buffer (synced from READ/WRITE SECTORS / WRITE BUFFER); absent/slave →
+//!   status 0; INTRQ follows nIEN like other PIO data-in commands
+//! - WRITE BUFFER (`0xE8`): ATA master → 512-byte host→device DRQ PIO into the
+//!   sector buffer (no LBA / no media write); absent/slave → status 0; INTRQ
+//!   follows nIEN like other PIO data-out commands (WRITE SECTORS)
+//! - SET MULTIPLE MODE (`0xC6`): store Sector Count block factor when a power of
+//!   two in `1..=16` (IDENTIFY word 47 max); IDENTIFY word 59 reports setting;
+//!   invalid → ERR+ABRT
+//! - READ MULTIPLE (`0xC4`) / WRITE MULTIPLE (`0xC5`): LBA28 PIO using stored
+//!   `multiple_count` sectors per DRQ block (last block may be shorter);
+//!   `multiple_count==0` → ERR+ABRT; INTRQ once per block / completion when nIEN=0
+//! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
+//! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
+//! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
+//!   status register read clears pending IRQ; `irq_line()` for MachineBus
+//! - `PortDevice` for MachineBus wiring
+//!
+//! # Unsupported (explicit)
+//!
+//! - ATAPI PACKET media engine / CD-ROM / ISO boot / slave ATAPI identify buffer
+//! - SMART feature set (thresholds, return data, enable/disable subcommands)
+//! - SECURITY feature set (passwords, SET PASSWORD PIO, FREEZE LOCK state,
+//!   unlock/ERASE PREPARE/ERASE UNIT)
+//! - DOWNLOAD MICROCODE transfer / vendor microcode apply (ABRT-only stub)
+//! - READ/WRITE LOG EXT / General Purpose Logging (log pages, LBA48 HOB) (ABRT-only stubs)
+//! - DATA SET MANAGEMENT / TRIM range-list PIO (ABRT-only stub)
+//! - TRUSTED RECEIVE / TRUSTED SEND Security Protocol PIO (ABRT-only stubs for
+//!   `0x5C` / `0x5E`)
+//! - Real BM-DMA / UDMA/MDMA / PRD engine (READ/WRITE DMA are ABRT-only)
+//! - LBA48
+//! - Slave drive on either channel
+//! - SeaBIOS / PCI IDE BAR remapping
+//!
+//! Secondary channel (`IdeSecondary`) remaps the same ATA PIO stub — including
+//! READ BUFFER (`0xE4`) / WRITE BUFFER (`0xE8`) sector-buffer PIO and
+//! READ/WRITE MULTIPLE multi-sector DRQ — to ports `0x170`–`0x177` / `0x376`
+//! and ISA IRQ15 (see below).
+
+use crate::PortDevice;
+
+/// Primary ATA data port (16-bit PIO).
+pub const IDE_PRIMARY_DATA: u16 = 0x1F0;
+/// Error (R) / Features (W).
+pub const IDE_PRIMARY_ERROR: u16 = 0x1F1;
+/// Sector count.
+pub const IDE_PRIMARY_SECCOUNT: u16 = 0x1F2;
+/// LBA 7:0 / sector number.
+pub const IDE_PRIMARY_LBA_LO: u16 = 0x1F3;
+/// LBA 15:8 / cylinder low.
+pub const IDE_PRIMARY_LBA_MID: u16 = 0x1F4;
+/// LBA 23:16 / cylinder high.
+pub const IDE_PRIMARY_LBA_HI: u16 = 0x1F5;
+/// Drive/head select + LBA 27:24.
+pub const IDE_PRIMARY_DRIVE: u16 = 0x1F6;
+/// Status (R) / Command (W).
+pub const IDE_PRIMARY_STATUS: u16 = 0x1F7;
+/// Alternate status (R) / Device control (W).
+pub const IDE_PRIMARY_CTRL: u16 = 0x3F6;
+
+/// Secondary ATA data port (16-bit PIO).
+pub const IDE_SECONDARY_DATA: u16 = 0x170;
+/// Secondary error (R) / Features (W).
+pub const IDE_SECONDARY_ERROR: u16 = 0x171;
+/// Secondary sector count.
+pub const IDE_SECONDARY_SECCOUNT: u16 = 0x172;
+/// Secondary LBA 7:0.
+pub const IDE_SECONDARY_LBA_LO: u16 = 0x173;
+/// Secondary LBA 15:8.
+pub const IDE_SECONDARY_LBA_MID: u16 = 0x174;
+/// Secondary LBA 23:16.
+pub const IDE_SECONDARY_LBA_HI: u16 = 0x175;
+/// Secondary drive/head select.
+pub const IDE_SECONDARY_DRIVE: u16 = 0x176;
+/// Secondary status (R) / Command (W).
+pub const IDE_SECONDARY_STATUS: u16 = 0x177;
+/// Secondary alternate status (R) / Device control (W).
+pub const IDE_SECONDARY_CTRL: u16 = 0x376;
+
+/// Status: busy.
+pub const ATA_SR_BSY: u8 = 0x80;
+/// Status: drive ready.
+pub const ATA_SR_DRDY: u8 = 0x40;
+/// Status: drive seek complete (stub always set with DRDY when ready).
+pub const ATA_SR_DSC: u8 = 0x10;
+/// Status: data request.
+pub const ATA_SR_DRQ: u8 = 0x08;
+/// Status: error.
+pub const ATA_SR_ERR: u8 = 0x01;
+
+/// IDENTIFY DEVICE.
+pub const ATA_CMD_IDENTIFY: u8 = 0xEC;
+/// PACKET (ATAPI) — rejected with ABRT on ATA master (no packet PIO).
+pub const ATA_CMD_PACKET: u8 = 0xA0;
+/// IDENTIFY PACKET DEVICE (ATAPI) — rejected with ABRT on ATA master.
+pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
+/// READ SECTORS (with retry) — LBA28 PIO.
+pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
+/// WRITE SECTORS (with retry) — LBA28 PIO.
+pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+/// WRITE VERIFY SECTORS (with retry) — LBA28 non-data; verifies writable range.
+/// Spec: ATA/ATAPI Command Set — WRITE VERIFY SECTORS (`0x3C`).
+pub const ATA_CMD_WRITE_VERIFY_SECTORS: u8 = 0x3C;
+/// READ VERIFY SECTORS (with retry) — LBA28 non-data; verifies range without PIO.
+/// Spec: ATA/ATAPI Command Set — READ VERIFY SECTORS (`0x40`).
+pub const ATA_CMD_READ_VERIFY_SECTORS: u8 = 0x40;
+/// FLUSH CACHE — non-data command; completes with success on ATA master.
+/// Spec: ATA/ATAPI Command Set — FLUSH CACHE (`0xE7`).
+pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+/// EXECUTE DEVICE DIAGNOSTIC — error=0x01 means passed (master).
+/// Spec: ATA/ATAPI Command Set — EXECUTE DEVICE DIAGNOSTIC (`0x90`).
+pub const ATA_CMD_DIAGNOSTIC: u8 = 0x90;
+/// Diagnostic passed code in error register.
+pub const ATA_DIAG_PASSED: u8 = 0x01;
+/// SET FEATURES — non-data; this stub accepts and succeeds (no feature side effects).
+/// Spec: ATA/ATAPI Command Set — SET FEATURES (`0xEF`).
+pub const ATA_CMD_SET_FEATURES: u8 = 0xEF;
+/// NOP — non-data success on ATA master (no side effects).
+/// Spec: ATA/ATAPI Command Set — NOP (`0x00`).
+pub const ATA_CMD_NOP: u8 = 0x00;
+/// READ MULTIPLE — LBA28 multi-sector PIO (`multiple_count` sectors per DRQ).
+/// Spec: ATA/ATAPI Command Set — READ MULTIPLE (`0xC4`).
+pub const ATA_CMD_READ_MULTIPLE: u8 = 0xC4;
+/// WRITE MULTIPLE — LBA28 multi-sector PIO (`multiple_count` sectors per DRQ).
+/// Spec: ATA/ATAPI Command Set — WRITE MULTIPLE (`0xC5`).
+pub const ATA_CMD_WRITE_MULTIPLE: u8 = 0xC5;
+/// IDLE IMMEDIATE — non-data success.
+/// Spec: ATA/ATAPI Command Set — IDLE IMMEDIATE (`0xE1`).
+pub const ATA_CMD_IDLE_IMMEDIATE: u8 = 0xE1;
+/// IDLE — non-data success (timer value in sector_count ignored by stub).
+/// Spec: ATA/ATAPI Command Set — IDLE (`0xE3`).
+pub const ATA_CMD_IDLE: u8 = 0xE3;
+/// STANDBY IMMEDIATE — non-data success.
+/// Spec: ATA/ATAPI Command Set — STANDBY IMMEDIATE (`0xE0`).
+pub const ATA_CMD_STANDBY_IMMEDIATE: u8 = 0xE0;
+/// CHECK POWER MODE — non-data; sector_count ← `0xFF` (Active/Idle).
+/// Spec: ATA/ATAPI Command Set — CHECK POWER MODE (`0xE5`).
+pub const ATA_CMD_CHECK_POWER_MODE: u8 = 0xE5;
+/// CHECK POWER MODE result: device is Active or Idle.
+pub const ATA_POWER_ACTIVE_OR_IDLE: u8 = 0xFF;
+/// STANDBY — non-data success (timer in sector_count ignored).
+/// Spec: ATA/ATAPI Command Set — STANDBY (`0xE2`).
+pub const ATA_CMD_STANDBY: u8 = 0xE2;
+/// SLEEP — non-data success.
+/// Spec: ATA/ATAPI Command Set — SLEEP (`0xE6`).
+pub const ATA_CMD_SLEEP: u8 = 0xE6;
+/// RECALIBRATE — non-data success stub.
+/// Spec: ATA/ATAPI Command Set — RECALIBRATE (`0x10`).
+pub const ATA_CMD_RECALIBRATE: u8 = 0x10;
+/// SEEK — non-data success stub.
+/// Spec: ATA/ATAPI Command Set — SEEK (`0x70`).
+pub const ATA_CMD_SEEK: u8 = 0x70;
+/// INITIALIZE DEVICE PARAMETERS — non-data success stub.
+/// Spec: ATA/ATAPI Command Set — INITIALIZE DEVICE PARAMETERS (`0x91`).
+pub const ATA_CMD_INIT_DEV_PARAMS: u8 = 0x91;
+/// FLUSH CACHE EXT — same non-data success as FLUSH CACHE in this stub.
+/// Spec: ATA/ATAPI Command Set — FLUSH CACHE EXT (`0xEA`).
+pub const ATA_CMD_FLUSH_CACHE_EXT: u8 = 0xEA;
+/// READ NATIVE MAX ADDRESS — returns max LBA28 in task-file registers.
+/// Spec: ATA/ATAPI Command Set — READ NATIVE MAX ADDRESS (`0xF8`).
+pub const ATA_CMD_READ_NATIVE_MAX: u8 = 0xF8;
+/// SET MAX ADDRESS — Host Protected Area set; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SET MAX ADDRESS (`0xF9`).
+pub const ATA_CMD_SET_MAX_ADDRESS: u8 = 0xF9;
+/// SET MULTIPLE MODE — store Sector Count block factor (READ/WRITE MULTIPLE DRQ size).
+/// Spec: ATA/ATAPI Command Set — SET MULTIPLE MODE (`0xC6`).
+pub const ATA_CMD_SET_MULTIPLE_MODE: u8 = 0xC6;
+/// Max sectors per READ/WRITE MULTIPLE interrupt (IDENTIFY word 47 bits 7:0).
+/// Spec: ATA IDENTIFY DEVICE — word 47 = `0x8000 | max_sectors_per_drq`.
+pub const ATA_MULTIPLE_MAX_SECTORS: u8 = 16;
+/// MEDIA LOCK (DOOR LOCK) — non-data success noop (no media tray).
+/// Spec: ATA/ATAPI Command Set — MEDIA LOCK (`0xDE`).
+pub const ATA_CMD_MEDIA_LOCK: u8 = 0xDE;
+/// MEDIA UNLOCK (DOOR UNLOCK) — non-data success noop.
+/// Spec: ATA/ATAPI Command Set — MEDIA UNLOCK (`0xDF`).
+pub const ATA_CMD_MEDIA_UNLOCK: u8 = 0xDF;
+/// SMART — feature-set command; this stub aborts (no SMART support).
+/// Spec: ATA/ATAPI Command Set — SMART (`0xB0`).
+pub const ATA_CMD_SMART: u8 = 0xB0;
+/// READ DMA — bus-master DMA read; this stub aborts (no BM-DMA/PRD engine).
+/// Spec: ATA/ATAPI Command Set — READ DMA (`0xC8`).
+pub const ATA_CMD_READ_DMA: u8 = 0xC8;
+/// WRITE DMA — bus-master DMA write; this stub aborts (no BM-DMA/PRD engine).
+/// Spec: ATA/ATAPI Command Set — WRITE DMA (`0xCA`).
+pub const ATA_CMD_WRITE_DMA: u8 = 0xCA;
+/// SECURITY SET PASSWORD — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY SET PASSWORD (`0xF1`).
+pub const ATA_CMD_SECURITY_SET_PASSWORD: u8 = 0xF1;
+/// SECURITY UNLOCK — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY UNLOCK (`0xF2`).
+pub const ATA_CMD_SECURITY_UNLOCK: u8 = 0xF2;
+/// SECURITY ERASE PREPARE — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY ERASE PREPARE (`0xF3`).
+pub const ATA_CMD_SECURITY_ERASE_PREPARE: u8 = 0xF3;
+/// SECURITY ERASE UNIT — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY ERASE UNIT (`0xF4`).
+pub const ATA_CMD_SECURITY_ERASE_UNIT: u8 = 0xF4;
+/// SECURITY FREEZE LOCK — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY FREEZE LOCK (`0xF5`).
+pub const ATA_CMD_SECURITY_FREEZE_LOCK: u8 = 0xF5;
+/// SECURITY DISABLE PASSWORD — SECURITY feature-set command; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — SECURITY DISABLE PASSWORD (`0xF6`).
+pub const ATA_CMD_SECURITY_DISABLE_PASSWORD: u8 = 0xF6;
+/// DOWNLOAD MICROCODE — vendor microcode transfer; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — DOWNLOAD MICROCODE (`0x92`).
+pub const ATA_CMD_DOWNLOAD_MICROCODE: u8 = 0x92;
+/// READ LOG EXT — General Purpose Logging read; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — READ LOG EXT (`0x2F`).
+pub const ATA_CMD_READ_LOG_EXT: u8 = 0x2F;
+/// WRITE LOG EXT — General Purpose Logging write; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — WRITE LOG EXT (`0x3F`).
+pub const ATA_CMD_WRITE_LOG_EXT: u8 = 0x3F;
+/// DATA SET MANAGEMENT — TRIM / DSM range list; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — DATA SET MANAGEMENT (`0x06`).
+pub const ATA_CMD_DATA_SET_MANAGEMENT: u8 = 0x06;
+/// TRUSTED RECEIVE — Trusted Computing / Security Protocol receive; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — TRUSTED RECEIVE (`0x5C`).
+pub const ATA_CMD_TRUSTED_RECEIVE: u8 = 0x5C;
+/// TRUSTED SEND — Trusted Computing / Security Protocol send; this stub aborts.
+/// Spec: ATA/ATAPI Command Set — TRUSTED SEND (`0x5E`).
+pub const ATA_CMD_TRUSTED_SEND: u8 = 0x5E;
+/// READ BUFFER — 512-byte sector buffer PIO data-in.
+/// Spec: ATA/ATAPI Command Set — READ BUFFER (`0xE4`).
+pub const ATA_CMD_READ_BUFFER: u8 = 0xE4;
+/// WRITE BUFFER — 512-byte sector buffer PIO data-out.
+/// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`).
+pub const ATA_CMD_WRITE_BUFFER: u8 = 0xE8;
+
+/// Error register: aborted command.
+pub const ATA_ER_ABRT: u8 = 0x04;
+
+/// Device control: software reset.
+pub const ATA_DC_SRST: u8 = 0x04;
+/// Device control: nIEN (1 = IRQ disabled / INTRQ not driven).
+pub const ATA_DC_NIEN: u8 = 0x02;
+
+/// Drive/head: LBA mode bit.
+pub const ATA_DRIVE_LBA: u8 = 0x40;
+/// Drive/head: slave select (bit4). Master = 0.
+pub const ATA_DRIVE_SLAVE: u8 = 0x10;
+
+const SECTOR_SIZE: usize = 512;
+const IDENTIFY_WORDS: usize = 256;
+
+/// Primary IDE channel (master drive stub).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdePrimary {
+    /// When false, status reads as `0` (no device) until a drive is attached.
+    pub present: bool,
+    /// Backing image bytes (multiple of 512 preferred; short reads zero-pad).
+    pub image: Vec<u8>,
+    error: u8,
+    features: u8,
+    sector_count: u8,
+    lba_lo: u8,
+    lba_mid: u8,
+    lba_hi: u8,
+    drive_head: u8,
+    status: u8,
+    dev_ctrl: u8,
+    /// Latched INTRQ request (gated by nIEN on [`Self::irq_line`]).
+    irq_pending: bool,
+    /// Persistent ATA sector buffer (READ/WRITE BUFFER / last READ|WRITE SECTORS).
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ/WRITE BUFFER transfer this 512-byte buffer.
+    sector_buffer: [u8; SECTOR_SIZE],
+    /// Current PIO transfer payload (512 bytes).
+    pio: [u8; SECTOR_SIZE],
+    pio_off: usize,
+    /// Sectors still to present/accept after the current PIO block (incl. current).
+    sectors_left: u32,
+    /// Next LBA to load (READ) or LBA of current PIO block (WRITE).
+    next_lba: u32,
+    /// True while host must drain/fill the data port under DRQ.
+    transferring: bool,
+    /// True = host→device WRITE PIO; false = device→host READ/IDENTIFY PIO.
+    pio_in: bool,
+    /// True = active WRITE BUFFER PIO (commit to `sector_buffer`, not media).
+    sector_buffer_write: bool,
+    /// Block factor from SET MULTIPLE MODE (`0` = not configured).
+    ///
+    /// Spec: ATA SET MULTIPLE MODE — Sector Count selects sectors per
+    /// READ/WRITE MULTIPLE DRQ; IDENTIFY word 59 reports the current setting.
+    pub multiple_count: u8,
+    /// True while READ/WRITE MULTIPLE multi-sector DRQ transfer is active.
+    multiple_xfer: bool,
+    /// Sectors remaining in the current READ/WRITE MULTIPLE DRQ block
+    /// (including the sector currently under DRQ).
+    block_left: u32,
+}
+
+impl Default for IdePrimary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdePrimary {
+    /// Empty channel (no drive) — status reads `0`.
+    pub fn new() -> Self {
+        Self {
+            present: false,
+            image: Vec::new(),
+            error: 0,
+            features: 0,
+            sector_count: 0,
+            lba_lo: 0,
+            lba_mid: 0,
+            lba_hi: 0,
+            drive_head: 0xA0,
+            status: 0,
+            dev_ctrl: ATA_DC_NIEN,
+            irq_pending: false,
+            sector_buffer: [0; SECTOR_SIZE],
+            pio: [0; SECTOR_SIZE],
+            pio_off: 0,
+            sectors_left: 0,
+            next_lba: 0,
+            transferring: false,
+            pio_in: false,
+            sector_buffer_write: false,
+            multiple_count: 0,
+            multiple_xfer: false,
+            block_left: 0,
+        }
+    }
+
+    /// Attach a master disk image and mark the drive present / ready.
+    ///
+    /// Spec: ATA — after power-on / reset, DRDY set when ready to accept commands.
+    pub fn with_image(image: Vec<u8>) -> Self {
+        let mut ide = Self::new();
+        ide.attach_image(image);
+        ide
+    }
+
+    pub fn attach_image(&mut self, image: Vec<u8>) {
+        self.image = image;
+        self.present = true;
+        self.reset_ready();
+    }
+
+    pub fn reset(&mut self) {
+        // Preserve backing image / presence across Machine::reset.
+        let image = std::mem::take(&mut self.image);
+        let present = self.present;
+        *self = Self::new();
+        self.image = image;
+        self.present = present;
+        if self.present {
+            self.reset_ready();
+        }
+    }
+
+    fn reset_ready(&mut self) {
+        self.error = 0;
+        self.features = 0;
+        self.sector_count = 1;
+        self.lba_lo = 1;
+        self.lba_mid = 0;
+        self.lba_hi = 0;
+        self.drive_head = 0xA0;
+        self.dev_ctrl = ATA_DC_NIEN;
+        self.irq_pending = false;
+        self.sector_buffer = [0; SECTOR_SIZE];
+        self.pio = [0; SECTOR_SIZE];
+        self.pio_off = 0;
+        self.sectors_left = 0;
+        self.next_lba = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sector_buffer_write = false;
+        self.multiple_count = 0;
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.status = if self.present {
+            ATA_SR_DRDY | ATA_SR_DSC
+        } else {
+            0
+        };
+    }
+
+    /// True if this device owns the I/O port.
+    pub fn owns_port(port: u16) -> bool {
+        matches!(port, 0x1F0..=0x1F7 | IDE_PRIMARY_CTRL)
+    }
+
+    /// ISA IRQ14 line level (INTRQ ∧ ¬nIEN).
+    ///
+    /// Spec: ATA device control nIEN; OSDev ATA PIO — primary → IRQ14.
+    pub fn irq_line(&self) -> bool {
+        self.irq_pending && (self.dev_ctrl & ATA_DC_NIEN == 0)
+    }
+
+    fn raise_irq(&mut self) {
+        // Spec: ATA — INTRQ asserted when drive needs attention; nIEN gates pin.
+        self.irq_pending = true;
+    }
+
+    fn clear_irq(&mut self) {
+        self.irq_pending = false;
+    }
+
+    fn is_slave_selected(&self) -> bool {
+        self.drive_head & ATA_DRIVE_SLAVE != 0
+    }
+
+    fn lba28(&self) -> u32 {
+        let hi = u32::from(self.drive_head & 0x0F) << 24;
+        hi | (u32::from(self.lba_hi) << 16)
+            | (u32::from(self.lba_mid) << 8)
+            | u32::from(self.lba_lo)
+    }
+
+    fn sector_count_effective(&self) -> u32 {
+        if self.sector_count == 0 {
+            256
+        } else {
+            u32::from(self.sector_count)
+        }
+    }
+
+    fn total_sectors(&self) -> u32 {
+        (self.image.len() / SECTOR_SIZE) as u32
+    }
+
+    /// Build a minimal IDENTIFY DEVICE payload (256 words, little-endian words).
+    ///
+    /// Spec: ATA IDENTIFY DEVICE — words 60–61 = total LBA28 user sectors;
+    /// word 49 bit9 = LBA supported; model string words 27–46 (byte-swapped).
+    fn fill_identify(&mut self) {
+        let mut words = [0u16; IDENTIFY_WORDS];
+        words[0] = 0x0040; // non-removable ATA disk (bit6)
+        words[1] = 16383; // obsolete cylinders
+        words[3] = 16; // obsolete heads
+        words[6] = 63; // obsolete sectors/track
+                       // Model: "x86WASM IDE STUB" padded, ATA byte-swap within words.
+        let model = b"x86WASM IDE STUB                        ";
+        for (i, chunk) in model.chunks(2).take(20).enumerate() {
+            let a = chunk.first().copied().unwrap_or(b' ');
+            let b = chunk.get(1).copied().unwrap_or(b' ');
+            words[27 + i] = u16::from(a) << 8 | u16::from(b);
+        }
+        words[47] = 0x8000 | u16::from(ATA_MULTIPLE_MAX_SECTORS); // max sectors/DRQ
+        words[49] = 1 << 9; // LBA supported
+        words[53] = 0x0001; // words 54–58 valid (legacy)
+                            // Spec: ATA IDENTIFY word 59 — bit8 = multiple setting valid; bits7:0 = current.
+        if self.multiple_count != 0 {
+            words[59] = 0x0100 | u16::from(self.multiple_count);
+        }
+        let total = self.total_sectors().max(1);
+        words[60] = (total & 0xFFFF) as u16;
+        words[61] = (total >> 16) as u16;
+        words[63] = 0; // no multiword DMA
+        words[80] = 1 << 4; // ATA/ATAPI-4 major version bit (informational)
+        words[82] = 0;
+        words[83] = 0x4000; // bit14 must be 1 in word 83
+        words[85] = 0;
+        words[86] = 0;
+
+        for (i, w) in words.iter().enumerate() {
+            let off = i * 2;
+            self.pio[off] = (*w & 0xFF) as u8;
+            self.pio[off + 1] = (*w >> 8) as u8;
+        }
+    }
+
+    fn begin_pio_out(&mut self) {
+        self.pio_off = 0;
+        self.pio_in = false;
+        self.transferring = true;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        self.error = 0;
+        // Spec: OSDev ATA PIO — IRQ when data ready (DRQ) if nIEN clear.
+        self.raise_irq();
+    }
+
+    fn begin_pio_in(&mut self) {
+        self.pio_off = 0;
+        self.pio.fill(0);
+        self.pio_in = true;
+        self.transferring = true;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        self.error = 0;
+        // Spec: OSDev ATA PIO WRITE — IRQ when DRQ set (host may fill data).
+        self.raise_irq();
+    }
+
+    fn load_sector_into_pio(&mut self, lba: u32) -> bool {
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            return false;
+        }
+        let start = (lba as usize) * SECTOR_SIZE;
+        self.pio.fill(0);
+        let end = (start + SECTOR_SIZE).min(self.image.len());
+        if start < self.image.len() {
+            let n = end - start;
+            self.pio[..n].copy_from_slice(&self.image[start..end]);
+        }
+        // Spec: ATA — media read updates the sector buffer (READ BUFFER source).
+        self.sector_buffer = self.pio;
+        true
+    }
+
+    fn store_sector_from_pio(&mut self, lba: u32) -> bool {
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            return false;
+        }
+        let start = (lba as usize) * SECTOR_SIZE;
+        let end = start + SECTOR_SIZE;
+        if end > self.image.len() {
+            self.image.resize(end, 0);
+        }
+        self.image[start..end].copy_from_slice(&self.pio);
+        // Spec: ATA — media write updates the sector buffer (READ BUFFER source).
+        self.sector_buffer = self.pio;
+        true
+    }
+
+    fn abort_command(&mut self, error: u8) {
+        self.error = error;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sector_buffer_write = false;
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_ERR;
+        // Spec: ATA — INTRQ on error completion when interrupts enabled.
+        self.raise_irq();
+    }
+
+    /// Sectors in the next READ/WRITE MULTIPLE DRQ block.
+    ///
+    /// Spec: ATA — block size is `multiple_count`, except the final block may
+    /// be shorter when Sector Count is not divisible by the block factor.
+    fn multiple_block_len(&self, sectors_remaining: u32) -> u32 {
+        u32::from(self.multiple_count).min(sectors_remaining)
+    }
+
+    fn exec_identify(&mut self) {
+        // Spec: OSDev ATA PIO — no device / slave → status 0 after IDENTIFY.
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.clear_irq();
+            return;
+        }
+        self.fill_identify();
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = 1;
+        self.next_lba = 0;
+        self.begin_pio_out();
+    }
+
+    /// IDENTIFY PACKET DEVICE (`0xA1`) on an ATA-only master.
+    ///
+    /// Spec: ATA/ATAPI — PACKET identify is valid for ATAPI devices; ATA disks
+    /// abort with ERR+ABRT (no 256-word PIO). SeaBIOS probes `0xA1` to detect
+    /// ATAPI; master stays ATA in this stub (no slave ATAPI path yet).
+    fn exec_identify_packet(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// PACKET (`0xA0`) on an ATA-only master.
+    ///
+    /// Spec: ATA/ATAPI — PACKET starts a 12-byte command packet transfer on
+    /// ATAPI devices (DRQ). Non-ATAPI (ATA disk) devices abort with ERR+ABRT
+    /// and no packet PIO. SeaBIOS-friendly: honest reject without a packet
+    /// engine. INTRQ follows the same nIEN rules as WRITE/IDENTIFY abort.
+    fn exec_packet(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    fn exec_read_sectors(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.clear_irq();
+            return;
+        }
+        // Require LBA bit for this stub (CHS not implemented).
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        if !self.load_sector_into_pio(lba) {
+            self.abort_command(0x10); // IDNF / sector not found style
+            return;
+        }
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = count;
+        self.next_lba = lba.wrapping_add(1);
+        self.begin_pio_out();
+    }
+
+    fn exec_write_sectors(&mut self) {
+        // Spec: ATA WRITE SECTORS (0x30) — LBA28 PIO; host fills 256 words/sector.
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT); // CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = count;
+        self.next_lba = lba;
+        self.begin_pio_in();
+    }
+
+    /// READ VERIFY SECTORS (`0x40`) / WRITE VERIFY SECTORS (`0x3C`) on ATA master
+    /// — non-data LBA28 range check.
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ/WRITE VERIFY SECTORS verify media
+    /// without transferring sector data (no DRQ). This stub succeeds when the
+    /// LBA28 range lies within the backing image; OOB → ERR+IDNF; CHS → ABRT.
+    /// Absent/slave → status 0. INTRQ follows nIEN like FLUSH CACHE. No write
+    /// to media on WRITE VERIFY (range check only).
+    fn exec_verify_sectors(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT); // CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        let total = self.total_sectors();
+        if total == 0 || lba >= total || count > total - lba {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// FLUSH CACHE (`0xE7`) on ATA master — non-data success completion.
+    ///
+    /// Spec: ATA/ATAPI Command Set — FLUSH CACHE writes volatile cache to media.
+    /// This stub has no volatile cache; it completes immediately with
+    /// DRDY|DSC, error=0, no DRQ, and raises INTRQ when nIEN=0 (SeaBIOS-friendly).
+    fn exec_flush_cache(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// NOP (`0x00`) on ATA master — non-data success (no side effects).
+    ///
+    /// Spec: ATA/ATAPI Command Set — NOP completes with success; this stub
+    /// mirrors other non-data success completions (DRDY|DSC, error=0).
+    fn exec_nop(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// READ MULTIPLE (`0xC4`) on ATA master — LBA28 multi-sector DRQ PIO.
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ MULTIPLE transfers up to
+    /// `multiple_count` sectors per DRQ interrupt after SET MULTIPLE MODE.
+    /// `multiple_count==0` (not configured) → ERR+ABRT. Final DRQ block may be
+    /// shorter when Sector Count is not divisible by the block factor. INTRQ
+    /// once per DRQ block ready and on command completion when nIEN=0.
+    fn exec_read_multiple(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        // Spec: ATA — READ MULTIPLE invalid if Multiple mode not set.
+        if self.multiple_count == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT); // CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        if !self.load_sector_into_pio(lba) {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.multiple_xfer = true;
+        self.sectors_left = count;
+        self.block_left = self.multiple_block_len(count);
+        self.next_lba = lba.wrapping_add(1);
+        self.begin_pio_out();
+    }
+
+    /// WRITE MULTIPLE (`0xC5`) on ATA master — LBA28 multi-sector DRQ PIO.
+    ///
+    /// Spec: ATA/ATAPI Command Set — WRITE MULTIPLE transfers up to
+    /// `multiple_count` sectors per DRQ interrupt after SET MULTIPLE MODE.
+    /// `multiple_count==0` (not configured) → ERR+ABRT. Final DRQ block may be
+    /// shorter when Sector Count is not divisible by the block factor. INTRQ
+    /// once per DRQ block ready and on command completion when nIEN=0.
+    fn exec_write_multiple(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        // Spec: ATA — WRITE MULTIPLE invalid if Multiple mode not set.
+        if self.multiple_count == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT); // CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.multiple_xfer = true;
+        self.sectors_left = count;
+        self.block_left = self.multiple_block_len(count);
+        self.next_lba = lba;
+        self.begin_pio_in();
+    }
+
+    /// SMART (`0xB0`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SMART is a feature-set command (subcommands
+    /// in Features). This stub does not implement SMART; ATA disks abort with
+    /// ERR+ABRT and no return data / DRQ. Absent/slave → status 0. INTRQ follows
+    /// nIEN like PACKET / READ MULTIPLE abort.
+    fn exec_smart(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// READ DMA (`0xC8`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ DMA transfers sectors via bus-master
+    /// DMA (PRD). This stub has no BM-DMA engine; ATA disks abort with ERR+ABRT
+    /// and no DRQ / DMA start. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SMART / PACKET abort.
+    fn exec_read_dma(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// WRITE DMA (`0xCA`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — WRITE DMA transfers sectors via bus-master
+    /// DMA (PRD). This stub has no BM-DMA engine; ATA disks abort with ERR+ABRT
+    /// and no DRQ / DMA start. Absent/slave → status 0. INTRQ follows nIEN like
+    /// READ DMA abort.
+    fn exec_write_dma(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// SECURITY SET PASSWORD (`0xF1`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY SET PASSWORD is a SECURITY
+    /// feature-set command that transfers a password identifier / password
+    /// buffer to enable device security. This stub does not implement SECURITY
+    /// passwords/state; ATA disks abort with ERR+ABRT and no password PIO /
+    /// DRQ. Absent/slave → status 0. INTRQ follows nIEN like SECURITY UNLOCK /
+    /// FREEZE LOCK abort.
+    fn exec_security_set_password(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// SECURITY UNLOCK (`0xF2`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY UNLOCK is a SECURITY feature-set
+    /// command that transfers a password to unlock the device. This stub does
+    /// not implement SECURITY passwords/state; ATA disks abort with ERR+ABRT
+    /// and no unlock PIO / DRQ. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SECURITY FREEZE LOCK abort.
+    fn exec_security_unlock(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// SECURITY ERASE PREPARE (`0xF3`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY ERASE PREPARE is a SECURITY
+    /// feature-set command that must precede SECURITY ERASE UNIT. This stub does
+    /// not implement SECURITY erase/password state; ATA disks abort with
+    /// ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SECURITY SET PASSWORD abort.
+    fn exec_security_erase_prepare(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// SECURITY ERASE UNIT (`0xF4`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY ERASE UNIT is a SECURITY
+    /// feature-set command that erases user data after SECURITY ERASE PREPARE.
+    /// This stub does not implement SECURITY erase/password PIO; ATA disks abort
+    /// with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SECURITY ERASE PREPARE abort.
+    fn exec_security_erase_unit(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// SECURITY FREEZE LOCK (`0xF5`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY FREEZE LOCK is a SECURITY
+    /// feature-set command that freezes the security state until power cycle.
+    /// This stub does not implement SECURITY; ATA disks abort with ERR+ABRT and
+    /// no freeze state / DRQ. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SMART / READ DMA abort.
+    fn exec_security_freeze_lock(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// SECURITY DISABLE PASSWORD (`0xF6`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SECURITY DISABLE PASSWORD is a SECURITY
+    /// feature-set command that clears a user/master password via a password
+    /// PIO transfer. This stub does not implement SECURITY passwords; ATA disks
+    /// abort with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows
+    /// nIEN like SECURITY ERASE UNIT abort.
+    fn exec_security_disable_password(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// DOWNLOAD MICROCODE (`0x92`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — DOWNLOAD MICROCODE transfers vendor
+    /// microcode (Features subcommand + sector count/buffer). This stub does
+    /// not implement microcode download; ATA disks abort with ERR+ABRT and no
+    /// data/DRQ transfer. Absent/slave → status 0. INTRQ follows nIEN like
+    /// SMART / SECURITY FREEZE abort.
+    fn exec_download_microcode(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// READ LOG EXT (`0x2F`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ LOG EXT reads a General Purpose Log
+    /// page (LBA48 HOB + PIO). This stub does not implement GPL / log pages;
+    /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
+    /// INTRQ follows nIEN like SMART / DOWNLOAD MICROCODE abort.
+    fn exec_read_log_ext(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// WRITE LOG EXT (`0x3F`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — WRITE LOG EXT writes a General Purpose Log
+    /// page (LBA48 HOB + PIO). This stub does not implement GPL / log pages;
+    /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
+    /// INTRQ follows nIEN like READ LOG EXT abort.
+    fn exec_write_log_ext(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// DATA SET MANAGEMENT (`0x06`) on ATA master — ABRT stub (TRIM).
+    ///
+    /// Spec: ATA/ATAPI Command Set — DATA SET MANAGEMENT transfers a DSM/TRIM
+    /// range list (Features TRIM bit + sector-count blocks of LBA ranges). This
+    /// stub does not implement TRIM; ATA disks abort with ERR+ABRT and no
+    /// data/DRQ. Absent/slave → status 0. INTRQ follows nIEN like WRITE LOG EXT.
+    fn exec_data_set_management(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// TRUSTED RECEIVE (`0x5C`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — TRUSTED RECEIVE returns Security Protocol
+    /// data (SPSP / transfer length + PIO). This stub does not implement Trusted
+    /// Computing; ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave →
+    /// status 0. INTRQ follows nIEN like DATA SET MANAGEMENT abort.
+    fn exec_trusted_receive(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// TRUSTED SEND (`0x5E`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — TRUSTED SEND transfers Security Protocol
+    /// data (SPSP / transfer length + PIO). This stub does not implement Trusted
+    /// Computing; ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave →
+    /// status 0. INTRQ follows nIEN like TRUSTED RECEIVE abort.
+    fn exec_trusted_send(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// READ BUFFER (`0xE4`) on ATA master — 512-byte PIO data-in.
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ BUFFER returns the device sector
+    /// buffer via 256-word PIO (no LBA). Buffer contents track the last
+    /// READ/WRITE SECTORS or WRITE BUFFER transfer (zeros after reset).
+    /// Absent/slave → status 0. INTRQ follows nIEN like READ SECTORS / IDENTIFY DRQ.
+    fn exec_read_buffer(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.pio = self.sector_buffer;
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = 1;
+        self.next_lba = 0;
+        self.begin_pio_out();
+    }
+
+    /// WRITE BUFFER (`0xE8`) on ATA master — 512-byte PIO data-out.
+    ///
+    /// Spec: ATA/ATAPI Command Set — WRITE BUFFER accepts the device sector
+    /// buffer via 256-word host→device PIO (no LBA / no media write). Buffer is
+    /// readable via READ BUFFER. Absent/slave → status 0. INTRQ follows nIEN
+    /// like WRITE SECTORS (DRQ ready + command complete).
+    fn exec_write_buffer(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.sector_buffer_write = false;
+            self.clear_irq();
+            return;
+        }
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = 1;
+        self.next_lba = 0;
+        self.sector_buffer_write = true;
+        self.begin_pio_in();
+    }
+
+    /// IDLE / IDLE IMMEDIATE / STANDBY IMMEDIATE — non-data success stubs.
+    ///
+    /// Spec: ATA power-management commands complete with DRDY|DSC; this stub
+    /// does not model timers or standby spin-down.
+    fn exec_power_mgmt_success(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// CHECK POWER MODE (`0xE5`) — report Active/Idle via sector_count=`0xFF`.
+    ///
+    /// Spec: ATA CHECK POWER MODE returns power state in the sector count
+    /// register (`0xFF` = Active or Idle). Stub always reports Active/Idle.
+    fn exec_check_power_mode(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.sector_count = ATA_POWER_ACTIVE_OR_IDLE;
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// RECALIBRATE (`0x10`) / SEEK (`0x70`) — non-data success stubs.
+    ///
+    /// Spec: ATA RECALIBRATE/SEEK complete with DRDY|DSC; this stub does not
+    /// model physical head motion (DSC always set when ready).
+    fn exec_recalibrate_seek_success(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// INITIALIZE DEVICE PARAMETERS (`0x91`) — non-data success stub.
+    ///
+    /// Spec: ATA INITIALIZE DEVICE PARAMETERS programs sectors/heads from the
+    /// task file; this stub accepts and succeeds without changing geometry.
+    fn exec_init_dev_params(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// SET MULTIPLE MODE (`0xC6`) — store Sector Count as READ/WRITE MULTIPLE block factor.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SET MULTIPLE MODE: Sector Count selects
+    /// sectors per interrupt for READ/WRITE MULTIPLE. Accepted values are
+    /// powers of two in `1..=ATA_MULTIPLE_MAX_SECTORS` (IDENTIFY word 47).
+    /// Invalid → ERR+ABRT (prior `multiple_count` unchanged). Completes with
+    /// DRDY|DSC and INTRQ when nIEN=0.
+    fn exec_set_multiple_mode(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        let factor = self.sector_count;
+        if !Self::is_valid_multiple_block_factor(factor) {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        self.multiple_count = factor;
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// Valid SET MULTIPLE MODE Sector Count: power of two ≤ IDENTIFY word 47 max.
+    fn is_valid_multiple_block_factor(factor: u8) -> bool {
+        factor > 0 && factor <= ATA_MULTIPLE_MAX_SECTORS && factor.is_power_of_two()
+    }
+
+    /// READ NATIVE MAX ADDRESS (`0xF8`) — write max LBA28 into task-file regs.
+    ///
+    /// Spec: ATA READ NATIVE MAX ADDRESS returns the native maximum address in
+    /// LBA Low/Mid/High and Device bits 3:0. This stub uses `total_sectors-1`
+    /// (or 0 if empty). Completes with DRDY|DSC and INTRQ when nIEN=0.
+    fn exec_read_native_max(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        let max = self.total_sectors().saturating_sub(1);
+        self.lba_lo = (max & 0xFF) as u8;
+        self.lba_mid = ((max >> 8) & 0xFF) as u8;
+        self.lba_hi = ((max >> 16) & 0xFF) as u8;
+        self.drive_head = (self.drive_head & 0xF0) | (((max >> 24) & 0x0F) as u8);
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// SET MAX ADDRESS (`0xF9`) on ATA master — ABRT stub.
+    ///
+    /// Spec: ATA/ATAPI Command Set — SET MAX ADDRESS sets the Host Protected
+    /// Area maximum address from the task-file LBA (paired with READ NATIVE
+    /// MAX ADDRESS `0xF8`). This stub does not implement HPA; ATA disks abort
+    /// with ERR+ABRT and leave capacity unchanged. Absent/slave → status 0.
+    /// INTRQ follows nIEN like WRITE BUFFER abort.
+    fn exec_set_max_address(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) — success noop (no tray lock state).
+    fn exec_media_lock_unlock(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
+    ///
+    /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
+    /// This stub always reports passed on present master; absent/slave → status 0.
+    fn exec_diagnostic(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        self.error = ATA_DIAG_PASSED;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    /// SET FEATURES (`0xEF`) — accept features register, succeed without side effects.
+    ///
+    /// Spec: ATA SET FEATURES uses the Features register as a subcommand.
+    /// This stub completes successfully on present master (SeaBIOS-friendly
+    /// accept); feature-specific behavior remains unsupported.
+    fn exec_set_features(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        let _subcmd = self.features; // accepted; no side effects yet
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
+    }
+
+    fn exec_command(&mut self, cmd: u8) {
+        match cmd {
+            ATA_CMD_IDENTIFY => self.exec_identify(),
+            ATA_CMD_PACKET => self.exec_packet(),
+            ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
+            ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
+            ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
+            ATA_CMD_READ_VERIFY_SECTORS | ATA_CMD_WRITE_VERIFY_SECTORS => {
+                self.exec_verify_sectors()
+            }
+            ATA_CMD_FLUSH_CACHE | ATA_CMD_FLUSH_CACHE_EXT => self.exec_flush_cache(),
+            ATA_CMD_NOP => self.exec_nop(),
+            ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
+            ATA_CMD_WRITE_MULTIPLE => self.exec_write_multiple(),
+            ATA_CMD_SMART => self.exec_smart(),
+            ATA_CMD_READ_DMA => self.exec_read_dma(),
+            ATA_CMD_WRITE_DMA => self.exec_write_dma(),
+            ATA_CMD_SECURITY_SET_PASSWORD => self.exec_security_set_password(),
+            ATA_CMD_SECURITY_UNLOCK => self.exec_security_unlock(),
+            ATA_CMD_SECURITY_ERASE_PREPARE => self.exec_security_erase_prepare(),
+            ATA_CMD_SECURITY_ERASE_UNIT => self.exec_security_erase_unit(),
+            ATA_CMD_SECURITY_FREEZE_LOCK => self.exec_security_freeze_lock(),
+            ATA_CMD_SECURITY_DISABLE_PASSWORD => self.exec_security_disable_password(),
+            ATA_CMD_DOWNLOAD_MICROCODE => self.exec_download_microcode(),
+            ATA_CMD_READ_LOG_EXT => self.exec_read_log_ext(),
+            ATA_CMD_WRITE_LOG_EXT => self.exec_write_log_ext(),
+            ATA_CMD_DATA_SET_MANAGEMENT => self.exec_data_set_management(),
+            ATA_CMD_TRUSTED_RECEIVE => self.exec_trusted_receive(),
+            ATA_CMD_TRUSTED_SEND => self.exec_trusted_send(),
+            ATA_CMD_READ_BUFFER => self.exec_read_buffer(),
+            ATA_CMD_WRITE_BUFFER => self.exec_write_buffer(),
+            ATA_CMD_SET_MULTIPLE_MODE => self.exec_set_multiple_mode(),
+            ATA_CMD_IDLE
+            | ATA_CMD_IDLE_IMMEDIATE
+            | ATA_CMD_STANDBY_IMMEDIATE
+            | ATA_CMD_STANDBY
+            | ATA_CMD_SLEEP => self.exec_power_mgmt_success(),
+            ATA_CMD_CHECK_POWER_MODE => self.exec_check_power_mode(),
+            ATA_CMD_RECALIBRATE | ATA_CMD_SEEK => self.exec_recalibrate_seek_success(),
+            ATA_CMD_INIT_DEV_PARAMS => self.exec_init_dev_params(),
+            ATA_CMD_READ_NATIVE_MAX => self.exec_read_native_max(),
+            ATA_CMD_SET_MAX_ADDRESS => self.exec_set_max_address(),
+            ATA_CMD_MEDIA_LOCK | ATA_CMD_MEDIA_UNLOCK => self.exec_media_lock_unlock(),
+            ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
+            ATA_CMD_SET_FEATURES => self.exec_set_features(),
+            _ => self.abort_command(ATA_ER_ABRT), // unsupported command
+        }
+    }
+
+    fn read_data(&mut self, size: u8) -> u32 {
+        if !self.transferring || self.pio_in || self.status & ATA_SR_DRQ == 0 {
+            return 0xFFFF_FFFF;
+        }
+        let mut val = 0u32;
+        let nbytes = match size {
+            4 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        for i in 0..nbytes {
+            if self.pio_off < SECTOR_SIZE {
+                val |= u32::from(self.pio[self.pio_off]) << (8 * i);
+                self.pio_off += 1;
+            }
+        }
+        if self.pio_off >= SECTOR_SIZE {
+            self.finish_sector_pio_out();
+        }
+        val
+    }
+
+    fn write_data(&mut self, size: u8, value: u32) {
+        if !self.transferring || !self.pio_in || self.status & ATA_SR_DRQ == 0 {
+            return;
+        }
+        let nbytes = match size {
+            4 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        for i in 0..nbytes {
+            if self.pio_off < SECTOR_SIZE {
+                self.pio[self.pio_off] = ((value >> (8 * i)) & 0xFF) as u8;
+                self.pio_off += 1;
+            }
+        }
+        if self.pio_off >= SECTOR_SIZE {
+            self.finish_sector_pio_in();
+        }
+    }
+
+    fn finish_sector_pio_out(&mut self) {
+        if self.sectors_left > 0 {
+            self.sectors_left -= 1;
+        }
+        if self.multiple_xfer && self.block_left > 0 {
+            self.block_left -= 1;
+        }
+        if self.sectors_left == 0 {
+            self.transferring = false;
+            self.pio_in = false;
+            self.multiple_xfer = false;
+            self.block_left = 0;
+            self.pio_off = 0;
+            self.status = ATA_SR_DRDY | ATA_SR_DSC;
+            self.sector_count = 0;
+            // Spec: ATA — INTRQ on command completion after final sector.
+            self.raise_irq();
+            return;
+        }
+        // Multi-sector READ / READ MULTIPLE: present next sector.
+        if !self.load_sector_into_pio(self.next_lba) {
+            self.abort_command(0x10);
+            return;
+        }
+        self.next_lba = self.next_lba.wrapping_add(1);
+        self.pio_off = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        // Spec: sector count decrements as sectors transfer.
+        if self.sector_count != 0 {
+            self.sector_count = self.sector_count.wrapping_sub(1);
+        }
+        if self.multiple_xfer {
+            if self.block_left == 0 {
+                // Spec: ATA READ MULTIPLE — IRQ when next multi-sector DRQ ready.
+                self.block_left = self.multiple_block_len(self.sectors_left);
+                self.raise_irq();
+            }
+            // Within a Multiple DRQ block: keep DRQ, no IRQ between sectors.
+        } else {
+            // Spec: OSDev ATA PIO — IRQ again when next sector DRQ ready.
+            self.raise_irq();
+        }
+    }
+
+    fn finish_sector_pio_in(&mut self) {
+        // Spec: ATA WRITE BUFFER — commit 512-byte PIO into sector buffer only.
+        if self.sector_buffer_write {
+            self.sector_buffer = self.pio;
+            self.sector_buffer_write = false;
+            self.sectors_left = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.pio_off = 0;
+            self.status = ATA_SR_DRDY | ATA_SR_DSC;
+            self.sector_count = 0;
+            // Spec: ATA — INTRQ on WRITE BUFFER command completion.
+            self.raise_irq();
+            return;
+        }
+        // Spec: ATA WRITE SECTORS / WRITE MULTIPLE — commit filled sector.
+        let lba = self.next_lba;
+        if !self.store_sector_from_pio(lba) {
+            self.abort_command(0x10);
+            return;
+        }
+        if self.sectors_left > 0 {
+            self.sectors_left -= 1;
+        }
+        if self.multiple_xfer && self.block_left > 0 {
+            self.block_left -= 1;
+        }
+        if self.sectors_left == 0 {
+            self.transferring = false;
+            self.pio_in = false;
+            self.multiple_xfer = false;
+            self.block_left = 0;
+            self.pio_off = 0;
+            self.status = ATA_SR_DRDY | ATA_SR_DSC;
+            self.sector_count = 0;
+            // Spec: ATA — INTRQ on WRITE command completion.
+            self.raise_irq();
+            return;
+        }
+        self.next_lba = lba.wrapping_add(1);
+        if self.next_lba >= self.total_sectors() {
+            self.abort_command(0x10);
+            return;
+        }
+        self.pio_off = 0;
+        self.pio.fill(0);
+        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        if self.sector_count != 0 {
+            self.sector_count = self.sector_count.wrapping_sub(1);
+        }
+        if self.multiple_xfer {
+            if self.block_left == 0 {
+                // Spec: ATA WRITE MULTIPLE — IRQ when next multi-sector DRQ ready.
+                self.block_left = self.multiple_block_len(self.sectors_left);
+                self.raise_irq();
+            }
+            // Within a Multiple DRQ block: keep DRQ, no IRQ between sectors.
+        } else {
+            // Spec: OSDev ATA PIO WRITE — IRQ when next sector DRQ ready.
+            self.raise_irq();
+        }
+    }
+
+    fn write_dev_ctrl(&mut self, value: u8) {
+        let prev = self.dev_ctrl;
+        self.dev_ctrl = value & (ATA_DC_SRST | ATA_DC_NIEN | 0x01);
+        // Spec: ATA device control — SRST high then low performs software reset.
+        if prev & ATA_DC_SRST == 0 && value & ATA_DC_SRST != 0 {
+            // Enter reset: BSY
+            if self.present && !self.is_slave_selected() {
+                self.status = ATA_SR_BSY;
+            }
+            self.clear_irq();
+        } else if prev & ATA_DC_SRST != 0 && value & ATA_DC_SRST == 0 {
+            if self.present {
+                self.reset_ready();
+            } else {
+                self.status = 0;
+                self.clear_irq();
+            }
+        }
+    }
+
+    fn status_byte(&self) -> u8 {
+        // No slave / absent: floating bus reads 0x00 for IDENTIFY probe.
+        if !self.present || self.is_slave_selected() {
+            return 0;
+        }
+        self.status
+    }
+
+    fn read_status_clear_irq(&mut self) -> u8 {
+        // Spec: OSDev ATA PIO — reading Status (not alt) clears IRQ.
+        self.clear_irq();
+        self.status_byte()
+    }
+}
+
+impl PortDevice for IdePrimary {
+    fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        match port {
+            IDE_PRIMARY_DATA => self.read_data(size),
+            IDE_PRIMARY_ERROR => u32::from(self.error),
+            IDE_PRIMARY_SECCOUNT => u32::from(self.sector_count),
+            IDE_PRIMARY_LBA_LO => u32::from(self.lba_lo),
+            IDE_PRIMARY_LBA_MID => u32::from(self.lba_mid),
+            IDE_PRIMARY_LBA_HI => u32::from(self.lba_hi),
+            IDE_PRIMARY_DRIVE => u32::from(self.drive_head),
+            IDE_PRIMARY_STATUS => u32::from(self.read_status_clear_irq()),
+            // Spec: alt status mirrors status without clearing IRQ.
+            IDE_PRIMARY_CTRL => u32::from(self.status_byte()),
+            _ => 0xFFFF_FFFF,
+        }
+    }
+
+    fn port_write(&mut self, port: u16, size: u8, value: u32) {
+        match port {
+            IDE_PRIMARY_DATA => self.write_data(size, value),
+            IDE_PRIMARY_ERROR => self.features = value as u8,
+            IDE_PRIMARY_SECCOUNT => self.sector_count = value as u8,
+            IDE_PRIMARY_LBA_LO => self.lba_lo = value as u8,
+            IDE_PRIMARY_LBA_MID => self.lba_mid = value as u8,
+            IDE_PRIMARY_LBA_HI => self.lba_hi = value as u8,
+            IDE_PRIMARY_DRIVE => {
+                self.drive_head = value as u8;
+                // Selecting absent slave yields status 0 on subsequent status reads.
+            }
+            IDE_PRIMARY_STATUS => {
+                // Command register.
+                if self.status & ATA_SR_BSY != 0 {
+                    return;
+                }
+                self.exec_command(value as u8);
+            }
+            IDE_PRIMARY_CTRL => self.write_dev_ctrl(value as u8),
+            _ => {}
+        }
+    }
+}
+
+/// Secondary ATA IDE channel — thin port remap of [`IdePrimary`] to `0x170`/`0x376`.
+///
+/// # Spec refs
+///
+/// - OSDev ATA PIO Mode — secondary command block `0x170`–`0x177`, control `0x376`;
+///   secondary channel → ISA IRQ15.
+/// - ATA / ATAPI — same IDENTIFY / READ / WRITE / READ BUFFER (`0xE4`) /
+///   WRITE BUFFER (`0xE8`) PIO semantics as primary (via inner).
+/// - Intel 8259A — DualPic IR15 (slave IR7) via MachineBus.
+///
+/// # Scope
+///
+/// - Master only; IDENTIFY / READ / WRITE / READ BUFFER / WRITE BUFFER /
+///   PACKET+IDENTIFY PACKET ABRT via inner [`IdePrimary`]
+/// - IRQ15 when INTRQ ∧ ¬nIEN (`irq_line`)
+///
+/// # Unsupported
+///
+/// - Slave drive, DMA, LBA48, PACKET media engine, PCI BAR remap
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct IdeSecondary {
+    /// Shared ATA PIO engine (ports remapped in [`PortDevice`]).
+    pub inner: IdePrimary,
+}
+
+impl IdeSecondary {
+    /// Empty secondary channel (no drive) — status reads `0`.
+    pub fn new() -> Self {
+        Self {
+            inner: IdePrimary::new(),
+        }
+    }
+
+    pub fn with_image(image: Vec<u8>) -> Self {
+        Self {
+            inner: IdePrimary::with_image(image),
+        }
+    }
+
+    pub fn attach_image(&mut self, image: Vec<u8>) {
+        self.inner.attach_image(image);
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// True if this device owns the secondary I/O port.
+    pub fn owns_port(port: u16) -> bool {
+        matches!(port, 0x170..=0x177 | IDE_SECONDARY_CTRL)
+    }
+
+    /// ISA IRQ15 line level (INTRQ ∧ ¬nIEN).
+    ///
+    /// Spec: ATA device control nIEN; OSDev ATA PIO — secondary → IRQ15.
+    pub fn irq_line(&self) -> bool {
+        self.inner.irq_line()
+    }
+
+    /// Map secondary ports onto the primary register file used by [`IdePrimary`].
+    fn map_port(port: u16) -> u16 {
+        match port {
+            0x170..=0x177 => port - IDE_SECONDARY_DATA + IDE_PRIMARY_DATA,
+            IDE_SECONDARY_CTRL => IDE_PRIMARY_CTRL,
+            _ => port,
+        }
+    }
+}
+
+impl PortDevice for IdeSecondary {
+    fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        self.inner.port_read(Self::map_port(port), size)
+    }
+
+    fn port_write(&mut self, port: u16, size: u8, value: u32) {
+        self.inner.port_write(Self::map_port(port), size, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identify_word(pio: &[u8; SECTOR_SIZE], idx: usize) -> u16 {
+        let off = idx * 2;
+        u16::from(pio[off]) | (u16::from(pio[off + 1]) << 8)
+    }
+
+    fn clear_nien(ide: &mut IdePrimary) {
+        ide.port_write(IDE_PRIMARY_CTRL, 1, 0);
+    }
+
+    #[test]
+    fn absent_drive_status_is_zero() {
+        // Spec: OSDev ATA PIO — IDENTIFY on missing drive → status 0.
+        let mut ide = IdePrimary::new();
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+    }
+
+    #[test]
+    fn identify_sets_drq_and_returns_256_words() {
+        // Spec: ATA IDENTIFY DEVICE — 256 words via data port when DRQ set.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        assert_eq!(
+            ide.port_read(IDE_PRIMARY_STATUS, 1) as u8,
+            ATA_SR_DRDY | ATA_SR_DSC
+        );
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_BSY, 0);
+        assert_ne!(st & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_MID, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_HI, 1) as u8, 0);
+
+        let mut words = Vec::with_capacity(IDENTIFY_WORDS);
+        for _ in 0..IDENTIFY_WORDS {
+            words.push(ide.port_read(IDE_PRIMARY_DATA, 2) as u16);
+        }
+        assert_eq!(words[49] & (1 << 9), 1 << 9, "LBA supported");
+        assert_eq!(words[60], 4);
+        assert_eq!(words[61], 0);
+        let st_done = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st_done & ATA_SR_DRQ, 0);
+        assert_ne!(st_done & ATA_SR_DRDY, 0);
+    }
+
+    #[test]
+    fn read_sectors_lba28_pio() {
+        // Spec: ATA READ SECTORS (0x20) — LBA28, sector count, 256 words/sector.
+        let mut img = vec![0u8; SECTOR_SIZE * 3];
+        img[SECTOR_SIZE] = 0xAA;
+        img[SECTOR_SIZE + 1] = 0x55;
+        img[SECTOR_SIZE + 511] = 0xC3;
+        let mut ide = IdePrimary::with_image(img);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        let w0 = ide.port_read(IDE_PRIMARY_DATA, 2) as u16;
+        assert_eq!(w0, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        let w_last = ide.port_read(IDE_PRIMARY_DATA, 2) as u16;
+        // Little-endian word at bytes 510–511: low=0x00, high=0xC3.
+        assert_eq!(w_last, 0xC300);
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn read_sectors_multi_two() {
+        let mut img = vec![0u8; SECTOR_SIZE * 2];
+        img[0] = 0x11;
+        img[SECTOR_SIZE] = 0x22;
+        let mut ide = IdePrimary::with_image(img);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        let first = ide.port_read(IDE_PRIMARY_DATA, 2) as u16;
+        assert_eq!(first & 0xFF, 0x11);
+        for _ in 1..256 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        // Second sector should now be under DRQ.
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        let second = ide.port_read(IDE_PRIMARY_DATA, 2) as u16;
+        assert_eq!(second & 0xFF, 0x22);
+        for _ in 1..256 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn read_oob_sets_err() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn alt_status_mirrors_status() {
+        // Spec: IBM PC/AT — 0x3F6 alternate status mirrors status without IRQ ack.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        assert_eq!(
+            ide.port_read(IDE_PRIMARY_CTRL, 1) as u8,
+            ide.port_read(IDE_PRIMARY_STATUS, 1) as u8
+        );
+    }
+
+    #[test]
+    fn srst_restores_ready() {
+        // Spec: ATA device control SRST pulse → software reset.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_SRST | ATA_DC_NIEN));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_BSY, 0);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        assert_eq!(
+            ide.port_read(IDE_PRIMARY_STATUS, 1) as u8,
+            ATA_SR_DRDY | ATA_SR_DSC
+        );
+    }
+
+    #[test]
+    fn owns_primary_ports_only() {
+        assert!(IdePrimary::owns_port(IDE_PRIMARY_DATA));
+        assert!(IdePrimary::owns_port(IDE_PRIMARY_STATUS));
+        assert!(IdePrimary::owns_port(IDE_PRIMARY_CTRL));
+        assert!(!IdePrimary::owns_port(0x170));
+        assert!(!IdePrimary::owns_port(0x3F7));
+    }
+
+    #[test]
+    fn identify_total_sectors_in_words_60_61() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 0x1_0001]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_eq!(identify_word(&ide.pio, 60), 0x0001);
+        assert_eq!(identify_word(&ide.pio, 61), 0x0001);
+    }
+
+    #[test]
+    fn identify_asserts_irq14_when_nien_clear() {
+        // Spec: ATA + OSDev ATA PIO — INTRQ when DRQ ready if nIEN=0.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn nien_set_masks_irq_line() {
+        // Spec: ATA device control — nIEN=1 disables INTRQ pin.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        // Default reset leaves nIEN set.
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn status_read_clears_irq_alt_does_not() {
+        // Spec: OSDev ATA PIO — Status clears IRQ; alternate status does not.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_CTRL, 1);
+        assert!(ide.irq_line(), "alt status must not clear IRQ");
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn read_sectors_asserts_irq_on_drq() {
+        // Spec: ATA READ SECTORS — IRQ when sector data ready (DRQ).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn error_completion_asserts_irq_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn multi_sector_raises_irq_per_drq_block() {
+        // Spec: OSDev ATA PIO — IRQ for each sector DRQ when interrupts enabled.
+        let mut img = vec![0u8; SECTOR_SIZE * 2];
+        img[0] = 0x11;
+        img[SECTOR_SIZE] = 0x22;
+        let mut ide = IdePrimary::with_image(img);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1); // ack first IRQ
+        assert!(!ide.irq_line());
+        for _ in 0..256 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        // Second sector under DRQ → IRQ again.
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
+    }
+
+    fn write_sector_words(ide: &mut IdePrimary, first: u16, last: u16) {
+        ide.port_write(IDE_PRIMARY_DATA, 2, u32::from(first));
+        for _ in 1..255 {
+            ide.port_write(IDE_PRIMARY_DATA, 2, 0);
+        }
+        ide.port_write(IDE_PRIMARY_DATA, 2, u32::from(last));
+    }
+
+    #[test]
+    fn write_sectors_lba28_pio() {
+        // Spec: ATA WRITE SECTORS (0x30) — LBA28, 256 words/sector into media.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 3]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(ide.image[SECTOR_SIZE], 0xAA);
+        assert_eq!(ide.image[SECTOR_SIZE + 1], 0x55);
+        assert_eq!(ide.image[SECTOR_SIZE + 511], 0xC3);
+    }
+
+    #[test]
+    fn write_sectors_multi_two() {
+        // Spec: ATA WRITE SECTORS — multi-sector PIO commits each sector in order.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words(&mut ide, 0x0011, 0);
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words(&mut ide, 0x0022, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        assert_eq!(ide.image[0], 0x11);
+        assert_eq!(ide.image[SECTOR_SIZE], 0x22);
+    }
+
+    #[test]
+    fn write_oob_sets_err() {
+        // Spec: ATA — out-of-range LBA → ERR (IDNF-style).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn write_sectors_asserts_irq_on_drq_and_complete() {
+        // Spec: ATA WRITE + OSDev — IRQ at DRQ and again at command complete.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1); // ack DRQ IRQ
+        assert!(!ide.irq_line());
+        write_sector_words(&mut ide, 0xBEEF, 0);
+        // Completion IRQ after final sector commit.
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_nien_masks_irq_line() {
+        // Spec: ATA device control — nIEN=1 disables INTRQ during WRITE.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_then_read_round_trip() {
+        // Spec: WRITE then READ SECTORS see committed media.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0xC300);
+    }
+
+    #[test]
+    fn identify_packet_aborts_on_ata_master() {
+        // Spec: ATA/ATAPI — IDENTIFY PACKET DEVICE (0xA1) on ATA disk → ERR+ABRT.
+        // Master remains ATA; no ATAPI identify PIO buffer in this stub.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY_PACKET));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn identify_packet_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion (SeaBIOS may poll or use IRQ).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY_PACKET));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn identify_packet_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device probe → status 0.
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY_PACKET));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    #[test]
+    fn packet_aborts_on_ata_master() {
+        // Spec: ATA/ATAPI — PACKET (0xA0) is for ATAPI devices; ATA disk → ERR+ABRT.
+        // No 12-byte packet PIO / DRQ phase on non-ATAPI master (SeaBIOS-friendly).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn packet_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match WRITE/IDENTIFY).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn packet_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match WRITE SECTORS).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn packet_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_PACKET));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — FLUSH CACHE (`0xE7`) non-data success on
+    /// ATA master: DRDY|DSC, error=0, no DRQ; INTRQ when nIEN=0.
+    /// Spec: ATA/ATAPI — READ VERIFY SECTORS (`0x40`) non-data success for
+    /// in-range LBA28; no DRQ / no sector transfer.
+    #[test]
+    fn read_verify_sectors_succeeds_in_range() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_ne!(st & ATA_SR_DSC, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    /// Spec: ATA — READ VERIFY SECTORS out-of-range → ERR+IDNF, no DRQ.
+    #[test]
+    fn read_verify_sectors_oob_sets_idnf() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
+    }
+
+    /// Spec: ATA — READ VERIFY range that spills past image end → IDNF.
+    #[test]
+    fn read_verify_sectors_partial_spill_sets_idnf() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1); // LBA 1..2 needs 2 sectors; only 0..1 exist
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
+    }
+
+    /// Spec: ATA — nIEN gates INTRQ on READ VERIFY success.
+    #[test]
+    fn read_verify_sectors_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_READ_VERIFY_SECTORS),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI — WRITE VERIFY SECTORS (`0x3C`) non-data success for
+    /// in-range LBA28; no DRQ / no media write.
+    #[test]
+    fn write_verify_sectors_succeeds_in_range_no_write() {
+        let img = vec![0x5Au8; SECTOR_SIZE * 2];
+        let mut ide = IdePrimary::with_image(img.clone());
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_WRITE_VERIFY_SECTORS),
+        );
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert_eq!(ide.image, img, "WRITE VERIFY must not alter media");
+    }
+
+    /// Spec: ATA — WRITE VERIFY SECTORS out-of-range → ERR+IDNF.
+    #[test]
+    fn write_verify_sectors_oob_sets_idnf() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 3);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_WRITE_VERIFY_SECTORS),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
+    }
+
+    #[test]
+    fn flush_cache_succeeds_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE));
+        // Spec: ATA — INTRQ asserted on completion; status read clears it.
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8; // alt status: no IRQ clear
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_ne!(st & ATA_SR_DSC, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(ide.irq_line(), "alt status must not clear INTRQ");
+    }
+
+    #[test]
+    fn flush_cache_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — EXECUTE DEVICE DIAGNOSTIC (`0x90`) → error=0x01 passed.
+    #[test]
+    fn diagnostic_passes_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DIAGNOSTIC));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_DIAG_PASSED);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+    }
+
+    /// Spec: ATA — SET FEATURES (`0xEF`) succeeds on ATA master (no side effects).
+    #[test]
+    fn set_features_succeeds_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_ERROR, 1, 0x03); // features write via error port alias
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_FEATURES));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+    }
+
+    #[test]
+    fn diagnostic_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DIAGNOSTIC));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+    }
+
+    #[test]
+    fn set_features_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_FEATURES));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+    }
+
+    #[test]
+    fn flush_cache_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI — NOP (`0x00`) non-data success on ATA master.
+    #[test]
+    fn nop_succeeds_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_NOP));
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_ne!(st & ATA_SR_DSC, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    #[test]
+    fn nop_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_NOP));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — READ MULTIPLE (`0xC4`) without SET MULTIPLE MODE → ERR+ABRT.
+    #[test]
+    fn read_multiple_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn read_multiple_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — WRITE MULTIPLE (`0xC5`) without SET MULTIPLE MODE → ERR+ABRT.
+    #[test]
+    fn write_multiple_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SMART (`0xB0`) is a feature-set command.
+    /// This stub has no SMART support; ATA master → ERR+ABRT, no data/DRQ.
+    #[test]
+    fn smart_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SMART));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn smart_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match PACKET/READ MULTIPLE).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SMART));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn smart_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match PACKET abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SMART));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn smart_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SMART));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — READ DMA (`0xC8`) needs bus-master DMA.
+    /// This stub has no BM-DMA/PRD engine; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn read_dma_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn read_dma_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match SMART/PACKET).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn read_dma_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match SMART abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn read_dma_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_DMA));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — WRITE DMA (`0xCA`) needs bus-master DMA.
+    /// This stub has no BM-DMA/PRD engine; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn write_dma_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_DMA));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn write_dma_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match READ DMA).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_DMA));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn write_dma_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match READ DMA abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_DMA));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_dma_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_DMA));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY SET PASSWORD (`0xF1`) is a
+    /// SECURITY feature-set command. This stub has no SECURITY passwords/state;
+    /// ATA master → ERR+ABRT, no password PIO/DRQ.
+    #[test]
+    fn security_set_password_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_set_password_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match UNLOCK/FREEZE).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_set_password_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match UNLOCK abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_set_password_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_SET_PASSWORD),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY ERASE PREPARE (`0xF3`) is a
+    /// SECURITY feature-set command that must precede SECURITY ERASE UNIT. This
+    /// stub has no SECURITY erase/password state; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn security_erase_prepare_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_PREPARE),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_erase_prepare_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match SET PASSWORD).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_PREPARE),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_erase_prepare_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match SET PASSWORD abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_PREPARE),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_erase_prepare_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_PREPARE),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY ERASE UNIT (`0xF4`) is a
+    /// SECURITY feature-set command that follows SECURITY ERASE PREPARE. This
+    /// stub has no SECURITY erase/password PIO; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn security_erase_unit_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_erase_unit_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match ERASE PREPARE).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_erase_unit_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match ERASE PREPARE abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_erase_unit_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_ERASE_UNIT),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY DISABLE PASSWORD (`0xF6`) is a
+    /// SECURITY feature-set command that clears passwords via PIO. This stub
+    /// has no SECURITY password PIO; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn security_disable_password_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_disable_password_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match ERASE UNIT).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_disable_password_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match ERASE UNIT abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_disable_password_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_DISABLE_PASSWORD),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY UNLOCK (`0xF2`) is a SECURITY
+    /// feature-set command. This stub has no SECURITY passwords/state; ATA
+    /// master → ERR+ABRT, no unlock PIO/DRQ.
+    #[test]
+    fn security_unlock_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SECURITY_UNLOCK));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_unlock_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match FREEZE LOCK).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SECURITY_UNLOCK));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_unlock_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match FREEZE LOCK abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SECURITY_UNLOCK));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_unlock_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SECURITY_UNLOCK));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SECURITY FREEZE LOCK (`0xF5`) is a SECURITY
+    /// feature-set command. This stub has no SECURITY support; ATA master →
+    /// ERR+ABRT, no freeze state/DRQ.
+    #[test]
+    fn security_freeze_lock_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_FREEZE_LOCK),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn security_freeze_lock_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match SMART/READ DMA).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_FREEZE_LOCK),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn security_freeze_lock_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match SMART abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_FREEZE_LOCK),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn security_freeze_lock_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_SECURITY_FREEZE_LOCK),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — DOWNLOAD MICROCODE (`0x92`) transfers vendor
+    /// microcode. This stub has no microcode path; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn download_microcode_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DOWNLOAD_MICROCODE));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn download_microcode_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match SMART/SECURITY).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DOWNLOAD_MICROCODE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn download_microcode_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match SMART abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DOWNLOAD_MICROCODE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn download_microcode_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_DOWNLOAD_MICROCODE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — READ LOG EXT (`0x2F`) reads a General
+    /// Purpose Log page. This stub has no GPL/log path; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn read_log_ext_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_LOG_EXT));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn read_log_ext_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match SMART/DOWNLOAD).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_LOG_EXT));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn read_log_ext_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match SMART abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_LOG_EXT));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn read_log_ext_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_LOG_EXT));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — WRITE LOG EXT (`0x3F`) writes a General
+    /// Purpose Log page. This stub has no GPL/log path; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn write_log_ext_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_LOG_EXT));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn write_log_ext_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match READ LOG EXT).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_LOG_EXT));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn write_log_ext_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match READ LOG EXT abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_LOG_EXT));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_log_ext_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_LOG_EXT));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — DATA SET MANAGEMENT (`0x06`) transfers a
+    /// TRIM/DSM range list. This stub has no TRIM path; ATA master → ERR+ABRT, no DRQ.
+    #[test]
+    fn data_set_management_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_DATA_SET_MANAGEMENT),
+        );
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn data_set_management_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match WRITE LOG EXT).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_DATA_SET_MANAGEMENT),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn data_set_management_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match WRITE LOG EXT abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_DATA_SET_MANAGEMENT),
+        );
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn data_set_management_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(
+            IDE_PRIMARY_STATUS,
+            1,
+            u32::from(ATA_CMD_DATA_SET_MANAGEMENT),
+        );
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — TRUSTED RECEIVE (`0x5C`) returns Security
+    /// Protocol data. This stub has no Trusted Computing path; ATA master →
+    /// ERR+ABRT, no DRQ.
+    #[test]
+    fn trusted_receive_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_RECEIVE));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn trusted_receive_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match DSM abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_RECEIVE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn trusted_receive_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match DSM abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_RECEIVE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn trusted_receive_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_RECEIVE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — TRUSTED SEND (`0x5E`) transfers Security
+    /// Protocol data. This stub has no Trusted Computing path; ATA master →
+    /// ERR+ABRT, no DRQ.
+    #[test]
+    fn trusted_send_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_SEND));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    #[test]
+    fn trusted_send_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match TRUSTED RECEIVE).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_SEND));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn trusted_send_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match TRUSTED RECEIVE).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_SEND));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn trusted_send_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_TRUSTED_SEND));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — READ BUFFER (`0xE4`) returns the 512-byte
+    /// sector buffer via PIO (no LBA). Buffer is last WRITE/READ SECTORS payload.
+    #[test]
+    fn read_buffer_pio_returns_sector_buffer() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        // Seed sector buffer via WRITE SECTORS (same device buffer path).
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0xC300);
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn read_buffer_zeros_before_any_transfer() {
+        // Spec: ATA READ BUFFER — sector buffer starts cleared; 256-word PIO of zeros.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        for _ in 0..256 {
+            assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn read_buffer_asserts_irq_on_drq_when_nien_clear() {
+        // Spec: ATA / OSDev PIO — INTRQ when DRQ ready if nIEN=0 (match READ SECTORS).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn read_buffer_nien_masks_irq_on_drq() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ during READ BUFFER DRQ.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn read_buffer_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`) accepts 512 bytes via
+    /// host→device DRQ PIO into the device sector buffer (no LBA / no media write).
+    #[test]
+    fn write_buffer_pio_fills_sector_buffer() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        let image_before = ide.image.clone();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        // Spec: WRITE BUFFER updates the sector buffer only — not backing media.
+        assert_eq!(ide.image, image_before);
+    }
+
+    /// Spec: ATA WRITE BUFFER then READ BUFFER — round-trip via shared sector buffer.
+    #[test]
+    fn write_buffer_read_buffer_round_trip() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words(&mut ide, 0x55AA, 0xC300);
+
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16, 0xC300);
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn write_buffer_asserts_irq_on_drq_and_complete_when_nien_clear() {
+        // Spec: ATA / OSDev PIO WRITE — INTRQ at DRQ and again at command complete.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1); // ack DRQ IRQ
+        assert!(!ide.irq_line());
+        write_sector_words(&mut ide, 0xBEEF, 0);
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_buffer_nien_masks_irq_on_drq() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ during WRITE BUFFER DRQ.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_buffer_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — IDLE / IDLE IMMEDIATE / STANDBY IMMEDIATE / STANDBY / SLEEP
+    /// succeed; CHECK POWER MODE sets sector_count=`0xFF` (Active/Idle).
+    #[test]
+    fn idle_standby_sleep_and_check_power_mode() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        for cmd in [
+            ATA_CMD_IDLE,
+            ATA_CMD_IDLE_IMMEDIATE,
+            ATA_CMD_STANDBY_IMMEDIATE,
+            ATA_CMD_STANDBY,
+            ATA_CMD_SLEEP,
+        ] {
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
+            assert!(ide.irq_line());
+            let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8; // clears IRQ
+            assert_eq!(st & ATA_SR_ERR, 0);
+            assert_ne!(st & ATA_SR_DRDY, 0);
+        }
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 0x00);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_CHECK_POWER_MODE));
+        assert!(ide.irq_line());
+        assert_eq!(
+            ide.port_read(IDE_PRIMARY_SECCOUNT, 1) as u8,
+            ATA_POWER_ACTIVE_OR_IDLE
+        );
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+    }
+
+    /// Spec: ATA — RECALIBRATE (`0x10`) and SEEK (`0x70`) non-data success.
+    #[test]
+    fn recalibrate_and_seek_succeed() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        for cmd in [ATA_CMD_RECALIBRATE, ATA_CMD_SEEK] {
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
+            assert!(ide.irq_line());
+            let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+            assert_eq!(st & ATA_SR_ERR, 0);
+            assert_ne!(st & ATA_SR_DSC, 0);
+        }
+    }
+
+    /// Spec: ATA — INITIALIZE DEVICE PARAMETERS (`0x91`) non-data success.
+    #[test]
+    fn init_device_parameters_succeeds() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 63);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_INIT_DEV_PARAMS));
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+    }
+
+    /// Spec: ATA — FLUSH CACHE EXT (`0xEA`) same success path as FLUSH CACHE.
+    #[test]
+    fn flush_cache_ext_succeeds_like_flush_cache() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_FLUSH_CACHE_EXT));
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    /// Spec: ATA — READ NATIVE MAX ADDRESS (`0xF8`) writes max LBA into task file.
+    #[test]
+    fn read_native_max_address_writes_task_file() {
+        // 4 sectors → max LBA = 3.
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_NATIVE_MAX));
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8, 3);
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_MID, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_HI, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DRIVE, 1) as u8 & 0x0F, 0);
+        let st = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+    }
+
+    /// Spec: ATA/ATAPI Command Set — SET MAX ADDRESS (`0xF9`) sets HPA max from
+    /// task-file LBA (paired with READ NATIVE MAX `0xF8` success). This stub has
+    /// no HPA path; ATA master → ERR+ABRT, no DRQ, capacity unchanged.
+    #[test]
+    fn set_max_address_aborts_on_ata_master() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        // Attempt to shrink max below native (would be HPA if implemented).
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        // Capacity unchanged: READ NATIVE MAX still reports LBA 3.
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_NATIVE_MAX));
+        assert_eq!(ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8, 3);
+    }
+
+    #[test]
+    fn set_max_address_asserts_irq_on_abort_when_nien_clear() {
+        // Spec: ATA — INTRQ on error completion when nIEN=0 (match WRITE BUFFER).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn set_max_address_nien_masks_irq_on_abort() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ (match WRITE BUFFER abort).
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn set_max_address_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MAX_ADDRESS));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA SET MULTIPLE MODE (`0xC6`) — Sector Count = block factor;
+    /// valid powers of two within IDENTIFY word 47 max (16) succeed and store
+    /// the factor (observable via `multiple_count` + IDENTIFY word 59).
+    #[test]
+    fn set_multiple_mode_stores_valid_block_factors() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        for factor in [1u8, 2, 4, 8, 16] {
+            ide.port_write(IDE_PRIMARY_SECCOUNT, 1, u32::from(factor));
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
+            assert!(ide.irq_line(), "factor {factor}");
+            let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+            assert_eq!(st & ATA_SR_ERR, 0, "factor {factor}");
+            assert_ne!(st & ATA_SR_DRDY, 0, "factor {factor}");
+            assert_eq!(
+                ide.port_read(IDE_PRIMARY_ERROR, 1) as u8,
+                0,
+                "factor {factor}"
+            );
+            assert_eq!(ide.multiple_count, factor, "factor {factor}");
+
+            // IDENTIFY word 59: bit8 valid + bits7:0 = current multiple setting.
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+            assert_eq!(
+                identify_word(&ide.pio, 59),
+                0x0100 | u16::from(factor),
+                "IDENTIFY word 59 for factor {factor}"
+            );
+            // Drain IDENTIFY PIO so the next command is not blocked on DRQ.
+            for _ in 0..IDENTIFY_WORDS {
+                let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+            }
+        }
+    }
+
+    /// Spec: ATA SET MULTIPLE MODE — invalid Sector Count → ERR+ABRT; prior
+    /// multiple_count unchanged.
+    #[test]
+    fn set_multiple_mode_invalid_factor_aborts() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 8);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
+        assert_eq!(ide.multiple_count, 8);
+
+        for bad in [0u8, 3, 5, 7, 9, 15, 17, 32, 255] {
+            ide.port_write(IDE_PRIMARY_SECCOUNT, 1, u32::from(bad));
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
+            assert!(ide.irq_line(), "bad {bad}");
+            assert_ne!(
+                ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_ERR,
+                0,
+                "bad {bad}"
+            );
+            assert_eq!(
+                ide.port_read(IDE_PRIMARY_ERROR, 1) as u8,
+                ATA_ER_ABRT,
+                "bad {bad}"
+            );
+            assert_eq!(ide.multiple_count, 8, "bad {bad} must not clobber");
+        }
+    }
+
+    #[test]
+    fn set_multiple_mode_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing device → status 0 (not ABRT from catch-all).
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 16);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert_eq!(ide.multiple_count, 0);
+        assert!(!ide.irq_line());
+    }
+
+    fn set_multiple_mode(ide: &mut IdePrimary, factor: u8) {
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, u32::from(factor));
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_SET_MULTIPLE_MODE));
+        assert_eq!(ide.multiple_count, factor);
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_ERR, 0);
+    }
+
+    fn drain_pio_sector_after_first_word(ide: &mut IdePrimary) {
+        for _ in 1..256 {
+            let _ = ide.port_read(IDE_PRIMARY_DATA, 2);
+        }
+    }
+
+    /// Spec: ATA READ MULTIPLE (`0xC4`) — after SET MULTIPLE MODE, transfer
+    /// `multiple_count` sectors per DRQ; IRQ once per block (not per sector).
+    #[test]
+    fn read_multiple_multi_sector_drq_and_irq_per_block() {
+        let mut img = vec![0u8; SECTOR_SIZE * 4];
+        img[0] = 0xA1;
+        img[SECTOR_SIZE] = 0xA2;
+        img[SECTOR_SIZE * 2] = 0xA3;
+        img[SECTOR_SIZE * 3] = 0xA4;
+        let mut ide = IdePrimary::with_image(img);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 2);
+
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 4);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1); // ack first-block IRQ
+        assert!(!ide.irq_line());
+
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA1);
+        drain_pio_sector_after_first_word(&mut ide);
+        // Still inside first DRQ block — no IRQ between sectors.
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA2);
+        drain_pio_sector_after_first_word(&mut ide);
+
+        // Second block ready → IRQ.
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA3);
+        drain_pio_sector_after_first_word(&mut ide);
+        assert!(!ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xA4);
+        drain_pio_sector_after_first_word(&mut ide);
+        // Completion IRQ after final sector; alt status does not clear INTRQ.
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    /// Spec: ATA READ MULTIPLE — short final DRQ when count % multiple_count != 0.
+    #[test]
+    fn read_multiple_short_final_block() {
+        let mut img = vec![0u8; SECTOR_SIZE * 5];
+        for (i, chunk) in img.chunks_mut(SECTOR_SIZE).enumerate() {
+            chunk[0] = 0xB0 + i as u8;
+        }
+        let mut ide = IdePrimary::with_image(img);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 4);
+
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 5);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+
+        for expected in [0xB0u8, 0xB1, 0xB2, 0xB3] {
+            assert!(!ide.irq_line(), "no IRQ mid-block before {expected:#x}");
+            assert_eq!(
+                ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF,
+                u16::from(expected)
+            );
+            drain_pio_sector_after_first_word(&mut ide);
+        }
+        // Final 1-sector block → IRQ then data.
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        assert_eq!(ide.port_read(IDE_PRIMARY_DATA, 2) as u16 & 0xFF, 0xB4);
+        drain_pio_sector_after_first_word(&mut ide);
+        assert!(ide.irq_line()); // completion
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    /// Spec: ATA WRITE MULTIPLE (`0xC5`) — multi-sector DRQ commits media; IRQ/block.
+    #[test]
+    fn write_multiple_multi_sector_drq_commits_media() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 2);
+
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 3);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+
+        write_sector_words(&mut ide, 0x1111, 0x2222);
+        // Mid-block: still DRQ, no IRQ.
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+        write_sector_words(&mut ide, 0x3333, 0x4444);
+        // Short final block ready → IRQ.
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_PRIMARY_STATUS, 1);
+        write_sector_words(&mut ide, 0x5555, 0x6666);
+        assert!(ide.irq_line()); // completion
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+
+        assert_eq!(ide.image[0], 0x11);
+        assert_eq!(ide.image[1], 0x11);
+        assert_eq!(ide.image[510], 0x22);
+        assert_eq!(ide.image[511], 0x22);
+        assert_eq!(ide.image[SECTOR_SIZE], 0x33);
+        assert_eq!(ide.image[SECTOR_SIZE + 1], 0x33);
+        assert_eq!(ide.image[SECTOR_SIZE * 2], 0x55);
+        assert_eq!(ide.image[SECTOR_SIZE * 2 + 1], 0x55);
+    }
+
+    /// Spec: ATA — nIEN gates INTRQ for READ MULTIPLE DRQ / completion.
+    #[test]
+    fn read_multiple_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        // Leave nIEN set (reset default).
+        set_multiple_mode(&mut ide, 2);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA — nIEN gates INTRQ for WRITE MULTIPLE DRQ.
+    #[test]
+    fn write_multiple_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        set_multiple_mode(&mut ide, 2);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn write_multiple_absent_drive_status_zero() {
+        let mut ide = IdePrimary::new();
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_WRITE_MULTIPLE));
+        assert_eq!(ide.port_read(IDE_PRIMARY_STATUS, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA READ MULTIPLE OOB LBA → ERR+IDNF (error bit 4 style `0x10`).
+    #[test]
+    fn read_multiple_oob_sets_err() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        set_multiple_mode(&mut ide, 1);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_MULTIPLE));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
+    }
+
+    /// Spec: ATA — MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) success noop.
+    #[test]
+    fn media_lock_unlock_succeed_noop() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        for cmd in [ATA_CMD_MEDIA_LOCK, ATA_CMD_MEDIA_UNLOCK] {
+            ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
+            assert!(ide.irq_line());
+            let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+            assert_eq!(st & ATA_SR_ERR, 0);
+            assert_ne!(st & ATA_SR_DRDY, 0);
+        }
+    }
+
+    #[test]
+    fn secondary_absent_drive_status_is_zero() {
+        // Spec: OSDev ATA PIO — secondary missing drive → status 0.
+        let mut ide = IdeSecondary::new();
+        assert!(IdeSecondary::owns_port(IDE_SECONDARY_STATUS));
+        assert!(IdeSecondary::owns_port(IDE_SECONDARY_CTRL));
+        assert!(!IdeSecondary::owns_port(IDE_PRIMARY_STATUS));
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
+    }
+
+    #[test]
+    fn secondary_identify_and_read_sectors() {
+        // Spec: ATA IDENTIFY + READ on secondary ports 0x170–0x177.
+        let mut sector = vec![0u8; SECTOR_SIZE];
+        sector[0] = 0x11;
+        sector[1] = 0x22;
+        let mut ide = IdeSecondary::with_image(sector);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0); // clear nIEN
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        // Alt status does not clear IRQ15.
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1); // ack IRQ
+        assert!(!ide.irq_line());
+        for _ in 0..256 {
+            let _ = ide.port_read(IDE_SECONDARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_SECONDARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_SECONDARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_SECONDARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_SECONDARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_SECTORS));
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0x2211);
+    }
+
+    #[test]
+    fn secondary_alt_status_does_not_clear_irq() {
+        // Spec: OSDev ATA PIO — alt status at 0x376 does not clear IRQ15.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_SECONDARY_CTRL, 1);
+        assert!(ide.irq_line());
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    fn write_sector_words_secondary(ide: &mut IdeSecondary, first: u16, last: u16) {
+        ide.port_write(IDE_SECONDARY_DATA, 2, u32::from(first));
+        for _ in 1..255 {
+            ide.port_write(IDE_SECONDARY_DATA, 2, 0);
+        }
+        ide.port_write(IDE_SECONDARY_DATA, 2, u32::from(last));
+    }
+
+    /// Spec: ATA/ATAPI Command Set — READ BUFFER (`0xE4`) on secondary ports
+    /// (`0x170`–`0x177`) returns the 512-byte sector buffer via PIO (IRQ15 path).
+    #[test]
+    fn secondary_read_buffer_pio_returns_sector_buffer() {
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_SECONDARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_SECONDARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_SECONDARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_SECONDARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_SECTORS));
+        write_sector_words_secondary(&mut ide, 0x55AA, 0xC300);
+
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        let st = ide.port_read(IDE_SECONDARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_SECONDARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0xC300);
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn secondary_read_buffer_zeros_before_any_transfer() {
+        // Spec: ATA READ BUFFER — sector buffer cleared after reset; 256 zero words.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        for _ in 0..256 {
+            assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0);
+        }
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn secondary_read_buffer_asserts_irq15_on_drq_when_nien_clear() {
+        // Spec: ATA / OSDev PIO — secondary INTRQ → IRQ15 when DRQ ready if nIEN=0.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(ide.irq_line());
+    }
+
+    #[test]
+    fn secondary_read_buffer_nien_masks_irq15_on_drq() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ/IRQ15 during READ BUFFER DRQ.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn secondary_read_buffer_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing secondary device → status 0.
+        let mut ide = IdeSecondary::new();
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
+    /// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`) on secondary ports
+    /// (`0x170`–`0x177`) accepts 512 bytes via host→device DRQ PIO into the
+    /// device sector buffer (no LBA / no media write); INTRQ → IRQ15.
+    #[test]
+    fn secondary_write_buffer_pio_fills_sector_buffer() {
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        let image_before = ide.inner.image.clone();
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        let st = ide.port_read(IDE_SECONDARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
+        write_sector_words_secondary(&mut ide, 0x55AA, 0xC300);
+        let st = ide.port_read(IDE_SECONDARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        // Spec: WRITE BUFFER updates the sector buffer only — not backing media.
+        assert_eq!(ide.inner.image, image_before);
+    }
+
+    /// Spec: ATA WRITE BUFFER then READ BUFFER on secondary — round-trip via
+    /// shared sector buffer (IRQ15 path).
+    #[test]
+    fn secondary_write_buffer_read_buffer_round_trip() {
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        write_sector_words_secondary(&mut ide, 0x55AA, 0xC300);
+
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_READ_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0x55AA);
+        for _ in 1..255 {
+            let _ = ide.port_read(IDE_SECONDARY_DATA, 2);
+        }
+        assert_eq!(ide.port_read(IDE_SECONDARY_DATA, 2) as u16, 0xC300);
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    #[test]
+    fn secondary_write_buffer_asserts_irq15_on_drq_and_complete_when_nien_clear() {
+        // Spec: ATA / OSDev PIO WRITE — secondary INTRQ → IRQ15 at DRQ and again
+        // at command complete when nIEN=0.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert!(ide.irq_line());
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1); // ack DRQ IRQ
+        assert!(!ide.irq_line());
+        write_sector_words_secondary(&mut ide, 0xBEEF, 0);
+        assert!(ide.irq_line());
+        assert_eq!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        let _ = ide.port_read(IDE_SECONDARY_STATUS, 1);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn secondary_write_buffer_nien_masks_irq15_on_drq() {
+        // Spec: ATA device control — nIEN=1 masks INTRQ/IRQ15 during WRITE BUFFER DRQ.
+        let mut ide = IdeSecondary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_SECONDARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_ne!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+        assert!(!ide.irq_line());
+    }
+
+    #[test]
+    fn secondary_write_buffer_absent_drive_status_zero() {
+        // Spec: OSDev ATA PIO — missing secondary device → status 0.
+        let mut ide = IdeSecondary::new();
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        ide.port_write(IDE_SECONDARY_STATUS, 1, u32::from(ATA_CMD_WRITE_BUFFER));
+        assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+}
