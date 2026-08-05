@@ -18,11 +18,12 @@
 //!
 //! Channel control-word programming (operating modes 0, 1, 2, 3, 4, 5),
 //! access-mode count load, counter-latch and Read-Back status/count latches,
-//! counting-element (`ce`) advancement via [`Pit8254::tick_ch0`], and OUT pin
-//! level / rising-edge reporting for IRQ0. Channel 2: GATE via port `0x61`
-//! bit0, OUT readback on bit5, speaker-data latch bit1 (no host audio), and
-//! [`Pit8254::tick_ch2`]. Channel 1 accepts control words and byte I/O but is
-//! **not** fully supported.
+//! counting-element (`ce`) advancement via [`Pit8254::tick_ch0`], BCD countdown
+//! when the control-word BCD bit is set (four decades; written `0` → 10_000),
+//! and OUT pin level / rising-edge reporting for IRQ0. Channel 2: GATE via
+//! port `0x61` bit0, OUT readback on bit5, speaker-data latch bit1 (no host
+//! audio), and [`Pit8254::tick_ch2`]. Channel 1 accepts control words and byte
+//! I/O but is **not** fully supported.
 //!
 //! GATE-triggered modes 1 and 5 need a GATE rising edge to start counting, so
 //! on this machine model they are only reachable on channel 2 (port `0x61`
@@ -36,10 +37,11 @@
 //!   (modes 1/5) takes effect on the same model clock, not on the following
 //!   CLK as on real hardware (terminal count lands one CLK early); NULL COUNT
 //!   therefore clears on the same model clock the CE is loaded
-//! - BCD counting during tick (BCD flag stored and reported in status; tick uses binary)
 //! - Channel 1 DRAM refresh; host PC-speaker audio output
 //! - Host-real-time wall-clock rate (callers choose tick quantum)
 //! - Port `0x61` NMI/parity/refresh toggle side effects (bits other than 0/1/5)
+//! - Invalid BCD digit programming (nibbles A–F): decode treats each nibble as a
+//!   weighted decade digit; hardware behavior for illegal BCD is unspecified
 
 use crate::PortDevice;
 
@@ -71,6 +73,34 @@ const CW_MODE_SHIFT: u8 = 1;
 const CW_MODE_MASK: u8 = 0b111;
 /// Control-word BCD bit.
 const CW_BCD: u8 = 1 << 0;
+
+/// Intel 8254 BCD mode: written count 0 encodes 10_000 clocks (four decades).
+const BCD_MAX_COUNT: u32 = 10_000;
+
+/// Decode a 16-bit BCD count (four decades) to a binary tick count.
+///
+/// Spec: Intel 8254 — BCD=1 selects a Binary Coded Decimal counter (4 decades).
+/// Nibbles A–F are illegal on real hardware; this model still weights each
+/// nibble as a decade digit (undefined case documented in the module header).
+fn bcd16_to_count(v: u16) -> u32 {
+    u32::from(v & 0xF)
+        + 10 * u32::from((v >> 4) & 0xF)
+        + 100 * u32::from((v >> 8) & 0xF)
+        + 1000 * u32::from((v >> 12) & 0xF)
+}
+
+/// Encode a binary tick count (0..=9999) as a 16-bit BCD value for latched reads.
+/// Values ≥ [`BCD_MAX_COUNT`] (just-loaded 0) read back as `0x0000`.
+fn count_to_bcd16(n: u32) -> u16 {
+    if n >= BCD_MAX_COUNT {
+        return 0;
+    }
+    let d0 = n % 10;
+    let d1 = (n / 10) % 10;
+    let d2 = (n / 100) % 10;
+    let d3 = (n / 1000) % 10;
+    (d0 | (d1 << 4) | (d2 << 8) | (d3 << 12)) as u16
+}
 
 /// Read-Back command (SC=11): COUNT=0 latches count of selected counters.
 const RB_COUNT: u8 = 1 << 5;
@@ -192,9 +222,18 @@ impl PitChannel {
         }
     }
 
-    /// Reload value for `ce`: written 0 → 65536 (Intel 8254).
+    /// Reload value for `ce`.
+    ///
+    /// Spec: Intel 8254 — binary written 0 → 65_536; BCD written 0 → 10_000
+    /// (four decades). Non-zero BCD counts are decoded as four BCD decades.
     fn reload_ce(&self) -> u32 {
-        if self.count == 0 {
+        if self.bcd {
+            if self.count == 0 {
+                BCD_MAX_COUNT
+            } else {
+                bcd16_to_count(self.count)
+            }
+        } else if self.count == 0 {
             65536
         } else {
             u32::from(self.count)
@@ -202,9 +241,16 @@ impl PitChannel {
     }
 
     /// Value captured by a counter-latch / Read-Back COUNT command.
+    ///
+    /// Spec: Intel 8254 — while counting, the output latch holds the current
+    /// counting element; in BCD mode that value is reported as four decades.
     fn latch_snapshot(&self) -> u16 {
         if self.counting {
-            (self.ce & 0xFFFF) as u16
+            if self.bcd {
+                count_to_bcd16(self.ce)
+            } else {
+                (self.ce & 0xFFFF) as u16
+            }
         } else {
             self.count
         }
@@ -833,6 +879,117 @@ mod tests {
         pit.port_write(PIT_CONTROL, 1, 0x37);
         assert!(pit.channel0().bcd);
         assert_eq!(pit.channel0().mode, 3);
+    }
+
+    /// Spec: Intel 8254 control-word BCD bit — four-decade BCD counter.
+    /// Written count `0x0100` means 100 clocks (not binary 256). Mode 0 OUT
+    /// rises at terminal count under BCD semantics.
+    #[test]
+    fn bcd_mode0_terminal_uses_bcd_period_not_binary() {
+        let mut bcd = Pit8254::new();
+        // ch0, lohi, mode 0, BCD → 0x31
+        bcd.port_write(PIT_CONTROL, 1, 0x31);
+        bcd.port_write(PIT_CH0_DATA, 1, 0x00);
+        bcd.port_write(PIT_CH0_DATA, 1, 0x01); // BCD 100
+        assert!(bcd.channel0().bcd);
+        assert_eq!(bcd.channel0().ce, 100);
+        assert!(!bcd.tick_ch0(99));
+        assert!(!bcd.out_ch0());
+        assert!(bcd.tick_ch0(1)); // 100th clock → OUT rising
+        assert!(bcd.out_ch0());
+        assert!(!bcd.channel0().counting);
+
+        let mut bin = Pit8254::new();
+        bin.port_write(PIT_CONTROL, 1, 0x30); // same bytes, binary
+        bin.port_write(PIT_CH0_DATA, 1, 0x00);
+        bin.port_write(PIT_CH0_DATA, 1, 0x01); // binary 256
+        assert_eq!(bin.channel0().ce, 0x0100);
+        assert!(!bin.tick_ch0(100)); // still counting after BCD's terminal
+        assert!(!bin.out_ch0());
+        assert!(bin.channel0().counting);
+    }
+
+    /// Spec: Intel 8254 BCD countdown — decade borrow: after one CLK from
+    /// BCD `0x0100`, latched CE reads `0x0099` (not binary `0x00FF`).
+    #[test]
+    fn bcd_tick_latch_shows_decade_borrow() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x31); // ch0 lohi mode 0 BCD
+        pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        pit.port_write(PIT_CH0_DATA, 1, 0x01); // BCD 100
+        assert!(!pit.tick_ch0(1));
+        assert_eq!(pit.channel0().ce, 99);
+        // Counter latch SC=0 RW=00 → 0x00
+        pit.port_write(PIT_CONTROL, 1, 0x00);
+        let lo = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        let hi = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), 0x0099);
+    }
+
+    /// Spec: Intel 8254 — initial count 0 in BCD mode means 10_000 clocks;
+    /// first CLK yields latched `0x9999`.
+    #[test]
+    fn bcd_count_zero_means_10000() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x31);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // BCD 0 → 10000
+        assert_eq!(pit.channel0().ce, 10_000);
+        assert!(!pit.tick_ch0(1));
+        assert_eq!(pit.channel0().ce, 9999);
+        pit.port_write(PIT_CONTROL, 1, 0x00);
+        let lo = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        let hi = pit.port_read(PIT_CH0_DATA, 1) as u8;
+        assert_eq!(u16::from(lo) | (u16::from(hi) << 8), 0x9999);
+        // Remaining 9999 clocks → OUT rising at total 10000.
+        assert!(!pit.tick_ch0(9998));
+        assert!(!pit.out_ch0());
+        assert!(pit.tick_ch0(1));
+        assert!(pit.out_ch0());
+    }
+
+    /// Spec: Intel 8254 mode 2 + BCD — period follows BCD value (`0x0020` = 20),
+    /// not binary 32; reload at terminal uses the same BCD interpretation.
+    #[test]
+    fn bcd_mode2_period_uses_bcd_value() {
+        let mut pit = Pit8254::new();
+        // ch0, lohi, mode 2, BCD → 0x35
+        pit.port_write(PIT_CONTROL, 1, 0x35);
+        pit.port_write(PIT_CH0_DATA, 1, 0x20);
+        pit.port_write(PIT_CH0_DATA, 1, 0x00); // BCD 20
+        assert_eq!(pit.channel0().ce, 20);
+        // Mode 2: rising edge after one low-pulse clock following terminal.
+        assert!(pit.tick_ch0(21));
+        assert!(pit.out_ch0());
+        // Reloaded to BCD period again.
+        assert_eq!(pit.channel0().ce, 20);
+    }
+
+    /// Spec: ch2 BCD mode 0 with GATE high; Read-Back status keeps BCD=1 after
+    /// tick; reset clears BCD programming.
+    #[test]
+    fn bcd_ch2_status_readback_and_reset() {
+        let mut pit = Pit8254::new();
+        pit.port61_write(PORT61_GATE2);
+        // ch2, lohi, mode 0, BCD → 0xB1
+        pit.port_write(PIT_CONTROL, 1, 0xB1);
+        pit.port_write(PIT_CH2_DATA, 1, 0x05);
+        pit.port_write(PIT_CH2_DATA, 1, 0x00); // BCD 5
+        assert!(pit.channel2().bcd);
+        assert_eq!(pit.channel2().ce, 5);
+        assert!(!pit.tick_ch2(4));
+        // Read-back status CNT2: SC=11 COUNT=1 STATUS=0 CNT2=1 → 0xE8
+        pit.port_write(PIT_CONTROL, 1, 0xE8);
+        let status = pit.port_read(PIT_CH2_DATA, 1) as u8;
+        // OUT=0, NULL_COUNT=0, RW=11, M=000, BCD=1 → 0x31
+        assert_eq!(status, 0x31);
+        assert!(pit.tick_ch2(1));
+        assert!(pit.out_ch2());
+
+        pit.reset();
+        assert!(!pit.channel2().bcd);
+        assert_eq!(pit.channel2().ce, 0);
+        assert!(!pit.channel2().counting);
     }
 
     /// Spec: Intel 8254 Read-Back Command (SC=11) — STATUS=0 latches status;
