@@ -483,6 +483,18 @@ pub const VGA_GC_INDEX: u16 = 0x3CE;
 pub const VGA_GC_DATA: u16 = 0x3CF;
 /// Number of standard VGA Graphics Controller registers (indexes `0x00`–`0x08`).
 pub const VGA_GC_REG_COUNT: usize = 9;
+/// Graphics Controller Set/Reset Register index.
+///
+/// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x00`. Bits 3:0 =
+/// Set/Reset value written to enabled planes in Write Mode 0 when Enable
+/// Set/Reset selects that plane. Plane write-path side effects are out of
+/// scope (store/readback only).
+pub const VGA_GC_SET_RESET: u8 = 0x00;
+/// Mode-03h-class Set/Reset reset default (`0x00`).
+///
+/// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Set/Reset `0x00`.
+/// Store/readback only; no Set/Reset plane fill side effects on the text plane.
+pub const VGA_GC_SET_RESET_DEFAULT: u8 = 0x00;
 /// Graphics Controller Data Rotate / Function Select Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x03`. Bits 2:0 =
@@ -538,7 +550,10 @@ pub const VGA_GC_BIT_MASK: u8 = 0x08;
 /// effects on the text plane.
 pub const VGA_GC_BIT_MASK_DEFAULT: u8 = 0xFF;
 const _: () = assert!(
-    VGA_GC_DATA_ROTATE == 0x03
+    VGA_GC_SET_RESET == 0x00
+        && VGA_GC_SET_RESET_DEFAULT == 0x00
+        && VGA_GC_DEFAULTS[VGA_GC_SET_RESET as usize] == VGA_GC_SET_RESET_DEFAULT
+        && VGA_GC_DATA_ROTATE == 0x03
         && VGA_GC_DATA_ROTATE_DEFAULT == 0x00
         && VGA_GC_MODE == 0x05
         && VGA_GC_MODE_DEFAULT == 0x10
@@ -553,13 +568,14 @@ const _: () = assert!(
 /// Mode-03h-class Graphics Controller reset defaults (store/readback only).
 ///
 /// Spec: FreeVGA Graphics Registers / OSDev VGA Hardware / IBM VGA mode-03h —
-/// SeaBIOS-class text programming: Set/Reset `0x00`, Enable Set/Reset `0x00`,
-/// Color Compare `0x00`, Data Rotate [`VGA_GC_DATA_ROTATE_DEFAULT`], Read Map
-/// Select `0x00`, Graphics Mode [`VGA_GC_MODE_DEFAULT`] (host odd/even),
-/// Miscellaneous [`VGA_GC_MISC_DEFAULT`] (odd/even + memory map `B8000`), Color
-/// Don't Care `0x00`, Bit Mask [`VGA_GC_BIT_MASK_DEFAULT`].
+/// SeaBIOS-class text programming: Set/Reset [`VGA_GC_SET_RESET_DEFAULT`],
+/// Enable Set/Reset `0x00`, Color Compare `0x00`, Data Rotate
+/// [`VGA_GC_DATA_ROTATE_DEFAULT`], Read Map Select `0x00`, Graphics Mode
+/// [`VGA_GC_MODE_DEFAULT`] (host odd/even), Miscellaneous
+/// [`VGA_GC_MISC_DEFAULT`] (odd/even + memory map `B8000`), Color Don't Care
+/// `0x00`, Bit Mask [`VGA_GC_BIT_MASK_DEFAULT`].
 pub const VGA_GC_DEFAULTS: [u8; VGA_GC_REG_COUNT] = [
-    0x00,
+    VGA_GC_SET_RESET_DEFAULT,
     0x00,
     0x00,
     VGA_GC_DATA_ROTATE_DEFAULT,
@@ -2393,6 +2409,48 @@ mod tests {
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0xAA);
         v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
         assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x00);
+    }
+
+    /// Spec: FreeVGA Graphics Registers — Set/Reset (index `0x00`) store/readback.
+    /// Mode-03h reset default is [`VGA_GC_SET_RESET_DEFAULT`] (`0x00`).
+    #[test]
+    fn gc_set_reset_store_readback() {
+        let mut v = VgaText::new();
+        assert_eq!(
+            v.gc_regs[usize::from(VGA_GC_SET_RESET)],
+            VGA_GC_SET_RESET_DEFAULT
+        );
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_SET_RESET));
+        assert_eq!(
+            v.port_read(VGA_GC_DATA, 1) as u8,
+            VGA_GC_SET_RESET_DEFAULT
+        );
+
+        // Planes 0+2 Set/Reset value (bits 3:0).
+        v.port_write(VGA_GC_DATA, 1, 0x05);
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x05);
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_SET_RESET)], 0x05);
+
+        // Word write path (lo=index, hi=data) also updates Set/Reset.
+        v.port_write(
+            VGA_GC_INDEX,
+            2,
+            (u32::from(0x0Fu8) << 8) | u32::from(VGA_GC_SET_RESET),
+        );
+        assert_eq!(v.gc_regs[usize::from(VGA_GC_SET_RESET)], 0x0F);
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_SET_RESET));
+        assert_eq!(v.port_read(VGA_GC_DATA, 1) as u8, 0x0F);
+
+        v.reset();
+        assert_eq!(
+            v.gc_regs[usize::from(VGA_GC_SET_RESET)],
+            VGA_GC_SET_RESET_DEFAULT
+        );
+        v.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_SET_RESET));
+        assert_eq!(
+            v.port_read(VGA_GC_DATA, 1) as u8,
+            VGA_GC_SET_RESET_DEFAULT
+        );
     }
 
     /// Spec: FreeVGA Graphics Registers — Data Rotate / Function Select (index

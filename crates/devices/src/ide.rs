@@ -5,7 +5,8 @@
 //! # Spec refs
 //!
 //! - ATA / ATAPI Command Set — IDENTIFY DEVICE (`0xEC`), READ SECTORS (`0x20`),
-//!   WRITE SECTORS (`0x30`), PACKET (`0xA0`), IDENTIFY PACKET DEVICE (`0xA1`),
+//!   WRITE SECTORS (`0x30`), READ VERIFY SECTORS (`0x40`), PACKET (`0xA0`),
+//!   IDENTIFY PACKET DEVICE (`0xA1`),
 //!   SMART (`0xB0`), READ DMA (`0xC8`), WRITE DMA (`0xCA`), SECURITY SET
 //!   PASSWORD (`0xF1`), SECURITY UNLOCK (`0xF2`), SECURITY ERASE PREPARE
 //!   (`0xF3`), SECURITY ERASE UNIT (`0xF4`), SECURITY FREEZE LOCK (`0xF5`),
@@ -157,6 +158,9 @@ pub const ATA_CMD_IDENTIFY_PACKET: u8 = 0xA1;
 pub const ATA_CMD_READ_SECTORS: u8 = 0x20;
 /// WRITE SECTORS (with retry) — LBA28 PIO.
 pub const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+/// READ VERIFY SECTORS (with retry) — LBA28 non-data; verifies range without PIO.
+/// Spec: ATA/ATAPI Command Set — READ VERIFY SECTORS (`0x40`).
+pub const ATA_CMD_READ_VERIFY_SECTORS: u8 = 0x40;
 /// FLUSH CACHE — non-data command; completes with success on ATA master.
 /// Spec: ATA/ATAPI Command Set — FLUSH CACHE (`0xE7`).
 pub const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
@@ -636,6 +640,39 @@ impl IdePrimary {
         self.sectors_left = count;
         self.next_lba = lba;
         self.begin_pio_in();
+    }
+
+    /// READ VERIFY SECTORS (`0x40`) on ATA master — non-data LBA28 range check.
+    ///
+    /// Spec: ATA/ATAPI Command Set — READ VERIFY SECTORS verifies media without
+    /// transferring sector data (no DRQ). This stub succeeds when the LBA28
+    /// range lies within the backing image; OOB → ERR+IDNF; CHS → ABRT.
+    /// Absent/slave → status 0. INTRQ follows nIEN like FLUSH CACHE.
+    fn exec_read_verify_sectors(&mut self) {
+        if !self.present || self.is_slave_selected() {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT); // CHS unsupported
+            return;
+        }
+        let count = self.sector_count_effective();
+        let lba = self.lba28();
+        let total = self.total_sectors();
+        if total == 0 || lba >= total || count > total - lba {
+            self.abort_command(0x10); // IDNF
+            return;
+        }
+        self.error = 0;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sectors_left = 0;
+        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        self.raise_irq();
     }
 
     /// FLUSH CACHE (`0xE7`) on ATA master — non-data success completion.
@@ -1209,6 +1246,7 @@ impl IdePrimary {
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
+            ATA_CMD_READ_VERIFY_SECTORS => self.exec_read_verify_sectors(),
             ATA_CMD_FLUSH_CACHE | ATA_CMD_FLUSH_CACHE_EXT => self.exec_flush_cache(),
             ATA_CMD_NOP => self.exec_nop(),
             ATA_CMD_READ_MULTIPLE => self.exec_read_multiple(),
@@ -1964,6 +2002,67 @@ mod tests {
 
     /// Spec: ATA/ATAPI Command Set — FLUSH CACHE (`0xE7`) non-data success on
     /// ATA master: DRDY|DSC, error=0, no DRQ; INTRQ when nIEN=0.
+    /// Spec: ATA/ATAPI — READ VERIFY SECTORS (`0x40`) non-data success for
+    /// in-range LBA28; no DRQ / no sector transfer.
+    #[test]
+    fn read_verify_sectors_succeeds_in_range() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 4]);
+        clear_nien(&mut ide);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        assert!(ide.irq_line());
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_eq!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_ne!(st & ATA_SR_DRDY, 0);
+        assert_ne!(st & ATA_SR_DSC, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+    }
+
+    /// Spec: ATA — READ VERIFY SECTORS out-of-range → ERR+IDNF, no DRQ.
+    #[test]
+    fn read_verify_sectors_oob_sets_idnf() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 5);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(st & ATA_SR_DRQ, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
+    }
+
+    /// Spec: ATA — READ VERIFY range that spills past image end → IDNF.
+    #[test]
+    fn read_verify_sectors_partial_spill_sets_idnf() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE * 2]);
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 2);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 1); // LBA 1..2 needs 2 sectors; only 0..1 exist
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        let st = ide.port_read(IDE_PRIMARY_STATUS, 1) as u8;
+        assert_ne!(st & ATA_SR_ERR, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0x10);
+    }
+
+    /// Spec: ATA — nIEN gates INTRQ on READ VERIFY success.
+    #[test]
+    fn read_verify_sectors_nien_masks_irq() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_NIEN));
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA));
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 1);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0);
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_READ_VERIFY_SECTORS));
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, 0);
+        assert!(!ide.irq_line());
+    }
+
     #[test]
     fn flush_cache_succeeds_on_ata_master() {
         let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);

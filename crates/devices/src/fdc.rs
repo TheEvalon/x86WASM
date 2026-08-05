@@ -200,7 +200,7 @@
 //! - 1.44MB media image attach/eject + CHS→offset/`read_sector`/
 //!   `write_sector` helpers (PC MFM geometry); DIR bit7 DSKCHG stub: set on
 //!   eject, preserved across re-attach/`reset`, cleared by successful
-//!   Recalibrate/Seek when media present (classic disk-change clear);
+//!   Recalibrate/Seek/Relative Seek when media present (classic disk-change clear);
 //!   `write_protected` / [`Self::set_write_protected`] for ST3 WP and WRITE
 //!   DATA / WRITE DELETED DATA / FORMAT TRACK ST1 NW; `reset()` preserves media
 //!   and write-protect flag like IDE.
@@ -1028,9 +1028,9 @@ impl Fdc82077 {
 
     /// Clear DIR DSKCHG when media is present (classic disk-change clear stub).
     ///
-    /// Spec: Intel 82077AA DIR bit7 / OSDev FDC — firmware Recalibrate/Seek
-    /// while a disk is inserted clears the latched change line. No-media leaves
-    /// the bit set so guests can detect empty drives.
+    /// Spec: Intel 82077AA DIR bit7 / OSDev FDC — firmware Recalibrate/Seek/
+    /// Relative Seek while a disk is inserted clears the latched change line.
+    /// No-media leaves the bit set so guests can detect empty drives.
     fn clear_dskchg_if_media(&mut self) {
         if self.has_media() {
             self.dir &= !FDC_DIR_DSKCHG;
@@ -1085,6 +1085,9 @@ impl Fdc82077 {
         } else {
             cur.saturating_sub(rcn)
         };
+        // Spec: Intel 82077AA DIR DSKCHG / OSDev FDC — Relative Seek steps the
+        // head like Seek; clear latched DSKCHG when media is present.
+        self.clear_dskchg_if_media();
         self.pending_sense_st0 = Some(FDC_ST0_SEEK_END | (unit as u8));
         self.irq_pending = true;
         self.phase = Phase::Command;
@@ -5146,7 +5149,7 @@ mod tests {
     }
 
     /// Stub DIR bit7 DSKCHG: set on eject; re-attach/`reset` preserve latch;
-    /// Recalibrate/Seek with media clear (classic disk-change).
+    /// Recalibrate/Seek/Relative Seek with media clear (classic disk-change).
     /// Spec: Intel 82077AA DIR DSKCHG / OSDev FDC — latched change cleared by
     /// head step while media present, not by insert alone.
     #[test]
@@ -5192,6 +5195,54 @@ mod tests {
             f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
             FDC_DIR_DSKCHG,
             "reset preserves DSKCHG after eject history"
+        );
+    }
+
+    /// Spec: Intel 82077AA DIR / OSDev FDC — Relative Seek with media clears DSKCHG
+    /// (same classic disk-change clear as Recalibrate/Seek).
+    #[test]
+    fn relative_seek_clears_dskchg_when_media_present() {
+        let mut f = Fdc82077::with_image(vec![0x66u8; FDC_1440_IMAGE_SIZE]);
+        f.eject();
+        assert!(f.attach_image(vec![0x66u8; FDC_1440_IMAGE_SIZE]).is_ok());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG,
+            "precondition: DSKCHG latched after re-insert"
+        );
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RELATIVE_SEEK)); // DIR=0 step out
+        f.port_write(FDC_FIFO, 1, 0x00); // HD|US
+        f.port_write(FDC_FIFO, 1, 0x00); // RCN=0 (still a completed Relative Seek)
+        assert!(f.irq_line(), "Relative Seek asserts IRQ");
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            0,
+            "Relative Seek with media clears DSKCHG"
+        );
+    }
+
+    /// Spec: no-media Relative Seek must leave DSKCHG set (empty-drive detect).
+    #[test]
+    fn relative_seek_leaves_dskchg_when_no_media() {
+        let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
+        f.eject();
+        assert!(!f.has_media());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG
+        );
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_RELATIVE_SEEK | FDC_CMD_RELATIVE_SEEK_DIR));
+        f.port_write(FDC_FIFO, 1, 0x00);
+        f.port_write(FDC_FIFO, 1, 0x01);
+        assert!(f.irq_line());
+        assert_eq!(
+            f.port_read(FDC_DIR_CCR, 1) as u8 & FDC_DIR_DSKCHG,
+            FDC_DIR_DSKCHG,
+            "no-media Relative Seek leaves DSKCHG set"
         );
     }
 

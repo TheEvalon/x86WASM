@@ -31,6 +31,8 @@
 //!   (`PCI_HOST_BRIDGE_COMMAND_MASK` = `0x0007`); other Command bits hardwired 0.
 //! - Host bridge Status (`0x06`) readback stub: CapList=0, FastB2B=1, DevSel=medium
 //!   (`PCI_HOST_BRIDGE_STATUS_STUB` = `0x0280`); RW1C error bits (MDPE/STA/RTA/RMA/SSE/DPE).
+//! - Host bridge Latency Timer (`0x0D`) byte store/readback (reset `0x00`; no
+//!   arbitration side effects yet).
 //! - PIIX ISA bridge (`00:01.0`) Command (`0x04`) store/readback: sticky IO/MEM/BusMaster
 //!   (`PCI_PIIX_ISA_COMMAND_MASK` = `0x0007`, same as host bridge); other bits hardwired 0.
 //! - PIIX ISA Status (`0x06`) readback stub: same CapList/FastB2B/DevSel as host bridge
@@ -125,6 +127,14 @@ const _: () = assert!(PCI_PIIX_ACPI_COMMAND_MASK == PCI_HOST_BRIDGE_COMMAND_MASK
 /// PCI Status register config offset.
 /// Spec: PCI Local Bus — Type 0 header Status at `0x06`.
 pub const PCI_STATUS_OFFSET: u8 = 0x06;
+/// PCI Latency Timer config offset (Type 0 header byte).
+/// Spec: PCI Local Bus — Latency Timer at `0x0D` (bus master grant timer, in
+/// PCI clocks / 8). This stub stores/reads back the byte; arbitration timing
+/// side effects are out of scope.
+pub const PCI_LATENCY_TIMER_OFFSET: u8 = 0x0D;
+/// Host bridge Latency Timer reset default.
+pub const PCI_HOST_BRIDGE_LATENCY_TIMER_DEFAULT: u8 = 0x00;
+const _: () = assert!(PCI_LATENCY_TIMER_OFFSET == 0x0D);
 /// Status bit 4: Capabilities List (RO). Stub: 0 — no cap list yet.
 pub const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
 /// Status bit 7: Fast Back-to-Back Capable (RO).
@@ -1055,6 +1065,48 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 4, 0xDEAD_BEEF);
         assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0x7000_8086);
+    }
+
+    /// Spec: PCI Local Bus — Latency Timer at `0x0D`. Host bridge `00:00.0`
+    /// stores/reads back the byte (reset `0x00`); no arbitration side effects.
+    /// Mechanism #1: CONFIG_ADDRESS is dword-aligned (`0x0C`); byte at `0x0D`
+    /// is accessed via CONFIG_DATA lane `0xCFD`.
+    #[test]
+    fn host_bridge_latency_timer_store_readback() {
+        let mut pci = PciConfig::new();
+        // Latch dword `0x0C`; Latency Timer is lane +1 (`0xCFD`).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, 0x0C, true),
+        );
+        assert_eq!(
+            pci.port_read(0xCFD, 1) as u8,
+            PCI_HOST_BRIDGE_LATENCY_TIMER_DEFAULT,
+            "Latency Timer defaults to 0 at reset"
+        );
+
+        pci.port_write(0xCFD, 1, 0x40);
+        assert_eq!(pci.port_read(0xCFD, 1) as u8, 0x40);
+
+        pci.port_write(0xCFD, 1, 0xFF);
+        assert_eq!(pci.port_read(0xCFD, 1) as u8, 0xFF);
+
+        // Word write at 0xCFC: lo=Cache Line Size, hi=Latency Timer.
+        pci.port_write(PCI_CONFIG_DATA, 2, 0x20_08); // CLS=0x08, LT=0x20
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 1) as u8, 0x08);
+        assert_eq!(pci.port_read(0xCFD, 1) as u8, 0x20);
+
+        pci.reset();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, 0x0C, true),
+        );
+        assert_eq!(
+            pci.port_read(0xCFD, 1) as u8,
+            PCI_HOST_BRIDGE_LATENCY_TIMER_DEFAULT
+        );
     }
 
     /// Spec: PCI Local Bus — Command at `0x04`. Host bridge `00:00.0` stub
