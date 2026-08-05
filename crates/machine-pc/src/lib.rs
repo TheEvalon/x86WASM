@@ -786,11 +786,11 @@ mod tests {
             bus.port_out_u8(PIC_SLAVE_DATA, 0x01).unwrap();
             bus.port_out_u8(PIC_MASTER_DATA, 0xFE).unwrap(); // unmask IR0
         }
-        // Mode 0 count=1 → OUT rises and stays high for the poll sync.
+        // Mode 0 count=1 → load CLK + terminal → OUT rises and stays high.
         m.pit.port_write(PIT_CONTROL, 1, 0x30);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x01);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
-        m.tick_pit(1);
+        m.tick_pit(2);
         assert!(m.pit.out_ch0());
         {
             let mut bus = m.bus_mut();
@@ -900,13 +900,13 @@ mod tests {
     fn pit_mode0_tick_asserts_irq0_eoi_clears() {
         let mut m = Machine::new(64 * 1024);
         init_at_pic_unmask_irq0(&mut m);
-        // Program PIT ch0 mode 0, count = 4.
+        // Program PIT ch0 mode 0, count = 4 (one-CLK CR→CE load + 4 countdown).
         m.pit.port_write(PIT_CONTROL, 1, 0x30);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x04);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
         assert!(!m.pit.out_ch0());
 
-        m.tick_pit(4);
+        m.tick_pit(5);
         assert!(m.pit.out_ch0());
         {
             let mut bus = m.bus_mut();
@@ -927,7 +927,7 @@ mod tests {
         m.pit.port_write(PIT_CONTROL, 1, 0x34);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x03);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00); // count = 3
-        m.tick_pit(4);
+        m.tick_pit(5); // load + period + low-pulse rise
         {
             let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), Some(0x08));
@@ -1183,7 +1183,7 @@ mod tests {
         m.pit.port_write(PIT_CONTROL, 1, 0x30);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x01);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
-        m.tick_pit(1);
+        m.tick_pit(2); // load + terminal
         assert!(m.pit.out_ch0());
 
         m.step().unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
         }
         assert!(m.pit.channel2().gate);
         assert!(m.pit.speaker_data_enabled());
-        m.tick_pit(2);
+        m.tick_pit(3); // load + countdown to terminal for count=2
         assert!(m.pit.out_ch2());
         {
             let mut bus = m.bus_mut();
