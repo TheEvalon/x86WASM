@@ -115,8 +115,9 @@
 //!   scancode-set / typematic are stored only — no host-visible LED hardware;
 //!   inject still emits the existing Set2-oriented stream regardless of stored
 //!   set)
-//! - Pulse-reset lines (controller command `0xFE` on `0x64` / output-port bit0
-//!   system-reset) — distinct from keyboard Resend `0xFE` on data port `0x60`
+//! - Output-port bit0 system-reset pulse via `0xD1` (controller command `0xFE`
+//!   on `0x64` latches [`I8042::take_system_reset_request`] for `Machine` wiring;
+//!   distinct from keyboard Resend `0xFE` on data port `0x60`)
 //! - Interface-test electrical fault codes beyond the success stub `0x00` for
 //!   `0xA9`/`0xAB`; authentic AT ASCII/scancode dump encoding for `0xAC`
 
@@ -475,8 +476,14 @@ pub struct I8042 {
     pub unsupported_commands: u32,
     /// Counts of controller pulse-reset commands (`0xFE` on `0x64`) seen.
     ///
-    /// Spec: OSDev I8042 — accepted and counted; CPU/system reset is not wired.
+    /// Spec: OSDev I8042 — accepted and counted; [`Self::system_reset_pending`]
+    /// latches a request for the machine layer (`Machine::reset`).
     pub pulse_reset_commands: u32,
+    /// Latched when the host writes controller pulse-reset (`0xFE` on `0x64`).
+    ///
+    /// Spec: OSDev I8042 — pulse output lines / system-reset request. Cleared by
+    /// [`Self::take_system_reset_request`] or controller [`Self::reset`].
+    system_reset_pending: bool,
     /// Last byte the host sent to the auxiliary device via `0xD4`.
     pub last_aux_device_write: Option<u8>,
     /// Count of `0xD4`-routed host→auxiliary-device bytes (tests / diagnostics).
@@ -567,6 +574,7 @@ impl I8042 {
             pending: PendingWrite::None,
             unsupported_commands: 0,
             pulse_reset_commands: 0,
+            system_reset_pending: false,
             last_aux_device_write: None,
             aux_device_writes: 0,
             mouse_reporting: false,
@@ -609,6 +617,7 @@ impl I8042 {
         self.pending = PendingWrite::None;
         self.unsupported_commands = 0;
         self.pulse_reset_commands = 0;
+        self.system_reset_pending = false;
         self.last_aux_device_write = None;
         self.aux_device_writes = 0;
         self.reset_mouse_defaults();
@@ -661,6 +670,18 @@ impl I8042 {
 
     pub fn reset(&mut self) {
         self.apply_reset_defaults();
+    }
+
+    /// Take a latched pulse-reset (`0xFE` on `0x64`) system-reset request.
+    ///
+    /// Spec: OSDev I8042 — controller command `0xFE` pulses the reset line.
+    /// Returns `true` once per command; the machine layer should then run its
+    /// CPU/device reset path (e.g. `Machine::reset`). Distinct from keyboard
+    /// Resend `0xFE` on data port `0x60`.
+    pub fn take_system_reset_request(&mut self) -> bool {
+        let pending = self.system_reset_pending;
+        self.system_reset_pending = false;
+        pending
     }
 
     /// Status register value (port `0x64` read).
@@ -1511,8 +1532,9 @@ impl I8042 {
             }
             CMD_PULSE_RESET => {
                 // Spec: OSDev I8042 — pulse output lines / system-reset request.
-                // Counted only; CPU reset is not wired in this stub.
+                // Latch for Machine::reset; distinct from keyboard Resend on 0x60.
                 self.pulse_reset_commands = self.pulse_reset_commands.saturating_add(1);
+                self.system_reset_pending = true;
             }
             _ => {
                 self.unsupported_commands = self.unsupported_commands.saturating_add(1);
@@ -1849,7 +1871,8 @@ mod tests {
     }
 
     /// Spec: OSDev I8042 — controller command `0xFE` on port `0x64` is pulse-
-    /// reset (counted; no CPU reset), not keyboard Resend on `0x60`.
+    /// reset (counted + latches system-reset request), not keyboard Resend on
+    /// `0x60`.
     #[test]
     fn controller_cmd_fe_on_64_counts_pulse_reset() {
         let mut k = I8042::new();
@@ -1858,11 +1881,29 @@ mod tests {
         assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
         let before_unsup = k.unsupported_commands;
         let before_pulse = k.pulse_reset_commands;
+        assert!(!k.take_system_reset_request());
         k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_PULSE_RESET));
         assert_eq!(k.pulse_reset_commands, before_pulse + 1);
         assert_eq!(k.unsupported_commands, before_unsup);
         assert_eq!(k.status() & STATUS_OBF, 0);
         assert_eq!(k.kbd_last_byte(), KBD_ECHO); // keyboard last byte untouched
+        assert!(k.take_system_reset_request());
+        assert!(!k.take_system_reset_request());
+    }
+
+    /// Spec: OSDev PS/2 Keyboard — Resend `0xFE` on data port does not latch
+    /// controller pulse-reset / system-reset.
+    #[test]
+    fn kbd_resend_fe_on_60_does_not_latch_system_reset() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        write_kbd(&mut k, KBD_CMD_ECHO);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
+        let before_pulse = k.pulse_reset_commands;
+        write_kbd(&mut k, KBD_CMD_RESEND);
+        assert_eq!(read_kbd_byte(&mut k), KBD_ECHO);
+        assert_eq!(k.pulse_reset_commands, before_pulse);
+        assert!(!k.take_system_reset_request());
     }
 
     /// Spec: OSDev PS/2 Keyboard — Reset (`0xFF`) clears last-byte tracking to
