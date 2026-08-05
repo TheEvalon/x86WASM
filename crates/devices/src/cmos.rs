@@ -242,8 +242,7 @@ impl CmosRtc {
                     convert_hour_format(self.ram[REG_HOUR as usize], binary, to_24);
                 let alarm = self.ram[REG_HOUR_ALARM as usize];
                 if alarm < 0xC0 {
-                    self.ram[REG_HOUR_ALARM as usize] =
-                        convert_hour_format(alarm, binary, to_24);
+                    self.ram[REG_HOUR_ALARM as usize] = convert_hour_format(alarm, binary, to_24);
                 }
             }
             self.recompute_irqf();
@@ -1686,7 +1685,7 @@ mod tests {
         let mut c = CmosRtc::new();
         c.write_reg(REG_HOUR, 0x13); // 13:00 24h BCD
         c.write_reg(REG_HOUR_ALARM, 0x00); // midnight alarm
-        // Clear 24/12 → 12-hour; DM remains BCD.
+                                           // Clear 24/12 → 12-hour; DM remains BCD.
         c.write_reg(REG_STATUS_B, 0x00);
         assert_eq!(c.read_reg(REG_STATUS_B) & STB_24_12, 0);
         assert_eq!(c.read_reg(REG_HOUR), HOUR_PM | 0x01); // 1 PM
