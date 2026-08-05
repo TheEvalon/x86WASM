@@ -2,14 +2,19 @@
 //!
 //! Floppy media for tests/host setup: [`Machine::attach_floppy_image`] /
 //! [`Machine::with_floppy`] wrap [`Fdc82077::attach_image`].
+//!
+//! IDE / boot handoff: [`Machine::attach_ide_image`] / [`Machine::with_ide`] and
+//! [`Machine::load_mbr_to_7c00`] (see [`mbr`]).
 
 #![forbid(unsafe_code)]
 
 mod hello_rom;
+mod mbr;
 mod mem;
 mod ports;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
+pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::PhysMem;
 
 use devices::{
@@ -33,6 +38,18 @@ pub enum MachineError {
     RomTooLarge,
     #[error(transparent)]
     BiosRom(#[from] BiosRomError),
+    /// No IDE LBA0 / floppy CHS (0,0,1) available for [`Machine::load_mbr_to_7c00`].
+    #[error("no boot media attached (IDE LBA0 or floppy CHS 0,0,1)")]
+    NoBootMedia,
+    /// IDE image present but shorter than one 512-byte sector.
+    #[error("boot sector shorter than 512 bytes")]
+    IncompleteBootSector,
+    /// Bytes 510–511 are not the classic `0x55AA` MBR/VBR signature.
+    #[error("invalid MBR signature (expected 0x55AA)")]
+    InvalidMbrSignature,
+    /// Guest RAM must cover `0x7C00`..`0x7DFF` for the boot-sector copy.
+    #[error("RAM too small for MBR at 0x7C00")]
+    MbrRamTooSmall,
 }
 
 pub struct Machine {
