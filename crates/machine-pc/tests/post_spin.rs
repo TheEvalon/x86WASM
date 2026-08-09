@@ -43,10 +43,12 @@ fn a_one_instruction_spin_is_named_and_detected() {
     assert_eq!(spin.hot[0].0.linear_pc, 0x000F_0000);
     assert_eq!(spin.hot[0].1, spin.sampled);
 
-    // And the reader sees it without parsing a struct.
+    // And the reader sees it without parsing a struct, including the bytes
+    // that make `EB FE` recognisable as a self-jump.
     let text = report.to_string();
     assert!(text.contains("stop-pc"), "{text}");
     assert!(text.contains("linear_pc=0x00000000000F0000"), "{text}");
+    assert!(text.contains("bytes=[EB FE"), "{text}");
     assert!(text.contains("cycle=1"), "{text}");
 }
 
