@@ -24,6 +24,11 @@
 //!   WRITE: host fills data port after DRQ; ATAPI probe via `0xA1` / PACKET.
 //! - IBM PC/AT IDE — alternate status / device control at `0x3F6`; IRQ14.
 //! - Intel 8259A — DualPic IR14 (slave IR6) vectoring via MachineBus.
+//! - ATA/ATAPI-6 (T13/1410D r3b) §7.7 DEV bit, §7.8.5 Device Control,
+//!   §5.2.9 INTRQ, §9.12 Signature and persistence, §9.16.1 "Device 0 only
+//!   configurations", Table 18 "Device 1 is selected and Device 0 is
+//!   responding for Device 1", §8.11 / Table 26 EXECUTE DEVICE DIAGNOSTIC —
+//!   see `docs/ide-device-selection.md`.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.5 / §21 PIIX IDE / ATAPI.
 //!
 //! # Scope (this slice)
@@ -81,6 +86,19 @@
 //!   `multiple_count==0` → ERR+ABRT; INTRQ once per block / completion when nIEN=0
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
+//! - Device selection (DEV bit4 of the Device register): this channel models
+//!   Device 0 only, so ATA/ATAPI-6 §9.16.1 "Device 0 only configurations"
+//!   applies when the host selects Device 1 — Device Control and non-Command
+//!   Command Block writes land in Device 0; Command register writes are
+//!   ignored except EXECUTE DEVICE DIAGNOSTIC (`0x90`); non-status Command
+//!   Block reads return Device 0 content (the Device register reads back with
+//!   DEV set); Status and Alternate Status read `00h`; INTRQ is released while
+//!   Device 0 is deselected and reasserted on reselect (§5.2.9) without losing
+//!   interrupt pending. Data port cycles for Device 1 are ignored (Table 18
+//!   defines only BSY=0/DRQ=0 cases; documented model choice)
+//! - Signature: software reset and EXECUTE DEVICE DIAGNOSTIC write the
+//!   non-PACKET signature Sector Count `01h` / LBA Low `01h` / LBA Mid `00h` /
+//!   LBA High `00h` (ATA/ATAPI-6 §9.12)
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
 //!   status register read clears pending IRQ; `irq_line()` for MachineBus
 //! - `PortDevice` for MachineBus wiring
@@ -98,7 +116,12 @@
 //!   `0x5C` / `0x5E`)
 //! - Real BM-DMA / UDMA/MDMA / PRD engine (READ/WRITE DMA are ABRT-only)
 //! - LBA48
-//! - Slave drive on either channel
+//! - An actual Device 1 on either channel — only the ATA/ATAPI-6 §9.16.1
+//!   Device-0-only responses are modeled; there is no second drive, no
+//!   PDIAG-/DASP- device-1 detection handshake, no ATA/ATAPI-6 §9.16.2
+//!   "Device 1 only" configuration, and no per-device task file
+//! - Data port behavior for Device 1 while Device 0 has BSY or DRQ set
+//!   (outside Table 18; modeled as an ignored cycle)
 //! - SeaBIOS / PCI IDE BAR remapping
 //!
 //! Secondary channel (`IdeSecondary`) remaps the same ATA PIO stub — including
@@ -305,8 +328,20 @@ pub const ATA_DC_NIEN: u8 = 0x02;
 
 /// Drive/head: LBA mode bit.
 pub const ATA_DRIVE_LBA: u8 = 0x40;
-/// Drive/head: slave select (bit4). Master = 0.
+/// Drive/head bit4: DEV — device 1 ("slave") select; Device 0 = 0.
+///
+/// Spec: ATA/ATAPI-6 §7.7 — "When the DEV bit is cleared to zero, Device 0 is
+/// selected. When the DEV bit is set to one, Device 1 is selected."
 pub const ATA_DRIVE_SLAVE: u8 = 0x10;
+
+/// Non-PACKET device signature Sector Count. Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_SECTOR_COUNT: u8 = 0x01;
+/// Non-PACKET device signature LBA Low. Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_LBA_LOW: u8 = 0x01;
+/// Non-PACKET device signature LBA Mid (`0x14` on ATAPI). Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_LBA_MID: u8 = 0x00;
+/// Non-PACKET device signature LBA High (`0xEB` on ATAPI). Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_LBA_HIGH: u8 = 0x00;
 
 const SECTOR_SIZE: usize = 512;
 const IDENTIFY_WORDS: usize = 256;
@@ -454,11 +489,15 @@ impl IdePrimary {
         matches!(port, 0x1F0..=0x1F7 | IDE_PRIMARY_CTRL)
     }
 
-    /// ISA IRQ14 line level (INTRQ ∧ ¬nIEN).
+    /// ISA IRQ14 line level (INTRQ ∧ ¬nIEN ∧ device selected).
     ///
-    /// Spec: ATA device control nIEN; OSDev ATA PIO — primary → IRQ14.
+    /// Spec: ATA/ATAPI-6 §5.2.9 INTRQ — "When the nIEN bit is set to one or the
+    /// device is not selected, the INTRQ signal shall be released." Selecting
+    /// Device 1 therefore releases the line without clearing Device 0 interrupt
+    /// pending; reselecting Device 0 asserts it again.
+    /// Spec: OSDev ATA PIO — primary → IRQ14.
     pub fn irq_line(&self) -> bool {
-        self.irq_pending && (self.dev_ctrl & ATA_DC_NIEN == 0)
+        self.irq_pending && (self.dev_ctrl & ATA_DC_NIEN == 0) && !self.is_slave_selected()
     }
 
     fn raise_irq(&mut self) {
@@ -470,6 +509,10 @@ impl IdePrimary {
         self.irq_pending = false;
     }
 
+    /// True when the Device register DEV bit selects Device 1.
+    ///
+    /// This channel models Device 0 only, so Device 1 is always absent and
+    /// ATA/ATAPI-6 §9.16.1 "Device 0 only configurations" applies.
     fn is_slave_selected(&self) -> bool {
         self.drive_head & ATA_DRIVE_SLAVE != 0
     }
@@ -611,7 +654,7 @@ impl IdePrimary {
 
     fn exec_identify(&mut self) {
         // Spec: OSDev ATA PIO — no device / slave → status 0 after IDENTIFY.
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -631,7 +674,7 @@ impl IdePrimary {
     /// abort with ERR+ABRT (no 256-word PIO). SeaBIOS probes `0xA1` to detect
     /// ATAPI; master stays ATA in this stub (no slave ATAPI path yet).
     fn exec_identify_packet(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -647,7 +690,7 @@ impl IdePrimary {
     /// and no packet PIO. SeaBIOS-friendly: honest reject without a packet
     /// engine. INTRQ follows the same nIEN rules as WRITE/IDENTIFY abort.
     fn exec_packet(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -657,7 +700,7 @@ impl IdePrimary {
     }
 
     fn exec_read_sectors(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -683,7 +726,7 @@ impl IdePrimary {
 
     fn exec_write_sectors(&mut self) {
         // Spec: ATA WRITE SECTORS (0x30) — LBA28 PIO; host fills 256 words/sector.
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -717,7 +760,7 @@ impl IdePrimary {
     /// Absent/slave → status 0. INTRQ follows nIEN like FLUSH CACHE. No write
     /// to media on WRITE VERIFY (range check only).
     fn exec_verify_sectors(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -749,7 +792,7 @@ impl IdePrimary {
     /// This stub has no volatile cache; it completes immediately with
     /// DRDY|DSC, error=0, no DRQ, and raises INTRQ when nIEN=0 (SeaBIOS-friendly).
     fn exec_flush_cache(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -769,7 +812,7 @@ impl IdePrimary {
     /// Spec: ATA/ATAPI Command Set — NOP completes with success; this stub
     /// mirrors other non-data success completions (DRDY|DSC, error=0).
     fn exec_nop(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -792,7 +835,7 @@ impl IdePrimary {
     /// shorter when Sector Count is not divisible by the block factor. INTRQ
     /// once per DRQ block ready and on command completion when nIEN=0.
     fn exec_read_multiple(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -829,7 +872,7 @@ impl IdePrimary {
     /// shorter when Sector Count is not divisible by the block factor. INTRQ
     /// once per DRQ block ready and on command completion when nIEN=0.
     fn exec_write_multiple(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -866,7 +909,7 @@ impl IdePrimary {
     /// ERR+ABRT and no return data / DRQ. Absent/slave → status 0. INTRQ follows
     /// nIEN like PACKET / READ MULTIPLE abort.
     fn exec_smart(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -883,7 +926,7 @@ impl IdePrimary {
     /// and no DRQ / DMA start. Absent/slave → status 0. INTRQ follows nIEN like
     /// SMART / PACKET abort.
     fn exec_read_dma(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -900,7 +943,7 @@ impl IdePrimary {
     /// and no DRQ / DMA start. Absent/slave → status 0. INTRQ follows nIEN like
     /// READ DMA abort.
     fn exec_write_dma(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -919,7 +962,7 @@ impl IdePrimary {
     /// DRQ. Absent/slave → status 0. INTRQ follows nIEN like SECURITY UNLOCK /
     /// FREEZE LOCK abort.
     fn exec_security_set_password(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -937,7 +980,7 @@ impl IdePrimary {
     /// and no unlock PIO / DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SECURITY FREEZE LOCK abort.
     fn exec_security_unlock(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -955,7 +998,7 @@ impl IdePrimary {
     /// ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SECURITY SET PASSWORD abort.
     fn exec_security_erase_prepare(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -973,7 +1016,7 @@ impl IdePrimary {
     /// with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SECURITY ERASE PREPARE abort.
     fn exec_security_erase_unit(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -991,7 +1034,7 @@ impl IdePrimary {
     /// no freeze state / DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SMART / READ DMA abort.
     fn exec_security_freeze_lock(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1009,7 +1052,7 @@ impl IdePrimary {
     /// abort with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows
     /// nIEN like SECURITY ERASE UNIT abort.
     fn exec_security_disable_password(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1027,7 +1070,7 @@ impl IdePrimary {
     /// data/DRQ transfer. Absent/slave → status 0. INTRQ follows nIEN like
     /// SMART / SECURITY FREEZE abort.
     fn exec_download_microcode(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1044,7 +1087,7 @@ impl IdePrimary {
     /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
     /// INTRQ follows nIEN like SMART / DOWNLOAD MICROCODE abort.
     fn exec_read_log_ext(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1061,7 +1104,7 @@ impl IdePrimary {
     /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
     /// INTRQ follows nIEN like READ LOG EXT abort.
     fn exec_write_log_ext(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1078,7 +1121,7 @@ impl IdePrimary {
     /// stub does not implement TRIM; ATA disks abort with ERR+ABRT and no
     /// data/DRQ. Absent/slave → status 0. INTRQ follows nIEN like WRITE LOG EXT.
     fn exec_data_set_management(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1095,7 +1138,7 @@ impl IdePrimary {
     /// Computing; ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave →
     /// status 0. INTRQ follows nIEN like DATA SET MANAGEMENT abort.
     fn exec_trusted_receive(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1112,7 +1155,7 @@ impl IdePrimary {
     /// Computing; ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave →
     /// status 0. INTRQ follows nIEN like TRUSTED RECEIVE abort.
     fn exec_trusted_send(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1129,7 +1172,7 @@ impl IdePrimary {
     /// READ/WRITE SECTORS or WRITE BUFFER transfer (zeros after reset).
     /// Absent/slave → status 0. INTRQ follows nIEN like READ SECTORS / IDENTIFY DRQ.
     fn exec_read_buffer(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1151,7 +1194,7 @@ impl IdePrimary {
     /// readable via READ BUFFER. Absent/slave → status 0. INTRQ follows nIEN
     /// like WRITE SECTORS (DRQ ready + command complete).
     fn exec_write_buffer(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1172,7 +1215,7 @@ impl IdePrimary {
     /// Spec: ATA power-management commands complete with DRDY|DSC; this stub
     /// does not model timers or standby spin-down.
     fn exec_power_mgmt_success(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1192,7 +1235,7 @@ impl IdePrimary {
     /// Spec: ATA CHECK POWER MODE returns power state in the sector count
     /// register (`0xFF` = Active or Idle). Stub always reports Active/Idle.
     fn exec_check_power_mode(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1213,7 +1256,7 @@ impl IdePrimary {
     /// Spec: ATA RECALIBRATE/SEEK complete with DRDY|DSC; this stub does not
     /// model physical head motion (DSC always set when ready).
     fn exec_recalibrate_seek_success(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1233,7 +1276,7 @@ impl IdePrimary {
     /// Spec: ATA INITIALIZE DEVICE PARAMETERS programs sectors/heads from the
     /// task file; this stub accepts and succeeds without changing geometry.
     fn exec_init_dev_params(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1256,7 +1299,7 @@ impl IdePrimary {
     /// Invalid → ERR+ABRT (prior `multiple_count` unchanged). Completes with
     /// DRDY|DSC and INTRQ when nIEN=0.
     fn exec_set_multiple_mode(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1288,7 +1331,7 @@ impl IdePrimary {
     /// LBA Low/Mid/High and Device bits 3:0. This stub uses `total_sectors-1`
     /// (or 0 if empty). Completes with DRDY|DSC and INTRQ when nIEN=0.
     fn exec_read_native_max(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1316,7 +1359,7 @@ impl IdePrimary {
     /// with ERR+ABRT and leave capacity unchanged. Absent/slave → status 0.
     /// INTRQ follows nIEN like WRITE BUFFER abort.
     fn exec_set_max_address(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1328,7 +1371,7 @@ impl IdePrimary {
 
     /// MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) — success noop (no tray lock state).
     fn exec_media_lock_unlock(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1345,10 +1388,16 @@ impl IdePrimary {
 
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
-    /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
-    /// This stub always reports passed on present master; absent/slave → status 0.
+    /// Spec: ATA/ATAPI-6 §8.11 / Table 26 — diagnostic code `01h` in the Error
+    /// register means "Device 0 passed, Device 1 passed or not present"; note 2
+    /// adds that with Device 1 absent the host may see Device 0 information even
+    /// though Device 1 is selected. §9.16.1(3) makes this the one Command
+    /// register write Device 0 still executes while Device 1 is selected.
+    /// Spec: ATA/ATAPI-6 §9.12 — the command also writes the non-PACKET
+    /// signature (Sector Count `01h`, LBA Low `01h`, LBA Mid `00h`,
+    /// LBA High `00h`) into the Command Block registers.
     fn exec_diagnostic(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1356,11 +1405,25 @@ impl IdePrimary {
             return;
         }
         self.error = ATA_DIAG_PASSED;
+        self.write_ata_signature();
         self.transferring = false;
         self.pio_in = false;
         self.sectors_left = 0;
         self.status = ATA_SR_DRDY | ATA_SR_DSC;
         self.raise_irq();
+    }
+
+    /// Place the non-PACKET device signature in the Command Block registers.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.12 Signature and persistence — Sector Count `01h`,
+    /// LBA Low `01h`, LBA Mid `00h`, LBA High `00h`. The Device register keeps
+    /// the obsolete ATA-1..5 bits 7/5 (`0xA0`-style) that classic PC firmware
+    /// expects, and the DEV bit is left as the host selected it.
+    fn write_ata_signature(&mut self) {
+        self.sector_count = ATA_SIGNATURE_SECTOR_COUNT;
+        self.lba_lo = ATA_SIGNATURE_LBA_LOW;
+        self.lba_mid = ATA_SIGNATURE_LBA_MID;
+        self.lba_hi = ATA_SIGNATURE_LBA_HIGH;
     }
 
     /// SET FEATURES (`0xEF`) — accept features register, succeed without side effects.
@@ -1369,7 +1432,7 @@ impl IdePrimary {
     /// This stub completes successfully on present master (SeaBIOS-friendly
     /// accept); feature-specific behavior remains unsupported.
     fn exec_set_features(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1385,7 +1448,17 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// Dispatch a Command register write.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.16.1(3) / Table 18 — in a Device 0 only
+    /// configuration, a write to the Command register while Device 1 is
+    /// selected shall be ignored, "except for EXECUTE DEVICE DIAGNOSTIC".
+    /// Ignoring means Device 0 keeps its status, Error register, interrupt
+    /// pending state, and any in-progress PIO transfer.
     fn exec_command(&mut self, cmd: u8) {
+        if self.is_slave_selected() && cmd != ATA_CMD_DIAGNOSTIC {
+            return;
+        }
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
             ATA_CMD_PACKET => self.exec_packet(),
@@ -1435,6 +1508,13 @@ impl IdePrimary {
     }
 
     fn read_data(&mut self, size: u8) -> u32 {
+        // Spec: ATA/ATAPI-6 Table 18 only defines Device 0 responses for
+        // Device 1 with BSY=0 and DRQ=0, so a Data port cycle aimed at the
+        // absent Device 1 has no defined answer. Documented model choice: the
+        // cycle is ignored so an in-progress Device 0 DRQ block is preserved.
+        if self.is_slave_selected() {
+            return 0xFFFF_FFFF;
+        }
         if !self.transferring || self.pio_in || self.status & ATA_SR_DRQ == 0 {
             return 0xFFFF_FFFF;
         }
@@ -1457,6 +1537,10 @@ impl IdePrimary {
     }
 
     fn write_data(&mut self, size: u8, value: u32) {
+        // See `read_data`: Data port cycles for the absent Device 1 are ignored.
+        if self.is_slave_selected() {
+            return;
+        }
         if !self.transferring || !self.pio_in || self.status & ATA_SR_DRQ == 0 {
             return;
         }
@@ -1583,13 +1667,20 @@ impl IdePrimary {
         }
     }
 
+    /// Device Control register write (`0x3F6` / `0x376`).
+    ///
+    /// Spec: ATA/ATAPI-6 §7.8.5 — "When the Device Control register is written,
+    /// both devices respond to the write regardless of which device is
+    /// selected", and §9.16.1(1) repeats that with Device 1 selected and absent
+    /// the write completes as if Device 0 was selected. SRST and nIEN therefore
+    /// take effect on Device 0 whatever the DEV bit says.
     fn write_dev_ctrl(&mut self, value: u8) {
         let prev = self.dev_ctrl;
         self.dev_ctrl = value & (ATA_DC_SRST | ATA_DC_NIEN | 0x01);
         // Spec: ATA device control — SRST high then low performs software reset.
         if prev & ATA_DC_SRST == 0 && value & ATA_DC_SRST != 0 {
             // Enter reset: BSY
-            if self.present && !self.is_slave_selected() {
+            if self.present {
                 self.status = ATA_SR_BSY;
             }
             self.clear_irq();
@@ -1603,16 +1694,29 @@ impl IdePrimary {
         }
     }
 
+    /// Status / Alternate Status value presented to the host.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.16.1(4) / Table 18 — in a Device 0 only
+    /// configuration, a read of the Status or Alternate Status register while
+    /// Device 1 is selected returns `00h`. An entirely empty channel also reads
+    /// `00h` because no device drives the bus.
     fn status_byte(&self) -> u8 {
-        // No slave / absent: floating bus reads 0x00 for IDENTIFY probe.
         if !self.present || self.is_slave_selected() {
             return 0;
         }
         self.status
     }
 
+    /// Status register read (`0x1F7` / `0x177`).
+    ///
+    /// Spec: OSDev ATA PIO — reading Status (not Alternate Status) clears the
+    /// pending interrupt. Spec: ATA/ATAPI-6 §9.16.1(4) — while Device 1 is
+    /// selected this read only returns `00h`; Device 0 interrupt pending is
+    /// left alone so a reselect still delivers the interrupt (§5.2.9).
     fn read_status_clear_irq(&mut self) -> u8 {
-        // Spec: OSDev ATA PIO — reading Status (not alt) clears IRQ.
+        if self.is_slave_selected() {
+            return 0;
+        }
         self.clear_irq();
         self.status_byte()
     }
