@@ -216,6 +216,43 @@ pub fn install_ivt(bus: &mut RamBus, cpu: &mut CpuState, vector: u8, segment: u1
     cpu.idtr.limit = 0x3FF;
 }
 
+/// Physical layout shared by the paging tests. Everything below `0x2_0000` is
+/// identity mapped by the first page table, so a physical address in this list
+/// is also its linear address unless a test says otherwise.
+pub const CODE: u32 = 0x5000;
+pub const HANDLER: u32 = 0x6000;
+pub const STACK_TOP: u32 = 0x8000;
+pub const DATA: u32 = 0x9000;
+/// Second page table, for the linear 4-MiB region starting at [`HIGH`].
+pub const PT2: usize = 0xA000;
+/// A linear address outside the identity-mapped region, so a test can prove
+/// the physical address really came from the page tables.
+pub const HIGH: u32 = 0x0040_0000;
+
+/// Stack slots of a `#PF`-style frame built by a 386 interrupt gate entered
+/// with `ESP = STACK_TOP` (SDM Vol. 3 §6.12.1 Figure 6-4).
+pub const FRAME_ERROR_CODE: usize = (STACK_TOP - 16) as usize;
+pub const FRAME_EIP: usize = (STACK_TOP - 12) as usize;
+
+/// 32-bit protected mode with paging on, the low 128 KiB identity mapped, a
+/// flat GDT, and a 386 IDT whose `#GP` and `#PF` gates both reach `HANDLER`.
+pub fn paged_fixture(code: &[u8]) -> (CpuState, RamBus, x86_mmu::paging::Mmu) {
+    let mut bus = RamBus::new(0x2_0000);
+    identity_map_first_4mib(&mut bus, 0x20, P | RW | US);
+    let mut cpu = flat_protected_cpu(CODE, STACK_TOP);
+    install_flat_gdt(&mut bus, &mut cpu, 0x3000);
+    install_386_idt(&mut bus, &mut cpu, 0x4000, &[(13, HANDLER), (14, HANDLER)]);
+    bus.write_bytes(CODE as usize, code);
+    bus.write_bytes(HANDLER as usize, &[0xF4]);
+    (cpu, bus, x86_mmu::paging::Mmu::new())
+}
+
+/// Point the second page directory entry at [`PT2`] and map [`HIGH`] there.
+pub fn map_high_page(bus: &mut RamBus, pte: u32) {
+    bus.poke_u32(PD_BASE + 4, PT2 as u32 | P | RW | US);
+    bus.poke_u32(PT2, pte);
+}
+
 /// A real-address-mode CPU executing at `0x0000:eip` with a flat 64-KiB stack.
 pub fn real_mode_cpu(eip: u16, sp: u16) -> CpuState {
     let mut cpu = CpuState::reset();

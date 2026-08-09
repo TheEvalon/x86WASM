@@ -154,18 +154,11 @@ fn mov_cr3_flushes_non_global_entries_even_when_the_value_is_unchanged() {
 /// included. Spec: SDM Vol. 3 §4.10.4.1.
 #[test]
 fn mov_cr0_clearing_pg_flushes_global_entries_too() {
-    let mut bus = RamBus::new(0x10000);
-    // 66 B8 01 00 00 00  MOV EAX, 1        (PE, PG clear)
-    // 0F 22 C0           MOV CR0, EAX
-    bus.write_bytes(
-        0x1000,
-        &[0x66, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x22, 0xC0, 0xF4],
-    );
-    let mut cpu = real_mode_cpu(0x1000, 0xFFFE);
-    cpu.cr0 = CR0_PE | CR0_PG;
-
-    let mut mmu = Mmu::new();
-    mmu.tlb_mut().insert(0x0040_0000, cached(true));
+    // B8 01 00 00 00   MOV EAX, 1        (PE set, PG clear)
+    // 0F 22 C0         MOV CR0, EAX
+    let (mut cpu, mut bus, mut mmu) =
+        paged_fixture(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0x22, 0xC0, 0xF4]);
+    mmu.tlb_mut().insert(HIGH, cached(true));
 
     step_with_mmu(&mut cpu, &mut bus, &mut mmu).unwrap();
     step_with_mmu(&mut cpu, &mut bus, &mut mmu).unwrap();

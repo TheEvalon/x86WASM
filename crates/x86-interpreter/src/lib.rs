@@ -7,7 +7,10 @@
 use thiserror::Error;
 use x86_core::CpuState;
 use x86_decode::{decode_with_mode, DecodeError, DecodedInsn};
-use x86_mmu::paging::{Mmu, PagingContext};
+use x86_mmu::paging::{
+    Access, AccessKind, AccessMode, Mmu, PageTableMemory, PagingContext, TranslateError,
+    UnsupportedPaging,
+};
 use x86_mmu::{checked_linear_addr, linear_addr};
 
 /// Memory + port callbacks supplied by `machine-pc`.
@@ -91,6 +94,25 @@ pub trait Bus {
     fn invalidate_page(&mut self, linear: u64) {
         let _ = linear;
     }
+
+    /// Read one instruction byte.
+    ///
+    /// Separate from [`Bus::read_u8`] only so the paging path can pass
+    /// `AccessKind::InstructionFetch` (SDM §4.6.1, §4.7). Default: an ordinary
+    /// read, which is what a bus with no translation does.
+    fn fetch_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        self.read_u8(addr)
+    }
+
+    /// Read one byte of a GDT, LDT, IDT or TSS entry.
+    ///
+    /// §4.6.1 makes accesses the processor performs to those tables
+    /// supervisor-mode accesses *regardless of CPL*, so they cannot derive
+    /// their access mode from the current privilege level. Default: an
+    /// ordinary read.
+    fn read_system_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        self.read_u8(addr)
+    }
 }
 
 /// The interpreter's memory path with 32-bit paging in it.
@@ -145,31 +167,151 @@ impl<'a> PagedBus<'a> {
     pub fn cpl(&self) -> u8 {
         self.cpl
     }
+
+    /// Is a linear address a physical address right now? (`CR0.PG = 0`.)
+    fn identity_mapped(&self) -> bool {
+        !self.ctx.paging_enabled()
+    }
+
+    /// Translate one linear address for one access.
+    ///
+    /// Returns the physical address, or the error the interpreter must raise:
+    /// [`ExecError::PageFault`] for an architectural `#PF`,
+    /// [`ExecError::PageTableFault`] when the walk itself could not reach
+    /// physical memory, or [`ExecError::UnsupportedPaging`] for a mode this
+    /// engine does not model.
+    ///
+    /// Spec: SDM Vol. 3 §4.3 (the walk), §4.6.1 (access rights and the
+    /// supervisor/user split), §4.7 (`CR2` and the error code).
+    fn translate(&mut self, linear: u64, access: Access) -> Result<u64, ExecError> {
+        if self.identity_mapped() {
+            return Ok(linear);
+        }
+        let ctx = self.ctx;
+        let mut mem = PageTableWalkBus {
+            inner: &mut *self.inner,
+            error: None,
+        };
+        let result = self.mmu.translate(&ctx, &mut mem, linear as u32, access);
+        if let Some(phys) = mem.error {
+            return Err(ExecError::PageTableFault(phys));
+        }
+        match result {
+            Ok(translation) => Ok(translation.phys_addr),
+            Err(TranslateError::Fault(fault)) => Err(ExecError::PageFault {
+                linear: fault.cr2(),
+                error_code: fault.error_code(),
+            }),
+            Err(TranslateError::Unsupported(kind)) => Err(ExecError::UnsupportedPaging(kind)),
+        }
+    }
+
+    /// The access a data reference of `kind` makes at the current CPL.
+    fn data_access(&self, kind: AccessKind) -> Access {
+        Access::from_cpl(kind, self.cpl)
+    }
+
+    /// An access the processor makes on software's behalf to the GDT, LDT, IDT
+    /// or TSS: supervisor mode whatever the CPL is (SDM §4.6.1).
+    fn system_access(kind: AccessKind) -> Access {
+        Access::new(kind, AccessMode::Supervisor)
+    }
+}
+
+/// Guest physical memory as the page walker sees it: the machine bus, so a
+/// paging-structure access goes through exactly the same address decode,
+/// shadowing and A20 masking as any other physical access.
+///
+/// A bus failure cannot be reported through [`PageTableMemory`], so the first
+/// failing address is latched and [`PagedBus::translate`] turns it into
+/// [`ExecError::PageTableFault`] rather than letting a zero entry masquerade as
+/// a not-present page.
+struct PageTableWalkBus<'b> {
+    inner: &'b mut dyn Bus,
+    error: Option<u64>,
+}
+
+impl PageTableMemory for PageTableWalkBus<'_> {
+    fn read_entry_u32(&mut self, phys_addr: u64) -> u32 {
+        match self.inner.read_u32(phys_addr) {
+            Ok(value) => value,
+            Err(_) => {
+                self.error.get_or_insert(phys_addr);
+                0
+            }
+        }
+    }
+
+    fn write_entry_u32(&mut self, phys_addr: u64, value: u32) {
+        if self.inner.write_u32(phys_addr, value).is_err() {
+            self.error.get_or_insert(phys_addr);
+        }
+    }
 }
 
 impl Bus for PagedBus<'_> {
     fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
-        self.inner.read_u8(addr)
+        let access = self.data_access(AccessKind::Read);
+        let phys = self.translate(addr, access)?;
+        self.inner.read_u8(phys)
     }
 
     fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
-        self.inner.write_u8(addr, val)
+        let access = self.data_access(AccessKind::Write);
+        let phys = self.translate(addr, access)?;
+        self.inner.write_u8(phys, val)
     }
 
+    // A multi-byte access can straddle a page boundary, where the two halves
+    // have unrelated translations. Until the page-crossing slice makes that
+    // one planned access, translation happens per byte: correct for reads, and
+    // for a write that crosses into a faulting page it commits the first half
+    // before faulting — the restartability hole the next slices close.
     fn read_u16(&mut self, addr: u64) -> Result<u16, ExecError> {
-        self.inner.read_u16(addr)
+        if self.identity_mapped() {
+            return self.inner.read_u16(addr);
+        }
+        let lo = self.read_u8(addr)?;
+        let hi = self.read_u8(addr.wrapping_add(1))?;
+        Ok(u16::from_le_bytes([lo, hi]))
     }
 
     fn write_u16(&mut self, addr: u64, val: u16) -> Result<(), ExecError> {
-        self.inner.write_u16(addr, val)
+        if self.identity_mapped() {
+            return self.inner.write_u16(addr, val);
+        }
+        let bytes = val.to_le_bytes();
+        self.write_u8(addr, bytes[0])?;
+        self.write_u8(addr.wrapping_add(1), bytes[1])
     }
 
     fn read_u32(&mut self, addr: u64) -> Result<u32, ExecError> {
-        self.inner.read_u32(addr)
+        if self.identity_mapped() {
+            return self.inner.read_u32(addr);
+        }
+        let lo = self.read_u16(addr)?;
+        let hi = self.read_u16(addr.wrapping_add(2))?;
+        Ok(u32::from(lo) | (u32::from(hi) << 16))
     }
 
     fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), ExecError> {
-        self.inner.write_u32(addr, val)
+        if self.identity_mapped() {
+            return self.inner.write_u32(addr, val);
+        }
+        self.write_u16(addr, val as u16)?;
+        self.write_u16(addr.wrapping_add(2), (val >> 16) as u16)
+    }
+
+    fn fetch_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        let access = self.data_access(AccessKind::InstructionFetch);
+        let phys = self.translate(addr, access)?;
+        self.inner.read_u8(phys)
+    }
+
+    fn read_system_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        let access = Self::system_access(AccessKind::Read);
+        let phys = self.translate(addr, access)?;
+        self.inner.read_u8(phys)
     }
 
     fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError> {
@@ -299,6 +441,24 @@ pub enum ExecError {
         vector: u8,
         reason: ProtectedModeDeliveryError,
     },
+    /// Pending `#PF` (vector 14). Carried separately from
+    /// [`ExecError::ArchFault`] because it needs a doubleword error code and
+    /// because `CR2` must be loaded with the faulting linear address before
+    /// delivery. Consumed by [`step`].
+    /// Spec: Intel SDM Vol. 3 §4.7; Vol. 3 "Interrupt 14—Page-Fault Exception".
+    #[error("page fault at linear {linear:#x}, error code {error_code:#x}")]
+    PageFault { linear: u64, error_code: u32 },
+    /// A page-table walk could not reach physical memory. This is a machine
+    /// failure, not an architectural `#PF`: an entry read that the bus rejects
+    /// must not be mistaken for a not-present entry, so it is reported rather
+    /// than turned into a guest-visible exception.
+    #[error("page-table walk could not reach physical memory at {0:#x}")]
+    PageTableFault(u64),
+    /// A paging mode the 32-bit engine does not model. Never deliverable as a
+    /// guest exception; `MOV to CR4` already refuses `CR4.PAE`, so nothing in
+    /// this build can reach it.
+    #[error("unsupported paging mode: {0:?}")]
+    UnsupportedPaging(UnsupportedPaging),
 }
 
 fn arch_fault(vector: u8) -> ExecError {
@@ -893,11 +1053,16 @@ fn seg_linear_checked(
         .map_err(|_| arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0))
 }
 
-/// Absolute moffs offset from address-size attribute.
-/// Spec: Intel SDM Vol. 2 MOV (moffs16 / moffs32).
+/// Absolute moffs offset from the effective address-size attribute.
+///
+/// `moffs16` vs `moffs32` follows the *attribute*, not the presence of a
+/// `0x67` prefix: under `CS.D=1` the offset is 32 bits with no prefix and 16
+/// bits with one, which is the inverse of the `D=0` case the decoder already
+/// resolves into `insn.address_size_32`.
+/// Spec: Intel SDM Vol. 2 MOV (moffs8/moffs16/moffs32); Vol. 1 §3.6 Table 3-4.
 fn moffs_offset(insn: &DecodedInsn) -> u64 {
-    if insn.prefixes.addr_size_override {
-        insn.immediate as u32 as u64
+    if asize32(insn) {
+        u64::from(insn.immediate as u32)
     } else {
         u64::from(insn.immediate as u16)
     }
@@ -1570,8 +1735,11 @@ fn read_gdt_segment_descriptor(
     let addr = cpu.gdtr.base.wrapping_add(offset);
     let mut descriptor = [0u8; 8];
     for (index, byte) in descriptor.iter_mut().enumerate() {
+        // A descriptor-table read is a supervisor-mode access whatever the CPL
+        // is (SDM Vol. 3 §4.6.1), so it must not go through the CPL-derived
+        // data path.
         *byte = bus
-            .read_u8(addr.wrapping_add(index as u64))
+            .read_system_u8(addr.wrapping_add(index as u64))
             .map_err(|error| classify_mem_fault(error, false))?;
     }
     Ok(descriptor)
@@ -3452,8 +3620,11 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
             u64::from((base as u16).wrapping_add(buf.len() as u16))
         };
         let addr = seg_linear_checked(&cpu.cs, ip, 1, false)?;
+        // `fetch_u8` so paging sees `AccessKind::InstructionFetch` (SDM §4.6.1).
+        // Each byte is translated on its own, so an instruction that straddles
+        // a page boundary faults on the byte that is actually unreachable.
         buf.push(
-            bus.read_u8(addr)
+            bus.fetch_u8(addr)
                 .map_err(|e| classify_mem_fault(e, false))?,
         );
         match decode_with_mode(&buf, mode) {
@@ -3525,11 +3696,14 @@ fn deliver_real_mode_exception(
 enum ProtectedGateSource {
     Software,
     Hardware,
-    Exception(Option<u16>),
+    /// A fault or trap, with the error code its gate pushes. The code is a
+    /// doubleword because `#PF` uses one (SDM Vol. 3 §4.7); the selector-style
+    /// codes of §6.13 occupy only its low word.
+    Exception(Option<u32>),
 }
 
 impl ProtectedGateSource {
-    fn error_code(self) -> Option<u16> {
+    fn error_code(self) -> Option<u32> {
         match self {
             Self::Exception(error_code) => error_code,
             Self::Software | Self::Hardware => None,
@@ -3577,7 +3751,7 @@ fn deliver_protected_mode_gate(
     let mut gate = [0u8; 8];
     for (index, byte) in gate.iter_mut().enumerate() {
         let addr = gate_addr.wrapping_add(index as u64);
-        *byte = bus.read_u8(addr).map_err(|_| {
+        *byte = bus.read_system_u8(addr).map_err(|_| {
             protected_mode_delivery_error(vector, ProtectedModeDeliveryError::IdtRead(addr))
         })?;
     }
@@ -3652,7 +3826,7 @@ fn deliver_protected_mode_gate(
     let mut descriptor = [0u8; 8];
     for (index, byte) in descriptor.iter_mut().enumerate() {
         let addr = descriptor_addr.wrapping_add(index as u64);
-        *byte = bus.read_u8(addr).map_err(|_| {
+        *byte = bus.read_system_u8(addr).map_err(|_| {
             protected_mode_delivery_error(vector, ProtectedModeDeliveryError::GdtRead(addr))
         })?;
     }
@@ -3718,7 +3892,7 @@ fn deliver_protected_mode_gate(
     // The `CS.D=1` rejection above guarantees a 16-bit gate's return EIP fits.
     frame_entries.extend([saved_flags, u32::from(cpu.cs.selector), return_ip]);
     if let Some(code) = error_code {
-        frame_entries.push(u32::from(code));
+        frame_entries.push(code);
     }
 
     let mut final_sp = stack_pointer(cpu);
@@ -3803,6 +3977,34 @@ fn deliver_hardware_interrupt(
         deliver_protected_mode_gate(cpu, bus, vector, return_ip, ProtectedGateSource::Hardware)
     } else {
         real_mode_software_interrupt(cpu, bus, vector, return_ip)
+    }
+}
+
+/// `#PF` — Page-Fault Exception. Spec: Intel SDM Vol. 3 §4.7, §6.15.
+const VECTOR_PAGE_FAULT: u8 = 14;
+
+/// Deliver a pending fault through whichever path the current mode selects.
+///
+/// A `#PF` can only arise with `CR0.PG = 1`, which requires `CR0.PE = 1`, so
+/// the real-mode branch is never reached for vector 14.
+/// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.12.1 (gates), §4.1.1.
+fn deliver_fault(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    error_code: Option<u32>,
+) -> Result<(), ExecError> {
+    if cr0_pe(cpu) {
+        let return_ip = current_ip(cpu);
+        deliver_protected_mode_gate(
+            cpu,
+            bus,
+            vector,
+            return_ip,
+            ProtectedGateSource::Exception(error_code),
+        )
+    } else {
+        deliver_real_mode_exception(cpu, bus, vector)
     }
 }
 
@@ -4544,18 +4746,13 @@ fn step_paged(cpu: &mut CpuState, bus: &mut PagedBus<'_>) -> Result<(), ExecErro
     }
     let result = match step_inner(cpu, bus) {
         Err(ExecError::ArchFault { vector, error_code }) => {
-            if cr0_pe(cpu) {
-                let return_ip = current_ip(cpu);
-                deliver_protected_mode_gate(
-                    cpu,
-                    bus,
-                    vector,
-                    return_ip,
-                    ProtectedGateSource::Exception(error_code),
-                )
-            } else {
-                deliver_real_mode_exception(cpu, bus, vector)
-            }
+            deliver_fault(cpu, bus, vector, error_code.map(u32::from))
+        }
+        Err(ExecError::PageFault { linear, error_code }) => {
+            // SDM Vol. 3 §4.7: `CR2` receives the faulting linear address, and
+            // it is loaded whether or not delivery itself then succeeds.
+            cpu.cr2 = linear;
+            deliver_fault(cpu, bus, VECTOR_PAGE_FAULT, Some(error_code))
         }
         other => other,
     };
@@ -6138,8 +6335,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0xA0 => {
-            // MOV AL, moffs8 — Spec: Intel SDM Vol. 2 "MOV".
-            // Address-size 16 → moffs16; 0x67 → moffs32 (unreal high offsets).
+            // MOV AL, moffs8 — Spec: Intel SDM Vol. 2 "MOV": "the address-size
+            // attribute of the instruction determines the size of the offset".
             let off = moffs_offset(&insn);
             let seg = data_seg_for_string_src(cpu, &insn);
             let uses_ss = string_src_uses_ss(&insn);
@@ -16632,6 +16829,46 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x5A);
         assert_eq!(cpu.ds.limit, 0xFFFF);
+    }
+
+    /// A `moffs` offset follows the *effective address-size attribute*, so
+    /// under `CS.D=1` it is 32 bits with no prefix and 16 bits with `0x67` —
+    /// the inverse of the `D=0` case. Keying on the prefix instead truncated
+    /// every 32-bit `moffs` reference to its low word, which sent SeaBIOS's
+    /// POST writes to `CS.base + offset16` in the ROM window.
+    /// Spec: Intel SDM Vol. 2 "MOV" (moffs8/moffs16/moffs32); Vol. 1 §3.6.
+    #[test]
+    fn moffs_offset_width_follows_the_address_size_attribute() {
+        let mut mem = vec![0u8; 0x3_0000];
+        mem[0x2_1234] = 0x5A;
+        mem[0x1234] = 0xA5;
+        // A0 34 12 02 00      MOV AL, moffs32 0x21234   (D=1, no prefix)
+        // 67 A0 34 12         MOV AL, moffs16 0x1234    (D=1, 0x67 → 16-bit)
+        mem[0..5].copy_from_slice(&[0xA0, 0x34, 0x12, 0x02, 0x00]);
+        mem[5..9].copy_from_slice(&[0x67, 0xA0, 0x34, 0x12]);
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x08,
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            flags: 0xC09B,
+        };
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x10,
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            flags: 0xC093,
+        };
+        cpu.ss = cpu.ds.clone();
+        cpu.cr0 = 1;
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x5A, "no prefix under D=1 is a 32-bit offset");
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xA5, "0x67 under D=1 is a 16-bit offset");
     }
 
     /// Expanded DS limit (unreal): moffs32 beyond 64KiB succeeds; beyond limit → #GP via IVT.
