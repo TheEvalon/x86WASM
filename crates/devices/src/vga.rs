@@ -1300,7 +1300,11 @@ pub const VGA_PLANAR16_DOTS_PER_BYTE: usize = 8;
 ///
 /// This model renders exactly three programmings and says so; it is not
 /// general VGA mode coverage. In particular there is no CGA-compatible fetch,
-/// no unchained 256-color ("mode X") fetch, and no VBE.
+/// no unchained 256-color ("mode X") fetch, and no guest-mappable VBE LFB.
+/// Host-side VBE 2.0 info blocks for the renderable BIOS modes live in
+/// [`VgaText::vbe_info_block_bytes`] / [`VgaText::vbe_mode_info_block_bytes`]
+/// (`docs/vga-r5-vbe-info-blocks.md`); the chain-4 path is the banked packed
+/// pixel mode those blocks advertise (`docs/vga-r5-vbe-banked-framebuffer.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VgaRenderMode {
     /// Alphanumeric (character generator) fetch: codes from map 0, attributes
@@ -1308,6 +1312,7 @@ pub enum VgaRenderMode {
     Text,
     /// Chain-4 256-color linear graphics — the mode-13h programming. Each
     /// display byte is one pixel and goes to the DAC through the PEL Mask.
+    /// This is also the banked VBE mode `13h` host linear view.
     Graphics256Chain4,
     /// Planar 16-color graphics — the BIOS mode `0Dh` / `0Eh` / `10h` / `12h`
     /// programming. One bit position across maps 0–3 forms a 4-bit index that
@@ -1316,6 +1321,68 @@ pub enum VgaRenderMode {
     Graphics16Planar,
     /// Programming the renderer does not model. No frame is produced.
     Unsupported,
+}
+
+/// VBE 2.0 `VbeInfoBlock` size when the caller supplies the `VBE2` signature.
+///
+/// Spec: VESA VBE 2.0 Function 00h — 512 bytes.
+pub const VBE_INFO_BLOCK_BYTES: usize = 512;
+/// VBE 2.0 `ModeInfoBlock` size.
+///
+/// Spec: VESA VBE 2.0 Function 01h — 256 bytes.
+pub const VBE_MODE_INFO_BLOCK_BYTES: usize = 256;
+
+/// BIOS mode `03h` — 80×25 color text. Spec: IBM VGA; VBE MemoryModel text.
+pub const VBE_MODE_03H_TEXT: u16 = 0x03;
+/// BIOS mode `0Dh` — 320×200 planar 16-color.
+pub const VBE_MODE_0DH_PLANAR: u16 = 0x0D;
+/// BIOS mode `0Eh` — 640×200 planar 16-color.
+pub const VBE_MODE_0EH_PLANAR: u16 = 0x0E;
+/// BIOS mode `10h` — 640×350 planar 16-color.
+pub const VBE_MODE_10H_PLANAR: u16 = 0x10;
+/// BIOS mode `12h` — 640×480 planar 16-color.
+pub const VBE_MODE_12H_PLANAR: u16 = 0x12;
+/// BIOS mode `13h` — 320×200 chain-4 256-color (banked packed pixel).
+pub const VBE_MODE_13H_CHAIN4: u16 = 0x13;
+
+/// Mode numbers this model can describe truthfully in a VBE mode list.
+pub const VBE_SUPPORTED_MODES: [u16; 6] = [
+    VBE_MODE_03H_TEXT,
+    VBE_MODE_0DH_PLANAR,
+    VBE_MODE_0EH_PLANAR,
+    VBE_MODE_10H_PLANAR,
+    VBE_MODE_12H_PLANAR,
+    VBE_MODE_13H_CHAIN4,
+];
+
+/// VBE MemoryModel: text. Spec: VBE 2.0.
+const VBE_MEMORY_MODEL_TEXT: u8 = 0x00;
+/// VBE MemoryModel: planar. Spec: VBE 2.0.
+const VBE_MEMORY_MODEL_PLANAR: u8 = 0x03;
+/// VBE MemoryModel: packed pixel. Spec: VBE 2.0.
+const VBE_MEMORY_MODEL_PACKED: u8 = 0x04;
+
+/// ModeAttributes: supported + optional info available + color.
+///
+/// Spec: VBE 2.0 ModeAttributes — D7 (LFB) and D6 (no windowing) stay clear so
+/// every advertised mode is banked VGA-compatible.
+const VBE_MODE_ATTR_BASE: u16 = 0x0001 | 0x0002 | 0x0008;
+/// ModeAttributes D2 — TTY output functions supported (text modes).
+const VBE_MODE_ATTR_TTY: u16 = 0x0004;
+/// ModeAttributes D4 — graphics mode.
+const VBE_MODE_ATTR_GRAPHICS: u16 = 0x0010;
+
+/// WinAAttributes: window exists, readable, writable. Spec: VBE 2.0.
+const VBE_WIN_A_ATTRS: u8 = 0x07;
+
+fn vbe_put_u16(buf: &mut [u8], off: usize, value: u16) {
+    buf[off] = (value & 0xFF) as u8;
+    buf[off + 1] = (value >> 8) as u8;
+}
+
+fn vbe_put_u32(buf: &mut [u8], off: usize, value: u32) {
+    vbe_put_u16(buf, off, (value & 0xFFFF) as u16);
+    vbe_put_u16(buf, off + 2, (value >> 16) as u16);
 }
 
 /// One rendered frame as DAC indices, one byte per pixel, row-major.
@@ -2974,6 +3041,159 @@ impl VgaText {
             VgaRenderMode::Graphics256Chain4 => Some(self.render_graphics256_frame()),
             VgaRenderMode::Graphics16Planar => Some(self.render_graphics16_frame()),
             VgaRenderMode::Unsupported => None,
+        }
+    }
+
+    /// Host-side VBE 2.0 `VbeInfoBlock` for the modes this device can render.
+    ///
+    /// Spec: VESA VBE 2.0 Function 00h. The block uses the `VBE2` signature and
+    /// is 512 bytes. Capabilities are all clear (6-bit DAC, VGA-compatible
+    /// controller, no programmable RAMDAC blanking). `TotalMemory` is 4 —
+    /// 256 KiB of plane memory in 64 KiB units.
+    ///
+    /// **Model choice:** the VideoModePtr far pointer's offset field points at
+    /// byte 34 of this same buffer (segment 0). That is a host-side embedding,
+    /// not a guest real-mode pointer — there is still no INT 10h hook.
+    ///
+    /// See `docs/vga-r5-vbe-info-blocks.md`.
+    pub fn vbe_info_block_bytes(&self) -> [u8; VBE_INFO_BLOCK_BYTES] {
+        let _ = self;
+        let mut block = [0u8; VBE_INFO_BLOCK_BYTES];
+        block[0..4].copy_from_slice(b"VBE2");
+        vbe_put_u16(&mut block, 4, 0x0200);
+        // OemStringPtr / VideoModePtr / OEM name pointers: offset-only host
+        // embedding; segment fields stay zero.
+        vbe_put_u16(&mut block, 14, 34); // VideoModePtr offset → mode list
+        vbe_put_u16(&mut block, 18, 4); // TotalMemory: 256 KiB / 64 KiB
+        vbe_put_u16(&mut block, 20, 0x0001); // OemSoftwareRev
+        let mut off = 34;
+        for mode in VBE_SUPPORTED_MODES {
+            vbe_put_u16(&mut block, off, mode);
+            off += 2;
+        }
+        vbe_put_u16(&mut block, off, 0xFFFF);
+        block
+    }
+
+    /// Host-side VBE 2.0 `ModeInfoBlock` for one supported BIOS mode.
+    ///
+    /// Spec: VESA VBE 2.0 Function 01h. Returns `None` for modes this model
+    /// does not render. Every returned block leaves ModeAttributes D7 clear and
+    /// `PhysBasePtr` zero — there is no guest-mappable linear framebuffer
+    /// aperture to advertise (`docs/vga-r5-vbe-banked-framebuffer.md`).
+    pub fn vbe_mode_info_block_bytes(&self, mode: u16) -> Option<[u8; VBE_MODE_INFO_BLOCK_BYTES]> {
+        let _ = self;
+        let (attrs, win_seg, pitch, width, height, planes, bpp, model, xchar, ychar) = match mode {
+            VBE_MODE_03H_TEXT => (
+                VBE_MODE_ATTR_BASE | VBE_MODE_ATTR_TTY,
+                0xB800u16,
+                (VGA_TEXT_COLS * VGA_CELL_BYTES) as u16,
+                VGA_TEXT_COLS as u16,
+                VGA_TEXT_ROWS as u16,
+                1u8,
+                4u8,
+                VBE_MEMORY_MODEL_TEXT,
+                9u8,
+                16u8,
+            ),
+            VBE_MODE_0DH_PLANAR => (
+                VBE_MODE_ATTR_BASE | VBE_MODE_ATTR_GRAPHICS,
+                0xA000,
+                40,
+                320,
+                200,
+                4,
+                4,
+                VBE_MEMORY_MODEL_PLANAR,
+                8,
+                8,
+            ),
+            VBE_MODE_0EH_PLANAR => (
+                VBE_MODE_ATTR_BASE | VBE_MODE_ATTR_GRAPHICS,
+                0xA000,
+                80,
+                640,
+                200,
+                4,
+                4,
+                VBE_MEMORY_MODEL_PLANAR,
+                8,
+                8,
+            ),
+            VBE_MODE_10H_PLANAR => (
+                VBE_MODE_ATTR_BASE | VBE_MODE_ATTR_GRAPHICS,
+                0xA000,
+                80,
+                640,
+                350,
+                4,
+                4,
+                VBE_MEMORY_MODEL_PLANAR,
+                8,
+                14,
+            ),
+            VBE_MODE_12H_PLANAR => (
+                VBE_MODE_ATTR_BASE | VBE_MODE_ATTR_GRAPHICS,
+                0xA000,
+                80,
+                640,
+                480,
+                4,
+                4,
+                VBE_MEMORY_MODEL_PLANAR,
+                8,
+                16,
+            ),
+            VBE_MODE_13H_CHAIN4 => (
+                VBE_MODE_ATTR_BASE | VBE_MODE_ATTR_GRAPHICS,
+                0xA000,
+                VGA_MODE13_WIDTH as u16,
+                VGA_MODE13_WIDTH as u16,
+                VGA_MODE13_HEIGHT as u16,
+                1,
+                8,
+                VBE_MEMORY_MODEL_PACKED,
+                8,
+                8,
+            ),
+            _ => return None,
+        };
+
+        let mut block = [0u8; VBE_MODE_INFO_BLOCK_BYTES];
+        vbe_put_u16(&mut block, 0, attrs);
+        block[2] = VBE_WIN_A_ATTRS;
+        block[3] = 0; // WinB not present
+        vbe_put_u16(&mut block, 4, 64); // WinGranularity KiB
+        vbe_put_u16(&mut block, 6, 64); // WinSize KiB
+        vbe_put_u16(&mut block, 8, win_seg);
+        vbe_put_u16(&mut block, 10, 0);
+        vbe_put_u32(&mut block, 12, 0); // WinFuncPtr — no bank-switch callable
+        vbe_put_u16(&mut block, 16, pitch);
+        vbe_put_u16(&mut block, 18, width);
+        vbe_put_u16(&mut block, 20, height);
+        block[22] = xchar;
+        block[23] = ychar;
+        block[24] = planes;
+        block[25] = bpp;
+        block[26] = 1; // NumberOfBanks
+        block[27] = model;
+        block[28] = 0; // BankSize (CGA-style; unused)
+        block[29] = 0; // NumberOfImagePages (pages − 1)
+                       // PhysBasePtr at offset 40 — deliberately zero (no LFB hardware).
+        vbe_put_u32(&mut block, 40, 0);
+        Some(block)
+    }
+
+    /// Host linear framebuffer view for the banked VBE mode `13h` programming.
+    ///
+    /// Returns the same [`VgaFrame`] as [`Self::render_frame`] when
+    /// [`VgaRenderMode::Graphics256Chain4`] is active. This is the honest
+    /// "LFB-ish" surface: a row-major DAC-index buffer for the host, not a
+    /// guest `PhysBasePtr` aperture.
+    pub fn vbe_host_linear_framebuffer(&self, blink_off_half: bool) -> Option<VgaFrame> {
+        match self.render_mode() {
+            VgaRenderMode::Graphics256Chain4 => self.render_frame(blink_off_half),
+            _ => None,
         }
     }
 
