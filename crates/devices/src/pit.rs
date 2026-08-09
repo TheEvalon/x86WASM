@@ -28,7 +28,8 @@
 //! reporting. Channel 0 OUT is for IRQ0 wiring. Channel 1: mode-2-ish refresh
 //! countdown with [`Pit8254::refresh_out`] / [`Pit8254::ch1_out`] (no IRQ).
 //! Channel 2: GATE via port `0x61` bit0, OUT readback on bit5, speaker-data
-//! latch bit1 (no host audio).
+//! latch bit1 (no host audio). System Control Port B bit4 is a read-only
+//! refresh-detect state that toggles on every channel-1 refresh rising edge.
 //!
 //! GATE-triggered modes 1 and 5 need a GATE rising edge to start counting, so
 //! on this machine model they are only reachable on channel 2 (port `0x61`
@@ -43,7 +44,7 @@
 //! - DRAM refresh *bus-cycle* side effects (only the ch1 OUT / refresh request
 //!   pin is modeled); host PC-speaker audio output
 //! - Host-real-time wall-clock rate (callers choose tick quantum)
-//! - Port `0x61` NMI/parity/refresh toggle side effects (bits other than 0/1/5)
+//! - Port `0x61` NMI/parity side effects (bits other than 0/1/4/5)
 //! - Invalid BCD digit programming (nibbles A–F): decode treats each nibble as a
 //!   weighted decade digit; hardware behavior for illegal BCD is unspecified
 //!
@@ -74,6 +75,8 @@ pub const PORT_SYSTEM_CONTROL: u16 = 0x61;
 pub const PORT61_GATE2: u8 = 1 << 0;
 /// Port `0x61` bit1: speaker data enable (latched; no host audio).
 pub const PORT61_SPKR_DATA: u8 = 1 << 1;
+/// Port `0x61` bit4: read-only refresh-detect toggle driven by channel 1.
+pub const PORT61_REFRESH_TOGGLE: u8 = 1 << 4;
 /// Port `0x61` bit5: PIT channel 2 OUT (read).
 pub const PORT61_OUT2: u8 = 1 << 5;
 
@@ -668,6 +671,8 @@ pub struct Pit8254 {
     pub channels: [PitChannel; 3],
     /// Port `0x61` bits 1:0 — GATE2 + speaker data enable (no host audio).
     port61_lo: u8,
+    /// Port `0x61` bit4 — toggles on every channel-1 refresh rising edge.
+    refresh_detect: bool,
 }
 
 impl Pit8254 {
@@ -675,6 +680,7 @@ impl Pit8254 {
         let mut s = Self {
             channels: [PitChannel::new(), PitChannel::new(), PitChannel::new()],
             port61_lo: 0,
+            refresh_detect: false,
         };
         // Ch2 GATE follows port 0x61 bit0 (cleared at reset → GATE low).
         s.channels[2].gate = false;
@@ -686,6 +692,7 @@ impl Pit8254 {
             ch.reset();
         }
         self.port61_lo = 0;
+        self.refresh_detect = false;
         self.channels[2].gate = false;
     }
 
@@ -746,18 +753,24 @@ impl Pit8254 {
         }
     }
 
-    /// Read system control port B subset: bits 1:0 latched + bit5 = ch2 OUT.
+    /// Read system control port B subset: bits 1:0 latched, bit4 refresh detect,
+    /// and bit5 = ch2 OUT.
     ///
-    /// Spec: IBM PC/AT PPI port B — bit0 GATE2, bit1 speaker data, bit5 OUT2.
+    /// Spec: IBM PC/AT System Control Port B — bit0 GATE2, bit1 speaker data,
+    /// bit4 refresh detect, bit5 OUT2.
     pub fn port61_read(&self) -> u8 {
         let mut v = self.port61_lo & (PORT61_GATE2 | PORT61_SPKR_DATA);
+        if self.refresh_detect {
+            v |= PORT61_REFRESH_TOGGLE;
+        }
         if self.out_ch2() {
             v |= PORT61_OUT2;
         }
         v
     }
 
-    /// Write system control port B subset (bits 1:0). Updates ch2 GATE.
+    /// Write system control port B subset (bits 1:0). Updates ch2 GATE; read-only
+    /// refresh-detect bit4 and OUT2 bit5 are ignored.
     pub fn port61_write(&mut self, value: u8) {
         self.port61_lo = value & (PORT61_GATE2 | PORT61_SPKR_DATA);
         self.channels[2].set_gate(self.port61_lo & PORT61_GATE2 != 0);
@@ -780,12 +793,14 @@ impl Pit8254 {
     /// Advance channel 1 by `clocks` model ticks (DRAM refresh countdown).
     ///
     /// Returns `true` if OUT had at least one rising edge during the quantum.
-    /// Rising edges update [`Self::refresh_out`] / [`Self::ch1_out`] only — they
-    /// do **not** assert any IRQ (unlike [`Self::tick_ch0`]).
+    /// Every rising edge toggles System Control Port B refresh-detect bit4,
+    /// including multiple edges in one call. Channel 1 does **not** assert any
+    /// IRQ (unlike [`Self::tick_ch0`]).
     pub fn tick_ch1(&mut self, clocks: u64) -> bool {
         let mut rising = false;
         for _ in 0..clocks {
             if self.channels[1].tick_one() {
+                self.refresh_detect = !self.refresh_detect;
                 rising = true;
             }
         }
@@ -1459,6 +1474,56 @@ mod tests {
         assert!(rising);
         assert!(pit.refresh_out());
         assert!(pit.ch1_out());
+    }
+
+    /// Spec: Intel 8254 mode 2 + IBM PC/AT System Control Port B — bit 4
+    /// toggles once for every channel-1 refresh edge, including batched periods.
+    #[test]
+    fn port61_refresh_detect_toggles_for_each_batched_ch1_edge() {
+        let mut pit = Pit8254::new();
+        pit.port_write(PIT_CONTROL, 1, 0x74); // ch1 lohi mode 2
+        pit.port_write(PIT_CH1_DATA, 1, 0x02);
+        pit.port_write(PIT_CH1_DATA, 1, 0x00); // count = 2
+        assert_eq!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+
+        // Initial load + two complete mode-2 refresh periods = two rising edges.
+        assert!(pit.tick_ch1(7));
+        assert_eq!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+
+        // One more period contributes one edge and flips the status bit.
+        assert!(pit.tick_ch1(3));
+        assert_eq!(
+            pit.port61_read() & PORT61_REFRESH_TOGGLE,
+            PORT61_REFRESH_TOGGLE
+        );
+    }
+
+    /// Spec: IBM PC/AT System Control Port B — refresh detect is read-only and
+    /// reset initializes it low.
+    #[test]
+    fn port61_refresh_detect_is_read_only_and_reset_low() {
+        let mut pit = Pit8254::new();
+        assert_eq!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+
+        pit.port61_write(PORT61_REFRESH_TOGGLE | PORT61_GATE2 | PORT61_SPKR_DATA);
+        assert_eq!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+        assert_eq!(
+            pit.port61_read() & (PORT61_GATE2 | PORT61_SPKR_DATA),
+            PORT61_GATE2 | PORT61_SPKR_DATA
+        );
+
+        pit.port_write(PIT_CONTROL, 1, 0x74); // ch1 lohi mode 2
+        pit.port_write(PIT_CH1_DATA, 1, 0x02);
+        pit.port_write(PIT_CH1_DATA, 1, 0x00);
+        assert!(pit.tick_ch1(4)); // first refresh rising edge
+        assert_ne!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+
+        pit.port61_write(0);
+        assert_ne!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+        assert_eq!(pit.port61_read() & (PORT61_GATE2 | PORT61_SPKR_DATA), 0);
+
+        pit.reset();
+        assert_eq!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
     }
 
     /// Spec: IBM PC/AT port 0x61 — bit0 GATE2, bit1 speaker data, bit5 OUT2.

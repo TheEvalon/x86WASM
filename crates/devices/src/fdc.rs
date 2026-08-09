@@ -111,9 +111,10 @@
 //! - LOCK (`0x14` unlock / `0x94` lock): Spec Intel 82077AA §5.3.2 — LOCK is
 //!   command-byte bit7 (no parameter bytes); one result byte `LOCK<<4` with
 //!   MSR RQM|DIO; no IRQ. Soft DOR reset does **not** clear LOCK; when LOCK=0
-//!   soft reset restores Configure EFIFO/FIFOTHR/PRETRK stub defaults (0);
+//!   soft reset restores Configure EFIFO/FIFOTHR/PRETRK defaults
+//!   (`EFIFO=1`, `FIFOTHR=0`, `PRETRK=0`);
 //!   when LOCK=1 those Configure fields survive soft reset. Full `reset()`
-//!   (hardware) clears LOCK and all Configure fields.
+//!   (hardware) clears LOCK and restores all Configure defaults.
 //! - PERPENDICULAR Mode (`0x12`): Spec Intel 82077AA §5.2.11 / Table 5-1 /
 //!   §5.3.1 — command byte → one parameter `OW|0|D3 D2 D1 D0|GAP|WGATE`;
 //!   always stores GAP|WGATE; updates D3–D0 only when OW=1; no result phase;
@@ -126,6 +127,12 @@
 //!   SC/EOT, LOCK|0|D3–D0|GAP|WGATE, 0|EIS|EFIFO|POLL|FIFOTHR, PRETRK.
 //!   `sc_eot` updated from READ/READ DELETED/WRITE DATA EOT or FORMAT TRACK SC;
 //!   byte7 bits 5:0 reflect stored PERPENDICULAR D3–D0|GAP|WGATE (OW not returned).
+//! - DSR software reset (bit7): Intel 82077AA §2.1.5 / §2.2.2 / §7.4 / §8.2 —
+//!   functionally the same as DOR software reset, but self-clearing; aborts the
+//!   current command/result/FIFO transfer, preserves DOR/TDR/DSR rate/CCR and
+//!   LOCK-protected Configure state, clears PCN/transient transfer state, then
+//!   queues polling status `0xC0..=0xC3`; IRQ is active until the first Sense
+//!   Interrupt Status. DOR reset instead remains held until DOR bit2 is released.
 //! - READ DATA (`0x06` | MT/MFM/SK): Spec Intel 82077AA §5.1.1 / Table 5-1 —
 //!   command byte lower 5 bits `00110`; optional MT (`0x80`)/MFM (`0x40`)/
 //!   SK (`0x20`); eight params (HD|US, C, H, R, N, EOT, GPL, DTL). With
@@ -268,7 +275,7 @@
 //!   (this stub completes R..=EOT then presents the full latch to DMA)
 //! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
 //! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
-//!   implied seek, poll disable enforcement); DSR software-reset path
+//!   implied seek, poll disable enforcement); DSR POWER DOWN/data-rate timing
 
 use crate::PortDevice;
 
@@ -317,6 +324,18 @@ pub const FDC_MSR_DIO: u8 = 0x40;
 pub const FDC_DOR_RESET_N: u8 = 0x04;
 /// DOR bit3 — DMA and IRQ enable. Spec: Intel 82077AA / OSDev FDC.
 pub const FDC_DOR_DMA_IRQ: u8 = 0x08;
+/// DSR bit7 — self-clearing software reset. Spec: Intel 82077AA §2.1.5 / §2.2.2.
+pub const FDC_DSR_SOFTWARE_RESET: u8 = 0x80;
+
+/// Configure byte1 EFIFO (1 = FIFO disabled / 8272-compatible). Spec: §5.2.7.
+const FDC_CONFIG_EFIFO: u8 = 0x20;
+/// Configure byte1 FIFO threshold minus one. Spec: Intel 82077AA §5.2.7.
+const FDC_CONFIG_FIFOTHR_MASK: u8 = 0x0F;
+/// Fields protected by LOCK across DOR/DSR software reset. Spec: §5.3.2.
+const FDC_CONFIG_LOCKED_MASK: u8 = FDC_CONFIG_EFIFO | FDC_CONFIG_FIFOTHR_MASK;
+/// Configure reset value: no implied seek, FIFO disabled, polling enabled,
+/// threshold one byte. Spec: Intel 82077AA §5.2.7.
+const FDC_CONFIG_RESET: u8 = FDC_CONFIG_EFIFO;
 
 /// Sense Drive Status command opcode. Spec: Intel 82077AA §5.2.5 — HD|US
 /// parameter, no execution phase, 1-byte ST3 result.
@@ -574,7 +593,7 @@ pub struct Fdc82077 {
     pub dor: u8,
     /// Tape Drive Register (stored).
     pub tdr: u8,
-    /// Data Rate Select (write side of `0x3F4`; stored).
+    /// Data Rate Select (write side of `0x3F4`; stored without self-clearing bit7).
     pub dsr: u8,
     /// Configuration Control Register (write side of `0x3F7`; stored).
     pub ccr: u8,
@@ -596,7 +615,8 @@ pub struct Fdc82077 {
     /// Configure parameter 0 (typically 0; stored). Spec: Intel 82077AA / OSDev.
     pub configure_byte0: u8,
     /// Configure parameter 1: EIS (bit6) | FIFO_DIS (bit5) | POLL_DIS (bit4) |
-    /// FIFOTHR (bits 3:0 = threshold−1). Spec: Intel 82077AA / OSDev Configure.
+    /// FIFOTHR (bits 3:0 = threshold−1). Reset is `0x20`: FIFO disabled,
+    /// threshold one, no implied seek, polling enabled. Spec: Intel 82077AA §5.2.7.
     pub configure_eis_fifo_poll_thr: u8,
     /// Configure parameter 2: PRETRK (write precompensation start track).
     pub configure_pretrk: u8,
@@ -622,6 +642,16 @@ pub struct Fdc82077 {
     phase: Phase,
     /// Command-completion ST0 for Sense Interrupt (Recalibrate/Seek Seek End); consumed once.
     pending_sense_st0: Option<u8>,
+    /// Next queued post-reset polling status drive (`0..=3`; `4` = no queue).
+    ///
+    /// Spec: Intel 82077AA §7.4 / §8.2 — reset queues one status for each of
+    /// four logical drives; INT remains active only through the first Sense.
+    post_reset_sense_next: u8,
+    /// A running→DOR-reset transition awaits completion when DOR bit2 is released.
+    ///
+    /// `new()` starts held in reset but does not synthesize a completed reset
+    /// until software explicitly enters DOR reset from the running state.
+    dor_reset_pending_completion: bool,
     /// Seek / Relative Seek param0 (HD|US) latched between the two parameter bytes.
     seek_head_unit: u8,
     /// Relative Seek DIR from command bit6: true = step in (+RCN), false = step out (−RCN).
@@ -702,7 +732,9 @@ impl Fdc82077 {
             specify_srt_hut: 0x00,
             specify_hlt_nd: 0x00,
             configure_byte0: 0x00,
-            configure_eis_fifo_poll_thr: 0x00,
+            // Spec: §5.2.7 — EFIFO=1 (FIFO disabled), threshold=1, EIS=0,
+            // POLL=0 (polling enabled).
+            configure_eis_fifo_poll_thr: FDC_CONFIG_RESET,
             configure_pretrk: 0x00,
             lock: false,
             perp_d3_d0: 0x00,
@@ -711,6 +743,8 @@ impl Fdc82077 {
             irq_pending: false,
             phase: Phase::Command,
             pending_sense_st0: None,
+            post_reset_sense_next: 4,
+            dor_reset_pending_completion: false,
             seek_head_unit: 0,
             relative_seek_dir_in: false,
             read_cmd_mt: false,
@@ -1159,24 +1193,52 @@ impl Fdc82077 {
         self.irq_pending = false;
     }
 
-    fn enter_dor_reset(&mut self) {
+    /// Apply the controller/FIFO state changes shared by DOR and DSR software reset.
+    ///
+    /// Spec: Intel 82077AA §2.1.5 / §2.2.2 — the resets are functionally the
+    /// same; DSR self-clears while DOR remains asserted until host release.
+    fn apply_software_reset(&mut self) {
         self.irq_pending = false;
         self.phase = Phase::Command;
         self.pending_sense_st0 = None;
+        self.post_reset_sense_next = 4;
         self.seek_head_unit = 0;
         self.relative_seek_dir_in = false;
         self.read_cmd_mt = false;
         self.sense_st0 = 0;
+        self.sense_pcn = 0;
         self.sense_st3 = 0;
-        // Spec: Intel 82077AA §5.3.2 — soft DOR reset does not clear LOCK; when
-        // LOCK=0, EFIFO/FIFOTHR/PRETRK return to defaults (stub zeros).
-        if !self.lock {
-            self.configure_eis_fifo_poll_thr = 0;
+        self.pcn = [0; 4];
+        self.sc_eot = 0;
+        self.read_params = [0; FDC_READ_DATA_PARAM_LEN as usize];
+        self.read_result = [0; FDC_READ_DATA_RESULT_LEN as usize];
+        self.last_sector = None;
+        self.dma_read_pending = false;
+        self.dma_write_pending = false;
+        self.last_write = None;
+        self.configure_byte0 = 0;
+
+        // Spec: §5.3.2 — LOCK itself survives. It protects only EFIFO,
+        // FIFOTHR, and PRETRK; EIS/POLL return to defaults on every soft reset.
+        if self.lock {
+            self.configure_eis_fifo_poll_thr &= FDC_CONFIG_LOCKED_MASK;
+        } else {
+            self.configure_eis_fifo_poll_thr = FDC_CONFIG_RESET;
             self.configure_pretrk = 0;
         }
-        // Spec: Intel 82077AA §5.3.1 — soft DOR/DSR reset clears GAP|WGATE only;
+        // Spec: §5.3.1 — soft DOR/DSR reset clears GAP|WGATE only;
         // D3–D0 retain (independent of LOCK).
         self.perp_gap_wgate = 0;
+    }
+
+    /// Finish a software reset and expose its polling completion status.
+    ///
+    /// Spec: Intel 82077AA §7.4 / §8.2 — one interrupt is generated after
+    /// reset and four logical-drive statuses are queued. The first Sense
+    /// Interrupt Status clears INT; the remaining three statuses stay queued.
+    fn complete_software_reset(&mut self) {
+        self.post_reset_sense_next = 0;
+        self.irq_pending = true;
     }
 
     /// Begin Specify parameter phase (2 bytes). Spec: Intel 82077AA Specify.
@@ -1276,15 +1338,20 @@ impl Fdc82077 {
     ///
     /// Spec: Intel 82077AA Sense Interrupt Status — no parameters; result ST0,
     /// PCN; clears interrupt. When a seek-class command latched ST0 (Recalibrate
-    /// / Seek / Relative Seek), return that value; otherwise ST0 IC=11 (`0xC0`)
-    /// models post-reset “ready line changed” / `assert_irq6`-only status; unit
-    /// select from DOR[1:0]. PCN is the Present Cylinder Number for the unit in
-    /// ST0 bits 1:0.
+    /// / Seek / Relative Seek), return that value. After reset, four polling
+    /// statuses `0xC0..=0xC3` are returned in order (§7.4 / §8.2). Otherwise
+    /// ST0 IC=11 (`0xC0`) models the legacy `assert_irq6`-only stub with unit
+    /// select from DOR[1:0]. PCN belongs to the unit in ST0 bits 1:0.
     fn start_sense_interrupt(&mut self) {
-        self.sense_st0 = self
-            .pending_sense_st0
-            .take()
-            .unwrap_or(FDC_ST0_IC_READY_CHANGE | (self.dor & 0x03));
+        self.sense_st0 = if self.post_reset_sense_next < 4 {
+            let unit = self.post_reset_sense_next;
+            self.post_reset_sense_next += 1;
+            FDC_ST0_IC_READY_CHANGE | unit
+        } else {
+            self.pending_sense_st0
+                .take()
+                .unwrap_or(FDC_ST0_IC_READY_CHANGE | (self.dor & 0x03))
+        };
         self.sense_pcn = self.pcn[(self.sense_st0 & 0x03) as usize];
         self.irq_pending = false;
         self.phase = Phase::SenseIntResult { index: 0 };
@@ -2626,14 +2693,29 @@ impl PortDevice for Fdc82077 {
                 // Read-only status ports — ignore writes (stub).
             }
             FDC_DOR => {
+                let was_in_reset = self.dor & FDC_DOR_RESET_N == 0;
                 self.dor = v;
-                // Spec: Intel 82077AA — DOR reset clears controller state including IRQ.
-                if self.dor & FDC_DOR_RESET_N == 0 {
-                    self.enter_dor_reset();
+                let is_in_reset = self.dor & FDC_DOR_RESET_N == 0;
+                // Spec: §2.2.2 — DOR reset is level-held and has precedence
+                // over DSR reset. Apply state changes on entry, complete on release.
+                if is_in_reset && !was_in_reset {
+                    self.apply_software_reset();
+                    self.dor_reset_pending_completion = true;
+                } else if !is_in_reset && was_in_reset && self.dor_reset_pending_completion {
+                    self.dor_reset_pending_completion = false;
+                    self.complete_software_reset();
                 }
             }
             FDC_TDR => self.tdr = v,
-            FDC_MSR => self.dsr = v, // DSR write-only side
+            FDC_MSR => {
+                // Spec: §2.1.5 — S/W RESET is self-clearing; its lower
+                // DRATE/PRECOMP bits remain as written. DOR reset has precedence.
+                self.dsr = v & !FDC_DSR_SOFTWARE_RESET;
+                if v & FDC_DSR_SOFTWARE_RESET != 0 && self.dor & FDC_DOR_RESET_N != 0 {
+                    self.apply_software_reset();
+                    self.complete_software_reset();
+                }
+            }
             FDC_FIFO => self.fifo_write(v),
             FDC_DIR_CCR => self.ccr = v, // CCR write-only side
             _ => {}
@@ -2681,6 +2763,209 @@ mod tests {
         assert_eq!(f.ccr, 0x00);
     }
 
+    /// Intel 82077AA §2.1.5 DSR / §2.2.2: DSR bit7 performs the same software
+    /// reset as DOR, but self-clears instead of holding the controller in reset.
+    /// Software reset does not alter DOR, TDR, CCR, or DSR DRATE/PRECOMP bits.
+    #[test]
+    fn dsr_software_reset_self_clears_without_holding_controller() {
+        let mut f = Fdc82077::new();
+        let dor = FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x01;
+        f.port_write(FDC_DOR, 1, u32::from(dor));
+        f.port_write(FDC_TDR, 1, 0x03);
+        f.port_write(FDC_DIR_CCR, 1, 0x02);
+        f.pcn = [0x11, 0x22, 0x33, 0x44];
+
+        f.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET | 0x1A));
+
+        assert_eq!(f.dsr, 0x1A, "software-reset bit self-clears");
+        assert_eq!(f.dor, dor, "DSR reset does not modify DOR");
+        assert_eq!(f.tdr, 0x03, "software reset does not modify TDR");
+        assert_eq!(f.ccr, 0x02, "software reset does not modify CCR");
+        assert_eq!(f.pcn, [0; 4], "8272 core drive state is reset");
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert!(f.irq_line(), "completed reset starts polling interrupt");
+    }
+
+    /// Intel 82077AA §2.2.2: DOR reset has precedence and remains asserted until
+    /// the host releases DOR bit2; DSR reset is immediate and self-clearing.
+    #[test]
+    fn dor_reset_holds_until_release_and_preserves_dsr_rate() {
+        let mut f = Fdc82077::new();
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        f.port_write(FDC_MSR, 1, 0x1A);
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        assert_eq!(f.phase, Phase::VersionResult);
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_DMA_IRQ));
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, 0, "DOR holds reset");
+        assert!(!f.irq_line(), "reset completion is not visible while held");
+        assert_eq!(f.dsr, 0x1A, "software reset preserves DRATE/PRECOMP");
+        f.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET | 0x1A));
+        assert_eq!(f.dsr, 0x1A, "DSR reset bit still self-clears");
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, 0, "DOR reset has precedence");
+        assert!(!f.irq_line(), "DSR cannot complete while DOR holds reset");
+
+        f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        assert_eq!(f.phase, Phase::Command, "result phase was aborted");
+        assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+        assert!(f.irq_line(), "DOR release completes reset");
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0xFF,
+            "aborted result is discarded"
+        );
+    }
+
+    /// Intel 82077AA §2.2: entering reset terminates an in-progress operation
+    /// and returns the controller to its idle command phase.
+    #[test]
+    fn dsr_reset_aborts_in_progress_command_and_result_phases() {
+        let mut command = Fdc82077::new();
+        command.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        command.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SPECIFY));
+        command.port_write(FDC_FIFO, 1, 0xAB);
+        assert_eq!(command.phase, Phase::SpecifyParams { index: 1 });
+        command.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET));
+        assert_eq!(command.phase, Phase::Command);
+        assert_eq!(command.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
+
+        let mut result = Fdc82077::new();
+        result.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        result.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_VERSION));
+        assert_eq!(result.phase, Phase::VersionResult);
+        result.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET));
+        assert_eq!(result.phase, Phase::Command);
+        assert_eq!(result.port_read(FDC_FIFO, 1) as u8, 0xFF);
+    }
+
+    /// Intel 82077AA §5.2.7 / §5.3.1 / §5.3.2: software reset preserves LOCK;
+    /// LOCK protects only EFIFO, FIFOTHR, and PRETRK, while EIS/POLL return to
+    /// defaults. D3-D0 survive independently; GAP/WGATE are always cleared.
+    #[test]
+    fn dor_and_dsr_resets_preserve_exact_locked_config_and_perp_state() {
+        fn programmed_locked_controller() -> Fdc82077 {
+            let mut f = Fdc82077::new();
+            f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+            f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+            f.port_write(FDC_FIFO, 1, 0x00);
+            f.port_write(FDC_FIFO, 1, 0x7B); // EIS|EFIFO|POLL|FIFOTHR=11
+            f.port_write(FDC_FIFO, 1, 0x66);
+            f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_PERPENDICULAR));
+            f.port_write(FDC_FIFO, 1, 0x80 | (0x0A << 2) | 0x03);
+            f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_LOCK_SET));
+            assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 1 << FDC_LOCK_RESULT_SHIFT);
+            f
+        }
+
+        let mut dsr = programmed_locked_controller();
+        let mut dor = dsr.clone();
+        dsr.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET));
+        dor.port_write(FDC_DOR, 1, u32::from(FDC_DOR_DMA_IRQ));
+        dor.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        for f in [&dsr, &dor] {
+            assert!(f.lock);
+            assert_eq!(
+                f.configure_eis_fifo_poll_thr, 0x2B,
+                "preserve EFIFO|FIFOTHR, reset EIS|POLL"
+            );
+            assert_eq!(f.configure_pretrk, 0x66);
+            assert_eq!(f.perp_d3_d0, 0x0A);
+            assert_eq!(f.perp_gap_wgate, 0);
+        }
+
+        let mut unlocked = Fdc82077::new();
+        unlocked.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        unlocked.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_CONFIGURE));
+        unlocked.port_write(FDC_FIFO, 1, 0x00);
+        unlocked.port_write(FDC_FIFO, 1, 0x7B);
+        unlocked.port_write(FDC_FIFO, 1, 0x66);
+        unlocked.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET));
+        assert!(!unlocked.lock);
+        assert_eq!(
+            unlocked.configure_eis_fifo_poll_thr, 0x20,
+            "default is EIS=0, EFIFO=1, POLL=0, FIFOTHR=0"
+        );
+        assert_eq!(unlocked.configure_pretrk, 0);
+    }
+
+    /// Intel 82077AA §7.4 / §8.2: reset queues polling status for logical drives
+    /// 0-3. INT is active only until the first SENSE INTERRUPT STATUS command.
+    #[test]
+    fn dor_and_dsr_resets_queue_four_sense_statuses_and_one_irq() {
+        fn assert_post_reset_sequence(f: &mut Fdc82077) {
+            assert!(f.irq_line());
+            for unit in 0u8..4 {
+                f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+                assert_eq!(
+                    f.port_read(FDC_FIFO, 1) as u8,
+                    FDC_ST0_IC_READY_CHANGE | unit
+                );
+                assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0, "reset PCN");
+                assert!(!f.irq_line(), "only the first queued status drives INT");
+            }
+        }
+
+        let mut dsr = Fdc82077::new();
+        dsr.port_write(
+            FDC_DOR,
+            1,
+            u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x03),
+        );
+        dsr.pcn = [1, 2, 3, 4];
+        dsr.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET));
+        assert_post_reset_sequence(&mut dsr);
+
+        let mut dor = Fdc82077::new();
+        dor.port_write(
+            FDC_DOR,
+            1,
+            u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x03),
+        );
+        dor.pcn = [1, 2, 3, 4];
+        dor.port_write(FDC_DOR, 1, u32::from(FDC_DOR_DMA_IRQ | 0x03));
+        assert_eq!(dor.port_read(FDC_MSR, 1) as u8, 0);
+        dor.port_write(
+            FDC_DOR,
+            1,
+            u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ | 0x03),
+        );
+        assert_post_reset_sequence(&mut dor);
+    }
+
+    /// Intel 82077AA §2.2 resets controller/FIFO activity, not the external
+    /// media or WP pin. The emulator also preserves its latched DSKCHG policy.
+    #[test]
+    fn software_resets_abort_transfer_state_but_preserve_media_and_wp() {
+        let mut image = vec![0u8; FDC_1440_IMAGE_SIZE];
+        image[0] = 0xA5;
+        let mut base = Fdc82077::with_image(image);
+        base.set_write_protected(true);
+        base.dir |= FDC_DIR_DSKCHG;
+        base.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        base.last_sector = Some(vec![0x11; FDC_SECTOR_SIZE]);
+        base.last_write = Some(vec![0x22; FDC_SECTOR_SIZE]);
+        base.dma_read_pending = true;
+        base.dma_write_pending = true;
+
+        let mut dsr = base.clone();
+        let mut dor = base;
+        dsr.port_write(FDC_MSR, 1, u32::from(FDC_DSR_SOFTWARE_RESET));
+        dor.port_write(FDC_DOR, 1, u32::from(FDC_DOR_DMA_IRQ));
+        dor.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+
+        for f in [&dsr, &dor] {
+            assert!(f.has_media());
+            assert!(f.write_protected);
+            assert_eq!(f.read_sector(0, 0, 1).unwrap()[0], 0xA5);
+            assert_eq!(f.dir & FDC_DIR_DSKCHG, FDC_DIR_DSKCHG);
+            assert!(f.last_sector.is_none());
+            assert!(f.last_write.is_none());
+            assert!(!f.dma_read_pending);
+            assert!(!f.dma_write_pending);
+        }
+    }
+
     #[test]
     fn tdr_round_trip() {
         let mut f = Fdc82077::new();
@@ -2722,11 +3007,16 @@ mod tests {
         f.assert_irq6();
         assert!(f.irq_line());
 
-        // Entering DOR reset clears pending.
+        // Entering DOR reset clears the old pending cause; releasing it creates
+        // the distinct reset-completion/polling interrupt (§7.4 / §8.2).
         f.port_write(FDC_DOR, 1, 0);
         assert!(!f.irq_line());
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
-        assert!(!f.irq_line(), "reset cleared pending");
+        assert!(f.irq_line(), "DOR release completes reset");
+        f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_READY_CHANGE);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0);
+        assert!(!f.irq_line());
     }
 
     /// Spec: Intel 82077AA Sense Interrupt Status — ST0+PCN result; clears IRQ.
@@ -2963,10 +3253,9 @@ mod tests {
         f.port_write(FDC_DOR, 1, 0); // enter reset
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.phase, Phase::Command);
-        assert!(!f.irq_line());
+        assert!(f.irq_line(), "DOR release generates reset completion IRQ");
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
-        // Aborted: no Seek End latch — Sense Interrupt uses ready-change stub.
-        f.assert_irq6();
+        // Aborted: no Seek End latch — Sense Interrupt starts reset polling status.
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_READY_CHANGE);
         let _ = f.port_read(FDC_FIFO, 1);
@@ -3338,9 +3627,8 @@ mod tests {
         f.port_write(FDC_DOR, 1, 0); // enter reset
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert_eq!(f.phase, Phase::Command);
-        assert!(!f.irq_line());
+        assert!(f.irq_line(), "DOR release generates reset completion IRQ");
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
-        f.assert_irq6();
         f.port_write(FDC_FIFO, 1, u32::from(FDC_CMD_SENSE_INT));
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_READY_CHANGE);
         let _ = f.port_read(FDC_FIFO, 1);
@@ -3511,10 +3799,10 @@ mod tests {
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N));
         assert_eq!(f.phase, Phase::Command);
         assert_eq!(f.port_read(FDC_MSR, 1) as u8, FDC_MSR_RQM);
-        // Soft DOR reset aborts phase; with LOCK=0, EFIFO/FIFOTHR/PRETRK return
-        // to stub defaults (0). Unused configure_byte0 is not LOCK-protected.
-        assert_eq!(f.configure_byte0, 0xAB);
-        assert_eq!(f.configure_eis_fifo_poll_thr, 0);
+        // Soft DOR reset aborts phase; with LOCK=0, Configure returns to §5.2.7
+        // defaults. The reserved first parameter is command staging, not state.
+        assert_eq!(f.configure_byte0, 0);
+        assert_eq!(f.configure_eis_fifo_poll_thr, FDC_CONFIG_RESET);
         assert_eq!(f.configure_pretrk, 0);
     }
 
@@ -3559,10 +3847,9 @@ mod tests {
         assert_eq!(f.configure_eis_fifo_poll_thr, 0x57);
         assert_eq!(f.configure_pretrk, 0x12);
         f.reset();
-        // Soft reset defaults: zeros (like Specify). Real 82077AA post-hardware-
-        // reset often has FIFO disabled / thr=1; this stub stores 0 until programmed.
+        // Intel 82077AA §5.2.7 hardware-reset Configure defaults.
         assert_eq!(f.configure_byte0, 0);
-        assert_eq!(f.configure_eis_fifo_poll_thr, 0);
+        assert_eq!(f.configure_eis_fifo_poll_thr, FDC_CONFIG_RESET);
         assert_eq!(f.configure_pretrk, 0);
         assert_eq!(f.phase, Phase::Command);
     }
@@ -3688,13 +3975,16 @@ mod tests {
         f.port_write(FDC_DOR, 1, 0); // soft DOR reset
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert!(f.lock, "LOCK survives soft reset");
-        assert_eq!(f.configure_eis_fifo_poll_thr, 0x57);
+        assert_eq!(
+            f.configure_eis_fifo_poll_thr, 0x07,
+            "LOCK preserves EFIFO=0 and FIFOTHR=7; EIS/POLL reset"
+        );
         assert_eq!(f.configure_pretrk, 0x12);
         assert_eq!(f.phase, Phase::Command);
     }
 
     /// Spec: 82077AA §5.3.2 — when LOCK=0, soft DOR reset returns Configure
-    /// EFIFO/FIFOTHR/PRETRK to defaults (stub zeros).
+    /// EFIFO/FIFOTHR/PRETRK to §5.2.7 defaults.
     #[test]
     fn dor_soft_reset_clears_configure_fifo_params_when_unlocked() {
         let mut f = Fdc82077::new();
@@ -3710,13 +4000,11 @@ mod tests {
         f.port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
         assert!(!f.lock);
         assert_eq!(
-            f.configure_eis_fifo_poll_thr, 0,
-            "unlocked soft reset clears FIFOTHR/EIS/FIFO/POLL"
+            f.configure_eis_fifo_poll_thr, FDC_CONFIG_RESET,
+            "unlocked reset restores EIS=0, EFIFO=1, POLL=0, FIFOTHR=0"
         );
         assert_eq!(f.configure_pretrk, 0, "unlocked soft reset clears PRETRK");
-        // Spec protects only EFIFO/FIFOTHR/PRETRK; unused configure_byte0 policy
-        // matches prior stub (survives soft reset until full `reset()`).
-        assert_eq!(f.configure_byte0, 0x01);
+        assert_eq!(f.configure_byte0, 0, "reserved command staging is cleared");
     }
 
     /// Spec: 82077AA §5.3.2 — hardware reset (pin / full `reset()`) clears LOCK.

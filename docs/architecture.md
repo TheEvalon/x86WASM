@@ -36,4 +36,33 @@ emulator-cli (native) ───────────────────�
 | `emulator-cli` | Native runner |
 | `emulator-web` | Wasm exports for the browser worker |
 
+## Milestone 2 execution boundary
+
+Real mode remains the complete M2 CPU foundation. With `CR0.PE=1`, the
+interpreter now also has a bounded 16-bit protected-mode path:
+
+- GDT-backed `MOV`/`POP` segment loads and `LDS`/`LES` validate the complete
+  descriptor before atomically updating visible and hidden segment state.
+- Direct far `JMP ptr16:16` / `JMP m16:16` can load a same-level,
+  nonconforming ring-0 `D=0` code segment.
+- Architectural faults, software `INT`/`INT3`/taken `INTO`, NMI, and maskable
+  IRQs can enter same-CPL 16-bit IDT interrupt/trap gates. Interrupt gates clear
+  IF; trap gates preserve it; applicable faults push selector/error-code words.
+- Same-CPL ring-0 `IRET16` validates its full frame and target descriptor before
+  commit. Successful `MOV SS` / `POP SS` blocks maskable interrupts through the
+  following instruction boundary without blocking NMI.
+- Failed descriptor, frame, or stack validation is atomic. A nested delivery
+  failure is reported deterministically; double-fault/triple-fault synthesis is
+  not implemented.
+
+`SegmentReg.flags` preserves the descriptor access byte plus AVL/L/D-B/G.
+That state does **not** imply default-32 execution support: default-32 code or
+stacks, 32-bit gates/IRETD, privilege-level stack switching, outer-level
+returns, call gates/tasks, LDT/TSS, and paging remain unsupported.
+
+The native CLI steps the machine directly so an execution failure retains the
+original `MachineError` and reports completed steps, `CS:IP`, full RIP, linear
+PC, and an eight-byte wrapping opcode window. This is diagnostic context only;
+it does not change interpreter semantics.
+
 JIT crate (`x86-jit-wasm`) is deferred until Milestone 4.

@@ -3,9 +3,12 @@
 use machine_pc::{build_hello_rom, Machine, MachineError, EXPECTED_HELLO};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Default instruction budget when `--steps` is omitted.
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
+
+const OPCODE_WINDOW_LEN: usize = 8;
 
 /// Parsed CLI options (firmware path + run budget).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +48,66 @@ pub enum FirmwareKind {
     Bios,
 }
 
+/// Deterministic architectural context captured after an execution step fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuFailureContext {
+    pub completed_steps: u64,
+    pub cs: u16,
+    pub ip: u16,
+    pub rip: u64,
+    pub linear_pc: u64,
+    pub opcode_bytes: [Option<u8>; OPCODE_WINDOW_LEN],
+}
+
+impl std::fmt::Display for CpuFailureContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "completed_steps={} cs:ip={:04X}:{:04X} rip=0x{:016X} \
+             linear_pc=0x{:016X} opcode_bytes=[",
+            self.completed_steps, self.cs, self.ip, self.rip, self.linear_pc
+        )?;
+        for (index, byte) in self.opcode_bytes.iter().enumerate() {
+            if index != 0 {
+                f.write_str(" ")?;
+            }
+            match byte {
+                Some(byte) => write!(f, "{byte:02X}")?,
+                None => f.write_str("??")?,
+            }
+        }
+        f.write_str("]")
+    }
+}
+
+/// Execution failure with its original machine error retained as the source.
+#[derive(Clone, Debug)]
+pub struct ExecutionFailure {
+    pub context: CpuFailureContext,
+    source: Arc<MachineError>,
+}
+
+impl ExecutionFailure {
+    fn new(context: CpuFailureContext, source: MachineError) -> Self {
+        Self {
+            context,
+            source: Arc::new(source),
+        }
+    }
+
+    pub fn source_error(&self) -> &MachineError {
+        self.source.as_ref()
+    }
+}
+
+impl PartialEq for ExecutionFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context && self.source.to_string() == other.source.to_string()
+    }
+}
+
+impl Eq for ExecutionFailure {}
+
 /// CLI argument / usage errors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliError {
@@ -54,6 +117,7 @@ pub enum CliError {
     RomAndBios,
     Io(String),
     Machine(String),
+    Execution(ExecutionFailure),
 }
 
 impl std::fmt::Display for CliError {
@@ -65,11 +129,24 @@ impl std::fmt::Display for CliError {
             Self::RomAndBios => write!(f, "Use only one of --rom or --bios"),
             Self::Io(msg) => write!(f, "{msg}"),
             Self::Machine(msg) => write!(f, "{msg}"),
+            Self::Execution(failure) => write!(
+                f,
+                "Execution error: {} error={}",
+                failure.context,
+                failure.source_error()
+            ),
         }
     }
 }
 
-impl std::error::Error for CliError {}
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Execution(failure) => Some(failure.source_error()),
+            _ => None,
+        }
+    }
+}
 
 /// Usage / help text for `--help` / `-h`.
 pub fn usage() -> String {
@@ -147,6 +224,31 @@ fn machine_err(e: MachineError) -> CliError {
     CliError::Machine(format!("Failed to load firmware: {e}"))
 }
 
+/// Capture the same real-mode fetch addresses used by the interpreter.
+///
+/// Intel SDM Vol. 3 §3.4.2: a real-mode linear address is the cached segment
+/// base plus the 16-bit offset. Instruction fetch wraps IP at 16 bits; the
+/// cached reset CS base remains `0xFFFF_0000`.
+fn capture_cpu_failure_context(machine: &Machine, completed_steps: u64) -> CpuFailureContext {
+    let rip = machine.cpu.rip;
+    let ip = rip as u16;
+    let cs_base = machine.cpu.cs.base;
+    let linear_pc = cs_base.wrapping_add(u64::from(ip));
+    let opcode_bytes = std::array::from_fn(|index| {
+        let offset = ip.wrapping_add(index as u16);
+        let address = cs_base.wrapping_add(u64::from(offset));
+        machine.mem.read_u8(address).ok()
+    });
+    CpuFailureContext {
+        completed_steps,
+        cs: machine.cpu.cs.selector,
+        ip,
+        rip,
+        linear_pc,
+        opcode_bytes,
+    }
+}
+
 /// Run until HLT / step budget; validate HELLO output when applicable.
 pub fn run_machine(
     machine: &mut Machine,
@@ -154,9 +256,14 @@ pub fn run_machine(
     max_steps: u64,
 ) -> Result<(u64, String, String), CliError> {
     machine.reset();
-    let steps = machine
-        .run(max_steps)
-        .map_err(|e| CliError::Machine(format!("Execution error: {e}")))?;
+    let mut steps = 0;
+    while steps < max_steps && !machine.cpu.halted {
+        if let Err(source) = machine.step() {
+            let context = capture_cpu_failure_context(machine, steps);
+            return Err(CliError::Execution(ExecutionFailure::new(context, source)));
+        }
+        steps += 1;
+    }
     let com1 = machine.com1_text();
     let dbg = machine.debug_text();
     if kind == FirmwareKind::Hello && (com1 != EXPECTED_HELLO || dbg != EXPECTED_HELLO) {
@@ -179,6 +286,15 @@ mod tests {
         rom[0] = 0xEA; // marker at image start (low + high)
         rom[256 - 16] = 0xF4; // HLT at reset vector
         rom[255] = 0x55;
+        rom
+    }
+
+    /// NOP followed by valid-but-unimplemented WAIT at the Intel reset vector.
+    fn failing_bios_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 256];
+        let reset = rom.len() - 16;
+        rom[reset..reset + 9]
+            .copy_from_slice(&[0x90, 0x9B, 0xF4, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
         rom
     }
 
@@ -280,5 +396,104 @@ mod tests {
         let (steps, _, _) = run_machine(&mut machine, kind, 16).expect("run");
         assert!(machine.cpu.halted, "tiny BIOS should HLT at reset vector");
         assert!(steps >= 1);
+    }
+
+    #[test]
+    fn bios_execution_error_reports_deterministic_cpu_context() {
+        let mut machine =
+            Machine::with_bios_rom(16 * 1024 * 1024, &failing_bios_rom()).expect("load BIOS");
+
+        let err = run_machine(&mut machine, FirmwareKind::Bios, 16).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Execution error: completed_steps=1 cs:ip=F000:FFF1 \
+             rip=0x000000000000FFF1 linear_pc=0x00000000FFFFFFF1 \
+             opcode_bytes=[9B F4 11 22 33 44 55 66] \
+             error=unsupported opcode 0x9B"
+        );
+        let source = std::error::Error::source(&err).expect("original execution error source");
+        assert_eq!(source.to_string(), "unsupported opcode 0x9B");
+        assert!(
+            source.downcast_ref::<MachineError>().is_some(),
+            "source should retain the original MachineError"
+        );
+    }
+
+    #[test]
+    fn failure_context_is_safe_at_top_of_address_space() {
+        let mut machine = Machine::new(8);
+        machine.mem.map_rom(u64::MAX - 1, vec![0xAA, 0xBB]);
+        for (addr, byte) in [0xCC, 0xDD, 0xEE, 0xF0, 0x12, 0x34].into_iter().enumerate() {
+            machine.mem.write_u8(addr as u64, byte).unwrap();
+        }
+        machine.cpu.cs.base = u64::MAX - 1;
+        machine.cpu.rip = 0;
+
+        let context = capture_cpu_failure_context(&machine, 7);
+
+        assert_eq!(context.completed_steps, 7);
+        assert_eq!(context.linear_pc, u64::MAX - 1);
+        assert_eq!(
+            context.opcode_bytes,
+            [
+                Some(0xAA),
+                Some(0xBB),
+                Some(0xCC),
+                Some(0xDD),
+                Some(0xEE),
+                Some(0xF0),
+                Some(0x12),
+                Some(0x34),
+            ]
+        );
+    }
+
+    #[test]
+    fn failure_context_wraps_real_mode_ip_for_opcode_window() {
+        let mut machine = Machine::new(0x20_000);
+        machine.cpu.cs.selector = 0x0100;
+        machine.cpu.cs.base = 0x1000;
+        machine.cpu.rip = 0x1_FFFF;
+        machine.mem.write_u8(0x10FFF, 0xA5).unwrap();
+        for (addr, byte) in [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70]
+            .into_iter()
+            .enumerate()
+        {
+            machine.mem.write_u8(0x1000 + addr as u64, byte).unwrap();
+        }
+
+        let context = capture_cpu_failure_context(&machine, 3);
+
+        assert_eq!(context.cs, 0x0100);
+        assert_eq!(context.ip, 0xFFFF);
+        assert_eq!(context.rip, 0x1_FFFF);
+        assert_eq!(context.linear_pc, 0x10FFF);
+        assert_eq!(
+            context.opcode_bytes,
+            [
+                Some(0xA5),
+                Some(0x10),
+                Some(0x20),
+                Some(0x30),
+                Some(0x40),
+                Some(0x50),
+                Some(0x60),
+                Some(0x70),
+            ]
+        );
+    }
+
+    #[test]
+    fn hello_rom_success_output_is_unchanged() {
+        let (mut machine, kind) = build_machine(&Options::default()).expect("build HELLO");
+
+        let (steps, com1, debug) =
+            run_machine(&mut machine, kind, DEFAULT_MAX_STEPS).expect("run HELLO");
+
+        assert!(steps > 0);
+        assert!(machine.cpu.halted);
+        assert_eq!(com1, EXPECTED_HELLO);
+        assert_eq!(debug, EXPECTED_HELLO);
     }
 }

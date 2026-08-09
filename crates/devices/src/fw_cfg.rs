@@ -5,8 +5,10 @@
 //! write resets the data offset; reads past end return `0x00`; data-port writes
 //! ignored (QEMU ≥2.4 traditional interface).
 //!
-//! This slice: signature key `0x0000` (`QEMU`), one named test file in the
-//! file directory (`FW_CFG_FILE_DIR` / `FW_CFG_FILE_FIRST`), no DMA (`0x514`).
+//! This slice: signature key `0x0000` (`QEMU`), ID key `0x0001` (base revision
+//! only; no DMA capability), RAM-size key `0x0003`, and one named test file in
+//! the file directory (`FW_CFG_FILE_DIR` / `FW_CFG_FILE_FIRST`). No DMA
+//! interface (`0x514`).
 
 use std::collections::BTreeMap;
 
@@ -19,10 +21,21 @@ pub const FW_CFG_DATA: u16 = 0x511;
 
 /// Signature item — four ASCII bytes `QEMU`.
 pub const FW_CFG_SIGNATURE: u16 = 0x0000;
+/// Revision / feature bitmap item (32-bit little-endian).
+pub const FW_CFG_ID: u16 = 0x0001;
+/// Guest RAM size in bytes (64-bit little-endian).
+pub const FW_CFG_RAM_SIZE: u16 = 0x0003;
 /// File directory item (`FWCfgFiles`).
 pub const FW_CFG_FILE_DIR: u16 = 0x0019;
 /// First named-file selector key.
 pub const FW_CFG_FILE_FIRST: u16 = 0x0020;
+
+/// Base fw_cfg interface revision bit, always present.
+pub const FW_CFG_VERSION: u32 = 1 << 0;
+/// DMA-interface capability bit. Kept clear because port `0x514` is absent.
+pub const FW_CFG_VERSION_DMA: u32 = 1 << 1;
+/// Truthful feature bitmap for this traditional-I/O-only device.
+pub const FW_CFG_ID_VALUE: u32 = FW_CFG_VERSION & !FW_CFG_VERSION_DMA;
 
 /// Selector bit14 — write mode (data-port writes still ignored here).
 pub const FW_CFG_SEL_WRITE: u16 = 0x4000;
@@ -64,7 +77,9 @@ impl Default for FwCfg {
 }
 
 impl FwCfg {
-    /// Signature + one test file (`opt/org.x86wasm/test` → `FWCF`).
+    /// Signature + truthful ID + one test file (`opt/org.x86wasm/test` → `FWCF`).
+    ///
+    /// Use [`Self::with_ram_size`] when the host machine's RAM size is known.
     pub fn new() -> Self {
         let mut cfg = Self {
             selector: 0,
@@ -76,13 +91,34 @@ impl FwCfg {
             FW_CFG_SIGNATURE,
             FwCfgItem::from_bytes(FW_CFG_SIGNATURE_BYTES),
         );
+        cfg.set_item(
+            FW_CFG_ID,
+            FwCfgItem::from_bytes(FW_CFG_ID_VALUE.to_le_bytes()),
+        );
         cfg.add_file(FW_CFG_TEST_FILE_NAME, FW_CFG_TEST_FILE_BYTES)
             .expect("default test file fits fw_cfg name limit");
         cfg
     }
 
+    /// Construct the traditional interface with the host-configured RAM size.
+    pub fn with_ram_size(ram_size: u64) -> Self {
+        let mut cfg = Self::new();
+        cfg.set_ram_size(ram_size);
+        cfg
+    }
+
+    /// Replace the RAM-size host configuration entry.
+    pub fn set_ram_size(&mut self, ram_size: u64) {
+        self.set_item(
+            FW_CFG_RAM_SIZE,
+            FwCfgItem::from_bytes(ram_size.to_le_bytes()),
+        );
+    }
+
+    /// Reset guest-visible stream state while preserving host configuration.
     pub fn reset(&mut self) {
-        *self = Self::new();
+        self.selector = 0;
+        self.offset = 0;
     }
 
     pub fn owns_port(port: u16) -> bool {
@@ -242,6 +278,44 @@ mod tests {
         assert_eq!(cfg.port_read(FW_CFG_DATA, 1) as u8, 0);
     }
 
+    /// QEMU fw_cfg spec: selector 0x0001 is a LE32 feature bitmap. Bit 0 is
+    /// the base revision; bit 1 advertises the optional DMA interface.
+    #[test]
+    fn id_selector_reports_base_revision_without_dma() {
+        assert_eq!(FW_CFG_ID, 0x0001);
+        assert_eq!(FW_CFG_VERSION, 0x0000_0001);
+        assert_eq!(FW_CFG_VERSION_DMA, 0x0000_0002);
+        assert_eq!(FW_CFG_ID_VALUE & FW_CFG_VERSION_DMA, 0);
+
+        let mut cfg = FwCfg::new();
+        cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(FW_CFG_ID));
+        assert_eq!(read_n(&mut cfg, 4), FW_CFG_ID_VALUE.to_le_bytes());
+    }
+
+    /// QEMU fw_cfg spec: selector 0x0003 is the RAM byte count as LE64.
+    #[test]
+    fn configured_ram_size_uses_le64_and_survives_reset() {
+        assert_eq!(FW_CFG_RAM_SIZE, 0x0003);
+
+        let ram_size = 16u64 * 1024 * 1024;
+        let mut cfg = FwCfg::with_ram_size(ram_size);
+
+        cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(FW_CFG_RAM_SIZE));
+        assert_eq!(
+            read_n(&mut cfg, 8),
+            [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]
+        );
+        cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(FW_CFG_RAM_SIZE));
+        let _ = cfg.port_read(FW_CFG_DATA, 1);
+
+        cfg.reset();
+
+        assert_eq!(cfg.selector(), 0);
+        assert_eq!(cfg.offset(), 0);
+        cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(FW_CFG_RAM_SIZE));
+        assert_eq!(read_n(&mut cfg, 8), ram_size.to_le_bytes());
+    }
+
     #[test]
     fn selector_write_resets_offset() {
         let mut cfg = FwCfg::new();
@@ -310,11 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_defaults() {
+    fn reset_preserves_host_files_and_resets_read_state() {
         let mut cfg = FwCfg::new();
         cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(FW_CFG_SIGNATURE));
         let _ = cfg.port_read(FW_CFG_DATA, 1);
-        cfg.add_file("opt/org.x86wasm/extra", b"x").unwrap();
+        let extra = cfg.add_file("opt/org.x86wasm/extra", b"x").unwrap();
         cfg.reset();
         assert_eq!(cfg.selector(), 0);
         assert_eq!(cfg.offset(), 0);
@@ -323,6 +397,8 @@ mod tests {
             let b = read_n(&mut cfg, 4);
             u32::from_be_bytes([b[0], b[1], b[2], b[3]])
         };
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
+        cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(extra));
+        assert_eq!(read_n(&mut cfg, 1), b"x");
     }
 }

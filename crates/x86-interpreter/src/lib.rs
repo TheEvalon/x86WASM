@@ -65,23 +65,65 @@ pub trait Bus {
     }
 }
 
+/// Deterministic reasons the bounded protected-mode exception-delivery path can
+/// reject a transfer instead of synthesizing nested #DF/triple-fault behavior.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ProtectedModeDeliveryError {
+    #[error("IDT limit excludes the vector gate")]
+    IdtLimit,
+    #[error("IDT gate read failed at {0:#x}")]
+    IdtRead(u64),
+    #[error("descriptor is not a 16-bit interrupt/trap gate (access {0:#04x})")]
+    GateType(u8),
+    #[error("gate is not present")]
+    GateNotPresent,
+    #[error("null target selector")]
+    NullTargetSelector,
+    #[error("LDT target selector is unsupported")]
+    LdtTargetSelector,
+    #[error("GDT limit excludes the target descriptor")]
+    GdtLimit,
+    #[error("GDT target descriptor read failed at {0:#x}")]
+    GdtRead(u64),
+    #[error("target code segment is not present")]
+    TargetNotPresent,
+    #[error("target descriptor is not a same-CPL executable code segment")]
+    TargetCode,
+    #[error("target descriptor is not a 16-bit target code segment")]
+    TargetNot16Bit,
+    #[error("target offset exceeds the code-segment limit")]
+    TargetOffsetLimit,
+    #[error("current code segment is not a supported 16-bit privilege context")]
+    CurrentPrivilege,
+    #[error("current stack is not 16-bit")]
+    StackWidth,
+    #[error("stack limit excludes the protected-mode frame")]
+    StackLimit,
+    #[error("stack read failed at {0:#x}")]
+    StackRead(u64),
+    #[error("stack write failed at {0:#x}")]
+    StackWrite(u64),
+    #[error("stack rollback failed at {0:#x}")]
+    StackRollback(u64),
+}
+
 /// Host-visible execution errors.
 ///
-/// Architectural faults delivered through the real-mode IVT return `Ok(())`
+/// Architectural faults delivered through the real-mode IVT (`CR0.PE=0`) or
+/// the bounded 16-bit protected-mode IDT path (`CR0.PE=1`) return `Ok(())`
 /// from [`step`] after vectoring:
-/// - `#DE` 0, `#BR` 5, `#UD` 6, `#SS` 12, `#GP` 13 (and software INT vectors)
+/// - `#DE` 0, `#BR` 5, `#UD` 6, `#SS` 12, `#GP` 13
 ///
 /// Remaining host errors:
 /// - `Decode`: truncated fetch, or sparse-table misses that are **not**
 ///   architectural `#UD` (valid-but-unimplemented primary opcodes — see
 ///   [`real_mode_primary_opcode_is_ud`])
-/// - `MemoryFault`: bus errors that could not be classified as `#GP`/`#SS`
-///   (IVT delivery failure; stack helpers used during delivery stay unchecked)
+/// - `MemoryFault`: bus errors outside architectural classification or during
+///   the legacy real-mode IVT path
 /// - `Unsupported`: valid-but-unimplemented forms reached after decode
-///   (ENTER/PUSHA/POPA/LEAVE with address-size 32 under 0x67 — needs ESP stack;
-///   MOVSQ/… qword strings are not architectural in REX-less real mode)
-/// - `ArchFault`: internal only — converted to IVT delivery inside [`step`];
-///   never returned to callers of [`step`]/[`run`].
+/// - `ArchFault`: internal vector + optional error code consumed by [`step`]
+/// - `ProtectedModeExceptionDelivery`: bounded delivery-time failure; nested
+///   `#DF`/triple-fault behavior is not modeled
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ExecError {
     #[error(transparent)]
@@ -90,9 +132,44 @@ pub enum ExecError {
     MemoryFault(u64),
     #[error("unsupported encoding for opcode 0x{0:02X}")]
     Unsupported(u8),
-    /// Pending real-mode IVT delivery (`vector`); consumed by [`step`].
-    #[error("architectural fault vector {0}")]
-    ArchFault(u8),
+    /// Pending architectural fault delivery; consumed by [`step`].
+    #[error("architectural fault vector {vector}, error code {error_code:?}")]
+    ArchFault { vector: u8, error_code: Option<u16> },
+    #[error(
+        "protected-mode exception delivery for vector {vector} failed \
+         (nested #DF/triple fault unsupported): {reason}"
+    )]
+    ProtectedModeExceptionDelivery {
+        vector: u8,
+        reason: ProtectedModeDeliveryError,
+    },
+}
+
+fn arch_fault(vector: u8) -> ExecError {
+    ExecError::ArchFault {
+        vector,
+        error_code: None,
+    }
+}
+
+fn arch_fault_with_error_code(vector: u8, error_code: u16) -> ExecError {
+    ExecError::ArchFault {
+        vector,
+        error_code: Some(error_code),
+    }
+}
+
+fn protected_mode_delivery_error(vector: u8, reason: ProtectedModeDeliveryError) -> ExecError {
+    ExecError::ProtectedModeExceptionDelivery { vector, reason }
+}
+
+/// Build a selector-based exception error code.
+///
+/// The faulting MOV supplies neither EXT nor IDT, so selector RPL bits 1:0 are
+/// cleared while TI (bit 2) and the selector index are preserved.
+/// Spec: Intel SDM Vol. 3 §6.13.
+fn selector_fault(vector: u8, selector: u16) -> ExecError {
+    arch_fault_with_error_code(vector, selector & 0xFFFC)
 }
 
 /// SF/ZF/PF from an 8-bit BCD-adjust result (DAA/DAS/AAM/AAD).
@@ -566,7 +643,7 @@ fn ea_16(
         _ => (&cpu.ds, false),
     };
     let addr = checked_linear_addr(seg, off, access_size)
-        .map_err(|_| ExecError::ArchFault(if uses_ss { 12 } else { 13 }))?;
+        .map_err(|_| arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0))?;
     Ok((addr, false, uses_ss))
 }
 
@@ -579,7 +656,7 @@ fn seg_linear_checked(
     uses_ss: bool,
 ) -> Result<u64, ExecError> {
     checked_linear_addr(seg, offset, size)
-        .map_err(|_| ExecError::ArchFault(if uses_ss { 12 } else { 13 }))
+        .map_err(|_| arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0))
 }
 
 /// Absolute moffs offset from address-size attribute.
@@ -628,7 +705,7 @@ fn ea_32(
         _ => (&cpu.ds, false),
     };
     let addr = checked_linear_addr(seg, off, access_size)
-        .map_err(|_| ExecError::ArchFault(if uses_ss { 12 } else { 13 }))?;
+        .map_err(|_| arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0))?;
     Ok((addr, false, uses_ss))
 }
 
@@ -636,7 +713,7 @@ fn ea_32(
 /// Spec: Intel SDM Vol. 3 §6.15 (#SS / #GP).
 fn classify_mem_fault(err: ExecError, uses_ss: bool) -> ExecError {
     match err {
-        ExecError::MemoryFault(_) => ExecError::ArchFault(if uses_ss { 12 } else { 13 }),
+        ExecError::MemoryFault(_) => arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0),
         e => e,
     }
 }
@@ -838,13 +915,21 @@ fn push16(cpu: &mut CpuState, bus: &mut dyn Bus, val: u16) -> Result<(), ExecErr
     }
 }
 
-fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
+/// Read a 16-bit stack value and calculate the next bounded SP without
+/// committing either. Segment-register POP uses this to validate the target
+/// descriptor before any architectural update.
+fn peek_pop16(cpu: &CpuState, bus: &mut dyn Bus) -> Result<(u16, u16), ExecError> {
     let sp = cpu.gpr_u16(CpuState::RSP);
     let addr = seg_linear_checked(&cpu.ss, u64::from(sp), 2, true)?;
     let v = bus
         .read_u16(addr)
         .map_err(|e| classify_mem_fault(e, true))?;
-    cpu.set_gpr_u16(CpuState::RSP, sp.wrapping_add(2));
+    Ok((v, sp.wrapping_add(2)))
+}
+
+fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
+    let (v, next_sp) = peek_pop16(cpu, bus)?;
+    cpu.set_gpr_u16(CpuState::RSP, next_sp);
     Ok(v)
 }
 
@@ -922,47 +1007,293 @@ fn encode_seg_desc(base: u32, limit20: u32, access: u8, gran_flags: u8) -> [u8; 
     ]
 }
 
-/// Parse an 8-byte data-segment descriptor and return cached base/limit/AR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParsedSegmentDescriptor {
+    base: u64,
+    limit: u32,
+    flags: u16,
+}
+
+/// Parse the common base, effective limit, and cached attribute fields.
 ///
-/// Requires P=1, S=1, non-executable (data). Applies G-bit to the effective limit.
-/// Spec: Intel SDM Vol. 3 §3.4.5 (segment descriptors); §3.4.3 (cached limit).
-fn parse_data_segment_descriptor(desc: [u8; 8]) -> Result<(u64, u32, u16), ExecError> {
-    let access = desc[5];
-    let present = access & 0x80 != 0;
-    let s_bit = access & 0x10 != 0;
-    let executable = access & 0x08 != 0;
-    if !present {
-        // Spec: SDM Vol. 2 MOV — DS/ES/FS/GS not present → #NP(selector).
-        // Caller maps to ArchFault(11) with the selector context.
-        return Err(ExecError::ArchFault(11));
-    }
-    if !s_bit || executable {
-        // Not a data segment (system or code) → #GP(selector).
-        return Err(ExecError::ArchFault(13));
-    }
+/// `flags` keeps the access byte in bits 7:0 and AVL/L/D-B/G in bits 15:12,
+/// matching their relative positions in the descriptor. Spec: Intel SDM
+/// Vol. 3 §§3.4.3–3.4.5.
+fn parse_segment_descriptor(desc: [u8; 8]) -> ParsedSegmentDescriptor {
     let base = u64::from(desc[2])
         | (u64::from(desc[3]) << 8)
         | (u64::from(desc[4]) << 16)
         | (u64::from(desc[7]) << 24);
     let limit20 =
         u32::from(desc[0]) | (u32::from(desc[1]) << 8) | (u32::from(desc[6] & 0x0F) << 16);
-    let gran = desc[6] & 0x80 != 0;
-    let limit = if gran {
+    let limit = if desc[6] & 0x80 != 0 {
         (limit20 << 12) | 0xFFF
     } else {
         limit20
     };
-    // Cache AR as the access byte in the low 8 bits (matches reset 0x0093 style).
-    let flags = u16::from(access);
-    Ok((base, limit, flags))
+    let flags = u16::from(desc[5]) | (u16::from(desc[6] & 0xF0) << 8);
+    ParsedSegmentDescriptor { base, limit, flags }
 }
 
-/// Protected-mode load of DS/ES/FS/GS from the GDT (TI=0). LDT (TI=1) → #GP(selector).
+/// Same-level protected-mode direct far jump through a D=0 GDT code segment.
+///
+/// This bounded path accepts only nonconforming ring-0 code segments. Selector
+/// validation faults use the selector-derived error code; a target offset past
+/// the effective segment limit raises `#GP(0)`. The visible CS selector, hidden
+/// cache, and IP are committed together only after all eight descriptor bytes
+/// and every check succeed.
+///
+/// Spec: Intel SDM Vol. 2 JMP (Operation; Protected Mode Exceptions); Vol. 3
+/// §§3.4.5, 5.8.1, 6.13.
+fn protected_far_jump16(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    target_offset: u16,
+    selector: u16,
+) -> Result<(), ExecError> {
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    if selector & 0x4 != 0 {
+        // LDT resolution is outside this bounded GDT-only slice.
+        return Err(selector_fault(13, selector));
+    }
+
+    let descriptor_offset = u64::from(selector >> 3) * 8;
+    if descriptor_offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Err(selector_fault(13, selector));
+    }
+    let descriptor_addr = cpu.gdtr.base.wrapping_add(descriptor_offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_u8(descriptor_addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+
+    let access = descriptor[5];
+    let code = access & 0x18 == 0x18;
+    let conforming = access & 0x04 != 0;
+    if !code || conforming {
+        return Err(selector_fault(13, selector));
+    }
+
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    if cpl != 0 || dpl != cpl || rpl > cpl {
+        return Err(selector_fault(13, selector));
+    }
+    if access & 0x80 == 0 {
+        return Err(selector_fault(11, selector));
+    }
+
+    let parsed = parse_segment_descriptor(descriptor);
+    if parsed.flags & (x86_core::SegmentReg::FLAG_LONG | x86_core::SegmentReg::FLAG_DEFAULT_BIG)
+        != 0
+    {
+        // D=1/default-32 and L=1 execution are separate slices.
+        return Err(selector_fault(13, selector));
+    }
+    if u32::from(target_offset) > parsed.limit {
+        // JMP Protected Mode Exceptions: target offset beyond CS.limit → #GP(0).
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    cpu.cs.load_descriptor_cache(
+        (selector & !3) | u16::from(cpl),
+        parsed.base,
+        parsed.limit,
+        parsed.flags,
+    );
+    cpu.rip = u64::from(target_offset);
+    Ok(())
+}
+
+/// Same-CPL protected-mode IRET through a 16-bit ring-0 frame.
+///
+/// The complete IP, CS, FLAGS frame and target descriptor are read and
+/// validated before any architectural state changes. This bounded path accepts
+/// only a nonconforming, present, D=0/L=0 ring-0 GDT code segment. Outer-level,
+/// conforming, task, VM86, LDT, 32-bit-stack, and default-32 returns remain
+/// separate slices.
+///
+/// At CPL 0, 16-bit IRET restores all defined FLAGS bits, including IF, IOPL,
+/// and NT. Reserved bits 3, 5, and 15 are zero, bit 1 is one, and
+/// EFLAGS[63:16] are unchanged.
+///
+/// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ (Operation; Protected Mode
+/// Exceptions); Vol. 1 §3.4.3; Vol. 3 §§2.3.1, 3.4.2–3.4.5, 5.5, 6.12.1,
+/// 6.13.
+fn protected_iret16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    if cpu.cs.selector & 3 != 0
+        || cpu.cs.default_big()
+        || cpu.ss.stack_width() != 16
+        || cpu.rflags & ((1 << 14) | (1 << 17)) != 0
+    {
+        return Err(ExecError::Unsupported(0xCF));
+    }
+
+    let old_sp = cpu.gpr_u16(CpuState::RSP);
+    let mut frame = [0u16; 3];
+    for (index, word) in frame.iter_mut().enumerate() {
+        let stack_offset = old_sp.wrapping_add((index as u16) * 2);
+        let addr = seg_linear_checked(&cpu.ss, u64::from(stack_offset), 2, true)?;
+        *word = bus
+            .read_u16(addr)
+            .map_err(|error| classify_mem_fault(error, true))?;
+    }
+    let [target_ip, selector, flags] = frame;
+
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    if selector & 0x4 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+
+    let descriptor_offset = u64::from(selector >> 3) * 8;
+    if descriptor_offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Err(selector_fault(13, selector));
+    }
+    let descriptor_addr = cpu.gdtr.base.wrapping_add(descriptor_offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_u8(descriptor_addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+
+    let access = descriptor[5];
+    let system = access & 0x10 == 0;
+    let executable = access & 0x08 != 0;
+    let conforming = access & 0x04 != 0;
+    if system || !executable || conforming {
+        return Err(selector_fault(13, selector));
+    }
+
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    if rpl != 0 || dpl != 0 {
+        return Err(selector_fault(13, selector));
+    }
+    if access & 0x80 == 0 {
+        return Err(selector_fault(11, selector));
+    }
+
+    let parsed = parse_segment_descriptor(descriptor);
+    if parsed.flags & (x86_core::SegmentReg::FLAG_LONG | x86_core::SegmentReg::FLAG_DEFAULT_BIG)
+        != 0
+    {
+        return Err(selector_fault(13, selector));
+    }
+    if u32::from(target_ip) > parsed.limit {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    const DEFINED_FLAGS16: u64 = 0x7FD5;
+    let restored_flags = (u64::from(flags) & DEFINED_FLAGS16) | 2;
+    let final_sp = old_sp.wrapping_add(6);
+
+    cpu.cs
+        .load_descriptor_cache(selector, parsed.base, parsed.limit, parsed.flags);
+    cpu.rip = u64::from(target_ip);
+    cpu.rflags = (cpu.rflags & !0xFFFF) | restored_flags;
+    cpu.set_gpr_u16(CpuState::RSP, final_sp);
+    Ok(())
+}
+
+/// Read one complete GDT descriptor after common selector/table validation.
+///
+/// LDT lookup remains outside this bounded slice. All eight bytes are read
+/// before a caller can commit visible or hidden segment state.
+/// Spec: Intel SDM Vol. 3 §§3.4.2, 3.5.1, 6.13.
+fn read_gdt_segment_descriptor(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<[u8; 8], ExecError> {
+    if selector & 0x4 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Err(selector_fault(13, selector));
+    }
+    let addr = cpu.gdtr.base.wrapping_add(offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_u8(addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(descriptor)
+}
+
+/// Validate a DS/ES/FS/GS descriptor and return cached base/limit/AR.
+///
+/// Data and readable code are accepted. Data and nonconforming code require
+/// both CPL and selector RPL no more privileged than DPL; conforming readable
+/// code does not use that check. Type/privilege faults precede the P check.
+/// Spec: Intel SDM Vol. 2 MOV/POP Sreg protected-mode checks; Vol. 3
+/// §§3.4.5, 5.4.1, 5.5, 5.6.
+fn parse_data_segment_descriptor(
+    desc: [u8; 8],
+    selector: u16,
+    cpl: u8,
+) -> Result<(u64, u32, u16), ExecError> {
+    let access = desc[5];
+    let present = access & 0x80 != 0;
+    let s_bit = access & 0x10 != 0;
+    let executable = access & 0x08 != 0;
+    let conforming = executable && access & 0x04 != 0;
+    let readable = !executable || access & 0x02 != 0;
+    if !s_bit || !readable {
+        // System or execute-only code descriptor.
+        return Err(selector_fault(13, selector));
+    }
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    if !conforming && (cpl > dpl || rpl > dpl) {
+        return Err(selector_fault(13, selector));
+    }
+    if !present {
+        return Err(selector_fault(11, selector));
+    }
+    let parsed = parse_segment_descriptor(desc);
+    Ok((parsed.base, parsed.limit, parsed.flags))
+}
+
+/// Prepare a protected-mode DS/ES/FS/GS cache without mutating CPU state.
+fn prepare_data_sreg_from_gdt(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<x86_core::SegmentReg, ExecError> {
+    if is_null_selector(selector) {
+        return Ok(x86_core::SegmentReg {
+            selector,
+            base: 0,
+            limit: 0,
+            flags: 0,
+        });
+    }
+    let descriptor = read_gdt_segment_descriptor(cpu, bus, selector)?;
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let (base, limit, flags) = parse_data_segment_descriptor(descriptor, selector, cpl)?;
+    Ok(x86_core::SegmentReg {
+        selector,
+        base,
+        limit,
+        flags,
+    })
+}
+
+/// Protected-mode load of DS/ES/FS/GS from the GDT.
 ///
 /// Spec: Intel SDM Vol. 2 MOV (Sreg, r/m16) protected-mode checks; Vol. 3 §3.5.1
 /// (segment loading); §5.4.1 (null selector into DS/ES/FS/GS allowed).
-/// Unsupported here: LDT, privilege (RPL/CPL/DPL) beyond basic #GP/#NP, readable
-/// code segments into DS/ES/FS/GS, far jumps into PM.
+/// Unsupported here: LDT resolution.
 fn load_data_sreg_from_gdt(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -973,44 +1304,12 @@ fn load_data_sreg_from_gdt(
         matches!(sreg, 0 | 3 | 4 | 5),
         "only DS/ES/FS/GS in this helper"
     );
-    if is_null_selector(selector) {
-        match sreg {
-            0 => cpu.es.load_null_selector(selector),
-            3 => cpu.ds.load_null_selector(selector),
-            4 => cpu.fs.load_null_selector(selector),
-            5 => cpu.gs.load_null_selector(selector),
-            _ => unreachable!(),
-        }
-        return Ok(());
-    }
-    if selector & 0x4 != 0 {
-        // TI=1 → LDT (out of scope) → #GP(selector)
-        return Err(ExecError::ArchFault(13));
-    }
-    let index = u64::from(selector >> 3);
-    let offset = index.saturating_mul(8);
-    // Descriptor must lie entirely within the GDT (limit is max offset).
-    if offset.saturating_add(7) > u64::from(cpu.gdtr.limit) {
-        return Err(ExecError::ArchFault(13));
-    }
-    let addr = cpu.gdtr.base.wrapping_add(offset);
-    let mut desc = [0u8; 8];
-    for (i, b) in desc.iter_mut().enumerate() {
-        *b = bus
-            .read_u8(addr.wrapping_add(i as u64))
-            .map_err(|e| classify_mem_fault(e, false))?;
-    }
-    let (base, limit, flags) = match parse_data_segment_descriptor(desc) {
-        Ok(v) => v,
-        Err(ExecError::ArchFault(11)) => return Err(ExecError::ArchFault(11)),
-        Err(ExecError::ArchFault(13)) => return Err(ExecError::ArchFault(13)),
-        Err(e) => return Err(e),
-    };
+    let loaded = prepare_data_sreg_from_gdt(cpu, bus, selector)?;
     match sreg {
-        0 => cpu.es.load_descriptor_cache(selector, base, limit, flags),
-        3 => cpu.ds.load_descriptor_cache(selector, base, limit, flags),
-        4 => cpu.fs.load_descriptor_cache(selector, base, limit, flags),
-        5 => cpu.gs.load_descriptor_cache(selector, base, limit, flags),
+        0 => cpu.es = loaded,
+        3 => cpu.ds = loaded,
+        4 => cpu.fs = loaded,
+        5 => cpu.gs = loaded,
         _ => unreachable!(),
     }
     Ok(())
@@ -1019,68 +1318,59 @@ fn load_data_sreg_from_gdt(
 /// Parse an 8-byte stack-segment descriptor (writable data / expand-down).
 ///
 /// Requires P=1, S=1, non-executable, writable (W=1). Applies G-bit to limit.
-/// Spec: Intel SDM Vol. 2 MOV — SS must be writable data; Vol. 3 §3.4.5.
-/// Not present → `#SS(selector)` (vector 12), not `#NP`.
-fn parse_stack_segment_descriptor(desc: [u8; 8]) -> Result<(u64, u32, u16), ExecError> {
+/// Spec: Intel SDM Vol. 2 MOV/POP SS protected-mode checks; Vol. 3 §§3.4.5,
+/// 5.4.1, 5.5, 5.7. Not present → `#SS(selector)` (vector 12), not `#NP`.
+fn parse_stack_segment_descriptor(
+    desc: [u8; 8],
+    selector: u16,
+    cpl: u8,
+) -> Result<(u64, u32, u16), ExecError> {
     let access = desc[5];
     let present = access & 0x80 != 0;
     let s_bit = access & 0x10 != 0;
     let executable = access & 0x08 != 0;
     let writable = access & 0x02 != 0;
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    if !s_bit || executable || !writable || rpl != cpl || dpl != cpl {
+        return Err(selector_fault(13, selector));
+    }
     if !present {
-        // Spec: SDM Vol. 2 MOV — SS not present → #SS(selector).
-        return Err(ExecError::ArchFault(12));
+        return Err(selector_fault(12, selector));
     }
-    if !s_bit || executable || !writable {
-        // Not a writable data segment → #GP(selector).
-        return Err(ExecError::ArchFault(13));
-    }
-    let base = u64::from(desc[2])
-        | (u64::from(desc[3]) << 8)
-        | (u64::from(desc[4]) << 16)
-        | (u64::from(desc[7]) << 24);
-    let limit20 =
-        u32::from(desc[0]) | (u32::from(desc[1]) << 8) | (u32::from(desc[6] & 0x0F) << 16);
-    let gran = desc[6] & 0x80 != 0;
-    let limit = if gran {
-        (limit20 << 12) | 0xFFF
-    } else {
-        limit20
-    };
-    let flags = u16::from(access);
-    Ok((base, limit, flags))
+    let parsed = parse_segment_descriptor(desc);
+    Ok((parsed.base, parsed.limit, parsed.flags))
 }
 
-/// Protected-mode load of SS from the GDT (TI=0).
+/// Prepare a protected-mode SS cache without mutating CPU state.
+fn prepare_ss_from_gdt(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<x86_core::SegmentReg, ExecError> {
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    let descriptor = read_gdt_segment_descriptor(cpu, bus, selector)?;
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let (base, limit, flags) = parse_stack_segment_descriptor(descriptor, selector, cpl)?;
+    Ok(x86_core::SegmentReg {
+        selector,
+        base,
+        limit,
+        flags,
+    })
+}
+
+/// Protected-mode load of SS from the GDT.
 ///
 /// Spec: Intel SDM Vol. 2 MOV (SS, r/m16); Vol. 3 §3.5.1 / §5.4.1.
 /// Null selector → `#GP(0)`; P=0 → `#SS(selector)`; non-writable/code/system →
 /// `#GP(selector)`; index outside GDTR.limit → `#GP(selector)`.
-/// Unsupported here: LDT (TI=1 → `#GP`), RPL/CPL/DPL privilege matching, IRQ
-/// inhibit after MOV SS, POP SS PM path, far jumps into PM.
+/// Unsupported here: LDT resolution.
 fn load_ss_from_gdt(cpu: &mut CpuState, bus: &mut dyn Bus, selector: u16) -> Result<(), ExecError> {
-    if is_null_selector(selector) {
-        // Spec: SDM Vol. 2 MOV / Vol. 3 §5.4.1 — null into SS → #GP(0).
-        return Err(ExecError::ArchFault(13));
-    }
-    if selector & 0x4 != 0 {
-        // TI=1 → LDT (out of scope) → #GP(selector)
-        return Err(ExecError::ArchFault(13));
-    }
-    let index = u64::from(selector >> 3);
-    let offset = index.saturating_mul(8);
-    if offset.saturating_add(7) > u64::from(cpu.gdtr.limit) {
-        return Err(ExecError::ArchFault(13));
-    }
-    let addr = cpu.gdtr.base.wrapping_add(offset);
-    let mut desc = [0u8; 8];
-    for (i, b) in desc.iter_mut().enumerate() {
-        *b = bus
-            .read_u8(addr.wrapping_add(i as u64))
-            .map_err(|e| classify_mem_fault(e, false))?;
-    }
-    let (base, limit, flags) = parse_stack_segment_descriptor(desc)?;
-    cpu.ss.load_descriptor_cache(selector, base, limit, flags);
+    let loaded = prepare_ss_from_gdt(cpu, bus, selector)?;
+    cpu.ss = loaded;
     Ok(())
 }
 
@@ -1118,6 +1408,38 @@ fn write_sreg(
         }
         _ => Err(ExecError::Unsupported(0x8E)),
     }
+}
+
+/// POP a 16-bit selector into ES/SS/DS with a single atomic commit.
+///
+/// The stack word and, in protected mode, all descriptor bytes/checks complete
+/// before either SP or the destination cache changes. The old SS cache is used
+/// for the stack read even for POP SS.
+/// Spec: Intel SDM Vol. 2 POP; Vol. 3 §§3.5.1, 5.4.1.
+fn pop_sreg16(cpu: &mut CpuState, bus: &mut dyn Bus, sreg: u8) -> Result<(), ExecError> {
+    debug_assert!(matches!(sreg, 0 | 2 | 3));
+    let (selector, next_sp) = peek_pop16(cpu, bus)?;
+    let protected_cache = if cr0_pe(cpu) {
+        Some(match sreg {
+            0 | 3 => prepare_data_sreg_from_gdt(cpu, bus, selector)?,
+            2 => prepare_ss_from_gdt(cpu, bus, selector)?,
+            _ => unreachable!(),
+        })
+    } else {
+        None
+    };
+
+    match (sreg, protected_cache) {
+        (0, Some(loaded)) => cpu.es = loaded,
+        (2, Some(loaded)) => cpu.ss = loaded,
+        (3, Some(loaded)) => cpu.ds = loaded,
+        (0, None) => cpu.es.load_real_mode_selector(selector),
+        (2, None) => cpu.ss.load_real_mode_selector(selector),
+        (3, None) => cpu.ds.load_real_mode_selector(selector),
+        _ => unreachable!(),
+    }
+    cpu.set_gpr_u16(CpuState::RSP, next_sp);
+    Ok(())
 }
 
 /// SI/DI step for string ops: +size if DF=0, −size if DF=1 (SDM Vol. 1 §3.4.3).
@@ -1721,32 +2043,35 @@ fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     Ok(())
 }
 
-/// Real-mode `#NMI` vector (Intel SDM Vol. 3 §6.3.3 / §6.15).
+/// Architectural `#NMI` vector (Intel SDM Vol. 3 §6.3.3 / §6.15).
 const VECTOR_NMI: u8 = 2;
 
 /// Service a latched platform `#NMI` if pending.
 ///
 /// Not gated by `RFLAGS.IF`. Clears `halted` so NMI can wake `HLT`.
-/// Spec: Intel SDM Vol. 3 §6.3.3, §6.7 (NMI); §6.4 (real-address delivery).
+/// Spec: Intel SDM Vol. 3 §§6.3.3, 6.7 (NMI), 6.12.1 (protected delivery).
 /// Stub: no SMRAM/SMI, no NMI blocking window after delivery.
 fn service_pending_nmi(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<bool, ExecError> {
     if !cpu.pending_nmi {
         return Ok(false);
     }
+    let return_ip = cpu.ip16();
+    deliver_hardware_interrupt(cpu, bus, VECTOR_NMI, return_ip)?;
     cpu.pending_nmi = false;
     cpu.halted = false;
-    real_mode_software_interrupt(cpu, bus, VECTOR_NMI, cpu.ip16())?;
     Ok(true)
 }
 
 /// Service a latched maskable external IRQ if `IF=1`.
 ///
 /// Pulls [`Bus::poll_external_irq`] into [`CpuState::pending_irq`], then
-/// delivers via the real-mode IVT when enabled. Return IP is the current
-/// instruction start (REP string ops leave IP unadvanced until completion).
+/// delivers through the current mode's IVT or IDT when enabled. Return IP is
+/// the current instruction start (REP string ops leave IP unadvanced until
+/// completion).
 ///
 /// Spec: Intel SDM Vol. 2 "REP/REPE/REPNE" (service pending interrupts between
-/// iterations); Vol. 3 §6.8.1 (maskable interrupts when IF=1).
+/// iterations); Vol. 3 §§6.8.1, 6.8.3 (maskable interrupts when IF=1 and the
+/// MOV/POP SS inhibition window is inactive).
 /// Stub: not a full 8259 — no priority / IRR / EOI.
 fn service_pending_external_interrupt(
     cpu: &mut CpuState,
@@ -1755,13 +2080,16 @@ fn service_pending_external_interrupt(
     if let Some(vector) = bus.poll_external_irq() {
         cpu.request_interrupt(vector);
     }
-    if !cpu.interrupt_flag() {
+    if cpu.maskable_interrupts_inhibited() || !cpu.interrupt_flag() {
         return Ok(false);
     }
-    let Some(vector) = cpu.pending_irq.take() else {
+    let Some(vector) = cpu.pending_irq else {
         return Ok(false);
     };
-    real_mode_software_interrupt(cpu, bus, vector, cpu.ip16())?;
+    let return_ip = cpu.ip16();
+    deliver_hardware_interrupt(cpu, bus, vector, return_ip)?;
+    cpu.pending_irq = None;
+    cpu.halted = false;
     Ok(true)
 }
 
@@ -2271,7 +2599,7 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
             Ok(insn) => return Ok(insn),
             Err(DecodeError::Truncated) => continue,
             Err(DecodeError::UnsupportedOpcode(op)) if real_mode_primary_opcode_is_ud(op) => {
-                return Err(ExecError::ArchFault(6));
+                return Err(arch_fault(6));
             }
             Err(e) => return Err(ExecError::Decode(e)),
         }
@@ -2303,13 +2631,280 @@ fn real_mode_software_interrupt(
     Ok(())
 }
 
-/// Real-mode exception fault delivery (#DE, #UD, #BR, #SS, #GP, …) through the IVT.
+/// Return a pending exception fault for top-level real-mode IVT delivery.
 ///
 /// Saved IP is the faulting instruction address (instruction start).
 /// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.15 (exception reference).
 /// Note: #OF from INTO is a trap (use [`real_mode_software_interrupt`] with next IP).
-fn real_mode_exception(cpu: &mut CpuState, bus: &mut dyn Bus, vector: u8) -> Result<(), ExecError> {
+fn real_mode_exception(
+    _cpu: &mut CpuState,
+    _bus: &mut dyn Bus,
+    vector: u8,
+) -> Result<(), ExecError> {
+    Err(arch_fault(vector))
+}
+
+/// Deliver a fault through the current real-mode IVT path.
+///
+/// Any protected-mode error-code payload is deliberately not pushed: the
+/// existing real-mode frame remains FLAGS, CS, and faulting IP.
+/// Spec: Intel SDM Vol. 3 §§6.13, 6.15.
+fn deliver_real_mode_exception(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+) -> Result<(), ExecError> {
     real_mode_software_interrupt(cpu, bus, vector, cpu.ip16())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtectedGateSource {
+    Software,
+    Hardware,
+    Exception(Option<u16>),
+}
+
+impl ProtectedGateSource {
+    fn error_code(self) -> Option<u16> {
+        match self {
+            Self::Exception(error_code) => error_code,
+            Self::Software | Self::Hardware => None,
+        }
+    }
+}
+
+/// Deliver one interrupt or architectural fault through a same-CPL 16-bit
+/// protected-mode interrupt or trap gate.
+///
+/// This bounded path validates the complete IDT gate and GDT target
+/// before touching the stack. It then snapshots every frame byte and rolls all
+/// writes back if a stack write fails, committing CS:IP, SP, and flags only
+/// after the complete frame is resident. Delivery-time failures are returned as
+/// [`ExecError::ProtectedModeExceptionDelivery`]; nested #DF/triple-fault
+/// machinery is deliberately outside this slice.
+///
+/// Gate DPL is checked only for software INT/INT3/INTO. A violation raises
+/// #GP with IDT=1 and EXT=0; faults, NMI, and external IRQs bypass gate DPL.
+/// Spec: Intel SDM Vol. 2 INT n/INT3/INTO; Vol. 3
+/// §§6.10, 6.11.2, 6.12.1, 6.12.3, 6.13.
+fn deliver_protected_mode_gate(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    return_ip: u16,
+    source: ProtectedGateSource,
+) -> Result<(), ExecError> {
+    let gate_offset = u64::from(vector) * 8;
+    if gate_offset + 7 > u64::from(cpu.idtr.limit) {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::IdtLimit,
+        ));
+    }
+
+    let gate_addr = cpu.idtr.base.wrapping_add(gate_offset);
+    let mut gate = [0u8; 8];
+    for (index, byte) in gate.iter_mut().enumerate() {
+        let addr = gate_addr.wrapping_add(index as u64);
+        *byte = bus.read_u8(addr).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::IdtRead(addr))
+        })?;
+    }
+
+    let gate_access = gate[5];
+    let interrupt_gate = match gate_access & 0x1F {
+        0x06 => true,
+        0x07 => false,
+        _ => {
+            return Err(protected_mode_delivery_error(
+                vector,
+                ProtectedModeDeliveryError::GateType(gate_access),
+            ));
+        }
+    };
+    if gate_access & 0x80 == 0 {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::GateNotPresent,
+        ));
+    }
+
+    let cpl = (cpu.cs.selector & 3) as u8;
+    if cpu.cs.default_big() || cpu.cs.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::CurrentPrivilege,
+        ));
+    }
+    let gate_dpl = (gate_access >> 5) & 3;
+    if source == ProtectedGateSource::Software && cpl > gate_dpl {
+        // IDT selector error code: vector index in bits 15:3, IDT=1, EXT=0.
+        // The failed software transfer has not touched the stack.
+        return Err(arch_fault_with_error_code(13, (u16::from(vector) << 3) | 2));
+    }
+
+    let target_selector = u16::from_le_bytes([gate[2], gate[3]]);
+    if is_null_selector(target_selector) {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::NullTargetSelector,
+        ));
+    }
+    if target_selector & 0x4 != 0 {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::LdtTargetSelector,
+        ));
+    }
+
+    let descriptor_offset = u64::from(target_selector >> 3) * 8;
+    if descriptor_offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::GdtLimit,
+        ));
+    }
+    let descriptor_addr = cpu.gdtr.base.wrapping_add(descriptor_offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        let addr = descriptor_addr.wrapping_add(index as u64);
+        *byte = bus.read_u8(addr).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::GdtRead(addr))
+        })?;
+    }
+
+    let target_access = descriptor[5];
+    if target_access & 0x80 == 0 {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TargetNotPresent,
+        ));
+    }
+    let system = target_access & 0x10 == 0;
+    let executable = target_access & 0x08 != 0;
+    let dpl = (target_access >> 5) & 3;
+    if system || !executable || dpl != cpl {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TargetCode,
+        ));
+    }
+
+    let parsed_target = parse_segment_descriptor(descriptor);
+    if parsed_target.flags
+        & (x86_core::SegmentReg::FLAG_LONG | x86_core::SegmentReg::FLAG_DEFAULT_BIG)
+        != 0
+    {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TargetNot16Bit,
+        ));
+    }
+    let target_offset = u16::from_le_bytes([gate[0], gate[1]]);
+    if u32::from(target_offset) > parsed_target.limit {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TargetOffsetLimit,
+        ));
+    }
+    if cpu.ss.stack_width() != 16 {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::StackWidth,
+        ));
+    }
+
+    // Intel push order is FLAGS, CS, IP, then the exception error code. The
+    // final lowest address therefore contains error code (when present), IP,
+    // CS, FLAGS. All addresses and original bytes are collected before writes.
+    let error_code = source.error_code();
+    let mut frame_words = Vec::with_capacity(if error_code.is_some() { 4 } else { 3 });
+    frame_words.extend([cpu.rflags as u16, cpu.cs.selector, return_ip]);
+    if let Some(code) = error_code {
+        frame_words.push(code);
+    }
+
+    let mut final_sp = cpu.gpr_u16(CpuState::RSP);
+    let mut desired_bytes = Vec::with_capacity(frame_words.len() * 2);
+    for word in frame_words {
+        final_sp = final_sp.wrapping_sub(2);
+        let addr = checked_linear_addr(&cpu.ss, u64::from(final_sp), 2).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackLimit)
+        })?;
+        let bytes = word.to_le_bytes();
+        desired_bytes.push((addr, bytes[0]));
+        desired_bytes.push((addr.wrapping_add(1), bytes[1]));
+    }
+
+    let mut planned_writes = Vec::with_capacity(desired_bytes.len());
+    for (addr, value) in desired_bytes {
+        let original = bus.read_u8(addr).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackRead(addr))
+        })?;
+        planned_writes.push((addr, original, value));
+    }
+
+    for index in 0..planned_writes.len() {
+        let (addr, _, value) = planned_writes[index];
+        if bus.write_u8(addr, value).is_err() {
+            let mut rollback_failure = None;
+            // Include the failed byte in case a bus reported failure after a
+            // side effect; continue restoring earlier bytes after any error.
+            for &(restore_addr, original, _) in planned_writes[..=index].iter().rev() {
+                if bus.write_u8(restore_addr, original).is_err() && rollback_failure.is_none() {
+                    rollback_failure = Some(restore_addr);
+                }
+            }
+            let reason = rollback_failure.map_or(
+                ProtectedModeDeliveryError::StackWrite(addr),
+                ProtectedModeDeliveryError::StackRollback,
+            );
+            return Err(protected_mode_delivery_error(vector, reason));
+        }
+    }
+
+    cpu.set_gpr_u16(CpuState::RSP, final_sp);
+    cpu.cs.load_descriptor_cache(
+        (target_selector & !3) | u16::from(cpl),
+        parsed_target.base,
+        parsed_target.limit,
+        parsed_target.flags,
+    );
+    cpu.rip = u64::from(target_offset);
+
+    // Both gate types clear TF, NT, RF, and VM. Only interrupt gates clear IF;
+    // trap gates preserve it. The saved FLAGS word above contains pre-entry IF.
+    cpu.rflags &= !((1 << 8) | (1 << 14) | (1 << 16) | (1 << 17));
+    if interrupt_gate {
+        cpu.set_interrupt_flag(false);
+    }
+    Ok(())
+}
+
+fn deliver_software_interrupt(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    return_ip: u16,
+) -> Result<(), ExecError> {
+    if cr0_pe(cpu) {
+        deliver_protected_mode_gate(cpu, bus, vector, return_ip, ProtectedGateSource::Software)
+    } else {
+        real_mode_software_interrupt(cpu, bus, vector, return_ip)
+    }
+}
+
+fn deliver_hardware_interrupt(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    return_ip: u16,
+) -> Result<(), ExecError> {
+    if cr0_pe(cpu) {
+        deliver_protected_mode_gate(cpu, bus, vector, return_ip, ProtectedGateSource::Hardware)
+    } else {
+        real_mode_software_interrupt(cpu, bus, vector, return_ip)
+    }
 }
 
 /// #UD — Invalid Opcode Exception (vector 6).
@@ -2333,7 +2928,7 @@ fn dtr_pseudo_desc(
     let m = insn.modrm.ok_or(ExecError::Unsupported(0x01))?;
     if m.mod_ == 3 {
         // Spec: SDM Vol. 2 LGDT/SGDT / LIDT/SIDT — register form #UD
-        return Err(ExecError::ArchFault(6));
+        return Err(arch_fault(6));
     }
     let (addr, _, uses_ss) = ea(cpu, insn, 6)?;
     let dtr = if idtr { &mut cpu.idtr } else { &mut cpu.gdtr };
@@ -2430,7 +3025,7 @@ fn step_two_byte(
                     // LMSW r/m16 — Spec: SDM Vol. 2 "LMSW"; Vol. 3 §2.5 (CR0.PE).
                     // Loads CR0[15:0]. Cannot clear PE once set. Setting PE=1
                     // enables protected-mode GDT descriptor loads for MOV
-                    // DS/ES/FS/GS/SS; far JMP still uses real-mode `selector<<4`.
+                    // DS/ES/FS/GS/SS and bounded direct far JMP16 transfers.
                     let src = read_rm_u16(cpu, bus, insn)?;
                     let pe_was = cpu.cr0 & 1 != 0;
                     let mut low = u64::from(src);
@@ -2447,7 +3042,7 @@ fn step_two_byte(
                     // mode the instruction is an architectural NOP (no TLB /
                     // paging here); GPRs and CR0 are unchanged.
                     if m.mod_ == 3 {
-                        return Err(ExecError::ArchFault(6));
+                        return Err(arch_fault(6));
                     }
                     cpu.set_ip16(next_ip);
                     Ok(())
@@ -2478,8 +3073,8 @@ fn step_two_byte(
             // MOV CR0, r32 — Spec: Intel SDM Vol. 2 "MOV—Move to/from Control
             // Registers"; Vol. 3 §2.5 (CR0). Unlike LMSW, this instruction
             // MAY clear PE. PE=1 enables GDT descriptor loads for MOV
-            // DS/ES/FS/GS/SS; far JMP remains real-mode `selector<<4` until
-            // later slices. Clearing PE restores the sticky-unreal data-seg path.
+            // DS/ES/FS/GS/SS and bounded direct far JMP16 transfers. Clearing PE
+            // restores the sticky-unreal data-segment and real-mode far-JMP paths.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x22))?;
             match m.reg {
                 0 => {
@@ -2523,23 +3118,43 @@ fn step_two_byte(
 /// Services latched `#NMI` (vector 2, not gated by `IF`) before maskable IRQs,
 /// then when `IF=1` services a latched/polled external IRQ before fetch/decode
 /// so non-REP instructions are interruptible (REP also polls between iterations).
-/// Spec: Intel SDM Vol. 3 §6.3.3 / §6.7 (NMI); §6.8.1 (maskable when IF=1).
+/// A successful instruction (including one whose architectural fault is entered)
+/// retires one MOV/POP SS shadow boundary. A bounded nested-delivery failure does
+/// not consume the shadow because no recoverable architectural boundary commits.
+/// Spec: Intel SDM Vol. 3 §6.3.3 / §6.7 (NMI); §§6.8.1, 6.8.3.
 pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     // Platform `#NMI` outranks maskable IRQs and can wake HLT.
     if service_pending_nmi(cpu, bus)? {
-        return Ok(());
-    }
-    if cpu.halted {
         return Ok(());
     }
     // Per-instruction external IRQ poll (PIC stub via pending_irq / Bus).
     if service_pending_external_interrupt(cpu, bus)? {
         return Ok(());
     }
-    match step_inner(cpu, bus) {
-        Err(ExecError::ArchFault(vector)) => real_mode_exception(cpu, bus, vector),
-        other => other,
+    if cpu.halted {
+        return Ok(());
     }
+    let result = match step_inner(cpu, bus) {
+        Err(ExecError::ArchFault { vector, error_code }) => {
+            if cr0_pe(cpu) {
+                let return_ip = cpu.ip16();
+                deliver_protected_mode_gate(
+                    cpu,
+                    bus,
+                    vector,
+                    return_ip,
+                    ProtectedGateSource::Exception(error_code),
+                )
+            } else {
+                deliver_real_mode_exception(cpu, bus, vector)
+            }
+        }
+        other => other,
+    };
+    if result.is_ok() {
+        cpu.retire_maskable_interrupt_shadow();
+    }
+    result
 }
 
 fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
@@ -2559,8 +3174,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x07 => {
             // POP ES — Spec: Intel SDM Vol. 2 "POP".
-            let sel = pop16(cpu, bus)?;
-            cpu.es.load_real_mode_selector(sel);
+            pop_sreg16(cpu, bus, 0)?;
             cpu.set_ip16(next_ip);
         }
         0x0E => {
@@ -2575,9 +3189,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x17 => {
             // POP SS — Spec: Intel SDM Vol. 2 "POP".
-            // Unsupported here: one-instruction interrupt inhibit after POP SS (Vol. 2).
-            let sel = pop16(cpu, bus)?;
-            cpu.ss.load_real_mode_selector(sel);
+            pop_sreg16(cpu, bus, 2)?;
+            cpu.arm_maskable_interrupt_shadow();
             cpu.set_ip16(next_ip);
         }
         0x1E => {
@@ -2587,8 +3200,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x1F => {
             // POP DS — Spec: Intel SDM Vol. 2 "POP".
-            let sel = pop16(cpu, bus)?;
-            cpu.ds.load_real_mode_selector(sel);
+            pop_sreg16(cpu, bus, 3)?;
             cpu.set_ip16(next_ip);
         }
         0xF4 => {
@@ -2758,18 +3370,27 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0xEA => {
-            // JMP far ptr16:16 / ptr16:32 — real-address mode.
-            // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H).
-            // Unsupported here: protected-mode / task-gate forms.
-            // Code fetch still uses IP16 (CS:IP); offset truncated to 16 bits.
+            // JMP far ptr16:16 / ptr16:32.
+            // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H); Vol. 3 §5.8.1.
+            // Protected mode is bounded to ptr16:16 targeting a same-level
+            // nonconforming D=0 GDT code segment. Gates/tasks and ptr16:32 are
+            // separate slices.
             let offset = if opsz32(&insn) {
                 insn.immediate as u32
             } else {
                 u32::from(insn.immediate as u16)
             };
             let selector = insn.displacement as u16;
-            cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-            cpu.set_ip16(offset as u16);
+            if cr0_pe(cpu) {
+                if opsz32(&insn) {
+                    return Err(ExecError::Unsupported(op));
+                }
+                protected_far_jump16(cpu, bus, offset as u16, selector)?;
+            } else {
+                // Real-address code fetch still uses IP16; ptr16:32 is truncated.
+                cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                cpu.set_ip16(offset as u16);
+            }
         }
         0xE8 => {
             // CALL near rel16/rel32 — Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H).
@@ -2813,41 +3434,85 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xC4 => {
             // LES r16/r32, m16:16/m16:32 — load offset into r and selector into ES.
-            // Spec: Intel SDM Vol. 2 "LES"; Ch. 2 (66H).
+            // In protected mode, validate/load ES through the shared DS/ES
+            // descriptor path only after the complete pointer is readable.
+            // Spec: Intel SDM Vol. 2 "LES" (Operation, Protected Mode
+            // Exceptions); Vol. 3 §§3.4.2–3.4.5, 5.3–5.6.
             // Register form (mod=11) → #UD (Vol. 3 §6.15).
-            // Unsupported here: protected-mode descriptor checks.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
             if opsz32(&insn) {
                 let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
+                let protected_es = if cr0_pe(cpu) {
+                    Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
+                } else {
+                    None
+                };
+                // All fallible pointer/descriptor work precedes this commit.
                 cpu.set_gpr_u32(m.reg as usize, offset);
-                cpu.es.load_real_mode_selector(selector);
+                if let Some(loaded) = protected_es {
+                    cpu.es = loaded;
+                } else {
+                    cpu.es.load_real_mode_selector(selector);
+                }
             } else {
                 let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
+                let protected_es = if cr0_pe(cpu) {
+                    Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
+                } else {
+                    None
+                };
+                // All fallible pointer/descriptor work precedes this commit.
                 cpu.set_gpr_u16(m.reg as usize, offset);
-                cpu.es.load_real_mode_selector(selector);
+                if let Some(loaded) = protected_es {
+                    cpu.es = loaded;
+                } else {
+                    cpu.es.load_real_mode_selector(selector);
+                }
             }
             cpu.set_ip16(next_ip);
         }
         0xC5 => {
             // LDS r16/r32, m16:16/m16:32 — load offset into r and selector into DS.
-            // Spec: Intel SDM Vol. 2 "LDS"; Ch. 2 (66H).
+            // In protected mode, validate/load DS through the shared DS/ES
+            // descriptor path only after the complete pointer is readable.
+            // Spec: Intel SDM Vol. 2 "LDS" (Operation, Protected Mode
+            // Exceptions); Vol. 3 §§3.4.2–3.4.5, 5.3–5.6.
             // Register form (mod=11) → #UD (Vol. 3 §6.15).
-            // Unsupported here: protected-mode descriptor checks.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
             if opsz32(&insn) {
                 let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
+                let protected_ds = if cr0_pe(cpu) {
+                    Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
+                } else {
+                    None
+                };
+                // All fallible pointer/descriptor work precedes this commit.
                 cpu.set_gpr_u32(m.reg as usize, offset);
-                cpu.ds.load_real_mode_selector(selector);
+                if let Some(loaded) = protected_ds {
+                    cpu.ds = loaded;
+                } else {
+                    cpu.ds.load_real_mode_selector(selector);
+                }
             } else {
                 let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
+                let protected_ds = if cr0_pe(cpu) {
+                    Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
+                } else {
+                    None
+                };
+                // All fallible pointer/descriptor work precedes this commit.
                 cpu.set_gpr_u16(m.reg as usize, offset);
-                cpu.ds.load_real_mode_selector(selector);
+                if let Some(loaded) = protected_ds {
+                    cpu.ds = loaded;
+                } else {
+                    cpu.ds.load_real_mode_selector(selector);
+                }
             }
             cpu.set_ip16(next_ip);
         }
@@ -3037,37 +3702,45 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_ip16(next_ip);
         }
         0xCC => {
-            // INT3 — one-byte breakpoint; vector 3 via IVT (real-address mode).
-            // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §6.4.
-            // Unsupported here: ICEBP/INT1 (F1); protected-mode privilege checks.
-            real_mode_software_interrupt(cpu, bus, 3, next_ip)?;
+            // INT3 — one-byte breakpoint; saved return IP is the following byte.
+            // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §§6.4, 6.12.1.
+            // Unsupported here: ICEBP/INT1 (F1).
+            deliver_software_interrupt(cpu, bus, 3, next_ip)?;
         }
         0xCD => {
-            // INT imm8 — real-address mode via IVT / IDTR base.
-            // Spec: Intel SDM Vol. 2 "INT n", Vol. 3 §6.4 (real-address mode).
-            real_mode_software_interrupt(cpu, bus, insn.immediate as u8, next_ip)?;
+            // INT imm8 — saved return IP is the following instruction.
+            // Spec: Intel SDM Vol. 2 "INT n"; Vol. 3 §§6.4, 6.12.1.
+            deliver_software_interrupt(cpu, bus, insn.immediate as u8, next_ip)?;
         }
         0xCE => {
-            // INTO — if OF=1, #OF (vector 4) trap via IVT; else fall through.
-            // Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1"; Vol. 3 §6.15 (#OF — trap).
+            // INTO — if OF=1, #OF (vector 4) trap; else fall through.
+            // Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1";
+            // Vol. 3 §§6.12.1, 6.15 (#OF — trap).
             // Saved IP is the following instruction (trap class).
-            // Unsupported here: 64-bit mode (#UD); protected-mode privilege checks.
+            // Unsupported here: 64-bit mode (#UD).
             if cpu.rflags & (1 << 11) != 0 {
-                real_mode_software_interrupt(cpu, bus, 4, next_ip)?;
+                deliver_software_interrupt(cpu, bus, 4, next_ip)?;
             } else {
                 cpu.set_ip16(next_ip);
             }
         }
         0xCF => {
-            // IRET — real-address mode (16-bit stack frame).
-            // Spec: Intel SDM Vol. 2 "IRET/IRETD/IRETQ".
-            let ip = pop16(cpu, bus)?;
-            let cs_sel = pop16(cpu, bus)?;
-            let flags = pop16(cpu, bus)?;
-            cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
-            cpu.set_ip16(ip);
-            // Preserve high RFLAGS; bit 1 of FLAGS is reserved-1.
-            cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
+            // IRET/IRETD — Spec: Intel SDM Vol. 2 "IRET/IRETD/IRETQ".
+            if cr0_pe(cpu) {
+                if opsz32(&insn) {
+                    return Err(ExecError::Unsupported(op));
+                }
+                protected_iret16(cpu, bus)?;
+            } else {
+                // Preserve the existing real-address 16-bit stack-frame path.
+                let ip = pop16(cpu, bus)?;
+                let cs_sel = pop16(cpu, bus)?;
+                let flags = pop16(cpu, bus)?;
+                cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+                cpu.set_ip16(ip);
+                // Preserve high RFLAGS; bit 1 of FLAGS is reserved-1.
+                cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
+            }
         }
         0xD4 => {
             // AAM — ASCII Adjust AX After Multiply. Spec: Intel SDM Vol. 2 "AAM".
@@ -3484,7 +4157,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // Group 5 r/m16|32 — INC/DEC/CALL/JMP/PUSH.
             // Spec: Intel SDM Vol. 2 "INC"/"DEC"/"CALL"/"JMP"/"PUSH"; opcode map Group 5;
             // Ch. 2 (66H). /7 reserved and far CALL/JMP register forms → #UD (Vol. 3 §6.15).
-            // Unsupported here: protected-mode transfers.
+            // Protected-mode far CALL and 16:32/gate/task transfers remain unsupported.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let op32 = opsz32(&insn);
             match m.reg {
@@ -3574,12 +4247,17 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 }
                 5 => {
                     // JMP FAR m16:16 / m16:32 — absolute indirect far (memory only).
-                    // Spec: Intel SDM Vol. 2 "JMP"; opcode map Group 5 /5; Ch. 2 (66H).
-                    // Register form is invalid (#UD). Unsupported: protected-mode gates.
+                    // Spec: Intel SDM Vol. 2 "JMP"; opcode map Group 5 /5; Ch. 2
+                    // (66H); Vol. 3 §5.8.1. Register form is invalid (#UD).
+                    // Protected mode is bounded to m16:16 through a same-level
+                    // nonconforming D=0 GDT code segment.
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
                     if op32 {
+                        if cr0_pe(cpu) {
+                            return Err(ExecError::Unsupported(op));
+                        }
                         let (addr, _, uses_ss) = ea(cpu, &insn, 6)?;
                         let offset = bus
                             .read_u32(addr)
@@ -3597,8 +4275,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                         let selector = bus
                             .read_u16(addr.wrapping_add(2))
                             .map_err(|e| classify_mem_fault(e, uses_ss))?;
-                        cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-                        cpu.set_ip16(offset);
+                        if cr0_pe(cpu) {
+                            protected_far_jump16(cpu, bus, offset, selector)?;
+                        } else {
+                            cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                            cpu.set_ip16(offset);
+                        }
                     }
                 }
                 6 => {
@@ -4247,8 +4929,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // clears; SS null → #GP; P=0 → #NP for data / #SS for SS; invalid
             // type / out of limit → #GP; SS requires writable data).
             // MOV to CS and reserved Sreg encodings → #UD (Vol. 3 §6.15).
-            // Unsupported here: LDT, privilege beyond basic #GP/#NP/#SS,
-            // IRQ inhibit after MOV SS.
+            // Unsupported here: LDT resolution.
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let Some(sreg) = sreg_from_modrm_reg(m.reg) else {
                 return real_mode_ud(cpu, bus);
@@ -4259,6 +4940,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
             let v = read_rm_u16(cpu, bus, &insn)?;
             write_sreg(cpu, bus, sreg, v)?;
+            if sreg == 2 {
+                cpu.arm_maskable_interrupt_shadow();
+            }
             cpu.set_ip16(next_ip);
         }
         0x86 => {
@@ -4957,6 +5641,1426 @@ mod tests {
         fn port_out_u8(&mut self, _port: u16, val: u8) -> Result<(), ExecError> {
             self.ports.push(val);
             Ok(())
+        }
+    }
+
+    fn assert_arch_fault(result: Result<(), ExecError>, vector: u8, error_code: Option<u16>) {
+        assert_eq!(result, Err(ExecError::ArchFault { vector, error_code }));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ProtectedFarJumpForm {
+        Immediate,
+        Memory,
+    }
+
+    impl ProtectedFarJumpForm {
+        const ALL: [Self; 2] = [Self::Immediate, Self::Memory];
+
+        fn name(self) -> &'static str {
+            match self {
+                Self::Immediate => "EA ptr16:16",
+                Self::Memory => "FF /5 m16:16",
+            }
+        }
+
+        fn instruction_len(self) -> usize {
+            match self {
+                Self::Immediate => 5,
+                Self::Memory => 4,
+            }
+        }
+
+        fn write(self, mem: &mut [u8], offset: u16, selector: u16) {
+            match self {
+                Self::Immediate => {
+                    let offset = offset.to_le_bytes();
+                    let selector = selector.to_le_bytes();
+                    mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 5].copy_from_slice(&[
+                        0xEA,
+                        offset[0],
+                        offset[1],
+                        selector[0],
+                        selector[1],
+                    ]);
+                }
+                Self::Memory => {
+                    // FF /5, mod=00 r/m=110: JMP FAR [DS:0x3000].
+                    mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 4]
+                        .copy_from_slice(&[0xFF, 0x2E, 0x00, 0x30]);
+                    mem[0x3000..0x3002].copy_from_slice(&offset.to_le_bytes());
+                    mem[0x3002..0x3004].copy_from_slice(&selector.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    const PROTECTED_TEST_CODE: usize = 0x1000;
+    const PROTECTED_TEST_GDT: usize = 0x4000;
+    const PROTECTED_TEST_IDT: usize = 0x5000;
+    const PROTECTED_TEST_HANDLER: u16 = 0x1234;
+    const PROTECTED_TEST_TARGET_CS: u16 = 0x0008;
+    const PROTECTED_COMPAT_IDT: usize = 0x7000;
+    const PROTECTED_COMPAT_TARGET_CS: u16 = 0x0078;
+    const PROTECTED_FAR_JUMP_TARGET_CS: u16 = 0x0020;
+    const PROTECTED_FAR_JUMP_TARGET_BASE: u32 = 0x0000_6000;
+    const PROTECTED_IRET_FRAME_SP: u16 = 0x8000;
+    const PROTECTED_IRET_RETURN_CS: u16 = 0x0020;
+    const PROTECTED_IRET_RETURN_BASE: u32 = 0x0000_6000;
+
+    fn encode_idt_gate(offset: u16, selector: u16, access: u8) -> [u8; 8] {
+        let offset = offset.to_le_bytes();
+        let selector = selector.to_le_bytes();
+        [
+            offset[0],
+            offset[1],
+            selector[0],
+            selector[1],
+            0,
+            access,
+            0,
+            0,
+        ]
+    }
+
+    fn write_protected_test_gate(
+        mem: &mut [u8],
+        vector: u8,
+        offset: u16,
+        selector: u16,
+        access: u8,
+    ) {
+        let entry = PROTECTED_TEST_IDT + usize::from(vector) * 8;
+        mem[entry..entry + 8].copy_from_slice(&encode_idt_gate(offset, selector, access));
+    }
+
+    fn protected_fault_fixture(vector: u8, gate_access: u8) -> (CpuState, VecBus) {
+        let mut mem = vec![0u8; 0x10000];
+        // Group 2 /6 is reserved and raises #UD at the instruction start.
+        mem[PROTECTED_TEST_CODE] = 0xD0;
+        mem[PROTECTED_TEST_CODE + 1] = 0xF0;
+        let target = encode_seg_desc(0x0000_2000, 0xFFFF, 0x9A, 0);
+        mem[PROTECTED_TEST_GDT + 8..PROTECTED_TEST_GDT + 16].copy_from_slice(&target);
+        write_protected_test_gate(
+            &mut mem,
+            vector,
+            PROTECTED_TEST_HANDLER,
+            PROTECTED_TEST_TARGET_CS,
+            gate_access,
+        );
+
+        let mut cpu = CpuState::reset();
+        cpu.cr0 |= 1;
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x0010,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x009A,
+        };
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0018,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x0093,
+        };
+        cpu.gdtr.base = PROTECTED_TEST_GDT as u64;
+        cpu.gdtr.limit = 15;
+        cpu.idtr.base = PROTECTED_TEST_IDT as u64;
+        cpu.idtr.limit = u16::from(vector) * 8 + 7;
+        cpu.rip = PROTECTED_TEST_CODE as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        (cpu, VecBus { mem, ports: vec![] })
+    }
+
+    fn protected_interrupt_fixture(vector: u8, gate_access: u8, cpl: u8) -> (CpuState, VecBus) {
+        let (mut cpu, mut bus) = protected_fault_fixture(vector, gate_access);
+        let code_access = 0x9A | (cpl << 5);
+        let data_access = 0x93 | (cpl << 5);
+
+        bus.mem[PROTECTED_TEST_GDT + 8..PROTECTED_TEST_GDT + 16].copy_from_slice(&encode_seg_desc(
+            0x0000_2000,
+            0xFFFF,
+            code_access,
+            0,
+        ));
+        bus.mem[PROTECTED_TEST_GDT + 16..PROTECTED_TEST_GDT + 24]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, code_access, 0));
+        cpu.gdtr.limit = 23;
+        cpu.idtr.limit = 0x07FF;
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x0010 | u16::from(cpl),
+            base: 0,
+            limit: 0xFFFF,
+            flags: u16::from(code_access),
+        };
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0018 | u16::from(cpl),
+            base: 0,
+            limit: 0xFFFF,
+            flags: u16::from(data_access),
+        };
+        (cpu, bus)
+    }
+
+    /// Give pre-existing PE=1 descriptor-fault tests a valid protected-mode
+    /// delivery target. Index 15 leaves their source descriptors at low GDT
+    /// indices undisturbed; limit-fault tests use index 16.
+    fn install_protected_test_exception_gate(
+        mem: &mut [u8],
+        cpu: &mut CpuState,
+        vector: u8,
+        handler: u16,
+    ) {
+        let descriptor_offset = usize::from(PROTECTED_COMPAT_TARGET_CS);
+        let descriptor_addr = cpu.gdtr.base as usize + descriptor_offset;
+        mem[descriptor_addr..descriptor_addr + 8]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9A, 0));
+        cpu.gdtr.limit = cpu.gdtr.limit.max((descriptor_offset + 7) as u16);
+
+        let entry = PROTECTED_COMPAT_IDT + usize::from(vector) * 8;
+        mem[entry..entry + 8].copy_from_slice(&encode_idt_gate(
+            handler,
+            PROTECTED_COMPAT_TARGET_CS,
+            0x86,
+        ));
+        cpu.idtr.base = PROTECTED_COMPAT_IDT as u64;
+        cpu.idtr.limit = u16::from(vector) * 8 + 7;
+    }
+
+    fn protected_far_jump_fixture(
+        form: ProtectedFarJumpForm,
+        offset: u16,
+        selector: u16,
+        descriptor: [u8; 8],
+    ) -> (CpuState, VecBus) {
+        let mut mem = vec![0u8; 0x10000];
+        form.write(&mut mem, offset, selector);
+        let descriptor_addr = PROTECTED_TEST_GDT + usize::from(selector >> 3) * 8;
+        mem[descriptor_addr..descriptor_addr + 8].copy_from_slice(&descriptor);
+
+        let mut cpu = CpuState::reset();
+        cpu.cr0 |= 1;
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x0010,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x009A,
+        };
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0018,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x0093,
+        };
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x0018,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x0093,
+        };
+        cpu.gdtr.base = PROTECTED_TEST_GDT as u64;
+        cpu.rip = PROTECTED_TEST_CODE as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_gpr_u16(CpuState::RAX, 0xA55A);
+        cpu.set_gpr_u16(CpuState::RBX, 0x5AA5);
+
+        // Install #NP before #GP so the final IDTR.limit includes both vectors.
+        install_protected_test_exception_gate(&mut mem, &mut cpu, 11, 0x0B00);
+        install_protected_test_exception_gate(&mut mem, &mut cpu, 13, 0x0D00);
+        (cpu, VecBus { mem, ports: vec![] })
+    }
+
+    fn protected_iret_fixture(
+        return_ip: u16,
+        return_selector: u16,
+        return_flags: u16,
+        descriptor: [u8; 8],
+    ) -> (CpuState, VecBus) {
+        let mut mem = vec![0u8; 0x10000];
+        mem[PROTECTED_TEST_CODE] = 0xCF;
+        let descriptor_addr =
+            PROTECTED_TEST_GDT + usize::from(return_selector >> 3).saturating_mul(8);
+        mem[descriptor_addr..descriptor_addr + 8].copy_from_slice(&descriptor);
+        let frame = usize::from(PROTECTED_IRET_FRAME_SP);
+        mem[frame..frame + 2].copy_from_slice(&return_ip.to_le_bytes());
+        mem[frame + 2..frame + 4].copy_from_slice(&return_selector.to_le_bytes());
+        mem[frame + 4..frame + 6].copy_from_slice(&return_flags.to_le_bytes());
+
+        let mut cpu = CpuState::reset();
+        cpu.cr0 |= 1;
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x0010,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x009A,
+        };
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0018,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x0093,
+        };
+        cpu.gdtr.base = PROTECTED_TEST_GDT as u64;
+        cpu.gdtr.limit = 0x00FF;
+        cpu.rip = PROTECTED_TEST_CODE as u64;
+        cpu.set_gpr_u16(CpuState::RSP, PROTECTED_IRET_FRAME_SP);
+        (cpu, VecBus { mem, ports: vec![] })
+    }
+
+    fn assert_bounded_protected_delivery_failure(
+        cpu: &mut CpuState,
+        bus: &mut dyn Bus,
+        expected_detail: &str,
+    ) {
+        let error = step(cpu, bus).expect_err("invalid protected delivery must be bounded");
+        assert!(
+            matches!(
+                &error,
+                ExecError::ProtectedModeExceptionDelivery {
+                    vector: _,
+                    reason: _
+                }
+            ),
+            "delivery failure escaped through the wrong error variant: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("protected-mode exception delivery")
+                && message.contains(expected_detail),
+            "unexpected delivery error: {message}"
+        );
+    }
+
+    struct FailOnceWriteBus {
+        mem: Vec<u8>,
+        fail_addr: u64,
+        failed: bool,
+    }
+
+    impl Bus for FailOnceWriteBus {
+        fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+            self.mem
+                .get(addr as usize)
+                .copied()
+                .ok_or(ExecError::MemoryFault(addr))
+        }
+
+        fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+            if addr == self.fail_addr && !self.failed {
+                self.failed = true;
+                return Err(ExecError::MemoryFault(addr));
+            }
+            let byte = self
+                .mem
+                .get_mut(addr as usize)
+                .ok_or(ExecError::MemoryFault(addr))?;
+            *byte = val;
+            Ok(())
+        }
+
+        fn port_in_u8(&mut self, _port: u16) -> Result<u8, ExecError> {
+            Ok(0xFF)
+        }
+
+        fn port_out_u8(&mut self, _port: u16, _val: u8) -> Result<(), ExecError> {
+            Ok(())
+        }
+    }
+
+    struct FailOnceReadBus {
+        mem: Vec<u8>,
+        fail_addr: u64,
+        failed: bool,
+    }
+
+    impl Bus for FailOnceReadBus {
+        fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+            if addr == self.fail_addr && !self.failed {
+                self.failed = true;
+                return Err(ExecError::MemoryFault(addr));
+            }
+            self.mem
+                .get(addr as usize)
+                .copied()
+                .ok_or(ExecError::MemoryFault(addr))
+        }
+
+        fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+            let byte = self
+                .mem
+                .get_mut(addr as usize)
+                .ok_or(ExecError::MemoryFault(addr))?;
+            *byte = val;
+            Ok(())
+        }
+
+        fn port_in_u8(&mut self, _port: u16) -> Result<u8, ExecError> {
+            Ok(0xFF)
+        }
+
+        fn port_out_u8(&mut self, _port: u16, _val: u8) -> Result<(), ExecError> {
+            Ok(())
+        }
+    }
+
+    /// #UD, #DE, and #BR are faults without error codes.
+    /// Spec: Intel SDM Vol. 3 §§6.13, 6.15.
+    #[test]
+    fn architectural_fault_payload_omits_error_codes_for_ud_de_br() {
+        let cases: &[(u8, &[u8])] = &[
+            (6, &[0xD0, 0xF0]),       // Group 2 /6 → #UD
+            (0, &[0xD4, 0x00]),       // AAM 0 → #DE
+            (5, &[0x62, 0x06, 0, 2]), // BOUND AX,[0x0200] → #BR
+        ];
+
+        for &(vector, code) in cases {
+            let mut mem = vec![0u8; 0x10000];
+            mem[..code.len()].copy_from_slice(code);
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ds = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_ax(1);
+            let mut bus = VecBus { mem, ports: vec![] };
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), vector, None);
+        }
+    }
+
+    /// A 16-bit interrupt gate pushes FLAGS, CS, and the faulting IP, then
+    /// clears IF only after the protected-mode transfer succeeds.
+    /// Spec: Intel SDM Vol. 3 §§6.11.2, 6.12.1, 6.15 (#UD).
+    #[test]
+    fn protected_fault_ud_interrupt_gate_frame_and_if() {
+        let (mut cpu, mut bus) = protected_fault_fixture(6, 0x86);
+        cpu.rflags |= (1 << 9) | 1;
+        let saved_flags = cpu.rflags as u16;
+        bus.mem[0xFFF6..0xFFF8].copy_from_slice(&0x5AA5u16.to_le_bytes());
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.cs.selector, PROTECTED_TEST_TARGET_CS);
+        assert_eq!(cpu.cs.base, 0x2000);
+        assert_eq!(cpu.cs.limit, 0xFFFF);
+        assert_eq!(cpu.cs.flags, 0x009A);
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_HANDLER);
+        assert!(!cpu.interrupt_flag(), "interrupt gate must clear IF");
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), PROTECTED_TEST_CODE as u16);
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0010);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+        assert_eq!(
+            bus.read_u16(0xFFF6).unwrap(),
+            0x5AA5,
+            "#UD must not push an error code"
+        );
+    }
+
+    /// A selector #GP uses its imported payload as the final 16-bit frame word;
+    /// a trap gate preserves IF. Final stack order is error, IP, CS, FLAGS.
+    /// Spec: Intel SDM Vol. 3 §§6.11.2, 6.12.1, 6.13, 6.15 (#GP).
+    #[test]
+    fn protected_fault_gp_trap_gate_error_code_and_if() {
+        let (mut cpu, mut bus) = protected_fault_fixture(13, 0x87);
+        // MOV DS,AX with RPL 3 naming DPL-0 nonconforming code → #GP(0x10).
+        bus.mem[PROTECTED_TEST_CODE] = 0x8E;
+        bus.mem[PROTECTED_TEST_CODE + 1] = 0xD8;
+        let invalid_data_target = encode_seg_desc(0, 0xFFFF, 0x9A, 0);
+        bus.mem[PROTECTED_TEST_GDT + 16..PROTECTED_TEST_GDT + 24]
+            .copy_from_slice(&invalid_data_target);
+        cpu.gdtr.limit = 23;
+        cpu.set_ax(0x0013);
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x0020,
+            base: 0xABCD_0000,
+            limit: 0x7FFF,
+            flags: 0x0093,
+        };
+        let ds_before = cpu.ds.clone();
+        cpu.set_interrupt_flag(true);
+        cpu.rflags |= 1;
+        let saved_flags = cpu.rflags as u16;
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.cs.selector, PROTECTED_TEST_TARGET_CS);
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_HANDLER);
+        assert!(cpu.interrupt_flag(), "trap gate must preserve IF");
+        assert_eq!(cpu.ds, ds_before);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6);
+        assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0x0010);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), PROTECTED_TEST_CODE as u16);
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0010);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+    }
+
+    /// INT imm8, INT3, and taken INTO are software-generated interrupts. Their
+    /// protected-mode frames save the following instruction, contain no error
+    /// code, and use the selected 16-bit interrupt/trap gate semantics.
+    ///
+    /// Spec: Intel SDM Vol. 2 INT n/INT3/INTO (Operation); Vol. 3
+    /// §§6.11.2, 6.12.1, 6.13.
+    #[test]
+    fn protected_software_interrupt_forms_save_next_ip_and_gate_flags() {
+        let cases: [(&str, &[u8], u8, u8, bool); 3] = [
+            ("INT imm8", &[0xCD, 0x30], 0x30, 0xE6, false),
+            ("INT3", &[0xCC], 3, 0xE7, false),
+            ("INTO", &[0xCE], 4, 0xE6, true),
+        ];
+
+        for (name, code, vector, gate_access, overflow) in cases {
+            let (mut cpu, mut bus) = protected_interrupt_fixture(vector, gate_access, 3);
+            bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + code.len()].copy_from_slice(code);
+            bus.mem[0xFFF6..0xFFF8].copy_from_slice(&0xA55Au16.to_le_bytes());
+            cpu.rflags = 0x0203;
+            cpu.set_of(overflow);
+            let saved_flags = cpu.rflags as u16;
+
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(cpu.cs.selector, PROTECTED_TEST_TARGET_CS | 3, "{name}");
+            assert_eq!(cpu.cs.base, 0x2000, "{name}");
+            assert_eq!(cpu.ip16(), PROTECTED_TEST_HANDLER, "{name}");
+            assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8, "{name}");
+            assert_eq!(
+                bus.read_u16(0xFFF8).unwrap(),
+                (PROTECTED_TEST_CODE + code.len()) as u16,
+                "{name}: saved IP"
+            );
+            assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0013, "{name}");
+            assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags, "{name}");
+            assert_eq!(
+                bus.read_u16(0xFFF6).unwrap(),
+                0xA55A,
+                "{name}: software interrupt must not push an error code"
+            );
+            assert_eq!(
+                cpu.interrupt_flag(),
+                gate_access & 1 != 0,
+                "{name}: interrupt/trap gate IF behavior"
+            );
+        }
+    }
+
+    /// Untaken INTO does not consult the IDT and changes only IP.
+    /// Spec: Intel SDM Vol. 2 INTO (Operation).
+    #[test]
+    fn protected_into_without_overflow_falls_through_without_gate_access() {
+        let (mut cpu, mut bus) = protected_interrupt_fixture(4, 0x06, 0);
+        bus.mem[PROTECTED_TEST_CODE] = 0xCE;
+        cpu.set_of(false);
+        let cs_before = cpu.cs.clone();
+        let flags_before = cpu.rflags;
+        let sp_before = cpu.gpr_u16(CpuState::RSP);
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_CODE as u16 + 1);
+        assert_eq!(cpu.cs, cs_before);
+        assert_eq!(cpu.rflags, flags_before);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp_before);
+    }
+
+    /// The IDT-gate DPL check applies to all three software forms. A CPL-3
+    /// violation raises #GP with IDT=1, EXT=0, and the software vector as the
+    /// index; the failed transfer writes no frame before #GP is delivered.
+    ///
+    /// Spec: Intel SDM Vol. 2 INT n/INT3/INTO (Protected Mode Exceptions);
+    /// Vol. 3 §§6.12.1, 6.13.
+    #[test]
+    fn protected_software_gate_dpl_violation_delivers_gp_idt_payload_atomically() {
+        let cases: [(&str, &[u8], u8, bool); 3] = [
+            ("INT imm8", &[0xCD, 0x30], 0x30, false),
+            ("INT3", &[0xCC], 3, false),
+            ("INTO", &[0xCE], 4, true),
+        ];
+
+        for (name, code, vector, overflow) in cases {
+            let (mut cpu, mut bus) = protected_interrupt_fixture(vector, 0x86, 3);
+            bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + code.len()].copy_from_slice(code);
+            write_protected_test_gate(&mut bus.mem, 13, 0x0D00, PROTECTED_TEST_TARGET_CS, 0x87);
+            cpu.rflags = 0x0203;
+            cpu.set_of(overflow);
+            let saved_flags = cpu.rflags as u16;
+
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(cpu.cs.selector, PROTECTED_TEST_TARGET_CS | 3, "{name}");
+            assert_eq!(cpu.ip16(), 0x0D00, "{name}: #GP handler");
+            assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6, "{name}");
+            assert_eq!(
+                bus.read_u16(0xFFF6).unwrap(),
+                (u16::from(vector) << 3) | 2,
+                "{name}: #GP IDT error code"
+            );
+            assert_eq!(
+                bus.read_u16(0xFFF8).unwrap(),
+                PROTECTED_TEST_CODE as u16,
+                "{name}: #GP must restart at the software instruction"
+            );
+            assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0013, "{name}");
+            assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags, "{name}");
+        }
+    }
+
+    /// Gate DPL is ignored for NMI and maskable hardware interrupts. Both can
+    /// enter a same-CPL D=0 target even when CPL=3 and gate DPL=0.
+    ///
+    /// Spec: Intel SDM Vol. 3 §§6.3.3, 6.8.1, 6.12.1.
+    #[test]
+    fn protected_hardware_interrupts_ignore_gate_dpl() {
+        let (mut nmi_cpu, mut nmi_bus) = protected_interrupt_fixture(2, 0x86, 3);
+        nmi_cpu.set_interrupt_flag(false);
+        nmi_cpu.request_nmi();
+        step(&mut nmi_cpu, &mut nmi_bus).unwrap();
+        assert_eq!(nmi_cpu.cs.selector, PROTECTED_TEST_TARGET_CS | 3);
+        assert_eq!(nmi_cpu.ip16(), PROTECTED_TEST_HANDLER);
+        assert_eq!(nmi_cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(
+            nmi_bus.read_u16(0xFFF8).unwrap(),
+            PROTECTED_TEST_CODE as u16
+        );
+
+        let (mut irq_cpu, irq_fixture) = protected_interrupt_fixture(0x20, 0x86, 3);
+        let mut irq_bus = IrqAfterWritesBus {
+            mem: irq_fixture.mem,
+            ports: vec![],
+            writes: 0,
+            inject_after_writes: usize::MAX,
+            inject_vector: 0x20,
+            latched: Some(0x20),
+        };
+        irq_cpu.set_interrupt_flag(true);
+        step(&mut irq_cpu, &mut irq_bus).unwrap();
+        assert_eq!(irq_cpu.cs.selector, PROTECTED_TEST_TARGET_CS | 3);
+        assert_eq!(irq_cpu.ip16(), PROTECTED_TEST_HANDLER);
+        assert_eq!(irq_cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(
+            irq_bus.read_u16(0xFFF8).unwrap(),
+            PROTECTED_TEST_CODE as u16
+        );
+    }
+
+    /// NMI wins over a simultaneous maskable IRQ. The NMI interrupt gate clears
+    /// IF, IRET restores it, and the still-pending IRQ then enters its trap gate.
+    /// Both hardware frames save the current interrupted IP and no error code.
+    ///
+    /// Spec: Intel SDM Vol. 2 IRET; Vol. 3 §§6.3.3, 6.7, 6.8.1, 6.12.1.
+    #[test]
+    fn protected_nmi_precedes_irq_and_both_iret_to_interrupted_ip() {
+        const NMI_HANDLER: u16 = 0x0200;
+        const IRQ_HANDLER: u16 = 0x0300;
+        let (mut cpu, mut bus) = protected_interrupt_fixture(2, 0x86, 0);
+        write_protected_test_gate(&mut bus.mem, 2, NMI_HANDLER, PROTECTED_TEST_TARGET_CS, 0x86);
+        write_protected_test_gate(
+            &mut bus.mem,
+            0x20,
+            IRQ_HANDLER,
+            PROTECTED_TEST_TARGET_CS,
+            0x87,
+        );
+        bus.mem[0x2000 + usize::from(NMI_HANDLER)] = 0xCF;
+        bus.mem[0x2000 + usize::from(IRQ_HANDLER)] = 0xCF;
+        bus.mem[PROTECTED_TEST_CODE] = 0x90;
+        bus.mem[0xFFF6..0xFFF8].copy_from_slice(&0x5AA5u16.to_le_bytes());
+        cpu.rflags = 0x0203;
+        cpu.request_interrupt(0x20);
+        cpu.request_nmi();
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), NMI_HANDLER);
+        assert!(!cpu.pending_nmi);
+        assert_eq!(cpu.pending_irq, Some(0x20));
+        assert!(!cpu.interrupt_flag());
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), PROTECTED_TEST_CODE as u16);
+        assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0x5AA5);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0x0010);
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_CODE as u16);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+        assert!(cpu.interrupt_flag());
+        assert_eq!(cpu.pending_irq, Some(0x20));
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), IRQ_HANDLER);
+        assert_eq!(cpu.pending_irq, None);
+        assert!(cpu.interrupt_flag(), "trap gate must preserve IF");
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), PROTECTED_TEST_CODE as u16);
+        assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0x5AA5);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, 0x0010);
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_CODE as u16);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+        assert!(cpu.interrupt_flag());
+    }
+
+    /// IF=0 leaves a pending PIC vector latched while the current instruction
+    /// executes. Once IF is set, delivery saves the then-current IP.
+    /// Spec: Intel SDM Vol. 3 §§6.8.1, 6.12.1.
+    #[test]
+    fn protected_irq_respects_if_and_saves_current_ip() {
+        let (mut cpu, mut bus) = protected_interrupt_fixture(0x20, 0x86, 0);
+        bus.mem[PROTECTED_TEST_CODE] = 0x90;
+        bus.mem[PROTECTED_TEST_CODE + 1] = 0x90;
+        cpu.set_interrupt_flag(false);
+        cpu.request_interrupt(0x20);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_CODE as u16 + 1);
+        assert_eq!(cpu.pending_irq, Some(0x20));
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+
+        cpu.set_interrupt_flag(true);
+        let saved_flags = cpu.rflags as u16;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_HANDLER);
+        assert_eq!(cpu.pending_irq, None);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        assert_eq!(
+            bus.read_u16(0xFFF8).unwrap(),
+            PROTECTED_TEST_CODE as u16 + 1
+        );
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+    }
+
+    /// A valid NMI or IF-enabled IRQ wakes HLT, saves the post-HLT IP, and can
+    /// return through the imported same-CPL IRET16 path.
+    ///
+    /// Spec: Intel SDM Vol. 2 HLT/IRET; Vol. 3 §§6.3.3, 6.8.1, 6.12.1.
+    #[test]
+    fn protected_nmi_and_irq_wake_hlt_and_iret_after_hlt() {
+        for (name, vector, nmi) in [("NMI", 2, true), ("IRQ", 0x20, false)] {
+            let (mut cpu, mut bus) = protected_interrupt_fixture(vector, 0x86, 0);
+            bus.mem[PROTECTED_TEST_CODE] = 0xF4;
+            bus.mem[PROTECTED_TEST_CODE + 1] = 0x90;
+            bus.mem[0x2000 + usize::from(PROTECTED_TEST_HANDLER)] = 0xCF;
+            cpu.set_interrupt_flag(!nmi);
+
+            step(&mut cpu, &mut bus).unwrap();
+            assert!(cpu.halted, "{name}");
+            assert_eq!(cpu.ip16(), PROTECTED_TEST_CODE as u16 + 1, "{name}");
+            let saved_flags = cpu.rflags as u16;
+            if nmi {
+                cpu.request_nmi();
+            } else {
+                cpu.request_interrupt(vector);
+            }
+
+            step(&mut cpu, &mut bus).unwrap();
+            assert!(!cpu.halted, "{name}: valid delivery must wake HLT");
+            assert_eq!(cpu.ip16(), PROTECTED_TEST_HANDLER, "{name}");
+            assert_eq!(
+                bus.read_u16(0xFFF8).unwrap(),
+                PROTECTED_TEST_CODE as u16 + 1,
+                "{name}: saved post-HLT IP"
+            );
+            assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags, "{name}");
+
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.cs.selector, 0x0010, "{name}");
+            assert_eq!(cpu.ip16(), PROTECTED_TEST_CODE as u16 + 1, "{name}");
+            assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE, "{name}");
+            assert_eq!(cpu.interrupt_flag(), !nmi, "{name}");
+        }
+    }
+
+    /// Newly routed software/NMI/IRQ callers retain the imported helper's
+    /// transactional behavior for invalid gate, target, and stack cases.
+    /// Pending hardware requests and HLT are committed only after valid entry.
+    ///
+    /// Spec: Intel SDM Vol. 3 §§6.11.2, 6.12.1.
+    #[test]
+    fn protected_interrupt_delivery_failures_remain_atomic() {
+        let (mut software_cpu, mut software_bus) = protected_interrupt_fixture(0x30, 0x8E, 0);
+        software_bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 2]
+            .copy_from_slice(&[0xCD, 0x30]);
+        let software_before = software_cpu.clone();
+        let software_mem_before = software_bus.mem.clone();
+        let error = step(&mut software_cpu, &mut software_bus).unwrap_err();
+        assert!(matches!(
+            error,
+            ExecError::ProtectedModeExceptionDelivery {
+                vector: 0x30,
+                reason: ProtectedModeDeliveryError::GateType(0x8E)
+            }
+        ));
+        assert_eq!(software_cpu, software_before);
+        assert_eq!(software_bus.mem, software_mem_before);
+
+        let (mut nmi_cpu, mut nmi_bus) = protected_interrupt_fixture(2, 0x86, 0);
+        nmi_bus.mem[PROTECTED_TEST_GDT + 8..PROTECTED_TEST_GDT + 16]
+            .copy_from_slice(&encode_seg_desc(0x2000, 0xFFFF, 0x1A, 0));
+        nmi_cpu.halted = true;
+        nmi_cpu.request_nmi();
+        let nmi_before = nmi_cpu.clone();
+        let nmi_mem_before = nmi_bus.mem.clone();
+        let error = step(&mut nmi_cpu, &mut nmi_bus).unwrap_err();
+        assert!(matches!(
+            error,
+            ExecError::ProtectedModeExceptionDelivery {
+                vector: 2,
+                reason: ProtectedModeDeliveryError::TargetNotPresent
+            }
+        ));
+        assert_eq!(nmi_cpu, nmi_before);
+        assert_eq!(nmi_bus.mem, nmi_mem_before);
+
+        let (mut irq_cpu, mut irq_bus) = protected_interrupt_fixture(0x20, 0x86, 0);
+        irq_cpu.set_interrupt_flag(true);
+        irq_cpu.ss.limit = 0xFFFC;
+        irq_cpu.halted = true;
+        irq_cpu.request_interrupt(0x20);
+        let irq_before = irq_cpu.clone();
+        let irq_mem_before = irq_bus.mem.clone();
+        let error = step(&mut irq_cpu, &mut irq_bus).unwrap_err();
+        assert!(matches!(
+            error,
+            ExecError::ProtectedModeExceptionDelivery {
+                vector: 0x20,
+                reason: ProtectedModeDeliveryError::StackLimit
+            }
+        ));
+        assert_eq!(irq_cpu, irq_before);
+        assert_eq!(irq_bus.mem, irq_mem_before);
+    }
+
+    /// Both 16-bit gate types round-trip a software INT frame through IRET.
+    /// Spec: Intel SDM Vol. 2 INT n/IRET; Vol. 3 §§6.11.2, 6.12.1.
+    #[test]
+    fn protected_software_interrupt_gate_types_round_trip_through_iret16() {
+        for (name, gate_access) in [("interrupt", 0x86), ("trap", 0x87)] {
+            let (mut cpu, mut bus) = protected_interrupt_fixture(0x30, gate_access, 0);
+            bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 2].copy_from_slice(&[0xCD, 0x30]);
+            bus.mem[0x2000 + usize::from(PROTECTED_TEST_HANDLER)] = 0xCF;
+            cpu.rflags = 0x0AD7;
+            let mut expected = cpu.clone();
+            expected.rip = PROTECTED_TEST_CODE as u64 + 2;
+
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.interrupt_flag(), gate_access & 1 != 0, "{name} gate");
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(cpu, expected, "{name} gate round trip");
+        }
+    }
+
+    /// IDT bounds, 16-bit gate type, and P are checked before any frame write.
+    /// Spec: Intel SDM Vol. 3 §§6.10, 6.11.2, 6.12.1.
+    #[test]
+    fn protected_fault_gate_validation_is_atomic() {
+        let cases = [
+            ("IDT limit", 0x86, Some(6 * 8 + 6), "IDT limit"),
+            ("32-bit gate type", 0x8E, None, "16-bit interrupt/trap gate"),
+            ("not-present gate", 0x06, None, "gate is not present"),
+        ];
+
+        for (name, access, idt_limit, detail) in cases {
+            let (mut cpu, mut bus) = protected_fault_fixture(6, access);
+            if let Some(limit) = idt_limit {
+                cpu.idtr.limit = limit;
+            }
+            let cpu_before = cpu.clone();
+            let mem_before = bus.mem.clone();
+
+            assert_bounded_protected_delivery_failure(&mut cpu, &mut bus, detail);
+            assert_eq!(cpu, cpu_before, "{name}: CPU state changed");
+            assert_eq!(bus.mem, mem_before, "{name}: guest memory changed");
+        }
+    }
+
+    /// This bounded same-CPL model accepts only a non-null GDT selector for a
+    /// present ring-0, D=0 code segment containing the gate offset.
+    /// Spec: Intel SDM Vol. 3 §§6.11.2, 6.12.1, 6.12.3.
+    #[test]
+    fn protected_fault_target_descriptor_validation_is_atomic() {
+        let valid = encode_seg_desc(0x2000, 0xFFFF, 0x9A, 0);
+        let cases = [
+            (
+                "null selector",
+                0x0000,
+                valid,
+                15,
+                PROTECTED_TEST_HANDLER,
+                "null target selector",
+            ),
+            (
+                "LDT selector",
+                0x000C,
+                valid,
+                15,
+                PROTECTED_TEST_HANDLER,
+                "LDT target selector",
+            ),
+            (
+                "GDT limit",
+                0x0008,
+                valid,
+                7,
+                PROTECTED_TEST_HANDLER,
+                "GDT limit",
+            ),
+            (
+                "not present",
+                0x0008,
+                encode_seg_desc(0x2000, 0xFFFF, 0x1A, 0),
+                15,
+                PROTECTED_TEST_HANDLER,
+                "target code segment is not present",
+            ),
+            (
+                "data segment",
+                0x0008,
+                encode_seg_desc(0x2000, 0xFFFF, 0x92, 0),
+                15,
+                PROTECTED_TEST_HANDLER,
+                "same-CPL executable code",
+            ),
+            (
+                "ring 1 code",
+                0x0008,
+                encode_seg_desc(0x2000, 0xFFFF, 0xBA, 0),
+                15,
+                PROTECTED_TEST_HANDLER,
+                "same-CPL executable code",
+            ),
+            (
+                "default-32 code",
+                0x0008,
+                encode_seg_desc(0x2000, 0xFFFF, 0x9A, 0x40),
+                15,
+                PROTECTED_TEST_HANDLER,
+                "16-bit target code segment",
+            ),
+            (
+                "offset past limit",
+                0x0008,
+                encode_seg_desc(0x2000, 0x00FF, 0x9A, 0),
+                15,
+                0x0100,
+                "target offset exceeds",
+            ),
+        ];
+
+        for (name, selector, descriptor, gdt_limit, offset, detail) in cases {
+            let (mut cpu, mut bus) = protected_fault_fixture(6, 0x86);
+            let descriptor_addr = PROTECTED_TEST_GDT + usize::from(selector >> 3) * 8;
+            bus.mem[descriptor_addr..descriptor_addr + 8].copy_from_slice(&descriptor);
+            write_protected_test_gate(&mut bus.mem, 6, offset, selector, 0x86);
+            cpu.gdtr.limit = gdt_limit;
+            let cpu_before = cpu.clone();
+            let mem_before = bus.mem.clone();
+
+            assert_bounded_protected_delivery_failure(&mut cpu, &mut bus, detail);
+            assert_eq!(cpu, cpu_before, "{name}: CPU state changed");
+            assert_eq!(bus.mem, mem_before, "{name}: guest memory changed");
+        }
+    }
+
+    /// A same-stack frame that exceeds SS.limit fails before changing CPU or RAM.
+    /// Spec: Intel SDM Vol. 3 §6.12.1; bounded nested-fault policy for this slice.
+    #[test]
+    fn protected_fault_stack_limit_failure_is_atomic() {
+        let (mut cpu, mut bus) = protected_fault_fixture(6, 0x86);
+        cpu.ss.limit = 0xFFFC;
+        let cpu_before = cpu.clone();
+        let mem_before = bus.mem.clone();
+
+        assert_bounded_protected_delivery_failure(&mut cpu, &mut bus, "stack limit");
+        assert_eq!(cpu, cpu_before);
+        assert_eq!(bus.mem, mem_before);
+    }
+
+    /// If a later stack byte write fails, earlier bytes are restored and no
+    /// architectural state is committed. This slice does not synthesize #DF.
+    /// Spec: Intel SDM Vol. 3 §6.12.1; bounded nested-fault policy for this slice.
+    #[test]
+    fn protected_fault_stack_write_failure_rolls_back() {
+        let (mut cpu, fixture) = protected_fault_fixture(6, 0x86);
+        let mut bus = FailOnceWriteBus {
+            mem: fixture.mem,
+            // FLAGS at FFFC succeeds; the first CS byte then fails once.
+            fail_addr: 0xFFFA,
+            failed: false,
+        };
+        let cpu_before = cpu.clone();
+        let mem_before = bus.mem.clone();
+
+        assert_bounded_protected_delivery_failure(&mut cpu, &mut bus, "stack write");
+        assert_eq!(cpu, cpu_before);
+        assert_eq!(
+            bus.mem, mem_before,
+            "partial frame bytes were not rolled back"
+        );
+    }
+
+    /// Same-CPL ring-0 IRET with a 16-bit operand restores the complete target
+    /// CS cache and SP only after validating the full frame and descriptor.
+    /// At CPL 0, IF and IOPL are writable; FLAGS bits 1/3/5/15 retain their
+    /// architectural fixed values while EFLAGS[31:16] remain unchanged.
+    ///
+    /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ (Operation, protected mode);
+    /// Vol. 1 §3.4.3; Vol. 3 §§2.3.1, 3.4.2–3.4.5, 6.12.1.
+    #[test]
+    fn protected_iret16_same_cpl_restores_cache_sp_and_flags() {
+        let descriptor = encode_seg_desc(
+            PROTECTED_IRET_RETURN_BASE,
+            0,
+            0x9A,
+            0x90, // G=1, D/B=0, L=0, AVL=1
+        );
+        let frame_flags = 0xBFFD; // IF+IOPL=3; reserved bits 3/5/15 deliberately set.
+        let (mut cpu, mut bus) =
+            protected_iret_fixture(0x0FFE, PROTECTED_IRET_RETURN_CS, frame_flags, descriptor);
+        let high_flags = 0x0000_0000_003D_0000; // RF/AC/VIF/VIP/ID, VM=0.
+        cpu.rflags = high_flags | 0x802A; // NT=0; low reserved bits start noncanonical.
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), 0x0FFE);
+        assert_eq!(cpu.cs.selector, PROTECTED_IRET_RETURN_CS);
+        assert_eq!(cpu.cs.base, u64::from(PROTECTED_IRET_RETURN_BASE));
+        assert_eq!(cpu.cs.limit, 0x0FFF);
+        assert_eq!(cpu.cs.flags, 0x909A);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), PROTECTED_IRET_FRAME_SP + 6);
+        assert_eq!(cpu.rflags, high_flags | 0x3FD7);
+        assert!(cpu.interrupt_flag(), "CPL-0 IRET must restore IF");
+    }
+
+    /// A 16-bit interrupt gate clears IF on entry; IRET restores the saved
+    /// same-CPL frame, including IF and the original CS descriptor cache.
+    ///
+    /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ; Vol. 3 §§6.11.2, 6.12.1.
+    #[test]
+    fn protected_iret16_round_trips_interrupt_gate_and_if() {
+        let (mut cpu, mut bus) = protected_fault_fixture(6, 0x86);
+        bus.mem[PROTECTED_TEST_GDT + 16..PROTECTED_TEST_GDT + 24]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9A, 0));
+        cpu.gdtr.limit = 23;
+        let handler = 0x2000usize + usize::from(PROTECTED_TEST_HANDLER);
+        bus.mem[handler] = 0xCF;
+        cpu.rflags = 0x0AD7;
+        let expected = cpu.clone();
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(!cpu.interrupt_flag(), "interrupt gate did not clear IF");
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu, expected);
+    }
+
+    /// Error-code frames are not special-cased by IRET. The trap handler
+    /// explicitly executes ADD SP,2 before IRET, then returns to the faulting
+    /// instruction with the original CS:IP, SP, FLAGS, and segment cache.
+    ///
+    /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ; Vol. 3 §§6.12.1, 6.13.
+    #[test]
+    fn protected_iret16_round_trips_trap_gate_after_error_discard() {
+        let (mut cpu, mut bus) = protected_fault_fixture(13, 0x87);
+        // MOV DS,AX with an execute-only code descriptor raises #GP(0x18).
+        bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 2].copy_from_slice(&[0x8E, 0xD8]);
+        bus.mem[PROTECTED_TEST_GDT + 16..PROTECTED_TEST_GDT + 24]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9A, 0));
+        bus.mem[PROTECTED_TEST_GDT + 24..PROTECTED_TEST_GDT + 32]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x98, 0));
+        cpu.gdtr.limit = 31;
+        cpu.set_ax(0x0018);
+        cpu.rflags = 0x0AD7;
+        let handler = 0x2000usize + usize::from(PROTECTED_TEST_HANDLER);
+        // ADD SP,2 discards #GP's error code; IRET consumes only IP, CS, FLAGS.
+        bus.mem[handler..handler + 4].copy_from_slice(&[0x83, 0xC4, 0x02, 0xCF]);
+        let expected = cpu.clone();
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6);
+        assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0x0018);
+        assert!(cpu.interrupt_flag(), "trap gate must preserve IF");
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF8);
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu, expected);
+    }
+
+    /// Selector, table, type, presence, privilege, width, and target-limit
+    /// checks fault before any architectural return state is committed.
+    /// Selector errors preserve TI/index and clear RPL; target-limit #GP uses 0.
+    ///
+    /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ (Protected Mode Exceptions);
+    /// Vol. 3 §§3.4.2–3.4.5, 5.5, 6.13, 6.15.
+    #[test]
+    fn protected_iret16_validation_faults_are_atomic() {
+        let valid = encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x9A, 0);
+        let cases = [
+            ("null selector", 0x0003, valid, 0x00FF, 0x0100, 13, 0x0000),
+            ("LDT selector", 0x0024, valid, 0x00FF, 0x0100, 13, 0x0024),
+            ("GDT limit", 0x0083, valid, 0x007F, 0x0100, 13, 0x0080),
+            (
+                "data descriptor",
+                0x0020,
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x92, 0),
+                0x00FF,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "system descriptor",
+                0x0020,
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x8A, 0),
+                0x00FF,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "not present",
+                0x0020,
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x1A, 0),
+                0x00FF,
+                0x0100,
+                11,
+                0x0020,
+            ),
+            (
+                "DPL mismatch",
+                0x0020,
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0xBA, 0),
+                0x00FF,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            ("RPL mismatch", 0x0021, valid, 0x00FF, 0x0100, 13, 0x0020),
+            (
+                "conforming code",
+                0x0020,
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x9E, 0),
+                0x00FF,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "default-32 code",
+                0x0020,
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x9A, 0x40),
+                0x00FF,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "effective limit",
+                0x0020,
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0, 0x9A, 0x80),
+                0x00FF,
+                0x1000,
+                13,
+                0x0000,
+            ),
+        ];
+
+        for &(name, selector, descriptor, gdt_limit, ip, vector, error_code) in &cases {
+            let (mut cpu, mut bus) = protected_iret_fixture(ip, selector, 0x0203, descriptor);
+            cpu.gdtr.limit = gdt_limit;
+            let cpu_before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), vector, Some(error_code));
+            assert_eq!(cpu, cpu_before, "{name}: IRET state partially committed");
+        }
+    }
+
+    /// Every IP/CS/FLAGS byte is read from the old SS:SP before SP or any
+    /// return state changes. A limit failure, truncated frame, or late bus
+    /// failure therefore raises #SS(0) with the complete CPU state unchanged.
+    ///
+    /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ (Protected Mode Exceptions);
+    /// Vol. 3 §§5.3, 6.12.1, 6.15.
+    #[test]
+    fn protected_iret16_stack_frame_reads_are_atomic() {
+        let valid = encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x9A, 0);
+
+        let (mut cpu, mut bus) =
+            protected_iret_fixture(0x0100, PROTECTED_IRET_RETURN_CS, 0x0203, valid);
+        cpu.ss.limit = u32::from(PROTECTED_IRET_FRAME_SP) + 4;
+        let cpu_before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert_eq!(cpu, cpu_before, "stack-limit fault changed CPU state");
+
+        let (mut cpu, mut bus) = protected_iret_fixture(0x0100, 0, 0x0203, valid);
+        bus.mem.truncate(usize::from(PROTECTED_IRET_FRAME_SP) + 5);
+        let cpu_before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert_eq!(
+            cpu, cpu_before,
+            "truncated FLAGS read changed CPU state or validated CS too early"
+        );
+
+        let (mut cpu, fixture) =
+            protected_iret_fixture(0x0100, PROTECTED_IRET_RETURN_CS, 0x0203, valid);
+        let mut bus = FailOnceReadBus {
+            mem: fixture.mem,
+            fail_addr: u64::from(PROTECTED_IRET_FRAME_SP) + 5,
+            failed: false,
+        };
+        let cpu_before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert_eq!(cpu, cpu_before, "late FLAGS bus fault changed CPU state");
+    }
+
+    /// Both direct far-JMP16 encodings load a same-level, present,
+    /// nonconforming D=0 GDT code descriptor. G makes raw limit 0 effective as
+    /// 0xFFF, and the complete cached attributes are preserved. JMP leaves
+    /// FLAGS and every unrelated field unchanged.
+    ///
+    /// Spec: Intel SDM Vol. 2 JMP (far direct forms, Operation); Vol. 3
+    /// §§3.4.5, 5.8.1.
+    #[test]
+    fn protected_far_jump16_direct_forms_load_cs_cache_atomically() {
+        let descriptor = encode_seg_desc(
+            PROTECTED_FAR_JUMP_TARGET_BASE,
+            0,
+            0x9A,
+            0x90, // G=1, D/B=0, L=0, AVL=1
+        );
+
+        for form in ProtectedFarJumpForm::ALL {
+            let (mut cpu, mut bus) =
+                protected_far_jump_fixture(form, 0x0FFE, PROTECTED_FAR_JUMP_TARGET_CS, descriptor);
+            cpu.rflags = 0x0000_0000_0000_A5D7;
+            let mut expected = cpu.clone();
+            expected.cs.load_descriptor_cache(
+                PROTECTED_FAR_JUMP_TARGET_CS,
+                u64::from(PROTECTED_FAR_JUMP_TARGET_BASE),
+                0x0FFF,
+                0x909A,
+            );
+            expected.rip = 0x0FFE;
+
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(cpu, expected, "{} changed unrelated state", form.name());
+        }
+    }
+
+    /// Selector/table/type/presence/privilege checks precede CS:IP commit for
+    /// both direct forms. Selector-derived #GP/#NP codes clear RPL bits but
+    /// retain TI/index; an offset beyond the effective segment limit is #GP(0).
+    /// D=1 and conforming segments are deliberately rejected by this bounded
+    /// D=0 nonconforming slice.
+    ///
+    /// Spec: Intel SDM Vol. 2 JMP, Protected Mode Exceptions; Vol. 3
+    /// §§3.4.5, 5.8.1, 6.13.
+    #[test]
+    fn protected_far_jump16_validation_faults_are_atomic_and_delivered() {
+        let valid = encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x9A, 0);
+        let cases = [
+            ("null selector", 0x0000, valid, 0x007F, 0x0100, 13, 0x0000),
+            ("LDT selector", 0x0024, valid, 0x007F, 0x0100, 13, 0x0024),
+            ("GDT limit", 0x0080, valid, 0x007F, 0x0100, 13, 0x0080),
+            (
+                "data descriptor",
+                0x0020,
+                encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x92, 0),
+                0x007F,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "system descriptor",
+                0x0020,
+                encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x82, 0),
+                0x007F,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "not present",
+                0x0020,
+                encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x1A, 0),
+                0x007F,
+                0x0100,
+                11,
+                0x0020,
+            ),
+            (
+                "DPL mismatch",
+                0x0020,
+                encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0xBA, 0),
+                0x007F,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            ("RPL mismatch", 0x0021, valid, 0x007F, 0x0100, 13, 0x0020),
+            (
+                "conforming code",
+                0x0020,
+                encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x9E, 0),
+                0x007F,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "default-32 code",
+                0x0020,
+                encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x9A, 0x40),
+                0x007F,
+                0x0100,
+                13,
+                0x0020,
+            ),
+            (
+                "effective limit",
+                0x0020,
+                encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0, 0x9A, 0x80),
+                0x007F,
+                0x1000,
+                13,
+                0x0000,
+            ),
+        ];
+
+        for form in ProtectedFarJumpForm::ALL {
+            for &(name, selector, descriptor, gdt_limit, offset, vector, error_code) in &cases {
+                let (mut cpu, mut bus) =
+                    protected_far_jump_fixture(form, offset, selector, descriptor);
+                cpu.gdtr.limit = gdt_limit;
+                let cpu_before = cpu.clone();
+
+                assert_arch_fault(step_inner(&mut cpu, &mut bus), vector, Some(error_code));
+                assert_eq!(
+                    cpu,
+                    cpu_before,
+                    "{} {name}: target state committed before fault",
+                    form.name()
+                );
+
+                let (mut cpu, mut bus) =
+                    protected_far_jump_fixture(form, offset, selector, descriptor);
+                cpu.gdtr.limit = gdt_limit;
+                cpu.rflags = 0x0000_0000_0000_8A57;
+                let saved_flags = cpu.rflags as u16;
+
+                step(&mut cpu, &mut bus).unwrap();
+
+                assert_eq!(
+                    cpu.cs.selector,
+                    PROTECTED_COMPAT_TARGET_CS,
+                    "{} {name}: protected fault gate was not entered",
+                    form.name()
+                );
+                assert_eq!(cpu.cs.base, 0);
+                assert_eq!(cpu.cs.limit, 0xFFFF);
+                assert_eq!(cpu.cs.flags, 0x009A);
+                assert_eq!(cpu.ip16(), if vector == 11 { 0x0B00 } else { 0x0D00 });
+                assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6);
+                assert_eq!(bus.read_u16(0xFFF6).unwrap(), error_code);
+                assert_eq!(bus.read_u16(0xFFF8).unwrap(), PROTECTED_TEST_CODE as u16);
+                assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0010);
+                assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+            }
+        }
+    }
+
+    /// Fetch truncation and a partial m16:16 operand read fault before CS:IP
+    /// commit. These tests use `step_inner` so the faulting architectural state
+    /// can be compared directly, before the protected #GP gate changes CS:IP.
+    ///
+    /// Spec: Intel SDM Vol. 2 JMP, Protected Mode Exceptions; Vol. 3 §6.13.
+    #[test]
+    fn protected_far_jump16_fetch_and_pointer_truncation_are_atomic() {
+        let descriptor = encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x9A, 0);
+
+        for form in ProtectedFarJumpForm::ALL {
+            let (mut cpu, mut bus) =
+                protected_far_jump_fixture(form, 0x0100, PROTECTED_FAR_JUMP_TARGET_CS, descriptor);
+            bus.mem
+                .truncate(PROTECTED_TEST_CODE + form.instruction_len() - 1);
+            let cpu_before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+            assert_eq!(
+                cpu,
+                cpu_before,
+                "{} fetch truncation changed CPU state",
+                form.name()
+            );
+        }
+
+        let (mut cpu, mut bus) = protected_far_jump_fixture(
+            ProtectedFarJumpForm::Memory,
+            0x0100,
+            PROTECTED_FAR_JUMP_TARGET_CS,
+            descriptor,
+        );
+        bus.mem.truncate(0x3003); // selector high byte is missing
+        let cpu_before = cpu.clone();
+
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, cpu_before, "partial far pointer changed CPU state");
+    }
+
+    /// A late pointer-byte or descriptor-byte read failure becomes #GP(0) only
+    /// after the complete target transfer has remained uncommitted. The
+    /// fail-once bus then permits the imported protected fault gate to deliver
+    /// that payload and expose the original CS:IP in its frame.
+    ///
+    /// Spec: Intel SDM Vol. 2 JMP, Protected Mode Exceptions; Vol. 3
+    /// §§5.8.1, 6.13.
+    #[test]
+    fn protected_far_jump16_memory_read_faults_do_not_partially_commit() {
+        let descriptor = encode_seg_desc(PROTECTED_FAR_JUMP_TARGET_BASE, 0xFFFF, 0x9A, 0);
+
+        let (mut cpu, fixture) = protected_far_jump_fixture(
+            ProtectedFarJumpForm::Memory,
+            0x0100,
+            PROTECTED_FAR_JUMP_TARGET_CS,
+            descriptor,
+        );
+        let mut bus = FailOnceReadBus {
+            mem: fixture.mem,
+            fail_addr: 0x3003,
+            failed: false,
+        };
+        let saved_flags = cpu.rflags as u16;
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
+        assert_eq!(cpu.ip16(), 0x0D00);
+        assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), PROTECTED_TEST_CODE as u16);
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0010);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+
+        for form in ProtectedFarJumpForm::ALL {
+            let (mut cpu, fixture) =
+                protected_far_jump_fixture(form, 0x0100, PROTECTED_FAR_JUMP_TARGET_CS, descriptor);
+            let mut bus = FailOnceReadBus {
+                mem: fixture.mem,
+                fail_addr: (PROTECTED_TEST_GDT + usize::from(PROTECTED_FAR_JUMP_TARGET_CS) + 7)
+                    as u64,
+                failed: false,
+            };
+            let saved_flags = cpu.rflags as u16;
+
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
+            assert_eq!(cpu.ip16(), 0x0D00);
+            assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0);
+            assert_eq!(bus.read_u16(0xFFF8).unwrap(), PROTECTED_TEST_CODE as u16);
+            assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0010);
+            assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
         }
     }
 
@@ -10481,23 +12585,26 @@ mod tests {
         assert_eq!(cpu.cr0 & 0xFFFF, 0x0011, "ET loaded; PE remains set");
     }
 
-    /// LMSW PE=1 enables MOV DS GDT loads; far JMP stays real-mode CS.
-    /// Spec: Intel SDM Vol. 2 "LMSW" / "MOV" (Sreg); Vol. 3 §2.5, §3.4.3–§3.5.1.
-    /// Contract change vs prior sticky-real-mode DS under PE: DS now consults GDTR.
+    /// LMSW PE=1 enables both MOV DS and direct far JMP GDT cache loads.
+    /// Spec: Intel SDM Vol. 2 LMSW / MOV Sreg / JMP; Vol. 3
+    /// §§2.5, 3.4.3–3.5.1, 5.8.1.
     #[test]
-    fn lmsw_pe_enables_mov_ds_gdt_far_jmp_still_real() {
+    fn lmsw_pe_enables_mov_ds_and_far_jmp_gdt_loads() {
         let mut mem = vec![0u8; 0x30000];
         let gdt = 0x8000usize;
         // GDT[0]=null; GDT[1] selector 0x08: data base=0x0002_0000 limit=0xFFFF access=0x92
         let desc = encode_seg_desc(0x0002_0000, 0xFFFF, 0x92, 0x00);
         mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
+        // GDT[2] selector 0x10: D=0 code base=0x0001_0000, limit=0xFFFF.
+        let code_desc = encode_seg_desc(0x0001_0000, 0xFFFF, 0x9A, 0x00);
+        mem[gdt + 16..gdt + 24].copy_from_slice(&code_desc);
 
         let code = 0x1000usize;
         // +0: B8 01 00         MOV AX, 1
         // +3: 0F 01 F0         LMSW AX            (CR0.PE ← 1)
         // +6: B8 08 00         MOV AX, 0x08
         // +9: 8E D8            MOV DS, AX         (GDT load)
-        // +B: EA 00 02 00 20   JMP 2000:0200      (far JMP still real-mode CS)
+        // +B: EA 00 02 10 00   JMP 0010:0200      (GDT code load)
         mem[code] = 0xB8;
         mem[code + 1] = 0x01;
         mem[code + 2] = 0x00;
@@ -10512,9 +12619,9 @@ mod tests {
         mem[code + 11] = 0xEA;
         mem[code + 12] = 0x00;
         mem[code + 13] = 0x02;
-        mem[code + 14] = 0x00;
-        mem[code + 15] = 0x20;
-        mem[0x20200] = 0xF4;
+        mem[code + 14] = 0x10;
+        mem[code + 15] = 0x00;
+        mem[0x10200] = 0xF4;
 
         let mut cpu = CpuState::reset();
         cpu.cs = x86_core::SegmentReg::real_mode_code(0);
@@ -10522,7 +12629,7 @@ mod tests {
         cpu.ds.limit = 0xFFFF_FFFF; // prior unreal cache must be replaced by GDT load
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.gdtr.base = gdt as u64;
-        cpu.gdtr.limit = 15; // two entries
+        cpu.gdtr.limit = 23; // null + data + code
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
@@ -10539,12 +12646,10 @@ mod tests {
         assert_eq!(cpu.ds.flags, 0x0092);
 
         step(&mut cpu, &mut bus).unwrap(); // JMP far
-        assert_eq!(cpu.cs.selector, 0x2000);
-        assert_eq!(
-            cpu.cs.base,
-            0x2000u64 << 4,
-            "after LMSW PE=1, far JMP still uses real-mode CS base"
-        );
+        assert_eq!(cpu.cs.selector, 0x0010);
+        assert_eq!(cpu.cs.base, 0x0001_0000);
+        assert_eq!(cpu.cs.limit, 0xFFFF);
+        assert_eq!(cpu.cs.flags, 0x009A);
         assert_eq!(cpu.ip16(), 0x0200);
     }
 
@@ -10695,6 +12800,25 @@ mod tests {
         assert_eq!(cpu.ds.limit, 0x0FFF);
     }
 
+    /// Parsed descriptors retain the access byte and AVL/L/D-B/G nibble in
+    /// their architectural positions, for both byte and page granularity.
+    /// Spec: Intel SDM Vol. 3 §§3.4.3–3.4.5.
+    #[test]
+    fn parsed_segment_descriptors_preserve_full_attributes() {
+        let byte_granular = encode_seg_desc(0x1234_5000, 0xA_BCDE, 0x97, 0x70);
+        let (base, limit, flags) = parse_data_segment_descriptor(byte_granular, 0x0008, 0).unwrap();
+        assert_eq!(base, 0x1234_5000);
+        assert_eq!(limit, 0xA_BCDE);
+        assert_eq!(flags, 0x7097, "access + AVL/L/D-B must be cached");
+
+        let page_granular = encode_seg_desc(0x5678_9000, 0x1_2345, 0x96, 0xD0);
+        let (base, limit, flags) =
+            parse_stack_segment_descriptor(page_granular, 0x0010, 0).unwrap();
+        assert_eq!(base, 0x5678_9000);
+        assert_eq!(limit, 0x1234_5FFF);
+        assert_eq!(flags, 0xD096, "access + AVL/D-B/G must be cached");
+    }
+
     /// PE=1 MOV DS loads data-segment descriptor from GDT (base/limit/AR + G-bit).
     /// Spec: Intel SDM Vol. 2 MOV (Sreg, r/m16); Vol. 3 §3.4.5 / §3.5.1.
     #[test]
@@ -10702,7 +12826,8 @@ mod tests {
         let mut mem = vec![0u8; 0x10000];
         // IVT unused; GDT at 0x5000
         let gdt = 0x5000usize;
-        // Selector 0x08: base=0x0011_2200, limit20=0xF_FFFF, G=1 → eff 0xFFFF_FFFF, AR=0x92
+        // Selector 0x08: base=0x0011_2200, limit20=0xF_FFFF, G=1
+        // → effective limit 0xFFFF_FFFF, cached attributes 0x8092.
         let desc = encode_seg_desc(0x0011_2200, 0xF_FFFF, 0x92, 0x80);
         mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
 
@@ -10733,7 +12858,7 @@ mod tests {
         assert_eq!(cpu.ds.selector, 0x08);
         assert_eq!(cpu.ds.base, 0x0011_2200);
         assert_eq!(cpu.ds.limit, 0xFFFF_FFFF, "G=1 expands limit");
-        assert_eq!(cpu.ds.flags, 0x0092);
+        assert_eq!(cpu.ds.flags, 0x8092);
         assert_eq!(cpu.ip16(), (code + 5) as u16);
     }
 
@@ -10743,7 +12868,9 @@ mod tests {
     fn mov_es_pe1_loads_gdt_data_descriptor() {
         let mut mem = vec![0u8; 0x10000];
         let gdt = 0x5000usize;
-        let desc = encode_seg_desc(0x0000_4000, 0x1FFF, 0x93, 0x00);
+        // Byte-granular descriptor with AVL=1 and L=1; cache the attributes
+        // exactly even though neither changes this slice's execution behavior.
+        let desc = encode_seg_desc(0x0000_4000, 0x1FFF, 0x93, 0x30);
         mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
 
         let code = 0x1000usize;
@@ -10771,19 +12898,15 @@ mod tests {
         assert_eq!(cpu.es.selector, 0x08);
         assert_eq!(cpu.es.base, 0x0000_4000);
         assert_eq!(cpu.es.limit, 0x1FFF);
-        assert_eq!(cpu.es.flags, 0x0093);
+        assert_eq!(cpu.es.flags, 0x3093);
+        assert!(!cpu.es.default_big(), "AVL/L do not imply D/B");
     }
 
-    /// PE=1 MOV DS with not-present data descriptor → #NP via IVT (vector 11).
-    /// Spec: Intel SDM Vol. 2 MOV protected-mode exceptions (#NP(selector)).
+    /// PE=1 MOV DS with not-present data descriptor → #NP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_ds_pe1_not_present_np_via_ivt() {
+    fn mov_ds_pe1_not_present_np_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        // IVT #NP vector 11 → handler at 0x0C00
-        mem[11 * 4] = 0x00;
-        mem[11 * 4 + 1] = 0x0C;
-        mem[11 * 4 + 2] = 0x00;
-        mem[11 * 4 + 3] = 0x00;
         let gdt = 0x5000usize;
         // P=0 data segment (access 0x12)
         let desc = encode_seg_desc(0x1000, 0xFFFF, 0x12, 0x00);
@@ -10808,15 +12931,169 @@ mod tests {
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 11, 0x0C00);
 
         step(&mut cpu, &mut bus).unwrap(); // MOV AX
         step(&mut cpu, &mut bus).unwrap(); // MOV DS → #NP
         assert_eq!(cpu.ip16(), 0x0C00, "#NP handler");
-        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(
             cpu.ds, ds_before,
             "failed MOV DS must not update segment cache"
         );
+    }
+
+    /// Descriptor faults carry selector error codes with RPL cleared, TI preserved,
+    /// and leave the full destination cache unchanged.
+    /// Spec: Intel SDM Vol. 3 §§6.13, 6.15; Vol. 2 MOV Sreg.
+    #[test]
+    fn data_segment_fault_payloads_mask_selector_and_preserve_state() {
+        let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x5000usize;
+        let not_present = encode_seg_desc(0x1000, 0xFFFF, 0x72, 0);
+        let execute_only_code = encode_seg_desc(0x2000, 0xFFFF, 0x98, 0);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&not_present);
+        mem[gdt + 16..gdt + 24].copy_from_slice(&execute_only_code);
+
+        let mut cpu = CpuState::reset();
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x0023,
+            base: 0x1234_0000,
+            limit: 0xABCD,
+            flags: 0x0093,
+        };
+        let ds_before = cpu.ds.clone();
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 23;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        assert_arch_fault(
+            load_data_sreg_from_gdt(&mut cpu, &mut bus, 3, 0x000B),
+            11,
+            Some(0x0008),
+        );
+        assert_eq!(cpu.ds, ds_before, "#NP must not partially load DS");
+
+        assert_arch_fault(
+            load_data_sreg_from_gdt(&mut cpu, &mut bus, 3, 0x0013),
+            13,
+            Some(0x0010),
+        );
+        assert_eq!(cpu.ds, ds_before, "type #GP must not partially load DS");
+
+        assert_arch_fault(
+            load_data_sreg_from_gdt(&mut cpu, &mut bus, 3, 0x001B),
+            13,
+            Some(0x0018),
+        );
+        assert_eq!(cpu.ds, ds_before, "limit #GP must not partially load DS");
+
+        assert_arch_fault(
+            load_data_sreg_from_gdt(&mut cpu, &mut bus, 3, 0x000F),
+            13,
+            Some(0x000C),
+        );
+        assert_eq!(cpu.ds, ds_before, "LDT #GP must not partially load DS");
+    }
+
+    /// SS descriptor faults use #GP(0), #GP(selector), or #SS(selector) as
+    /// appropriate and leave the full SS cache unchanged.
+    /// Spec: Intel SDM Vol. 3 §§6.13, 6.15; Vol. 2 MOV Sreg.
+    #[test]
+    fn stack_segment_fault_payloads_mask_selector_and_preserve_state() {
+        let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x5000usize;
+        let not_present = encode_seg_desc(0x1000, 0xFFFF, 0x12, 0);
+        let read_only = encode_seg_desc(0x2000, 0xFFFF, 0x90, 0);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&not_present);
+        mem[gdt + 16..gdt + 24].copy_from_slice(&read_only);
+
+        let mut cpu = CpuState::reset();
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0020,
+            base: 0x5678_0000,
+            limit: 0xCDEF,
+            flags: 0x0093,
+        };
+        let ss_before = cpu.ss.clone();
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 23;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        assert_arch_fault(load_ss_from_gdt(&mut cpu, &mut bus, 0x0003), 13, Some(0));
+        assert_eq!(cpu.ss, ss_before, "null #GP must not partially load SS");
+
+        assert_arch_fault(
+            load_ss_from_gdt(&mut cpu, &mut bus, 0x0008),
+            12,
+            Some(0x0008),
+        );
+        assert_eq!(cpu.ss, ss_before, "#SS must not partially load SS");
+
+        assert_arch_fault(
+            load_ss_from_gdt(&mut cpu, &mut bus, 0x0013),
+            13,
+            Some(0x0010),
+        );
+        assert_eq!(cpu.ss, ss_before, "type #GP must not partially load SS");
+
+        assert_arch_fault(
+            load_ss_from_gdt(&mut cpu, &mut bus, 0x001B),
+            13,
+            Some(0x0018),
+        );
+        assert_eq!(cpu.ss, ss_before, "limit #GP must not partially load SS");
+
+        assert_arch_fault(
+            load_ss_from_gdt(&mut cpu, &mut bus, 0x000F),
+            13,
+            Some(0x000C),
+        );
+        assert_eq!(cpu.ss, ss_before, "LDT #GP must not partially load SS");
+    }
+
+    /// Selector payloads become the final word of a protected-mode exception
+    /// frame, below faulting IP, CS, and FLAGS.
+    /// Spec: Intel SDM Vol. 3 §§6.12.1, 6.13, 6.15; Vol. 2 MOV Sreg.
+    #[test]
+    fn selector_fault_payload_is_pushed_by_protected_mode_delivery() {
+        let mut mem = vec![0u8; 0x10000];
+        let gdt = 0x5000usize;
+        let not_present = encode_seg_desc(0x1000, 0xFFFF, 0x72, 0);
+        mem[gdt + 8..gdt + 16].copy_from_slice(&not_present);
+
+        let code = 0x1000usize;
+        mem[code] = 0xB8;
+        mem[code + 1] = 0x0B;
+        mem[code + 2] = 0x00;
+        mem[code + 3] = 0x8E;
+        mem[code + 4] = 0xD8;
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0x1111);
+        let ds_before = cpu.ds.clone();
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.cr0 |= 1;
+        cpu.gdtr.base = gdt as u64;
+        cpu.gdtr.limit = 15;
+        cpu.rip = code as u64;
+        cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        let saved_flags = cpu.rflags as u16;
+        let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 11, 0x0C00);
+
+        step(&mut cpu, &mut bus).unwrap();
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), 0x0C00);
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF6);
+        assert_eq!(bus.read_u16(0xFFF6).unwrap(), 0x0008);
+        assert_eq!(bus.read_u16(0xFFF8).unwrap(), (code + 3) as u16);
+        assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), saved_flags);
+        assert_eq!(cpu.ds, ds_before);
     }
 
     /// PE=1 null selector into DS clears hidden cache (no #GP). Spec: SDM Vol. 3 §5.4.1.
@@ -10855,22 +13132,17 @@ mod tests {
         assert_eq!(cpu.ds.flags, 0);
     }
 
-    /// PE=1 MOV DS with index past GDTR.limit → #GP via IVT (vector 13).
-    /// Spec: Intel SDM Vol. 2 MOV — #GP(selector) if index outside table limits.
+    /// PE=1 MOV DS with index past GDTR.limit → #GP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_ds_pe1_gdt_limit_gp_via_ivt() {
+    fn mov_ds_pe1_gdt_limit_gp_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[13 * 4] = 0x00;
-        mem[13 * 4 + 1] = 0x0D;
-        mem[13 * 4 + 2] = 0x00;
-        mem[13 * 4 + 3] = 0x00;
-
         let code = 0x1000usize;
         mem[code] = 0xB8;
-        mem[code + 1] = 0x08;
+        mem[code + 1] = 0x80;
         mem[code + 2] = 0x00;
         mem[code + 3] = 0x8E;
-        mem[code + 4] = 0xD8; // selector 0x08 needs bytes 8..=15; limit=7 → #GP
+        mem[code + 4] = 0xD8; // selector 0x80 lies beyond gate CS at limit 0x7F
         mem[code + 5] = 0xF4;
 
         let mut cpu = CpuState::reset();
@@ -10880,14 +13152,16 @@ mod tests {
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.cr0 |= 1;
         cpu.gdtr.base = 0x5000;
-        cpu.gdtr.limit = 7; // only null entry
+        cpu.gdtr.limit = 0x7F; // gate CS at index 15; source selector 0x80 is index 16
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 13, 0x0D00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(cpu.ds, ds_before, "failed MOV DS must not update cache");
     }
 
@@ -10928,7 +13202,8 @@ mod tests {
     fn mov_fs_pe1_loads_gdt_data_descriptor() {
         let mut mem = vec![0u8; 0x10000];
         let gdt = 0x5000usize;
-        // Selector 0x08: base=0x0022_3300, limit20=0xF_FFFF, G=1 → eff 0xFFFF_FFFF, AR=0x92
+        // Selector 0x08: base=0x0022_3300, limit20=0xF_FFFF, G=1
+        // → effective limit 0xFFFF_FFFF, cached attributes 0x8092.
         let desc = encode_seg_desc(0x0022_3300, 0xF_FFFF, 0x92, 0x80);
         mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
 
@@ -10959,7 +13234,7 @@ mod tests {
         assert_eq!(cpu.fs.selector, 0x08);
         assert_eq!(cpu.fs.base, 0x0022_3300);
         assert_eq!(cpu.fs.limit, 0xFFFF_FFFF, "G=1 expands limit");
-        assert_eq!(cpu.fs.flags, 0x0092);
+        assert_eq!(cpu.fs.flags, 0x8092);
         assert_eq!(cpu.ip16(), (code + 5) as u16);
     }
 
@@ -11041,15 +13316,11 @@ mod tests {
         assert_eq!(cpu.fs.flags, 0x0092);
     }
 
-    /// PE=1 MOV FS with not-present data descriptor → #NP via IVT (vector 11).
-    /// Spec: Intel SDM Vol. 2 MOV protected-mode exceptions (#NP(selector)).
+    /// PE=1 MOV FS with not-present data descriptor → #NP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_fs_pe1_not_present_np_via_ivt() {
+    fn mov_fs_pe1_not_present_np_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[11 * 4] = 0x00;
-        mem[11 * 4 + 1] = 0x0C;
-        mem[11 * 4 + 2] = 0x00;
-        mem[11 * 4 + 3] = 0x00;
         let gdt = 0x5000usize;
         let desc = encode_seg_desc(0x1000, 0xFFFF, 0x12, 0x00);
         mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
@@ -11073,11 +13344,12 @@ mod tests {
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 11, 0x0C00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0C00, "#NP handler");
-        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(
             cpu.fs, fs_before,
             "failed MOV FS must not update segment cache"
@@ -11120,22 +13392,17 @@ mod tests {
         assert_eq!(cpu.gs.flags, 0);
     }
 
-    /// PE=1 MOV GS with index past GDTR.limit → #GP via IVT (vector 13).
-    /// Spec: Intel SDM Vol. 2 MOV — #GP(selector) if index outside table limits.
+    /// PE=1 MOV GS with index past GDTR.limit → #GP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_gs_pe1_gdt_limit_gp_via_ivt() {
+    fn mov_gs_pe1_gdt_limit_gp_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[13 * 4] = 0x00;
-        mem[13 * 4 + 1] = 0x0D;
-        mem[13 * 4 + 2] = 0x00;
-        mem[13 * 4 + 3] = 0x00;
-
         let code = 0x1000usize;
         mem[code] = 0xB8;
-        mem[code + 1] = 0x08;
+        mem[code + 1] = 0x80;
         mem[code + 2] = 0x00;
         mem[code + 3] = 0x8E;
-        mem[code + 4] = 0xE8; // selector 0x08 needs bytes 8..=15; limit=7 → #GP
+        mem[code + 4] = 0xE8; // selector 0x80 lies beyond gate CS at limit 0x7F
         mem[code + 5] = 0xF4;
 
         let mut cpu = CpuState::reset();
@@ -11145,29 +13412,27 @@ mod tests {
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.cr0 |= 1;
         cpu.gdtr.base = 0x5000;
-        cpu.gdtr.limit = 7;
+        cpu.gdtr.limit = 0x7F; // gate CS at index 15; source selector 0x80 is index 16
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 13, 0x0D00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(cpu.gs, gs_before, "failed MOV GS must not update cache");
     }
 
-    /// PE=1 MOV FS with code-segment descriptor → #GP via IVT (invalid type).
-    /// Spec: Intel SDM Vol. 2 MOV — DS/ES/FS/GS must reference data segment.
+    /// PE=1 MOV FS with code-segment descriptor → #GP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_fs_pe1_code_descriptor_gp_via_ivt() {
+    fn mov_fs_pe1_execute_only_code_descriptor_gp_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[13 * 4] = 0x00;
-        mem[13 * 4 + 1] = 0x0D;
-        mem[13 * 4 + 2] = 0x00;
-        mem[13 * 4 + 3] = 0x00;
         let gdt = 0x5000usize;
-        // Executable code segment (access 0x9A) — not valid for FS load.
-        let desc = encode_seg_desc(0x1000, 0xFFFF, 0x9A, 0x00);
+        // Execute-only code segment (access 0x98) — not valid for FS load.
+        let desc = encode_seg_desc(0x1000, 0xFFFF, 0x98, 0x00);
         mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
 
         let code = 0x1000usize;
@@ -11189,10 +13454,12 @@ mod tests {
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 13, 0x0D00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(cpu.fs, fs_before, "failed MOV FS must not update cache");
     }
 
@@ -11233,8 +13500,9 @@ mod tests {
     fn mov_ss_pe1_loads_gdt_writable_data_descriptor() {
         let mut mem = vec![0u8; 0x10000];
         let gdt = 0x5000usize;
-        // Selector 0x08: writable data, base=0x0003_0000, limit=0x7FFF, AR=0x92
-        let desc = encode_seg_desc(0x0003_0000, 0x7FFF, 0x92, 0x00);
+        // Selector 0x08: writable data, base=0x0003_0000, limit=0x7FFF,
+        // access=0x92, B=1 (32-bit stack-pointer width).
+        let desc = encode_seg_desc(0x0003_0000, 0x7FFF, 0x92, 0x40);
         mem[gdt + 8..gdt + 16].copy_from_slice(&desc);
 
         let code = 0x1000usize;
@@ -11263,7 +13531,8 @@ mod tests {
         assert_eq!(cpu.ss.selector, 0x08);
         assert_eq!(cpu.ss.base, 0x0003_0000);
         assert_eq!(cpu.ss.limit, 0x7FFF);
-        assert_eq!(cpu.ss.flags, 0x0092);
+        assert_eq!(cpu.ss.flags, 0x4092);
+        assert_eq!(cpu.ss.stack_width(), 32);
         assert_eq!(cpu.ip16(), (code + 5) as u16);
     }
 
@@ -11341,15 +13610,11 @@ mod tests {
         assert_eq!(cpu.ss.flags, 0x0093);
     }
 
-    /// PE=1 null selector into SS → #GP via IVT (vector 13). Spec: SDM Vol. 3 §5.4.1.
+    /// PE=1 null selector into SS → #GP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 3 §§5.4.1, 6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_ss_pe1_null_selector_gp_via_ivt() {
+    fn mov_ss_pe1_null_selector_gp_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[13 * 4] = 0x00;
-        mem[13 * 4 + 1] = 0x0D;
-        mem[13 * 4 + 2] = 0x00;
-        mem[13 * 4 + 3] = 0x00;
-
         let code = 0x1000usize;
         // B8 00 00  MOV AX, 0
         // 8E D0     MOV SS, AX → #GP
@@ -11366,7 +13631,7 @@ mod tests {
         cpu.ss = x86_core::SegmentReg {
             selector: 0x0010,
             base: 0,
-            limit: 0xBEEF,
+            limit: 0xFFFF,
             flags: 0x0093,
         };
         let ss_before = cpu.ss.clone();
@@ -11375,22 +13640,20 @@ mod tests {
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 13, 0x0D00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(cpu.ss, ss_before, "failed MOV SS must not update cache");
     }
 
-    /// PE=1 MOV SS with not-present writable data → #SS via IVT (vector 12).
-    /// Spec: Intel SDM Vol. 2 MOV protected-mode exceptions (#SS(selector)).
+    /// PE=1 MOV SS with not-present writable data → #SS via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_ss_pe1_not_present_ss_via_ivt() {
+    fn mov_ss_pe1_not_present_ss_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[12 * 4] = 0x00;
-        mem[12 * 4 + 1] = 0x0C;
-        mem[12 * 4 + 2] = 0x00;
-        mem[12 * 4 + 3] = 0x00;
         let gdt = 0x5000usize;
         // P=0 writable data (access 0x12)
         let desc = encode_seg_desc(0x1000, 0xFFFF, 0x12, 0x00);
@@ -11409,7 +13672,7 @@ mod tests {
         cpu.ss = x86_core::SegmentReg {
             selector: 0x0020,
             base: 0,
-            limit: 0xCAFE,
+            limit: 0xFFFF,
             flags: 0x0093,
         };
         let ss_before = cpu.ss.clone();
@@ -11419,26 +13682,23 @@ mod tests {
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 12, 0x0C00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0C00, "#SS handler");
-        assert_eq!(cpu.cs.selector, 0);
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(
             cpu.ss, ss_before,
             "failed MOV SS must not update segment cache"
         );
     }
 
-    /// PE=1 MOV SS with read-only data descriptor → #GP via IVT.
-    /// Spec: Intel SDM Vol. 2 MOV — SS must be writable data.
+    /// PE=1 MOV SS with read-only data descriptor → #GP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_ss_pe1_readonly_data_gp_via_ivt() {
+    fn mov_ss_pe1_readonly_data_gp_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[13 * 4] = 0x00;
-        mem[13 * 4 + 1] = 0x0D;
-        mem[13 * 4 + 2] = 0x00;
-        mem[13 * 4 + 3] = 0x00;
         let gdt = 0x5000usize;
         // Access 0x90: P=1 S=1 type=0 (data RO) — not valid for SS
         let desc = encode_seg_desc(0x1000, 0xFFFF, 0x90, 0x00);
@@ -11457,7 +13717,7 @@ mod tests {
         cpu.ss = x86_core::SegmentReg {
             selector: 0x0030,
             base: 0,
-            limit: 0xDEAD,
+            limit: 0xFFFF,
             flags: 0x0093,
         };
         let ss_before = cpu.ss.clone();
@@ -11467,26 +13727,23 @@ mod tests {
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 13, 0x0D00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(cpu.ss, ss_before, "failed MOV SS must not update cache");
     }
 
-    /// PE=1 MOV SS with index past GDTR.limit → #GP via IVT (vector 13).
-    /// Spec: Intel SDM Vol. 2 MOV — #GP(selector) if index outside table limits.
+    /// PE=1 MOV SS with index past GDTR.limit → #GP via a 16-bit IDT gate.
+    /// Spec: Intel SDM Vol. 2 MOV; Vol. 3 §§6.11.2, 6.12.1, 6.13.
     #[test]
-    fn mov_ss_pe1_gdt_limit_gp_via_ivt() {
+    fn mov_ss_pe1_gdt_limit_gp_via_idt() {
         let mut mem = vec![0u8; 0x10000];
-        mem[13 * 4] = 0x00;
-        mem[13 * 4 + 1] = 0x0D;
-        mem[13 * 4 + 2] = 0x00;
-        mem[13 * 4 + 3] = 0x00;
-
         let code = 0x1000usize;
         mem[code] = 0xB8;
-        mem[code + 1] = 0x08;
+        mem[code + 1] = 0x80;
         mem[code + 2] = 0x00;
         mem[code + 3] = 0x8E;
         mem[code + 4] = 0xD0;
@@ -11497,20 +13754,22 @@ mod tests {
         cpu.ss = x86_core::SegmentReg {
             selector: 0x0040,
             base: 0,
-            limit: 0xF00D,
+            limit: 0xFFFF,
             flags: 0x0093,
         };
         let ss_before = cpu.ss.clone();
         cpu.cr0 |= 1;
         cpu.gdtr.base = 0x5000;
-        cpu.gdtr.limit = 7; // only null entry
+        cpu.gdtr.limit = 0x7F; // gate CS at index 15; source selector 0x80 is index 16
         cpu.rip = code as u64;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
+        install_protected_test_exception_gate(&mut bus.mem, &mut cpu, 13, 0x0D00);
 
         step(&mut cpu, &mut bus).unwrap();
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.ip16(), 0x0D00, "#GP handler");
+        assert_eq!(cpu.cs.selector, PROTECTED_COMPAT_TARGET_CS);
         assert_eq!(cpu.ss, ss_before, "failed MOV SS must not update cache");
     }
 
@@ -13176,5 +15435,996 @@ mod tests {
         assert_eq!(err, ExecError::Unsupported(0x60));
         assert_eq!(cpu.ip16(), 0);
         assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+    }
+
+    const POP_SEG_STACK_BASE: usize = 0x2000;
+    const POP_SEG_STACK_SP: u16 = 0x0100;
+    const POP_SEG_SELECTOR: u16 = 0x0020;
+
+    fn protected_pop_segment_fixture(
+        opcode: u8,
+        selector: u16,
+        descriptor: Option<[u8; 8]>,
+        cpl: u8,
+    ) -> (CpuState, VecBus) {
+        let mut mem = vec![0u8; 0x10000];
+        mem[PROTECTED_TEST_CODE] = opcode;
+        let descriptor_offset = usize::from(selector >> 3) * 8;
+        if let Some(descriptor) = descriptor {
+            let descriptor_addr = PROTECTED_TEST_GDT + descriptor_offset;
+            mem[descriptor_addr..descriptor_addr + 8].copy_from_slice(&descriptor);
+        }
+        let stack_addr = POP_SEG_STACK_BASE + usize::from(POP_SEG_STACK_SP);
+        mem[stack_addr..stack_addr + 2].copy_from_slice(&selector.to_le_bytes());
+        // Poison the unbased offset so this also proves that POP reads old SS:SP.
+        mem[usize::from(POP_SEG_STACK_SP)..usize::from(POP_SEG_STACK_SP) + 2]
+            .copy_from_slice(&0x0000u16.to_le_bytes());
+
+        let code_access = 0x9A | (cpl << 5);
+        let data_access = 0x93 | (cpl << 5);
+        let mut cpu = CpuState::reset();
+        cpu.cr0 |= 1;
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x0010 | u16::from(cpl),
+            base: 0,
+            limit: 0xFFFF,
+            flags: u16::from(code_access),
+        };
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0018 | u16::from(cpl),
+            base: POP_SEG_STACK_BASE as u64,
+            limit: 0xFFFF,
+            flags: u16::from(data_access),
+        };
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x0030 | u16::from(cpl),
+            base: 0x3333_0000,
+            limit: 0x3333,
+            flags: u16::from(data_access),
+        };
+        cpu.es = x86_core::SegmentReg {
+            selector: 0x0038 | u16::from(cpl),
+            base: 0x4444_0000,
+            limit: 0x4444,
+            flags: u16::from(data_access),
+        };
+        cpu.gdtr.base = PROTECTED_TEST_GDT as u64;
+        cpu.gdtr.limit = if descriptor.is_some() {
+            (descriptor_offset + 7) as u16
+        } else {
+            0
+        };
+        cpu.rip = PROTECTED_TEST_CODE as u64;
+        cpu.rflags = 0x0AD7;
+        cpu.gpr[CpuState::RSP] = 0xA5A5_5A5A_0000_0000 | u64::from(POP_SEG_STACK_SP);
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        cpu.gpr[CpuState::RBX] = 0x5555_6666_7777_8888;
+        (cpu, VecBus { mem, ports: vec![] })
+    }
+
+    fn real_interrupt_shadow_fixture(code: &[u8]) -> (CpuState, VecBus) {
+        let mut mem = vec![0u8; 0x10000];
+        mem[..code.len()].copy_from_slice(code);
+        mem[usize::from(VECTOR_NMI) * 4..usize::from(VECTOR_NMI) * 4 + 4]
+            .copy_from_slice(&[0x00, 0x0D, 0x00, 0x00]);
+        mem[0x20 * 4..0x20 * 4 + 4].copy_from_slice(&[0x00, 0x0E, 0x00, 0x00]);
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.rflags = 0x0203;
+        cpu.set_ax(0);
+        cpu.set_gpr_u16(CpuState::RSP, 0x8000);
+        (cpu, VecBus { mem, ports: vec![] })
+    }
+
+    /// POP ES/DS/SS reads through the old 16-bit SS:SP, validates all descriptor
+    /// bytes, then commits the cache and advances SP exactly once.
+    ///
+    /// Spec: Intel SDM Vol. 2 POP (Protected Mode Exceptions); Vol. 3
+    /// §§3.4.3–3.4.5, 5.4.1.
+    #[test]
+    fn protected_pop_segments_load_gdt_caches_atomically() {
+        let cases = [
+            ("POP ES data", 0x07, 0, 0, 0x92, 0x10),
+            ("POP DS readable code", 0x1F, 3, 0, 0x9A, 0x80),
+            ("POP SS writable data", 0x17, 2, 0, 0x93, 0x10),
+            ("POP DS ring-3 readable code", 0x1F, 3, 3, 0xFA, 0x00),
+        ];
+
+        for (name, opcode, target, cpl, access, gran) in cases {
+            let selector = POP_SEG_SELECTOR | u16::from(cpl);
+            let base = 0x1234_5000 + u32::from(opcode);
+            let raw_limit = 0x1_2345;
+            let descriptor = encode_seg_desc(base, raw_limit, access, gran);
+            let (mut cpu, mut bus) =
+                protected_pop_segment_fixture(opcode, selector, Some(descriptor), cpl);
+            let before = cpu.clone();
+
+            step(&mut cpu, &mut bus).unwrap();
+
+            let loaded = match target {
+                0 => &cpu.es,
+                2 => &cpu.ss,
+                3 => &cpu.ds,
+                _ => unreachable!(),
+            };
+            assert_eq!(loaded.selector, selector, "{name}: selector");
+            assert_eq!(loaded.base, u64::from(base), "{name}: base");
+            let expected_limit = if gran & 0x80 != 0 {
+                (raw_limit << 12) | 0xFFF
+            } else {
+                raw_limit
+            };
+            assert_eq!(loaded.limit, expected_limit, "{name}: limit");
+            assert_eq!(
+                loaded.flags,
+                u16::from(access) | (u16::from(gran & 0xF0) << 8),
+                "{name}: cached attributes"
+            );
+            assert_eq!(cpu.ip16(), PROTECTED_TEST_CODE as u16 + 1, "{name}");
+            assert_eq!(
+                cpu.gpr[CpuState::RSP],
+                (before.gpr[CpuState::RSP] & !0xFFFF) | u64::from(POP_SEG_STACK_SP + 2),
+                "{name}: bounded 16-bit SP advances once"
+            );
+            assert_eq!(cpu.gpr[CpuState::RAX], before.gpr[CpuState::RAX], "{name}");
+            assert_eq!(cpu.gpr[CpuState::RBX], before.gpr[CpuState::RBX], "{name}");
+            assert_eq!(cpu.rflags, before.rflags, "{name}: FLAGS");
+            if target != 0 {
+                assert_eq!(cpu.es, before.es, "{name}: unrelated ES");
+            }
+            if target != 2 {
+                assert_eq!(cpu.ss, before.ss, "{name}: unrelated SS");
+            }
+            if target != 3 {
+                assert_eq!(cpu.ds, before.ds, "{name}: unrelated DS");
+            }
+        }
+    }
+
+    /// Null selectors (index zero, including nonzero RPL) are legal for DS/ES
+    /// and use the repository's cleared/unusable cache contract.
+    /// Spec: Intel SDM Vol. 2 POP; Vol. 3 §5.4.1.
+    #[test]
+    fn protected_pop_data_segments_accept_null_selectors() {
+        for (name, opcode, selector) in [("POP ES", 0x07, 0x0003), ("POP DS", 0x1F, 0x0000)] {
+            let (mut cpu, mut bus) = protected_pop_segment_fixture(opcode, selector, None, 0);
+            let old_sp = cpu.gpr_u16(CpuState::RSP);
+
+            step_inner(&mut cpu, &mut bus).unwrap();
+
+            let loaded = if opcode == 0x07 { &cpu.es } else { &cpu.ds };
+            assert_eq!(loaded.selector, selector, "{name}");
+            assert_eq!(loaded.base, 0, "{name}");
+            assert_eq!(loaded.limit, 0, "{name}");
+            assert_eq!(loaded.flags, 0, "{name}");
+            assert_eq!(cpu.gpr_u16(CpuState::RSP), old_sp + 2, "{name}");
+        }
+    }
+
+    /// DS/ES accept data or readable code, enforce CPL/RPL versus DPL for data
+    /// and nonconforming code, and check type/privilege before presence.
+    ///
+    /// Spec: Intel SDM Vol. 2 POP (Protected Mode Exceptions); Vol. 3
+    /// §§3.4.5, 5.4.1, 5.5, 5.6, 6.13.
+    #[test]
+    fn protected_pop_data_segment_fault_matrix_is_atomic() {
+        let cases = [
+            ("system", 0x0020, 0x80, 0, None, 13),
+            ("execute-only code", 0x0020, 0x98, 0, None, 13),
+            ("RPL above DPL", 0x0023, 0x92, 0, None, 13),
+            ("CPL above DPL", 0x0020, 0xD2, 3, None, 13),
+            ("not present", 0x0020, 0x12, 0, None, 11),
+            ("GDT limit", 0x0020, 0x92, 0, Some(38), 13),
+            ("LDT selector", 0x0024, 0x92, 0, None, 13),
+        ];
+
+        for (name, selector, access, cpl, gdt_limit, vector) in cases {
+            let descriptor = encode_seg_desc(0x1234_0000, 0xFFFF, access, 0);
+            let (mut cpu, mut bus) =
+                protected_pop_segment_fixture(0x1F, selector, Some(descriptor), cpl);
+            if let Some(limit) = gdt_limit {
+                cpu.gdtr.limit = limit;
+            }
+            let before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), vector, Some(selector & !3));
+            assert_eq!(cpu, before, "{name}: POP DS partially committed");
+        }
+    }
+
+    /// SS must be non-null writable data with RPL=CPL=DPL. Type and privilege
+    /// failures are #GP; only a valid-but-not-present stack descriptor is #SS.
+    ///
+    /// Spec: Intel SDM Vol. 2 POP (Protected Mode Exceptions); Vol. 3
+    /// §§3.4.5, 5.4.1, 5.5, 5.7, 6.13.
+    #[test]
+    fn protected_pop_ss_fault_matrix_is_atomic() {
+        let cases = [
+            ("null", 0x0003, 0x93, 0, None, 13, 0),
+            ("read-only data", 0x0020, 0x90, 0, None, 13, 0x20),
+            ("code", 0x0020, 0x9A, 0, None, 13, 0x20),
+            ("RPL differs from CPL", 0x0023, 0x92, 0, None, 13, 0x20),
+            ("DPL differs from CPL", 0x0023, 0xD2, 3, None, 13, 0x20),
+            ("not present", 0x0020, 0x12, 0, None, 12, 0x20),
+            (
+                "not-present privilege mismatch",
+                0x0023,
+                0x12,
+                0,
+                None,
+                13,
+                0x20,
+            ),
+            ("GDT limit", 0x0020, 0x92, 0, Some(38), 13, 0x20),
+            ("LDT selector", 0x0024, 0x92, 0, None, 13, 0x24),
+        ];
+
+        for (name, selector, access, cpl, gdt_limit, vector, error_code) in cases {
+            let descriptor = encode_seg_desc(0x5678_0000, 0xFFFF, access, 0);
+            let (mut cpu, mut bus) =
+                protected_pop_segment_fixture(0x17, selector, Some(descriptor), cpl);
+            if let Some(limit) = gdt_limit {
+                cpu.gdtr.limit = limit;
+            }
+            let before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), vector, Some(error_code));
+            assert_eq!(cpu, before, "{name}: POP SS partially committed");
+        }
+    }
+
+    /// Stack limit/read faults and a late descriptor-byte fault leave SP and
+    /// the destination cache unchanged.
+    ///
+    /// Spec: Intel SDM Vol. 2 POP (Protected Mode Exceptions); Vol. 3
+    /// §§5.3, 6.13, 6.15.
+    #[test]
+    fn protected_pop_segment_stack_and_descriptor_faults_are_atomic() {
+        let descriptor = encode_seg_desc(0x1234_0000, 0xFFFF, 0x92, 0);
+
+        let (mut cpu, mut bus) =
+            protected_pop_segment_fixture(0x1F, POP_SEG_SELECTOR, Some(descriptor), 0);
+        cpu.ss.limit = u32::from(POP_SEG_STACK_SP);
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert_eq!(cpu, before, "stack-limit #SS changed POP DS state");
+
+        let (mut cpu, fixture) =
+            protected_pop_segment_fixture(0x07, POP_SEG_SELECTOR, Some(descriptor), 0);
+        let mut bus = FailOnceReadBus {
+            mem: fixture.mem,
+            fail_addr: POP_SEG_STACK_BASE as u64 + u64::from(POP_SEG_STACK_SP) + 1,
+            failed: false,
+        };
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert!(bus.failed);
+        assert_eq!(cpu, before, "stack bus #SS changed POP ES state");
+
+        let (mut cpu, fixture) =
+            protected_pop_segment_fixture(0x1F, POP_SEG_SELECTOR, Some(descriptor), 0);
+        let mut bus = FailOnceReadBus {
+            mem: fixture.mem,
+            fail_addr: cpu.gdtr.base + u64::from(POP_SEG_SELECTOR >> 3) * 8 + 7,
+            failed: false,
+        };
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert!(bus.failed, "the final descriptor byte must be read");
+        assert_eq!(cpu, before, "descriptor bus #GP changed POP DS state");
+    }
+
+    /// MOV SS inhibits a pending maskable IRQ through the immediately following
+    /// HLT. The next boundary recognizes the IRQ and wakes the halted CPU.
+    ///
+    /// Spec: Intel SDM Vol. 2 MOV/HLT; Vol. 3 §6.8.3.
+    #[test]
+    fn mov_ss_shadow_delays_irq_across_hlt_in_real_mode() {
+        let (mut cpu, mut bus) = real_interrupt_shadow_fixture(&[0x8E, 0xD0, 0xF4]);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 2);
+        assert_eq!(cpu.ss.selector, 0);
+        cpu.request_interrupt(0x20);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(cpu.halted, "HLT immediately after MOV SS must execute");
+        assert_eq!(cpu.ip16(), 3);
+        assert_eq!(cpu.pending_irq, Some(0x20));
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(!cpu.halted, "delayed IRQ must wake HLT");
+        assert_eq!(cpu.ip16(), 0x0E00);
+        assert_eq!(cpu.pending_irq, None);
+        assert_eq!(bus.read_u16(0x7FFA).unwrap(), 3, "saved post-HLT IP");
+    }
+
+    /// Protected-mode POP SS creates the same exact one-instruction shadow.
+    /// Spec: Intel SDM Vol. 2 POP; Vol. 3 §6.8.3.
+    #[test]
+    fn pop_ss_shadow_delays_irq_one_instruction_in_protected_mode() {
+        let (mut cpu, mut bus) = protected_interrupt_fixture(0x20, 0x87, 0);
+        bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 2].copy_from_slice(&[0x17, 0x90]);
+        bus.mem[PROTECTED_TEST_GDT + 32..PROTECTED_TEST_GDT + 40]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x93, 0));
+        cpu.gdtr.limit = 39;
+        cpu.set_gpr_u16(CpuState::RSP, 0xF000);
+        bus.mem[0xF000..0xF002].copy_from_slice(&POP_SEG_SELECTOR.to_le_bytes());
+        cpu.set_interrupt_flag(true);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ss.selector, POP_SEG_SELECTOR);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xF002);
+        cpu.request_interrupt(0x20);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(
+            cpu.ip16(),
+            PROTECTED_TEST_CODE as u16 + 2,
+            "following NOP must execute before IRQ"
+        );
+        assert_eq!(cpu.pending_irq, Some(0x20));
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xF002);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), PROTECTED_TEST_HANDLER);
+        assert_eq!(cpu.pending_irq, None);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xEFFC);
+        assert_eq!(
+            bus.read_u16(0xEFFC).unwrap(),
+            PROTECTED_TEST_CODE as u16 + 2
+        );
+    }
+
+    /// The SS shadow masks external IRQ recognition, not NMI delivery.
+    /// Spec: Intel SDM Vol. 3 §§6.3.3, 6.7, 6.8.3.
+    #[test]
+    fn ss_shadow_does_not_block_nmi() {
+        let (mut cpu, mut bus) = real_interrupt_shadow_fixture(&[0x8E, 0xD0, 0x90]);
+
+        step(&mut cpu, &mut bus).unwrap();
+        cpu.request_nmi();
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.ip16(), 0x0D00);
+        assert!(!cpu.pending_nmi);
+        assert_eq!(
+            bus.read_u16(0x7FFA).unwrap(),
+            2,
+            "NMI saves following NOP IP"
+        );
+    }
+
+    /// Descriptor failures do not create an SS interrupt shadow: an IF-enabled
+    /// IRQ is recognized before the faulting MOV/POP can be retried.
+    ///
+    /// Spec: Intel SDM Vol. 2 MOV/POP (Protected Mode Exceptions); Vol. 3 §6.8.3.
+    #[test]
+    fn failed_mov_and_pop_ss_do_not_arm_interrupt_shadow() {
+        for (name, opcode) in [("MOV SS", 0x8E), ("POP SS", 0x17)] {
+            let (mut cpu, mut bus) = protected_interrupt_fixture(0x20, 0x87, 0);
+            bus.mem[PROTECTED_TEST_GDT + 32..PROTECTED_TEST_GDT + 40]
+                .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x90, 0));
+            cpu.gdtr.limit = 39;
+            cpu.set_interrupt_flag(true);
+            if opcode == 0x8E {
+                bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 2]
+                    .copy_from_slice(&[0x8E, 0xD0]);
+                cpu.set_ax(POP_SEG_SELECTOR);
+            } else {
+                bus.mem[PROTECTED_TEST_CODE] = 0x17;
+                cpu.set_gpr_u16(CpuState::RSP, 0xF000);
+                bus.mem[0xF000..0xF002].copy_from_slice(&POP_SEG_SELECTOR.to_le_bytes());
+            }
+            let before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(POP_SEG_SELECTOR));
+            assert_eq!(cpu, before, "{name}: fault changed state");
+
+            cpu.request_interrupt(0x20);
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.ip16(),
+                PROTECTED_TEST_HANDLER,
+                "{name}: failed load incorrectly delayed IRQ"
+            );
+        }
+    }
+
+    /// A fault from the instruction after MOV SS is delivered normally and
+    /// consumes the one-instruction shadow; a pending IRQ can then preempt the
+    /// trap handler before its first instruction.
+    ///
+    /// Spec: Intel SDM Vol. 3 §§6.8.3, 6.11.2, 6.12.1. This bounded model clears
+    /// the shadow only after successful fault-gate entry; a failed nested delivery
+    /// remains an emulator error without partially retiring the boundary.
+    #[test]
+    fn ss_shadow_expires_when_following_instruction_faults() {
+        const FAULT_HANDLER: u16 = 0x0200;
+        const IRQ_HANDLER: u16 = 0x0300;
+        let (mut cpu, mut bus) = protected_interrupt_fixture(6, 0x87, 0);
+        write_protected_test_gate(
+            &mut bus.mem,
+            6,
+            FAULT_HANDLER,
+            PROTECTED_TEST_TARGET_CS,
+            0x87,
+        );
+        write_protected_test_gate(
+            &mut bus.mem,
+            0x20,
+            IRQ_HANDLER,
+            PROTECTED_TEST_TARGET_CS,
+            0x87,
+        );
+        cpu.idtr.limit = 0x20 * 8 + 7;
+        bus.mem[PROTECTED_TEST_GDT + 32..PROTECTED_TEST_GDT + 40]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x93, 0));
+        cpu.gdtr.limit = 39;
+        bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 4]
+            .copy_from_slice(&[0x8E, 0xD0, 0xD0, 0xF0]);
+        cpu.set_ax(POP_SEG_SELECTOR);
+        cpu.set_interrupt_flag(true);
+
+        step(&mut cpu, &mut bus).unwrap();
+        cpu.request_interrupt(0x20);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), FAULT_HANDLER);
+        assert_eq!(cpu.pending_irq, Some(0x20));
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), IRQ_HANDLER);
+        assert_eq!(cpu.pending_irq, None);
+        assert_eq!(bus.read_u16(0xFFF2).unwrap(), FAULT_HANDLER);
+    }
+
+    #[derive(Clone, Copy)]
+    struct ProtectedFarDataLoadForm {
+        opcode: u8,
+        op32: bool,
+        reg: usize,
+        uses_ss: bool,
+    }
+
+    fn protected_far_data_load_fixture(
+        form: ProtectedFarDataLoadForm,
+        pointer_offset: u16,
+        offset: u32,
+        selector: u16,
+        descriptor: Option<[u8; 8]>,
+        cpl: u8,
+    ) -> (CpuState, VecBus) {
+        let ProtectedFarDataLoadForm {
+            opcode,
+            op32,
+            reg,
+            uses_ss,
+        } = form;
+        let mut mem = vec![0u8; 0x10000];
+        let mut code_index = PROTECTED_TEST_CODE;
+        if op32 {
+            mem[code_index] = 0x66;
+            code_index += 1;
+        }
+        mem[code_index] = opcode;
+        mem[code_index + 1] = (if uses_ss { 0x80 } else { 0 }) | ((reg as u8) << 3) | 0x06;
+        let displacement = if uses_ss { 0 } else { pointer_offset };
+        mem[code_index + 2..code_index + 4].copy_from_slice(&displacement.to_le_bytes());
+
+        let pointer_index = usize::from(pointer_offset);
+        if op32 {
+            mem[pointer_index..pointer_index + 4].copy_from_slice(&offset.to_le_bytes());
+            mem[pointer_index + 4..pointer_index + 6].copy_from_slice(&selector.to_le_bytes());
+        } else {
+            mem[pointer_index..pointer_index + 2].copy_from_slice(&(offset as u16).to_le_bytes());
+            mem[pointer_index + 2..pointer_index + 4].copy_from_slice(&selector.to_le_bytes());
+        }
+
+        let descriptor_offset = usize::from(selector >> 3) * 8;
+        if let Some(descriptor) = descriptor {
+            let descriptor_addr = PROTECTED_TEST_GDT + descriptor_offset;
+            mem[descriptor_addr..descriptor_addr + 8].copy_from_slice(&descriptor);
+        }
+
+        let code_access = 0x9A | (cpl << 5);
+        let data_access = 0x93 | (cpl << 5);
+        let mut cpu = CpuState::reset();
+        cpu.cr0 |= 1;
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x0010 | u16::from(cpl),
+            base: 0,
+            limit: 0xFFFF,
+            flags: u16::from(code_access),
+        };
+        cpu.ss = x86_core::SegmentReg {
+            selector: 0x0018 | u16::from(cpl),
+            base: 0,
+            limit: 0xFFFF,
+            flags: u16::from(data_access),
+        };
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x0030 | u16::from(cpl),
+            base: 0,
+            limit: 0xFFFF,
+            flags: u16::from(data_access),
+        };
+        cpu.es = x86_core::SegmentReg {
+            selector: 0x0038 | u16::from(cpl),
+            base: 0x4444_0000,
+            limit: 0x4444,
+            flags: u16::from(data_access),
+        };
+        cpu.gdtr.base = PROTECTED_TEST_GDT as u64;
+        cpu.gdtr.limit = descriptor
+            .map(|_| (descriptor_offset + 7) as u16)
+            .unwrap_or(0);
+        cpu.rip = PROTECTED_TEST_CODE as u64;
+        cpu.rflags = 0x0AD7;
+        for (index, value) in cpu.gpr.iter_mut().enumerate() {
+            *value = 0xA5A5_5A5A_DEAD_0000 | index as u64;
+        }
+        if uses_ss {
+            cpu.set_gpr_u16(CpuState::RBP, pointer_offset);
+        }
+        (cpu, VecBus { mem, ports: vec![] })
+    }
+
+    /// Protected LDS/LES read the complete far pointer and descriptor before
+    /// committing either the destination GPR or the DS/ES visible+hidden state.
+    /// The cases cover both operand widths, DS and SS addressing, exact segment
+    /// end boundaries, data/readable-code descriptors, and multiple registers.
+    ///
+    /// Spec: Intel SDM Vol. 2 LDS/LES (Operation, Protected Mode Exceptions);
+    /// Vol. 3 §§3.4.3–3.4.5, 5.3–5.6.
+    #[test]
+    fn protected_les_lds_load_offsets_and_gdt_caches_atomically() {
+        let cases = [
+            (
+                "LES AX data at DS limit",
+                0xC4,
+                false,
+                CpuState::RAX,
+                0xFFFC,
+                false,
+                0x0020,
+                0x92,
+                0xD0,
+                0,
+                0x0000_BEEF,
+            ),
+            (
+                "LDS DI readable code through SS",
+                0xC5,
+                false,
+                CpuState::RDI,
+                0x2800,
+                true,
+                0x0020,
+                0x9A,
+                0x10,
+                0,
+                0x0000_1234,
+            ),
+            (
+                "LES ECX conforming readable code through SS",
+                0xC4,
+                true,
+                CpuState::RCX,
+                0x3000,
+                true,
+                0x0023,
+                0x9E,
+                0x80,
+                3,
+                0x89AB_CDEF,
+            ),
+            (
+                "LDS EBX ring-3 data at DS limit",
+                0xC5,
+                true,
+                CpuState::RBX,
+                0xFFFA,
+                false,
+                0x0023,
+                0xF2,
+                0x00,
+                3,
+                0x0123_4567,
+            ),
+        ];
+
+        for (name, opcode, op32, reg, pointer, uses_ss, selector, access, gran, cpl, offset) in
+            cases
+        {
+            let base = 0x1234_5000u32
+                .wrapping_add(u32::from(opcode) << 8)
+                .wrapping_add(reg as u32);
+            let raw_limit = 0x1_2345;
+            let descriptor = encode_seg_desc(base, raw_limit, access, gran);
+            let (mut cpu, mut bus) = protected_far_data_load_fixture(
+                ProtectedFarDataLoadForm {
+                    opcode,
+                    op32,
+                    reg,
+                    uses_ss,
+                },
+                pointer,
+                offset,
+                selector,
+                Some(descriptor),
+                cpl,
+            );
+            let before = cpu.clone();
+
+            step_inner(&mut cpu, &mut bus).unwrap();
+
+            let loaded = if opcode == 0xC4 { &cpu.es } else { &cpu.ds };
+            assert_eq!(loaded.selector, selector, "{name}: selector");
+            assert_eq!(loaded.base, u64::from(base), "{name}: base");
+            let expected_limit = if gran & 0x80 != 0 {
+                (raw_limit << 12) | 0xFFF
+            } else {
+                raw_limit
+            };
+            assert_eq!(loaded.limit, expected_limit, "{name}: effective limit");
+            assert_eq!(
+                loaded.flags,
+                u16::from(access) | (u16::from(gran & 0xF0) << 8),
+                "{name}: cached attributes"
+            );
+
+            let write_mask = if op32 { 0xFFFF_FFFF } else { 0xFFFF };
+            let expected_gpr = (before.gpr[reg] & !write_mask) | (u64::from(offset) & write_mask);
+            assert_eq!(cpu.gpr[reg], expected_gpr, "{name}: destination width");
+            for index in 0..cpu.gpr.len() {
+                if index != reg {
+                    assert_eq!(cpu.gpr[index], before.gpr[index], "{name}: GPR {index}");
+                }
+            }
+            assert_eq!(cpu.rflags, before.rflags, "{name}: FLAGS");
+            assert_eq!(cpu.ss, before.ss, "{name}: unrelated SS");
+            if opcode == 0xC4 {
+                assert_eq!(cpu.ds, before.ds, "{name}: unrelated DS");
+            } else {
+                assert_eq!(cpu.es, before.es, "{name}: unrelated ES");
+            }
+            assert_eq!(
+                cpu.ip16(),
+                PROTECTED_TEST_CODE as u16 + if op32 { 5 } else { 4 },
+                "{name}: IP"
+            );
+        }
+    }
+
+    /// A null selector (index zero, including a nonzero RPL) is legal for
+    /// LDS→DS and LES→ES. It loads the offset and the repository's cleared,
+    /// unusable data-segment cache without consulting a descriptor.
+    ///
+    /// Spec: Intel SDM Vol. 2 LDS/LES (Operation, Protected Mode Exceptions);
+    /// Vol. 3 §§3.4.2–3.4.3, 5.4.1.
+    #[test]
+    fn protected_les_lds_accept_null_selectors() {
+        let cases = [
+            (
+                "LES DX null+RPL",
+                0xC4,
+                false,
+                CpuState::RDX,
+                0x0003,
+                0xCAFEu32,
+            ),
+            (
+                "LDS ESI null",
+                0xC5,
+                true,
+                CpuState::RSI,
+                0x0000,
+                0x7654_3210,
+            ),
+        ];
+
+        for (name, opcode, op32, reg, selector, offset) in cases {
+            let (mut cpu, mut bus) = protected_far_data_load_fixture(
+                ProtectedFarDataLoadForm {
+                    opcode,
+                    op32,
+                    reg,
+                    uses_ss: false,
+                },
+                0x3000,
+                offset,
+                selector,
+                None,
+                0,
+            );
+            let before = cpu.clone();
+
+            step_inner(&mut cpu, &mut bus).unwrap();
+
+            let loaded = if opcode == 0xC4 { &cpu.es } else { &cpu.ds };
+            assert_eq!(loaded.selector, selector, "{name}: visible selector");
+            assert_eq!(loaded.base, 0, "{name}: base");
+            assert_eq!(loaded.limit, 0, "{name}: limit");
+            assert_eq!(loaded.flags, 0, "{name}: attributes");
+            let write_mask = if op32 { 0xFFFF_FFFF } else { 0xFFFF };
+            assert_eq!(
+                cpu.gpr[reg],
+                (before.gpr[reg] & !write_mask) | (u64::from(offset) & write_mask),
+                "{name}: destination"
+            );
+            assert_eq!(cpu.rflags, before.rflags, "{name}: FLAGS");
+        }
+    }
+
+    /// LDS/LES use the DS/ES data-segment load rules: system and execute-only
+    /// descriptors fail, valid-but-not-present descriptors raise #NP, data and
+    /// nonconforming readable code enforce CPL/RPL≤DPL, and only GDT selectors
+    /// within the table limit are supported. Every failure is atomic.
+    ///
+    /// Spec: Intel SDM Vol. 2 LDS/LES (Protected Mode Exceptions); Vol. 3
+    /// §§3.4.5, 5.4.1, 5.5–5.6, 6.13.
+    #[test]
+    fn protected_les_lds_descriptor_fault_matrix_is_atomic() {
+        let cases = [
+            (
+                "LES system",
+                0xC4,
+                false,
+                CpuState::RAX,
+                0x0020,
+                0x80,
+                0,
+                None,
+                13,
+                0x20,
+            ),
+            (
+                "LDS execute-only code",
+                0xC5,
+                true,
+                CpuState::RBX,
+                0x0020,
+                0x98,
+                0,
+                None,
+                13,
+                0x20,
+            ),
+            (
+                "LES not-present data",
+                0xC4,
+                true,
+                CpuState::RCX,
+                0x0020,
+                0x12,
+                0,
+                None,
+                11,
+                0x20,
+            ),
+            (
+                "LDS readable-code RPL above DPL",
+                0xC5,
+                false,
+                CpuState::RDI,
+                0x0023,
+                0x9A,
+                0,
+                None,
+                13,
+                0x20,
+            ),
+            (
+                "LES CPL above data DPL",
+                0xC4,
+                false,
+                CpuState::RDX,
+                0x0020,
+                0xD2,
+                3,
+                None,
+                13,
+                0x20,
+            ),
+            (
+                "LDS LDT selector",
+                0xC5,
+                true,
+                CpuState::RSI,
+                0x0024,
+                0x92,
+                0,
+                None,
+                13,
+                0x24,
+            ),
+            (
+                "LES GDT limit",
+                0xC4,
+                true,
+                CpuState::RBP,
+                0x0020,
+                0x92,
+                0,
+                Some(38),
+                13,
+                0x20,
+            ),
+        ];
+
+        for (name, opcode, op32, reg, selector, access, cpl, gdt_limit, vector, error_code) in cases
+        {
+            let descriptor = encode_seg_desc(0x1234_0000, 0xFFFF, access, 0);
+            let (mut cpu, mut bus) = protected_far_data_load_fixture(
+                ProtectedFarDataLoadForm {
+                    opcode,
+                    op32,
+                    reg,
+                    uses_ss: false,
+                },
+                0x3000,
+                0x89AB_CDEF,
+                selector,
+                Some(descriptor),
+                cpl,
+            );
+            if let Some(limit) = gdt_limit {
+                cpu.gdtr.limit = limit;
+            }
+            let before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), vector, Some(error_code));
+            assert_eq!(cpu, before, "{name}: partial GPR or segment-cache update");
+        }
+    }
+
+    /// The full m16:16/m16:32 operand must fit in the old source segment and be
+    /// readable before descriptor validation. Pointer and descriptor read
+    /// failures retain the destination GPR, DS/ES cache, IP, and FLAGS.
+    ///
+    /// Spec: Intel SDM Vol. 2 LDS/LES (Protected Mode Exceptions); Vol. 3
+    /// §§5.3, 6.13, 6.15.
+    #[test]
+    fn protected_les_lds_pointer_and_descriptor_read_faults_are_atomic() {
+        let descriptor = encode_seg_desc(0x1234_0000, 0xFFFF, 0x92, 0);
+
+        let (mut cpu, mut bus) = protected_far_data_load_fixture(
+            ProtectedFarDataLoadForm {
+                opcode: 0xC4,
+                op32: false,
+                reg: CpuState::RAX,
+                uses_ss: false,
+            },
+            0x3000,
+            0xBEEF,
+            0x0020,
+            Some(descriptor),
+            0,
+        );
+        cpu.ds.limit = 0x3002;
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before, "m16:16 DS-limit failure changed state");
+
+        let (mut cpu, mut bus) = protected_far_data_load_fixture(
+            ProtectedFarDataLoadForm {
+                opcode: 0xC5,
+                op32: true,
+                reg: CpuState::RBX,
+                uses_ss: true,
+            },
+            0x3000,
+            0x89AB_CDEF,
+            0x0020,
+            Some(descriptor),
+            0,
+        );
+        cpu.ss.limit = 0x3004;
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert_eq!(cpu, before, "m16:32 SS-limit failure changed state");
+
+        let (mut cpu, mut bus) = protected_far_data_load_fixture(
+            ProtectedFarDataLoadForm {
+                opcode: 0xC4,
+                op32: true,
+                reg: CpuState::RCX,
+                uses_ss: false,
+            },
+            0xF000,
+            0x0123_4567,
+            0x0020,
+            Some(descriptor),
+            0,
+        );
+        bus.mem.truncate(0xF005); // selector high byte is absent
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before, "truncated m16:32 changed state");
+
+        let (mut cpu, fixture) = protected_far_data_load_fixture(
+            ProtectedFarDataLoadForm {
+                opcode: 0xC5,
+                op32: false,
+                reg: CpuState::RDI,
+                uses_ss: true,
+            },
+            0x3000,
+            0xCAFE,
+            0x0020,
+            Some(descriptor),
+            0,
+        );
+        let mut bus = FailOnceReadBus {
+            mem: fixture.mem,
+            fail_addr: 0x3003,
+            failed: false,
+        };
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert!(bus.failed, "selector high byte must be read through old SS");
+        assert_eq!(cpu, before, "late m16:16 read failure changed state");
+
+        for (name, opcode, op32, reg) in [
+            ("LES descriptor byte 7", 0xC4, false, CpuState::RDX),
+            ("LDS descriptor byte 7", 0xC5, true, CpuState::RSI),
+        ] {
+            let (mut cpu, fixture) = protected_far_data_load_fixture(
+                ProtectedFarDataLoadForm {
+                    opcode,
+                    op32,
+                    reg,
+                    uses_ss: false,
+                },
+                0x3000,
+                0x7654_3210,
+                0x0020,
+                Some(descriptor),
+                0,
+            );
+            let mut bus = FailOnceReadBus {
+                mem: fixture.mem,
+                fail_addr: PROTECTED_TEST_GDT as u64 + 0x20 + 7,
+                failed: false,
+            };
+            let before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+            assert!(bus.failed, "{name}: final descriptor byte was not read");
+            assert_eq!(cpu, before, "{name}: partial update");
+        }
+    }
+
+    /// ModRM.mod=11 is invalid for LDS/LES in protected mode as in real mode.
+    /// Spec: Intel SDM Vol. 2 LDS/LES; Vol. 3 §6.15 (#UD).
+    #[test]
+    fn protected_les_lds_register_source_is_ud_and_atomic() {
+        for (name, opcode, op32, reg) in [
+            ("LES r16,r16", 0xC4, false, CpuState::RAX),
+            ("LDS r32,r32", 0xC5, true, CpuState::RBX),
+        ] {
+            let (mut cpu, mut bus) = protected_far_data_load_fixture(
+                ProtectedFarDataLoadForm {
+                    opcode,
+                    op32,
+                    reg,
+                    uses_ss: false,
+                },
+                0x3000,
+                0,
+                0x0020,
+                Some(encode_seg_desc(0, 0xFFFF, 0x92, 0)),
+                0,
+            );
+            let opcode_index = PROTECTED_TEST_CODE + usize::from(op32);
+            bus.mem[opcode_index + 1] = 0xC0 | ((reg as u8) << 3) | 1;
+            let before = cpu.clone();
+
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+            assert_eq!(cpu, before, "{name}: #UD changed state");
+        }
     }
 }

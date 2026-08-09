@@ -83,7 +83,7 @@ pub struct Machine {
     pub ide_secondary: IdeSecondary,
     /// 82077AA FDC — ports 0x3F0–0x3F5 / 0x3F7; media READ DATA + DMA ch2 wire.
     pub fdc: Fdc82077,
-    /// QEMU fw_cfg — selector/data `0x510`/`0x511` (signature + test file).
+    /// QEMU fw_cfg — signature, ID, configured RAM size, and test file.
     pub fw_cfg: FwCfg,
     ports: PortBus,
 }
@@ -107,7 +107,7 @@ impl Machine {
             ide: IdePrimary::new(),
             ide_secondary: IdeSecondary::new(),
             fdc: Fdc82077::new(),
-            fw_cfg: FwCfg::new(),
+            fw_cfg: FwCfg::with_ram_size(ram_size as u64),
             ports: PortBus::new(),
         }
     }
@@ -3433,5 +3433,63 @@ mod tests {
             *b = bus.port_in_u8(FW_CFG_DATA).unwrap();
         }
         assert_eq!(&sig, FW_CFG_SIGNATURE_BYTES);
+    }
+
+    /// Spec: QEMU fw_cfg — ID 0x0001 is LE32 (base revision only here);
+    /// RAM_SIZE 0x0003 is the configured byte count as LE64.
+    #[test]
+    fn machine_bus_fw_cfg_id_ram_size_reset_and_unknown_selector() {
+        const RAM_SIZE: usize = 16 * 1024 * 1024;
+        const FW_CFG_ID_SELECTOR: u16 = 0x0001;
+        const FW_CFG_RAM_SIZE_SELECTOR: u16 = 0x0003;
+        let mut m = Machine::new(RAM_SIZE);
+
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_ID_SELECTOR)
+                .unwrap();
+            let mut id = [0u8; 4];
+            for byte in &mut id {
+                *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
+            }
+            assert_eq!(id, [0x01, 0x00, 0x00, 0x00]);
+
+            bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_RAM_SIZE_SELECTOR)
+                .unwrap();
+            let mut ram_size = [0u8; 8];
+            for byte in &mut ram_size {
+                *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
+            }
+            assert_eq!(ram_size, [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+
+            bus.port_out_u16(FW_CFG_SELECTOR, 0x00FF).unwrap();
+            assert_eq!(bus.port_in_u8(FW_CFG_DATA).unwrap(), 0);
+
+            bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_RAM_SIZE_SELECTOR)
+                .unwrap();
+            let _ = bus.port_in_u8(FW_CFG_DATA).unwrap();
+        }
+        assert_eq!(m.fw_cfg.offset(), 1);
+
+        m.reset();
+
+        assert_eq!(m.fw_cfg.selector(), 0);
+        assert_eq!(m.fw_cfg.offset(), 0);
+        let mut bus = m.bus_mut();
+        bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_ID_SELECTOR)
+            .unwrap();
+        let mut id = [0u8; 4];
+        for byte in &mut id {
+            *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
+        }
+        assert_eq!(id, [0x01, 0x00, 0x00, 0x00]);
+
+        bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_RAM_SIZE_SELECTOR)
+            .unwrap();
+        let mut ram_size = [0u8; 8];
+        for byte in &mut ram_size {
+            *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
+        }
+        assert_eq!(ram_size, (RAM_SIZE as u64).to_le_bytes());
     }
 }

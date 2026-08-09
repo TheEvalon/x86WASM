@@ -17,11 +17,20 @@ pub struct SegmentReg {
     pub selector: u16,
     pub base: u64,
     pub limit: u32,
-    /// Access rights / attributes (opaque beyond present defaults).
+    /// Cached descriptor attributes.
+    ///
+    /// Bits 7:0 preserve the access byte; bits 15:12 preserve AVL/L/D-B/G
+    /// in their descriptor positions. Bits 11:8 are reserved zero.
+    /// Spec: Intel SDM Vol. 3 §§3.4.3–3.4.5.
     pub flags: u16,
 }
 
 impl SegmentReg {
+    pub const FLAG_AVL: u16 = 1 << 12;
+    pub const FLAG_LONG: u16 = 1 << 13;
+    pub const FLAG_DEFAULT_BIG: u16 = 1 << 14;
+    pub const FLAG_GRANULARITY: u16 = 1 << 15;
+
     pub const fn flat_real(selector: u16, base: u64) -> Self {
         Self {
             selector,
@@ -73,6 +82,40 @@ impl SegmentReg {
     pub fn load_null_selector(&mut self, selector: u16) {
         self.load_descriptor_cache(selector, 0, 0, 0);
     }
+
+    /// Cached code-segment D bit or stack-segment B bit.
+    ///
+    /// Spec: Intel SDM Vol. 3 §§3.4.5.1–3.4.5.2.
+    pub const fn default_big(&self) -> bool {
+        self.flags & Self::FLAG_DEFAULT_BIG != 0
+    }
+
+    /// Default code operand size selected by the cached D bit.
+    pub const fn default_operand_size(&self) -> u8 {
+        if self.default_big() {
+            32
+        } else {
+            16
+        }
+    }
+
+    /// Default code address size selected by the cached D bit.
+    pub const fn default_address_size(&self) -> u8 {
+        if self.default_big() {
+            32
+        } else {
+            16
+        }
+    }
+
+    /// Stack-pointer width selected by the cached B bit.
+    pub const fn stack_width(&self) -> u8 {
+        if self.default_big() {
+            32
+        } else {
+            16
+        }
+    }
 }
 
 /// GDTR / IDTR.
@@ -108,6 +151,14 @@ pub struct CpuState {
     pub cr8: u64,
     pub efer: u64,
     pub halted: bool,
+    /// Maskable-interrupt inhibition after a successful `MOV SS` / `POP SS`.
+    ///
+    /// `0` means inactive, `1` covers the immediately following instruction,
+    /// and `2` is the transient value armed by the SS-loading instruction before
+    /// that instruction's own boundary retires it to `1`. NMI is not gated by
+    /// this state. Spec: Intel SDM Vol. 3 §6.8.3.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub maskable_interrupt_shadow: u8,
     /// Latched maskable external IRQ vector (PIC stub for later).
     ///
     /// Not guest-architectural beyond interrupt delivery. Recognized at
@@ -169,9 +220,24 @@ impl CpuState {
             cr8: 0,
             efer: 0,
             halted: false,
+            maskable_interrupt_shadow: 0,
             pending_irq: None,
             pending_nmi: false,
         }
+    }
+
+    /// Arm inhibition through the instruction following a successful SS load.
+    pub fn arm_maskable_interrupt_shadow(&mut self) {
+        self.maskable_interrupt_shadow = 2;
+    }
+
+    /// Retire one executed instruction boundary from the SS interrupt shadow.
+    pub fn retire_maskable_interrupt_shadow(&mut self) {
+        self.maskable_interrupt_shadow = self.maskable_interrupt_shadow.saturating_sub(1);
+    }
+
+    pub const fn maskable_interrupts_inhibited(&self) -> bool {
+        self.maskable_interrupt_shadow != 0
     }
 
     /// Queue a maskable external interrupt vector (test / future PIC hook).
@@ -397,6 +463,9 @@ impl CpuState {
         if self.halted != other.halted {
             out.push("halted");
         }
+        if self.maskable_interrupt_shadow != other.maskable_interrupt_shadow {
+            out.push("maskable_interrupt_shadow");
+        }
         if self.pending_irq != other.pending_irq {
             out.push("pending_irq");
         }
@@ -418,6 +487,48 @@ mod tests {
         let c = SegmentReg::real_mode_code(0xF000);
         assert_eq!(c.base, 0xF000u64 << 4);
         assert_eq!(c.flags, 0x009B);
+    }
+
+    /// Intel SDM Vol. 3 §§3.4.3–3.4.5: cached D/B selects the legacy
+    /// code default operand/address size and the stack-pointer width.
+    #[test]
+    fn segment_attribute_helpers_follow_cached_default_big() {
+        let mut seg = SegmentReg::real_mode_code(0);
+        assert!(!seg.default_big());
+        assert_eq!(seg.default_operand_size(), 16);
+        assert_eq!(seg.default_address_size(), 16);
+        assert_eq!(seg.stack_width(), 16);
+
+        seg.flags |= 0x4000;
+        assert!(seg.default_big());
+        assert_eq!(seg.default_operand_size(), 32);
+        assert_eq!(seg.default_address_size(), 32);
+        assert_eq!(seg.stack_width(), 32);
+    }
+
+    /// Intel SDM Vol. 3 §§3.4.3–3.4.5: reset and ordinary real-mode caches
+    /// retain legacy access bytes with AVL/L/D-B/G all clear.
+    #[test]
+    fn reset_and_real_mode_cache_attributes_remain_legacy_16_bit() {
+        let cpu = CpuState::reset();
+        assert_eq!(cpu.cs.flags, 0x009B);
+        for seg in [&cpu.es, &cpu.ss, &cpu.ds, &cpu.fs, &cpu.gs] {
+            assert_eq!(seg.flags, 0x0093);
+            assert!(!seg.default_big());
+            assert_eq!(seg.default_operand_size(), 16);
+            assert_eq!(seg.default_address_size(), 16);
+            assert_eq!(seg.stack_width(), 16);
+        }
+
+        let mut unreal = SegmentReg {
+            selector: 0x0008,
+            base: 0,
+            limit: u32::MAX,
+            flags: 0xC093,
+        };
+        unreal.load_real_mode_selector(0x1234);
+        assert_eq!(unreal.flags, 0xC093);
+        assert!(unreal.default_big());
     }
 
     #[test]
@@ -488,5 +599,17 @@ mod tests {
         let mut b = a.clone();
         b.rip = 0x1234;
         assert_eq!(a.diff(&b), vec!["rip"]);
+    }
+
+    /// Intel SDM Vol. 3 §6.8.3: reset/default starts outside the MOV/POP SS
+    /// maskable-interrupt shadow, and lockstep comparisons include that state.
+    #[test]
+    fn maskable_interrupt_shadow_resets_and_participates_in_diff() {
+        let reset = CpuState::reset();
+        let mut shadowed = CpuState::default();
+        assert_eq!(reset.maskable_interrupt_shadow, 0);
+
+        shadowed.maskable_interrupt_shadow = 1;
+        assert_eq!(reset.diff(&shadowed), vec!["maskable_interrupt_shadow"]);
     }
 }

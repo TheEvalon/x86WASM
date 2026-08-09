@@ -6,8 +6,9 @@
 //! # Spec refs
 //!
 //! - Intel 8237A High Performance Programmable DMA Controller — address/count
-//!   registers, byte pointer flip-flop, mode/mask/command/status, master reset,
-//!   terminal count (word count = N−1), current address/count after transfer.
+//!   registers, byte pointer flip-flop, mode/mask/command, Request Register,
+//!   Status Register, Master Clear, terminal count (word count = N−1), current
+//!   address/count after transfer.
 //! - OSDev Wiki ISA DMA — AT port map and page register assignment
 //!   (`0x87`/`0x83`/`0x81`/`0x82` ch0–3; `0x8F`/`0x8B`/`0x89`/`0x8A` ch4–7);
 //!   8-bit channel physical address `(page << 16) | addr`; 16-bit channels 4–7
@@ -18,10 +19,11 @@
 //! # Scope (this slice)
 //!
 //! - Dual 8237A programming model: addr/count with flip-flop, mode, masks,
-//!   command/request accept, status read, master/mask reset.
+//!   command, software Request Register set/reset, status read, master/mask reset.
 //! - Base Address / Base Word Count loaded whenever Current is programmed
 //!   (Intel 8237A programming model).
-//! - Status register TC bits (3:0) clear-on-read + `latch_tc` device/test API.
+//! - Status register TC bits (3:0) clear-on-read + `latch_tc` device/test API;
+//!   request bits (7:4) persist until their software request is reset.
 //! - Mode register programming (including Cascade bits 7:6 = `11`) on master
 //!   channels 0–3 and slave channels 0–3 (ISA 4–7); ISA channel 4 is the AT
 //!   cascade channel and may be programmed like any other channel.
@@ -110,9 +112,9 @@ pub struct DmaController {
     /// Command register (stored; transfer engine unsupported).
     pub command: u8,
     /// Status register: bits 3:0 = TC per channel (clear-on-read);
-    /// bits 7:4 = request pending (DREQ path unsupported; stay 0 unless latched).
+    /// bits 7:4 = software request pending (external DREQ path unsupported).
     pub status: u8,
-    /// Software request register (stored).
+    /// Software request pending bits 3:0, one bit per controller-local channel.
     pub request: u8,
     /// Channel mask bits 3:0 (1 = masked). Reset default: all masked.
     pub mask: u8,
@@ -139,7 +141,8 @@ impl DmaController {
         }
     }
 
-    /// Spec: Intel 8237A master clear — masks all channels, clears flip-flop.
+    /// Spec: Intel 8237A Master Clear — masks all channels and clears the byte
+    /// pointer, command, status, software requests, and temporary register.
     pub fn master_reset(&mut self) {
         *self = Self::new();
     }
@@ -154,6 +157,21 @@ impl DmaController {
         if channel < 4 {
             self.status |= 1 << channel;
         }
+    }
+
+    /// Apply an Intel 8237A Request Register command.
+    ///
+    /// Bits 1:0 select a controller-local channel; bit 2 sets (`1`) or resets
+    /// (`0`) only that channel's software request. Channel masking is independent.
+    fn write_request(&mut self, value: u8) {
+        let channel = value & 0x03;
+        let request_bit = 1u8 << channel;
+        if value & 0x04 != 0 {
+            self.request |= request_bit;
+        } else {
+            self.request &= !request_bit;
+        }
+        self.status = (self.status & 0x0F) | ((self.request & 0x0F) << 4);
     }
 
     fn clear_flip_flop(&mut self) {
@@ -214,7 +232,8 @@ impl DmaController {
             }
             8 => {
                 // Spec: Intel 8237A — status read returns TC (bits 3:0) + request
-                // (bits 7:4); TC bits clear on read. Master clear also clears them.
+                // (bits 7:4); only TC bits clear on read. Software requests persist
+                // until reset through the Request Register or Master Clear.
                 let status = self.status;
                 self.status &= !0x0F;
                 status
@@ -233,7 +252,7 @@ impl DmaController {
                 self.write_addr_count_byte(ch, is_count, value);
             }
             8 => self.command = value,
-            9 => self.request = value,
+            9 => self.write_request(value),
             10 => {
                 // Single-channel mask: bits1:0 = channel, bit2 = mask set/clear.
                 let ch = value & 0x03;
@@ -628,16 +647,145 @@ mod tests {
     }
 
     #[test]
+    fn software_request_set_reset_each_master_channel() {
+        // Spec: Intel 8237A Request Register — bits 1:0 select the channel and
+        // bit 2 sets (1) or resets (0) that channel's software request.
+        let mut d = Dma8237::new();
+        let mut expected = 0u8;
+        for channel in 0u8..4 {
+            let request_bit = 1u8 << channel;
+            expected |= request_bit;
+
+            d.port_write(0x09, 1, u32::from(0x04 | channel));
+            assert_eq!(d.master.request, expected, "set channel {channel}");
+            assert_eq!(
+                d.port_read(0x08, 1) as u8 & 0xF0,
+                expected << 4,
+                "status channel {channel}"
+            );
+            assert_eq!(
+                d.port_read(0x08, 1) as u8 & 0xF0,
+                expected << 4,
+                "status read preserves channel {channel} request"
+            );
+        }
+
+        for channel in 0u8..4 {
+            expected &= !(1u8 << channel);
+            d.port_write(0x09, 1, u32::from(channel));
+            assert_eq!(d.master.request, expected, "reset channel {channel}");
+            assert_eq!(d.port_read(0x08, 1) as u8 & 0xF0, expected << 4);
+        }
+    }
+
+    #[test]
+    fn software_request_set_reset_each_slave_channel() {
+        // Spec: Intel 8237A Request Register at slave offset 9 → PC/AT port
+        // 0xD2. The two selector bits address slave-local channels 0–3
+        // (ISA channels 4–7), reflected in slave status at 0xD0.
+        let mut d = Dma8237::new();
+        let mut expected = 0u8;
+        for channel in 0u8..4 {
+            let request_bit = 1u8 << channel;
+            expected |= request_bit;
+
+            d.port_write(0xD2, 1, u32::from(0x04 | channel));
+            assert_eq!(d.slave.request, expected, "set slave channel {channel}");
+            assert_eq!(d.master.request, 0, "master remains independent");
+            assert_eq!(
+                d.port_read(0xD0, 1) as u8 & 0xF0,
+                expected << 4,
+                "slave status channel {channel}"
+            );
+        }
+
+        for channel in 0u8..4 {
+            expected &= !(1u8 << channel);
+            d.port_write(0xD2, 1, u32::from(channel));
+            assert_eq!(d.slave.request, expected, "reset slave channel {channel}");
+            assert_eq!(d.port_read(0xD0, 1) as u8 & 0xF0, expected << 4);
+        }
+    }
+
+    #[test]
+    fn software_requests_are_independent_of_channel_masks() {
+        // Spec: Intel 8237A Request Register and Mask Register are independent:
+        // a masked channel can hold a software request, and mask writes do not
+        // set or reset that request.
+        let mut d = Dma8237::new();
+        assert_eq!(d.master.mask, 0x0F);
+
+        d.port_write(0x09, 1, 0x06); // set request ch2 while masked
+        assert_eq!(d.master.request, 0x04);
+        assert_eq!(d.master.mask, 0x0F);
+        assert_eq!(d.port_read(0x08, 1) as u8, 0x40);
+
+        d.port_write(0x0A, 1, 0x02); // unmask ch2
+        assert_eq!(d.master.mask, 0x0B);
+        assert_eq!(d.master.request, 0x04);
+        assert_eq!(d.port_read(0x08, 1) as u8, 0x40);
+
+        d.port_write(0x09, 1, 0x02); // reset request ch2
+        assert_eq!(d.master.request, 0);
+        assert_eq!(d.master.mask, 0x0B);
+    }
+
+    #[test]
+    fn status_read_clears_tc_only_and_preserves_request_bits() {
+        // Spec: Intel 8237A Status Register — bits 7:4 report requests and bits
+        // 3:0 report terminal count. A status read clears only the TC bits.
+        let mut d = Dma8237::new();
+        d.latch_tc(1); // TC ch1 → status bit 1
+        d.port_write(0x09, 1, 0x07); // set request ch3 → status bit 7
+
+        assert_eq!(d.port_read(0x08, 1) as u8, 0x82);
+        assert_eq!(d.master.status & 0x0F, 0);
+        assert_eq!(d.master.request, 0x08);
+        assert_eq!(d.port_read(0x08, 1) as u8, 0x80);
+
+        d.latch_tc(0);
+        d.port_write(0x09, 1, 0x03); // reset request ch3 without disturbing TC
+        assert_eq!(d.port_read(0x08, 1) as u8, 0x01);
+        assert_eq!(d.port_read(0x08, 1) as u8, 0);
+    }
+
+    #[test]
+    fn master_clear_clears_target_controller_software_requests() {
+        // Spec: Intel 8237A Master Clear clears the Request Register and status,
+        // resets the byte pointer, and sets all four channel masks.
+        let mut d = Dma8237::new();
+        d.port_write(0x09, 1, 0x05); // master request ch1
+        d.port_write(0xD2, 1, 0x06); // slave request ch2 (ISA ch6)
+        d.port_write(0x0A, 1, 0x01); // unmask master ch1
+        d.port_write(0xD4, 1, 0x02); // unmask slave-local ch2
+        d.latch_tc(1);
+        d.latch_tc(6);
+
+        d.port_write(0x0D, 1, 0); // master controller Master Clear
+        assert_eq!(d.master.request, 0);
+        assert_eq!(d.master.mask, 0x0F);
+        assert_eq!(d.port_read(0x08, 1) as u8, 0);
+        assert_eq!(d.slave.request, 0x04);
+        assert_eq!(d.port_read(0xD0, 1) as u8, 0x44);
+
+        d.port_write(0xDA, 1, 0); // slave controller Master Clear
+        assert_eq!(d.slave.request, 0);
+        assert_eq!(d.slave.mask, 0x0F);
+        assert_eq!(d.port_read(0xD0, 1) as u8, 0);
+    }
+
+    #[test]
     fn software_request_and_mask_unchanged_with_tc() {
         // Existing programming model must stay green beside TC latch/status.
         let mut d = Dma8237::new();
         d.port_write(0x09, 1, 0x04); // software request set ch0
-        assert_eq!(d.master.request, 0x04);
+        assert_eq!(d.master.request, 0x01);
         d.port_write(0x0A, 1, 0x00); // unmask ch0
         assert_eq!(d.master.mask & 0x01, 0);
         d.latch_tc(0);
-        assert_eq!(d.port_read(0x08, 1) as u8 & 0x0F, 0x01);
-        assert_eq!(d.master.request, 0x04);
+        assert_eq!(d.port_read(0x08, 1) as u8, 0x11);
+        assert_eq!(d.port_read(0x08, 1) as u8, 0x10);
+        assert_eq!(d.master.request, 0x01);
         assert_eq!(d.master.mask & 0x01, 0);
     }
 
