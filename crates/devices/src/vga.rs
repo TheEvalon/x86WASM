@@ -1227,15 +1227,39 @@ pub const VGA_TEXT_UNDERLINE_FG_VALUE: u8 = 0x01;
 /// Attribute background bits (6:4) that must be zero for underline.
 pub const VGA_TEXT_UNDERLINE_BG_BITS: u8 = 0x70;
 
+/// Attribute Controller Mode Control bit6 — 8-bit Color Enable.
+///
+/// Spec: FreeVGA Attribute Mode Control Register — "When this bit is set to 1,
+/// the video data is sampled so that eight bits are available to select a color
+/// in the 256-color mode (0x13). This bit is set to 0 in all other modes."
+pub const VGA_ATC_MODE_8BIT: u8 = 0x40;
+
+/// Graphics Mode (`0x05`) bit6 — 256-Color Mode / Shift 256.
+///
+/// Spec: FreeVGA Graphics Mode Register `C256`; IBM PS/2 Video Subsystems
+/// Figure 2-72 "256-Color Shift Mode".
+pub const VGA_GC_MODE_SHIFT256: u8 = 0x40;
+
+/// Displayed width of the chain-4 256-color graphics fetch, in pixels.
+///
+/// Spec: IBM VGA mode 13h is 320×200 with 256 colors.
+pub const VGA_MODE13_WIDTH: usize = 320;
+/// Displayed height of the chain-4 256-color graphics fetch, in rows.
+pub const VGA_MODE13_HEIGHT: usize = 200;
+
 /// Display mode the renderer can currently produce.
 ///
 /// This model renders exactly two programmings and says so; it is not general
-/// VGA mode coverage.
+/// VGA mode coverage. In particular there is **no** planar 16-color renderer
+/// (modes 0Dh/0Eh/10h/12h) and no VBE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VgaRenderMode {
     /// Alphanumeric (character generator) fetch: codes from map 0, attributes
     /// from map 1, glyphs from map 2.
     Text,
+    /// Chain-4 256-color linear graphics — the mode-13h programming. Each
+    /// display byte is one pixel and goes to the DAC through the PEL Mask.
+    Graphics256Chain4,
     /// Programming the renderer does not model. No frame is produced.
     Unsupported,
 }
@@ -2658,12 +2682,50 @@ impl VgaText {
             && attr & VGA_TEXT_UNDERLINE_BG_BITS == 0
     }
 
+    /// True when Attribute Mode Control 8-bit Color Enable is set.
+    ///
+    /// Spec: FreeVGA Attribute Mode Control Register `8BIT`.
+    pub fn atc_8bit_color(&self) -> bool {
+        self.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)] & VGA_ATC_MODE_8BIT != 0
+    }
+
+    /// True when Graphics Mode 256-Color Mode (`C256`) is set.
+    ///
+    /// Spec: FreeVGA Graphics Mode Register; IBM Figure 2-72.
+    pub fn gc_shift256(&self) -> bool {
+        self.gc_regs[usize::from(VGA_GC_MODE)] & VGA_GC_MODE_SHIFT256 != 0
+    }
+
+    /// True when the register file carries the whole mode-13h signature.
+    ///
+    /// All five must hold, because this model claims only this programming:
+    /// Graphics Controller Miscellaneous Graphics/Alphanumeric (IBM Figure
+    /// 2-74 bit0), Attribute Mode Control `ATGE` and `8BIT` (FreeVGA index
+    /// `10h` bits 0 and 6), Sequencer Memory Mode Chain 4 (IBM Figure 2-34),
+    /// and Graphics Mode `C256` (IBM Figure 2-72).
+    ///
+    /// The Memory Map Select CPU window is deliberately *not* part of the
+    /// test: the CRTC addresses display memory directly, so where the CPU
+    /// aperture sits does not change what is displayed.
+    pub fn is_mode13h_programming(&self) -> bool {
+        self.gc_graphics_mode()
+            && self.atc_graphics_enabled()
+            && self.atc_8bit_color()
+            && self.seq_chain4_enabled()
+            && self.gc_shift256()
+    }
+
     /// Display fetch this model can produce with the current programming.
     ///
-    /// Only the alphanumeric (character generator) fetch exists in this slice.
-    /// Any graphics programming reports [`VgaRenderMode::Unsupported`] rather
-    /// than rendering something that is not what the hardware would show.
+    /// Two fetches exist: the alphanumeric character generator and the
+    /// chain-4 256-color linear fetch. Every other graphics programming —
+    /// planar 16-color modes included — reports
+    /// [`VgaRenderMode::Unsupported`] rather than rendering something that is
+    /// not what the hardware would show.
     pub fn render_mode(&self) -> VgaRenderMode {
+        if self.is_mode13h_programming() {
+            return VgaRenderMode::Graphics256Chain4;
+        }
         if self.gc_graphics_mode() || self.atc_graphics_enabled() {
             return VgaRenderMode::Unsupported;
         }
@@ -2674,10 +2736,12 @@ impl VgaText {
     /// a programming this model does not fetch.
     ///
     /// `blink_off_half` selects the invisible half of the blink cycle; the
-    /// caller owns the phase because there is no vertical-retrace timer.
+    /// caller owns the phase because there is no vertical-retrace timer. It has
+    /// no effect on a graphics fetch.
     pub fn render_frame(&self, blink_off_half: bool) -> Option<VgaFrame> {
         match self.render_mode() {
             VgaRenderMode::Text => Some(self.render_text_frame(blink_off_half)),
+            VgaRenderMode::Graphics256Chain4 => Some(self.render_graphics256_frame()),
             VgaRenderMode::Unsupported => None,
         }
     }
@@ -2765,6 +2829,76 @@ impl VgaText {
             height,
             pixels,
             mode: VgaRenderMode::Text,
+        }
+    }
+
+    /// Byte distance between two displayed rows in a graphics fetch.
+    ///
+    /// Spec: FreeVGA CRTC Offset Register — "Beginning with the second scan
+    /// line, the starting scan line is increased by twice the value of this
+    /// register multiplied by the current memory address size". The mode-13h
+    /// programming (Offset `0x28`, doubleword addressing) gives
+    /// `0x28 * 2 * 4` = 320 bytes, one byte per pixel across the screen.
+    pub fn graphics_row_stride_bytes(&self) -> usize {
+        usize::from(self.crtc_regs[usize::from(VGA_CRTC_OFFSET)])
+            * 2
+            * self.crtc_address_multiplier()
+    }
+
+    /// DAC index of one chain-4 256-color pixel at display byte address
+    /// `linear`.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-34 — with Chain 4 the two
+    /// low-order address bits select the map, so display byte *n* lives in map
+    /// `n & 3`. The per-map offset is the address with A1:A0 cleared, the same
+    /// form the CPU side uses (`docs/vga-plane-memory-model.md`), so a byte the
+    /// CPU wrote at `0xA0000 + n` is the pixel the display reads at *n*.
+    ///
+    /// Spec: FreeVGA Attribute Mode Control `8BIT` and Color Select — "In mode
+    /// 13 hex, the 8-bit attribute is the digital color value to the video
+    /// DAC", so the Internal Palette and Color Select take no part; only the
+    /// PEL Mask is applied.
+    pub fn graphics256_pixel_dac_index(&self, linear: usize) -> u8 {
+        let map = linear & 0b11;
+        let offset = (linear & !0b11) % self.plane_size_bytes();
+        let pixel = self.planes[map * VGA_PLANE_SIZE + offset];
+        self.display_dac_index(pixel)
+    }
+
+    /// Render the chain-4 256-color linear display (the mode-13h fetch).
+    ///
+    /// Row *r* starts at CRTC address counter `StartAddress + r * Offset * 2`,
+    /// which the addressing multiplier turns into a byte address; pixel *x* of
+    /// that row is the next byte along. Each byte is a DAC index after the PEL
+    /// Mask.
+    ///
+    /// **Model choice:** the frame is a fixed
+    /// [`VGA_MODE13_WIDTH`]×[`VGA_MODE13_HEIGHT`] window, for the same reason
+    /// the text grid is fixed at 80×25 — this model has no CRTC timing, so
+    /// Horizontal and Vertical Display End cannot size it. A wider Offset
+    /// therefore behaves as a virtual resolution: the row stride grows while
+    /// the visible window stays 320 pixels. Maximum Scan Line bit7 Scan
+    /// Doubling (which real mode 13h uses to paint 200 rows on 400 scan lines)
+    /// is not applied, so a row is one output row here.
+    pub fn render_graphics256_frame(&self) -> VgaFrame {
+        let width = VGA_MODE13_WIDTH;
+        let height = VGA_MODE13_HEIGHT;
+        let mut pixels = vec![0u8; width * height];
+        let start_byte = usize::from(self.text_start_address()) * self.crtc_address_multiplier();
+        let stride = self.graphics_row_stride_bytes();
+
+        for row in 0..height {
+            let row_byte = start_byte + row * stride;
+            for x in 0..width {
+                pixels[row * width + x] = self.graphics256_pixel_dac_index(row_byte + x);
+            }
+        }
+
+        VgaFrame {
+            width,
+            height,
+            pixels,
+            mode: VgaRenderMode::Graphics256Chain4,
         }
     }
 
@@ -6794,5 +6928,218 @@ mod unified_display_memory_tests {
         );
         assert_eq!(v.plane_byte(VGA_FONT_PLANE, 0x1234), Some(0x00));
         assert_eq!(v.char_at(24, 79), Some(VGA_DEFAULT_CHAR));
+    }
+}
+
+/// Chain-4 256-color graphics display fetch — the mode-13h path
+/// (M2 round 3, slice 3).
+///
+/// This is the *only* graphics fetch this model has. Planar 16-color modes
+/// (0Dh / 0Eh / 10h / 12h) have no renderer, and there is no VBE.
+#[cfg(test)]
+mod graphics256_tests {
+    use super::*;
+
+    fn set_crtc(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(index));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(value));
+    }
+
+    fn set_seq(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(index));
+        v.port_write(VGA_SEQ_DATA, 1, u32::from(value));
+    }
+
+    fn set_gc(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_GC_INDEX, 1, u32::from(index));
+        v.port_write(VGA_GC_DATA, 1, u32::from(value));
+    }
+
+    fn set_atc(v: &mut VgaText, index: u8, value: u8) {
+        v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(index));
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(value));
+    }
+
+    /// The register values IBM mode 13h programs, for the fields this device
+    /// models: `0xA0000` 64 KB graphics window, 256-color shift, chain-4 with
+    /// all maps writable, 8-bit attribute straight to the DAC, doubleword
+    /// addressing with an Offset of `0x28` (a 320-byte row stride).
+    fn program_mode13h(v: &mut VgaText) {
+        // A BIOS mode set clears display memory; clear it here too so the
+        // reset 80×25 blank-screen fill (which now lives in maps 0 and 1)
+        // does not show up as pixels.
+        v.planes.fill(0);
+        set_gc(
+            v,
+            VGA_GC_MISC,
+            VGA_GC_MISC_GRAPHICS_MODE
+                | (VGA_GC_MEMORY_MAP_A0000_64K << VGA_GC_MISC_MEMORY_MAP_SHIFT),
+        );
+        set_gc(v, VGA_GC_MODE, VGA_GC_MODE_SHIFT256);
+        set_seq(
+            v,
+            VGA_SEQ_MEMORY_MODE,
+            VGA_SEQ_MEMORY_MODE_EXTENDED
+                | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE
+                | VGA_SEQ_MEMORY_MODE_CHAIN4,
+        );
+        set_seq(v, VGA_SEQ_MAP_MASK, VGA_SEQ_MAP_MASK_PLANES);
+        set_atc(
+            v,
+            VGA_ATC_MODE_CONTROL,
+            VGA_ATC_MODE_ATGE | VGA_ATC_MODE_8BIT,
+        );
+        set_crtc(v, VGA_CRTC_UNDERLINE_LOCATION, VGA_CRTC_UNDERLINE_DW);
+        set_crtc(v, VGA_CRTC_OFFSET, VGA_CRTC_OFFSET_DEFAULT);
+    }
+
+    /// Spec: IBM mode 13h — 320×200×256. The whole signature must be present.
+    #[test]
+    fn the_mode13h_signature_selects_the_chain4_256_color_fetch() {
+        let mut v = VgaText::new();
+        assert_eq!(v.render_mode(), VgaRenderMode::Text);
+
+        program_mode13h(&mut v);
+        assert!(v.is_mode13h_programming());
+        assert_eq!(v.render_mode(), VgaRenderMode::Graphics256Chain4);
+        assert_eq!(v.crtc_address_multiplier(), 4);
+        assert_eq!(v.graphics_row_stride_bytes(), 320);
+
+        let frame = v.render_frame(false).expect("mode 13h renders");
+        assert_eq!(frame.width, VGA_MODE13_WIDTH);
+        assert_eq!(frame.height, VGA_MODE13_HEIGHT);
+        assert_eq!(frame.pixels.len(), 320 * 200);
+        assert_eq!(frame.mode, VgaRenderMode::Graphics256Chain4);
+    }
+
+    /// Any missing piece of the signature is reported rather than rendered.
+    #[test]
+    fn partial_256_color_programming_is_unsupported() {
+        for drop in 0..5 {
+            let mut v = VgaText::new();
+            program_mode13h(&mut v);
+            match drop {
+                0 => set_gc(&mut v, VGA_GC_MISC, VGA_GC_MISC_DEFAULT),
+                1 => set_gc(&mut v, VGA_GC_MODE, 0x00),
+                2 => set_seq(
+                    &mut v,
+                    VGA_SEQ_MEMORY_MODE,
+                    VGA_SEQ_MEMORY_MODE_EXTENDED | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE,
+                ),
+                3 => set_atc(&mut v, VGA_ATC_MODE_CONTROL, VGA_ATC_MODE_ATGE),
+                _ => set_atc(&mut v, VGA_ATC_MODE_CONTROL, VGA_ATC_MODE_8BIT),
+            }
+            assert!(!v.is_mode13h_programming(), "case {drop}");
+            // Dropping ATGE alone still leaves Graphics/Alphanumeric set, so
+            // this is graphics programming with no renderer, not text.
+            assert_eq!(v.render_mode(), VgaRenderMode::Unsupported, "case {drop}");
+            assert!(v.render_frame(false).is_none(), "case {drop}");
+        }
+    }
+
+    /// A guest byte written to `0xA0000 + n` is the pixel displayed at *n*.
+    ///
+    /// Spec: IBM Figure 2-34 — chain 4 selects the map from A1:A0, so
+    /// consecutive display bytes rotate through maps 0, 1, 2, 3 at one shared
+    /// per-map offset.
+    #[test]
+    fn consecutive_pixels_rotate_through_the_four_maps() {
+        let mut v = VgaText::new();
+        program_mode13h(&mut v);
+        for n in 0..8u8 {
+            assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE + u64::from(n), 0x10 + n));
+        }
+
+        // Bytes 0-3 share per-map offset 0; bytes 4-7 share offset 4.
+        assert_eq!(v.plane_byte(0, 0), Some(0x10));
+        assert_eq!(v.plane_byte(1, 0), Some(0x11));
+        assert_eq!(v.plane_byte(2, 0), Some(0x12));
+        assert_eq!(v.plane_byte(3, 0), Some(0x13));
+        assert_eq!(v.plane_byte(0, 4), Some(0x14));
+        assert_eq!(v.plane_byte(3, 4), Some(0x17));
+
+        let frame = v.render_frame(false).expect("mode 13h renders");
+        for n in 0..8usize {
+            assert_eq!(frame.index_at(n, 0), Some(0x10 + n as u8), "pixel {n}");
+        }
+        // Nothing else was written, so the rest of the row is index 0.
+        assert_eq!(frame.index_at(8, 0), Some(0x00));
+    }
+
+    /// Row *r* starts one 320-byte stride further into display memory.
+    ///
+    /// Spec: FreeVGA CRTC Offset Register — the row stride is
+    /// `Offset * 2 * MemoryAddressSize`, and mode 13h uses doubleword
+    /// addressing, giving `0x28 * 2 * 4` = 320.
+    #[test]
+    fn rows_are_one_offset_stride_apart() {
+        let mut v = VgaText::new();
+        program_mode13h(&mut v);
+        // First pixel of row 1 is display byte 320.
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE + 320, 0x5A));
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE + 320 + 319, 0x6B));
+
+        let frame = v.render_frame(false).expect("mode 13h renders");
+        assert_eq!(frame.index_at(0, 1), Some(0x5A));
+        assert_eq!(frame.index_at(319, 1), Some(0x6B));
+        assert_eq!(frame.index_at(0, 0), Some(0x00));
+        assert_eq!(frame.index_at(0, 2), Some(0x00));
+    }
+
+    /// Start Address moves the whole picture, scaled by the addressing
+    /// multiplier. Spec: FreeVGA CRTC Start Address Low.
+    #[test]
+    fn start_address_moves_the_graphics_origin() {
+        let mut v = VgaText::new();
+        program_mode13h(&mut v);
+        // Counter 2 with doubleword addressing is display byte 8.
+        set_crtc(&mut v, VGA_CRTC_START_ADDR_HIGH, 0x00);
+        set_crtc(&mut v, VGA_CRTC_START_ADDR_LOW, 0x02);
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE + 8, 0x77));
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE + 9, 0x88));
+
+        let frame = v.render_frame(false).expect("mode 13h renders");
+        assert_eq!(frame.index_at(0, 0), Some(0x77));
+        assert_eq!(frame.index_at(1, 0), Some(0x88));
+    }
+
+    /// The 8-bit pixel value goes to the DAC directly: the Internal Palette
+    /// and Color Select take no part, and only the PEL Mask is applied.
+    ///
+    /// Spec: FreeVGA Attribute Mode Control `8BIT` + Color Select ("In mode 13
+    /// hex, the 8-bit attribute is the digital color value to the video DAC").
+    #[test]
+    fn the_internal_palette_is_bypassed_and_only_the_pel_mask_applies() {
+        let mut v = VgaText::new();
+        program_mode13h(&mut v);
+        // Repaint palette entry 5 and set Color Select; neither may show up.
+        set_atc(&mut v, 0x05, 0x2A);
+        set_atc(&mut v, VGA_ATC_COLOR_SELECT, 0b0000_1111);
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE, 0x05));
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE + 1, 0xC5));
+
+        let frame = v.render_frame(false).expect("mode 13h renders");
+        assert_eq!(frame.index_at(0, 0), Some(0x05));
+        assert_eq!(frame.index_at(1, 0), Some(0xC5));
+
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x3F);
+        let frame = v.render_frame(false).expect("mode 13h renders");
+        assert_eq!(frame.index_at(0, 0), Some(0x05));
+        assert_eq!(frame.index_at(1, 0), Some(0xC5 & 0x3F));
+    }
+
+    /// The RGBA expansion works the same for a graphics frame.
+    #[test]
+    fn graphics_frames_expand_through_the_dac_like_text_frames() {
+        let mut v = VgaText::new();
+        program_mode13h(&mut v);
+        v.dac_ram[0x21] = [0x00, 0x3F, 0x15];
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE, 0x21));
+
+        let frame = v.render_frame(false).expect("mode 13h renders");
+        let rgba = v.frame_rgba8(&frame);
+        assert_eq!(rgba.len(), 320 * 200 * 4);
+        assert_eq!(&rgba[..4], &[0x00, 0xFF, 0x55, 0xFF]);
     }
 }
