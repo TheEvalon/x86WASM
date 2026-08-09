@@ -7,9 +7,16 @@
 use thiserror::Error;
 use x86_core::CpuState;
 use x86_decode::{decode_with_mode, DecodeError, DecodedInsn};
+use x86_mmu::paging::{Mmu, PagingContext};
 use x86_mmu::{checked_linear_addr, linear_addr};
 
 /// Memory + port callbacks supplied by `machine-pc`.
+///
+/// Addresses are **linear**, not physical. When `CR0.PG = 1` the interpreter
+/// wraps the machine's bus in [`PagedBus`], which translates each access
+/// through the 32-bit paging engine before forwarding a physical address here;
+/// with `CR0.PG = 0` a linear address *is* the physical address and the wrapper
+/// forwards it unchanged (SDM Vol. 3 §4.1.1).
 pub trait Bus {
     fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError>;
     fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError>;
@@ -62,6 +69,153 @@ pub trait Bus {
     /// REP can observe an interrupt between iterations. Full 8259 is later.
     fn poll_external_irq(&mut self) -> Option<u8> {
         None
+    }
+
+    /// The guest executed `MOV to CR0`, `MOV to CR3`, `MOV to CR4`, `LMSW` or
+    /// `CLTS`; `reg` is the control-register number that was written and the
+    /// three values are the state after the write.
+    ///
+    /// [`PagedBus`] uses this to refresh its [`PagingContext`] and to apply the
+    /// SDM §4.10.4.1 TLB invalidation for the specific register written — which
+    /// is not the same as noticing a changed value, because `MOV to CR3`
+    /// invalidates even when it stores the value `CR3` already held.
+    ///
+    /// Default: nothing, for a bus that models no translation.
+    fn on_mov_to_control_register(&mut self, reg: u8, cr0: u64, cr3: u64, cr4: u64) {
+        let _ = (reg, cr0, cr3, cr4);
+    }
+
+    /// The guest executed `INVLPG` for this linear address (SDM §4.10.4.1).
+    ///
+    /// Default: nothing. A bus that caches no translation has nothing to drop.
+    fn invalidate_page(&mut self, linear: u64) {
+        let _ = linear;
+    }
+}
+
+/// The interpreter's memory path with 32-bit paging in it.
+///
+/// Every access the interpreter makes goes through one of these, whether or not
+/// paging is enabled, so that the translated and untranslated paths cannot
+/// drift apart. With `CR0.PG = 0` it forwards linear addresses to the machine
+/// bus unchanged, which is exactly what the interpreter did before paging
+/// existed; with `CR0.PG = 1` it translates through [`Mmu`] first.
+///
+/// Spec: Intel SDM Vol. 3 §4.1.1 (a linear address is a physical address when
+/// `CR0.PG = 0`), §4.3 (32-bit paging), §4.6.1 (access rights).
+pub struct PagedBus<'a> {
+    inner: &'a mut dyn Bus,
+    mmu: &'a mut Mmu,
+    ctx: PagingContext,
+    /// CPL sampled at the instruction boundary (SDM §4.6.1). The delivery paths
+    /// this interpreter implements are same-CPL, so it cannot change mid-
+    /// instruction; a future privilege-changing gate must resample it.
+    cpl: u8,
+}
+
+impl<'a> PagedBus<'a> {
+    /// Wrap `inner` with the paging state `cpu` currently selects.
+    ///
+    /// Construction polls [`Mmu::sync_control_registers`], which applies any
+    /// invalidation implied by a control-register change that did not come
+    /// through `MOV to CRn` — a reset, or a path a later slice adds. The
+    /// explicit `MOV to CRn` hooks stay the precise interface (SDM §4.10.4.1).
+    pub fn new(inner: &'a mut dyn Bus, mmu: &'a mut Mmu, cpu: &CpuState) -> Self {
+        let ctx = PagingContext::new(cpu.cr0, cpu.cr3, cpu.cr4);
+        mmu.sync_control_registers(&ctx);
+        Self {
+            inner,
+            mmu,
+            ctx,
+            cpl: if cr0_pe(cpu) {
+                (cpu.cs.selector & 3) as u8
+            } else {
+                // Real-address mode executes at CPL 0 (SDM Vol. 3 §5.5).
+                0
+            },
+        }
+    }
+
+    /// The control-register state this path is translating with.
+    pub fn paging_context(&self) -> &PagingContext {
+        &self.ctx
+    }
+
+    /// CPL of the accesses this path makes (SDM §4.6.1).
+    pub fn cpl(&self) -> u8 {
+        self.cpl
+    }
+}
+
+impl Bus for PagedBus<'_> {
+    fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        self.inner.read_u8(addr)
+    }
+
+    fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        self.inner.write_u8(addr, val)
+    }
+
+    fn read_u16(&mut self, addr: u64) -> Result<u16, ExecError> {
+        self.inner.read_u16(addr)
+    }
+
+    fn write_u16(&mut self, addr: u64, val: u16) -> Result<(), ExecError> {
+        self.inner.write_u16(addr, val)
+    }
+
+    fn read_u32(&mut self, addr: u64) -> Result<u32, ExecError> {
+        self.inner.read_u32(addr)
+    }
+
+    fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), ExecError> {
+        self.inner.write_u32(addr, val)
+    }
+
+    fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError> {
+        self.inner.port_in_u8(port)
+    }
+
+    fn port_out_u8(&mut self, port: u16, val: u8) -> Result<(), ExecError> {
+        self.inner.port_out_u8(port, val)
+    }
+
+    fn port_in_u16(&mut self, port: u16) -> Result<u16, ExecError> {
+        self.inner.port_in_u16(port)
+    }
+
+    fn port_out_u16(&mut self, port: u16, val: u16) -> Result<(), ExecError> {
+        self.inner.port_out_u16(port, val)
+    }
+
+    fn port_in_u32(&mut self, port: u16) -> Result<u32, ExecError> {
+        self.inner.port_in_u32(port)
+    }
+
+    fn port_out_u32(&mut self, port: u16, val: u32) -> Result<(), ExecError> {
+        self.inner.port_out_u32(port, val)
+    }
+
+    fn poll_external_irq(&mut self) -> Option<u8> {
+        self.inner.poll_external_irq()
+    }
+
+    fn on_mov_to_control_register(&mut self, reg: u8, cr0: u64, cr3: u64, cr4: u64) {
+        let previous = self.ctx;
+        self.ctx = PagingContext::with_profile(cr0, cr3, cr4, previous.profile);
+        match reg {
+            0 => self.mmu.on_mov_to_cr0(previous.cr0, cr0),
+            3 => self.mmu.on_mov_to_cr3(cr3),
+            4 => self.mmu.on_mov_to_cr4(previous.cr4, cr4),
+            _ => {}
+        }
+        // Keep the polled shadow level with the explicit hook so the next
+        // `sync_control_registers` does not repeat the same invalidation.
+        self.mmu.sync_control_registers(&self.ctx);
+    }
+
+    fn invalidate_page(&mut self, linear: u64) {
+        self.mmu.invlpg(linear as u32);
     }
 }
 
@@ -2953,21 +3107,46 @@ const CPUID_MAX_EXTENDED_LEAF: u32 = 0x8000_0000;
 /// conservative vendor/brand string until the features exist.
 const CPUID_VENDOR: [u8; 12] = *b"x86WASM Emu ";
 
-/// `CPUID` leaf 1 version information: family 5, model 0, stepping 0.
+/// `CPUID` leaf 1 version information: family 6, model 0, stepping 0.
 ///
-/// Family 5 is the generation that introduced `RDMSR`/`WRMSR`, which is the
-/// only feature bit reported below, so the signature and the feature bits agree.
-const CPUID_VERSION_INFO: u32 = 0x0000_0500;
+/// Family 6 is the generation that introduced the two newest features reported
+/// below — `PGE` and `CMOV` — so the signature and the feature bits still
+/// agree. It was family 5 while `MSR` was the only bit set.
+const CPUID_VERSION_INFO: u32 = 0x0000_0600;
+
+/// `CPUID.01H:EDX[3]` — page size extensions, i.e. 4-MiB pages through
+/// `CR4.PSE` (SDM Vol. 3 §4.1.4, §4.3).
+const CPUID_FEATURE_PSE: u32 = 1 << 3;
+/// `CPUID.01H:EDX[5]` — `RDMSR`/`WRMSR`.
+const CPUID_FEATURE_MSR: u32 = 1 << 5;
+/// `CPUID.01H:EDX[13]` — global pages through `CR4.PGE` (SDM Vol. 3 §4.1.4,
+/// §4.10.2.4).
+const CPUID_FEATURE_PGE: u32 = 1 << 13;
+/// `CPUID.01H:EDX[15]` — `CMOVcc` (and `FCMOVcc` when an FPU is present, which
+/// this emulator does not report).
+const CPUID_FEATURE_CMOV: u32 = 1 << 15;
 
 /// `CPUID` leaf 1 `EDX` feature bits.
 ///
-/// Bit 5 (`MSR`) is the only feature this emulator implements: `RDMSR` and
-/// `WRMSR` decode, check privilege, and raise the architectural `#GP` for the
-/// MSR addresses they do not implement. Every other bit — `FPU`, `TSC`, `PSE`,
-/// `PAE`, `APIC`, `MTRR`, `CX8`, `CMOV`, `MMX`, `SSE`, and the rest — stays
-/// clear because none of those are implemented.
-/// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); `AGENTS.md` truthful-CPUID rule.
-const CPUID_FEATURES_EDX: u32 = 1 << 5;
+/// Four features are implemented and therefore advertised:
+///
+/// * `PSE` — `CR4.PSE` and 4-MiB pages are implemented by the paging engine,
+///   and §4.1.4 makes the CPUID bit the guest's licence to set `CR4.PSE`.
+/// * `MSR` — `RDMSR`/`WRMSR` decode, check privilege, and raise the
+///   architectural `#GP` for the MSR addresses they do not implement.
+/// * `PGE` — `CR4.PGE` and global-page TLB retention are implemented.
+/// * `CMOV` — the `0F 40`–`0F 4F` conditional moves are implemented. The
+///   `FCMOVcc` half of this bit's definition needs an FPU, which `FPU`
+///   (`EDX[0]`) correctly reports as absent.
+///
+/// Deliberately still clear: `PAE` (`EDX[6]`), `PAT` (`EDX[16]`) and `PSE-36`
+/// (`EDX[17]`) — the paging engine models none of them, and its default profile
+/// assumes exactly that. Everything else — `FPU`, `TSC`, `APIC`, `MTRR`, `CX8`,
+/// `MMX`, `SSE` — stays clear because none of those are implemented.
+/// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); Vol. 3 §4.1.4; `AGENTS.md`
+/// truthful-CPUID rule.
+const CPUID_FEATURES_EDX: u32 =
+    CPUID_FEATURE_PSE | CPUID_FEATURE_MSR | CPUID_FEATURE_PGE | CPUID_FEATURE_CMOV;
 
 /// `CPUID` leaf 1 `ECX` feature bits: none are implemented.
 const CPUID_FEATURES_ECX: u32 = 0;
@@ -3059,6 +3238,40 @@ fn require_cpl0(cpu: &CpuState) -> Result<(), ExecError> {
         return Err(arch_fault_with_error_code(13, 0));
     }
     Ok(())
+}
+
+/// The `CR4` bits a guest may set, derived from the `CPUID` bits that advertise
+/// them so the two cannot drift apart.
+///
+/// SDM Vol. 3 §4.1.4 makes each paging feature's `CR4` bit conditional on its
+/// `CPUID` bit ("`CR4.PSE` … can be set only if `CPUID.01H:EDX.PSE [bit 3]` is
+/// 1"), and Vol. 2 "MOV—Move to/from Control Registers" raises `#GP(0)` on a
+/// write of 1 to a reserved `CR4` bit. Every bit outside this mask — `VME`,
+/// `PVI`, `TSD`, `DE`, `PAE`, `MCE`, `PCE`, `OSFXSR`, `OSXMMEXCPT`, `UMIP`,
+/// `SMEP`, `SMAP`, `PKE`, and the rest — is unimplemented here, so it is
+/// reserved and refused rather than silently stored. In particular `CR4.PAE`
+/// is refused, which keeps a guest from selecting the PAE paging mode the
+/// engine reports as unsupported.
+const fn cr4_reserved_mask() -> u64 {
+    let mut implemented = 0u64;
+    if CPUID_FEATURES_EDX & CPUID_FEATURE_PSE != 0 {
+        implemented |= x86_mmu::paging::CR4_PSE;
+    }
+    if CPUID_FEATURES_EDX & CPUID_FEATURE_PGE != 0 {
+        implemented |= x86_mmu::paging::CR4_PGE;
+    }
+    !implemented
+}
+
+/// `CR0.PG`, bit 31 (SDM Vol. 3 §4.1.1).
+const CR0_PG: u64 = x86_mmu::paging::CR0_PG;
+
+/// Commit a control-register write and tell the memory path about it.
+///
+/// Every `MOV to CRn`, `LMSW` and `CLTS` routes through here so the TLB
+/// invalidation hooks (SDM §4.10.4.1) cannot be forgotten on one path.
+fn note_control_register_write(cpu: &CpuState, bus: &mut dyn Bus, reg: u8) {
+    bus.on_mov_to_control_register(reg, cpu.cr0, cpu.cr3, cpu.cr4);
 }
 
 /// What `BT`/`BTS`/`BTR`/`BTC` do to the selected bit after copying it to CF.
@@ -3660,6 +3873,7 @@ fn step_two_byte(
             // CR0 bits (including PE) are unchanged. Real-mode path only —
             // protected-mode CPL=0 / #GP(0) checks are out of scope here.
             cpu.cr0 &= !(1u64 << 3);
+            note_control_register_write(cpu, bus, 0);
             set_current_ip(cpu, next_ip);
             Ok(())
         }
@@ -3719,17 +3933,33 @@ fn step_two_byte(
                         low |= 1; // Spec: LMSW cannot clear PE
                     }
                     cpu.cr0 = (cpu.cr0 & !0xFFFF) | low;
+                    // LMSW reaches only CR0[15:0], so it can change neither PG
+                    // (bit 31) nor WP (bit 16) and implies no invalidation; the
+                    // hook still runs so the memory path's shadow of CR0 stays
+                    // exact. Spec: SDM Vol. 3 §4.10.4.1.
+                    note_control_register_write(cpu, bus, 0);
                     set_current_ip(cpu, next_ip);
                     Ok(())
                 }
                 7 => {
                     // INVLPG m — Spec: Intel SDM Vol. 2 "INVLPG—Invalidate TLB
-                    // Entries". Register form (mod=11) → #UD. In real-address
-                    // mode the instruction is an architectural NOP (no TLB /
-                    // paging here); GPRs and CR0 are unchanged.
+                    // Entries"; Vol. 3 §4.10.4.1. Register form (mod=11) → #UD,
+                    // and CPL != 0 → #GP(0).
+                    //
+                    // The operand is an address, not an operand the processor
+                    // reads: the effective address is formed and limit-checked
+                    // (§5.3) but no byte is loaded or stored, so `INVLPG` can
+                    // raise `#GP`/`#SS` for a limit violation and never `#PF`.
+                    // With no translation cached — which includes every
+                    // real-address-mode execution — invalidating nothing is
+                    // still the architectural result, so this stays a NOP by
+                    // consequence rather than by special case.
                     if m.mod_ == 3 {
                         return Err(arch_fault(6));
                     }
+                    require_cpl0(cpu)?;
+                    let (addr, _, _) = ea(cpu, insn, 1)?;
+                    bus.invalidate_page(addr);
                     set_current_ip(cpu, next_ip);
                     Ok(())
                 }
@@ -3742,18 +3972,20 @@ fn step_two_byte(
             // register; the mod field is architecturally ignored (decoder
             // never populates SIB/displacement for this opcode). Operand
             // size is always 32 bits regardless of any 0x66 prefix.
-            // CR1 → #UD. CR2/CR3/CR4 → explicit Unsupported (out of scope).
+            // CR1 and CR5-CR7 → #UD. CPL != 0 → #GP(0) (Vol. 3 §5.5).
+            // Unsupported here: CR8 (`REX.R` in 64-bit mode).
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x20))?;
-            match m.reg {
-                0 => {
-                    cpu.set_gpr_u32(m.rm as usize, cpu.cr0 as u32);
-                    set_current_ip(cpu, next_ip);
-                    Ok(())
-                }
-                1 => real_mode_ud(cpu, bus),
-                2..=4 => Err(ExecError::Unsupported(0x20)),
-                _ => real_mode_ud(cpu, bus),
-            }
+            let value = match m.reg {
+                0 => cpu.cr0,
+                2 => cpu.cr2,
+                3 => cpu.cr3,
+                4 => cpu.cr4,
+                _ => return real_mode_ud(cpu, bus),
+            };
+            require_cpl0(cpu)?;
+            cpu.set_gpr_u32(m.rm as usize, value as u32);
+            set_current_ip(cpu, next_ip);
+            Ok(())
         }
         0x22 => {
             // MOV CR0, r32 — Spec: Intel SDM Vol. 2 "MOV—Move to/from Control
@@ -3761,18 +3993,51 @@ fn step_two_byte(
             // MAY clear PE. PE=1 enables GDT descriptor loads for MOV
             // DS/ES/FS/GS/SS and bounded direct far JMP16 transfers. Clearing PE
             // restores the sticky-unreal data-segment and real-mode far-JMP paths.
+            //
+            // CR1 and CR5-CR7 → #UD; CPL != 0 → #GP(0). Writing 1 to a reserved
+            // bit of CR0 or CR4 → #GP(0). Outside 64-bit mode the write is 32
+            // bits wide and clears the register's upper doubleword.
+            // Unsupported here: CR8, and the CR0 reserved-bit and
+            // NW/CD/PE/PG-combination checks other than the PG-without-PE one
+            // below.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x22))?;
+            if !matches!(m.reg, 0 | 2 | 3 | 4) {
+                return real_mode_ud(cpu, bus);
+            }
+            require_cpl0(cpu)?;
+            let src = u64::from(cpu.gpr_u32(m.rm as usize));
             match m.reg {
                 0 => {
-                    let src = cpu.gpr_u32(m.rm as usize);
-                    cpu.cr0 = u64::from(src);
-                    set_current_ip(cpu, next_ip);
-                    Ok(())
+                    // Spec: SDM Vol. 2 MOV CRn — "#GP(0) if an attempt is made
+                    // to set CR0.PG when CR0.PE is clear"; Vol. 3 §4.1.1 makes
+                    // protected mode a precondition of paging.
+                    if src & CR0_PG != 0 && src & 1 == 0 {
+                        return Err(arch_fault_with_error_code(13, 0));
+                    }
+                    cpu.cr0 = src;
                 }
-                1 => real_mode_ud(cpu, bus),
-                2..=4 => Err(ExecError::Unsupported(0x22)),
-                _ => real_mode_ud(cpu, bus),
+                2 => {
+                    // CR2 holds the linear address of the last page fault
+                    // (SDM Vol. 3 §4.7); it has no reserved bits.
+                    cpu.cr2 = src;
+                }
+                3 => {
+                    // Spec: SDM Vol. 3 Table 4-3 — with 32-bit paging, CR3 bits
+                    // 2:0 and 11:5 are *ignored*, not reserved, so no bit of a
+                    // 32-bit write can raise #GP. Bits 31:12 locate the page
+                    // directory; PWT/PCD are stored and inert.
+                    cpu.cr3 = src;
+                }
+                _ => {
+                    if src & cr4_reserved_mask() != 0 {
+                        return Err(arch_fault_with_error_code(13, 0));
+                    }
+                    cpu.cr4 = src;
+                }
             }
+            note_control_register_write(cpu, bus, m.reg);
+            set_current_ip(cpu, next_ip);
+            Ok(())
         }
         0x80..=0x8F => {
             // Jcc rel16/rel32 (near) — Spec: Intel SDM Vol. 2 "Jcc—Jump if
@@ -4241,6 +4506,31 @@ fn step_two_byte(
 /// not consume the shadow because no recoverable architectural boundary commits.
 /// Spec: Intel SDM Vol. 3 §6.3.3 / §6.7 (NMI); §§6.8.1, 6.8.3.
 pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    // No caller-owned MMU: the TLB lives for exactly this instruction. §4.10.2.2
+    // permits that ("Processors need not implement any TLBs"), so translation
+    // stays correct, but software that edits a paging-structure entry without
+    // invalidating will see the new entry rather than the stale translation
+    // real hardware may keep. Use [`step_with_mmu`] to model that.
+    let mut mmu = Mmu::new();
+    step_with_mmu(cpu, bus, &mut mmu)
+}
+
+/// One instruction with a caller-owned [`Mmu`], so the TLB survives across
+/// instructions and `INVLPG` / `MOV to CR3` are observable.
+///
+/// This is the entry point a machine integration should use: it is the only
+/// way a guest that forgets an invalidation misbehaves here the way it would on
+/// silicon (SDM Vol. 3 §4.10.2, §4.10.4.1).
+pub fn step_with_mmu(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    mmu: &mut Mmu,
+) -> Result<(), ExecError> {
+    let mut paged = PagedBus::new(bus, mmu, cpu);
+    step_paged(cpu, &mut paged)
+}
+
+fn step_paged(cpu: &mut CpuState, bus: &mut PagedBus<'_>) -> Result<(), ExecError> {
     // Platform `#NMI` outranks maskable IRQs and can wake HLT.
     if service_pending_nmi(cpu, bus)? {
         return Ok(());
@@ -6722,9 +7012,21 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
 
 /// Run until HLT or `max_steps`.
 pub fn run(cpu: &mut CpuState, bus: &mut dyn Bus, max_steps: u64) -> Result<u64, ExecError> {
+    let mut mmu = Mmu::new();
+    run_with_mmu(cpu, bus, &mut mmu, max_steps)
+}
+
+/// Run until HLT or `max_steps` with a caller-owned [`Mmu`]; see
+/// [`step_with_mmu`] for why that matters.
+pub fn run_with_mmu(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    mmu: &mut Mmu,
+    max_steps: u64,
+) -> Result<u64, ExecError> {
     let mut n = 0u64;
     while n < max_steps && !cpu.halted {
-        step(cpu, bus)?;
+        step_with_mmu(cpu, bus, mmu)?;
         n += 1;
     }
     Ok(n)
@@ -15143,11 +15445,13 @@ mod tests {
         assert_eq!(cpu.ip16(), 0x0B00);
     }
 
-    /// MOV to/from CR2/CR3/CR4 are valid on real hardware but out of scope for
-    /// this slice — must fail explicitly rather than silently faking behavior.
-    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"; Vol. 3 §2.5.
+    /// MOV to/from CR2/CR3/CR4 are implemented as of round 4; they were
+    /// `Unsupported` while the paging engine was unwired.
+    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"; Vol. 3
+    /// §2.5, §4.7 (CR2), Table 4-3 (CR3), §4.1.4 (CR4).
+    /// Behavioral coverage lives in `tests/cpu_r4_control_registers.rs`.
     #[test]
-    fn mov_cr2_cr3_cr4_are_explicitly_unsupported() {
+    fn mov_cr2_cr3_cr4_are_implemented() {
         let mut mem = vec![0u8; 0x10000];
         let code = 0x1000usize;
         // +0: 0F 20 D0   MOV EAX, CR2  (reg=2)
@@ -15168,14 +15472,16 @@ mod tests {
         cpu.ds = x86_core::SegmentReg::real_mode(0);
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = code as u64;
+        cpu.cr2 = 0x1234_5678;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
 
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x20)));
-        cpu.set_ip16(cpu.ip16().wrapping_add(3));
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x22)));
-        cpu.set_ip16(cpu.ip16().wrapping_add(3));
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x20)));
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1234_5678, "EAX ← CR2");
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cr3, 0x1234_5678, "CR3 ← EAX");
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0, "EAX ← CR4 (still zero)");
     }
 
     /// LIDT/SIDT m16&32 — opcode 0F 01 /3 and /1 (SDM Vol. 2 LIDT/SIDT; Vol. 3 §2.4.3).
@@ -20317,9 +20623,16 @@ mod tests {
     }
 
     /// `AGENTS.md`: CPUID must never advertise an unimplemented feature. Leaf 1
-    /// therefore reports only bit 5 (`MSR`), whose instructions this slice
-    /// implements. Every other enumerated feature must stay clear.
-    /// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11).
+    /// reports `PSE`, `MSR`, `PGE` and `CMOV`, all of which are implemented;
+    /// every other enumerated feature must stay clear.
+    ///
+    /// Round 4 added `PSE` (bit 3) and `PGE` (bit 13) because §4.1.4 makes
+    /// those bits a guest's licence to set `CR4.PSE` / `CR4.PGE`, and the
+    /// paging engine implements 4-MiB pages and global pages; and `CMOV`
+    /// (bit 15) because round 3 implemented `CMOVcc` and left the bit clear
+    /// only for want of a reason to change it. `PAE`, `PAT` and `PSE-36` stay
+    /// clear: the paging engine's default profile assumes exactly that.
+    /// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); Vol. 3 §4.1.4.
     #[test]
     fn cpuid_leaf_1_advertises_only_implemented_features() {
         let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA2], |cpu, _| {
@@ -20329,7 +20642,11 @@ mod tests {
 
         let edx = cpu.gpr_u32(CpuState::RDX);
         let ecx = cpu.gpr_u32(CpuState::RCX);
-        assert_eq!(edx, 1 << 5, "only the MSR feature bit may be set");
+        assert_eq!(
+            edx,
+            (1 << 3) | (1 << 5) | (1 << 13) | (1 << 15),
+            "exactly PSE, MSR, PGE and CMOV"
+        );
         assert_eq!(ecx, 0, "no ECX feature is implemented");
 
         // Named guards for the features most likely to be assumed present.
@@ -20337,16 +20654,14 @@ mod tests {
             (0u32, "FPU"),
             (1, "VME"),
             (2, "DE"),
-            (3, "PSE"),
             (4, "TSC"),
             (6, "PAE"),
             (8, "CX8"),
             (9, "APIC"),
             (11, "SEP"),
             (12, "MTRR"),
-            (13, "PGE"),
-            (15, "CMOV"),
             (16, "PAT"),
+            (17, "PSE-36"),
             (19, "CLFSH"),
             (23, "MMX"),
             (25, "SSE"),
@@ -20356,9 +20671,9 @@ mod tests {
             assert_eq!(edx & (1 << bit), 0, "CPUID must not advertise {name}");
         }
 
-        // Family 5 is the generation that introduced RDMSR/WRMSR, so the
-        // version information agrees with the one feature bit reported.
-        assert_eq!((cpu.eax() >> 8) & 0xF, 5, "family");
+        // Family 6 is the generation that introduced PGE and CMOV, so the
+        // version information still agrees with the feature bits reported.
+        assert_eq!((cpu.eax() >> 8) & 0xF, 6, "family");
         assert_eq!(cpu.gpr_u32(CpuState::RBX), 0, "no brand/APIC-ID claims");
     }
 
