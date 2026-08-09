@@ -243,15 +243,21 @@ fn e820_file_survives_reset() {
     );
 }
 
-/// The selectors this device does not implement must read as absent rather than
-/// as a fabricated value. Firmware probing NB_CPUS or a boot order gets `0x00`,
-/// which is the spec's "past the end of the item" answer for an unknown key.
+/// The selectors this device still cannot fill truthfully must read as absent
+/// rather than as a fabricated value: `0x00`, the spec's "past the end of the
+/// item" answer for an unknown key.
+///
+/// ADR-0005 later approved the fw_cfg key list as an interface reference, so
+/// the CPU-count views (`0x0005`, `0x000F`, `etc/max-cpus`) moved out of this
+/// list and are asserted in `fwcfg_selectors.rs` instead — this tree really
+/// does have one CPU, so reporting it is not an invention. Everything that
+/// describes a machine fact this device cannot state on its own stays here.
 #[test]
 fn unimplemented_numeric_selectors_are_absent_not_invented() {
     let mut cfg = FwCfg::with_ram_size(16 * 1024 * 1024);
-    // 0x0002 UUID, 0x0004 nographic, 0x0005 NB_CPUS, 0x000F max-cpus … none of
-    // these are populated by this device.
-    for selector in [0x0002u16, 0x0004, 0x0005, 0x000F, 0x0010, 0x0018] {
+    // 0x0002 UUID and 0x0004 nographic are host-settable and unset by default;
+    // 0x0010 and 0x0018 are unassigned here.
+    for selector in [0x0002u16, 0x0004, 0x0010, 0x0018] {
         select(&mut cfg, selector);
         assert_eq!(
             read_n(&mut cfg, 8),
@@ -259,12 +265,9 @@ fn unimplemented_numeric_selectors_are_absent_not_invented() {
             "selector {selector:#06x} must not report invented data"
         );
     }
-    for name in [
-        "etc/max-cpus",
-        "etc/system-states",
-        "etc/table-loader",
-        "bootorder",
-    ] {
+    // No ACPI power-state machine and no ACPI tables, so neither file exists;
+    // no boot policy is stated, so that file does not exist either.
+    for name in ["etc/system-states", "etc/table-loader", "bootorder"] {
         assert_eq!(cfg.file_selector(name), None, "{name} must be absent");
     }
 }

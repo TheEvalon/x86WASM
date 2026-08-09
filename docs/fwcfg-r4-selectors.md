@@ -1,0 +1,77 @@
+# fw_cfg numeric selectors and named files
+
+What `devices::FwCfg` publishes, what it deliberately does not, and the rule
+that decides which.
+
+## Authority
+
+- [QEMU Firmware Configuration (fw_cfg) Device] specification — the
+  selector/data protocol, the DMA interface, the file directory layout, and the
+  rule that a read past the end of an item returns `0x00`.
+- `docs/adr/0005-fw-cfg-key-list-interface-reference.md` — QEMU's `fw_cfg.h`
+  and SeaBIOS's headers are approved as an **interface reference only**: key
+  numbers, field widths, blob layouts, firmware file names. No implementation
+  logic was read or copied, and the approval covers fw_cfg interface
+  definitions and nothing else.
+
+The specification itself defines only `0x0000` (signature), `0x0001`
+(revision/feature bitmap) and `0x0019` (file directory), and refers the reader
+to the QEMU source for the rest. ADR-0005 exists precisely because that leaves
+an emulator two bad options — invent key numbers, or read a header and be
+unsure whether it broke the no-copying rule — and picks a third.
+
+[QEMU Firmware Configuration (fw_cfg) Device]: https://www.qemu.org/docs/master/specs/fw_cfg.html
+
+## The rule
+
+A selector or file is published only when this machine can fill it
+**truthfully**. Anything else stays absent, and firmware reading it gets the
+specification's `0x00`. An empty-but-present item is worse than an absent one:
+it looks like an answer.
+
+## Published unconditionally
+
+| Key / file | Width | Value | Why it is truthful |
+|---|---|---|---|
+| `0x0005` NB_CPUS | LE16 | `1` | One execution context, no SMP anywhere in the tree |
+| `0x000F` max-cpus | LE16 | `1` | Same count; there is no CPU hotplug |
+| `etc/max-cpus` | LE16 | `1` | The file form of the same fact, for firmware that reads it instead |
+
+`FwCfg::set_cpu_count` writes all three together, so a guest can never see two
+different answers, and clamps zero to one — a machine with no CPU cannot be
+running the firmware asking the question.
+
+## Host-settable, absent by default
+
+Each of these describes a machine fact the device cannot state on its own, so
+it is absent until a host supplies it.
+
+| Key / file | Setter | Layout |
+|---|---|---|
+| `0x0002` UUID | `set_system_uuid` / `clear_system_uuid` | 16 raw bytes |
+| `0x0004` nographic | `set_nographic` | LE16, 1 = no graphics adapter |
+| `bootorder` | `set_boot_order` | newline-separated paths, trailing newline, NUL-terminated |
+| `etc/system-states` | `set_system_states` | 6 bytes indexed by S-state; bit 7 supported, bits 6:4 `SLP_TYP` |
+
+`etc/system-states` deserves its own sentence: this tree implements no ACPI
+power-state machine at all — the PIIX PM I/O block is a noop store/readback —
+so publishing a states blob would advertise a surface that does not exist.
+`set_boot_order(&[])` removes the file rather than publishing an empty policy,
+for the same reason `set_e820_entries(&[])` removes `etc/e820`.
+
+## Not implemented
+
+- `etc/table-loader`. It is the ACPI table build script, and this tree builds no
+  ACPI tables, so there is nothing to load — not even as a host-settable blob,
+  because no honest content exists for it.
+- Every other numeric key. Absent items read `0x00`.
+- Item writeability: selector bit 14 and DMA control bit 4 (write) are rejected
+  with the spec's error bit rather than modelled.
+
+## Wiring status
+
+`FwCfg::new()` publishes the CPU-count views, so a running machine answers them
+today. The host-settable items need a call from the machine layer to become
+visible; nothing in `crates/machine-pc` makes those calls yet, so on the
+assembled PC they are still absent. That is a wiring gap, not a device gap, and
+it is stated here so nobody reads the setter list as a claim about the machine.
