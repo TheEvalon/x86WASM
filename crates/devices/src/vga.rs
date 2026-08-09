@@ -114,10 +114,12 @@
 //!   (even → maps 0+2, odd → maps 1+3), planar, Extended Memory map size
 //! - Graphics Controller data path over [`VgaText::planes`]:
 //!   [`VgaText::gc_read_u8`] loads the four [`VgaText::gc_latches`] and applies
-//!   read mode 0 (Read Map Select, or A1:A0 in Chain 4) or read mode 1 (Color
-//!   Compare / Color Don't Care); [`VgaText::gc_write_u8`] applies write modes
-//!   0–3 with Set/Reset + Enable Set/Reset, Data Rotate + Function Select,
-//!   Bit Mask, and Map Mask plane write enables.
+//!   read mode 0 (Read Map Select, A1:A0 in Chain 4, or A0 substituted for
+//!   Read Map Select bit0 when Graphics Mode bit4 Host Odd/Even read
+//!   addressing is set) or read mode 1 (Color Compare / Color Don't Care);
+//!   [`VgaText::gc_write_u8`] applies write modes 0–3 with Set/Reset + Enable
+//!   Set/Reset, Data Rotate + Function Select (write mode 3 included), Bit
+//!   Mask, and Map Mask plane write enables.
 //! - Single guest-facing display-memory MMIO entry point
 //!   ([`VgaText::mmio_read_u8`] / [`VgaText::mmio_write_u8`]) running RAM
 //!   Enable gating → Memory Map Select window decode → plane addressing → the
@@ -176,9 +178,7 @@
 //!   Real hardware has one memory; unification waits for the character
 //!   generator and a display fetch
 //! - Graphics/Alphanumeric (Misc bit0) has no character-generator effect
-//! - Graphics Mode bit4 host odd/even *read* addressing does not steer read
-//!   mode 0 map selection (IBM Figure 2-71's odd/even note is ambiguous);
-//!   Shift Register Interleave and 256-Color Shift Mode have no effect
+//! - Shift Register Interleave and 256-Color Shift Mode have no effect
 //! - No display fetch from [`VgaText::planes`]: character generation, planar
 //!   pixel output, and Chain-4/doubleword display addressing are absent
 //! - ATC / Sequencer / GC timing, plane-enable / overscan display side effects,
@@ -746,9 +746,21 @@ pub const VGA_GC_MODE_DEFAULT: u8 = 0x10;
 pub const VGA_GC_MODE_WRITE_MASK: u8 = 0x03;
 /// Graphics Mode bit3 — Read Mode (`0` = map read, `1` = color compare).
 pub const VGA_GC_MODE_READ: u8 = 0x08;
+/// Graphics Mode bit4 — Host Odd/Even Memory Read Addressing Enable.
+///
+/// Spec: FreeVGA Graphics Registers, Graphics Mode "Host O/E": "When set to 1,
+/// this bit selects the odd/even addressing mode used by the IBM
+/// Color/Graphics Monitor Adapter. Normally, the value here follows the value
+/// of Memory Mode register bit 2 in the sequencer." Sequencer Memory Mode
+/// bit 2 governs odd/even *write* plane selection; this bit governs the
+/// *read* side, so the host address bit A0 replaces bit 0 of Read Map Select
+/// in read mode 0 ([`VgaText::gc_read_u8`]).
+pub const VGA_GC_MODE_HOST_ODD_EVEN_READ: u8 = 0x10;
+/// Mode-03h leaves Host Odd/Even read addressing set (CGA text emulation).
 const _: () = assert!(
     VGA_GC_MODE_DEFAULT & VGA_GC_MODE_WRITE_MASK == 0
         && VGA_GC_MODE_DEFAULT & VGA_GC_MODE_READ == 0
+        && VGA_GC_MODE_DEFAULT & VGA_GC_MODE_HOST_ODD_EVEN_READ != 0
 );
 /// Graphics Controller Miscellaneous Register index.
 ///
@@ -1464,6 +1476,13 @@ impl VgaText {
         u8::from(self.gc_regs[usize::from(VGA_GC_MODE)] & VGA_GC_MODE_READ != 0)
     }
 
+    /// Graphics Mode Host Odd/Even Memory Read Addressing bit (bit4).
+    ///
+    /// Spec: FreeVGA Graphics Registers, Graphics Mode "Host O/E".
+    pub fn gc_host_odd_even_read(&self) -> bool {
+        self.gc_regs[usize::from(VGA_GC_MODE)] & VGA_GC_MODE_HOST_ODD_EVEN_READ != 0
+    }
+
     /// Data Rotate rotate count (bits 2:0). Spec: IBM Figure 2-69.
     pub fn gc_rotate_count(&self) -> u32 {
         u32::from(self.gc_regs[usize::from(VGA_GC_DATA_ROTATE)] & VGA_GC_ROTATE_COUNT_MASK)
@@ -1577,6 +1596,14 @@ impl VgaText {
         }
         let plane = if access.addressing == VgaPlaneAddressing::Chain4 {
             access.planes.trailing_zeros() as usize
+        } else if self.gc_host_odd_even_read() {
+            // Host Odd/Even read addressing: the host address bit A0 replaces
+            // bit 0 of Read Map Select, so an even address reads the even map
+            // of the pair and an odd address the odd map. A0 comes from the
+            // host address, not from `access.offset`, because odd/even
+            // addressing has already cleared it there.
+            let host_a0 = usize::from((addr - self.display_window().0) & 1 != 0);
+            (self.gc_read_map_select() & !1) | host_a0
         } else {
             self.gc_read_map_select()
         };
@@ -1589,6 +1616,17 @@ impl VgaText {
     /// Figures 2-66/2-67 (Set/Reset), 2-69/2-70 (rotate + Function Select),
     /// 2-77 (Bit Mask) and Figure 2-29 (Map Mask); OSDev VGA Hardware
     /// "Read/Write logic" for the per-step ordering.
+    ///
+    /// Write mode 3 applies Function Select between the expanded Set/Reset
+    /// value and the latch, like modes 0 and 2. Sources conflict here: OSDev's
+    /// write-mode-3 step list omits the ALU stage, while Michael Abrash's
+    /// *Graphics Programming Black Book* chapter 26 documents its write-mode-3
+    /// helper as "Forces ALU function to 'move'" — a redundant step if the
+    /// stage were bypassed — and the Graphics Controller data flow places one
+    /// ALU between the Set/Reset multiplexer and the Bit Mask multiplexer for
+    /// every write mode. This model follows Abrash. The default Function
+    /// Select is replace, so ordinary drivers see no difference; see
+    /// `docs/vga-r2-gc-datapath-fixes.md`.
     ///
     /// Returns `false` when Misc Output RAM Enable is clear or the address is
     /// outside [`Self::display_window`].
@@ -1630,10 +1668,13 @@ impl VgaText {
                     Self::blend_with_latch(alu, latch, bit_mask)
                 }
                 // Write mode 3: Set/Reset value (Enable Set/Reset ignored)
-                // through a mask of rotated data ANDed with the Bit Mask.
+                // through Function Select, then a mask of rotated data ANDed
+                // with the Bit Mask.
                 _ => {
                     let mask = rotated & bit_mask;
-                    Self::blend_with_latch(Self::expand_map_bit(set_reset, plane), latch, mask)
+                    let alu =
+                        self.apply_function_select(Self::expand_map_bit(set_reset, plane), latch);
+                    Self::blend_with_latch(alu, latch, mask)
                 }
             };
         }
@@ -5483,9 +5524,18 @@ mod tests {
         assert_eq!(v.plane_byte(2, 0), Some(0), "Map Mask 0x03 blocks map 2");
         assert_eq!(v.plane_byte(3, 0), Some(0), "Map Mask 0x03 blocks map 3");
 
+        // Mode-03h leaves Graphics Mode bit4 Host Odd/Even read addressing set,
+        // so A0 replaces Read Map Select bit0: even → character map, odd →
+        // attribute map. Spec: FreeVGA Graphics Mode "Host O/E".
+        set_gc_reg(&mut v, VGA_GC_READ_MAP_SELECT, 0);
+        assert_eq!(v.gc_read_u8(VGA_TEXT_BASE), Some(b'Z'));
+        assert_eq!(v.gc_read_u8(VGA_TEXT_BASE + 1), Some(0x1F));
+        assert_eq!(v.gc_latches, [b'Z', 0x1F, 0, 0]);
+
+        // With the bit clear, Read Map Select alone chooses the map.
+        set_gc_reg(&mut v, VGA_GC_MODE, 0x00);
         set_gc_reg(&mut v, VGA_GC_READ_MAP_SELECT, 1);
         assert_eq!(v.gc_read_u8(VGA_TEXT_BASE), Some(0x1F));
-        assert_eq!(v.gc_latches, [b'Z', 0x1F, 0, 0]);
     }
 
     /// Direct map helpers reject out-of-range maps and offsets.
