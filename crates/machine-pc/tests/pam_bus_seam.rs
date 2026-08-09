@@ -95,33 +95,21 @@ fn pci_and_phys_mem_agree_on_pam_region_ordering() {
 
 /// Program CONFIG_ADDRESS for host-bridge `00:00.0` register `reg`.
 ///
-/// Written with four 8-bit `OUT DX, AL` stores because this build's primary
-/// opcode map has no `ED`/`EF` accumulator port I/O — only the byte forms
-/// `E4`/`E6`/`EC`/`EE` exist.
-///
-/// Real hardware does not accept this. PCI Local Bus Specification Revision 3.0
-/// §3.2.2.3.2 says non-dword accesses to CONFIG_ADDRESS "have no effect on
-/// CONFIG_ADDRESS and are executed as normal I/O transactions on the PCI bus",
-/// which is the emulator's default. The test therefore arms the documented
-/// compatibility policy (`set_config_address_byte_lane_compat`) explicitly, and
-/// this whole helper can be replaced with a single `OUT DX, EAX` once `EF`
-/// decodes.
+/// One 32-bit `OUT DX, EAX` to `0xCF8`, which is the only access a host bridge
+/// latches. Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.2 —
+/// "Anytime a host bridge sees a full DWORD I/O write from the host to
+/// CONFIG_ADDRESS, the bridge must latch the data into its CONFIG_ADDRESS
+/// register"; non-DWORD accesses "have no effect on CONFIG_ADDRESS and are
+/// executed as normal I/O transactions on the PCI bus".
 #[rustfmt::skip]
 fn config_address_for_host_bridge(reg: u8) -> Vec<u8> {
-    let dword = reg & !0x03;
+    // Enable | bus 0 | device 0 | function 0 | register (dword-aligned).
+    let address: u32 = 0x8000_0000 | u32::from(reg & 0xFC);
+    let [b0, b1, b2, b3] = address.to_le_bytes();
     vec![
-        0xBA, 0xF8, 0x0C,       // MOV DX, 0x0CF8
-        0xB0, dword,            // MOV AL, reg & ~3
-        0xEE,                   // OUT DX, AL
-        0xBA, 0xF9, 0x0C,       // MOV DX, 0x0CF9
-        0xB0, 0x00,             // MOV AL, 0 (bus 0)
-        0xEE,                   // OUT DX, AL
-        0xBA, 0xFA, 0x0C,       // MOV DX, 0x0CFA
-        0xB0, 0x00,             // MOV AL, 0 (device 0, function 0)
-        0xEE,                   // OUT DX, AL
-        0xBA, 0xFB, 0x0C,       // MOV DX, 0x0CFB
-        0xB0, 0x80,             // MOV AL, enable (bit 31)
-        0xEE,                   // OUT DX, AL
+        0x66, 0xB8, b0, b1, b2, b3, // MOV EAX, address
+        0xBA, 0xF8, 0x0C,           // MOV DX, 0x0CF8
+        0x66, 0xEF,                 // OUT DX, EAX
     ]
 }
 
@@ -199,9 +187,6 @@ fn guest_programs_pam_through_mechanism_1_then_shadows_and_locks_the_bios() {
 
     let rom = bios_image_64k(&code);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("map BIOS image");
-    // See `config_address_for_host_bridge`: byte-lane CONFIG_ADDRESS programming
-    // is a documented model choice this guest needs until `EF` decodes.
-    m.pci.set_config_address_byte_lane_compat(true);
     m.reset();
 
     // Reset state: PAM0 is 0x00, so the BIOS area reads ROM and drops writes.

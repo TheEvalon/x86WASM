@@ -23,6 +23,54 @@ fn bios_rom_with_code(code: &[u8]) -> Vec<u8> {
     rom
 }
 
+/// Second opcode byte of a two-byte instruction this build cannot decode.
+///
+/// `0F C7` is the Group 9 escape — `CMPXCHG8B m64` (Intel SDM Vol. 2
+/// "CMPXCHG8B/CMPXCHG16B"; opcode map Table A-3, Group 9). It is absent from
+/// `x86-spec`'s two-byte subset, so the decoder rejects it with
+/// `UnsupportedOpcode(0xC7)`.
+///
+/// The four probe tests below need *some* undecodable two-byte opcode; which
+/// one is an accident of what is implemented today. Two consecutive rounds
+/// implemented the previous stand-in out from under them — first the near
+/// `Jcc` map, then `CMOVcc` at `0F 40` — each time surfacing as four unrelated
+/// -looking failures. Naming the choice once means the next occurrence is one
+/// edit, and `known_absent_opcode_is_still_absent` fails first and says so.
+///
+/// A replacement must stay three bytes when encoded (escape, opcode, ModR/M)
+/// so the `steps`, `ip`, and `opcode_bytes` expectations below still hold.
+const KNOWN_ABSENT_2BYTE_OPCODE: u8 = 0xC7;
+
+/// [`KNOWN_ABSENT_2BYTE_OPCODE`] encoded with a ModR/M byte: `mod=11`, `reg=0`,
+/// `rm=1`. Register-direct, so no SIB or displacement follows.
+const KNOWN_ABSENT_2BYTE_INSN: [u8; 3] = [0x0F, KNOWN_ABSENT_2BYTE_OPCODE, 0xC1];
+
+/// How [`PostFailureKind::UnsupportedOpcode`] renders the stand-in opcode.
+fn known_absent_opcode_text() -> String {
+    format!("unsupported opcode 0x0F 0x{KNOWN_ABSENT_2BYTE_OPCODE:02X}")
+}
+
+/// Guard for the four probe tests that rely on a decode gap.
+///
+/// When this fails, [`KNOWN_ABSENT_2BYTE_OPCODE`] has been implemented and
+/// needs re-pointing at another absent two-byte opcode — see its documentation.
+#[test]
+fn known_absent_opcode_is_still_absent() {
+    let result = x86_decode::decode(&KNOWN_ABSENT_2BYTE_INSN);
+
+    assert_eq!(
+        result.err(),
+        Some(x86_decode::DecodeError::UnsupportedOpcode(
+            KNOWN_ABSENT_2BYTE_OPCODE
+        )),
+        "0F {KNOWN_ABSENT_2BYTE_OPCODE:02X} now decodes, so it can no longer stand in for \
+         \"a two-byte opcode this build cannot decode\". Re-point \
+         KNOWN_ABSENT_2BYTE_OPCODE at another absent two-byte opcode of the same \
+         encoded length and update KNOWN_ABSENT_2BYTE_INSN; the four probe tests \
+         that use it will then pass again."
+    );
+}
+
 #[test]
 fn probe_reports_halt_and_console_output() {
     // MOV AL,'A' / MOV DX,0x402 / OUT DX,AL (debug console) / HLT.
@@ -74,30 +122,36 @@ fn probe_reports_first_unsupported_opcode_with_opcode_window() {
 /// Spec: Intel SDM Vol. 2 §2.1.1 — an instruction is prefixes followed by a
 /// one-, two-, or three-byte opcode. The decoder reports only the byte its
 /// tables missed, so the report reconstructs the escape from the window.
-/// `0F 40` (`CMOVO`) stands in for "a two-byte opcode this build does not
-/// decode"; the near `Jcc` map that used to serve that role is implemented now.
 #[test]
 fn probe_names_two_byte_opcode_with_its_escape() {
-    // 0F 40 /r (CMOVO r16, r/m16) — not in the decode tables.
-    let rom = bios_rom_with_code(&[0x0F, 0x40, 0xC1, 0x90]);
+    let mut code = KNOWN_ABSENT_2BYTE_INSN.to_vec();
+    code.push(0x90);
+    let rom = bios_rom_with_code(&code);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
 
     let report = m.probe_post(16);
 
     let failure = report.failure().expect("first failure recorded");
     let site = failure.opcode_site().expect("opcode recovered from window");
-    assert_eq!(site.opcode, vec![0x0F, 0x40]);
+    assert_eq!(site.opcode, vec![0x0F, KNOWN_ABSENT_2BYTE_OPCODE]);
     assert!(site.prefixes.is_empty());
     let text = report.to_string();
-    assert!(text.contains("unsupported opcode 0x0F 0x40"), "{text}");
-    assert!(!text.contains("unsupported opcode 0x40 "), "{text}");
+    assert!(text.contains(&known_absent_opcode_text()), "{text}");
+    assert!(
+        !text.contains(&format!(
+            "unsupported opcode 0x{KNOWN_ABSENT_2BYTE_OPCODE:02X} "
+        )),
+        "{text}"
+    );
 }
 
 /// Prefixes are reported alongside the opcode instead of being swallowed.
 #[test]
 fn probe_names_prefixes_before_the_opcode() {
-    // 66 0F 40 /r — operand-size prefixed CMOVO.
-    let rom = bios_rom_with_code(&[0x66, 0x0F, 0x40, 0xC1, 0x90]);
+    let mut code = vec![0x66];
+    code.extend_from_slice(&KNOWN_ABSENT_2BYTE_INSN);
+    code.push(0x90);
+    let rom = bios_rom_with_code(&code);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
 
     let report = m.probe_post(16);
@@ -105,10 +159,10 @@ fn probe_names_prefixes_before_the_opcode() {
     let failure = report.failure().expect("first failure recorded");
     let site = failure.opcode_site().expect("opcode recovered from window");
     assert_eq!(site.prefixes, vec![0x66]);
-    assert_eq!(site.opcode, vec![0x0F, 0x40]);
+    assert_eq!(site.opcode, vec![0x0F, KNOWN_ABSENT_2BYTE_OPCODE]);
     let text = report.to_string();
     assert!(
-        text.contains("unsupported opcode 0x0F 0x40 (prefixes 66)"),
+        text.contains(&format!("{} (prefixes 66)", known_absent_opcode_text())),
         "{text}"
     );
 }
@@ -124,8 +178,16 @@ fn probe_names_prefixes_before_the_opcode() {
 fn probe_reports_protected_mode_d1_failure_with_full_eip() {
     // Well above the 16-bit window, so an IP-truncated capture reads 0x0000.
     const CODE_LINEAR: u32 = 0x0002_0000;
-    // 0F 40 /r (CMOVO) — a two-byte opcode this build does not decode.
-    const CODE: [u8; 8] = [0x0F, 0x40, 0xC1, 0x90, 0x11, 0x22, 0x33, 0x44];
+    let code: [u8; 8] = [
+        KNOWN_ABSENT_2BYTE_INSN[0],
+        KNOWN_ABSENT_2BYTE_INSN[1],
+        KNOWN_ABSENT_2BYTE_INSN[2],
+        0x90,
+        0x11,
+        0x22,
+        0x33,
+        0x44,
+    ];
 
     let mut m = Machine::new(1024 * 1024);
     // Spec: SDM Vol. 3 §9.9.1 — CR0.PE set, then a flat 32-bit code segment
@@ -135,7 +197,7 @@ fn probe_reports_protected_mode_d1_failure_with_full_eip() {
         .cs
         .load_descriptor_cache(0x0008, 0, 0xFFFF_FFFF, 0xC09B);
     m.cpu.rip = u64::from(CODE_LINEAR);
-    for (offset, byte) in CODE.iter().enumerate() {
+    for (offset, byte) in code.iter().enumerate() {
         m.mem
             .write_u8(u64::from(CODE_LINEAR) + offset as u64, *byte)
             .expect("place 32-bit code in RAM");
@@ -144,16 +206,19 @@ fn probe_reports_protected_mode_d1_failure_with_full_eip() {
     let report = m.probe_post(16);
 
     let failure = report.failure().expect("first failure recorded");
-    assert_eq!(failure.kind, PostFailureKind::UnsupportedOpcode(0x40));
+    assert_eq!(
+        failure.kind,
+        PostFailureKind::UnsupportedOpcode(KNOWN_ABSENT_2BYTE_OPCODE)
+    );
     assert!(failure.cs_default_big, "{report}");
     assert_eq!(failure.eip, CODE_LINEAR);
     assert_eq!(failure.linear_pc, u64::from(CODE_LINEAR));
     // The IP16 view is 0x0000 here; the window must not follow it.
     assert_eq!(failure.ip, 0x0000);
-    assert_eq!(failure.opcode_bytes, CODE.map(Some));
+    assert_eq!(failure.opcode_bytes, code.map(Some));
 
     let text = report.to_string();
-    assert!(text.contains("unsupported opcode 0x0F 0x40"), "{text}");
+    assert!(text.contains(&known_absent_opcode_text()), "{text}");
     assert!(text.contains("cs.d=1"), "{text}");
     assert!(text.contains("eip=0x00020000"), "{text}");
     assert!(text.contains("linear_pc=0x0000000000020000"), "{text}");
@@ -162,7 +227,7 @@ fn probe_reports_protected_mode_d1_failure_with_full_eip() {
 /// A 16-bit code segment keeps the legacy `IP` window, including its wrap.
 #[test]
 fn probe_reports_real_mode_failure_in_the_ip16_window() {
-    let rom = bios_rom_with_code(&[0x0F, 0x40, 0xC1]);
+    let rom = bios_rom_with_code(&KNOWN_ABSENT_2BYTE_INSN);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
 
     let report = m.probe_post(16);

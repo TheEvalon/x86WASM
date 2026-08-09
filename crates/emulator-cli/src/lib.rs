@@ -1,7 +1,10 @@
 //! Native CLI helpers for the x86WASM emulator runner.
 
-use devices::{VGA_TEXT_COLS, VGA_TEXT_ROWS};
-use machine_pc::{build_hello_rom, Machine, MachineError, PostReport, EXPECTED_HELLO};
+use devices::{VgaRenderMode, VGA_TEXT_COLS, VGA_TEXT_ROWS};
+use machine_pc::{
+    build_hello_rom, Machine, MachineError, PostReport, PostTraceConfig, TracedPostReport,
+    DEFAULT_POST_TRACE_CAPACITY, EXPECTED_HELLO,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,8 +34,15 @@ pub struct Options {
     pub max_steps: u64,
     /// Run the POST first-contact diagnostic instead of the normal run.
     pub post_probe: bool,
+    /// Arm the bounded POST event trace. Implies [`Options::post_probe`].
+    ///
+    /// `None` leaves the probe untraced, which is what keeps the `--post-probe`
+    /// output byte-identical to a build without this flag.
+    pub post_trace: Option<PostTraceConfig>,
     /// Dump the 80×25 VGA text buffer after the run / probe.
     pub vga_text: bool,
+    /// Render the current display through the VGA display fetch and report it.
+    pub vga_frame: bool,
     /// Option ROM image to map before running (e.g. a VGA BIOS).
     pub option_rom_path: Option<PathBuf>,
     /// Physical base for [`Options::option_rom_path`].
@@ -46,7 +56,9 @@ impl Default for Options {
             bios_path: None,
             max_steps: DEFAULT_MAX_STEPS,
             post_probe: false,
+            post_trace: None,
             vga_text: false,
+            vga_frame: false,
             option_rom_path: None,
             option_rom_base: DEFAULT_OPTION_ROM_BASE,
         }
@@ -275,16 +287,26 @@ impl std::error::Error for CliError {
 pub fn usage() -> String {
     format!(
         "Usage: emulator-cli [--rom path.bin | --bios path.bin] [--steps N] [--post-probe]\n\
-         \x20                  [--option-rom path.bin [--option-rom-base ADDR]] [--vga-text]\n\
+         \x20                  [--post-trace [N]] [--option-rom path.bin [--option-rom-base ADDR]]\n\
+         \x20                  [--vga-text] [--vga-frame]\n\
          --rom              Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
          --bios             Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
          --post-probe       Report POST first contact (first failure, unclaimed ports,\n\
          \x20                  unmapped MMIO) instead of validating the run.\n\
+         --post-trace       Implies --post-probe and appends a bounded trace of the most\n\
+         \x20                  recent platform accesses (port I/O, PCI config cycles, PAM\n\
+         \x20                  programming, VGA aperture, memory faults). Optional N is the\n\
+         \x20                  event capacity (default {DEFAULT_POST_TRACE_CAPACITY}). The\n\
+         \x20                  --post-probe lines above it are unchanged.\n\
          --option-rom       Map an option ROM image (e.g. a VGA BIOS) and report its\n\
          \x20                  55AA/size/checksum header. Mapping only: nothing scans or\n\
          \x20                  executes option ROMs yet.\n\
          --option-rom-base  Physical base for --option-rom (default 0x{DEFAULT_OPTION_ROM_BASE:05X}).\n\
          --vga-text         Dump the {VGA_TEXT_COLS}x{VGA_TEXT_ROWS} VGA text buffer after the run.\n\
+         --vga-frame        Render the display through the VGA display fetch and report the\n\
+         \x20                  frame geometry and RGBA size. Only text mode 03h and mode 13h\n\
+         \x20                  have a renderer; any other programming is reported as having\n\
+         \x20                  none rather than rendered.\n\
          Diagnostics are appended after the normal / --post-probe output, which is unchanged.\n\
          Default ROM prints '{EXPECTED_HELLO}' via COM1 and port 0x402."
     )
@@ -310,7 +332,7 @@ where
     S: AsRef<str>,
 {
     let mut opts = Options::default();
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().peekable();
     while let Some(arg) = iter.next() {
         let arg = arg.as_ref();
         match arg {
@@ -324,7 +346,22 @@ where
                 opts.bios_path = Some(PathBuf::from(path.as_ref()));
             }
             "--post-probe" => opts.post_probe = true,
+            // The capacity is optional: `--post-trace` alone keeps
+            // DEFAULT_POST_TRACE_CAPACITY events. Only a value that parses as a
+            // count is consumed, so `--post-trace --steps 100` still works.
+            "--post-trace" => {
+                let capacity = match iter.peek().and_then(|v| v.as_ref().parse::<usize>().ok()) {
+                    Some(capacity) => {
+                        iter.next();
+                        capacity
+                    }
+                    None => DEFAULT_POST_TRACE_CAPACITY,
+                };
+                opts.post_probe = true;
+                opts.post_trace = Some(PostTraceConfig::with_capacity(capacity));
+            }
             "--vga-text" => opts.vga_text = true,
+            "--vga-frame" => opts.vga_frame = true,
             "--option-rom" => {
                 let path = iter.next().ok_or(CliError::MissingValue("--option-rom"))?;
                 opts.option_rom_path = Some(PathBuf::from(path.as_ref()));
@@ -511,6 +548,60 @@ pub fn run_post_probe(machine: &mut Machine, max_steps: u64) -> PostReport {
     machine.probe_post(max_steps)
 }
 
+/// [`run_post_probe`] with an optional bounded event trace.
+///
+/// With `trace` `None` the printed output is byte-identical to
+/// [`run_post_probe`]: [`TracedPostReport`] renders the report alone when no
+/// trace is armed.
+pub fn run_post_probe_traced(
+    machine: &mut Machine,
+    max_steps: u64,
+    trace: Option<PostTraceConfig>,
+) -> TracedPostReport {
+    machine.reset();
+    machine.probe_post_traced(max_steps, trace)
+}
+
+/// Render the current display and describe the result.
+///
+/// Only two programmings have a display fetch in this model — alphanumeric
+/// (text mode 03h) and chain-4 256-color (mode 13h). Anything else reports that
+/// there is no renderer instead of producing a frame that is not what the
+/// hardware would show. `blink_off_half` selects the invisible half of the text
+/// blink cycle; the caller owns the phase because there is no retrace timer.
+pub fn vga_frame_report(machine: &Machine, blink_off_half: bool) -> String {
+    let vga = &machine.vga;
+    let mode = vga.render_mode();
+    let Some(frame) = vga.render_frame(blink_off_half) else {
+        return format!(
+            "vga-frame: mode={} rendered=no — the current programming has no display fetch in \
+             this model (no planar 16-color renderer, no VBE, no host display)",
+            render_mode_name(mode)
+        );
+    };
+    let rgba = vga.frame_rgba8(&frame);
+    let nonzero = frame.pixels.iter().filter(|index| **index != 0).count();
+    format!(
+        "vga-frame: mode={} rendered=yes width={} height={} pixels={} nonzero_indices={} \
+         rgba_bytes={} blink_off_half={}",
+        render_mode_name(frame.mode),
+        frame.width,
+        frame.height,
+        frame.pixels.len(),
+        nonzero,
+        rgba.len(),
+        u8::from(blink_off_half),
+    )
+}
+
+fn render_mode_name(mode: VgaRenderMode) -> &'static str {
+    match mode {
+        VgaRenderMode::Text => "text",
+        VgaRenderMode::Graphics256Chain4 => "graphics256-chain4",
+        VgaRenderMode::Unsupported => "unsupported",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +706,134 @@ mod tests {
         );
         assert_eq!(failure.opcode_bytes[0], Some(0x9B));
         assert_eq!(report.steps, 1);
+    }
+
+    /// `--post-trace` implies `--post-probe` and defaults its capacity.
+    #[test]
+    fn parse_post_trace_implies_post_probe_with_a_default_capacity() {
+        let parsed = parse_args(["--bios", "fw.bin", "--post-trace"]).unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(Options {
+                bios_path: Some(PathBuf::from("fw.bin")),
+                post_probe: true,
+                post_trace: Some(PostTraceConfig::with_capacity(DEFAULT_POST_TRACE_CAPACITY)),
+                ..Options::default()
+            })
+        );
+        assert!(usage().contains("--post-trace"));
+    }
+
+    /// An explicit capacity is consumed; a following flag is not.
+    #[test]
+    fn parse_post_trace_capacity_is_optional() {
+        let ParsedArgs::Run(opts) = parse_args(["--post-trace", "16"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(opts.post_trace, Some(PostTraceConfig::with_capacity(16)));
+        assert_eq!(opts.max_steps, DEFAULT_MAX_STEPS);
+
+        let ParsedArgs::Run(opts) = parse_args(["--post-trace", "--steps", "99"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(
+            opts.post_trace,
+            Some(PostTraceConfig::with_capacity(DEFAULT_POST_TRACE_CAPACITY))
+        );
+        assert_eq!(opts.max_steps, 99);
+    }
+
+    /// The probe output is unchanged by the flag's existence: an untraced run
+    /// prints exactly what `--post-probe` printed before the trace existed.
+    #[test]
+    fn untraced_probe_output_is_byte_identical() {
+        let mut plain =
+            Machine::with_bios_rom(16 * 1024 * 1024, &failing_bios_rom()).expect("load BIOS");
+        let mut traced =
+            Machine::with_bios_rom(16 * 1024 * 1024, &failing_bios_rom()).expect("load BIOS");
+
+        let expected = run_post_probe(&mut plain, 16).to_string();
+        let untraced = run_post_probe_traced(&mut traced, 16, None);
+
+        assert!(untraced.trace.is_none());
+        assert_eq!(untraced.to_string(), expected);
+    }
+
+    /// With a trace armed the same first lines are followed by a trace section.
+    #[test]
+    fn traced_probe_appends_a_trace_section_after_the_same_report() {
+        let mut plain =
+            Machine::with_bios_rom(16 * 1024 * 1024, &failing_bios_rom()).expect("load BIOS");
+        let mut traced =
+            Machine::with_bios_rom(16 * 1024 * 1024, &failing_bios_rom()).expect("load BIOS");
+
+        let expected = run_post_probe(&mut plain, 16).to_string();
+        let report =
+            run_post_probe_traced(&mut traced, 16, Some(PostTraceConfig::with_capacity(8)));
+
+        let text = report.to_string();
+        assert!(text.starts_with(&expected), "{text}");
+        assert!(text.contains("post-trace: events="), "{text}");
+    }
+
+    /// A reset machine is in the mode-03h text programming, which renders.
+    #[test]
+    fn vga_frame_report_describes_the_text_frame() {
+        let built = build_machine(&Options::default()).expect("build HELLO");
+
+        let line = vga_frame_report(&built.machine, false);
+
+        assert!(line.contains("mode=text"), "{line}");
+        assert!(line.contains("rendered=yes"), "{line}");
+        assert!(line.contains("width=720 height=400"), "{line}");
+        assert!(line.contains("pixels=288000"), "{line}");
+        assert!(line.contains("rgba_bytes=1152000"), "{line}");
+    }
+
+    /// Reset installs no font, so the only non-background pixels in the text
+    /// frame come from the hardware cursor, not from glyphs. Anything more
+    /// would mean a glyph was rendered from a character generator that has no
+    /// font loaded.
+    #[test]
+    fn vga_frame_report_shows_only_the_cursor_at_reset() {
+        let built = build_machine(&Options::default()).expect("build HELLO");
+        let frame = built
+            .machine
+            .vga
+            .render_frame(false)
+            .expect("text mode renders");
+
+        let nonzero = frame.pixels.iter().filter(|index| **index != 0).count();
+        let cell_pixels =
+            built.machine.vga.text_cell_width() * built.machine.vga.text_cell_height();
+        assert!(nonzero > 0, "the reset cursor should be visible");
+        assert!(
+            nonzero <= cell_pixels,
+            "no font is loaded, so nothing outside the single cursor cell should be lit: \
+             {nonzero} of {cell_pixels}"
+        );
+    }
+
+    /// Graphics programming with no renderer is reported honestly instead of
+    /// producing a frame this model cannot actually fetch.
+    #[test]
+    fn vga_frame_report_admits_when_there_is_no_renderer() {
+        use devices::{VGA_GC_INDEX, VGA_GC_MISC, VGA_GC_MISC_DEFAULT, VGA_GC_MISC_GRAPHICS_MODE};
+
+        let mut built = build_machine(&Options::default()).expect("build HELLO");
+        let vga = &mut built.machine.vga;
+        vga.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MISC));
+        vga.port_write(
+            VGA_GC_INDEX + 1,
+            1,
+            u32::from(VGA_GC_MISC_DEFAULT | VGA_GC_MISC_GRAPHICS_MODE),
+        );
+
+        let line = vga_frame_report(&built.machine, false);
+
+        assert!(line.contains("mode=unsupported"), "{line}");
+        assert!(line.contains("rendered=no"), "{line}");
+        assert!(line.contains("no planar 16-color renderer"), "{line}");
     }
 
     #[test]

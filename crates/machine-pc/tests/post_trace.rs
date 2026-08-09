@@ -21,24 +21,24 @@ fn bios_image_64k(code: &[u8]) -> Vec<u8> {
     rom
 }
 
-/// Four 8-bit stores that assemble CONFIG_ADDRESS for host-bridge `00:00.0`.
+/// The single 32-bit store that latches CONFIG_ADDRESS for host-bridge
+/// `00:00.0`, enable set, register `reg`.
 ///
-/// Real hardware ignores non-dword writes to `0xCF8`-`0xCFB` (PCI 3.0
-/// §3.2.2.3.2); the caller arms the documented compatibility policy because
-/// this build's decoder has no `EF` (`OUT DX, eAX`) form yet.
+/// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.2 — only a full
+/// DWORD write to `0xCF8` is latched.
 #[rustfmt::skip]
 fn config_address_host_bridge(reg: u8) -> Vec<u8> {
+    let address: u32 = 0x8000_0000 | u32::from(reg & 0xFC);
+    let [b0, b1, b2, b3] = address.to_le_bytes();
     vec![
-        0xBA, 0xF8, 0x0C, 0xB0, reg & !0x03, 0xEE,  // 0xCF8 <- register
-        0xBA, 0xF9, 0x0C, 0xB0, 0x00, 0xEE,         // 0xCF9 <- bus 0
-        0xBA, 0xFA, 0x0C, 0xB0, 0x00, 0xEE,         // 0xCFA <- device/function 0
-        0xBA, 0xFB, 0x0C, 0xB0, 0x80, 0xEE,         // 0xCFB <- enable
+        0x66, 0xB8, b0, b1, b2, b3, // MOV EAX, address
+        0xBA, 0xF8, 0x0C,           // MOV DX, 0x0CF8
+        0x66, 0xEF,                 // OUT DX, EAX
     ]
 }
 
 fn traced_run(code: &[u8], capacity: usize) -> (Machine, PostTrace) {
     let mut m = Machine::with_bios_rom(1024 * 1024, &bios_image_64k(code)).expect("map BIOS");
-    m.pci.set_config_address_byte_lane_compat(true);
     let traced = m.probe_post_traced(10_000, Some(PostTraceConfig::with_capacity(capacity)));
     assert!(
         m.cpu.halted,
@@ -80,8 +80,8 @@ fn a_traced_run_records_ports_config_cycles_pam_and_the_vga_aperture() {
             _ => None,
         })
         .collect();
-    assert_eq!(latched.len(), 4, "four byte-lane stores");
-    assert_eq!(*latched.last().unwrap(), 0x8000_0058, "assembled latch");
+    assert_eq!(latched.len(), 1, "one dword store latches the address");
+    assert_eq!(latched[0], 0x8000_0058, "latched address");
 
     // CONFIG_DATA accesses carry the decoded target, both directions.
     let data: Vec<PostTraceEvent> = trace

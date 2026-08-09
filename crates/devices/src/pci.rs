@@ -603,11 +603,6 @@ pub struct PciConfig {
     /// Used to deassert IRQs that lose their last PIRQ route without touching
     /// unrelated PIC lines.
     pub pirq_pic_driven: u16,
-    /// Host policy: accept byte/word writes to `0xCF8`–`0xCFB` as CONFIG_ADDRESS
-    /// byte lanes instead of ignoring them (see
-    /// [`PciConfig::set_config_address_byte_lane_compat`]). Off by default,
-    /// which is what PCI 3.0 §3.2.2.3.2 requires.
-    address_byte_lane_compat: bool,
 }
 
 /// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
@@ -731,9 +726,6 @@ impl PciConfig {
             // Spec: Intel 82371SB — PIRQ# lines idle at reset; routes disabled (0x80).
             pirq_asserted: [false; 4],
             pirq_pic_driven: 0,
-            // Spec: PCI 3.0 §3.2.2.3.2 — non-dword accesses to CONFIG_ADDRESS
-            // have no effect. The compatibility policy is opt-in.
-            address_byte_lane_compat: false,
         }
     }
 
@@ -748,27 +740,6 @@ impl PciConfig {
 
     /// CONFIG_ADDRESS bits that are reserved / hardwired zero.
     pub const ADDRESS_RESERVED_MASK: u32 = !Self::ADDRESS_WRITABLE_MASK;
-
-    /// Accept byte and word accesses to `0xCF8`–`0xCFB` as CONFIG_ADDRESS byte
-    /// lanes (default: off).
-    ///
-    /// **Model choice, not hardware behavior.** PCI 3.0 §3.2.2.3.2 is explicit:
-    /// "Any other types of accesses to this address (non-DWORD) have no effect
-    /// on CONFIG_ADDRESS and are executed as normal I/O transactions on the PCI
-    /// bus", and the Intel 440FX PMC documents CONFADD the same way. This
-    /// switch exists only for hosts that cannot yet issue a 32-bit `OUT` — the
-    /// interpreter's primary opcode map has no `EF` (`OUT DX, eAX`) form, so a
-    /// guest-code test has no other way to program the register. Turn it off
-    /// (or simply never turn it on) for anything claiming to model a real
-    /// platform.
-    pub fn set_config_address_byte_lane_compat(&mut self, enabled: bool) {
-        self.address_byte_lane_compat = enabled;
-    }
-
-    /// Whether the non-spec CONFIG_ADDRESS byte-lane policy is armed.
-    pub fn config_address_byte_lane_compat(&self) -> bool {
-        self.address_byte_lane_compat
-    }
 
     fn init_host_bridge() -> [u8; 256] {
         let mut cfg = [0u8; 256];
@@ -897,14 +868,8 @@ impl PciConfig {
     }
 
     /// Return every guest-visible register to its power-on state.
-    ///
-    /// The CONFIG_ADDRESS byte-lane compatibility policy is host configuration
-    /// rather than guest state, so it survives, the same way
-    /// `Machine::set_step_clock` survives a machine reset.
     pub fn reset(&mut self) {
-        let compat = self.address_byte_lane_compat;
         *self = Self::new();
-        self.address_byte_lane_compat = compat;
     }
 
     /// PIRQRC byte for PIRQ `pirq` (0=A … 3=D) from ISA config `0x60`–`0x63`.
@@ -1068,26 +1033,7 @@ impl PciConfig {
     fn write_address(&mut self, size: u8, port: u16, value: u32) {
         if size == 4 && port == PCI_CONFIG_ADDRESS {
             self.address = value & Self::ADDRESS_WRITABLE_MASK;
-            return;
         }
-        if !self.address_byte_lane_compat {
-            return;
-        }
-        // Documented model choice only — see
-        // [`Self::set_config_address_byte_lane_compat`].
-        let shift = ((port - PCI_CONFIG_ADDRESS) as u32) * 8;
-        match size {
-            2 if port <= 0xCFA => {
-                let mask = 0xFFFFu32 << shift;
-                self.address = (self.address & !mask) | ((value as u16 as u32) << shift);
-            }
-            1 => {
-                let mask = 0xFFu32 << shift;
-                self.address = (self.address & !mask) | ((value as u8 as u32) << shift);
-            }
-            _ => return,
-        }
-        self.address &= Self::ADDRESS_WRITABLE_MASK;
     }
 
     /// CONFIG_ADDRESS (`0xCF8`–`0xCFB`) read.
@@ -1098,14 +1044,6 @@ impl PciConfig {
     fn read_address(&self, size: u8, port: u16) -> u32 {
         if size == 4 && port == PCI_CONFIG_ADDRESS {
             return self.address;
-        }
-        if self.address_byte_lane_compat {
-            let shift = ((port - PCI_CONFIG_ADDRESS) as u32) * 8;
-            match size {
-                2 if port <= 0xCFA => return (self.address >> shift) & 0xFFFF,
-                1 => return (self.address >> shift) & 0xFF,
-                _ => {}
-            }
         }
         OPEN_BUS
     }
@@ -2177,53 +2115,41 @@ mod tests {
         );
     }
 
-    /// Model choice (**not** hardware): with the compatibility policy armed,
-    /// byte lanes at `0xCF8`–`0xCFB` assemble CONFIG_ADDRESS, because a guest
-    /// whose decoder has no `EF` (`OUT DX, eAX`) form cannot program it any
-    /// other way. Reserved bits stay zero either way.
+    /// Only a full-DWORD write to `0xCF8` latches; a reset clears the latch.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.2 — "Anytime a
+    /// host bridge sees a full DWORD I/O write from the host to CONFIG_ADDRESS,
+    /// the bridge must latch the data into its CONFIG_ADDRESS register ... Any
+    /// other types of accesses to this address (non-DWORD) have no effect on
+    /// CONFIG_ADDRESS and are executed as normal I/O transactions on the PCI
+    /// bus." Access-width behavior in full is covered by
+    /// `tests/pci_config_access_widths.rs`.
     #[test]
-    fn config_address_byte_lane_compat_policy_assembles_the_latch() {
+    fn only_a_dword_write_latches_config_address_and_reset_clears_it() {
         let mut pci = PciConfig::new();
-        assert!(!pci.config_address_byte_lane_compat());
-        pci.set_config_address_byte_lane_compat(true);
-
         let addr = PciConfig::make_address(0, 0, 0, 0x5C, true);
-        for (lane, byte) in addr.to_le_bytes().iter().enumerate() {
-            pci.port_write(PCI_CONFIG_ADDRESS + lane as u16, 1, u32::from(*byte));
-        }
+        pci.port_write(PCI_CONFIG_ADDRESS, 4, addr);
         assert_eq!(pci.port_read(PCI_CONFIG_ADDRESS, 4), addr);
-        assert_eq!(pci.port_read(0xCFB, 1) as u8, (addr >> 24) as u8);
 
-        // Reserved bits are still refused through the lanes.
-        pci.port_write(0xCFB, 1, 0xFF);
-        pci.port_write(PCI_CONFIG_ADDRESS, 1, 0xFF);
-        assert_eq!(
-            pci.port_read(PCI_CONFIG_ADDRESS, 4) & PciConfig::ADDRESS_RESERVED_MASK,
-            0
-        );
-
-        // Word lanes work the same; a word at 0xCFB would leave the register.
-        let other = PciConfig::make_address(0, 1, 1, 0x20, true);
-        pci.port_write(PCI_CONFIG_ADDRESS, 2, other & 0xFFFF);
-        pci.port_write(0xCFA, 2, other >> 16);
-        assert_eq!(pci.port_read(PCI_CONFIG_ADDRESS, 4), other);
-        pci.port_write(0xCFB, 2, 0x0000);
-        assert_eq!(pci.port_read(PCI_CONFIG_ADDRESS, 4), other);
-    }
-
-    /// The compatibility policy is host configuration, not guest state: a
-    /// device reset returns the latch to zero but leaves the policy armed.
-    #[test]
-    fn config_address_compat_policy_survives_reset() {
-        let mut pci = PciConfig::new();
-        pci.set_config_address_byte_lane_compat(true);
-        pci.port_write(PCI_CONFIG_ADDRESS, 1, 0x40);
-        assert_ne!(pci.address, 0);
+        // Byte and word stores anywhere in 0xCF8-0xCFB leave the latch alone.
+        for (port, size) in [
+            (PCI_CONFIG_ADDRESS, 1u8),
+            (0xCF9, 1),
+            (0xCFA, 1),
+            (0xCFB, 1),
+            (PCI_CONFIG_ADDRESS, 2),
+            (0xCFA, 2),
+        ] {
+            pci.port_write(port, size, 0xFFFF_FFFF);
+            assert_eq!(
+                pci.port_read(PCI_CONFIG_ADDRESS, 4),
+                addr,
+                "size {size} write at {port:#06X} must not change the latch"
+            );
+        }
 
         pci.reset();
-
         assert_eq!(pci.address, 0);
-        assert!(pci.config_address_byte_lane_compat());
     }
 
     /// Spec: PCI 3.0 §3.2.2.3.2 Figure 3-2 — the latch decodes to bus, device,

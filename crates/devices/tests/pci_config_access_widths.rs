@@ -28,11 +28,10 @@
 //! back to on this machine, so they read as ISA open bus (all ones) and drop
 //! writes. That is the behavior asserted here.
 //!
-//! These tests exercise the spec default only. The opt-in byte-lane
-//! compatibility policy (`PciConfig::set_config_address_byte_lane_compat`) is
-//! covered by the unit tests in `crates/devices/src/pci.rs`, because a machine
-//! whose interpreter has no 32-bit `OUT` form yet cannot program
-//! CONFIG_ADDRESS any other way.
+//! There is no compatibility escape hatch: the spec rules are the only
+//! behavior. Round 3 added `OUT DX, eAX` (`EF`) to the interpreter, so guest
+//! code programs CONFIG_ADDRESS the way hardware requires and the byte-lane
+//! policy that stood in for it was removed.
 
 use devices::{PciConfig, PortDevice, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA};
 

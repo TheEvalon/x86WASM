@@ -1,8 +1,8 @@
 //! Native CLI: run a ROM/BIOS (default: built-in HELLO ROM) until HLT.
 
 use emulator_cli::{
-    build_machine, parse_args, run_machine, run_post_probe, usage, vga_text_dump, BuiltMachine,
-    CliError, Options, ParsedArgs,
+    build_machine, parse_args, run_machine, run_post_probe_traced, usage, vga_frame_report,
+    vga_text_dump, BuiltMachine, CliError, Options, ParsedArgs,
 };
 use machine_pc::Machine;
 use std::env;
@@ -16,6 +16,9 @@ fn print_diagnostics(machine: &Machine, built_option_rom: Option<String>, opts: 
     }
     if opts.vga_text {
         println!("{}", vga_text_dump(machine));
+    }
+    if opts.vga_frame {
+        println!("{}", vga_frame_report(machine, false));
     }
 }
 
@@ -57,7 +60,10 @@ fn main() -> ExitCode {
     let option_rom_line = option_rom.map(|info| info.to_string());
 
     if opts.post_probe {
-        println!("{}", run_post_probe(&mut machine, opts.max_steps));
+        println!(
+            "{}",
+            run_post_probe_traced(&mut machine, opts.max_steps, opts.post_trace)
+        );
         print_diagnostics(&machine, option_rom_line, &opts);
         return ExitCode::SUCCESS;
     }

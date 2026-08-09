@@ -42,19 +42,22 @@ to what `PciConfig::make_address` would have produced. Register selection is
 bits 7:2 only: this is the 256-byte legacy configuration space, not the
 extended (`0xCF8` bits 27:24 / MMCONFIG) space, which is unimplemented.
 
-### Model choice: byte-lane compatibility policy
+### Retired: the byte-lane compatibility policy
 
-`PciConfig::set_config_address_byte_lane_compat(true)` makes 8- and 16-bit
-accesses to `0xCF8`–`0xCFB` assemble the latch byte-lane-wise. **This is not
-hardware behavior** — rule 2 above forbids it, and the Intel 440FX PMC
-documents CONFADD the same way.
+This slice shipped with an opt-in `set_config_address_byte_lane_compat` switch
+that let 8- and 16-bit accesses to `0xCF8`–`0xCFB` assemble the latch byte-lane
+-wise. It was never hardware behavior — rule 2 above forbids it, and the Intel
+440FX PMC documents CONFADD the same way. It existed for exactly one reason:
+the interpreter had no `EF` (`OUT DX, eAX`) form, so guest code in a
+machine-level test could not issue a 32-bit `OUT` at all.
 
-It exists for exactly one reason: the interpreter's primary opcode map has no
-`EF` (`OUT DX, eAX`) form yet, so guest code in a machine-level test cannot
-issue a 32-bit `OUT` at all. `crates/machine-pc/tests/pam_bus_seam.rs` arms the
-policy, drives the BIOS-shadowing sequence with four byte stores, and says so.
-The policy is off by default, survives `PciConfig::reset` (host configuration,
-not guest state), and should be deleted once `EF` decodes.
+The CPU slice landing in the same round added `EF`, so round-3 integration
+**removed the switch entirely** and rewrote the two guests that used it
+(`crates/machine-pc/tests/pam_bus_seam.rs` and
+`crates/machine-pc/tests/post_trace.rs`) to program CONFIG_ADDRESS with the
+single 32-bit store hardware requires. There is now no way to reach the
+non-spec behavior, which is the correct end state: the table above is the whole
+contract.
 
 ## CONFIG_DATA — `0xCFC`–`0xCFF`
 

@@ -4833,9 +4833,11 @@ mod tests {
 /// *detected*. PACKET (`0xA0`) is still aborted and no command packet set is
 /// implemented, so these tests also pin what the device refuses to do.
 ///
-/// They live beside the device rather than in `crates/devices/tests/` because
-/// `crates/devices/src/lib.rs` does not yet re-export the new constants and
-/// `IdePrimary::with_atapi_device`.
+/// The `ATAPI_SIGNATURE_*` constants are re-exported from
+/// `crates/devices/src/lib.rs` as of round-3 integration, so these could move to
+/// `crates/devices/tests/`. They stay here because they assert the device's
+/// internal configuration (`present`, `is_packet_device`) alongside its port
+/// behavior, which is a device-level rather than integration-level concern.
 #[cfg(test)]
 mod atapi_detection_tests {
     use super::*;

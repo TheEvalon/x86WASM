@@ -6209,8 +6209,11 @@ mod tests {
 /// back out of the renderer.
 ///
 /// These live beside the device rather than in `crates/devices/tests/` because
-/// `crates/devices/src/lib.rs` does not yet re-export [`VgaFrame`],
-/// [`VgaRenderMode`] or the new constants; see `docs/vga-r3-character-generator.md`.
+/// they reach into the device's own state to stage a display — plane memory,
+/// the DAC RAM, and register files directly — which an integration test has no
+/// business doing. [`VgaFrame`], [`VgaRenderMode`] and the new constants are
+/// re-exported from `crates/devices/src/lib.rs` as of round-3 integration; see
+/// `docs/vga-r3-character-generator.md`.
 #[cfg(test)]
 mod character_generator_tests {
     use super::*;
