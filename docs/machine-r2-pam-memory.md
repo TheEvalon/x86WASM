@@ -105,3 +105,41 @@ PhysMem::pam_region_index(phys_addr);                        // -> Option<usize>
 `0..PAM_REGION_COUNT`. Region indices are in ascending address order:
 `0` = `0xC0000`–`0xC3FFF` … `11` = `0xEC000`–`0xEFFFF`, and
 `PAM_BIOS_REGION` (`12`) = `0xF0000`–`0xFFFFF`.
+
+## 2. BIOS shadowing end to end
+
+Specs
+
+- Intel 440FX PMC PAM as above. The shadowing sequence is: set the region to
+  read-from-ROM / write-to-DRAM, copy the region onto itself (reads resolve to
+  the ROM, writes land in DRAM), then set read-from-DRAM / write-disabled so
+  the copy is what executes and stray writes are dropped.
+- Intel SDM Vol. 3 §9.1.4 — reset fetch at `0xFFFFFFF0` with
+  `CS.base = 0xFFFF0000`; a far `JMP ptr16:16` to `F000:0000` moves execution to
+  the below-1 MiB alias, which is the window PAM attributes.
+- SeaBIOS memory map (`docs/sources.md`, Firmware) — the BIOS is mapped at the
+  top of 4 GiB with the last up to 128 KiB aliased below 1 MiB.
+
+Supported
+
+- `crates/machine-pc/tests/bios_shadow.rs` runs the sequence with guest
+  instructions (`REP MOVSB` twice over 32 KiB, entered through the reset
+  vector's far jump), patches one byte of the shadow copy while writes still
+  reach DRAM, locks the region, and then resumes so the next instruction can
+  only produce its output if the **fetch** came from shadow DRAM.
+- The same test checks that the top-of-4 GiB window still returns the original
+  image after the low alias has been shadowed and re-attributed, so
+  `firmware_interface::prepare_bios_rom`'s dual placement keeps working.
+- A second test drives a guest `MOV ES:[DI], AL` into the BIOS area with PAM at
+  its reset value and shows the machine continues instead of taking a memory
+  fault — the behavior that would otherwise stop POST.
+- A third test shadows the `0xE0000` region of a 256 KiB image and shows the
+  neighbouring 16 KiB region and the high map are untouched.
+
+Not supported
+
+- Nothing arms PAM automatically. Until the PCI side forwards writes to
+  `0x59`–`0x5F`, a guest that copies itself into the BIOS area still sees its
+  writes dropped, which is what real hardware does before PAM is programmed.
+- The copy is a plain byte copy: no cacheability, no write combining, and no
+  modeling of the fetch-versus-data distinction during the transition.
