@@ -18,9 +18,9 @@ pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO
 pub use mem::PhysMem;
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
-    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA,
-    CMOS_INDEX, FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, FwCfgDmaOutcome,
+    IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText,
+    CMOS_DATA, CMOS_INDEX, FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
     PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE,
     PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
     PORT_SYSTEM_CONTROL_A,
@@ -430,6 +430,34 @@ impl Machine {
         self.pic.set_irq_line(12, self.kbd.irq12_line());
     }
 
+    /// Service a pending fw_cfg DMA operation against [`Self::mem`].
+    ///
+    /// Spec: QEMU fw_cfg "Guest-side DMA Interface". `MachineBus` already does
+    /// this after every fw_cfg port write; this is the host-side entry point
+    /// for tests and diagnostics. Returns `None` when nothing is pending.
+    pub fn service_fw_cfg_dma(&mut self) -> Option<FwCfgDmaOutcome> {
+        let mut view = MachineBus {
+            mem: &mut self.mem,
+            com1: &mut self.com1,
+            com2: &mut self.com2,
+            debug: &mut self.debug,
+            pic: &mut self.pic,
+            pit: &mut self.pit,
+            cmos: &mut self.cmos,
+            kbd: &mut self.kbd,
+            port92: &mut self.port92,
+            dma: &mut self.dma,
+            vga: &mut self.vga,
+            pci: &mut self.pci,
+            ide: &mut self.ide,
+            ide_secondary: &mut self.ide_secondary,
+            fdc: &mut self.fdc,
+            fw_cfg: &mut self.fw_cfg,
+            ports: &mut self.ports,
+        };
+        view.try_fw_cfg_dma()
+    }
+
     /// Drive PIC IRQ4 from the current COM1 16550 interrupt line (level follow).
     ///
     /// Spec: IBM PC/AT ISA interrupt assignment — COM1 (`0x3F8`) is IRQ4 (master
@@ -689,6 +717,27 @@ impl MachineBus<'_> {
         }
     }
 
+    /// Service a triggered fw_cfg DMA operation against [`PhysMem`].
+    ///
+    /// Spec: QEMU fw_cfg "Guest-side DMA Interface". The device supplies the
+    /// state machine; the machine supplies guest-physical byte accessors, so
+    /// the A20 gate applies to fw_cfg DMA exactly as it does to CPU accesses.
+    fn try_fw_cfg_dma(&mut self) -> Option<FwCfgDmaOutcome> {
+        if !self.fw_cfg.dma_pending() {
+            return None;
+        }
+        use std::cell::RefCell;
+        let mem = RefCell::new(std::mem::replace(self.mem, PhysMem::new(0)));
+        let outcome = self.fw_cfg.service_dma(
+            |phys| mem.borrow().read_u8(phys).unwrap_or(0xFF),
+            |phys, b| {
+                let _ = mem.borrow_mut().write_u8(phys, b);
+            },
+        );
+        *self.mem = mem.into_inner();
+        outcome
+    }
+
     /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
@@ -756,6 +805,9 @@ impl MachineBus<'_> {
         }
         if FwCfg::owns_port(port) {
             self.fw_cfg.port_write(port, size, value);
+            // Spec: QEMU fw_cfg DMA — a write to the low half of the address
+            // register at `0x518` triggers the operation immediately.
+            self.try_fw_cfg_dma();
             return;
         }
         if Dma8237::owns_port(port) {
@@ -922,15 +974,18 @@ mod tests {
         FDC_CMD_SENSE_DRIVE_STATUS, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA,
         FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM,
         FDC_SECTOR_SIZE, FDC_ST0_IC_ABNORMAL, FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST3_RESERVED_BIT3,
-        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FW_CFG_DATA, FW_CFG_SELECTOR, FW_CFG_SIGNATURE,
-        FW_CFG_SIGNATURE_BYTES, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS,
-        PCI_CONFIG_DATA, PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA,
-        PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT92_A20,
-        PORT92_RESET, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A, REG_STATUS_A, REG_STATUS_B,
-        REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
-        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
-        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
+        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FW_CFG_DATA, FW_CFG_DMA_ADDR_HIGH,
+        FW_CFG_DMA_ADDR_LOW, FW_CFG_DMA_CTL_ERROR, FW_CFG_DMA_CTL_READ, FW_CFG_DMA_CTL_SELECT,
+        FW_CFG_DMA_CTL_WRITE, FW_CFG_DMA_SIGNATURE, FW_CFG_ID, FW_CFG_RAM_SIZE, FW_CFG_SELECTOR,
+        FW_CFG_SIGNATURE, FW_CFG_SIGNATURE_BYTES, FW_CFG_VERSION, FW_CFG_VERSION_DMA, I8042,
+        I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
+        PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+        PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
+        PORT61_OUT2, PORT61_SPKR_DATA, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL,
+        PORT_SYSTEM_CONTROL_A, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
+        STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
+        VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
+        VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -1305,6 +1360,124 @@ mod tests {
         assert_eq!(m.cpu.ip16(), 0x0E00);
         assert!(!m.cpu.interrupt_flag());
         assert_eq!(m.pic.master.isr, 0x10);
+    }
+
+    /// Write a big-endian `FWCfgDmaAccess { control, length, address }` into RAM.
+    fn put_fw_cfg_dma_access(m: &mut Machine, at: u64, control: u32, length: u32, address: u64) {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&control.to_be_bytes());
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(&address.to_be_bytes());
+        for (i, b) in bytes.into_iter().enumerate() {
+            m.mem.write_u8(at + i as u64, b).unwrap();
+        }
+    }
+
+    /// Spec: QEMU fw_cfg "Guest-side DMA Interface" — writing the low half of
+    /// the big-endian address register at `0x518` triggers the operation
+    /// described by the `FWCfgDmaAccess` structure in guest RAM.
+    #[test]
+    fn machine_bus_fw_cfg_dma_read_copies_item_into_phys_mem() {
+        let mut m = Machine::new(64 * 1024);
+        put_fw_cfg_dma_access(
+            &mut m,
+            0x1000,
+            FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (u32::from(FW_CFG_SIGNATURE) << 16),
+            4,
+            0x2000,
+        );
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_HIGH, 0).unwrap();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_LOW, 0x1000u32.swap_bytes())
+                .unwrap();
+        }
+
+        let copied: Vec<u8> = (0..4).map(|i| m.mem.read_u8(0x2000 + i).unwrap()).collect();
+        assert_eq!(copied, FW_CFG_SIGNATURE_BYTES);
+        // Control writeback: all bits clear on success.
+        let control: Vec<u8> = (0..4).map(|i| m.mem.read_u8(0x1000 + i).unwrap()).collect();
+        assert_eq!(control, [0, 0, 0, 0]);
+        assert!(!m.fw_cfg.dma_pending());
+        assert_eq!(m.fw_cfg.dma_address(), 0);
+    }
+
+    /// The RAM-size item the machine configures is reachable over DMA too.
+    #[test]
+    fn machine_bus_fw_cfg_dma_reads_configured_ram_size() {
+        let ram_size = 64 * 1024usize;
+        let mut m = Machine::new(ram_size);
+        put_fw_cfg_dma_access(
+            &mut m,
+            0x1000,
+            FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (u32::from(FW_CFG_RAM_SIZE) << 16),
+            8,
+            0x2000,
+        );
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_HIGH, 0).unwrap();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_LOW, 0x1000u32.swap_bytes())
+                .unwrap();
+        }
+
+        let copied: Vec<u8> = (0..8).map(|i| m.mem.read_u8(0x2000 + i).unwrap()).collect();
+        assert_eq!(copied, (ram_size as u64).to_le_bytes());
+    }
+
+    /// Spec: reading the DMA address register returns `QEMU CFG` big-endian, and
+    /// ID bit1 advertises the interface now that the machine services it.
+    #[test]
+    fn machine_bus_fw_cfg_dma_signature_and_id_bit() {
+        let mut m = Machine::new(64 * 1024);
+        let mut bus = m.bus_mut();
+        assert_eq!(
+            bus.port_in_u32(FW_CFG_DMA_ADDR_HIGH).unwrap(),
+            ((FW_CFG_DMA_SIGNATURE >> 32) as u32).swap_bytes()
+        );
+        bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_ID).unwrap();
+        let id: Vec<u8> = (0..4)
+            .map(|_| bus.port_in_u8(FW_CFG_DATA).unwrap())
+            .collect();
+        assert_eq!(
+            u32::from_le_bytes(id.try_into().unwrap()),
+            FW_CFG_VERSION | FW_CFG_VERSION_DMA
+        );
+    }
+
+    /// A DMA write request is refused with the spec error bit (no item
+    /// writeability in this tree) and leaves guest RAM and the item alone.
+    #[test]
+    fn machine_bus_fw_cfg_dma_write_direction_sets_error_bit() {
+        let mut m = Machine::new(64 * 1024);
+        put_fw_cfg_dma_access(
+            &mut m,
+            0x1000,
+            FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_WRITE | (u32::from(FW_CFG_SIGNATURE) << 16),
+            4,
+            0x2000,
+        );
+        for i in 0..4 {
+            m.mem.write_u8(0x2000 + i, b'Z').unwrap();
+        }
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_HIGH, 0).unwrap();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_LOW, 0x1000u32.swap_bytes())
+                .unwrap();
+        }
+
+        let control: Vec<u8> = (0..4).map(|i| m.mem.read_u8(0x1000 + i).unwrap()).collect();
+        assert_eq!(
+            u32::from_be_bytes(control.try_into().unwrap()),
+            FW_CFG_DMA_CTL_ERROR
+        );
+        let mut bus = m.bus_mut();
+        bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_SIGNATURE).unwrap();
+        let sig: Vec<u8> = (0..4)
+            .map(|_| bus.port_in_u8(FW_CFG_DATA).unwrap())
+            .collect();
+        assert_eq!(sig, FW_CFG_SIGNATURE_BYTES);
     }
 
     /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
@@ -3627,7 +3800,8 @@ mod tests {
             for byte in &mut id {
                 *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
             }
-            assert_eq!(id, [0x01, 0x00, 0x00, 0x00]);
+            // Base revision + DMA interface (the machine services `0x514`).
+            assert_eq!(id, [0x03, 0x00, 0x00, 0x00]);
 
             bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_RAM_SIZE_SELECTOR)
                 .unwrap();
@@ -3657,7 +3831,7 @@ mod tests {
         for byte in &mut id {
             *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
         }
-        assert_eq!(id, [0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(id, [0x03, 0x00, 0x00, 0x00]);
 
         bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_RAM_SIZE_SELECTOR)
             .unwrap();
