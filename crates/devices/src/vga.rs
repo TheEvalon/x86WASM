@@ -185,8 +185,13 @@
 //!   unchained "mode X", and every VBE mode report
 //!   [`VgaRenderMode::Unsupported`] rather than guessing. There is no VBE, no
 //!   host display, and no timing-accurate raster
-//! - No font is installed at reset, so a freshly reset device renders no
-//!   glyphs (`docs/vga-r3-character-generator.md`)
+//! - **No font is installed at reset and this crate ships no character ROM**,
+//!   so a freshly reset device renders no glyphs. That is deliberate:
+//!   `docs/vga-r4-font-provenance.md` records the licensing reasoning. The
+//!   state is reported rather than left ambiguous —
+//!   [`VgaText::text_font_installed`], [`VgaText::font_bank_is_blank`], and
+//!   [`VgaFrame::font_installed`] on every alphanumeric frame — and
+//!   [`VgaText::install_font_bank`] lets a host supply its own
 //! - ATC / Sequencer / GC timing, plane-enable / overscan display side effects,
 //!   map-mask, write-mode, read-map, or bitmask side effects on the text plane;
 //!   Internal Palette + Color Select attr→DAC composition is on host text
@@ -1328,6 +1333,18 @@ pub struct VgaFrame {
     pub pixels: Vec<u8>,
     /// Which display fetch produced this frame.
     pub mode: VgaRenderMode,
+    /// Whether the character generator had glyph data, for a frame it produced.
+    ///
+    /// - `Some(true)` — an alphanumeric frame whose selected character sets
+    ///   contain glyph data.
+    /// - `Some(false)` — an alphanumeric frame rendered with **no font
+    ///   installed**. Every character cell is background, so the frame is a
+    ///   blank screen that carries no text. This device ships no character ROM
+    ///   (`docs/vga-r4-font-provenance.md`), so it is the state a freshly reset
+    ///   device is in until a video BIOS or a host loads a font. A front end
+    ///   should say so rather than present the blank frame as content.
+    /// - `None` — a graphics frame; the character generator took no part.
+    pub font_installed: Option<bool>,
 }
 
 impl VgaFrame {
@@ -2694,6 +2711,78 @@ impl VgaText {
         self.planes[VGA_FONT_PLANE * VGA_PLANE_SIZE + offset]
     }
 
+    /// True when a font bank in map 2 holds no glyph data at all.
+    ///
+    /// A bank is [`VGA_FONT_BANK_BYTES`] of map 2 starting at `bank_offset`
+    /// (FreeVGA Fonts: 256 characters × [`VGA_FONT_GLYPH_BYTES`]). "Blank"
+    /// means every one of those bytes is zero, which is what the character
+    /// generator would fetch as an all-background glyph.
+    pub fn font_bank_is_blank(&self, bank_offset: usize) -> bool {
+        let size = self.plane_size_bytes();
+        (0..VGA_FONT_BANK_BYTES).all(|i| {
+            let offset = (bank_offset + i) % size;
+            self.planes[VGA_FONT_PLANE * VGA_PLANE_SIZE + offset] == 0
+        })
+    }
+
+    /// True when at least one character set the current programming selects
+    /// holds glyph data.
+    ///
+    /// The two banks are the ones [`Self::text_font_bank_offset`] names for
+    /// attribute bit 3 set (Character Set A) and clear (Character Set B), which
+    /// collapse to bank `0000h` when Sequencer Memory Mode Extended Memory is
+    /// clear.
+    ///
+    /// **This device installs no font.** See
+    /// `docs/vga-r4-font-provenance.md` for why, and
+    /// [`Self::install_font_bank`] for the way a host or a video BIOS puts one
+    /// there.
+    pub fn text_font_installed(&self) -> bool {
+        let set_a = self.text_font_bank_offset(VGA_TEXT_ATTR_FONT_SELECT);
+        let set_b = self.text_font_bank_offset(0);
+        !self.font_bank_is_blank(set_a) || !self.font_bank_is_blank(set_b)
+    }
+
+    /// Load a font bank into map 2.
+    ///
+    /// `glyphs` is `256 * glyph_height` bytes, one glyph after another, each
+    /// glyph's scan lines top to bottom — the layout FreeVGA Fonts describes
+    /// minus the padding. Each glyph is written at
+    /// `bank_offset + code * VGA_FONT_GLYPH_BYTES` and the scan lines past
+    /// `glyph_height` are zeroed, so a shorter font does not inherit whatever
+    /// was in the bank.
+    ///
+    /// Returns `false` without touching display memory when `bank_offset` is
+    /// not a [`VGA_FONT_BANK_BYTES`]-aligned bank inside the enabled map size,
+    /// when `glyph_height` is zero or exceeds [`VGA_FONT_MAX_SCAN_LINES`], or
+    /// when `glyphs` is not exactly `256 * glyph_height` bytes.
+    ///
+    /// This exists so the font stays *the host's* to supply: this crate ships
+    /// no glyph data, and a front end that has a legitimately licensed set can
+    /// install it without going through the Graphics Controller write path.
+    pub fn install_font_bank(
+        &mut self,
+        bank_offset: usize,
+        glyph_height: usize,
+        glyphs: &[u8],
+    ) -> bool {
+        if !bank_offset.is_multiple_of(VGA_FONT_BANK_BYTES)
+            || bank_offset + VGA_FONT_BANK_BYTES > self.plane_size_bytes()
+            || glyph_height == 0
+            || glyph_height > VGA_FONT_MAX_SCAN_LINES
+            || glyphs.len() != 256 * glyph_height
+        {
+            return false;
+        }
+        for code in 0..256 {
+            let src = code * glyph_height;
+            let dst = VGA_FONT_PLANE * VGA_PLANE_SIZE + bank_offset + code * VGA_FONT_GLYPH_BYTES;
+            self.planes[dst..dst + glyph_height].copy_from_slice(&glyphs[src..src + glyph_height]);
+            self.planes[dst + glyph_height..dst + VGA_FONT_GLYPH_BYTES].fill(0);
+        }
+        true
+    }
+
     /// True when Attribute Mode Control Line Graphics Enable is set.
     ///
     /// Spec: IBM PS/2 Video Subsystems Figure 2-79 Mode Control bit2. Set means
@@ -2971,6 +3060,9 @@ impl VgaText {
             height,
             pixels,
             mode: VgaRenderMode::Text,
+            // A blank alphanumeric frame is ambiguous — no font versus no
+            // content — so the frame says which (`docs/vga-r4-font-provenance.md`).
+            font_installed: Some(self.text_font_installed()),
         }
     }
 
@@ -3041,6 +3133,7 @@ impl VgaText {
             height,
             pixels,
             mode: VgaRenderMode::Graphics256Chain4,
+            font_installed: None,
         }
     }
 
@@ -3134,6 +3227,7 @@ impl VgaText {
             height,
             pixels,
             mode: VgaRenderMode::Graphics16Planar,
+            font_installed: None,
         }
     }
 
