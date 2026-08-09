@@ -1819,10 +1819,7 @@ mod tests {
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
-        assert!(
-            lookup_0f(0x00).is_some(),
-            "missing 0F 00 GRP6 STR/LTR"
-        );
+        assert!(lookup_0f(0x00).is_some(), "missing 0F 00 GRP6 STR/LTR");
         assert!(
             lookup_0f(0x01).is_some(),
             "missing 0F 01 GRP7 SGDT/SIDT/LGDT/LIDT"

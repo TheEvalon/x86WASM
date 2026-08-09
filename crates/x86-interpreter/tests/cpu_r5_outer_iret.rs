@@ -86,9 +86,7 @@ fn encode_seg_desc(base: u32, limit20: u32, access: u8, gran_flags: u8) -> [u8; 
 fn encode_idt_gate32(offset: u32, selector: u16, access: u8) -> [u8; 8] {
     let off = offset.to_le_bytes();
     let sel = selector.to_le_bytes();
-    [
-        off[0], off[1], sel[0], sel[1], 0, access, off[2], off[3],
-    ]
+    [off[0], off[1], sel[0], sel[1], 0, access, off[2], off[3]]
 }
 
 fn install_tables(bus: &mut RamBus) {
@@ -100,10 +98,7 @@ fn install_tables(bus: &mut RamBus) {
     bus.write_bytes(GDT + 40, &encode_seg_desc(0, 0xF_FFFF, 0xF3, 0xC0));
     bus.poke_u32(TSS + 4, KERNEL_ESP0);
     bus.poke_u16(TSS + 8, SEL_KDATA);
-    bus.write_bytes(
-        IDT + 0x80 * 8,
-        &encode_idt_gate32(HANDLER, SEL_KCODE, 0xEE),
-    );
+    bus.write_bytes(IDT + 0x80 * 8, &encode_idt_gate32(HANDLER, SEL_KCODE, 0xEE));
 }
 
 /// Ring-3 `INT 0x80` then handler `IRETD` restores user `CS:EIP` and `SS:ESP`.
@@ -173,10 +168,7 @@ fn outer_iretd_rejects_bad_outer_ss_atomically() {
     bus.write_bytes(CODE, &[0xCD, 0x80]);
     bus.mem[HANDLER as usize] = 0xCF;
     // #GP gate for the nested failure observation path — keep delivery local.
-    bus.write_bytes(
-        IDT + 13 * 8,
-        &encode_idt_gate32(0x1F00, SEL_KCODE, 0x8E),
-    );
+    bus.write_bytes(IDT + 13 * 8, &encode_idt_gate32(0x1F00, SEL_KCODE, 0x8E));
     bus.mem[0x1F00] = 0xF4;
 
     let mut cpu = CpuState::reset();
@@ -217,5 +209,9 @@ fn outer_iretd_rejects_bad_outer_ss_atomically() {
     step(&mut cpu, &mut bus).unwrap();
     assert_eq!(cpu.rip, 0x1F00, "nested #GP handler entered");
     assert_eq!(before.ss.selector, SEL_KDATA);
-    assert_ne!(cpu.gpr_u32(CpuState::RSP), 0x8000, "did not return to user stack");
+    assert_ne!(
+        cpu.gpr_u32(CpuState::RSP),
+        0x8000,
+        "did not return to user stack"
+    );
 }

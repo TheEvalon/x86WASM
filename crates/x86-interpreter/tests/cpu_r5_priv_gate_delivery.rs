@@ -98,9 +98,7 @@ fn encode_seg_desc(base: u32, limit20: u32, access: u8, gran_flags: u8) -> [u8; 
 fn encode_idt_gate32(offset: u32, selector: u16, access: u8) -> [u8; 8] {
     let off = offset.to_le_bytes();
     let sel = selector.to_le_bytes();
-    [
-        off[0], off[1], sel[0], sel[1], 0, access, off[2], off[3],
-    ]
+    [off[0], off[1], sel[0], sel[1], 0, access, off[2], off[3]]
 }
 
 fn install_tables(bus: &mut RamBus) {
@@ -120,20 +118,11 @@ fn install_tables(bus: &mut RamBus) {
     bus.poke_u16(TSS + 8, SEL_KDATA);
 
     // Vector 0x80: 386 interrupt gate to kernel code, DPL=3 (software INT).
-    bus.write_bytes(
-        IDT + 0x80 * 8,
-        &encode_idt_gate32(HANDLER, SEL_KCODE, 0xEE),
-    );
+    bus.write_bytes(IDT + 0x80 * 8, &encode_idt_gate32(HANDLER, SEL_KCODE, 0xEE));
     // Vector 14: #PF trap gate (error code), DPL=0.
-    bus.write_bytes(
-        IDT + 14 * 8,
-        &encode_idt_gate32(HANDLER, SEL_KCODE, 0x8F),
-    );
+    bus.write_bytes(IDT + 14 * 8, &encode_idt_gate32(HANDLER, SEL_KCODE, 0x8F));
     // Vector 6: same-CPL #UD for the ring-0 regression.
-    bus.write_bytes(
-        IDT + 6 * 8,
-        &encode_idt_gate32(HANDLER, SEL_KCODE, 0x8E),
-    );
+    bus.write_bytes(IDT + 6 * 8, &encode_idt_gate32(HANDLER, SEL_KCODE, 0x8E));
 }
 
 fn user_fixture(code: &[u8]) -> (CpuState, RamBus) {
@@ -208,10 +197,7 @@ fn privilege_changing_gp_pushes_dword_error_code() {
     // 66 B8 18 00   MOV AX, 0x0018   (opsize override under CS.D=1)
     // 0F 00 D8      LTR AX           → #GP(0) at CPL 3
     let (mut cpu, mut bus) = user_fixture(&[0x66, 0xB8, 0x18, 0x00, 0x0F, 0x00, 0xD8]);
-    bus.write_bytes(
-        IDT + 13 * 8,
-        &encode_idt_gate32(HANDLER, SEL_KCODE, 0x8E),
-    );
+    bus.write_bytes(IDT + 13 * 8, &encode_idt_gate32(HANDLER, SEL_KCODE, 0x8E));
 
     step(&mut cpu, &mut bus).unwrap(); // MOV AX
     step(&mut cpu, &mut bus).unwrap(); // LTR → #GP(0) with stack switch

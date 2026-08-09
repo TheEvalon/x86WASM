@@ -106,10 +106,7 @@ fn install_gdt(bus: &mut RamBus, tss_access: u8, tss_limit: u32) {
 fn install_exception_gates(bus: &mut RamBus, cpu: &mut CpuState) {
     for vector in [6u8, 11, 13] {
         let entry = IDT + usize::from(vector) * 8;
-        bus.write_bytes(
-            entry,
-            &encode_idt_gate16(HANDLER, SEL_CODE, 0x86),
-        );
+        bus.write_bytes(entry, &encode_idt_gate16(HANDLER, SEL_CODE, 0x86));
     }
     cpu.idtr.base = IDT as u64;
     cpu.idtr.limit = 13 * 8 + 7;
@@ -153,9 +150,8 @@ fn ltr_loads_available_tss32_marks_busy_and_str_stores_selector() {
     // 0F 00 D8      LTR AX
     // 0F 00 CB      STR BX
     // F4            HLT
-    let (mut cpu, mut bus) = protected_fixture(&[
-        0xB8, 0x18, 0x00, 0x0F, 0x00, 0xD8, 0x0F, 0x00, 0xCB, 0xF4,
-    ]);
+    let (mut cpu, mut bus) =
+        protected_fixture(&[0xB8, 0x18, 0x00, 0x0F, 0x00, 0xD8, 0x0F, 0x00, 0xCB, 0xF4]);
 
     step(&mut cpu, &mut bus).unwrap();
     step(&mut cpu, &mut bus).unwrap();
@@ -172,18 +168,14 @@ fn ltr_loads_available_tss32_marks_busy_and_str_stores_selector() {
 /// CPL > 0 raises `#GP(0)` through the IDT and leaves TR/GDT untouched.
 #[test]
 fn ltr_at_cpl3_raises_gp0_atomically() {
-    let (mut cpu, mut bus) =
-        protected_fixture(&[0xB8, 0x18, 0x00, 0x0F, 0x00, 0xD8, 0xF4]);
+    let (mut cpu, mut bus) = protected_fixture(&[0xB8, 0x18, 0x00, 0x0F, 0x00, 0xD8, 0xF4]);
     // Same-CPL ring-3 code+data so delivery stays same-privilege.
     bus.write_bytes(GDT + 8, &encode_seg_desc(0, 0xFFFF, 0xFA, 0));
     bus.write_bytes(GDT + 16, &encode_seg_desc(0, 0xFFFF, 0xF3, 0));
     // Retarget exception gates at the ring-3 code selector.
     for vector in [6u8, 11, 13] {
         let entry = IDT + usize::from(vector) * 8;
-        bus.write_bytes(
-            entry,
-            &encode_idt_gate16(HANDLER, SEL_CODE | 3, 0xE6),
-        );
+        bus.write_bytes(entry, &encode_idt_gate16(HANDLER, SEL_CODE | 3, 0xE6));
     }
     cpu.cs.selector = SEL_CODE | 3;
     cpu.cs.flags = 0x00FA;
@@ -218,8 +210,7 @@ fn ltr_rejects_invalid_tss_descriptors() {
 
     for &(selector, access, limit, error_code) in cases {
         let lo = selector.to_le_bytes();
-        let (mut cpu, mut bus) =
-            protected_fixture(&[0xB8, lo[0], lo[1], 0x0F, 0x00, 0xD8, 0xF4]);
+        let (mut cpu, mut bus) = protected_fixture(&[0xB8, lo[0], lo[1], 0x0F, 0x00, 0xD8, 0xF4]);
         install_gdt(&mut bus, access, limit);
         step(&mut cpu, &mut bus).unwrap();
         let before = cpu.tr.clone();
