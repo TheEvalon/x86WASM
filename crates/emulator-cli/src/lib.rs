@@ -564,18 +564,19 @@ pub fn run_post_probe_traced(
 
 /// Render the current display and describe the result.
 ///
-/// Only two programmings have a display fetch in this model — alphanumeric
-/// (text mode 03h) and chain-4 256-color (mode 13h). Anything else reports that
-/// there is no renderer instead of producing a frame that is not what the
-/// hardware would show. `blink_off_half` selects the invisible half of the text
-/// blink cycle; the caller owns the phase because there is no retrace timer.
+/// Only three programmings have a display fetch in this model — alphanumeric
+/// (text mode 03h), chain-4 256-color (mode 13h) and planar 16-color (modes
+/// 0Dh/0Eh/10h/12h). Anything else reports that there is no renderer instead of
+/// producing a frame that is not what the hardware would show.
+/// `blink_off_half` selects the invisible half of the text blink cycle; the
+/// caller owns the phase because there is no retrace timer.
 pub fn vga_frame_report(machine: &Machine, blink_off_half: bool) -> String {
     let vga = &machine.vga;
     let mode = vga.render_mode();
     let Some(frame) = vga.render_frame(blink_off_half) else {
         return format!(
             "vga-frame: mode={} rendered=no — the current programming has no display fetch in \
-             this model (no planar 16-color renderer, no VBE, no host display)",
+             this model (no CGA-compatible modes, no unchained mode X, no VBE, no host display)",
             render_mode_name(mode)
         );
     };
@@ -598,6 +599,7 @@ fn render_mode_name(mode: VgaRenderMode) -> &'static str {
     match mode {
         VgaRenderMode::Text => "text",
         VgaRenderMode::Graphics256Chain4 => "graphics256-chain4",
+        VgaRenderMode::Graphics16Planar => "graphics16-planar",
         VgaRenderMode::Unsupported => "unsupported",
     }
 }
@@ -833,7 +835,7 @@ mod tests {
 
         assert!(line.contains("mode=unsupported"), "{line}");
         assert!(line.contains("rendered=no"), "{line}");
-        assert!(line.contains("no planar 16-color renderer"), "{line}");
+        assert!(line.contains("no CGA-compatible modes"), "{line}");
     }
 
     #[test]

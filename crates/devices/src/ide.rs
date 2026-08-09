@@ -50,9 +50,22 @@
 //!   `docs/atapi-r3-identify-and-signature.md`
 //! - IDENTIFY PACKET DEVICE (`0xA1`): ATA master → ERR+ABRT (§8.16.2 "use
 //!   prohibited" for non-PACKET devices)
-//! - PACKET (`0xA0`): ERR+ABRT on **both** device types — no command packet
-//!   set is implemented, so there is no CD-ROM and no media;
-//!   absent/slave → status 0; INTRQ follows nIEN like WRITE/IDENTIFY abort
+//! - PACKET (`0xA0`): on a configured packet device, the ATA/ATAPI-6 §8.21 /
+//!   §9.8 protocol — Features DMA/OVL rejection, Byte Count Limit from
+//!   Cylinder Low/High, a 12-byte command-packet DRQ phase with Interrupt
+//!   Reason C/D=1 I/O=0 and **no** INTRQ, a byte-count-limited data-in phase
+//!   with C/D=0 I/O=1 and one INTRQ per block, and completion with C/D=1
+//!   I/O=1. Three packet commands are implemented — `TEST UNIT READY`
+//!   (`00h`), `REQUEST SENSE` (`03h`) and `INQUIRY` (`12h`) — and every other
+//!   operation code is CHECK CONDITION with sense key ILLEGAL REQUEST. On an
+//!   ATA disk the command is still ERR+ABRT (§8.21.2 "use prohibited"). See
+//!   `docs/atapi-r4-packet-protocol.md`
+//! - DEVICE RESET (`0x08`): on a configured packet device, ATA/ATAPI-6 §8.7 —
+//!   Error `01h`, the §9.12 PACKET signature, Status `00h`, any command in
+//!   progress and any pending sense dropped, and **no INTRQ**; Device Control
+//!   and the Device register are untouched. On an ATA disk → ERR+ABRT
+//!   (§8.7.2 "use prohibited"). IDENTIFY PACKET DEVICE words 82 and 85 bit 9
+//!   now claim it. See `docs/atapi-r4-sense-and-device-reset.md`
 //! - SMART (`0xB0`): ATA master → ERR+ABRT (no SMART feature-set data);
 //!   absent/slave → status 0; INTRQ follows nIEN like PACKET/READ MULTIPLE abort
 //! - READ DMA (`0xC8`): ATA master → ERR+ABRT (no BM-DMA/PRD engine);
@@ -128,12 +141,20 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - The PACKET command itself, on either device type: no command packet set
-//!   is implemented (IDENTIFY PACKET DEVICE word 0 reports `1Fh` "unknown or
-//!   no device type"), so there is no packet PIO engine, no SFF-8020i / MMC
-//!   command set, no CD-ROM, no media, and no ISO boot
-//! - DEVICE RESET (`0x08`), which ATA/ATAPI-6 §6.8 makes mandatory for a real
-//!   PACKET device; IDENTIFY PACKET DEVICE word 82 bit 9 stays clear to say so
+//! - Every packet command except `TEST UNIT READY`, `REQUEST SENSE` and
+//!   `INQUIRY`. There is no
+//!   medium of any kind — no `READ (10)`, no `READ TOC`, no `READ CAPACITY`,
+//!   no tray, no medium-change notification, no ISO image path and no CD-ROM
+//!   boot. IDENTIFY PACKET DEVICE word 0 and INQUIRY byte 0 both report
+//!   peripheral device type `1Fh` "unknown or no device type" rather than
+//!   `05h` CD-ROM, because that is what this device is
+//! - Packet data-out (host → device) transfers; only data-in is implemented
+//! - PACKET with the Features DMA or OVL bit set (ERR+ABRT), overlap, command
+//!   queuing, SERVICE, and release interrupts
+//! - Unit Attention: a reset does not queue a `6h` UNIT ATTENTION sense
+//!   condition, it clears the sense data instead
+//! - Deferred errors, descriptor-format sense data, and every sense key other
+//!   than NO SENSE and ILLEGAL REQUEST
 //! - A packet device on Device 1 (slave); the packet configuration applies to
 //!   Device 0 of a channel
 //! - SMART feature set (thresholds, return data, enable/disable subcommands)
@@ -449,6 +470,138 @@ const IDENTIFY_PACKET_WORD_VALID: u16 = 0x4000;
 ///
 /// Spec: ATA/ATAPI-6 Table 29 words 82 and 85.
 const IDENTIFY_PACKET_FEATURE_SET: u16 = 1 << 4;
+/// IDENTIFY PACKET DEVICE words 82 / 85 bit9 — DEVICE RESET is supported.
+///
+/// Spec: ATA/ATAPI-6 Table 29 — word 82 bit 9 "The DEVICE RESET command is
+/// supported", word 85 bit 9 reports it enabled. Round 3 left this clear
+/// because `08h` was unimplemented; [`IdePrimary::exec_device_reset`] now
+/// implements it, so the claim is truthful.
+const IDENTIFY_PACKET_DEVICE_RESET: u16 = 1 << 9;
+
+/// DEVICE RESET (`08h`).
+///
+/// Spec: ATA/ATAPI-6 §8.7 — mandatory for devices implementing the PACKET
+/// Command feature set, "use prohibited" for devices that do not.
+pub const ATA_CMD_DEVICE_RESET: u8 = 0x08;
+
+/// Command packet length this device accepts, in bytes.
+///
+/// Spec: ATA/ATAPI-6 §8.16.9 — IDENTIFY PACKET DEVICE word 0 bits (1:0) select
+/// the command packet size; `00b` means a 12-byte packet. This device reports
+/// `00b`, so it accepts exactly 12 bytes and nothing else.
+pub const ATAPI_PACKET_BYTES: usize = 12;
+
+/// Interrupt Reason (Sector Count) bit0 — C/D.
+///
+/// Spec: ATA/ATAPI-6 §7.13 "Interrupt Reason register" — C/D set means the
+/// bytes transferred are a command packet (or, at completion, that the command
+/// is complete); cleared means user data.
+pub const ATAPI_IR_CD: u8 = 0x01;
+/// Interrupt Reason (Sector Count) bit1 — I/O.
+///
+/// Spec: ATA/ATAPI-6 §7.13 — set means the transfer is to the host
+/// (device → host), cleared means from the host.
+pub const ATAPI_IR_IO: u8 = 0x02;
+/// Interrupt Reason (Sector Count) bit2 — REL (release).
+///
+/// Spec: ATA/ATAPI-6 §7.13 — set when the device has released the bus before
+/// completing a command. This model never overlaps a command, so it is never
+/// set.
+pub const ATAPI_IR_REL: u8 = 0x04;
+/// The three Interrupt Reason bits occupy Sector Count bits 2:0.
+///
+/// Spec: ATA/ATAPI-6 §7.13. REL is never set by this model, so the assertion
+/// also documents that the value is defined rather than unused.
+const _: () = assert!(ATAPI_IR_CD | ATAPI_IR_IO | ATAPI_IR_REL == 0x07);
+
+/// PACKET Features register bit0 — DMA.
+///
+/// Spec: ATA/ATAPI-6 §8.21.4 — "DMA: If set to one, the data transfer ... shall
+/// be via DMA." There is no DMA engine here, so the command is aborted.
+pub const ATAPI_FEATURE_DMA: u8 = 0x01;
+/// PACKET Features register bit1 — OVL (overlap).
+///
+/// Spec: ATA/ATAPI-6 §8.21.4 — "OVL: If set to one, the command ... may be
+/// overlapped." Overlap is not implemented, so the command is aborted.
+pub const ATAPI_FEATURE_OVL: u8 = 0x02;
+
+/// Packet command `TEST UNIT READY`.
+///
+/// Spec: SFF-8020i §10.8.24 / MMC — checks whether the logical unit is ready.
+pub const ATAPI_CMD_TEST_UNIT_READY: u8 = 0x00;
+/// Packet command `REQUEST SENSE`.
+///
+/// Spec: SFF-8020i §10.8.16 / MMC — returns the sense data describing the
+/// CHECK CONDITION that preceded it.
+pub const ATAPI_CMD_REQUEST_SENSE: u8 = 0x03;
+/// Packet command `INQUIRY`.
+///
+/// Spec: SFF-8020i §10.8.4 / MMC — returns the standard INQUIRY data.
+pub const ATAPI_CMD_INQUIRY: u8 = 0x12;
+
+/// Sense key `0h` NO SENSE. Spec: SFF-8020i Table "Sense Key Definitions".
+pub const ATAPI_SENSE_NO_SENSE: u8 = 0x00;
+/// Sense key `5h` ILLEGAL REQUEST. Spec: SFF-8020i "Sense Key Definitions" —
+/// "an illegal parameter in the command packet".
+pub const ATAPI_SENSE_ILLEGAL_REQUEST: u8 = 0x05;
+/// Additional sense code `20h` INVALID COMMAND OPERATION CODE.
+///
+/// Spec: SFF-8020i "ASC and ASCQ Definitions".
+pub const ATAPI_ASC_INVALID_COMMAND_OPERATION_CODE: u8 = 0x20;
+/// Additional sense code `24h` INVALID FIELD IN COMMAND PACKET.
+///
+/// Spec: SFF-8020i "ASC and ASCQ Definitions".
+pub const ATAPI_ASC_INVALID_FIELD_IN_CDB: u8 = 0x24;
+
+/// Fixed-format sense data length this device returns, in bytes.
+///
+/// Spec: SFF-8020i §10.8.16 — the request sense data is 18 bytes: an 8-byte
+/// header plus the Additional Sense Length of 10 reported in byte 7.
+pub const ATAPI_SENSE_DATA_BYTES: usize = 18;
+/// Sense data byte 0 — response code `70h`, "current error", VALID cleared.
+///
+/// Spec: SFF-8020i §10.8.16 request sense data format. VALID (bit 7) stays
+/// clear because there is no valid information field to report.
+pub const ATAPI_SENSE_RESPONSE_CODE_CURRENT: u8 = 0x70;
+
+/// Standard INQUIRY data length this device returns, in bytes.
+///
+/// Spec: SFF-8020i §10.8.4 — 36 bytes with an Additional Length of 31.
+pub const ATAPI_INQUIRY_DATA_BYTES: usize = 36;
+/// INQUIRY byte 1 bit0 — EVPD (enable vital product data).
+///
+/// Spec: SFF-8020i §10.8.4. No VPD pages exist here, so a set EVPD is an
+/// invalid field.
+pub const ATAPI_INQUIRY_EVPD: u8 = 0x01;
+/// INQUIRY byte 3 — Response Data Format.
+///
+/// Spec: SFF-8020i §10.8.4 — the standard INQUIRY data layout this device
+/// returns is the one the standard defines, reported as `02h`.
+pub const ATAPI_INQUIRY_RESPONSE_DATA_FORMAT: u8 = 0x02;
+/// Peripheral device type `1Fh` — "unknown or no device type".
+///
+/// Spec: SCSI Primary Commands peripheral device type table, referenced by
+/// ATA/ATAPI-6 §8.16.9 for IDENTIFY PACKET DEVICE word 0 bits (12:8). This
+/// device has no medium and no medium-capable command packet set, so INQUIRY
+/// byte 0 reports the same `1Fh` the identify block does rather than claiming
+/// `05h` CD-ROM.
+pub const ATAPI_PERIPHERAL_DEVICE_TYPE_UNKNOWN: u8 = 0x1F;
+
+/// Where a PACKET command is in the ATA/ATAPI-6 §9.8 protocol.
+///
+/// Spec: ATA/ATAPI-6 §9.8 "PACKET command protocol" — a PACKET command runs
+/// through a command-packet transfer, an optional data transfer, and command
+/// completion. This model has no overlap or DMA, so there is no released or
+/// bus-master state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketPhase {
+    /// No PACKET command in progress.
+    Idle,
+    /// Awaiting the [`ATAPI_PACKET_BYTES`]-byte command packet from the host.
+    Command,
+    /// Presenting packet data to the host under DRQ.
+    DataIn,
+}
 
 const SECTOR_SIZE: usize = 512;
 const IDENTIFY_WORDS: usize = 256;
@@ -532,6 +685,32 @@ pub struct IdePrimary {
     /// Sectors remaining in the current READ/WRITE MULTIPLE DRQ block
     /// (including the sector currently under DRQ).
     block_left: u32,
+    /// Where a PACKET command is in the ATA/ATAPI-6 §9.8 protocol.
+    packet_phase: PacketPhase,
+    /// Command packet bytes received so far this PACKET command.
+    packet_cmd: [u8; ATAPI_PACKET_BYTES],
+    /// Bytes of [`Self::packet_cmd`] the host has written.
+    packet_off: usize,
+    /// Byte Count Limit latched from Cylinder Low/High when PACKET was written.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.21.4 — "the Byte Count Limit ... is the maximum
+    /// number of bytes that may be transferred in a single DRQ data block".
+    packet_byte_count_limit: u16,
+    /// Packet data still to present to the host (device → host only).
+    packet_data: Vec<u8>,
+    /// Read cursor into [`Self::packet_data`].
+    packet_data_off: usize,
+    /// End offset of the DRQ block currently under transfer.
+    packet_block_end: usize,
+    /// Sense key reported by the next REQUEST SENSE.
+    ///
+    /// Spec: SFF-8020i §10.8.16 — sense data describes the CHECK CONDITION
+    /// that preceded it and is cleared once reported.
+    sense_key: u8,
+    /// Additional sense code reported by the next REQUEST SENSE.
+    sense_asc: u8,
+    /// Additional sense code qualifier reported by the next REQUEST SENSE.
+    sense_ascq: u8,
 }
 
 impl Default for IdePrimary {
@@ -574,6 +753,16 @@ impl IdePrimary {
             multiple_count: 0,
             multiple_xfer: false,
             block_left: 0,
+            packet_phase: PacketPhase::Idle,
+            packet_cmd: [0; ATAPI_PACKET_BYTES],
+            packet_off: 0,
+            packet_byte_count_limit: 0,
+            packet_data: Vec::new(),
+            packet_data_off: 0,
+            packet_block_end: 0,
+            sense_key: ATAPI_SENSE_NO_SENSE,
+            sense_asc: 0,
+            sense_ascq: 0,
         }
     }
 
@@ -689,7 +878,41 @@ impl IdePrimary {
         self.multiple_count = 0;
         self.multiple_xfer = false;
         self.block_left = 0;
+        // Spec: ATA/ATAPI-6 §9.10 / §9.11 — a reset ends any PACKET command in
+        // progress, and §8.7.5 gives the same outcome for DEVICE RESET.
+        self.clear_packet_state();
+        self.clear_sense();
         self.status = if self.present { self.reset_status() } else { 0 };
+    }
+
+    /// Drop any PACKET command in progress.
+    fn clear_packet_state(&mut self) {
+        self.packet_phase = PacketPhase::Idle;
+        self.packet_cmd = [0; ATAPI_PACKET_BYTES];
+        self.packet_off = 0;
+        self.packet_byte_count_limit = 0;
+        self.packet_data.clear();
+        self.packet_data_off = 0;
+        self.packet_block_end = 0;
+    }
+
+    /// Reset the sense data to NO SENSE with no additional sense.
+    ///
+    /// Spec: SFF-8020i §10.8.16 — sense data is valid until it is reported, so
+    /// clearing it means "nothing to report".
+    fn clear_sense(&mut self) {
+        self.sense_key = ATAPI_SENSE_NO_SENSE;
+        self.sense_asc = 0;
+        self.sense_ascq = 0;
+    }
+
+    /// Sense key, additional sense code and qualifier a REQUEST SENSE would
+    /// report right now.
+    ///
+    /// Spec: SFF-8020i §10.8.16. Exposed so a host (or a test) can observe the
+    /// CHECK CONDITION reason without running the packet command.
+    pub fn atapi_sense(&self) -> (u8, u8, u8) {
+        (self.sense_key, self.sense_asc, self.sense_ascq)
     }
 
     /// True if this device owns the I/O port.
@@ -897,6 +1120,9 @@ impl IdePrimary {
         self.block_left = 0;
         self.sectors_left = 0;
         self.lba48_xfer = false;
+        // Spec: ATA/ATAPI-6 §9.8 — an aborted command ends the packet protocol
+        // wherever it was.
+        self.clear_packet_state();
         self.status = self.ready_status() | ATA_SR_ERR;
         // Spec: ATA — INTRQ on error completion when interrupts enabled.
         self.raise_irq();
@@ -950,7 +1176,7 @@ impl IdePrimary {
             let b = chunk.get(1).copied().unwrap_or(b' ');
             words[23 + i] = u16::from(a) << 8 | u16::from(b);
         }
-        let model = b"x86WASM ATAPI IDENTIFY-ONLY             ";
+        let model = b"x86WASM ATAPI PACKET MINIMAL            ";
         for (i, chunk) in model.chunks(2).take(20).enumerate() {
             let a = chunk.first().copied().unwrap_or(b' ');
             let b = chunk.get(1).copied().unwrap_or(b' ');
@@ -958,10 +1184,10 @@ impl IdePrimary {
         }
         words[49] = IDENTIFY_PACKET_WORD49_MANDATORY;
         words[50] = IDENTIFY_PACKET_WORD_VALID;
-        words[82] = IDENTIFY_PACKET_FEATURE_SET;
+        words[82] = IDENTIFY_PACKET_FEATURE_SET | IDENTIFY_PACKET_DEVICE_RESET;
         words[83] = IDENTIFY_PACKET_WORD_VALID;
         words[84] = IDENTIFY_PACKET_WORD_VALID;
-        words[85] = IDENTIFY_PACKET_FEATURE_SET;
+        words[85] = IDENTIFY_PACKET_FEATURE_SET | IDENTIFY_PACKET_DEVICE_RESET;
         words[87] = IDENTIFY_PACKET_WORD_VALID;
 
         for (i, w) in words.iter().enumerate() {
@@ -997,14 +1223,12 @@ impl IdePrimary {
         self.begin_pio_out();
     }
 
-    /// PACKET (`0xA0`) — **not implemented**, on either device type.
+    /// PACKET (`0xA0`) on a device that does **not** implement the PACKET
+    /// Command feature set.
     ///
-    /// Spec: ATA/ATAPI-6 §8.21 / §9.8 — PACKET starts a command-packet PIO
-    /// transfer and then whichever command packet set the device implements.
-    /// This tree implements no command packet set (IDENTIFY PACKET DEVICE word
-    /// 0 says so), so there is nothing to deliver a packet to and the command
-    /// is aborted with ERR+ABRT on an ATA disk and on a configured packet
-    /// device alike. INTRQ follows the usual nIEN rules.
+    /// Spec: ATA/ATAPI-6 §8.21.2 — "Use prohibited for devices not implementing
+    /// the PACKET Command feature set", so an ATA disk aborts with ERR+ABRT.
+    /// INTRQ follows the usual nIEN rules.
     fn exec_packet(&mut self) {
         if !self.present {
             self.status = 0;
@@ -1013,6 +1237,339 @@ impl IdePrimary {
             return;
         }
         self.abort_command(ATA_ER_ABRT);
+    }
+
+    /// PACKET (`0xA0`) on a configured packet device — enter the command-packet
+    /// transfer phase.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.21 PACKET and §9.8 "PACKET command protocol". The
+    /// device latches the Features register (§8.21.4 DMA and OVL) and the Byte
+    /// Count Limit from Cylinder Low / Cylinder High, then sets DRQ with the
+    /// Interrupt Reason register reporting C/D = 1, I/O = 0 and REL = 0 so the
+    /// host knows to write a command packet.
+    ///
+    /// **INTRQ is not asserted here.** IDENTIFY PACKET DEVICE word 0 bits (6:5)
+    /// report `00b`, "the device shall set DRQ to one within 3 ms of receiving
+    /// the PACKET command", not the `01b` "INTRQ DRQ" response; §9.8 asserts
+    /// INTRQ for the command-packet DRQ only in the interrupt-DRQ case.
+    ///
+    /// Model choices, both because §8.21.4 leaves the case indeterminate rather
+    /// than defining it: an odd Byte Count Limit is rounded **down** to even,
+    /// and a limit that is zero (or rounds to zero) aborts the command instead
+    /// of transferring an indeterminate amount.
+    fn exec_packet_on_packet_device(&mut self) {
+        // Spec: ATA/ATAPI-6 §8.21.4 — neither DMA nor overlap is implemented,
+        // and IDENTIFY PACKET DEVICE words 49 and 0 say so. Requesting either
+        // is a request for an unimplemented capability, so the command aborts.
+        if self.features & (ATAPI_FEATURE_DMA | ATAPI_FEATURE_OVL) != 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        let limit = ((u16::from(self.lba_hi) << 8) | u16::from(self.lba_mid)) & !1;
+        if limit == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        self.clear_packet_state();
+        self.packet_byte_count_limit = limit;
+        self.packet_phase = PacketPhase::Command;
+        self.transferring = false;
+        self.pio_in = false;
+        self.sector_buffer_write = false;
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = 0;
+        self.error = 0;
+        // Spec: ATA/ATAPI-6 §7.13 — C/D set, I/O clear: the host writes a
+        // command packet to the device.
+        self.sector_count = ATAPI_IR_CD;
+        self.status = self.ready_status() | ATA_SR_DRQ;
+        self.clear_irq();
+    }
+
+    /// Accept command-packet bytes written to the Data register.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.8 — the host transfers the command packet under
+    /// DRQ; the device clears DRQ and begins processing once the last byte of
+    /// the [`ATAPI_PACKET_BYTES`]-byte packet arrives.
+    fn write_packet_command(&mut self, size: u8, value: u32) {
+        if self.status & ATA_SR_DRQ == 0 {
+            return;
+        }
+        let nbytes = match size {
+            4 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        for i in 0..nbytes {
+            if self.packet_off < ATAPI_PACKET_BYTES {
+                self.packet_cmd[self.packet_off] = ((value >> (8 * i)) & 0xFF) as u8;
+                self.packet_off += 1;
+            }
+        }
+        if self.packet_off >= ATAPI_PACKET_BYTES {
+            self.execute_packet_command();
+        }
+    }
+
+    /// Dispatch the received command packet.
+    ///
+    /// Spec: SFF-8020i / MMC command packet set. Only `TEST UNIT READY` and
+    /// `INQUIRY` are implemented; every other operation code is an honest
+    /// CHECK CONDITION with sense key ILLEGAL REQUEST and additional sense
+    /// code `20h` INVALID COMMAND OPERATION CODE, so a host learns *why* the
+    /// command failed instead of seeing a bare ATA abort.
+    fn execute_packet_command(&mut self) {
+        self.packet_phase = PacketPhase::Idle;
+        match self.packet_cmd[0] {
+            ATAPI_CMD_TEST_UNIT_READY => self.exec_packet_test_unit_ready(),
+            ATAPI_CMD_REQUEST_SENSE => self.exec_packet_request_sense(),
+            ATAPI_CMD_INQUIRY => self.exec_packet_inquiry(),
+            _ => self.complete_packet_check_condition(
+                ATAPI_SENSE_ILLEGAL_REQUEST,
+                ATAPI_ASC_INVALID_COMMAND_OPERATION_CODE,
+                0,
+            ),
+        }
+    }
+
+    /// `TEST UNIT READY` — a non-data packet command.
+    ///
+    /// Spec: SFF-8020i §10.8.24 — "provides a means to check if the logical
+    /// unit is ready", returning GOOD status when it is and CHECK CONDITION
+    /// when it is not.
+    ///
+    /// **This device reports GOOD.** It has no medium model at all — no tray,
+    /// no disc, no capacity, no medium-change notification — so reporting
+    /// NOT READY / `3Ah` MEDIUM NOT PRESENT would assert a medium state it
+    /// cannot have, which is the same kind of claim the `1Fh` peripheral
+    /// device type exists to avoid. The logical unit is ready in the only sense
+    /// this device implements: it accepts the packet commands it advertises.
+    /// When a medium model lands, this command gains the NOT READY path.
+    fn exec_packet_test_unit_ready(&mut self) {
+        self.complete_packet_good();
+    }
+
+    /// The fixed-format sense data describing the last CHECK CONDITION.
+    ///
+    /// Spec: SFF-8020i §10.8.16 request sense data format. Only the fields this
+    /// device can fill truthfully are non-zero: there is no information field
+    /// (so VALID stays clear), no command-specific information, no field
+    /// replaceable unit code and no sense-key specific data.
+    ///
+    /// | Byte | Value |
+    /// |---|---|
+    /// | 0 | `70h` — current error, VALID clear |
+    /// | 2 | sense key in bits (3:0); FILEMARK / EOM / ILI clear |
+    /// | 7 | additional sense length `0Ah`, giving 18 bytes total |
+    /// | 12 | additional sense code |
+    /// | 13 | additional sense code qualifier |
+    fn sense_data(&self) -> [u8; ATAPI_SENSE_DATA_BYTES] {
+        let mut data = [0u8; ATAPI_SENSE_DATA_BYTES];
+        data[0] = ATAPI_SENSE_RESPONSE_CODE_CURRENT;
+        data[2] = self.sense_key & 0x0F;
+        data[7] = (ATAPI_SENSE_DATA_BYTES - 8) as u8;
+        data[12] = self.sense_asc;
+        data[13] = self.sense_ascq;
+        data
+    }
+
+    /// `REQUEST SENSE` — report and then clear the sense data.
+    ///
+    /// Spec: SFF-8020i §10.8.16 — the sense data stays valid until it is
+    /// reported, which is what makes the CHECK CONDITION → REQUEST SENSE cycle
+    /// work: a host that sees ERR issues this command and learns the reason.
+    /// An allocation length of zero reports nothing, so it clears nothing.
+    fn exec_packet_request_sense(&mut self) {
+        let allocation = usize::from(self.packet_cmd[4]);
+        let data = self.sense_data();
+        if data.len().min(allocation) > 0 {
+            self.clear_sense();
+        }
+        self.begin_packet_data_in(&data, allocation);
+    }
+
+    /// DEVICE RESET (`0x08`).
+    ///
+    /// Spec: ATA/ATAPI-6 §8.7 — mandatory for a device implementing the PACKET
+    /// Command feature set and "use prohibited" (§8.7.2) without it, so an ATA
+    /// disk aborts with ERR+ABRT. §8.7.5 normal outputs put the diagnostic code
+    /// in the Error register and the §9.12 signature in the Command Block
+    /// registers, and the command **shall not** assert INTRQ — unlike EXECUTE
+    /// DEVICE DIAGNOSTIC, which does.
+    ///
+    /// This is a device reset, not a software reset: the Device Control
+    /// register (nIEN, HOB) and the Device register are left as the host
+    /// programmed them. Everything belonging to a command in progress — the
+    /// packet protocol state, the PIO transfer, and the pending sense data — is
+    /// dropped, because there is no longer a command to report on.
+    fn exec_device_reset(&mut self) {
+        if !self.present {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        if !self.packet_device {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        self.clear_packet_state();
+        self.clear_sense();
+        self.transferring = false;
+        self.pio_in = false;
+        self.sector_buffer_write = false;
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = 0;
+        self.lba48_xfer = false;
+        self.error = ATA_DIAG_PASSED;
+        self.write_device_signature();
+        self.status = self.reset_status();
+        self.clear_irq();
+    }
+
+    /// `INQUIRY` — standard INQUIRY data as a packet data-in transfer.
+    ///
+    /// Spec: SFF-8020i §10.8.4 — byte 1 bit 0 is EVPD and byte 2 is the page
+    /// code; byte 4 is the allocation length. No vital product data pages are
+    /// implemented, so EVPD set or a non-zero page code is CHECK CONDITION with
+    /// `24h` INVALID FIELD IN COMMAND PACKET rather than a wrong answer.
+    fn exec_packet_inquiry(&mut self) {
+        if self.packet_cmd[1] & ATAPI_INQUIRY_EVPD != 0 || self.packet_cmd[2] != 0 {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_ILLEGAL_REQUEST,
+                ATAPI_ASC_INVALID_FIELD_IN_CDB,
+                0,
+            );
+            return;
+        }
+        let allocation = usize::from(self.packet_cmd[4]);
+        let data = Self::inquiry_data();
+        self.begin_packet_data_in(&data, allocation);
+    }
+
+    /// The standard INQUIRY data this device returns.
+    ///
+    /// Spec: SFF-8020i §10.8.4 standard INQUIRY data.
+    ///
+    /// | Byte | Value | Reason |
+    /// |---|---|---|
+    /// | 0 | `1Fh` | qualifier `000b` (device connected) + peripheral device type "unknown or no device type" — the same value IDENTIFY PACKET DEVICE word 0 reports |
+    /// | 1 | `00h` | RMB clear: not removable, matching identify word 0 bit 7 |
+    /// | 2 | `00h` | no ANSI version claimed, because this is not a conforming ATAPI CD-ROM |
+    /// | 3 | `02h` | the data below is the standard-defined layout |
+    /// | 4 | `1Fh` | additional length: 36 − 5 |
+    /// | 8:15 | `"x86WASM "` | vendor identification |
+    /// | 16:31 | `"ATAPI PACKET MIN"` | product identification, saying what this is |
+    /// | 32:35 | `"0001"` | product revision level |
+    fn inquiry_data() -> [u8; ATAPI_INQUIRY_DATA_BYTES] {
+        let mut data = [0u8; ATAPI_INQUIRY_DATA_BYTES];
+        data[0] = ATAPI_PERIPHERAL_DEVICE_TYPE_UNKNOWN;
+        data[3] = ATAPI_INQUIRY_RESPONSE_DATA_FORMAT;
+        data[4] = (ATAPI_INQUIRY_DATA_BYTES - 5) as u8;
+        data[8..16].copy_from_slice(b"x86WASM ");
+        data[16..32].copy_from_slice(b"ATAPI PACKET MIN");
+        data[32..36].copy_from_slice(b"0001");
+        data
+    }
+
+    /// Start a device-to-host packet data transfer, truncated to the command's
+    /// allocation length.
+    ///
+    /// Spec: SFF-8020i — a packet command transfers no more than its allocation
+    /// length. An allocation length of zero is not an error: nothing is
+    /// transferred and the command completes.
+    fn begin_packet_data_in(&mut self, data: &[u8], allocation_length: usize) {
+        let len = data.len().min(allocation_length);
+        if len == 0 {
+            self.complete_packet_good();
+            return;
+        }
+        self.packet_data = data[..len].to_vec();
+        self.packet_data_off = 0;
+        self.begin_packet_data_block();
+    }
+
+    /// Present the next DRQ block of packet data.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.21.4 / §9.8 — a block is at most the Byte Count
+    /// Limit; the device reports the actual byte count in Cylinder Low / High,
+    /// sets the Interrupt Reason to C/D = 0, I/O = 1 (data to the host), sets
+    /// DRQ, and asserts INTRQ.
+    fn begin_packet_data_block(&mut self) {
+        let remaining = self.packet_data.len() - self.packet_data_off;
+        let block = remaining.min(usize::from(self.packet_byte_count_limit));
+        self.packet_block_end = self.packet_data_off + block;
+        self.lba_mid = (block & 0xFF) as u8;
+        self.lba_hi = ((block >> 8) & 0xFF) as u8;
+        self.sector_count = ATAPI_IR_IO;
+        self.packet_phase = PacketPhase::DataIn;
+        self.error = 0;
+        self.status = self.ready_status() | ATA_SR_DRQ;
+        self.raise_irq();
+    }
+
+    /// Data register read during a packet data-in phase.
+    ///
+    /// Bytes past the end of the current block read as zero: a Byte Count Limit
+    /// or allocation length that is odd leaves half of the last 16-bit Data
+    /// register cycle undefined, and this model pads rather than over-reading.
+    fn read_packet_data(&mut self, size: u8) -> u32 {
+        if self.status & ATA_SR_DRQ == 0 {
+            return 0xFFFF_FFFF;
+        }
+        let nbytes = match size {
+            4 => 4,
+            2 => 2,
+            _ => 1,
+        };
+        let mut val = 0u32;
+        for i in 0..nbytes {
+            if self.packet_data_off < self.packet_block_end {
+                val |= u32::from(self.packet_data[self.packet_data_off]) << (8 * i);
+                self.packet_data_off += 1;
+            }
+        }
+        if self.packet_data_off >= self.packet_block_end {
+            if self.packet_data_off >= self.packet_data.len() {
+                self.complete_packet_good();
+            } else {
+                self.begin_packet_data_block();
+            }
+        }
+        val
+    }
+
+    /// Command completion with GOOD status.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.8 — at command completion the device clears BSY and
+    /// DRQ, sets the Interrupt Reason to C/D = 1 and I/O = 1, and asserts
+    /// INTRQ. §8.21.5 sets DRDY.
+    fn complete_packet_good(&mut self) {
+        self.clear_packet_state();
+        self.error = 0;
+        self.sector_count = ATAPI_IR_CD | ATAPI_IR_IO;
+        self.status = self.ready_status();
+        self.raise_irq();
+    }
+
+    /// Command completion with CHECK CONDITION.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.21.6 — the Error register on a PACKET device holds
+    /// the Sense Key in bits (7:4); bit 2 is ABRT, set here because the command
+    /// was aborted for an invalid operation code or command-packet field.
+    /// Status reports ERR, which is how a host knows to issue REQUEST SENSE.
+    fn complete_packet_check_condition(&mut self, sense_key: u8, asc: u8, ascq: u8) {
+        self.clear_packet_state();
+        self.sense_key = sense_key & 0x0F;
+        self.sense_asc = asc;
+        self.sense_ascq = ascq;
+        self.error = (self.sense_key << 4) | ATA_ER_ABRT;
+        self.sector_count = ATAPI_IR_CD | ATAPI_IR_IO;
+        self.status = self.ready_status() | ATA_SR_ERR;
+        self.raise_irq();
     }
 
     /// IDENTIFY DEVICE (`0xEC`) on a configured packet device.
@@ -1040,9 +1597,7 @@ impl IdePrimary {
 
     /// Dispatch a Command register write on a configured packet device.
     ///
-    /// This device implements the PACKET Command feature set only far enough
-    /// to be *detected*. Four commands do something; everything else, PACKET
-    /// (`0xA0`) and DEVICE RESET (`0x08`) included, is aborted with ERR+ABRT,
+    /// Six commands do something; everything else is aborted with ERR+ABRT,
     /// which is the ATA/ATAPI-6 §8.x response for an unimplemented command.
     fn exec_packet_device_command(&mut self, cmd: u8) {
         if !self.present {
@@ -1056,6 +1611,8 @@ impl IdePrimary {
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_IDENTIFY => self.exec_identify_on_packet_device(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors_on_packet_device(),
+            ATA_CMD_PACKET => self.exec_packet_on_packet_device(),
+            ATA_CMD_DEVICE_RESET => self.exec_device_reset(),
             ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
             _ => self.abort_command(ATA_ER_ABRT),
         }
@@ -1982,6 +2539,9 @@ impl IdePrimary {
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
             ATA_CMD_PACKET => self.exec_packet(),
+            // Spec: ATA/ATAPI-6 §8.7.2 — "use prohibited" without the PACKET
+            // Command feature set.
+            ATA_CMD_DEVICE_RESET => self.exec_device_reset(),
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
@@ -2037,6 +2597,11 @@ impl IdePrimary {
         if self.is_slave_selected() {
             return 0xFFFF_FFFF;
         }
+        // Spec: ATA/ATAPI-6 §9.8 — a packet data-in phase uses the same Data
+        // register but a variable byte count, not the 512-byte sector engine.
+        if self.packet_phase == PacketPhase::DataIn {
+            return self.read_packet_data(size);
+        }
         if !self.transferring || self.pio_in || self.status & ATA_SR_DRQ == 0 {
             return 0xFFFF_FFFF;
         }
@@ -2061,6 +2626,12 @@ impl IdePrimary {
     fn write_data(&mut self, size: u8, value: u32) {
         // See `read_data`: Data port cycles for the absent Device 1 are ignored.
         if self.is_slave_selected() {
+            return;
+        }
+        // Spec: ATA/ATAPI-6 §9.8 — the command packet arrives through the Data
+        // register while the Interrupt Reason reports C/D = 1, I/O = 0.
+        if self.packet_phase == PacketPhase::Command {
+            self.write_packet_command(size, value);
             return;
         }
         if !self.transferring || !self.pio_in || self.status & ATA_SR_DRQ == 0 {
@@ -5055,13 +5626,13 @@ mod atapi_detection_tests {
         assert_eq!(identify_word(&pio, 63), 0x0000, "no multiword DMA");
         assert_eq!(identify_word(&pio, 88), 0x0000, "no Ultra DMA");
         // Word 82 bit4 "shall be set to one indicating the PACKET Command
-        // feature set is supported"; bit9 stays clear because DEVICE RESET is
-        // not implemented.
-        assert_eq!(identify_word(&pio, 82), 1 << 4);
-        assert_eq!(identify_word(&pio, 82) & (1 << 9), 0);
+        // feature set is supported"; bit9 is now set too, because round 4
+        // slice 2 implemented DEVICE RESET. Round 3 asserted bit9 clear, which
+        // was truthful then and is a retired model now.
+        assert_eq!(identify_word(&pio, 82), (1 << 4) | (1 << 9));
         assert_eq!(identify_word(&pio, 83), 0x4000);
         assert_eq!(identify_word(&pio, 84), 0x4000);
-        assert_eq!(identify_word(&pio, 85), 1 << 4);
+        assert_eq!(identify_word(&pio, 85), (1 << 4) | (1 << 9));
         assert_eq!(identify_word(&pio, 87), 0x4000);
         // Serial number is optional and "shall be zeros" when not implemented.
         assert!((10..20).all(|w| identify_word(&pio, w) == 0));
@@ -5072,7 +5643,7 @@ mod atapi_detection_tests {
                 [(word >> 8) as u8, (word & 0xFF) as u8]
             })
             .collect();
-        assert_eq!(&model[..27], b"x86WASM ATAPI IDENTIFY-ONLY");
+        assert_eq!(&model[..28], b"x86WASM ATAPI PACKET MINIMAL");
 
         // Completion: DRQ cleared, DRDY set, no error (§8.16.5).
         let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
@@ -5096,28 +5667,35 @@ mod atapi_detection_tests {
         assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
     }
 
-    /// PACKET itself is still refused: this device implements no command
-    /// packet set, and says so in IDENTIFY PACKET DEVICE word 0.
+    /// PACKET is no longer refused: round 4 slice 1 implemented the
+    /// ATA/ATAPI-6 §8.21 / §9.8 protocol, so the command now enters the
+    /// command-packet DRQ phase instead of aborting. Round 3's assertion that
+    /// it aborts encoded a model this tree has retired; the protocol itself is
+    /// covered by `tests/atapi_packet_protocol.rs`.
     #[test]
-    fn packet_is_still_aborted_on_a_configured_packet_device() {
+    fn packet_now_enters_the_command_packet_phase() {
         let mut ide = IdePrimary::with_atapi_device();
         clear_nien(&mut ide);
         select_device0(&mut ide);
+        // Byte Count Limit; the reset signature already supplies a large one,
+        // but a host normally programs it (§8.21.4).
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0x00);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0x02);
         command(&mut ide, ATA_CMD_PACKET);
 
         let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
-        assert_ne!(status & ATA_SR_ERR, 0);
-        assert_eq!(status & ATA_SR_DRQ, 0, "no command packet is accepted");
-        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        assert_eq!(status & ATA_SR_ERR, 0);
+        assert_ne!(status & ATA_SR_DRQ, 0, "the command packet is accepted");
+        // Spec: §7.13 — C/D set, I/O clear: host writes a command packet.
+        assert_eq!(ide.port_read(IDE_PRIMARY_SECCOUNT, 1) as u8, ATAPI_IR_CD);
     }
 
-    /// Everything outside the four detection commands is aborted, including
-    /// the ATA commands that succeed on a disk here.
+    /// Everything outside the six implemented commands is aborted, including
+    /// the ATA commands that succeed on a disk here. DEVICE RESET (`08h`) left
+    /// this list in round 4 slice 2, which implemented it.
     #[test]
     fn non_detection_commands_are_aborted_on_a_packet_device() {
         for cmd in [
-            ATA_CMD_PACKET,
-            0x08, // DEVICE RESET — mandatory for real ATAPI, absent here
             ATA_CMD_SET_FEATURES,
             ATA_CMD_NOP,
             ATA_CMD_READ_MULTIPLE,
