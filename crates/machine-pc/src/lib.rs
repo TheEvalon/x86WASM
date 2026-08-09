@@ -14,6 +14,7 @@ mod mem;
 mod ports;
 mod post_code;
 mod post_probe;
+mod post_spin;
 mod post_trace;
 mod step_clock;
 
@@ -33,6 +34,10 @@ pub use post_probe::{
     seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
     TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV,
     SEABIOS_IMAGE_RELATIVE,
+};
+pub use post_spin::{
+    PostPcSite, PostSpinConfig, PostSpinCycle, PostSpinSummary, DEFAULT_POST_SPIN_HOT,
+    DEFAULT_POST_SPIN_MAX_PERIOD, DEFAULT_POST_SPIN_WINDOW,
 };
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use step_clock::{

@@ -20,6 +20,7 @@ use x86_decode::DecodeError;
 use x86_interpreter::ExecError;
 
 use crate::ports::{UnclaimedPortAccess, UnmappedMmioAccess};
+use crate::post_spin::{PostPcSite, PostSpinConfig, PostSpinSampler, PostSpinSummary};
 use crate::post_trace::{PostTrace, PostTraceConfig};
 use crate::step_clock::StepClock;
 use crate::{Machine, MachineError};
@@ -287,6 +288,18 @@ pub struct PostReport {
     /// Instructions that retired before the stop.
     pub steps: u64,
     pub stop: PostStopReason,
+    /// Where the CPU was when the probe stopped: the architectural `CS:EIP`,
+    /// i.e. the instruction that would execute next.
+    ///
+    /// For [`PostStopReason::Failure`] this repeats the failure's own site; for
+    /// the other two it is the only location the report carries, and the reason
+    /// this field exists — a step-budget stop used to name no address at all.
+    /// After [`PostStopReason::Halted`] it is the instruction **after** the
+    /// `HLT`, because that is where an interrupt would resume; the `HLT` itself
+    /// is the last entry in [`Self::spin`]'s cycle.
+    pub stop_site: PostPcSite,
+    /// What the trailing instructions were doing, when a sampler was armed.
+    pub spin: Option<PostSpinSummary>,
     /// Ports no device claimed, in first-touch order.
     pub unclaimed_ports: Vec<UnclaimedPortAccess>,
     /// More distinct unclaimed ports existed than the bounded log holds.
@@ -319,6 +332,15 @@ impl PostReport {
 impl fmt::Display for PostReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "post-probe: steps={} stop={}", self.steps, self.stop)?;
+        // The header line is byte-identical to what it has always been, and a
+        // failure stop already names its site in that line — so the location
+        // block is emitted only for the two stops that reported nothing.
+        if self.failure().is_none() {
+            writeln!(f, "  stop-pc        {}", self.stop_site)?;
+            if let Some(spin) = &self.spin {
+                writeln!(f, "{spin}")?;
+            }
+        }
         for access in &self.unclaimed_ports {
             writeln!(
                 f,
@@ -424,14 +446,34 @@ impl Machine {
         max_steps: u64,
         trace: Option<PostTraceConfig>,
     ) -> TracedPostReport {
-        let report = self.run_post_probe(max_steps, trace);
+        self.probe_post_options(max_steps, trace, Some(PostSpinConfig::default()))
+    }
+
+    /// [`Self::probe_post_traced`] with the trailing-PC sampler under caller
+    /// control.
+    ///
+    /// `spin` `None` (or a zero window) records no program counters and omits
+    /// the spin block from the report; the stop program counter is reported
+    /// either way, because it costs nothing.
+    pub fn probe_post_options(
+        &mut self,
+        max_steps: u64,
+        trace: Option<PostTraceConfig>,
+        spin: Option<PostSpinConfig>,
+    ) -> TracedPostReport {
+        let report = self.run_post_probe(max_steps, trace, spin);
         TracedPostReport {
             report,
             trace: self.ports.take_trace(),
         }
     }
 
-    fn run_post_probe(&mut self, max_steps: u64, trace: Option<PostTraceConfig>) -> PostReport {
+    fn run_post_probe(
+        &mut self,
+        max_steps: u64,
+        trace: Option<PostTraceConfig>,
+        spin: Option<PostSpinConfig>,
+    ) -> PostReport {
         self.ports.clear_diagnostics();
         self.ports.set_trace(trace);
         self.post_diag.reset();
@@ -440,6 +482,7 @@ impl Machine {
         if !host_clock.enabled {
             self.set_step_clock(StepClock::enabled_default());
         }
+        let mut sampler = spin.and_then(PostSpinSampler::new);
 
         let mut steps = 0u64;
         let stop = loop {
@@ -448,6 +491,9 @@ impl Machine {
             }
             if steps >= max_steps {
                 break PostStopReason::StepBudgetExhausted;
+            }
+            if let Some(sampler) = sampler.as_mut() {
+                sampler.record(PostPcSite::from_cpu(&self.cpu));
             }
             match self.step() {
                 Ok(()) => steps += 1,
@@ -462,6 +508,8 @@ impl Machine {
         PostReport {
             steps,
             stop,
+            stop_site: PostPcSite::from_cpu(&self.cpu),
+            spin: sampler.as_ref().and_then(PostSpinSampler::summarize),
             unclaimed_ports: self.ports.unclaimed_ports().to_vec(),
             unclaimed_port_overflow: self.ports.unclaimed_port_overflow(),
             unmapped_mmio: self.ports.unmapped_mmio().to_vec(),
