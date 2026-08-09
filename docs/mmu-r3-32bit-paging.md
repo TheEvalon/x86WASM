@@ -50,7 +50,11 @@ PagingContext { cr0, cr3, cr4, profile: PagingProfile }
 
 // A pure structural walk: no permission check, no accessed/dirty write.
 walk(&PagingContext, &mut impl PageTableMemory, linear: u32)
-    -> Result<Walk, TranslateError>
+    -> Result<Walk, WalkError>
+
+// Walk plus the §4.6 access-rights check. What an interpreter calls.
+translate(&PagingContext, &mut impl PageTableMemory, linear: u32, Access)
+    -> Result<Translation, TranslateError>
 ```
 
 `TranslateError` separates the two failure kinds that must never be confused:
@@ -90,6 +94,63 @@ of them when the PSE-36 mechanism is in use (§4.3).
     note), so such an entry reports a not-present fault.
 * `PS` (PDE bit 7) is ignored when `CR4.PSE = 0`, so the entry references a page
   table (Table 4-5).
+
+## Access rights (§4.6.1)
+
+Rights combine over every entry the translation used: the address is a
+user-mode address only if `U/S = 1` in **both** the PDE and the PTE, and the
+translation is writable only if `R/W = 1` in both. §4.10.2.2 describes a TLB
+entry as holding exactly those two logical-ANDs, which is why `Translation`
+reports them.
+
+What 32-bit paging without SMEP, SMAP, protection keys or execute-disable
+reduces to:
+
+| Access | Supervisor (CPL < 3) | User (CPL = 3) |
+|---|---|---|
+| Data read | always permitted | requires a user-mode address |
+| Instruction fetch | always permitted | requires a user-mode address |
+| Data write | `CR0.WP = 0`: permitted. `CR0.WP = 1`: requires combined `R/W = 1` | requires a user-mode address **and** combined `R/W = 1` |
+
+The supervisor write row is the one worth stating twice: with `CR0.WP = 1` a
+supervisor write is denied to a read-only page whether that page is a
+supervisor-mode or a **user-mode** address. That is the case `CR0.WP` exists
+for, and §4.6.1 spells it out under both "Data writes to supervisor-mode
+addresses" and "Data writes to user-mode addresses".
+
+Supervisor reads are unconditionally permitted here only because SMAP is not
+modeled. §4.6.1 makes the implicit-versus-explicit supervisor-access
+distinction solely to describe SMAP with `EFLAGS.AC`, so `AccessMode` does not
+carry it; a future SMAP slice must add it.
+
+## Page-fault error code (§4.7)
+
+`PageFault::error_code()` composes the code from the fault reason and the
+access, never from the access rights:
+
+| Bit | Name | Set when |
+|---|---|---|
+| 0 | P | the fault was **not** a not-present fault — that is, for a protection violation or a reserved-bit violation |
+| 1 | W/R | the causing access was a write |
+| 2 | U/S | a user-mode access caused the fault |
+| 3 | RSVD | a reserved bit was set in one of the entries used |
+| 4 | I/D | never; see below |
+| 5 | PK | never — no protection keys |
+| 15 | SGX | never — no SGX |
+
+Two traps this gets right on purpose:
+
+* **RSVD implies P.** Reserved bits are not checked in an entry whose `P` flag
+  is 0, so bit 3 can be set only if bit 0 is (§4.7). The reserved-bit checks in
+  the walker are therefore guarded on `present()`.
+* **I/D is not "this was a fetch".** §4.7 sets bit 4 only if the access was an
+  instruction fetch *and* either `CR4.SMEP = 1` or (`CR4.PAE = 1` and
+  `IA32_EFER.NXE = 1`). With 32-bit paging and no SMEP, none of those hold, so a
+  faulting instruction fetch here produces a code with bit 4 **clear**. Setting
+  it would be the more "obvious" behavior and would be wrong.
+
+`PageFault::cr2()` returns the faulting linear address verbatim, offset
+included.
 
 ## Processor-model profile
 

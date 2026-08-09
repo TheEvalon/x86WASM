@@ -10,8 +10,8 @@ mod common;
 use common::PageTables;
 use x86_mmu::paging::entry::{ENTRY_A, ENTRY_P, ENTRY_RW, ENTRY_US, PDE_PS, PTE_PAT};
 use x86_mmu::paging::{
-    walk, FaultReason, PageSize, PagingContext, PagingLevel, TranslateError, UnsupportedPaging,
-    CR0_PG, CR4_PAE, CR4_PSE,
+    walk, FaultReason, PageSize, PagingContext, PagingLevel, UnsupportedPaging, WalkError, CR0_PG,
+    CR4_PAE, CR4_PSE,
 };
 
 fn ctx(tables: &PageTables, cr4: u64) -> PagingContext {
@@ -84,13 +84,10 @@ fn absent_pde_faults_at_the_directory_level() {
 
     let ctx = ctx(&tables, 0);
     let err = walk(&ctx, &mut tables.mem, linear).expect_err("no PDE installed");
-    let fault = err.as_fault().expect("architectural fault");
     assert_eq!(
-        fault.reason,
+        err.as_fault_reason().expect("architectural fault"),
         FaultReason::NotPresent(PagingLevel::PageDirectory)
     );
-    assert_eq!(fault.linear_address, linear);
-    assert_eq!(fault.cr2(), u64::from(linear));
 }
 
 /// SDM §4.3 / §4.7: a PTE with P = 0 yields no translation, and the walk
@@ -104,7 +101,7 @@ fn absent_pte_faults_at_the_table_level() {
     let ctx = ctx(&tables, 0);
     let err = walk(&ctx, &mut tables.mem, linear).expect_err("no PTE installed");
     assert_eq!(
-        err.as_fault().unwrap().reason,
+        err.as_fault_reason().unwrap(),
         FaultReason::NotPresent(PagingLevel::PageTable)
     );
 }
@@ -122,7 +119,7 @@ fn reserved_bits_are_not_checked_in_an_absent_entry() {
     let ctx = ctx(&tables, CR4_PSE);
     let err = walk(&ctx, &mut tables.mem, linear).expect_err("absent PTE");
     assert_eq!(
-        err.as_fault().unwrap().reason,
+        err.as_fault_reason().unwrap(),
         FaultReason::NotPresent(PagingLevel::PageTable)
     );
 }
@@ -139,7 +136,7 @@ fn pte_bit7_is_reserved_only_when_cr4_pse_is_set() {
     let with_pse = ctx(&tables, CR4_PSE);
     let err = walk(&with_pse, &mut tables.mem, linear).expect_err("reserved bit");
     assert_eq!(
-        err.as_fault().unwrap().reason,
+        err.as_fault_reason().unwrap(),
         FaultReason::ReservedBit(PagingLevel::PageTable)
     );
 
@@ -160,7 +157,7 @@ fn reserved_bits_in_a_large_pde_fault_at_the_directory_level() {
     let ctx = ctx(&tables, CR4_PSE);
     let err = walk(&ctx, &mut tables.mem, linear).expect_err("reserved bit");
     assert_eq!(
-        err.as_fault().unwrap().reason,
+        err.as_fault_reason().unwrap(),
         FaultReason::ReservedBit(PagingLevel::PageDirectory)
     );
 }
@@ -193,11 +190,8 @@ fn large_page_is_reported_unsupported_for_now() {
 
     let ctx = ctx(&tables, CR4_PSE);
     let err = walk(&ctx, &mut tables.mem, linear).expect_err("4-MiB pages not implemented yet");
-    assert_eq!(
-        err,
-        TranslateError::Unsupported(UnsupportedPaging::LargePage)
-    );
-    assert!(err.as_fault().is_none());
+    assert_eq!(err, WalkError::Unsupported(UnsupportedPaging::LargePage));
+    assert!(err.as_fault_reason().is_none());
 }
 
 /// SDM §4.1.1: with CR0.PG = 0 there is nothing to translate, and with
@@ -212,17 +206,13 @@ fn modes_outside_32bit_paging_are_reported_not_guessed() {
     let disabled = PagingContext::new(0, tables.pd_base, 0);
     assert_eq!(
         walk(&disabled, &mut tables.mem, linear),
-        Err(TranslateError::Unsupported(
-            UnsupportedPaging::PagingDisabled
-        ))
+        Err(WalkError::Unsupported(UnsupportedPaging::PagingDisabled))
     );
 
     let pae = PagingContext::new(CR0_PG, tables.pd_base, CR4_PAE);
     assert_eq!(
         walk(&pae, &mut tables.mem, linear),
-        Err(TranslateError::Unsupported(
-            UnsupportedPaging::PaeOrLongMode
-        ))
+        Err(WalkError::Unsupported(UnsupportedPaging::PaeOrLongMode))
     );
 }
 

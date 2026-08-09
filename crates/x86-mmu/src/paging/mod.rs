@@ -242,25 +242,112 @@ pub enum PagingLevel {
 /// Why a linear address has no usable translation, or why an existing
 /// translation refused the access.
 ///
-/// Spec: SDM §4.7 — "there is no translation for a linear address if the
-/// translation process for that address would use a paging-structure entry in
-/// which the P flag (bit 0) is 0 or one that sets a reserved bit".
+/// Spec: SDM §4.7 — an access "may cause a page-fault exception for either of
+/// two reasons: (1) there is no translation for the linear address; or (2)
+/// there is a translation for the linear address, but its access rights do not
+/// permit the access". There is no translation if the process "would use a
+/// paging-structure entry in which the P flag (bit 0) is 0 or one that sets a
+/// reserved bit".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultReason {
     /// The P flag was 0 in the entry at this level.
     NotPresent(PagingLevel),
     /// The entry at this level set a reserved bit.
     ReservedBit(PagingLevel),
+    /// The translation exists but its access rights do not permit the access
+    /// (§4.6.1).
+    Protection,
 }
 
-/// A structured page fault. Delivery — vector 14, the error code, and `CR2` —
-/// is the interpreter's job; this engine only reports.
+/// What kind of access is being attempted.
+///
+/// Spec: SDM §4.6.1 and the §4.7 error-code definitions, which describe the
+/// access rather than the access rights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessKind {
+    /// A data read.
+    Read,
+    /// A data write.
+    Write,
+    /// An instruction fetch.
+    InstructionFetch,
+}
+
+/// Whether the access is a supervisor-mode or user-mode access.
+///
+/// Spec: SDM §4.6.1 — "accesses made while CPL < 3 are supervisor-mode
+/// accesses, while accesses made while CPL = 3 are user-mode accesses".
+///
+/// The SDM further splits supervisor-mode accesses into *implicit* (accesses to
+/// the GDT/LDT/IDT/TSS) and *explicit* ones. That distinction only ever
+/// modifies `CR4.SMAP` behavior, and SMAP is not modeled here, so this engine
+/// does not carry it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessMode {
+    /// CPL < 3, or an implicit access to a system data structure.
+    Supervisor,
+    /// CPL = 3.
+    User,
+}
+
+/// The access an interpreter is asking permission for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Access {
+    pub kind: AccessKind,
+    pub mode: AccessMode,
+}
+
+impl Access {
+    pub fn new(kind: AccessKind, mode: AccessMode) -> Self {
+        Self { kind, mode }
+    }
+
+    /// Build an access from the current privilege level (SDM §4.6.1: CPL = 3 is
+    /// a user-mode access, CPL < 3 a supervisor-mode one).
+    pub fn from_cpl(kind: AccessKind, cpl: u8) -> Self {
+        let mode = if cpl == 3 {
+            AccessMode::User
+        } else {
+            AccessMode::Supervisor
+        };
+        Self { kind, mode }
+    }
+
+    pub fn is_write(&self) -> bool {
+        matches!(self.kind, AccessKind::Write)
+    }
+
+    pub fn is_user(&self) -> bool {
+        matches!(self.mode, AccessMode::User)
+    }
+}
+
+/// Page-fault error code, P (bit 0). SDM §4.7 / Figure 4-12.
+pub const PF_ERR_P: u32 = 1 << 0;
+/// Page-fault error code, W/R (bit 1).
+pub const PF_ERR_WR: u32 = 1 << 1;
+/// Page-fault error code, U/S (bit 2).
+pub const PF_ERR_US: u32 = 1 << 2;
+/// Page-fault error code, RSVD (bit 3).
+pub const PF_ERR_RSVD: u32 = 1 << 3;
+/// Page-fault error code, I/D (bit 4).
+///
+/// Never set by this engine: §4.7 sets it only if the access was an instruction
+/// fetch **and** either `CR4.SMEP = 1` or (`CR4.PAE = 1` and
+/// `IA32_EFER.NXE = 1`). With 32-bit paging and no SMEP, none of those hold.
+pub const PF_ERR_ID: u32 = 1 << 4;
+
+/// A structured page fault. Delivery — vector 14, pushing the error code, and
+/// loading `CR2` — is the interpreter's job; this engine only reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageFault {
     /// The linear address whose use caused the fault. This is the value that
     /// belongs in `CR2` (SDM §4.7 / Vol. 3 "Interrupt 14—Page-Fault
     /// Exception").
     pub linear_address: u32,
+    /// The access that caused the fault. The §4.7 error code describes the
+    /// access, not the access rights, so it is recorded verbatim.
+    pub access: Access,
     /// What went wrong.
     pub reason: FaultReason,
 }
@@ -270,6 +357,37 @@ impl PageFault {
     /// fault.
     pub fn cr2(&self) -> u64 {
         u64::from(self.linear_address)
+    }
+
+    /// The `#PF` error code, composed exactly as SDM §4.7 defines it.
+    ///
+    /// * P (bit 0) is 0 "if there is no translation for the linear address
+    ///   because the P flag was 0 in one of the paging-structure entries" — so
+    ///   it is set for a protection violation and for a reserved-bit violation,
+    ///   and clear only for a not-present fault.
+    /// * W/R (bit 1) is 1 if the causing access was a write.
+    /// * U/S (bit 2) is 1 if a user-mode access caused the fault.
+    /// * RSVD (bit 3) is 1 if a reserved bit was set in one of the entries
+    ///   used. Because reserved bits are not checked in an entry whose P flag
+    ///   is 0, bit 3 can be set only if bit 0 is also set.
+    /// * I/D (bit 4) is always 0 here; see [`PF_ERR_ID`].
+    /// * PK (bit 5) and SGX (bit 15) are always 0: neither protection keys nor
+    ///   SGX exist in this model.
+    pub fn error_code(&self) -> u32 {
+        let mut code = 0;
+        if !matches!(self.reason, FaultReason::NotPresent(_)) {
+            code |= PF_ERR_P;
+        }
+        if self.access.is_write() {
+            code |= PF_ERR_WR;
+        }
+        if self.access.is_user() {
+            code |= PF_ERR_US;
+        }
+        if matches!(self.reason, FaultReason::ReservedBit(_)) {
+            code |= PF_ERR_RSVD;
+        }
+        code
     }
 }
 
@@ -307,6 +425,41 @@ impl TranslateError {
     }
 }
 
+/// Failure of a structural walk.
+///
+/// A walk knows nothing about the access being attempted, so it reports the
+/// fault *reason* rather than a complete [`PageFault`]; [`translate`] pairs the
+/// reason with the access to produce the error code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkError {
+    /// The linear address has no translation (§4.3, §4.7).
+    Fault(FaultReason),
+    /// Outside what this engine models.
+    Unsupported(UnsupportedPaging),
+}
+
+impl WalkError {
+    /// The fault reason, if this failure is one.
+    pub fn as_fault_reason(&self) -> Option<FaultReason> {
+        match self {
+            WalkError::Fault(reason) => Some(*reason),
+            WalkError::Unsupported(_) => None,
+        }
+    }
+
+    /// Pair this failure with the access that provoked it.
+    pub fn into_translate_error(self, linear: u32, access: Access) -> TranslateError {
+        match self {
+            WalkError::Fault(reason) => TranslateError::Fault(PageFault {
+                linear_address: linear,
+                access,
+                reason,
+            }),
+            WalkError::Unsupported(kind) => TranslateError::Unsupported(kind),
+        }
+    }
+}
+
 /// The result of a structural page walk: every paging-structure entry the
 /// translation used, and the physical address it produced.
 ///
@@ -332,6 +485,149 @@ pub struct Walk {
     pub pte: Option<(u64, Pte)>,
 }
 
+impl Walk {
+    /// Combined R/W: the logical-AND of the R/W flags of every entry used.
+    ///
+    /// Spec: SDM §4.6.1 — a write is permitted only "with a translation for
+    /// which the R/W flag (bit 1) is 1 in every paging-structure entry
+    /// controlling the translation"; §4.10.2.2 records the same logical-AND in
+    /// a TLB entry.
+    pub fn writable(&self) -> bool {
+        self.pde.read_write() && self.pte.is_none_or(|(_, pte)| pte.read_write())
+    }
+
+    /// Combined U/S: the logical-AND of the U/S flags of every entry used.
+    ///
+    /// Spec: SDM §4.6.1 — "If the U/S flag (bit 2) is 0 in at least one of the
+    /// paging-structure entries, the address is a supervisor-mode address.
+    /// Otherwise, the address is a user-mode address."
+    pub fn user_accessible(&self) -> bool {
+        self.pde.user_supervisor() && self.pte.is_none_or(|(_, pte)| pte.user_supervisor())
+    }
+
+    /// The G flag of the entry that maps the page, before `CR4.PGE` gating
+    /// (SDM Tables 4-4/4-6 bit 8, §4.10.2.4).
+    pub fn global_flag(&self) -> bool {
+        match self.pte {
+            Some((_, pte)) => pte.global(),
+            None => self.pde.global(),
+        }
+    }
+
+    /// Physical address of the entry that identifies the final page frame — the
+    /// PTE, or the PDE when `PS = 1`. This is the entry whose dirty flag a
+    /// write updates (SDM §4.8).
+    pub fn final_entry_addr(&self) -> u64 {
+        match self.pte {
+            Some((addr, _)) => addr,
+            None => self.pde_addr,
+        }
+    }
+
+    /// Raw value of the entry that identifies the final page frame.
+    pub fn final_entry_bits(&self) -> u32 {
+        match self.pte {
+            Some((_, pte)) => pte.bits(),
+            None => self.pde.bits(),
+        }
+    }
+
+    /// The dirty flag of the entry that identifies the final page frame.
+    pub fn dirty(&self) -> bool {
+        self.final_entry_bits() & entry::ENTRY_D != 0
+    }
+}
+
+/// A permitted translation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Translation {
+    /// The linear address translated.
+    pub linear_address: u32,
+    /// The physical address it maps to.
+    pub phys_addr: u64,
+    /// Physical base of the page frame.
+    pub frame_base: u64,
+    /// 4 KiB or 4 MiB.
+    pub page_size: PageSize,
+    /// Combined R/W of the entries used (SDM §4.6.1).
+    pub writable: bool,
+    /// Combined U/S of the entries used (SDM §4.6.1).
+    pub user_accessible: bool,
+    /// Whether the translation is global: the final entry's G flag with
+    /// `CR4.PGE = 1` (SDM §4.10.2.4).
+    pub global: bool,
+    /// Physical address of the entry that identifies the final page frame.
+    pub final_entry_addr: u64,
+    /// Dirty flag of that entry, after any update this translation performed.
+    pub dirty: bool,
+}
+
+/// Does the translation permit this access?
+///
+/// Spec: SDM §4.6.1, restricted to what 32-bit paging without SMEP, SMAP,
+/// protection keys or execute-disable can express:
+///
+/// * Supervisor-mode data reads are permitted to any address (SMAP is not
+///   modeled, so `EFLAGS.AC` and the implicit/explicit distinction never
+///   matter).
+/// * Supervisor-mode data writes: if `CR0.WP = 0` they are permitted to any
+///   address; if `CR0.WP = 1` they require R/W = 1 in every entry — including
+///   for a *user-mode* address, which is the classic supervisor-write-to-a-
+///   read-only-user-page case.
+/// * Supervisor-mode instruction fetches are permitted from any address: SMEP
+///   is not modeled, and "for 32-bit paging or if IA32_EFER.NXE = 0,
+///   instructions may be fetched from any ... address".
+/// * User-mode accesses are permitted only to user-mode addresses, and a
+///   user-mode write additionally requires R/W = 1 in every entry, regardless
+///   of `CR0.WP`.
+pub fn access_permitted(ctx: &PagingContext, walk: &Walk, access: Access) -> bool {
+    match access.mode {
+        AccessMode::Supervisor => match access.kind {
+            AccessKind::Read | AccessKind::InstructionFetch => true,
+            AccessKind::Write => !ctx.write_protect() || walk.writable(),
+        },
+        AccessMode::User => match access.kind {
+            AccessKind::Read | AccessKind::InstructionFetch => walk.user_accessible(),
+            AccessKind::Write => walk.user_accessible() && walk.writable(),
+        },
+    }
+}
+
+/// Translate `linear` for `access`: walk the paging structures, then apply the
+/// §4.6 access rights.
+///
+/// Returns a structured [`PageFault`] rather than raising anything. Delivering
+/// `#PF` with [`PageFault::error_code`] and [`PageFault::cr2`] is the
+/// interpreter's job.
+pub fn translate<M: PageTableMemory>(
+    ctx: &PagingContext,
+    mem: &mut M,
+    linear: u32,
+    access: Access,
+) -> Result<Translation, TranslateError> {
+    let walk = walk(ctx, mem, linear).map_err(|err| err.into_translate_error(linear, access))?;
+
+    if !access_permitted(ctx, &walk, access) {
+        return Err(TranslateError::Fault(PageFault {
+            linear_address: linear,
+            access,
+            reason: FaultReason::Protection,
+        }));
+    }
+
+    Ok(Translation {
+        linear_address: linear,
+        phys_addr: walk.phys_addr,
+        frame_base: walk.frame_base,
+        page_size: walk.page_size,
+        writable: walk.writable(),
+        user_accessible: walk.user_accessible(),
+        global: walk.global_flag() && ctx.pge(),
+        final_entry_addr: walk.final_entry_addr(),
+        dirty: walk.dirty(),
+    })
+}
+
 /// Walk the 32-bit paging structures for `linear`, with no access-rights check
 /// and no accessed/dirty update.
 ///
@@ -342,17 +638,13 @@ pub fn walk<M: PageTableMemory>(
     ctx: &PagingContext,
     mem: &mut M,
     linear: u32,
-) -> Result<Walk, TranslateError> {
+) -> Result<Walk, WalkError> {
     match ctx.mode() {
         PagingMode::Disabled => {
-            return Err(TranslateError::Unsupported(
-                UnsupportedPaging::PagingDisabled,
-            ))
+            return Err(WalkError::Unsupported(UnsupportedPaging::PagingDisabled))
         }
         PagingMode::PaeOrLongMode => {
-            return Err(TranslateError::Unsupported(
-                UnsupportedPaging::PaeOrLongMode,
-            ))
+            return Err(WalkError::Unsupported(UnsupportedPaging::PaeOrLongMode))
         }
         PagingMode::Bits32 => {}
     }
@@ -366,20 +658,18 @@ pub fn walk<M: PageTableMemory>(
     let pde = Pde(mem.read_entry_u32(pde_addr));
 
     if !pde.present() {
-        return Err(fault(
-            linear,
-            FaultReason::NotPresent(PagingLevel::PageDirectory),
-        ));
+        return Err(WalkError::Fault(FaultReason::NotPresent(
+            PagingLevel::PageDirectory,
+        )));
     }
     if pde.sets_reserved_bit(cr4_pse, &profile) {
-        return Err(fault(
-            linear,
-            FaultReason::ReservedBit(PagingLevel::PageDirectory),
-        ));
+        return Err(WalkError::Fault(FaultReason::ReservedBit(
+            PagingLevel::PageDirectory,
+        )));
     }
 
     if pde.maps_large_page(cr4_pse) {
-        return Err(TranslateError::Unsupported(UnsupportedPaging::LargePage));
+        return Err(WalkError::Unsupported(UnsupportedPaging::LargePage));
     }
 
     // SDM §4.3: "Bits 31:12 are from the PDE. Bits 11:2 are bits 21:12 of the
@@ -388,16 +678,14 @@ pub fn walk<M: PageTableMemory>(
     let pte = Pte(mem.read_entry_u32(pte_addr));
 
     if !pte.present() {
-        return Err(fault(
-            linear,
-            FaultReason::NotPresent(PagingLevel::PageTable),
-        ));
+        return Err(WalkError::Fault(FaultReason::NotPresent(
+            PagingLevel::PageTable,
+        )));
     }
     if pte.sets_reserved_bit(cr4_pse, &profile) {
-        return Err(fault(
-            linear,
-            FaultReason::ReservedBit(PagingLevel::PageTable),
-        ));
+        return Err(WalkError::Fault(FaultReason::ReservedBit(
+            PagingLevel::PageTable,
+        )));
     }
 
     let frame_base = pte.page_base();
@@ -411,13 +699,6 @@ pub fn walk<M: PageTableMemory>(
         pde_addr,
         pde,
         pte: Some((pte_addr, pte)),
-    })
-}
-
-fn fault(linear: u32, reason: FaultReason) -> TranslateError {
-    TranslateError::Fault(PageFault {
-        linear_address: linear,
-        reason,
     })
 }
 
