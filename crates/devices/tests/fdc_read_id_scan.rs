@@ -20,18 +20,19 @@
 
 use devices::{
     Fdc82077, PortDevice, FDC_1440_CYLINDERS, FDC_1440_IMAGE_SIZE, FDC_1440_SECTORS_PER_TRACK,
-    FDC_CMD_SEEK, FDC_CMD_SENSE_INT, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO,
-    FDC_SECTOR_N, FDC_ST0_HEAD, FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_NORMAL, FDC_ST1_ND,
+    FDC_CMD_READ_ID_MFM, FDC_CMD_SEEK, FDC_CMD_SENSE_INT, FDC_DOR, FDC_DOR_DMA_IRQ,
+    FDC_DOR_RESET_N, FDC_DSR_SOFTWARE_RESET, FDC_FIFO, FDC_MSR, FDC_SECTOR_N, FDC_ST0_HEAD,
+    FDC_ST0_IC_ABNORMAL, FDC_ST0_IC_NORMAL, FDC_ST1_MA, FDC_ST1_ND,
 };
 
 /// READ ID with the MFM modifier. Spec: Intel 82077AA Table 5-1 (`MFM|01010`).
-const CMD_READ_ID_MFM: u32 = 0x4A;
+const CMD_READ_ID_MFM: u32 = FDC_CMD_READ_ID_MFM as u32;
 /// ST1 bit0 MA — Missing Address Mark. Spec: Intel 82077AA §6.2.
-const ST1_MA: u8 = 0x01;
+const ST1_MA: u8 = FDC_ST1_MA;
 /// DSR software reset (self-clearing bit7). Spec: Intel 82077AA §2.1.5.
-const DSR_SOFTWARE_RESET: u32 = 0x80;
+const DSR_SOFTWARE_RESET: u32 = FDC_DSR_SOFTWARE_RESET as u32;
 /// Data Rate Select / Main Status port (`0x3F4`).
-const PORT_MSR_DSR: u16 = 0x3F4;
+const PORT_MSR_DSR: u16 = FDC_MSR;
 
 fn running_fdc(media: bool) -> Fdc82077 {
     let mut f = if media {

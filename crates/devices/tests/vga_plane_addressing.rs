@@ -6,22 +6,28 @@
 //! Memory / Odd-Even / Chain 4) and Figure 2-34 (Map Selection, Chain 4);
 //! OSDev VGA Hardware "Addressing Logic" for the per-map offset forms.
 //!
-//! The plane-decode value types are not re-exported from `devices`, so these
-//! tests assert through `VgaText` methods and integer results only. See
+//! These tests assert through `VgaText` methods and integer results only. See
 //! `docs/vga-plane-memory-model.md`.
 
-use devices::{PortDevice, VgaText, VGA_SEQ_DATA, VGA_SEQ_INDEX, VGA_TEXT_BASE, VGA_TEXT_END};
+use devices::{
+    PortDevice, VgaText, VGA_GC_DATA, VGA_GC_INDEX, VGA_GC_MEMORY_MAP_B8000_32K, VGA_GC_MISC,
+    VGA_GC_MISC_GRAPHICS_MODE, VGA_GC_MISC_MEMORY_MAP_SHIFT, VGA_PLANE_SIZE_NO_EXTENDED,
+    VGA_SEQ_DATA, VGA_SEQ_INDEX, VGA_SEQ_MAP_MASK, VGA_SEQ_MAP_MASK_DEFAULT,
+    VGA_SEQ_MAP_MASK_PLANES, VGA_SEQ_MEMORY_MODE, VGA_SEQ_MEMORY_MODE_CHAIN4,
+    VGA_SEQ_MEMORY_MODE_EXTENDED, VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE, VGA_TEXT_BASE,
+    VGA_TEXT_END,
+};
 
 /// Sequencer Map Mask register index (`0x02`).
-const SEQ_MAP_MASK: u32 = 0x02;
+const SEQ_MAP_MASK: u32 = VGA_SEQ_MAP_MASK as u32;
 /// Sequencer Memory Mode register index (`0x04`).
-const SEQ_MEMORY_MODE: u32 = 0x04;
+const SEQ_MEMORY_MODE: u32 = VGA_SEQ_MEMORY_MODE as u32;
 /// Memory Mode bit1 Extended Memory.
-const MEMORY_MODE_EXTENDED: u32 = 0x02;
+const MEMORY_MODE_EXTENDED: u32 = VGA_SEQ_MEMORY_MODE_EXTENDED as u32;
 /// Memory Mode bit2 Odd/Even disable.
-const MEMORY_MODE_ODD_EVEN_DISABLE: u32 = 0x04;
+const MEMORY_MODE_ODD_EVEN_DISABLE: u32 = VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE as u32;
 /// Memory Mode bit3 Chain 4.
-const MEMORY_MODE_CHAIN4: u32 = 0x08;
+const MEMORY_MODE_CHAIN4: u32 = VGA_SEQ_MEMORY_MODE_CHAIN4 as u32;
 
 fn write_seq(vga: &mut VgaText, index: u32, value: u32) {
     vga.port_write(VGA_SEQ_INDEX, 1, index);
@@ -34,7 +40,7 @@ fn mode03h_reset_state_decodes_text_character_and_attribute_maps() {
     assert!(vga.seq_odd_even_enabled());
     assert!(!vga.seq_chain4_enabled());
     assert!(vga.seq_extended_memory());
-    assert_eq!(vga.seq_map_mask(), 0x03);
+    assert_eq!(vga.seq_map_mask(), VGA_SEQ_MAP_MASK_DEFAULT);
 
     // Map Mask 0x03 narrows the odd/even pairs to map 0 (character) and map 1
     // (attribute); both share one map offset.
@@ -53,7 +59,7 @@ fn chain4_programming_selects_one_map_per_low_address_pair() {
         SEQ_MEMORY_MODE,
         MEMORY_MODE_EXTENDED | MEMORY_MODE_CHAIN4,
     );
-    write_seq(&mut vga, SEQ_MAP_MASK, 0x0F);
+    write_seq(&mut vga, SEQ_MAP_MASK, VGA_SEQ_MAP_MASK_PLANES as u32);
     assert!(vga.seq_chain4_enabled());
 
     assert_eq!(vga.plane_write_mask(VGA_TEXT_BASE), 0b0001);
@@ -69,8 +75,13 @@ fn planar_programming_reports_map_mask_and_unshifted_offset() {
     let mut vga = VgaText::new();
     // Graphics Controller Miscellaneous must also drop Chain Odd/Even
     // (IBM Figure 2-74 OE) for planar host addressing; keep the B8000 window.
-    vga.port_write(devices::VGA_GC_INDEX, 1, 0x06);
-    vga.port_write(devices::VGA_GC_DATA, 1, 0x0D);
+    vga.port_write(VGA_GC_INDEX, 1, VGA_GC_MISC as u32);
+    vga.port_write(
+        VGA_GC_DATA,
+        1,
+        VGA_GC_MISC_GRAPHICS_MODE as u32
+            | ((VGA_GC_MEMORY_MAP_B8000_32K as u32) << VGA_GC_MISC_MEMORY_MAP_SHIFT),
+    );
     write_seq(
         &mut vga,
         SEQ_MEMORY_MODE,
@@ -88,8 +99,11 @@ fn extended_memory_clear_shrinks_the_addressable_map() {
     let mut vga = VgaText::new();
     write_seq(&mut vga, SEQ_MEMORY_MODE, MEMORY_MODE_ODD_EVEN_DISABLE);
     assert!(!vga.seq_extended_memory());
-    assert_eq!(vga.plane_size_bytes(), 0x4000);
-    assert_eq!(vga.plane_offset(VGA_TEXT_BASE + 0x4010), Some(0x10));
+    assert_eq!(vga.plane_size_bytes(), VGA_PLANE_SIZE_NO_EXTENDED);
+    assert_eq!(
+        vga.plane_offset(VGA_TEXT_BASE + VGA_PLANE_SIZE_NO_EXTENDED as u64 + 0x10),
+        Some(0x10)
+    );
 }
 
 #[test]

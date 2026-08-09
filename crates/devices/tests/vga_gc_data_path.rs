@@ -12,27 +12,36 @@
 //! See `docs/vga-plane-memory-model.md`.
 
 use devices::{
-    PortDevice, VgaText, VGA_GC_DATA, VGA_GC_INDEX, VGA_SEQ_DATA, VGA_SEQ_INDEX, VGA_TEXT_BASE,
+    PortDevice, VgaText, VGA_GC_BIT_MASK, VGA_GC_COLOR_COMPARE, VGA_GC_COLOR_DONT_CARE,
+    VGA_GC_DATA, VGA_GC_DATA_ROTATE, VGA_GC_ENABLE_SET_RESET, VGA_GC_INDEX,
+    VGA_GC_MEMORY_MAP_B8000_32K, VGA_GC_MISC, VGA_GC_MISC_GRAPHICS_MODE,
+    VGA_GC_MISC_MEMORY_MAP_SHIFT, VGA_GC_MODE, VGA_GC_READ_MAP_SELECT, VGA_GC_SET_RESET,
+    VGA_SEQ_DATA, VGA_SEQ_INDEX, VGA_SEQ_MAP_MASK, VGA_SEQ_MAP_MASK_PLANES, VGA_SEQ_MEMORY_MODE,
+    VGA_SEQ_MEMORY_MODE_EXTENDED, VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE, VGA_TEXT_BASE,
 };
 
 /// Graphics Controller indexes (FreeVGA / IBM VGA).
-const GC_SET_RESET: u32 = 0x00;
-const GC_ENABLE_SET_RESET: u32 = 0x01;
-const GC_COLOR_COMPARE: u32 = 0x02;
-const GC_DATA_ROTATE: u32 = 0x03;
-const GC_READ_MAP_SELECT: u32 = 0x04;
-const GC_MODE: u32 = 0x05;
-const GC_COLOR_DONT_CARE: u32 = 0x07;
-const GC_MISC: u32 = 0x06;
-const GC_BIT_MASK: u32 = 0x08;
+const GC_SET_RESET: u32 = VGA_GC_SET_RESET as u32;
+const GC_ENABLE_SET_RESET: u32 = VGA_GC_ENABLE_SET_RESET as u32;
+const GC_COLOR_COMPARE: u32 = VGA_GC_COLOR_COMPARE as u32;
+const GC_DATA_ROTATE: u32 = VGA_GC_DATA_ROTATE as u32;
+const GC_READ_MAP_SELECT: u32 = VGA_GC_READ_MAP_SELECT as u32;
+const GC_MODE: u32 = VGA_GC_MODE as u32;
+const GC_COLOR_DONT_CARE: u32 = VGA_GC_COLOR_DONT_CARE as u32;
+const GC_MISC: u32 = VGA_GC_MISC as u32;
+const GC_BIT_MASK: u32 = VGA_GC_BIT_MASK as u32;
 /// Miscellaneous: graphics mode, Chain Odd/Even clear, Memory Map Select `11`.
-const GC_MISC_GRAPHICS_B8000: u32 = 0x0D;
+const GC_MISC_GRAPHICS_B8000: u32 = VGA_GC_MISC_GRAPHICS_MODE as u32
+    | ((VGA_GC_MEMORY_MAP_B8000_32K as u32) << VGA_GC_MISC_MEMORY_MAP_SHIFT);
 
 /// Sequencer indexes.
-const SEQ_MAP_MASK: u32 = 0x02;
-const SEQ_MEMORY_MODE: u32 = 0x04;
+const SEQ_MAP_MASK: u32 = VGA_SEQ_MAP_MASK as u32;
+const SEQ_MEMORY_MODE: u32 = VGA_SEQ_MEMORY_MODE as u32;
 /// Extended Memory | Odd/Even disable → planar addressing of all four maps.
-const MEMORY_MODE_PLANAR: u32 = 0x06;
+const MEMORY_MODE_PLANAR: u32 =
+    VGA_SEQ_MEMORY_MODE_EXTENDED as u32 | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE as u32;
+/// Map Mask with every map write-enabled.
+const MAP_MASK_ALL_PLANES: u32 = VGA_SEQ_MAP_MASK_PLANES as u32;
 
 fn write_gc(vga: &mut VgaText, index: u32, value: u32) {
     vga.port_write(VGA_GC_INDEX, 1, index);
@@ -51,7 +60,7 @@ fn write_seq(vga: &mut VgaText, index: u32, value: u32) {
 fn planar_all_maps() -> VgaText {
     let mut vga = VgaText::new();
     write_seq(&mut vga, SEQ_MEMORY_MODE, MEMORY_MODE_PLANAR);
-    write_seq(&mut vga, SEQ_MAP_MASK, 0x0F);
+    write_seq(&mut vga, SEQ_MAP_MASK, MAP_MASK_ALL_PLANES);
     write_gc(&mut vga, GC_MISC, GC_MISC_GRAPHICS_B8000);
     vga
 }

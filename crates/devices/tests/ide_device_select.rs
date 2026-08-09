@@ -27,8 +27,10 @@
 //!   information from Device 0 even though Device 1 is selected."
 
 use devices::{
-    IdePrimary, IdeSecondary, PortDevice, ATA_CMD_IDENTIFY, ATA_CMD_READ_SECTORS, ATA_DC_NIEN,
-    ATA_DC_SRST, ATA_DRIVE_LBA, ATA_DRIVE_SLAVE, ATA_ER_ABRT, ATA_SR_DRDY, ATA_SR_DRQ, ATA_SR_DSC,
+    IdePrimary, IdeSecondary, PortDevice, ATA_CMD_DIAGNOSTIC, ATA_CMD_IDENTIFY,
+    ATA_CMD_READ_SECTORS, ATA_CMD_SMART, ATA_DC_NIEN, ATA_DC_SRST, ATA_DIAG_PASSED, ATA_DRIVE_LBA,
+    ATA_DRIVE_SLAVE, ATA_ER_ABRT, ATA_SIGNATURE_LBA_HIGH, ATA_SIGNATURE_LBA_LOW,
+    ATA_SIGNATURE_LBA_MID, ATA_SIGNATURE_SECTOR_COUNT, ATA_SR_DRDY, ATA_SR_DRQ, ATA_SR_DSC,
     ATA_SR_ERR, IDE_PRIMARY_CTRL, IDE_PRIMARY_DATA, IDE_PRIMARY_DRIVE, IDE_PRIMARY_ERROR,
     IDE_PRIMARY_LBA_HI, IDE_PRIMARY_LBA_LO, IDE_PRIMARY_LBA_MID, IDE_PRIMARY_SECCOUNT,
     IDE_PRIMARY_STATUS, IDE_SECONDARY_CTRL, IDE_SECONDARY_DRIVE, IDE_SECONDARY_STATUS,
@@ -38,12 +40,12 @@ use devices::{
 const DEV0: u32 = 0xA0;
 /// Device 1 selection value (DEV=1).
 const DEV1: u32 = 0xA0 | ATA_DRIVE_SLAVE as u32;
-/// SMART (`0xB0`) — an ABRT-only opcode in this tree (not re-exported).
-const CMD_SMART: u32 = 0xB0;
+/// SMART (`0xB0`) — an ABRT-only opcode in this tree.
+const CMD_SMART: u32 = ATA_CMD_SMART as u32;
 /// EXECUTE DEVICE DIAGNOSTIC (`0x90`). Spec: ATA/ATAPI-6 §8.11.
-const CMD_DIAGNOSTIC: u32 = 0x90;
+const CMD_DIAGNOSTIC: u32 = ATA_CMD_DIAGNOSTIC as u32;
 /// Diagnostic code "Device 0 passed". Spec: ATA/ATAPI-6 Table 26.
-const DIAG_PASSED: u8 = 0x01;
+const DIAG_PASSED: u8 = ATA_DIAG_PASSED;
 
 fn ready_master() -> IdePrimary {
     let mut ide = IdePrimary::with_image(vec![0u8; 512 * 4]);
@@ -112,10 +114,22 @@ fn execute_device_diagnostic_runs_while_device1_selected() {
 
     // Reads other than Status complete as if Device 0 was selected (§9.16.1(4)).
     assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, DIAG_PASSED);
-    assert_eq!(ide.port_read(IDE_PRIMARY_SECCOUNT, 1) as u8, 0x01);
-    assert_eq!(ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8, 0x01);
-    assert_eq!(ide.port_read(IDE_PRIMARY_LBA_MID, 1) as u8, 0x00);
-    assert_eq!(ide.port_read(IDE_PRIMARY_LBA_HI, 1) as u8, 0x00);
+    assert_eq!(
+        ide.port_read(IDE_PRIMARY_SECCOUNT, 1) as u8,
+        ATA_SIGNATURE_SECTOR_COUNT
+    );
+    assert_eq!(
+        ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8,
+        ATA_SIGNATURE_LBA_LOW
+    );
+    assert_eq!(
+        ide.port_read(IDE_PRIMARY_LBA_MID, 1) as u8,
+        ATA_SIGNATURE_LBA_MID
+    );
+    assert_eq!(
+        ide.port_read(IDE_PRIMARY_LBA_HI, 1) as u8,
+        ATA_SIGNATURE_LBA_HIGH
+    );
     // Status still reads 00h while Device 1 is selected.
     assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8, 0);
 
@@ -142,8 +156,14 @@ fn device_control_srst_completes_while_device1_selected() {
         ide.port_read(IDE_PRIMARY_CTRL, 1) as u8,
         ATA_SR_DRDY | ATA_SR_DSC
     );
-    assert_eq!(ide.port_read(IDE_PRIMARY_SECCOUNT, 1) as u8, 0x01);
-    assert_eq!(ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8, 0x01);
+    assert_eq!(
+        ide.port_read(IDE_PRIMARY_SECCOUNT, 1) as u8,
+        ATA_SIGNATURE_SECTOR_COUNT
+    );
+    assert_eq!(
+        ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8,
+        ATA_SIGNATURE_LBA_LOW
+    );
 }
 
 /// Table 18: with Device 1 selected, non-status Command Block reads return the

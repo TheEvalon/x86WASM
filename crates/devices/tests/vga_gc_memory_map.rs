@@ -12,21 +12,29 @@
 //! See `docs/vga-plane-memory-model.md`.
 
 use devices::{
-    PortDevice, VgaText, VGA_GC_DATA, VGA_GC_INDEX, VGA_MISC_OUTPUT_WRITE, VGA_SEQ_DATA,
-    VGA_SEQ_INDEX, VGA_TEXT_BASE, VGA_TEXT_END,
+    PortDevice, VgaText, VGA_GC_DATA, VGA_GC_INDEX, VGA_GC_MEMORY_MAP_A0000_128K,
+    VGA_GC_MEMORY_MAP_A0000_64K, VGA_GC_MEMORY_MAP_B0000_32K, VGA_GC_MEMORY_MAP_B8000_32K,
+    VGA_GC_MISC, VGA_GC_MISC_CHAIN_ODD_EVEN, VGA_GC_MISC_GRAPHICS_MODE,
+    VGA_GC_MISC_MEMORY_MAP_SHIFT, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_WRITE,
+    VGA_MISC_RAM_ENABLE, VGA_SEQ_DATA, VGA_SEQ_INDEX, VGA_SEQ_MEMORY_MODE,
+    VGA_SEQ_MEMORY_MODE_EXTENDED, VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE, VGA_TEXT_BASE,
+    VGA_TEXT_END, VGA_WINDOW_A0000_BASE, VGA_WINDOW_B0000_BASE,
 };
 
 /// Graphics Controller Miscellaneous register index.
-const GC_MISC: u32 = 0x06;
+const GC_MISC: u32 = VGA_GC_MISC as u32;
 /// Sequencer Memory Mode register index.
-const SEQ_MEMORY_MODE: u32 = 0x04;
+const SEQ_MEMORY_MODE: u32 = VGA_SEQ_MEMORY_MODE as u32;
 
 /// Misc values: graphics-mode bit plus a Memory Map Select field, with Chain
 /// Odd/Even clear so only the window under test varies.
-const MISC_MAP_A0000_128K: u32 = 0x01;
-const MISC_MAP_A0000_64K: u32 = 0x05;
-const MISC_MAP_B0000_32K: u32 = 0x09;
-const MISC_MAP_B8000_32K: u32 = 0x0D;
+const fn misc_window(memory_map: u8) -> u32 {
+    VGA_GC_MISC_GRAPHICS_MODE as u32 | ((memory_map as u32) << VGA_GC_MISC_MEMORY_MAP_SHIFT)
+}
+const MISC_MAP_A0000_128K: u32 = misc_window(VGA_GC_MEMORY_MAP_A0000_128K);
+const MISC_MAP_A0000_64K: u32 = misc_window(VGA_GC_MEMORY_MAP_A0000_64K);
+const MISC_MAP_B0000_32K: u32 = misc_window(VGA_GC_MEMORY_MAP_B0000_32K);
+const MISC_MAP_B8000_32K: u32 = misc_window(VGA_GC_MEMORY_MAP_B8000_32K);
 
 fn write_gc(vga: &mut VgaText, index: u32, value: u32) {
     vga.port_write(VGA_GC_INDEX, 1, index);
@@ -41,7 +49,7 @@ fn write_seq(vga: &mut VgaText, index: u32, value: u32) {
 #[test]
 fn reset_default_selects_the_b8000_text_window() {
     let vga = VgaText::new();
-    assert_eq!(vga.gc_memory_map_select(), 0b11);
+    assert_eq!(vga.gc_memory_map_select(), VGA_GC_MEMORY_MAP_B8000_32K);
     assert!(vga.gc_chain_odd_even());
     assert!(!vga.gc_graphics_mode());
     assert_eq!(vga.display_window(), (VGA_TEXT_BASE, VGA_TEXT_END));
@@ -54,16 +62,22 @@ fn memory_map_select_moves_the_display_window() {
     let mut vga = VgaText::new();
 
     write_gc(&mut vga, GC_MISC, MISC_MAP_A0000_128K);
-    assert_eq!(vga.display_window(), (0x000A_0000, 0x000C_0000));
+    assert_eq!(
+        vga.display_window(),
+        (VGA_WINDOW_A0000_BASE, VGA_WINDOW_A0000_BASE + 0x2_0000)
+    );
 
     write_gc(&mut vga, GC_MISC, MISC_MAP_A0000_64K);
-    assert_eq!(vga.display_window(), (0x000A_0000, 0x000B_0000));
+    assert_eq!(
+        vga.display_window(),
+        (VGA_WINDOW_A0000_BASE, VGA_WINDOW_B0000_BASE)
+    );
 
     write_gc(&mut vga, GC_MISC, MISC_MAP_B0000_32K);
-    assert_eq!(vga.display_window(), (0x000B_0000, 0x000B_8000));
+    assert_eq!(vga.display_window(), (VGA_WINDOW_B0000_BASE, VGA_TEXT_BASE));
 
     write_gc(&mut vga, GC_MISC, MISC_MAP_B8000_32K);
-    assert_eq!(vga.display_window(), (0x000B_8000, 0x000C_0000));
+    assert_eq!(vga.display_window(), (VGA_TEXT_BASE, VGA_TEXT_END));
 }
 
 /// A window that excludes `0xB8000` must not claim CPU accesses there.
@@ -79,8 +93,8 @@ fn text_window_accesses_are_not_claimed_outside_the_selected_window() {
     assert!(!vga.gc_write_u8(VGA_TEXT_BASE, 0xFF));
 
     // The B0000 window itself decodes to map offset 0.
-    assert!(vga.owns_display_addr(0x000B_0000));
-    assert_eq!(vga.plane_offset(0x000B_0000), Some(0));
+    assert!(vga.owns_display_addr(VGA_WINDOW_B0000_BASE));
+    assert_eq!(vga.plane_offset(VGA_WINDOW_B0000_BASE), Some(0));
 
     write_gc(&mut vga, GC_MISC, MISC_MAP_B8000_32K);
     assert_eq!(vga.read_u8(VGA_TEXT_BASE), Some(b'Q'), "buffer preserved");
@@ -93,12 +107,16 @@ fn text_window_accesses_are_not_claimed_outside_the_selected_window() {
 fn map_offsets_are_relative_to_the_window_base() {
     let mut vga = VgaText::new();
     write_gc(&mut vga, GC_MISC, MISC_MAP_A0000_128K);
-    assert_eq!(vga.plane_offset(0x000A_0000), Some(0));
-    assert_eq!(vga.plane_offset(0x000A_0010), Some(0x10));
+    assert_eq!(vga.plane_offset(VGA_WINDOW_A0000_BASE), Some(0));
+    assert_eq!(vga.plane_offset(VGA_WINDOW_A0000_BASE + 0x10), Some(0x10));
 
     write_gc(&mut vga, GC_MISC, MISC_MAP_A0000_64K);
-    assert_eq!(vga.plane_offset(0x000A_0010), Some(0x10));
-    assert_eq!(vga.plane_offset(0x000B_0000), None, "64 KB window ends");
+    assert_eq!(vga.plane_offset(VGA_WINDOW_A0000_BASE + 0x10), Some(0x10));
+    assert_eq!(
+        vga.plane_offset(VGA_WINDOW_B0000_BASE),
+        None,
+        "64 KB window ends"
+    );
 
     write_gc(&mut vga, GC_MISC, MISC_MAP_B8000_32K);
     assert_eq!(vga.plane_offset(VGA_TEXT_BASE + 0x10), Some(0x10));
@@ -110,8 +128,16 @@ fn map_offsets_are_relative_to_the_window_base() {
 fn chain_odd_even_forces_odd_even_addressing() {
     let mut vga = VgaText::new();
     // Sequencer says "sequential" (Odd/Even disable set) but GC Misc chains.
-    write_seq(&mut vga, SEQ_MEMORY_MODE, 0x06);
-    write_gc(&mut vga, GC_MISC, 0x0F); // graphics | chain odd/even | B8000
+    write_seq(
+        &mut vga,
+        SEQ_MEMORY_MODE,
+        VGA_SEQ_MEMORY_MODE_EXTENDED as u32 | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE as u32,
+    );
+    write_gc(
+        &mut vga,
+        GC_MISC,
+        MISC_MAP_B8000_32K | VGA_GC_MISC_CHAIN_ODD_EVEN as u32,
+    );
     assert!(!vga.seq_odd_even_enabled());
     assert!(vga.gc_chain_odd_even());
     assert_eq!(vga.plane_write_mask(VGA_TEXT_BASE), 0b0001);
@@ -129,12 +155,13 @@ fn chain_odd_even_forces_odd_even_addressing() {
 #[test]
 fn ram_enable_still_gates_the_selected_window() {
     let mut vga = VgaText::new();
-    vga.port_write(VGA_MISC_OUTPUT_WRITE, 1, 0x65); // RAM Enable clear
+    let ram_disabled = (VGA_MISC_OUTPUT_DEFAULT & !VGA_MISC_RAM_ENABLE) as u32;
+    vga.port_write(VGA_MISC_OUTPUT_WRITE, 1, ram_disabled);
     assert!(!vga.owns_display_addr(VGA_TEXT_BASE));
     assert_eq!(vga.read_u8(VGA_TEXT_BASE), None);
     assert!(!vga.write_u8(VGA_TEXT_BASE, 0x41));
 
-    vga.port_write(VGA_MISC_OUTPUT_WRITE, 1, 0x67);
+    vga.port_write(VGA_MISC_OUTPUT_WRITE, 1, VGA_MISC_OUTPUT_DEFAULT as u32);
     assert!(vga.owns_display_addr(VGA_TEXT_BASE));
     assert!(vga.write_u8(VGA_TEXT_BASE, 0x41));
 }
@@ -143,9 +170,12 @@ fn ram_enable_still_gates_the_selected_window() {
 fn reset_restores_the_b8000_window() {
     let mut vga = VgaText::new();
     write_gc(&mut vga, GC_MISC, MISC_MAP_A0000_64K);
-    assert_eq!(vga.display_window(), (0x000A_0000, 0x000B_0000));
+    assert_eq!(
+        vga.display_window(),
+        (VGA_WINDOW_A0000_BASE, VGA_WINDOW_B0000_BASE)
+    );
     vga.reset();
-    assert_eq!(vga.gc_memory_map_select(), 0b11);
+    assert_eq!(vga.gc_memory_map_select(), VGA_GC_MEMORY_MAP_B8000_32K);
     assert_eq!(vga.display_window(), (VGA_TEXT_BASE, VGA_TEXT_END));
     assert_eq!(vga.read_u8(VGA_TEXT_BASE), Some(b' '));
 }
