@@ -1356,7 +1356,68 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "MOV CRn,r32",
     },
+    // Near `Jcc rel16/rel32` — Spec: Intel SDM Vol. 2 "Jcc—Jump if Condition
+    // Is Met" (opcode map 2 — `0F 80`+cc). The displacement follows the
+    // operand-size attribute, so `Encoding::Rel16` widens to rel32 under a
+    // 32-bit operand size exactly as the near `E8`/`E9` forms do.
+    jcc_near(0x80, "JO"),
+    jcc_near(0x81, "JNO"),
+    jcc_near(0x82, "JB"),
+    jcc_near(0x83, "JAE"),
+    jcc_near(0x84, "JE"),
+    jcc_near(0x85, "JNE"),
+    jcc_near(0x86, "JBE"),
+    jcc_near(0x87, "JA"),
+    jcc_near(0x88, "JS"),
+    jcc_near(0x89, "JNS"),
+    jcc_near(0x8A, "JP"),
+    jcc_near(0x8B, "JNP"),
+    jcc_near(0x8C, "JL"),
+    jcc_near(0x8D, "JGE"),
+    jcc_near(0x8E, "JLE"),
+    jcc_near(0x8F, "JG"),
+    // `SETcc r/m8` — Spec: Intel SDM Vol. 2 "SETcc—Set Byte on Condition"
+    // (opcode map 2 — `0F 90`+cc /r). Always an 8-bit destination; the
+    // operand-size attribute has no effect. ModR/M.reg is not used.
+    setcc(0x90, "SETO"),
+    setcc(0x91, "SETNO"),
+    setcc(0x92, "SETB"),
+    setcc(0x93, "SETAE"),
+    setcc(0x94, "SETE"),
+    setcc(0x95, "SETNE"),
+    setcc(0x96, "SETBE"),
+    setcc(0x97, "SETA"),
+    setcc(0x98, "SETS"),
+    setcc(0x99, "SETNS"),
+    setcc(0x9A, "SETP"),
+    setcc(0x9B, "SETNP"),
+    setcc(0x9C, "SETL"),
+    setcc(0x9D, "SETGE"),
+    setcc(0x9E, "SETLE"),
+    setcc(0x9F, "SETG"),
 ];
+
+/// Two-byte near `Jcc rel16/rel32` entry (`0F 80`+cc cw/cd).
+const fn jcc_near(opcode: u8, mnemonic: &'static str) -> InstrDef {
+    InstrDef {
+        mnemonic,
+        opcode,
+        encoding: Encoding::Rel16,
+        width: Width::OsZ,
+        sdm: "Jcc rel16/rel32",
+    }
+}
+
+/// Two-byte `SETcc r/m8` entry (`0F 90`+cc /r).
+const fn setcc(opcode: u8, mnemonic: &'static str) -> InstrDef {
+    InstrDef {
+        mnemonic,
+        opcode,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "SETcc r/m8",
+    }
+}
 
 pub fn lookup_0f(opcode: u8) -> Option<&'static InstrDef> {
     M1_0F_SUBSET.iter().find(|d| d.opcode == opcode)
@@ -1417,5 +1478,33 @@ mod tests {
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
         assert!(lookup_0f(0x20).is_some(), "missing 0F 20 MOV r32,CRn");
         assert!(lookup_0f(0x22).is_some(), "missing 0F 22 MOV CRn,r32");
+    }
+
+    /// Intel SDM Vol. 2 "Jcc" / "SETcc" (opcode map 2): the whole `0F 80`–`0F 8F`
+    /// and `0F 90`–`0F 9F` condition ranges are present with the documented
+    /// mnemonic order, rel16/rel32 vs byte-destination encodings.
+    #[test]
+    fn two_byte_condition_ranges_are_complete() {
+        const JCC: [&str; 16] = [
+            "JO", "JNO", "JB", "JAE", "JE", "JNE", "JBE", "JA", "JS", "JNS", "JP", "JNP", "JL",
+            "JGE", "JLE", "JG",
+        ];
+        const SETCC: [&str; 16] = [
+            "SETO", "SETNO", "SETB", "SETAE", "SETE", "SETNE", "SETBE", "SETA", "SETS", "SETNS",
+            "SETP", "SETNP", "SETL", "SETGE", "SETLE", "SETG",
+        ];
+        for cc in 0u8..16 {
+            let jcc =
+                lookup_0f(0x80 | cc).unwrap_or_else(|| panic!("missing 0F {:02X}", 0x80 | cc));
+            assert_eq!(jcc.mnemonic, JCC[cc as usize]);
+            assert_eq!(jcc.encoding, Encoding::Rel16);
+            assert_eq!(jcc.width, Width::OsZ);
+
+            let set =
+                lookup_0f(0x90 | cc).unwrap_or_else(|| panic!("missing 0F {:02X}", 0x90 | cc));
+            assert_eq!(set.mnemonic, SETCC[cc as usize]);
+            assert_eq!(set.encoding, Encoding::Modrm);
+            assert_eq!(set.width, Width::W8);
+        }
     }
 }

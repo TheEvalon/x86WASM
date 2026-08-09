@@ -523,7 +523,11 @@ pub fn decode_with_mode(bytes: &[u8], mode: DecodeMode) -> Result<DecodedInsn, D
     }
 
     // Group 1 / 2 / 3 / 4 / 5: mnemonic from ModRM.reg (Intel SDM Vol. 2 opcode map).
-    let mnemonic = if matches!(opcode, 0x80 | 0x81 | 0x83) {
+    // These groups live in the *primary* map only; the two-byte map reuses the
+    // same opcode bytes for unrelated instructions (e.g. `0F 80` is `JO rel16`).
+    let mnemonic = if two_byte {
+        def.mnemonic
+    } else if matches!(opcode, 0x80 | 0x81 | 0x83) {
         match modrm.map(|m| m.reg) {
             Some(0) => "ADD",
             Some(1) => "OR",
@@ -1959,6 +1963,114 @@ mod tests {
         // Truncated 32-bit forms still fail cleanly.
         assert_eq!(
             decode_with_mode(&[0xE9, 0x00, 0x10, 0x00], DecodeMode::DEFAULT32),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    /// Intel SDM Vol. 2 "Jcc" (near form): `0F 80`+cc takes a rel16 under a
+    /// 16-bit operand size and a rel32 under a 32-bit one, in both code-segment
+    /// defaults. The primary-map Group 1 opcodes `80`/`81`/`83` must not leak
+    /// their ModR/M.reg mnemonics into the two-byte map.
+    #[test]
+    fn decode_jcc_near_rel16_rel32() {
+        const MNEMONICS: [&str; 16] = [
+            "JO", "JNO", "JB", "JAE", "JE", "JNE", "JBE", "JA", "JS", "JNS", "JP", "JNP", "JL",
+            "JGE", "JLE", "JG",
+        ];
+        for cc in 0u8..16 {
+            let d = decode(&[0x0F, 0x80 | cc, 0x34, 0x12]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.opcode, 0x80 | cc);
+            assert_eq!(d.mnemonic, MNEMONICS[cc as usize]);
+            assert!(d.modrm.is_none());
+            assert_eq!(d.immediate, 0x1234);
+            assert_eq!(d.length, 4);
+            assert!(!d.operand_size_32);
+        }
+
+        // Negative rel16 sign-extends.
+        let d = decode(&[0x0F, 0x85, 0x8E, 0xF9]).unwrap(); // SeaBIOS reset-vector JNZ
+        assert_eq!(d.mnemonic, "JNE");
+        assert_eq!(d.immediate, -1650);
+        assert_eq!(d.length, 4);
+
+        // 66 0F 8x cd — rel32 under a 16-bit code segment.
+        let d = decode(&[0x66, 0x0F, 0x84, 0x78, 0x56, 0x34, 0x12]).unwrap();
+        assert_eq!(d.mnemonic, "JE");
+        assert!(d.operand_size_32);
+        assert_eq!(d.immediate, 0x1234_5678);
+        assert_eq!(d.length, 7);
+
+        // D=1 defaults to rel32; 0x66 selects rel16.
+        let d =
+            decode_with_mode(&[0x0F, 0x8F, 0x00, 0x10, 0x00, 0x00], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.mnemonic, "JG");
+        assert!(d.operand_size_32);
+        assert_eq!(d.immediate, 0x1000);
+        assert_eq!(d.length, 6);
+        let d = decode_with_mode(&[0x66, 0x0F, 0x8F, 0x00, 0x10], DecodeMode::DEFAULT32).unwrap();
+        assert!(!d.operand_size_32);
+        assert_eq!(d.immediate, 0x1000);
+        assert_eq!(d.length, 5);
+
+        // Truncated displacements fail cleanly in both widths.
+        assert_eq!(decode(&[0x0F, 0x85, 0x00]), Err(DecodeError::Truncated));
+        assert_eq!(
+            decode(&[0x66, 0x0F, 0x85, 0x00, 0x00, 0x00]),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    /// Intel SDM Vol. 2 "SETcc": `0F 90`+cc /r always has a byte destination,
+    /// register or memory, and the operand-size prefix does not change it.
+    #[test]
+    fn decode_setcc_rm8() {
+        const MNEMONICS: [&str; 16] = [
+            "SETO", "SETNO", "SETB", "SETAE", "SETE", "SETNE", "SETBE", "SETA", "SETS", "SETNS",
+            "SETP", "SETNP", "SETL", "SETGE", "SETLE", "SETG",
+        ];
+        for cc in 0u8..16 {
+            // mod=11, rm=0 → AL.
+            let d = decode(&[0x0F, 0x90 | cc, 0xC0]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.opcode, 0x90 | cc);
+            assert_eq!(d.mnemonic, MNEMONICS[cc as usize]);
+            assert_eq!(d.modrm.unwrap().mod_, 3);
+            assert_eq!(d.modrm.unwrap().rm, 0);
+            assert_eq!(d.length, 3);
+        }
+
+        // Legacy high-byte register form (rm=7 → BH).
+        let d = decode(&[0x0F, 0x94, 0xC7]).unwrap();
+        assert_eq!(d.modrm.unwrap().rm, 7);
+        assert_eq!(d.length, 3);
+
+        // ModR/M.reg is not used by SETcc; a nonzero reg still decodes.
+        let d = decode(&[0x0F, 0x94, 0xF8]).unwrap();
+        assert_eq!(d.mnemonic, "SETE");
+        assert_eq!(d.modrm.unwrap().reg, 7);
+
+        // 0F 95 06 00 40 = SETNE byte [0x4000]
+        let d = decode(&[0x0F, 0x95, 0x06, 0x00, 0x40]).unwrap();
+        assert_eq!(d.mnemonic, "SETNE");
+        assert_eq!(d.modrm.unwrap().mod_, 0);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.length, 5);
+
+        // 0x66 does not add an operand; the destination stays a byte.
+        let d = decode(&[0x66, 0x0F, 0x9F, 0xC3]).unwrap();
+        assert_eq!(d.mnemonic, "SETG");
+        assert_eq!(d.length, 4);
+
+        // D=1 selects 32-bit addressing for the memory form (SIB decoded).
+        let d = decode_with_mode(&[0x0F, 0x94, 0x44, 0x24, 0x08], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.sib, Some(0x24));
+        assert_eq!(d.displacement, 8);
+        assert_eq!(d.length, 5);
+
+        assert_eq!(decode(&[0x0F, 0x94]), Err(DecodeError::Truncated));
+        assert_eq!(
+            decode(&[0x0F, 0x95, 0x06, 0x00]),
             Err(DecodeError::Truncated)
         );
     }

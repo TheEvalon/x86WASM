@@ -2692,32 +2692,41 @@ fn grp2_u32(cpu: &mut CpuState, reg: u8, mut val: u32, raw_count: u8) -> Result<
     }
 }
 
-/// Short Jcc condition for opcodes 0x70–0x7F (Intel SDM Vol. 2, Jcc).
-fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
+/// Evaluate an x86 condition code against the current `EFLAGS`.
+///
+/// `cc` is the low nibble shared by the short `Jcc` (`70`+cc), the near `Jcc`
+/// (`0F 80`+cc), and `SETcc` (`0F 90`+cc) encodings, so all three forms select
+/// the condition through this one helper.
+/// Spec: Intel SDM Vol. 2 "Jcc"/"SETcc"; Appendix B (condition-code encodings).
+fn condition_code(cpu: &CpuState, cc: u8) -> bool {
     let cf = cpu.rflags & 1 != 0;
     let pf = cpu.rflags & (1 << 2) != 0;
     let zf = cpu.rflags & (1 << 6) != 0;
     let sf = cpu.rflags & (1 << 7) != 0;
     let of = cpu.rflags & (1 << 11) != 0;
-    match opcode {
-        0x70 => of,                // JO
-        0x71 => !of,               // JNO
-        0x72 => cf,                // JB / JC / JNAE
-        0x73 => !cf,               // JAE / JNB / JNC
-        0x74 => zf,                // JE / JZ
-        0x75 => !zf,               // JNE / JNZ
-        0x76 => cf || zf,          // JBE / JNA
-        0x77 => !cf && !zf,        // JA / JNBE
-        0x78 => sf,                // JS
-        0x79 => !sf,               // JNS
-        0x7A => pf,                // JP / JPE
-        0x7B => !pf,               // JNP / JPO
-        0x7C => sf != of,          // JL / JNGE
-        0x7D => sf == of,          // JGE / JNL
-        0x7E => zf || (sf != of),  // JLE / JNG
-        0x7F => !zf && (sf == of), // JG / JNLE
-        _ => false,
+    match cc & 0x0F {
+        0x0 => of,               // O
+        0x1 => !of,              // NO
+        0x2 => cf,               // B / C / NAE
+        0x3 => !cf,              // AE / NB / NC
+        0x4 => zf,               // E / Z
+        0x5 => !zf,              // NE / NZ
+        0x6 => cf || zf,         // BE / NA
+        0x7 => !cf && !zf,       // A / NBE
+        0x8 => sf,               // S
+        0x9 => !sf,              // NS
+        0xA => pf,               // P / PE
+        0xB => !pf,              // NP / PO
+        0xC => sf != of,         // L / NGE
+        0xD => sf == of,         // GE / NL
+        0xE => zf || (sf != of), // LE / NG
+        _ => !zf && (sf == of),  // G / NLE
     }
+}
+
+/// Short Jcc condition for opcodes 0x70–0x7F (Intel SDM Vol. 2, Jcc).
+fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
+    condition_code(cpu, opcode)
 }
 
 /// Primary opcodes that are architectural `#UD` in real-address mode when the
@@ -3292,6 +3301,36 @@ fn step_two_byte(
                 2..=4 => Err(ExecError::Unsupported(0x22)),
                 _ => real_mode_ud(cpu, bus),
             }
+        }
+        0x80..=0x8F => {
+            // Jcc rel16/rel32 (near) — Spec: Intel SDM Vol. 2 "Jcc—Jump if
+            // Condition Is Met". The displacement is relative to the next
+            // instruction and follows the operand-size attribute; a 16-bit
+            // operand size clears `EIP[31:16]` (shared `near_branch_target`).
+            // Flags are not modified. The `CS`-limit check for the target
+            // happens on the next instruction fetch.
+            // Unsupported here: `rel32` under a `D=0` code segment commits only
+            // `IP` (the shared `set_current_ip` window), and 64-bit mode.
+            if condition_code(cpu, insn.opcode) {
+                set_current_ip(
+                    cpu,
+                    near_branch_target(next_ip, insn.immediate, opsz32(insn)),
+                );
+            } else {
+                set_current_ip(cpu, next_ip);
+            }
+            Ok(())
+        }
+        0x90..=0x9F => {
+            // SETcc r/m8 — Spec: Intel SDM Vol. 2 "SETcc—Set Byte on
+            // Condition": `IF condition THEN DEST := 1 ELSE DEST := 0`.
+            // The destination is always a byte (register form covers the
+            // legacy high-byte encodings AH/CH/DH/BH); ModR/M.reg is not used
+            // and no flags are affected.
+            let value = u8::from(condition_code(cpu, insn.opcode));
+            write_rm_u8(cpu, bus, insn, value)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
         }
         0xAF => {
             // IMUL r16, r/m16 / IMUL r32, r/m32 — Spec: Intel SDM Vol. 2 "IMUL".
@@ -10007,7 +10046,7 @@ mod tests {
             mem[6 * 4 + 2] = 0x00;
             mem[6 * 4 + 3] = 0x00;
             mem[0] = 0x0F;
-            mem[1] = 0x90; // not in 0F map
+            mem[1] = 0x10; // MOVUPS — valid SSE encoding, not in this 0F map
             let mut cpu = CpuState::reset();
             cpu.cs = x86_core::SegmentReg::real_mode_code(0);
             cpu.ss = x86_core::SegmentReg::real_mode(0);
@@ -10016,7 +10055,7 @@ mod tests {
             let mut bus = VecBus { mem, ports: vec![] };
             let err = step(&mut cpu, &mut bus).unwrap_err();
             assert!(
-                matches!(err, ExecError::Decode(DecodeError::UnsupportedOpcode(0x90))),
+                matches!(err, ExecError::Decode(DecodeError::UnsupportedOpcode(0x10))),
                 "unimplemented 0F map entry should remain Decode/UnsupportedOpcode(secondary), got {err:?}"
             );
             assert_eq!(cpu.ip16(), 0, "IP must not advance on host decode miss");
@@ -17769,5 +17808,206 @@ mod tests {
 
         assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
         assert_eq!(cpu, before);
+    }
+
+    // ----------------------------------------------------------------------
+    // Milestone 2 round 2 — two-byte `0F` map (`docs/cpu-0f-map.md`).
+    // ----------------------------------------------------------------------
+
+    /// Execute one real-mode instruction from `code` at `CS:0000` with the
+    /// given `EFLAGS`, returning the CPU and bus afterwards.
+    fn run_real_mode_once(code: &[u8], flags: u64) -> (CpuState, VecBus) {
+        let mut mem = vec![0u8; 0x10000];
+        mem[..code.len()].copy_from_slice(code);
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.rflags = flags;
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        (cpu, bus)
+    }
+
+    /// The 32 architecturally meaningful `EFLAGS` combinations of CF/PF/ZF/SF/OF,
+    /// with bit 1 reserved-one set. Spec: Intel SDM Vol. 1 §3.4.3.
+    fn condition_flag_combinations() -> impl Iterator<Item = u64> {
+        (0u64..32).map(|bits| {
+            0x0002
+                | (bits & 1)
+                | ((bits >> 1) & 1) << 2
+                | ((bits >> 2) & 1) << 6
+                | ((bits >> 3) & 1) << 7
+                | ((bits >> 4) & 1) << 11
+        })
+    }
+
+    /// Intel SDM Vol. 2 "Jcc" and Appendix B (condition-code encodings): the
+    /// near `0F 80`+cc map selects exactly the same condition as the
+    /// already-validated short `70`+cc form for every condition code and every
+    /// CF/PF/ZF/SF/OF combination, and neither form writes flags.
+    #[test]
+    fn jcc_near_condition_matches_short_form_for_every_flag_combination() {
+        for cc in 0u8..16 {
+            for flags in condition_flag_combinations() {
+                // 70+cc 10 — short form, +0x10 from the 2-byte next IP.
+                let (short_cpu, _) = run_real_mode_once(&[0x70 | cc, 0x10], flags);
+                let taken = match short_cpu.ip16() {
+                    0x12 => true,
+                    0x02 => false,
+                    other => panic!("cc {cc:#x} flags {flags:#x}: short IP {other:#06X}"),
+                };
+
+                // 0F 80+cc 10 00 — near rel16, +0x10 from the 4-byte next IP.
+                let (near_cpu, _) = run_real_mode_once(&[0x0F, 0x80 | cc, 0x10, 0x00], flags);
+                assert_eq!(
+                    near_cpu.ip16(),
+                    if taken { 0x14 } else { 0x04 },
+                    "cc {cc:#x} flags {flags:#x}"
+                );
+                assert_eq!(near_cpu.rflags, flags, "Jcc must not write flags");
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "Jcc" (Operation): a negative rel16 wraps inside the
+    /// 16-bit `IP` window under a `D=0` code segment.
+    #[test]
+    fn jcc_near_rel16_backward_displacement_wraps_in_16_bit_window() {
+        let mut mem = vec![0u8; 0x10000];
+        // 0F 85 8E F9 = JNZ -1650 — the SeaBIOS reset-vector branch shape.
+        mem[0x1000..0x1004].copy_from_slice(&[0x0F, 0x85, 0x8E, 0xF9]);
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0x1000;
+        cpu.set_zf(false);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 0x1004u16.wrapping_sub(1650));
+
+        // Taken-with-wrap below zero stays inside the 16-bit window.
+        let (cpu, _) = run_real_mode_once(&[0x0F, 0x85, 0xF0, 0xFF], 0x0002);
+        assert_eq!(cpu.ip16(), 0xFFF4);
+    }
+
+    /// Intel SDM Vol. 2 "Jcc" (Operation): "If the operand-size attribute is
+    /// 16, the upper two bytes of the EIP register are cleared." Under `CS.D=1`
+    /// a `0x66`-prefixed near Jcc must therefore drop `EIP[31:16]`.
+    #[test]
+    fn jcc_near_rel16_clears_eip_high_bits_under_default32() {
+        // 66 0F 85 00 00 = JNZ rel16 +0 (5 bytes) at EIP 0x0002_1000.
+        let (mut cpu, mut bus) =
+            pm32_fixture(&[0x66, 0x0F, 0x85, 0x00, 0x00], PM32_HIGH_CODE, true);
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, u64::from((PM32_HIGH_CODE as u32 + 5) & 0xFFFF));
+
+        // Not taken: the sequential next EIP keeps its high bits.
+        let (mut cpu, mut bus) =
+            pm32_fixture(&[0x66, 0x0F, 0x85, 0x00, 0x00], PM32_HIGH_CODE, true);
+        cpu.set_zf(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, (PM32_HIGH_CODE + 5) as u64);
+    }
+
+    /// Intel SDM Vol. 2 "Jcc" (near, rel32): under `CS.D=1` the default
+    /// displacement is 32 bits and reaches targets outside the 16-bit window.
+    #[test]
+    fn jcc_near_rel32_reaches_beyond_16_bit_window_under_default32() {
+        // 0F 84 cd = JZ rel32 (6 bytes) from PM32_CODE to PM32_HIGH_CODE.
+        let disp = (PM32_HIGH_CODE as i32) - (PM32_CODE as i32 + 6);
+        let mut code = vec![0x0F, 0x84];
+        code.extend_from_slice(&disp.to_le_bytes());
+
+        let (mut cpu, mut bus) = pm32_fixture(&code, PM32_CODE, true);
+        cpu.set_zf(true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, PM32_HIGH_CODE as u64);
+
+        let (mut cpu, mut bus) = pm32_fixture(&code, PM32_CODE, true);
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, (PM32_CODE + 6) as u64);
+    }
+
+    /// Intel SDM Vol. 2 "SETcc": `DEST := 1` when the condition holds and `0`
+    /// otherwise, for every condition code and flag combination, with the
+    /// condition agreeing with the short `Jcc` form and no flags written.
+    #[test]
+    fn setcc_condition_matches_short_jcc_for_every_flag_combination() {
+        for cc in 0u8..16 {
+            for flags in condition_flag_combinations() {
+                let (short_cpu, _) = run_real_mode_once(&[0x70 | cc, 0x10], flags);
+                let taken = short_cpu.ip16() == 0x12;
+
+                // 0F 90+cc C0 = SETcc AL.
+                let (cpu, _) = run_real_mode_once(&[0x0F, 0x90 | cc, 0xC0], flags);
+                assert_eq!(cpu.al(), u8::from(taken), "cc {cc:#x} flags {flags:#x}");
+                assert_eq!(cpu.rflags, flags, "SETcc must not write flags");
+                assert_eq!(cpu.ip16(), 3);
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SETcc": the byte destination may be any legacy 8-bit
+    /// register, including the high-byte encodings AH/CH/DH/BH, and only that
+    /// byte changes.
+    #[test]
+    fn setcc_writes_legacy_low_and_high_byte_registers() {
+        // 0F 94 C7 = SETE BH (mod=11, rm=7).
+        let mut mem = vec![0u8; 0x10000];
+        mem[..3].copy_from_slice(&[0x0F, 0x94, 0xC7]);
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.gpr[CpuState::RBX] = 0x1111_2222_3333_4455;
+        cpu.set_zf(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RBX], 0x1111_2222_3333_0155);
+
+        // 0F 95 C1 = SETNE CL (mod=11, rm=1) — low byte only.
+        let mut mem = vec![0u8; 0x10000];
+        mem[..3].copy_from_slice(&[0x0F, 0x95, 0xC1]);
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.rip = 0;
+        cpu.gpr[CpuState::RCX] = 0xAAAA_BBBB_CCCC_DDEE;
+        cpu.set_zf(true);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RCX], 0xAAAA_BBBB_CCCC_DD00);
+    }
+
+    /// Intel SDM Vol. 2 "SETcc": the memory form writes exactly one byte at the
+    /// effective address, in both the 16-bit and the `D=1` 32-bit addressing
+    /// modes.
+    #[test]
+    fn setcc_memory_form_writes_one_byte() {
+        // 0F 95 06 00 40 = SETNE byte [0x4000] (16-bit addressing).
+        let mut mem = vec![0u8; 0x10000];
+        mem[..5].copy_from_slice(&[0x0F, 0x95, 0x06, 0x00, 0x40]);
+        mem[0x4000] = 0xAA;
+        mem[0x4001] = 0xBB;
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        cpu.set_zf(false);
+        let mut bus = VecBus { mem, ports: vec![] };
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 1);
+        assert_eq!(bus.read_u8(0x4001).unwrap(), 0xBB);
+        assert_eq!(cpu.ip16(), 5);
+
+        // 0F 94 05 disp32 = SETE byte [disp32] under CS.D=1.
+        let mut code = vec![0x0F, 0x94, 0x05];
+        code.extend_from_slice(&(PM32_DATA as u32).to_le_bytes());
+        let (mut cpu, mut bus) = pm32_fixture(&code, PM32_CODE, true);
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(PM32_DATA as u64).unwrap(), 0);
+        assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
     }
 }
