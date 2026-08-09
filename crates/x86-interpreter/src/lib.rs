@@ -952,80 +952,126 @@ fn write_rm_u32(
     }
 }
 
+/// Stack-address size selected by the cached `SS.B` bit.
+///
+/// The `0x67` address-size prefix applies to memory operands, **not** to the
+/// stack pointer. Spec: Intel SDM Vol. 1 §6.2.2; Vol. 3 §3.4.5.1 (B flag).
+fn stack_addr_size_32(cpu: &CpuState) -> bool {
+    cpu.ss.default_big()
+}
+
+/// Current stack pointer within the `SS.B` window (`ESP` or zero-extended `SP`).
+fn stack_pointer(cpu: &CpuState) -> u32 {
+    if stack_addr_size_32(cpu) {
+        cpu.gpr_u32(CpuState::RSP)
+    } else {
+        u32::from(cpu.gpr_u16(CpuState::RSP))
+    }
+}
+
+/// Commit a stack pointer within the `SS.B` window.
+///
+/// `B=0` writes only `SP`, preserving `ESP[31:16]` exactly as the legacy
+/// 16-bit path did.
+fn set_stack_pointer(cpu: &mut CpuState, value: u32) {
+    if stack_addr_size_32(cpu) {
+        cpu.set_gpr_u32(CpuState::RSP, value);
+    } else {
+        cpu.set_gpr_u16(CpuState::RSP, value as u16);
+    }
+}
+
+/// Step a stack pointer, wrapping modulo 2^32 (`B=1`) or 2^16 (`B=0`).
+fn stack_step(cpu: &CpuState, base: u32, delta: i32) -> u32 {
+    let stepped = base.wrapping_add(delta as u32);
+    if stack_addr_size_32(cpu) {
+        stepped
+    } else {
+        u32::from(stepped as u16)
+    }
+}
+
 /// Stack push without `#SS` classification (used by IVT delivery itself).
 fn push16_unchecked(cpu: &mut CpuState, bus: &mut dyn Bus, val: u16) -> Result<(), ExecError> {
-    let old_sp = cpu.gpr_u16(CpuState::RSP);
-    let sp = old_sp.wrapping_sub(2);
-    cpu.set_gpr_u16(CpuState::RSP, sp);
+    let old_sp = stack_pointer(cpu);
+    let sp = stack_step(cpu, old_sp, -2);
+    set_stack_pointer(cpu, sp);
     let addr = linear_addr(&cpu.ss, u64::from(sp));
     match bus.write_u16(addr, val) {
         Ok(()) => Ok(()),
         Err(e) => {
-            cpu.set_gpr_u16(CpuState::RSP, old_sp);
+            set_stack_pointer(cpu, old_sp);
             Err(e)
         }
     }
 }
 
 fn push16(cpu: &mut CpuState, bus: &mut dyn Bus, val: u16) -> Result<(), ExecError> {
-    let old_sp = cpu.gpr_u16(CpuState::RSP);
-    let sp = old_sp.wrapping_sub(2);
-    // Limit check before mutating SP (SDM Vol. 3 §5.3 / §6.15 #SS).
+    let old_sp = stack_pointer(cpu);
+    let sp = stack_step(cpu, old_sp, -2);
+    // Limit check before mutating SP/ESP (SDM Vol. 3 §5.3 / §6.15 #SS).
     seg_linear_checked(&cpu.ss, u64::from(sp), 2, true)?;
-    cpu.set_gpr_u16(CpuState::RSP, sp);
+    set_stack_pointer(cpu, sp);
     let addr = linear_addr(&cpu.ss, u64::from(sp));
     match bus.write_u16(addr, val) {
         Ok(()) => Ok(()),
         Err(e) => {
-            cpu.set_gpr_u16(CpuState::RSP, old_sp);
+            set_stack_pointer(cpu, old_sp);
             Err(classify_mem_fault(e, true))
         }
     }
 }
 
-/// Read a 16-bit stack value and calculate the next bounded SP without
+/// Read a 16-bit stack value and calculate the next bounded SP/ESP without
 /// committing either. Segment-register POP uses this to validate the target
 /// descriptor before any architectural update.
-fn peek_pop16(cpu: &CpuState, bus: &mut dyn Bus) -> Result<(u16, u16), ExecError> {
-    let sp = cpu.gpr_u16(CpuState::RSP);
+fn peek_pop16(cpu: &CpuState, bus: &mut dyn Bus) -> Result<(u16, u32), ExecError> {
+    let sp = stack_pointer(cpu);
     let addr = seg_linear_checked(&cpu.ss, u64::from(sp), 2, true)?;
     let v = bus
         .read_u16(addr)
         .map_err(|e| classify_mem_fault(e, true))?;
-    Ok((v, sp.wrapping_add(2)))
+    Ok((v, stack_step(cpu, sp, 2)))
 }
 
 fn pop16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u16, ExecError> {
     let (v, next_sp) = peek_pop16(cpu, bus)?;
-    cpu.set_gpr_u16(CpuState::RSP, next_sp);
+    set_stack_pointer(cpu, next_sp);
     Ok(v)
 }
 
-/// PUSH with 32-bit operand size; address-size 16 still uses SP (decrement by 4).
-/// Spec: Intel SDM Vol. 2 "PUSH"; Vol. 1 §3.6.
+/// PUSH with 32-bit operand size; the pointer width follows `SS.B`.
+/// Spec: Intel SDM Vol. 2 "PUSH"; Vol. 1 §§3.6, 6.2.2.
 fn push32(cpu: &mut CpuState, bus: &mut dyn Bus, val: u32) -> Result<(), ExecError> {
-    let old_sp = cpu.gpr_u16(CpuState::RSP);
-    let sp = old_sp.wrapping_sub(4);
+    let old_sp = stack_pointer(cpu);
+    let sp = stack_step(cpu, old_sp, -4);
     seg_linear_checked(&cpu.ss, u64::from(sp), 4, true)?;
-    cpu.set_gpr_u16(CpuState::RSP, sp);
+    set_stack_pointer(cpu, sp);
     let addr = linear_addr(&cpu.ss, u64::from(sp));
     match bus.write_u32(addr, val) {
         Ok(()) => Ok(()),
         Err(e) => {
-            cpu.set_gpr_u16(CpuState::RSP, old_sp);
+            set_stack_pointer(cpu, old_sp);
             Err(classify_mem_fault(e, true))
         }
     }
 }
 
 fn pop32(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<u32, ExecError> {
-    let sp = cpu.gpr_u16(CpuState::RSP);
+    let sp = stack_pointer(cpu);
     let addr = seg_linear_checked(&cpu.ss, u64::from(sp), 4, true)?;
     let v = bus
         .read_u32(addr)
         .map_err(|e| classify_mem_fault(e, true))?;
-    cpu.set_gpr_u16(CpuState::RSP, sp.wrapping_add(4));
+    set_stack_pointer(cpu, stack_step(cpu, sp, 4));
     Ok(v)
+}
+
+/// Release `count` bytes from the stack after a `RET`/`RETF` immediate.
+/// Spec: Intel SDM Vol. 2 "RET" (near/far imm16).
+fn stack_release(cpu: &mut CpuState, count: u16) {
+    let sp = stack_step(cpu, stack_pointer(cpu), i32::from(count));
+    set_stack_pointer(cpu, sp);
 }
 
 /// ModRM.reg → segment register index for MOV Sreg forms (SDM Vol. 2, MOV).
@@ -1488,6 +1534,9 @@ fn write_sreg(
 fn pop_sreg16(cpu: &mut CpuState, bus: &mut dyn Bus, sreg: u8) -> Result<(), ExecError> {
     debug_assert!(matches!(sreg, 0 | 2 | 3));
     let (selector, next_sp) = peek_pop16(cpu, bus)?;
+    // POP SS pops through the *old* stack segment, so the pointer width for the
+    // committed SP/ESP is the old `SS.B` (SDM Vol. 2 POP, Operation).
+    let old_stack_addr_size_32 = stack_addr_size_32(cpu);
     let protected_cache = if cr0_pe(cpu) {
         Some(match sreg {
             0 | 3 => prepare_data_sreg_from_gdt(cpu, bus, selector)?,
@@ -1507,7 +1556,11 @@ fn pop_sreg16(cpu: &mut CpuState, bus: &mut dyn Bus, sreg: u8) -> Result<(), Exe
         (3, None) => cpu.ds.load_real_mode_selector(selector),
         _ => unreachable!(),
     }
-    cpu.set_gpr_u16(CpuState::RSP, next_sp);
+    if old_stack_addr_size_32 {
+        cpu.set_gpr_u32(CpuState::RSP, next_sp);
+    } else {
+        cpu.set_gpr_u16(CpuState::RSP, next_sp as u16);
+    }
     Ok(())
 }
 
@@ -3503,8 +3556,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             } else {
                 u32::from(pop16(cpu, bus)?)
             };
-            let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
-            cpu.set_gpr_u16(CpuState::RSP, sp);
+            stack_release(cpu, release);
             set_current_ip(cpu, near_absolute_target(target, opsz32(&insn)));
         }
         0xC3 => {
@@ -3629,15 +3681,13 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if opsz32(&insn) {
                 let eip = pop32(cpu, bus)?;
                 let cs_sel = pop16(cpu, bus)?;
-                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
-                cpu.set_gpr_u16(CpuState::RSP, sp);
+                stack_release(cpu, release);
                 cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
                 cpu.set_ip16(eip as u16);
             } else {
                 let ip = pop16(cpu, bus)?;
                 let cs_sel = pop16(cpu, bus)?;
-                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_add(release);
-                cpu.set_gpr_u16(CpuState::RSP, sp);
+                stack_release(cpu, release);
                 cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
                 cpu.set_ip16(ip);
             }
@@ -3660,65 +3710,72 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xC8 => {
             // ENTER/ENTERD iw, ib — nesting level = imm8 mod 32.
-            // Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §6.5 / §3.6; Ch. 2 (66H).
-            // Address-size 16: SP/BP used for stack walks; opsize selects word vs dword.
-            // Unsupported here: address-size 32 (0x67 → ESP/EBP stack; push helpers
-            // are SP-only); asize 64; protected-mode.
-            if asize32(&insn) {
-                return Err(ExecError::Unsupported(op));
-            }
+            // Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §§6.5, 6.2.2; Ch. 2 (66H).
+            // The operand size selects the pushed width and the BP/EBP frame
+            // register; the stack pointer follows `SS.B` (the `0x67`
+            // address-size prefix does not change the stack address size).
+            // Unsupported here: 64-bit stacks (RBP/RSP).
             let alloc = insn.immediate as u16;
             let nesting = (insn.displacement as u8) & 0x1F;
-            if opsz32(&insn) {
+            let op32 = opsz32(&insn);
+            if op32 {
                 push32(cpu, bus, cpu.gpr_u32(CpuState::RBP))?;
-                let frame_temp = cpu.gpr_u32(CpuState::RSP);
-                if nesting > 0 {
-                    for _ in 1..nesting {
-                        let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(4);
+            } else {
+                push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
+            }
+            let frame_temp = stack_pointer(cpu);
+            if nesting > 0 {
+                // Copy nesting-1 display pointers from the caller's frame, then
+                // push frame_temp (current procedure's frame pointer for LEAVE).
+                let step = if op32 { 4u64 } else { 2 };
+                for _ in 1..nesting {
+                    let bp = if op32 {
+                        let bp = cpu.gpr_u32(CpuState::RBP).wrapping_sub(step as u32);
+                        cpu.set_gpr_u32(CpuState::RBP, bp);
+                        u64::from(bp)
+                    } else {
+                        let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(step as u16);
                         cpu.set_gpr_u16(CpuState::RBP, bp);
-                        let addr = seg_linear_checked(&cpu.ss, u64::from(bp), 4, true)?;
+                        u64::from(bp)
+                    };
+                    let addr = seg_linear_checked(&cpu.ss, bp, step, true)?;
+                    if op32 {
                         let display = bus
                             .read_u32(addr)
                             .map_err(|e| classify_mem_fault(e, true))?;
                         push32(cpu, bus, display)?;
-                    }
-                    push32(cpu, bus, frame_temp)?;
-                }
-                cpu.set_gpr_u32(CpuState::RBP, frame_temp);
-                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(alloc);
-                cpu.set_gpr_u16(CpuState::RSP, sp);
-            } else {
-                push16(cpu, bus, cpu.gpr_u16(CpuState::RBP))?;
-                let frame_temp = cpu.gpr_u16(CpuState::RSP);
-                if nesting > 0 {
-                    // Copy nesting-1 display pointers from the caller's frame, then
-                    // push frame_temp (current procedure's frame pointer for LEAVE).
-                    for _ in 1..nesting {
-                        let bp = cpu.gpr_u16(CpuState::RBP).wrapping_sub(2);
-                        cpu.set_gpr_u16(CpuState::RBP, bp);
-                        let addr = seg_linear_checked(&cpu.ss, u64::from(bp), 2, true)?;
+                    } else {
                         let display = bus
                             .read_u16(addr)
                             .map_err(|e| classify_mem_fault(e, true))?;
                         push16(cpu, bus, display)?;
                     }
-                    push16(cpu, bus, frame_temp)?;
                 }
-                cpu.set_gpr_u16(CpuState::RBP, frame_temp);
-                let sp = cpu.gpr_u16(CpuState::RSP).wrapping_sub(alloc);
-                cpu.set_gpr_u16(CpuState::RSP, sp);
+                if op32 {
+                    push32(cpu, bus, frame_temp)?;
+                } else {
+                    push16(cpu, bus, frame_temp as u16)?;
+                }
             }
+            if op32 {
+                cpu.set_gpr_u32(CpuState::RBP, frame_temp);
+            } else {
+                cpu.set_gpr_u16(CpuState::RBP, frame_temp as u16);
+            }
+            let sp = stack_step(cpu, stack_pointer(cpu), -i32::from(alloc));
+            set_stack_pointer(cpu, sp);
             set_current_ip(cpu, next_ip);
         }
         0xC9 => {
-            // LEAVE — Spec: Intel SDM Vol. 2 "LEAVE"; Ch. 2 (66H).
-            // Address-size 16: SP ← BP; opsize selects BP vs EBP pop width.
-            // Unsupported here: address-size 32 (0x67 → ESP←EBP); asize 64.
-            if asize32(&insn) {
-                return Err(ExecError::Unsupported(op));
-            }
-            let bp = cpu.gpr_u16(CpuState::RBP);
-            cpu.set_gpr_u16(CpuState::RSP, bp);
+            // LEAVE — Spec: Intel SDM Vol. 2 "LEAVE"; Vol. 1 §6.2.2; Ch. 2 (66H).
+            // `SS.B` selects `ESP ← EBP` vs `SP ← BP`; the operand size selects
+            // the popped frame-pointer width. Unsupported: 64-bit stacks.
+            let bp = if stack_addr_size_32(cpu) {
+                cpu.gpr_u32(CpuState::RBP)
+            } else {
+                u32::from(cpu.gpr_u16(CpuState::RBP))
+            };
+            set_stack_pointer(cpu, bp);
             if opsz32(&insn) {
                 let v = pop32(cpu, bus)?;
                 cpu.set_gpr_u32(CpuState::RBP, v);
@@ -4453,14 +4510,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0x60 => {
             // PUSHA/PUSHAD — push AX…DI / EAX…EDI; Temp = SP/ESP before pushes.
             // Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD"; Ch. 2 (66H).
-            // Address-size 16: Temp ← SP (zero-extended into dword slot for PUSHAD).
-            // Unsupported here: address-size 32 (0x67 → ESP stack / Temp←ESP);
-            // asize 64. Stack push helpers remain SP-only in this slice.
-            if asize32(&insn) {
-                return Err(ExecError::Unsupported(op));
-            }
+            // `Temp` is the stack pointer before the first push: ESP when
+            // `SS.B=1`, otherwise SP (zero-extended into the PUSHAD slot).
+            // The `0x67` address-size prefix does not change the stack address
+            // size. Unsupported here: 64-bit stacks (RSP).
             if opsz32(&insn) {
-                let temp = u32::from(cpu.gpr_u16(CpuState::RSP));
+                let temp = stack_pointer(cpu);
                 push32(cpu, bus, cpu.gpr_u32(CpuState::RAX))?;
                 push32(cpu, bus, cpu.gpr_u32(CpuState::RCX))?;
                 push32(cpu, bus, cpu.gpr_u32(CpuState::RDX))?;
@@ -4470,7 +4525,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 push32(cpu, bus, cpu.gpr_u32(CpuState::RSI))?;
                 push32(cpu, bus, cpu.gpr_u32(CpuState::RDI))?;
             } else {
-                let sp0 = cpu.gpr_u16(CpuState::RSP);
+                let sp0 = stack_pointer(cpu) as u16;
                 push16(cpu, bus, cpu.gpr_u16(CpuState::RAX))?;
                 push16(cpu, bus, cpu.gpr_u16(CpuState::RCX))?;
                 push16(cpu, bus, cpu.gpr_u16(CpuState::RDX))?;
@@ -4484,11 +4539,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x61 => {
             // POPA/POPAD — pop DI…AX / EDI…EAX; discard saved SP/ESP slot.
-            // Spec: Intel SDM Vol. 2 "POPA/POPAD"; Ch. 2 (66H).
-            // Unsupported here: address-size 32 (0x67 → ESP stack); asize 64.
-            if asize32(&insn) {
-                return Err(ExecError::Unsupported(op));
-            }
+            // Spec: Intel SDM Vol. 2 "POPA/POPAD"; Vol. 1 §6.2.2; Ch. 2 (66H).
+            // The stack pointer follows `SS.B`; `0x67` does not change it.
+            // Unsupported here: 64-bit stacks (RSP).
             if opsz32(&insn) {
                 let di = pop32(cpu, bus)?;
                 let si = pop32(cpu, bus)?;
@@ -15480,10 +15533,11 @@ mod tests {
         assert!(!cpu.interrupt_flag());
     }
 
-    /// ENTER with address-size override (0x67) is Unsupported — needs ESP stack path.
-    /// Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §3.6 (stack address-size).
+    /// The `0x67` address-size override applies to memory operands, not to the
+    /// stack address size, so ENTER on a `B=0` stack still uses SP/BP.
+    /// Spec: Intel SDM Vol. 2 "ENTER"; Vol. 1 §§3.6, 6.2.2; Vol. 3 §3.4.5.1.
     #[test]
-    fn enter_asize32_unsupported() {
+    fn enter_ignores_address_size_override_on_16_bit_stack() {
         let mut mem = vec![0u8; 0x10000];
         // 67 C8 08 00 00 = ENTER 8, 0 with asize32
         mem[0] = 0x67;
@@ -15496,17 +15550,21 @@ mod tests {
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = 0;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_gpr_u32(CpuState::RBP, 0x1111_ABCD);
         let mut bus = VecBus { mem, ports: vec![] };
-        let err = step(&mut cpu, &mut bus).unwrap_err();
-        assert_eq!(err, ExecError::Unsupported(0xC8));
-        assert_eq!(cpu.ip16(), 0);
-        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 5);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), 0xABCD);
+        assert_eq!(cpu.gpr_u32(CpuState::RBP), 0x1111_FFFC);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF4);
     }
 
-    /// PUSHA with address-size override (0x67) is Unsupported — needs ESP stack path.
-    /// Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD"; Vol. 1 §3.6 (stack address-size).
+    /// The `0x67` address-size override does not change the stack address
+    /// size, so PUSHA on a `B=0` stack still steps SP.
+    /// Spec: Intel SDM Vol. 2 "PUSHA/PUSHAD"; Vol. 1 §6.2.2; Vol. 3 §3.4.5.1.
     #[test]
-    fn pusha_asize32_unsupported() {
+    fn pusha_ignores_address_size_override_on_16_bit_stack() {
         let mut mem = vec![0u8; 0x10000];
         // 67 60 = PUSHA with asize32
         mem[0] = 0x67;
@@ -15516,11 +15574,14 @@ mod tests {
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = 0;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        cpu.set_gpr_u16(CpuState::RAX, 0x1234);
         let mut bus = VecBus { mem, ports: vec![] };
-        let err = step(&mut cpu, &mut bus).unwrap_err();
-        assert_eq!(err, ExecError::Unsupported(0x60));
-        assert_eq!(cpu.ip16(), 0);
-        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFFE);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ip16(), 2);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFEE);
+        assert_eq!(bus.read_u16(0xFFFC).unwrap(), 0x1234);
+        assert_eq!(bus.read_u16(0xFFF4).unwrap(), 0xFFFE); // Temp = SP
     }
 
     const POP_SEG_STACK_BASE: usize = 0x2000;
@@ -16776,5 +16837,298 @@ mod tests {
                 reason: ProtectedModeDeliveryError::CurrentPrivilege,
             })
         );
+    }
+
+    /// Ring-0 writable `B=1` stack selector used by the 32-bit stack tests.
+    const PM32_SS32: u16 = 0x0020;
+    const PM32_TEST_ESP: u32 = 0x0002_0000;
+
+    /// `CS.D=1` fixture whose stack segment has `B=1` and a 4 GiB limit.
+    ///
+    /// Spec: Intel SDM Vol. 3 §3.4.5.1 (B flag); Vol. 1 §6.2.
+    fn pm32_big_stack_fixture(code: &[u8], entry: usize, esp: u32) -> (CpuState, VecBus) {
+        let (mut cpu, bus) = pm32_fixture(code, entry, true);
+        cpu.ss = x86_core::SegmentReg {
+            selector: PM32_SS32,
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            flags: 0xC092,
+        };
+        cpu.set_gpr_u32(CpuState::RSP, esp);
+        (cpu, bus)
+    }
+
+    /// Intel SDM Vol. 1 §6.2.2; Vol. 2 "PUSH"/"POP" (Operation, `StackAddrSize`):
+    /// with `SS.B=1` the stack pointer is the full 32-bit ESP; with `SS.B=0`
+    /// only SP changes and `ESP[31:16]` is preserved.
+    #[test]
+    fn stack_b_flag_selects_esp_or_sp() {
+        // 68 id = PUSH imm32; 58 = POP EAX.
+        let code = [0x68, 0x78, 0x56, 0x34, 0x12, 0x58];
+
+        let (mut cpu, mut bus) = pm32_big_stack_fixture(&code, PM32_CODE, PM32_TEST_ESP);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 4);
+        assert_eq!(
+            bus.read_u32(u64::from(PM32_TEST_ESP - 4)).unwrap(),
+            0x1234_5678
+        );
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 0x1234_5678);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+
+        // Same code, same ESP, but the `B=0` stack of `pm32_fixture` wraps SP.
+        let (mut cpu, mut bus) = pm32_fixture(&code, PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RSP, PM32_TEST_ESP);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), 0x0002_FFFC);
+        assert_eq!(bus.read_u32(0xFFFC).unwrap(), 0x1234_5678);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eax(), 0x1234_5678);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+    }
+
+    /// Intel SDM Vol. 3 §5.3 (limit checking) with a 32-bit stack: the pointer
+    /// wraps modulo 2^32, so a push through offset 0 leaves the segment limit
+    /// and raises `#SS(0)` without committing ESP.
+    #[test]
+    fn stack_b1_wraps_at_32_bits_and_faults_outside_the_limit() {
+        let (mut cpu, mut bus) =
+            pm32_big_stack_fixture(&[0x68, 0x78, 0x56, 0x34, 0x12], PM32_CODE, 2);
+        cpu.ss.limit = 0x0001_FFFF;
+        let before = cpu.clone();
+
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert_eq!(cpu, before, "faulting push committed ESP");
+    }
+
+    /// Intel SDM Vol. 2 "PUSHF/PUSHFD" and "POPF/POPFD": the pushed width
+    /// follows the operand size while the pointer follows `SS.B`.
+    #[test]
+    fn stack_b1_pushfd_popfd_use_esp() {
+        // 9C = PUSHFD (D=1); 9D = POPFD.
+        let (mut cpu, mut bus) = pm32_big_stack_fixture(&[0x9C, 0x9D], PM32_CODE, PM32_TEST_ESP);
+        cpu.rflags = 0x0000_0000_0000_0A57;
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 4);
+        assert_eq!(bus.read_u32(u64::from(PM32_TEST_ESP - 4)).unwrap(), 0x0A57);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+        assert_eq!(cpu.rflags & 0xFFFF, 0x0A57);
+    }
+
+    /// Intel SDM Vol. 2 "PUSHA/PUSHAD" and "POPA/POPAD": `Temp` is the stack
+    /// pointer before the first push and the saved slot is discarded on pop.
+    /// `StackAddrSize` (SS.B), not the `0x67` address-size prefix, selects ESP.
+    #[test]
+    fn stack_b1_pushad_popad_use_esp_and_ignore_address_size_prefix() {
+        for prefix in [None, Some(0x67u8)] {
+            let mut code = Vec::new();
+            if let Some(p) = prefix {
+                code.push(p);
+            }
+            code.push(0x60); // PUSHAD
+            let pushad_len = code.len();
+            if let Some(p) = prefix {
+                code.push(p);
+            }
+            code.push(0x61); // POPAD
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&code, PM32_CODE, PM32_TEST_ESP);
+            for (index, value) in [
+                0x1111_1111u32,
+                0x2222_2222,
+                0x3333_3333,
+                0x4444_4444,
+                0,
+                0x6666_6666,
+                0x7777_7777,
+                0x8888_8888,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if index != CpuState::RSP {
+                    cpu.set_gpr_u32(index, value);
+                }
+            }
+            let expected = cpu.gpr;
+
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 32);
+            assert_eq!(cpu.rip, (PM32_CODE + pushad_len) as u64);
+            // EAX…EBX, then Temp = ESP before the first push.
+            assert_eq!(
+                bus.read_u32(u64::from(PM32_TEST_ESP - 4)).unwrap(),
+                0x1111_1111
+            );
+            assert_eq!(
+                bus.read_u32(u64::from(PM32_TEST_ESP - 20)).unwrap(),
+                PM32_TEST_ESP
+            );
+            assert_eq!(
+                bus.read_u32(u64::from(PM32_TEST_ESP - 32)).unwrap(),
+                0x8888_8888
+            );
+
+            // Scramble everything so POPAD has to restore it.
+            for index in 0..8 {
+                if index != CpuState::RSP {
+                    cpu.set_gpr_u32(index, 0xDEAD_0000 + index as u32);
+                }
+            }
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+            for (index, (&actual, &want)) in cpu.gpr.iter().zip(expected.iter()).enumerate().take(8)
+            {
+                if index != CpuState::RSP {
+                    assert_eq!(actual, want, "gpr {index}");
+                }
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CALL"/"RET" (near) with a 32-bit stack: the 32-bit
+    /// return EIP is pushed and popped through ESP.
+    #[test]
+    fn stack_b1_near_call_ret_use_esp() {
+        let rel = (PM32_HIGH_CODE as i64 - (PM32_CODE + 5) as i64) as i32;
+        let mut code = vec![0xE8];
+        code.extend_from_slice(&rel.to_le_bytes());
+        let (mut cpu, mut bus) = pm32_big_stack_fixture(&code, PM32_CODE, PM32_TEST_ESP);
+        bus.mem[PM32_HIGH_CODE] = 0xC3;
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, PM32_HIGH_CODE as u64);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 4);
+        assert_eq!(
+            bus.read_u32(u64::from(PM32_TEST_ESP - 4)).unwrap(),
+            (PM32_CODE + 5) as u32
+        );
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, (PM32_CODE + 5) as u64);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+    }
+
+    /// Intel SDM Vol. 2 "RET" (near, imm16) with a 32-bit stack: the release
+    /// count is added to ESP, not SP.
+    #[test]
+    fn stack_b1_ret_imm16_releases_through_esp() {
+        // C2 iw = RET 8.
+        let (mut cpu, mut bus) =
+            pm32_big_stack_fixture(&[0xC2, 0x08, 0x00], PM32_CODE, PM32_TEST_ESP - 4);
+        bus.mem[(PM32_TEST_ESP - 4) as usize..(PM32_TEST_ESP) as usize]
+            .copy_from_slice(&(PM32_HIGH_CODE as u32).to_le_bytes());
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, PM32_HIGH_CODE as u64);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP + 8);
+    }
+
+    /// Intel SDM Vol. 2 "ENTER"/"LEAVE"; Vol. 1 §6.5: with `StackAddrSize=32`
+    /// the frame pointer and allocation use ESP/EBP. The `0x67` address-size
+    /// prefix does not change the stack address size.
+    #[test]
+    fn stack_b1_enter_leave_use_esp_and_ebp() {
+        for prefix in [None, Some(0x67u8)] {
+            let mut code = Vec::new();
+            if let Some(p) = prefix {
+                code.push(p);
+            }
+            code.extend_from_slice(&[0xC8, 0x08, 0x00, 0x00]); // ENTER 8, 0
+            let enter_len = code.len();
+            if let Some(p) = prefix {
+                code.push(p);
+            }
+            code.push(0xC9); // LEAVE
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&code, PM32_CODE, PM32_TEST_ESP);
+            cpu.set_gpr_u32(CpuState::RBP, 0xAAAA_BBBB);
+
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.rip, (PM32_CODE + enter_len) as u64);
+            assert_eq!(cpu.gpr_u32(CpuState::RBP), PM32_TEST_ESP - 4);
+            assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 12);
+            assert_eq!(
+                bus.read_u32(u64::from(PM32_TEST_ESP - 4)).unwrap(),
+                0xAAAA_BBBB
+            );
+
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.gpr_u32(CpuState::RBP), 0xAAAA_BBBB);
+            assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "ENTER" (nesting level > 0): the display pointers are
+    /// walked through EBP with the 32-bit stack pointer.
+    #[test]
+    fn stack_b1_enter_nesting_walks_display_through_ebp() {
+        // C8 iw ib = ENTER 4, 2.
+        let (mut cpu, mut bus) =
+            pm32_big_stack_fixture(&[0xC8, 0x04, 0x00, 0x02], PM32_CODE, PM32_TEST_ESP);
+        let caller_bp = PM32_TEST_ESP - 0x40;
+        cpu.set_gpr_u32(CpuState::RBP, caller_bp);
+        bus.mem[(caller_bp - 4) as usize..caller_bp as usize]
+            .copy_from_slice(&0x0BAD_F00Du32.to_le_bytes());
+
+        step(&mut cpu, &mut bus).unwrap();
+        // Saved EBP, one copied display pointer, the new frame pointer, then 4
+        // bytes of locals.
+        let frame = PM32_TEST_ESP - 4;
+        assert_eq!(cpu.gpr_u32(CpuState::RBP), frame);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), frame - 8 - 4);
+        assert_eq!(bus.read_u32(u64::from(frame)).unwrap(), caller_bp);
+        assert_eq!(bus.read_u32(u64::from(frame - 4)).unwrap(), 0x0BAD_F00D);
+        assert_eq!(bus.read_u32(u64::from(frame - 8)).unwrap(), frame);
+    }
+
+    /// Intel SDM Vol. 2 "PUSH"/"POP" (r/m and +rd forms) on a 32-bit stack.
+    #[test]
+    fn stack_b1_push_pop_rm_and_reg_forms_use_esp() {
+        // FF 35 id = PUSH dword [disp32]; 8F 05 id = POP dword [disp32].
+        let mut code = vec![0xFF, 0x35];
+        code.extend_from_slice(&(PM32_DATA as u32).to_le_bytes());
+        code.extend_from_slice(&[0x8F, 0x05]);
+        code.extend_from_slice(&((PM32_DATA + 4) as u32).to_le_bytes());
+        code.push(0x53); // PUSH EBX
+        code.push(0x5A); // POP EDX
+
+        let (mut cpu, mut bus) = pm32_big_stack_fixture(&code, PM32_CODE, PM32_TEST_ESP);
+        bus.mem[PM32_DATA..PM32_DATA + 4].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        cpu.set_gpr_u32(CpuState::RBX, 0x0F0F_0F0F);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 4);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+        assert_eq!(bus.read_u32((PM32_DATA + 4) as u64).unwrap(), 0xCAFE_BABE);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 4);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0x0F0F_0F0F);
+    }
+
+    /// Intel SDM Vol. 2 "PUSH"/"POP": a `0x66` operand-size override on a
+    /// 32-bit stack pushes a word while the pointer still steps through ESP.
+    #[test]
+    fn stack_b1_word_push_pop_steps_esp_by_two() {
+        // 66 50 = PUSH AX; 66 5B = POP BX.
+        let (mut cpu, mut bus) =
+            pm32_big_stack_fixture(&[0x66, 0x50, 0x66, 0x5B], PM32_CODE, PM32_TEST_ESP);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 2);
+        assert_eq!(bus.read_u16(u64::from(PM32_TEST_ESP - 2)).unwrap(), 0x2222);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x2222);
     }
 }

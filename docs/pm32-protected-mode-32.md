@@ -45,7 +45,8 @@ plus AVL / L / D-B / G) so entering and leaving 32-bit code works. `L=1`
 targets are still rejected.
 
 **Not supported by this slice.** 32-bit stacks (`SS.B=1`) â€” pushes and pops
-still use 16-bit `SP`; 32-bit IDT gates and `IRETD`; delivering an
+still use 16-bit `SP` (closed by slice 2); 32-bit IDT gates and `IRETD`;
+delivering an
 architectural fault, software interrupt, NMI, or IRQ while `CS.D=1` (the
 bounded 16-bit gate path reports
 `ProtectedModeExceptionDelivery { reason: CurrentPrivilege }` instead of
@@ -53,3 +54,43 @@ truncating a 32-bit return `EIP` into a 16-bit frame); protected far `CALL`,
 call gates, tasks; conforming segments, privilege switching, or outer-level
 returns; branch-time `CS`-limit `#GP` (a target beyond the limit is reported by
 the next instruction fetch); `L=1` / 64-bit defaults.
+
+## Slice 2 — `SS.B=1` 32-bit stacks
+
+**Supported.** The stack-pointer helpers now derive the stack address size
+from the cached `SS.B` bit (SDM Vol. 3 §3.4.5.1, Vol. 1 §6.2.2). With `B=1`
+every push and pop uses the full 32-bit `ESP` and wraps modulo 2^32; with
+`B=0` only `SP` changes, `ESP[31:16]` is preserved, and the pointer wraps
+modulo 2^16 exactly as before. The pushed/popped *width* still follows the
+operand-size attribute, so `CS.D=1` code defaults to dword slots.
+
+This covers `PUSH`/`POP` of registers, immediates, `r/m` memory and segment
+registers, `PUSHF`/`PUSHFD` and `POPF`/`POPFD`, `PUSHA`/`PUSHAD` and
+`POPA`/`POPAD` (including the `Temp` slot, which is `ESP` before the first
+push when `B=1`), near `CALL`/`RET`, the `RET`/`RETF imm16` stack release,
+`ENTER`/`ENTERD` (level 0 and nested display walks) and `LEAVE`. The stack
+segment limit is checked against the stepped pointer before it is committed,
+so a push that wraps outside the limit raises `#SS(0)` atomically.
+
+`POP SS` commits its pointer update with the *old* `SS.B`, because the pop
+itself happens through the old stack segment.
+
+**Closed `Unsupported` gap.** `ENTER`, `LEAVE`, `PUSHA(D)` and `POPA(D)` used
+to return `Unsupported` when prefixed with `0x67`. Per SDM Vol. 1 §6.2.2 the
+address-size override applies to memory operands and does not change the
+stack address size, so those forms now execute and take their pointer width
+from `SS.B`. The previous `*_asize32_unsupported` tests were replaced with
+tests asserting that behavior.
+
+**Model note.** For `ENTER`/`LEAVE`, this tree uses the operand-size attribute
+for the pushed/popped width *and* for the `BP` vs `EBP` frame-pointer register,
+while `SS.B` selects `SP` vs `ESP`. The SDM `ENTER` pseudocode expresses both
+in terms of `StackSize`; the split above preserves the previously tested
+`ENTERD`-on-a-16-bit-stack behavior and matches the operand-size-selected
+`ENTER`/`ENTERD` mnemonics.
+
+**Not supported by this slice.** 64-bit stacks (`RSP`); 32-bit IDT gates
+(delivery still requires a 16-bit stack and reports
+`ProtectedModeDeliveryError::StackWidth` otherwise); `IRETD`; `IRET16` on a
+`B=1` stack; privilege-level stack switching, TSS `SS0:ESP0`, or expand-down
+stack segments.
