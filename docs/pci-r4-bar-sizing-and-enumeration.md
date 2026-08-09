@@ -1,0 +1,91 @@
+# PCI BAR sizing and the enumeration surface
+
+What a firmware `pci_probe_devices` scan sees on this machine, and how a Base
+Address Register answers the all-ones sizing protocol.
+
+## Authority
+
+PCI Local Bus Specification Revision 3.0:
+
+- §6.1 Figure 6-1 "Type 00h Configuration Space Header" — register layout.
+- §6.2.1 "Device Identification" — Vendor ID, Device ID, Revision ID, Class
+  Code, Header Type; "FFFFh is an invalid value for Vendor ID"; Header Type
+  bit 7 "identifies a multi-function device".
+- §6.2.5.1 "Base Addresses" — the encoding bits, the writable-bit/hardwired-bit
+  model, and the sizing calculation.
+- §6.2.5.2 "Expansion ROM Base Address Register".
+- §6.2.4 "Miscellaneous Registers" — Interrupt Line, Interrupt Pin, BIST,
+  Capabilities Pointer.
+- §6.7 "Capabilities List" — the Capabilities Pointer is meaningful only when
+  Status bit 4 is set.
+
+Intel 440FX PCIset 82441FX (PMC) and Intel 82371SB/82371AB (PIIX3/PIIX4)
+datasheets for the per-function register defaults and reserved ranges.
+
+## The sizing protocol
+
+§6.2.5.1: "Software saves the original value of the Base Address register,
+writes 0 FFFF FFFFh to the register, then reads it back. Size calculation can
+be done from the 32-bit value read by first clearing encoding information bits
+(bit 0 for I/O, bits 0-3 for memory), inverting all 32 bits (logical NOT), then
+incrementing by 1."
+
+That works because a device "would build the top bits of the address register,
+hardwiring the other bits to 0". So a register of size *S* has writable mask
+`!(S - 1)`, hardwired zeros below it, and read-only encoding bits underneath.
+`PciBarSpec` is exactly those three facts, and every BAR write goes through
+`PciBarSpec::readback`, so a byte, word, or dword write all obey the same rule.
+
+## What this machine implements
+
+| Function | Offset | Kind | Size | Sizing read-back |
+|---|---|---|---|---|
+| `00:01.1` PIIX IDE | `0x20` (BAR4) | I/O | 16 B | `0xFFFFFFF1` |
+| `00:01.2` PIIX USB UHCI | `0x20` (BAR4) | I/O | 32 B | `0xFFFFFFE1` |
+
+Everything else is read-only zero: all six BARs on `00:00.0`, `00:01.0` and
+`00:01.3`, the five unused BAR slots on the IDE and USB functions, and the
+Expansion ROM register at `0x30` on every function. Before this slice those
+positions were ordinary read/write storage, so a sizing pass read back the
+`0xFFFFFFFF` it had just written and would have concluded that the host bridge
+requested a 4 GB region.
+
+Both implemented registers read back their I/O-space bit **from reset**, before
+firmware programs anything. That matters: firmware reads the register first to
+decide whether it is looking at an I/O or a memory region, so a BAR that read
+all-zero at reset would be sized and assigned as memory. Intel 82371SB gives
+BMIBA the matching default value `00000001h`.
+
+## Model choice: the writable mask runs to bit 31
+
+The PIIX datasheets describe bits 31:16 of BMIBA and of the UHCI I/O base as
+Reserved, because that silicon decodes only the 16-bit x86 I/O space. Read
+literally, an all-ones write would read back `0x0000FFF1`, and §6.2.5.1's
+calculation on that value yields `0xFFFF0010` — not a region size at all.
+
+This model keeps the writable bits running to bit 31 so the documented
+calculation produces the documented answer, and handles the 16-bit decode limit
+where it actually belongs: `bmide_io_base` and `uhci_io_base` refuse to decode a
+base at or above `0x10000`. A machine cannot address such a port with `IN`/`OUT`
+anyway (Intel SDM Vol. 1 §18.3 — the I/O address space is 64 KB).
+
+This is a **model choice**, not a datasheet reading, and it is recorded here for
+the same reason ADR-0006 records the CMOS `5Bh` encoding: the interoperable
+behavior and the vendor document disagree, and pretending otherwise would hide
+the disagreement rather than settle it.
+
+## Unsupported (explicit)
+
+- Memory BARs. `PciBarSpec` can encode the type and prefetchable bits, but no
+  function here exposes one, so no memory window is ever decoded from a BAR.
+- 64-bit BARs (type `10b`), which would consume the following register.
+- Expansion ROMs: the register is read-only zero, and no option ROM exists.
+- PIIX ACPI PMBASE at `0x40` is a device-specific base register outside the
+  Type 0 BAR block. No sizing protocol runs on it, and unlike the two real BARs
+  it stays fully zero at reset rather than taking the datasheet's `00000001h`
+  default — so nothing decodes at I/O port 0 before firmware programs it. That
+  difference is deliberate and is the one place this file departs from the
+  "hardwired bit 0" rule above.
+- Base Address Register *decode* beyond the two I/O windows already stubbed
+  (BMIDE registers, UHCI registers): programming a BAR does not create any new
+  MMIO region.
