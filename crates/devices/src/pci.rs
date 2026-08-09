@@ -12,6 +12,10 @@
 //! - OSDev Wiki PCI — Configuration Space Access Mechanism #1; absent device
 //!   reads return `0xFFFFFFFF`.
 //! - Intel 440FX (i440FX) host bridge identity (`vendor 0x8086`, `device 0x1237`).
+//! - Intel 440FX PCIset 82441FX (PMC) datasheet §3.2.18 "PAM — Programmable
+//!   Attribute Map Registers (PAM[6:0])", Table 2 "Attribute Bit Assignment"
+//!   and Table 3 "PAM Registers and Associated Memory Segments" — the shadow
+//!   RAM attribute register block at PMC config `0x59`–`0x5F`.
 //! - Intel 82371SB (PIIX3) PCI function IDs used as classic pc-i440fx-compatible
 //!   stubs: ISA bridge `8086:7000`, IDE `8086:7010`, USB UHCI `8086:7020` at
 //!   `00:01.0` / `00:01.1` / `00:01.2` (behavior from public device IDs / PCI
@@ -35,6 +39,12 @@
 //!   cache/burst side effects yet).
 //! - Host bridge Latency Timer (`0x0D`) byte store/readback (reset `0x00`; no
 //!   arbitration side effects yet).
+//! - i440FX PMC Programmable Attribute Map registers PAM0–PAM6 (`0x59`–`0x5F`):
+//!   store/readback of the RE/WE fields, reset default `0x00`, reserved bits
+//!   ([7, 6, 3, 2] and `PAM0[3:0]`) hardwired 0, plus the decoded host accessors
+//!   [`PciConfig::pam_regions`] / [`PciConfig::pam_region_for_addr`] reporting
+//!   read-from-DRAM and write-to-DRAM per Table 3 segment. The register file is
+//!   standalone — nothing in this crate steers memory from it.
 //! - PIIX ISA bridge (`00:01.0`) Command (`0x04`) store/readback: sticky IO/MEM/BusMaster
 //!   (`PCI_PIIX_ISA_COMMAND_MASK` = `0x0007`, same as host bridge); other bits hardwired 0.
 //! - PIIX ISA Status (`0x06`) readback stub: same CapList/FastB2B/DevSel as host bridge
@@ -109,6 +119,12 @@
 //! - ACPI SCI/SMI / GPE / real power transitions / ACPI tables
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
+//! - PAM *effect*: programming PAM0–PAM6 changes only this register file and
+//!   the decoded accessors. No physical memory is remapped here, so BIOS
+//!   shadowing does not work until the machine layer consumes
+//!   [`PciConfig::pam_regions`]. The neighbouring PMC registers that complete
+//!   the legacy memory map — FDHC (`0x68`, the `080000-09FFFFh` DRAM hole) and
+//!   SMRAM (`0x72`) — are plain read/write config bytes with no decode.
 
 use crate::PortDevice;
 
@@ -405,6 +421,123 @@ const _: () = assert!(PIIX_ELCR_MASTER_WRITABLE == 0xF8);
 const _: () = assert!(PIIX_ELCR_SLAVE_WRITABLE == 0xDE);
 const _: () = assert!(PIIX_ELCR_MASTER_WRITABLE & 0x07 == 0);
 const _: () = assert!(PIIX_ELCR_SLAVE_WRITABLE & 0x21 == 0);
+
+/// i440FX PMC Programmable Attribute Map register PAM0.
+///
+/// Spec: Intel 440FX PCIset 82441FX (PMC) datasheet §3.2.18 "PAM — Programmable
+/// Attribute Map Registers (PAM[6:0])" — "Address Offset: PAM0 (59h) … PAM6
+/// (5Fh)", "Default Value: 00h", "Attribute: Read/Write".
+pub const PCI_PMC_PAM0_OFFSET: u8 = 0x59;
+/// Number of PAM registers (PAM0–PAM6 at PMC config `0x59`–`0x5F`).
+pub const PCI_PMC_PAM_COUNT: usize = 7;
+/// PAM power-on / reset value. Spec: 440FX §3.2.18 "Default Value: 00h".
+///
+/// Table 2 encoding `00` is "Disabled. DRAM is disabled and all accesses are
+/// directed to PCI", which is how the platform comes out of reset executing
+/// from the BIOS ROM rather than from shadow DRAM.
+pub const PCI_PMC_PAM_DEFAULT: u8 = 0x00;
+
+/// Read Enable within one 4-bit PAM attribute field.
+///
+/// Spec: 440FX §3.2.18 Table 2 "Attribute Bit Assignment" — RE is bits [4, 0].
+/// "When RE=1, CPU read accesses to the corresponding memory segment are
+/// claimed by the PMC and directed to main memory. Conversely, when RE=0, the
+/// CPU read accesses are directed to PCI."
+pub const PCI_PMC_PAM_RE: u8 = 1 << 0;
+/// Write Enable within one 4-bit PAM attribute field.
+///
+/// Spec: 440FX §3.2.18 Table 2 — WE is bits [5, 1]. "When WE=1, CPU write
+/// accesses to the corresponding memory segment are claimed by the PMC and
+/// directed to main memory. Conversely, when WE=0, the CPU write accesses are
+/// directed to PCI."
+pub const PCI_PMC_PAM_WE: u8 = 1 << 1;
+/// Defined bits of one 4-bit PAM attribute field (RE|WE); bits 3:2 Reserved.
+pub const PCI_PMC_PAM_FIELD_MASK: u8 = PCI_PMC_PAM_RE | PCI_PMC_PAM_WE;
+
+/// Writable bits of PAM1–PAM6: RE|WE in both nibbles.
+///
+/// Spec: 440FX §3.2.18 Table 2 — bits [7, 6, 3, 2] are Reserved. PCI Local Bus
+/// Specification: reserved configuration fields are read-only and return zero,
+/// so this model masks them off on write instead of storing them.
+pub const PCI_PMC_PAM_WRITABLE_MASK: u8 = 0x33;
+/// Writable bits of PAM0: the high nibble only.
+///
+/// Spec: 440FX §3.2.18 Table 3 — `PAM0[3:0]` is Reserved; `PAM0[7:4]` carries
+/// the `0F0000-0FFFFFh` BIOS Area attributes.
+pub const PCI_PMC_PAM0_WRITABLE_MASK: u8 = 0x30;
+
+// Spec: 440FX §3.2.18 Table 2 — a 4-bit attribute field defines only RE and WE,
+// so the writable mask of PAM1–PAM6 is that field in both nibbles, and Table 3
+// leaves PAM0 with the high nibble alone. Reset leaves every field Disabled.
+const _: () = assert!(PCI_PMC_PAM_FIELD_MASK == 0x03);
+const _: () =
+    assert!(PCI_PMC_PAM_WRITABLE_MASK == PCI_PMC_PAM_FIELD_MASK | (PCI_PMC_PAM_FIELD_MASK << 4));
+const _: () = assert!(PCI_PMC_PAM0_WRITABLE_MASK == PCI_PMC_PAM_FIELD_MASK << 4);
+const _: () = assert!(PCI_PMC_PAM_DEFAULT & PCI_PMC_PAM_WRITABLE_MASK == 0);
+
+/// Number of legacy memory segments controlled by the PAM registers.
+///
+/// Spec: 440FX §3.2.18 — "The PMC allows programmable memory attributes on 13
+/// memory segments of various sizes in the 640-Kbyte to 1-Mbyte address range."
+pub const PCI_PMC_PAM_REGION_COUNT: usize = 13;
+
+/// Table 3 mapping in ascending guest-physical address order:
+/// `(pam register index, high nibble?, inclusive start, inclusive end)`.
+///
+/// Spec: 440FX §3.2.18 Table 3 "PAM Registers and Associated Memory Segments".
+/// Entries 0–11 are the twelve 16 KiB ISA Add-on BIOS / BIOS Extension segments
+/// from `0C0000h` to `0EFFFFh`; entry 12 is the 64 KiB BIOS Area.
+const PAM_REGION_MAP: [(usize, bool, u32, u32); PCI_PMC_PAM_REGION_COUNT] = [
+    (1, false, 0x000C_0000, 0x000C_3FFF),
+    (1, true, 0x000C_4000, 0x000C_7FFF),
+    (2, false, 0x000C_8000, 0x000C_BFFF),
+    (2, true, 0x000C_C000, 0x000C_FFFF),
+    (3, false, 0x000D_0000, 0x000D_3FFF),
+    (3, true, 0x000D_4000, 0x000D_7FFF),
+    (4, false, 0x000D_8000, 0x000D_BFFF),
+    (4, true, 0x000D_C000, 0x000D_FFFF),
+    (5, false, 0x000E_0000, 0x000E_3FFF),
+    (5, true, 0x000E_4000, 0x000E_7FFF),
+    (6, false, 0x000E_8000, 0x000E_BFFF),
+    (6, true, 0x000E_C000, 0x000E_FFFF),
+    (0, true, 0x000F_0000, 0x000F_FFFF),
+];
+
+/// Decoded PAM attributes for one legacy memory segment.
+///
+/// Spec: 440FX §3.2.18 Table 2 / Table 3. This is the host-side view the
+/// machine layer consumes to steer a physical-address range at ROM or at DRAM;
+/// the device crate itself owns no memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PamRegion {
+    /// Inclusive guest-physical start of the segment.
+    pub start: u32,
+    /// Inclusive guest-physical end of the segment.
+    pub end: u32,
+    /// RE=1 — CPU reads are directed to main memory (DRAM) rather than to PCI.
+    pub read_from_ram: bool,
+    /// WE=1 — CPU writes are directed to main memory (DRAM) rather than to PCI.
+    pub write_to_ram: bool,
+}
+
+impl PamRegion {
+    /// Segment length in bytes (16 KiB for the expansion/extension segments,
+    /// 64 KiB for the BIOS Area).
+    pub const fn len(&self) -> u32 {
+        self.end - self.start + 1
+    }
+
+    /// Always false — every Table 3 segment has a non-zero length. Present so
+    /// the `len` accessor does not trip `clippy::len_without_is_empty`.
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Whether `phys` falls inside this segment.
+    pub const fn contains(&self, phys: u32) -> bool {
+        phys >= self.start && phys <= self.end
+    }
+}
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -964,6 +1097,10 @@ impl PciConfig {
             let rw1c = (old & PCI_STATUS_RW1C_MASK) & !(written & PCI_STATUS_RW1C_MASK);
             let status = PCI_HOST_BRIDGE_STATUS_STUB | rw1c;
             cfg[st_off..st_off + 2].copy_from_slice(&status.to_le_bytes());
+
+            // Spec: Intel 440FX §3.2.18 — PAM0–PAM6 at 0x59–0x5F are R/W, but
+            // Table 2 bits [7, 6, 3, 2] and Table 3 `PAM0[3:0]` are Reserved.
+            Self::apply_pam_reserved_mask(cfg);
         }
         // Spec: PCI Local Bus + Intel 82371SB — PIIX ISA bridge Command at 0x04
         // keeps IO/MEM/BusMaster sticky (same mask as host bridge); other bits
@@ -1058,6 +1195,79 @@ impl PciConfig {
             let bytes = masked.to_le_bytes();
             cfg[PCI_PIIX_ACPI_PMBASE_OFFSET as usize..PCI_PIIX_ACPI_PMBASE_OFFSET as usize + 4]
                 .copy_from_slice(&bytes);
+        }
+    }
+
+    /// Raw PAM register byte, `index` 0–6 selecting PAM0 (`0x59`)–PAM6 (`0x5F`).
+    ///
+    /// Spec: 440FX §3.2.18. Reserved bits always read zero, so the value only
+    /// ever carries RE/WE fields.
+    pub fn pam_register(&self, index: usize) -> Option<u8> {
+        if index >= PCI_PMC_PAM_COUNT {
+            return None;
+        }
+        Some(self.host_bridge[PCI_PMC_PAM0_OFFSET as usize + index])
+    }
+
+    /// All seven PAM register bytes, PAM0 first.
+    pub fn pam_registers(&self) -> [u8; PCI_PMC_PAM_COUNT] {
+        let base = PCI_PMC_PAM0_OFFSET as usize;
+        let mut out = [0u8; PCI_PMC_PAM_COUNT];
+        out.copy_from_slice(&self.host_bridge[base..base + PCI_PMC_PAM_COUNT]);
+        out
+    }
+
+    /// Decoded attributes for all thirteen PAM segments, in ascending
+    /// guest-physical address order (`0C0000h`… first, the BIOS Area last).
+    ///
+    /// Spec: 440FX §3.2.18 Table 2 / Table 3. This is the accessor the machine
+    /// layer drives its per-region ROM/RAM attribute model from; the mapping is
+    /// recomputed from the register file on every call, so a caller can refresh
+    /// after any configuration write without a change notification.
+    pub fn pam_regions(&self) -> [PamRegion; PCI_PMC_PAM_REGION_COUNT] {
+        let mut out = [PamRegion {
+            start: 0,
+            end: 0,
+            read_from_ram: false,
+            write_to_ram: false,
+        }; PCI_PMC_PAM_REGION_COUNT];
+        for (slot, &(pam, high, start, end)) in out.iter_mut().zip(PAM_REGION_MAP.iter()) {
+            let byte = self.host_bridge[PCI_PMC_PAM0_OFFSET as usize + pam];
+            let field = if high { byte >> 4 } else { byte } & 0x0F;
+            *slot = PamRegion {
+                start,
+                end,
+                read_from_ram: field & PCI_PMC_PAM_RE != 0,
+                write_to_ram: field & PCI_PMC_PAM_WE != 0,
+            };
+        }
+        out
+    }
+
+    /// Decoded attributes for the PAM segment containing `phys`, if any.
+    ///
+    /// Spec: 440FX §3.2.18 — only the thirteen Table 3 segments are attribute
+    /// controlled. The video buffer area `A0000-BFFFFh` "is not controlled by
+    /// attribute bits" and the DOS area below it is handled by the FDHC
+    /// register, so both return `None` here.
+    pub fn pam_region_for_addr(&self, phys: u32) -> Option<PamRegion> {
+        self.pam_regions().into_iter().find(|r| r.contains(phys))
+    }
+
+    /// Mask the reserved bits out of the host-bridge PAM block.
+    ///
+    /// Spec: 440FX §3.2.18 Table 2 (bits [7, 6, 3, 2] Reserved) and Table 3
+    /// (`PAM0[3:0]` Reserved), with the PCI Local Bus Specification rule that
+    /// reserved configuration fields read as zero.
+    fn apply_pam_reserved_mask(cfg: &mut [u8; 256]) {
+        let base = PCI_PMC_PAM0_OFFSET as usize;
+        for i in 0..PCI_PMC_PAM_COUNT {
+            let mask = if i == 0 {
+                PCI_PMC_PAM0_WRITABLE_MASK
+            } else {
+                PCI_PMC_PAM_WRITABLE_MASK
+            };
+            cfg[base + i] &= mask;
         }
     }
 
@@ -2522,6 +2732,135 @@ mod tests {
     /// Spec: PCI Local Bus — Cache Line Size at `0x0C`. Host bridge `00:00.0`
     /// stores/reads back the byte (reset `0x00`); no cache/burst side effects.
     /// Mechanism #1: CONFIG_ADDRESS dword-aligned at `0x0C`; byte via `0xCFC`.
+    /// Spec: Intel 440FX §3.2.18 Table 3 — the thirteen PAM segments and the
+    /// register/nibble that owns each one.
+    #[test]
+    fn pam_region_map_matches_datasheet_table_3() {
+        assert_eq!(PCI_PMC_PAM0_OFFSET, 0x59);
+        assert_eq!(PCI_PMC_PAM_COUNT, 7);
+        assert_eq!(PCI_PMC_PAM_REGION_COUNT, 13);
+
+        // Twelve 16 KiB segments, then the 64 KiB BIOS Area.
+        let expected: [(usize, bool, u32, u32); 13] = [
+            (1, false, 0x000C_0000, 0x000C_3FFF),
+            (1, true, 0x000C_4000, 0x000C_7FFF),
+            (2, false, 0x000C_8000, 0x000C_BFFF),
+            (2, true, 0x000C_C000, 0x000C_FFFF),
+            (3, false, 0x000D_0000, 0x000D_3FFF),
+            (3, true, 0x000D_4000, 0x000D_7FFF),
+            (4, false, 0x000D_8000, 0x000D_BFFF),
+            (4, true, 0x000D_C000, 0x000D_FFFF),
+            (5, false, 0x000E_0000, 0x000E_3FFF),
+            (5, true, 0x000E_4000, 0x000E_7FFF),
+            (6, false, 0x000E_8000, 0x000E_BFFF),
+            (6, true, 0x000E_C000, 0x000E_FFFF),
+            (0, true, 0x000F_0000, 0x000F_FFFF),
+        ];
+        assert_eq!(PAM_REGION_MAP, expected);
+
+        let regions = PciConfig::new().pam_regions();
+        for region in regions.iter().take(12) {
+            assert_eq!(region.len(), 16 * 1024);
+            assert!(!region.is_empty());
+        }
+        assert_eq!(regions[12].len(), 64 * 1024);
+    }
+
+    /// Spec: Intel 440FX §3.2.18 Table 2 — the four encodings of a 4-bit
+    /// attribute field: Disabled, Read Only, Write Only, Read/Write.
+    #[test]
+    fn pam_attribute_field_encodings_decode_to_re_we() {
+        assert_eq!(PCI_PMC_PAM_RE, 0x01);
+        assert_eq!(PCI_PMC_PAM_WE, 0x02);
+        assert_eq!(PCI_PMC_PAM_FIELD_MASK, 0x03);
+
+        let mut pci = PciConfig::new();
+        // PAM6 low nibble owns 0E8000-0EBFFFh (region index 10).
+        for (field, re, we) in [
+            (0x0u8, false, false), // Disabled
+            (0x1, true, false),    // Read Only
+            (0x2, false, true),    // Write Only
+            (0x3, true, true),     // Read/Write
+        ] {
+            let addr = PciConfig::make_address(0, 0, 0, 0x5F, true);
+            pci.port_write(PCI_CONFIG_ADDRESS, 4, addr);
+            pci.port_write(PCI_CONFIG_DATA + 3, 1, u32::from(field));
+
+            let region = pci.pam_regions()[10];
+            assert_eq!(region.start, 0x000E_8000);
+            assert_eq!(region.read_from_ram, re, "field {field:#x} RE");
+            assert_eq!(region.write_to_ram, we, "field {field:#x} WE");
+        }
+    }
+
+    /// Spec: Intel 440FX §3.2.18 — "Default Value: 00h" and "Attribute:
+    /// Read/Write"; Table 2 reserves bits [7, 6, 3, 2] and Table 3 reserves
+    /// `PAM0[3:0]`, which the PCI Local Bus Specification requires to read zero.
+    #[test]
+    fn pam_registers_default_store_readback_and_mask_reserved() {
+        let mut pci = PciConfig::new();
+        assert_eq!(
+            pci.pam_registers(),
+            [PCI_PMC_PAM_DEFAULT; PCI_PMC_PAM_COUNT]
+        );
+        assert_eq!(pci.pam_register(PCI_PMC_PAM_COUNT), None);
+
+        for i in 0..PCI_PMC_PAM_COUNT {
+            let offset = PCI_PMC_PAM0_OFFSET + i as u8;
+            let addr = PciConfig::make_address(0, 0, 0, offset, true);
+            pci.port_write(PCI_CONFIG_ADDRESS, 4, addr);
+            pci.port_write(PCI_CONFIG_DATA + u16::from(offset & 3), 1, 0xFF);
+
+            let expected = if i == 0 {
+                PCI_PMC_PAM0_WRITABLE_MASK
+            } else {
+                PCI_PMC_PAM_WRITABLE_MASK
+            };
+            assert_eq!(pci.pam_register(i), Some(expected));
+        }
+
+        // `PAM0[3:0]` being reserved means nothing can turn the low nibble on,
+        // so no region ever decodes from it.
+        assert_eq!(pci.pam_register(0), Some(0x30));
+
+        pci.reset();
+        assert_eq!(
+            pci.pam_registers(),
+            [PCI_PMC_PAM_DEFAULT; PCI_PMC_PAM_COUNT]
+        );
+    }
+
+    /// The datasheet's worked shadowing example: Write Only while copying the
+    /// ROM into DRAM, then Read Only so writes go back out to the expansion bus.
+    #[test]
+    fn pam_bios_area_shadowing_sequence_decodes() {
+        let mut pci = PciConfig::new();
+        let addr = PciConfig::make_address(0, 0, 0, PCI_PMC_PAM0_OFFSET, true);
+
+        pci.port_write(PCI_CONFIG_ADDRESS, 4, addr);
+        pci.port_write(PCI_CONFIG_DATA + 1, 1, 0x20);
+        let bios = pci.pam_region_for_addr(0x000F_FFF0).unwrap();
+        assert_eq!((bios.read_from_ram, bios.write_to_ram), (false, true));
+
+        pci.port_write(PCI_CONFIG_ADDRESS, 4, addr);
+        pci.port_write(PCI_CONFIG_DATA + 1, 1, 0x10);
+        let bios = pci.pam_region_for_addr(0x000F_FFF0).unwrap();
+        assert_eq!((bios.read_from_ram, bios.write_to_ram), (true, false));
+    }
+
+    /// Spec: Intel 440FX §3.2.18 — the video buffer area `A0000-BFFFFh` "is not
+    /// controlled by attribute bits", and the PAM range stops at `0FFFFFh`.
+    #[test]
+    fn pam_lookup_returns_none_outside_table_3() {
+        let pci = PciConfig::new();
+        for addr in [0x0000_0000u32, 0x0007_FFFF, 0x000A_0000, 0x000B_FFFF] {
+            assert!(pci.pam_region_for_addr(addr).is_none());
+        }
+        assert!(pci.pam_region_for_addr(0x000C_0000).is_some());
+        assert!(pci.pam_region_for_addr(0x000F_FFFF).is_some());
+        assert!(pci.pam_region_for_addr(0x0010_0000).is_none());
+    }
+
     #[test]
     fn host_bridge_cache_line_size_store_readback() {
         let mut pci = PciConfig::new();
