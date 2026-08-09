@@ -46,13 +46,13 @@ pub use step_clock::{
 };
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
+    ApmSmi, CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
     FwCfgDmaOutcome, IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550,
-    VgaText, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA,
-    EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT,
-    I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
-    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
-    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY,
+    E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED,
+    FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
+    PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA,
+    PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -105,6 +105,8 @@ pub struct Machine {
     pub kbd: I8042,
     /// System Control Port A (`0x92`) — Fast Gate A20 + fast reset pulse.
     pub port92: Port92,
+    /// APM/SMI command+status (`0xB2`/`0xB3`) with SMM-completion stub.
+    pub apm: ApmSmi,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
     /// VGA color text plane at 0xB8000 + CRTC/Seq/GC/ATC/DAC/Misc stubs.
@@ -153,6 +155,7 @@ impl Machine {
             cmos: CmosRtc::new(),
             kbd: I8042::new(),
             port92: Port92::new(),
+            apm: ApmSmi::new(),
             dma: Dma8237::new(),
             vga: VgaText::new(),
             pci: PciConfig::new(),
@@ -523,6 +526,7 @@ impl Machine {
         self.cmos.reset();
         self.kbd.reset();
         self.port92.reset();
+        self.apm.reset();
         self.dma.reset();
         self.vga.reset();
         self.pci.reset();
@@ -577,6 +581,7 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             port92: &mut self.port92,
+            apm: &mut self.apm,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
@@ -609,6 +614,7 @@ impl Machine {
                 cmos: &mut self.cmos,
                 kbd: &mut self.kbd,
                 port92: &mut self.port92,
+                apm: &mut self.apm,
                 dma: &mut self.dma,
                 vga: &mut self.vga,
                 pci: &mut self.pci,
@@ -794,6 +800,7 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             port92: &mut self.port92,
+            apm: &mut self.apm,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
@@ -988,6 +995,7 @@ struct MachineBus<'a> {
     cmos: &'a mut CmosRtc,
     kbd: &'a mut I8042,
     port92: &'a mut Port92,
+    apm: &'a mut ApmSmi,
     dma: &'a mut Dma8237,
     vga: &'a mut VgaText,
     pci: &'a mut PciConfig,
@@ -1224,6 +1232,8 @@ impl MachineBus<'_> {
             POST_DIAG_PORT => self.post_diag.port_read(port, size),
             PORT_SYSTEM_CONTROL => u32::from(self.pit.port61_read()),
             PORT_SYSTEM_CONTROL_A => self.port92.port_read(port, size),
+            // Spec: Intel APM_CNT/APM_STS fixed I/O at 0xB2/0xB3 (PIIX/PCH).
+            APM_CNT_PORT | APM_STS_PORT => self.apm.port_read(port, size),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
             0x2F8..0x300 => self.com2.port_read(port, size),
@@ -1317,6 +1327,9 @@ impl MachineBus<'_> {
                 self.mem.set_a20_enabled(enabled);
                 self.kbd.set_a20_enabled(enabled);
             }
+            // Spec: Intel APM_CNT/APM_STS — command write stub-completes SMI
+            // handshake (clears status); no architectural SMM entry.
+            APM_CNT_PORT | APM_STS_PORT => self.apm.port_write(port, size, value),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
             I8042_DATA | I8042_STATUS_CMD => {
                 self.kbd.port_write(port, size, value);
@@ -2721,6 +2734,7 @@ mod tests {
         assert_eq!(m.cmos, Machine::new(64 * 1024).cmos);
         assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.port92, Port92::new());
+        assert_eq!(m.apm, ApmSmi::new());
         assert_eq!(m.pci, PciConfig::new());
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
@@ -2918,6 +2932,7 @@ mod tests {
         assert_eq!(m.cpu.gpr[CpuState::RAX], 0);
         assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.port92, Port92::new());
+        assert_eq!(m.apm, ApmSmi::new());
         assert!(!m.service_8042_pulse_reset());
     }
 
