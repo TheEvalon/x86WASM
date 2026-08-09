@@ -24,6 +24,16 @@
 //!   WRITE: host fills data port after DRQ; ATAPI probe via `0xA1` / PACKET.
 //! - IBM PC/AT IDE — alternate status / device control at `0x3F6`; IRQ14.
 //! - Intel 8259A — DualPic IR14 (slave IR6) vectoring via MachineBus.
+//! - ATA/ATAPI-6 (T13/1410D r3b) §7.7 DEV bit, §7.8.5 Device Control,
+//!   §5.2.9 INTRQ, §9.12 Signature and persistence, §9.16.1 "Device 0 only
+//!   configurations", Table 18 "Device 1 is selected and Device 0 is
+//!   responding for Device 1", §8.11 / Table 26 EXECUTE DEVICE DIAGNOSTIC —
+//!   see `docs/ide-device-selection.md`.
+//! - ATA/ATAPI-6 §6.20 "48-bit Address feature set" + Table 11, §6.2.1 /
+//!   §6.2.2 capacity and addressing-error rules, §7.8.6 Device Control HOB,
+//!   §8.35 READ SECTOR(S) EXT (`24h`), §8.63 WRITE SECTOR(S) EXT (`34h`),
+//!   Table 27 IDENTIFY words 83/86 bit10 and words (103:100) —
+//!   see `docs/ide-lba48.md`.
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.5 / §21 PIIX IDE / ATAPI.
 //!
 //! # Scope (this slice)
@@ -79,8 +89,29 @@
 //! - READ MULTIPLE (`0xC4`) / WRITE MULTIPLE (`0xC5`): LBA28 PIO using stored
 //!   `multiple_count` sectors per DRQ block (last block may be shorter);
 //!   `multiple_count==0` → ERR+ABRT; INTRQ once per block / completion when nIEN=0
+//! - READ SECTOR(S) EXT (`0x24`) / WRITE SECTOR(S) EXT (`0x34`): 48-bit
+//!   Address feature set PIO using the two-byte deep Features / Sector Count /
+//!   LBA Low / LBA Mid / LBA High FIFOs and Device Control HOB (bit7); 16-bit
+//!   Sector Count with `0000h` = 65,536; one DRQ block and one INTRQ per
+//!   sector; Device register LBA bit required (CHS → ERR+ABRT); a range
+//!   outside the user-addressable sectors → ERR+IDNF before any DRQ. IDENTIFY
+//!   word 83 bit10 / word 86 bit10 and words 100–103 report the feature set
+//!   and 48-bit capacity, and words 60–61 are capped at 268,435,455
 //! - Status: BSY/DRDY/DRQ/ERR; alt status at `0x3F6` (no IRQ clear)
 //! - Device control: SRST (bit2) software reset; nIEN gates IRQ14
+//! - Device selection (DEV bit4 of the Device register): this channel models
+//!   Device 0 only, so ATA/ATAPI-6 §9.16.1 "Device 0 only configurations"
+//!   applies when the host selects Device 1 — Device Control and non-Command
+//!   Command Block writes land in Device 0; Command register writes are
+//!   ignored except EXECUTE DEVICE DIAGNOSTIC (`0x90`); non-status Command
+//!   Block reads return Device 0 content (the Device register reads back with
+//!   DEV set); Status and Alternate Status read `00h`; INTRQ is released while
+//!   Device 0 is deselected and reasserted on reselect (§5.2.9) without losing
+//!   interrupt pending. Data port cycles for Device 1 are ignored (Table 18
+//!   defines only BSY=0/DRQ=0 cases; documented model choice)
+//! - Signature: software reset and EXECUTE DEVICE DIAGNOSTIC write the
+//!   non-PACKET signature Sector Count `01h` / LBA Low `01h` / LBA Mid `00h` /
+//!   LBA High `00h` (ATA/ATAPI-6 §9.12)
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
 //!   status register read clears pending IRQ; `irq_line()` for MachineBus
 //! - `PortDevice` for MachineBus wiring
@@ -97,8 +128,20 @@
 //! - TRUSTED RECEIVE / TRUSTED SEND Security Protocol PIO (ABRT-only stubs for
 //!   `0x5C` / `0x5E`)
 //! - Real BM-DMA / UDMA/MDMA / PRD engine (READ/WRITE DMA are ABRT-only)
-//! - LBA48
-//! - Slave drive on either channel
+//! - The rest of the 48-bit Address feature set: READ/WRITE DMA EXT, READ/WRITE
+//!   DMA QUEUED EXT, READ/WRITE MULTIPLE EXT, READ VERIFY SECTOR(S) EXT,
+//!   READ NATIVE MAX ADDRESS EXT, SET MAX ADDRESS EXT, FLUSH CACHE EXT is a
+//!   success stub only. Only READ SECTOR(S) EXT / WRITE SECTOR(S) EXT are
+//!   implemented, which is what IDENTIFY word 83 bit10 claims
+//! - Error-output LBA reporting for the failing sector of an EXT command (the
+//!   task file keeps the command address instead)
+//! - HOB clearing on a Data port write (task-file register writes only)
+//! - An actual Device 1 on either channel — only the ATA/ATAPI-6 §9.16.1
+//!   Device-0-only responses are modeled; there is no second drive, no
+//!   PDIAG-/DASP- device-1 detection handshake, no ATA/ATAPI-6 §9.16.2
+//!   "Device 1 only" configuration, and no per-device task file
+//! - Data port behavior for Device 1 while Device 0 has BSY or DRQ set
+//!   (outside Table 18; modeled as an ignored cycle)
 //! - SeaBIOS / PCI IDE BAR remapping
 //!
 //! Secondary channel (`IdeSecondary`) remaps the same ATA PIO stub — including
@@ -295,21 +338,64 @@ pub const ATA_CMD_READ_BUFFER: u8 = 0xE4;
 /// Spec: ATA/ATAPI Command Set — WRITE BUFFER (`0xE8`).
 pub const ATA_CMD_WRITE_BUFFER: u8 = 0xE8;
 
+/// READ SECTOR(S) EXT — 48-bit Address feature set. Spec: ATA/ATAPI-6 §8.35.1.
+pub const ATA_CMD_READ_SECTORS_EXT: u8 = 0x24;
+/// WRITE SECTOR(S) EXT — 48-bit Address feature set. Spec: ATA/ATAPI-6 §8.63.1.
+pub const ATA_CMD_WRITE_SECTORS_EXT: u8 = 0x34;
+
 /// Error register: aborted command.
 pub const ATA_ER_ABRT: u8 = 0x04;
+/// Error register bit4: IDNF (requested address not found / out of range).
+///
+/// Spec: ATA/ATAPI-6 §8.35.6 / §8.63.6 — "IDNF shall be set to one if an
+/// address outside of the range of user-accessible addresses is requested if
+/// command aborted is not returned."
+pub const ATA_ER_IDNF: u8 = 0x10;
 
 /// Device control: software reset.
 pub const ATA_DC_SRST: u8 = 0x04;
 /// Device control: nIEN (1 = IRQ disabled / INTRQ not driven).
 pub const ATA_DC_NIEN: u8 = 0x02;
+/// Device control bit7: HOB (high order byte).
+///
+/// Spec: ATA/ATAPI-6 §7.8.6 / §6.20 — when set, reads of the Sector Count,
+/// LBA Low, LBA Mid and LBA High registers return the "previous content" half
+/// of their two-byte deep FIFO.
+pub const ATA_DC_HOB: u8 = 0x80;
+
+/// Largest LBA28 user-addressable sector count (IDENTIFY words 61:60 cap).
+///
+/// Spec: ATA/ATAPI-6 §6.2.1 — words (61:60) "shall be greater than or equal to
+/// one and less than or equal to 268,435,455".
+pub const ATA_LBA28_MAX_SECTORS: u64 = 268_435_455;
+/// Largest LBA48 user-addressable sector count. Spec: ATA/ATAPI-6 §6.2.1 —
+/// words (103:100) "shall not exceed 0000FFFFFFFFFFFFh".
+pub const ATA_LBA48_MAX_SECTORS: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 /// Drive/head: LBA mode bit.
 pub const ATA_DRIVE_LBA: u8 = 0x40;
-/// Drive/head: slave select (bit4). Master = 0.
+/// Drive/head bit4: DEV — device 1 ("slave") select; Device 0 = 0.
+///
+/// Spec: ATA/ATAPI-6 §7.7 — "When the DEV bit is cleared to zero, Device 0 is
+/// selected. When the DEV bit is set to one, Device 1 is selected."
 pub const ATA_DRIVE_SLAVE: u8 = 0x10;
+
+/// Non-PACKET device signature Sector Count. Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_SECTOR_COUNT: u8 = 0x01;
+/// Non-PACKET device signature LBA Low. Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_LBA_LOW: u8 = 0x01;
+/// Non-PACKET device signature LBA Mid (`0x14` on ATAPI). Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_LBA_MID: u8 = 0x00;
+/// Non-PACKET device signature LBA High (`0xEB` on ATAPI). Spec: ATA/ATAPI-6 §9.12.
+pub const ATA_SIGNATURE_LBA_HIGH: u8 = 0x00;
 
 const SECTOR_SIZE: usize = 512;
 const IDENTIFY_WORDS: usize = 256;
+/// IDENTIFY words 83/86 bit10 — 48-bit Address feature set supported.
+///
+/// Spec: ATA/ATAPI-6 Table 27 — "If bit 10 of word 83 is set to one, the 48-bit
+/// Address feature set is supported"; word 86 bit10 mirrors it.
+const IDENTIFY_LBA48_SUPPORTED: u16 = 1 << 10;
 
 /// Primary IDE channel (master drive stub).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -324,6 +410,17 @@ pub struct IdePrimary {
     lba_lo: u8,
     lba_mid: u8,
     lba_hi: u8,
+    /// "Previous content" halves of the two-byte deep Command Block FIFOs.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 / Table 11 — the Features, Sector Count, LBA
+    /// Low, LBA Mid and LBA High registers are each a two-byte deep FIFO; a
+    /// write moves the old "most recently written" value here. The host reads
+    /// them back with Device Control HOB set.
+    features_prev: u8,
+    sector_count_prev: u8,
+    lba_lo_prev: u8,
+    lba_mid_prev: u8,
+    lba_hi_prev: u8,
     drive_head: u8,
     status: u8,
     dev_ctrl: u8,
@@ -339,7 +436,16 @@ pub struct IdePrimary {
     /// Sectors still to present/accept after the current PIO block (incl. current).
     sectors_left: u32,
     /// Next LBA to load (READ) or LBA of current PIO block (WRITE).
-    next_lba: u32,
+    ///
+    /// 64-bit so the same PIO engine serves LBA28 and the 48-bit Address
+    /// feature set (ATA/ATAPI-6 §6.20).
+    next_lba: u64,
+    /// True while a 48-bit Address feature set transfer is in progress.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 — the EXT commands use a 16-bit Sector Count
+    /// spread across the two-deep FIFO, so the running count is mirrored into
+    /// both halves instead of the single LBA28 byte.
+    lba48_xfer: bool,
     /// True while host must drain/fill the data port under DRQ.
     transferring: bool,
     /// True = host→device WRITE PIO; false = device→host READ/IDENTIFY PIO.
@@ -376,6 +482,11 @@ impl IdePrimary {
             lba_lo: 0,
             lba_mid: 0,
             lba_hi: 0,
+            features_prev: 0,
+            sector_count_prev: 0,
+            lba_lo_prev: 0,
+            lba_mid_prev: 0,
+            lba_hi_prev: 0,
             drive_head: 0xA0,
             status: 0,
             dev_ctrl: ATA_DC_NIEN,
@@ -385,6 +496,7 @@ impl IdePrimary {
             pio_off: 0,
             sectors_left: 0,
             next_lba: 0,
+            lba48_xfer: false,
             transferring: false,
             pio_in: false,
             sector_buffer_write: false,
@@ -428,6 +540,14 @@ impl IdePrimary {
         self.lba_lo = 1;
         self.lba_mid = 0;
         self.lba_hi = 0;
+        // Spec: ATA/ATAPI-6 §6.20 — the "previous content" halves have no
+        // defined value after reset; clear them so no stale HOB byte leaks
+        // into the next 48-bit command.
+        self.features_prev = 0;
+        self.sector_count_prev = 0;
+        self.lba_lo_prev = 0;
+        self.lba_mid_prev = 0;
+        self.lba_hi_prev = 0;
         self.drive_head = 0xA0;
         self.dev_ctrl = ATA_DC_NIEN;
         self.irq_pending = false;
@@ -436,6 +556,7 @@ impl IdePrimary {
         self.pio_off = 0;
         self.sectors_left = 0;
         self.next_lba = 0;
+        self.lba48_xfer = false;
         self.transferring = false;
         self.pio_in = false;
         self.sector_buffer_write = false;
@@ -454,11 +575,15 @@ impl IdePrimary {
         matches!(port, 0x1F0..=0x1F7 | IDE_PRIMARY_CTRL)
     }
 
-    /// ISA IRQ14 line level (INTRQ ∧ ¬nIEN).
+    /// ISA IRQ14 line level (INTRQ ∧ ¬nIEN ∧ device selected).
     ///
-    /// Spec: ATA device control nIEN; OSDev ATA PIO — primary → IRQ14.
+    /// Spec: ATA/ATAPI-6 §5.2.9 INTRQ — "When the nIEN bit is set to one or the
+    /// device is not selected, the INTRQ signal shall be released." Selecting
+    /// Device 1 therefore releases the line without clearing Device 0 interrupt
+    /// pending; reselecting Device 0 asserts it again.
+    /// Spec: OSDev ATA PIO — primary → IRQ14.
     pub fn irq_line(&self) -> bool {
-        self.irq_pending && (self.dev_ctrl & ATA_DC_NIEN == 0)
+        self.irq_pending && (self.dev_ctrl & ATA_DC_NIEN == 0) && !self.is_slave_selected()
     }
 
     fn raise_irq(&mut self) {
@@ -470,15 +595,33 @@ impl IdePrimary {
         self.irq_pending = false;
     }
 
+    /// True when the Device register DEV bit selects Device 1.
+    ///
+    /// This channel models Device 0 only, so Device 1 is always absent and
+    /// ATA/ATAPI-6 §9.16.1 "Device 0 only configurations" applies.
     fn is_slave_selected(&self) -> bool {
         self.drive_head & ATA_DRIVE_SLAVE != 0
     }
 
-    fn lba28(&self) -> u32 {
-        let hi = u32::from(self.drive_head & 0x0F) << 24;
-        hi | (u32::from(self.lba_hi) << 16)
-            | (u32::from(self.lba_mid) << 8)
-            | u32::from(self.lba_lo)
+    fn lba28(&self) -> u64 {
+        let hi = u64::from(self.drive_head & 0x0F) << 24;
+        hi | (u64::from(self.lba_hi) << 16)
+            | (u64::from(self.lba_mid) << 8)
+            | u64::from(self.lba_lo)
+    }
+
+    /// 48-bit LBA assembled from the two-byte deep Command Block FIFOs.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 Table 11 — LBA Low current/previous supply
+    /// LBA (7:0)/(31:24), LBA Mid supplies (15:8)/(39:32), LBA High supplies
+    /// (23:16)/(47:40). Device register bits 3:0 are reserved and take no part.
+    fn lba48(&self) -> u64 {
+        u64::from(self.lba_lo)
+            | (u64::from(self.lba_mid) << 8)
+            | (u64::from(self.lba_hi) << 16)
+            | (u64::from(self.lba_lo_prev) << 24)
+            | (u64::from(self.lba_mid_prev) << 32)
+            | (u64::from(self.lba_hi_prev) << 40)
     }
 
     fn sector_count_effective(&self) -> u32 {
@@ -489,8 +632,30 @@ impl IdePrimary {
         }
     }
 
-    fn total_sectors(&self) -> u32 {
-        (self.image.len() / SECTOR_SIZE) as u32
+    /// 16-bit Sector Count for a 48-bit command; `0000h` means 65,536 sectors.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 Table 11 / §8.35.8 / §8.63.8.
+    fn sector_count48_effective(&self) -> u32 {
+        let count = u32::from(self.sector_count_prev) << 8 | u32::from(self.sector_count);
+        if count == 0 {
+            65_536
+        } else {
+            count
+        }
+    }
+
+    fn total_sectors(&self) -> u64 {
+        (self.image.len() / SECTOR_SIZE) as u64
+    }
+
+    /// IDENTIFY words (61:60) value for a capacity.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 — "if the device contains greater than the
+    /// capacity addressable with 28-bit commands, words (61:60) shall describe
+    /// the maximum capacity that can be addressed by 28-bit commands", i.e.
+    /// they are capped at 268,435,455 (§6.2.1).
+    fn identify_lba28_capacity(total_sectors: u64) -> u32 {
+        total_sectors.min(ATA_LBA28_MAX_SECTORS) as u32
     }
 
     /// Build a minimal IDENTIFY DEVICE payload (256 words, little-endian words).
@@ -518,14 +683,27 @@ impl IdePrimary {
             words[59] = 0x0100 | u16::from(self.multiple_count);
         }
         let total = self.total_sectors().max(1);
-        words[60] = (total & 0xFFFF) as u16;
-        words[61] = (total >> 16) as u16;
+        // Spec: ATA/ATAPI-6 §6.2.1 / §6.20 — words (61:60) are the LBA28
+        // user-addressable sector count, capped at 268,435,455.
+        let lba28_total = Self::identify_lba28_capacity(total);
+        words[60] = (lba28_total & 0xFFFF) as u16;
+        words[61] = (lba28_total >> 16) as u16;
         words[63] = 0; // no multiword DMA
         words[80] = 1 << 4; // ATA/ATAPI-4 major version bit (informational)
         words[82] = 0;
-        words[83] = 0x4000; // bit14 must be 1 in word 83
+        // Spec: ATA/ATAPI-6 §6.20 / Table 27 — word 83 bit14 shall be one and
+        // bit10 reports the 48-bit Address feature set; word 86 bit10 mirrors
+        // it. READ/WRITE SECTOR(S) EXT are implemented, so this is truthful.
+        words[83] = 0x4000 | IDENTIFY_LBA48_SUPPORTED;
         words[85] = 0;
-        words[86] = 0;
+        words[86] = IDENTIFY_LBA48_SUPPORTED;
+        // Spec: ATA/ATAPI-6 §6.2.1 — words (103:100) hold the 48-bit
+        // user-addressable sector count (max LBA + 1).
+        let lba48_total = total.min(ATA_LBA48_MAX_SECTORS);
+        words[100] = (lba48_total & 0xFFFF) as u16;
+        words[101] = ((lba48_total >> 16) & 0xFFFF) as u16;
+        words[102] = ((lba48_total >> 32) & 0xFFFF) as u16;
+        words[103] = ((lba48_total >> 48) & 0xFFFF) as u16;
 
         for (i, w) in words.iter().enumerate() {
             let off = i * 2;
@@ -555,7 +733,7 @@ impl IdePrimary {
         self.raise_irq();
     }
 
-    fn load_sector_into_pio(&mut self, lba: u32) -> bool {
+    fn load_sector_into_pio(&mut self, lba: u64) -> bool {
         let total = self.total_sectors();
         if total == 0 || lba >= total {
             return false;
@@ -572,7 +750,7 @@ impl IdePrimary {
         true
     }
 
-    fn store_sector_from_pio(&mut self, lba: u32) -> bool {
+    fn store_sector_from_pio(&mut self, lba: u64) -> bool {
         let total = self.total_sectors();
         if total == 0 || lba >= total {
             return false;
@@ -596,6 +774,7 @@ impl IdePrimary {
         self.multiple_xfer = false;
         self.block_left = 0;
         self.sectors_left = 0;
+        self.lba48_xfer = false;
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_ERR;
         // Spec: ATA — INTRQ on error completion when interrupts enabled.
         self.raise_irq();
@@ -611,7 +790,7 @@ impl IdePrimary {
 
     fn exec_identify(&mut self) {
         // Spec: OSDev ATA PIO — no device / slave → status 0 after IDENTIFY.
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -631,7 +810,7 @@ impl IdePrimary {
     /// abort with ERR+ABRT (no 256-word PIO). SeaBIOS probes `0xA1` to detect
     /// ATAPI; master stays ATA in this stub (no slave ATAPI path yet).
     fn exec_identify_packet(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -647,7 +826,7 @@ impl IdePrimary {
     /// and no packet PIO. SeaBIOS-friendly: honest reject without a packet
     /// engine. INTRQ follows the same nIEN rules as WRITE/IDENTIFY abort.
     fn exec_packet(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -657,7 +836,7 @@ impl IdePrimary {
     }
 
     fn exec_read_sectors(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.clear_irq();
@@ -676,14 +855,128 @@ impl IdePrimary {
         }
         self.multiple_xfer = false;
         self.block_left = 0;
+        self.lba48_xfer = false;
         self.sectors_left = count;
         self.next_lba = lba.wrapping_add(1);
         self.begin_pio_out();
     }
 
+    /// READ SECTOR(S) EXT (`0x24`) — 48-bit Address feature set PIO data-in.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.35 — 1 to 65,536 sectors (Sector Count `0000h` =
+    /// 65,536) starting at the 48-bit LBA in the two-deep Command Block FIFOs
+    /// (§6.20 Table 11); DRQ per sector and "the device shall interrupt for
+    /// each DRQ block transferred". The Device register LBA bit shall be set
+    /// (the feature set "operates in LBA only") — CHS aborts. A requested
+    /// address outside the user-addressable range reports IDNF (§8.35.6).
+    fn exec_read_sectors_ext(&mut self) {
+        if !self.present {
+            self.status = 0;
+            self.transferring = false;
+            self.clear_irq();
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        let count = self.sector_count48_effective();
+        let lba = self.lba48();
+        if !self.lba48_range_in_bounds(lba, count) {
+            self.abort_command(ATA_ER_IDNF);
+            return;
+        }
+        if !self.load_sector_into_pio(lba) {
+            self.abort_command(ATA_ER_IDNF);
+            return;
+        }
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.lba48_xfer = true;
+        self.sectors_left = count;
+        self.next_lba = lba + 1;
+        self.begin_pio_out();
+        self.update_transfer_sector_count();
+    }
+
+    /// WRITE SECTOR(S) EXT (`0x34`) — 48-bit Address feature set PIO data-out.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.63 — same addressing, 16-bit count and per-block
+    /// interrupt rules as READ SECTOR(S) EXT; out-of-range reports IDNF
+    /// (§8.63.6) and no media is written.
+    fn exec_write_sectors_ext(&mut self) {
+        if !self.present {
+            self.status = 0;
+            self.transferring = false;
+            self.pio_in = false;
+            self.clear_irq();
+            return;
+        }
+        if self.drive_head & ATA_DRIVE_LBA == 0 {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        let count = self.sector_count48_effective();
+        let lba = self.lba48();
+        if !self.lba48_range_in_bounds(lba, count) {
+            self.abort_command(ATA_ER_IDNF);
+            return;
+        }
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.lba48_xfer = true;
+        self.sectors_left = count;
+        self.next_lba = lba;
+        self.begin_pio_in();
+        self.update_transfer_sector_count();
+    }
+
+    /// True when the whole `count`-sector range from `lba` is user-addressable.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.2.2 — a command whose requested LBA is greater than
+    /// or equal to the contents of words (103:100) shall report IDNF or ABRT.
+    /// This tree validates the entire range before starting so no partial DRQ
+    /// block is presented for an out-of-range request.
+    fn lba48_range_in_bounds(&self, lba: u64, count: u32) -> bool {
+        let total = self.total_sectors();
+        if total == 0 || lba >= total {
+            return false;
+        }
+        u64::from(count) <= total - lba
+    }
+
+    /// Mirror the remaining sector count back into the task file.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 Table 11 — a 48-bit command's Sector Count spans
+    /// both halves of the two-deep FIFO, so the running count is published to
+    /// Sector Count (7:0) and (15:8). The LBA28 path keeps its single-byte
+    /// decrement. Both are model-defined between DRQ blocks: §8.35.5 / §8.63.5
+    /// mark the Sector Count outputs Reserved on completion.
+    fn update_transfer_sector_count(&mut self) {
+        if self.lba48_xfer {
+            self.sector_count = (self.sectors_left & 0xFF) as u8;
+            self.sector_count_prev = ((self.sectors_left >> 8) & 0xFF) as u8;
+        } else if self.sector_count != 0 {
+            self.sector_count = self.sector_count.wrapping_sub(1);
+        }
+    }
+
+    /// Zero the Sector Count task-file value at successful command completion.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.35.5 / §8.63.5 — the Sector Count outputs of the
+    /// EXT commands are Reserved on normal completion; this tree reports zero
+    /// (both FIFO halves) like the LBA28 path.
+    fn clear_transfer_sector_count(&mut self) {
+        self.sector_count = 0;
+        if self.lba48_xfer {
+            self.sector_count_prev = 0;
+        }
+        self.lba48_xfer = false;
+    }
+
     fn exec_write_sectors(&mut self) {
         // Spec: ATA WRITE SECTORS (0x30) — LBA28 PIO; host fills 256 words/sector.
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -717,7 +1010,7 @@ impl IdePrimary {
     /// Absent/slave → status 0. INTRQ follows nIEN like FLUSH CACHE. No write
     /// to media on WRITE VERIFY (range check only).
     fn exec_verify_sectors(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -731,8 +1024,8 @@ impl IdePrimary {
         let count = self.sector_count_effective();
         let lba = self.lba28();
         let total = self.total_sectors();
-        if total == 0 || lba >= total || count > total - lba {
-            self.abort_command(0x10); // IDNF
+        if total == 0 || lba >= total || u64::from(count) > total - lba {
+            self.abort_command(ATA_ER_IDNF);
             return;
         }
         self.error = 0;
@@ -749,7 +1042,7 @@ impl IdePrimary {
     /// This stub has no volatile cache; it completes immediately with
     /// DRDY|DSC, error=0, no DRQ, and raises INTRQ when nIEN=0 (SeaBIOS-friendly).
     fn exec_flush_cache(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -769,7 +1062,7 @@ impl IdePrimary {
     /// Spec: ATA/ATAPI Command Set — NOP completes with success; this stub
     /// mirrors other non-data success completions (DRDY|DSC, error=0).
     fn exec_nop(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -792,7 +1085,7 @@ impl IdePrimary {
     /// shorter when Sector Count is not divisible by the block factor. INTRQ
     /// once per DRQ block ready and on command completion when nIEN=0.
     fn exec_read_multiple(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -829,7 +1122,7 @@ impl IdePrimary {
     /// shorter when Sector Count is not divisible by the block factor. INTRQ
     /// once per DRQ block ready and on command completion when nIEN=0.
     fn exec_write_multiple(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -866,7 +1159,7 @@ impl IdePrimary {
     /// ERR+ABRT and no return data / DRQ. Absent/slave → status 0. INTRQ follows
     /// nIEN like PACKET / READ MULTIPLE abort.
     fn exec_smart(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -883,7 +1176,7 @@ impl IdePrimary {
     /// and no DRQ / DMA start. Absent/slave → status 0. INTRQ follows nIEN like
     /// SMART / PACKET abort.
     fn exec_read_dma(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -900,7 +1193,7 @@ impl IdePrimary {
     /// and no DRQ / DMA start. Absent/slave → status 0. INTRQ follows nIEN like
     /// READ DMA abort.
     fn exec_write_dma(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -919,7 +1212,7 @@ impl IdePrimary {
     /// DRQ. Absent/slave → status 0. INTRQ follows nIEN like SECURITY UNLOCK /
     /// FREEZE LOCK abort.
     fn exec_security_set_password(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -937,7 +1230,7 @@ impl IdePrimary {
     /// and no unlock PIO / DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SECURITY FREEZE LOCK abort.
     fn exec_security_unlock(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -955,7 +1248,7 @@ impl IdePrimary {
     /// ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SECURITY SET PASSWORD abort.
     fn exec_security_erase_prepare(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -973,7 +1266,7 @@ impl IdePrimary {
     /// with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SECURITY ERASE PREPARE abort.
     fn exec_security_erase_unit(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -991,7 +1284,7 @@ impl IdePrimary {
     /// no freeze state / DRQ. Absent/slave → status 0. INTRQ follows nIEN like
     /// SMART / READ DMA abort.
     fn exec_security_freeze_lock(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1009,7 +1302,7 @@ impl IdePrimary {
     /// abort with ERR+ABRT and no DRQ. Absent/slave → status 0. INTRQ follows
     /// nIEN like SECURITY ERASE UNIT abort.
     fn exec_security_disable_password(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1027,7 +1320,7 @@ impl IdePrimary {
     /// data/DRQ transfer. Absent/slave → status 0. INTRQ follows nIEN like
     /// SMART / SECURITY FREEZE abort.
     fn exec_download_microcode(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1044,7 +1337,7 @@ impl IdePrimary {
     /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
     /// INTRQ follows nIEN like SMART / DOWNLOAD MICROCODE abort.
     fn exec_read_log_ext(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1061,7 +1354,7 @@ impl IdePrimary {
     /// ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave → status 0.
     /// INTRQ follows nIEN like READ LOG EXT abort.
     fn exec_write_log_ext(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1078,7 +1371,7 @@ impl IdePrimary {
     /// stub does not implement TRIM; ATA disks abort with ERR+ABRT and no
     /// data/DRQ. Absent/slave → status 0. INTRQ follows nIEN like WRITE LOG EXT.
     fn exec_data_set_management(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1095,7 +1388,7 @@ impl IdePrimary {
     /// Computing; ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave →
     /// status 0. INTRQ follows nIEN like DATA SET MANAGEMENT abort.
     fn exec_trusted_receive(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1112,7 +1405,7 @@ impl IdePrimary {
     /// Computing; ATA disks abort with ERR+ABRT and no data/DRQ. Absent/slave →
     /// status 0. INTRQ follows nIEN like TRUSTED RECEIVE abort.
     fn exec_trusted_send(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1129,7 +1422,7 @@ impl IdePrimary {
     /// READ/WRITE SECTORS or WRITE BUFFER transfer (zeros after reset).
     /// Absent/slave → status 0. INTRQ follows nIEN like READ SECTORS / IDENTIFY DRQ.
     fn exec_read_buffer(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1151,7 +1444,7 @@ impl IdePrimary {
     /// readable via READ BUFFER. Absent/slave → status 0. INTRQ follows nIEN
     /// like WRITE SECTORS (DRQ ready + command complete).
     fn exec_write_buffer(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1172,7 +1465,7 @@ impl IdePrimary {
     /// Spec: ATA power-management commands complete with DRDY|DSC; this stub
     /// does not model timers or standby spin-down.
     fn exec_power_mgmt_success(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1192,7 +1485,7 @@ impl IdePrimary {
     /// Spec: ATA CHECK POWER MODE returns power state in the sector count
     /// register (`0xFF` = Active or Idle). Stub always reports Active/Idle.
     fn exec_check_power_mode(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1213,7 +1506,7 @@ impl IdePrimary {
     /// Spec: ATA RECALIBRATE/SEEK complete with DRDY|DSC; this stub does not
     /// model physical head motion (DSC always set when ready).
     fn exec_recalibrate_seek_success(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1233,7 +1526,7 @@ impl IdePrimary {
     /// Spec: ATA INITIALIZE DEVICE PARAMETERS programs sectors/heads from the
     /// task file; this stub accepts and succeeds without changing geometry.
     fn exec_init_dev_params(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1256,7 +1549,7 @@ impl IdePrimary {
     /// Invalid → ERR+ABRT (prior `multiple_count` unchanged). Completes with
     /// DRDY|DSC and INTRQ when nIEN=0.
     fn exec_set_multiple_mode(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1288,14 +1581,20 @@ impl IdePrimary {
     /// LBA Low/Mid/High and Device bits 3:0. This stub uses `total_sectors-1`
     /// (or 0 if empty). Completes with DRDY|DSC and INTRQ when nIEN=0.
     fn exec_read_native_max(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
             self.clear_irq();
             return;
         }
-        let max = self.total_sectors().saturating_sub(1);
+        // Spec: ATA/ATAPI-6 §6.20 — "If the native maximum address is greater
+        // than 268,435,455, a READ NATIVE MAX ADDRESS command shall cause the
+        // device to return a maximum value of 268,435,454."
+        let max = self
+            .total_sectors()
+            .saturating_sub(1)
+            .min(ATA_LBA28_MAX_SECTORS - 1);
         self.lba_lo = (max & 0xFF) as u8;
         self.lba_mid = ((max >> 8) & 0xFF) as u8;
         self.lba_hi = ((max >> 16) & 0xFF) as u8;
@@ -1316,7 +1615,7 @@ impl IdePrimary {
     /// with ERR+ABRT and leave capacity unchanged. Absent/slave → status 0.
     /// INTRQ follows nIEN like WRITE BUFFER abort.
     fn exec_set_max_address(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1328,7 +1627,7 @@ impl IdePrimary {
 
     /// MEDIA LOCK/UNLOCK (`0xDE`/`0xDF`) — success noop (no tray lock state).
     fn exec_media_lock_unlock(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1345,10 +1644,16 @@ impl IdePrimary {
 
     /// EXECUTE DEVICE DIAGNOSTIC (`0x90`).
     ///
-    /// Spec: ATA — runs diagnostics; error register `0x01` = device 0 passed.
-    /// This stub always reports passed on present master; absent/slave → status 0.
+    /// Spec: ATA/ATAPI-6 §8.11 / Table 26 — diagnostic code `01h` in the Error
+    /// register means "Device 0 passed, Device 1 passed or not present"; note 2
+    /// adds that with Device 1 absent the host may see Device 0 information even
+    /// though Device 1 is selected. §9.16.1(3) makes this the one Command
+    /// register write Device 0 still executes while Device 1 is selected.
+    /// Spec: ATA/ATAPI-6 §9.12 — the command also writes the non-PACKET
+    /// signature (Sector Count `01h`, LBA Low `01h`, LBA Mid `00h`,
+    /// LBA High `00h`) into the Command Block registers.
     fn exec_diagnostic(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1356,11 +1661,25 @@ impl IdePrimary {
             return;
         }
         self.error = ATA_DIAG_PASSED;
+        self.write_ata_signature();
         self.transferring = false;
         self.pio_in = false;
         self.sectors_left = 0;
         self.status = ATA_SR_DRDY | ATA_SR_DSC;
         self.raise_irq();
+    }
+
+    /// Place the non-PACKET device signature in the Command Block registers.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.12 Signature and persistence — Sector Count `01h`,
+    /// LBA Low `01h`, LBA Mid `00h`, LBA High `00h`. The Device register keeps
+    /// the obsolete ATA-1..5 bits 7/5 (`0xA0`-style) that classic PC firmware
+    /// expects, and the DEV bit is left as the host selected it.
+    fn write_ata_signature(&mut self) {
+        self.sector_count = ATA_SIGNATURE_SECTOR_COUNT;
+        self.lba_lo = ATA_SIGNATURE_LBA_LOW;
+        self.lba_mid = ATA_SIGNATURE_LBA_MID;
+        self.lba_hi = ATA_SIGNATURE_LBA_HIGH;
     }
 
     /// SET FEATURES (`0xEF`) — accept features register, succeed without side effects.
@@ -1369,7 +1688,7 @@ impl IdePrimary {
     /// This stub completes successfully on present master (SeaBIOS-friendly
     /// accept); feature-specific behavior remains unsupported.
     fn exec_set_features(&mut self) {
-        if !self.present || self.is_slave_selected() {
+        if !self.present {
             self.status = 0;
             self.transferring = false;
             self.pio_in = false;
@@ -1385,13 +1704,28 @@ impl IdePrimary {
         self.raise_irq();
     }
 
+    /// Dispatch a Command register write.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.16.1(3) / Table 18 — in a Device 0 only
+    /// configuration, a write to the Command register while Device 1 is
+    /// selected shall be ignored, "except for EXECUTE DEVICE DIAGNOSTIC".
+    /// Ignoring means Device 0 keeps its status, Error register, interrupt
+    /// pending state, and any in-progress PIO transfer.
     fn exec_command(&mut self, cmd: u8) {
+        if self.is_slave_selected() && cmd != ATA_CMD_DIAGNOSTIC {
+            return;
+        }
+        // Any new command leaves the 48-bit transfer mode; the EXT handlers
+        // re-arm it (ATA/ATAPI-6 §6.20 — 28-bit and 48-bit commands intermix).
+        self.lba48_xfer = false;
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
             ATA_CMD_PACKET => self.exec_packet(),
             ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
             ATA_CMD_READ_SECTORS => self.exec_read_sectors(),
             ATA_CMD_WRITE_SECTORS => self.exec_write_sectors(),
+            ATA_CMD_READ_SECTORS_EXT => self.exec_read_sectors_ext(),
+            ATA_CMD_WRITE_SECTORS_EXT => self.exec_write_sectors_ext(),
             ATA_CMD_READ_VERIFY_SECTORS | ATA_CMD_WRITE_VERIFY_SECTORS => {
                 self.exec_verify_sectors()
             }
@@ -1435,6 +1769,13 @@ impl IdePrimary {
     }
 
     fn read_data(&mut self, size: u8) -> u32 {
+        // Spec: ATA/ATAPI-6 Table 18 only defines Device 0 responses for
+        // Device 1 with BSY=0 and DRQ=0, so a Data port cycle aimed at the
+        // absent Device 1 has no defined answer. Documented model choice: the
+        // cycle is ignored so an in-progress Device 0 DRQ block is preserved.
+        if self.is_slave_selected() {
+            return 0xFFFF_FFFF;
+        }
         if !self.transferring || self.pio_in || self.status & ATA_SR_DRQ == 0 {
             return 0xFFFF_FFFF;
         }
@@ -1457,6 +1798,10 @@ impl IdePrimary {
     }
 
     fn write_data(&mut self, size: u8, value: u32) {
+        // See `read_data`: Data port cycles for the absent Device 1 are ignored.
+        if self.is_slave_selected() {
+            return;
+        }
         if !self.transferring || !self.pio_in || self.status & ATA_SR_DRQ == 0 {
             return;
         }
@@ -1490,7 +1835,7 @@ impl IdePrimary {
             self.block_left = 0;
             self.pio_off = 0;
             self.status = ATA_SR_DRDY | ATA_SR_DSC;
-            self.sector_count = 0;
+            self.clear_transfer_sector_count();
             // Spec: ATA — INTRQ on command completion after final sector.
             self.raise_irq();
             return;
@@ -1504,9 +1849,7 @@ impl IdePrimary {
         self.pio_off = 0;
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
         // Spec: sector count decrements as sectors transfer.
-        if self.sector_count != 0 {
-            self.sector_count = self.sector_count.wrapping_sub(1);
-        }
+        self.update_transfer_sector_count();
         if self.multiple_xfer {
             if self.block_left == 0 {
                 // Spec: ATA READ MULTIPLE — IRQ when next multi-sector DRQ ready.
@@ -1530,7 +1873,7 @@ impl IdePrimary {
             self.pio_in = false;
             self.pio_off = 0;
             self.status = ATA_SR_DRDY | ATA_SR_DSC;
-            self.sector_count = 0;
+            self.clear_transfer_sector_count();
             // Spec: ATA — INTRQ on WRITE BUFFER command completion.
             self.raise_irq();
             return;
@@ -1554,7 +1897,7 @@ impl IdePrimary {
             self.block_left = 0;
             self.pio_off = 0;
             self.status = ATA_SR_DRDY | ATA_SR_DSC;
-            self.sector_count = 0;
+            self.clear_transfer_sector_count();
             // Spec: ATA — INTRQ on WRITE command completion.
             self.raise_irq();
             return;
@@ -1567,9 +1910,7 @@ impl IdePrimary {
         self.pio_off = 0;
         self.pio.fill(0);
         self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
-        if self.sector_count != 0 {
-            self.sector_count = self.sector_count.wrapping_sub(1);
-        }
+        self.update_transfer_sector_count();
         if self.multiple_xfer {
             if self.block_left == 0 {
                 // Spec: ATA WRITE MULTIPLE — IRQ when next multi-sector DRQ ready.
@@ -1583,13 +1924,22 @@ impl IdePrimary {
         }
     }
 
+    /// Device Control register write (`0x3F6` / `0x376`).
+    ///
+    /// Spec: ATA/ATAPI-6 §7.8.5 — "When the Device Control register is written,
+    /// both devices respond to the write regardless of which device is
+    /// selected", and §9.16.1(1) repeats that with Device 1 selected and absent
+    /// the write completes as if Device 0 was selected. SRST and nIEN therefore
+    /// take effect on Device 0 whatever the DEV bit says.
     fn write_dev_ctrl(&mut self, value: u8) {
         let prev = self.dev_ctrl;
-        self.dev_ctrl = value & (ATA_DC_SRST | ATA_DC_NIEN | 0x01);
+        // Spec: ATA/ATAPI-6 §7.8.6 / §6.20 — bit7 is HOB for the 48-bit
+        // Address feature set; bits 6:3 are reserved and bit0 is obsolete.
+        self.dev_ctrl = value & (ATA_DC_HOB | ATA_DC_SRST | ATA_DC_NIEN | 0x01);
         // Spec: ATA device control — SRST high then low performs software reset.
         if prev & ATA_DC_SRST == 0 && value & ATA_DC_SRST != 0 {
             // Enter reset: BSY
-            if self.present && !self.is_slave_selected() {
+            if self.present {
                 self.status = ATA_SR_BSY;
             }
             self.clear_irq();
@@ -1603,29 +1953,83 @@ impl IdePrimary {
         }
     }
 
+    /// Status / Alternate Status value presented to the host.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.16.1(4) / Table 18 — in a Device 0 only
+    /// configuration, a read of the Status or Alternate Status register while
+    /// Device 1 is selected returns `00h`. An entirely empty channel also reads
+    /// `00h` because no device drives the bus.
     fn status_byte(&self) -> u8 {
-        // No slave / absent: floating bus reads 0x00 for IDENTIFY probe.
         if !self.present || self.is_slave_selected() {
             return 0;
         }
         self.status
     }
 
+    /// Status register read (`0x1F7` / `0x177`).
+    ///
+    /// Spec: OSDev ATA PIO — reading Status (not Alternate Status) clears the
+    /// pending interrupt. Spec: ATA/ATAPI-6 §9.16.1(4) — while Device 1 is
+    /// selected this read only returns `00h`; Device 0 interrupt pending is
+    /// left alone so a reselect still delivers the interrupt (§5.2.9).
     fn read_status_clear_irq(&mut self) -> u8 {
-        // Spec: OSDev ATA PIO — reading Status (not alt) clears IRQ.
+        if self.is_slave_selected() {
+            return 0;
+        }
         self.clear_irq();
         self.status_byte()
     }
 }
 
+impl IdePrimary {
+    /// True when the host asked for the "previous content" FIFO half.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 — "If HOB (bit 7) in the Device Control register
+    /// is cleared to zero the host reads the 'most recently written' content."
+    #[inline]
+    fn hob(&self) -> bool {
+        self.dev_ctrl & ATA_DC_HOB != 0
+    }
+
+    /// Push a Command Block register write into its two-byte deep FIFO.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 — "the new content written is placed into the
+    /// 'most recently written' location and the previous content of the
+    /// register is moved to 'previous content' location. ... The 'most recently
+    /// written' content always gets written by a register write regardless of
+    /// the state of HOB."
+    #[inline]
+    fn fifo_write(current: &mut u8, previous: &mut u8, value: u8) {
+        *previous = *current;
+        *current = value;
+    }
+
+    /// Clear Device Control HOB after any Command Block register write.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.20 — "A write to any Command Block register shall
+    /// cause the device to clear the HOB bit to zero in the Device Control
+    /// register." Data port writes are excluded in this tree so a PIO data-out
+    /// block cannot clear HOB mid-transfer (documented model choice).
+    #[inline]
+    fn clear_hob(&mut self) {
+        self.dev_ctrl &= !ATA_DC_HOB;
+    }
+}
+
 impl PortDevice for IdePrimary {
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        let hob = self.hob();
         match port {
             IDE_PRIMARY_DATA => self.read_data(size),
             IDE_PRIMARY_ERROR => u32::from(self.error),
+            // Spec: ATA/ATAPI-6 §6.20 Table 11 — HOB selects the FIFO half.
+            IDE_PRIMARY_SECCOUNT if hob => u32::from(self.sector_count_prev),
             IDE_PRIMARY_SECCOUNT => u32::from(self.sector_count),
+            IDE_PRIMARY_LBA_LO if hob => u32::from(self.lba_lo_prev),
             IDE_PRIMARY_LBA_LO => u32::from(self.lba_lo),
+            IDE_PRIMARY_LBA_MID if hob => u32::from(self.lba_mid_prev),
             IDE_PRIMARY_LBA_MID => u32::from(self.lba_mid),
+            IDE_PRIMARY_LBA_HI if hob => u32::from(self.lba_hi_prev),
             IDE_PRIMARY_LBA_HI => u32::from(self.lba_hi),
             IDE_PRIMARY_DRIVE => u32::from(self.drive_head),
             IDE_PRIMARY_STATUS => u32::from(self.read_status_clear_irq()),
@@ -1638,21 +2042,44 @@ impl PortDevice for IdePrimary {
     fn port_write(&mut self, port: u16, size: u8, value: u32) {
         match port {
             IDE_PRIMARY_DATA => self.write_data(size, value),
-            IDE_PRIMARY_ERROR => self.features = value as u8,
-            IDE_PRIMARY_SECCOUNT => self.sector_count = value as u8,
-            IDE_PRIMARY_LBA_LO => self.lba_lo = value as u8,
-            IDE_PRIMARY_LBA_MID => self.lba_mid = value as u8,
-            IDE_PRIMARY_LBA_HI => self.lba_hi = value as u8,
+            IDE_PRIMARY_ERROR => {
+                Self::fifo_write(&mut self.features, &mut self.features_prev, value as u8);
+                self.clear_hob();
+            }
+            IDE_PRIMARY_SECCOUNT => {
+                Self::fifo_write(
+                    &mut self.sector_count,
+                    &mut self.sector_count_prev,
+                    value as u8,
+                );
+                self.clear_hob();
+            }
+            IDE_PRIMARY_LBA_LO => {
+                Self::fifo_write(&mut self.lba_lo, &mut self.lba_lo_prev, value as u8);
+                self.clear_hob();
+            }
+            IDE_PRIMARY_LBA_MID => {
+                Self::fifo_write(&mut self.lba_mid, &mut self.lba_mid_prev, value as u8);
+                self.clear_hob();
+            }
+            IDE_PRIMARY_LBA_HI => {
+                Self::fifo_write(&mut self.lba_hi, &mut self.lba_hi_prev, value as u8);
+                self.clear_hob();
+            }
             IDE_PRIMARY_DRIVE => {
+                // Spec: ATA/ATAPI-6 §7.7 — DEV selects the device; the Device
+                // register is not part of the two-deep FIFO (§6.20 Table 11).
                 self.drive_head = value as u8;
-                // Selecting absent slave yields status 0 on subsequent status reads.
+                self.clear_hob();
             }
             IDE_PRIMARY_STATUS => {
                 // Command register.
                 if self.status & ATA_SR_BSY != 0 {
                     return;
                 }
-                self.exec_command(value as u8);
+                let cmd = value as u8;
+                self.exec_command(cmd);
+                self.clear_hob();
             }
             IDE_PRIMARY_CTRL => self.write_dev_ctrl(value as u8),
             _ => {}
@@ -1750,6 +2177,59 @@ mod tests {
 
     fn clear_nien(ide: &mut IdePrimary) {
         ide.port_write(IDE_PRIMARY_CTRL, 1, 0);
+    }
+
+    /// Spec: ATA/ATAPI-6 §6.2.1 / §6.20 — IDENTIFY words (61:60) hold the LBA28
+    /// user-addressable sector count and are capped at 268,435,455 when the
+    /// device is larger than 28-bit addressing can reach. Exercised directly
+    /// because a >128 GiB backing image cannot be allocated in a unit test.
+    #[test]
+    fn identify_lba28_capacity_caps_at_28_bit_maximum() {
+        assert_eq!(IdePrimary::identify_lba28_capacity(0), 0);
+        assert_eq!(IdePrimary::identify_lba28_capacity(4), 4);
+        assert_eq!(
+            IdePrimary::identify_lba28_capacity(ATA_LBA28_MAX_SECTORS),
+            ATA_LBA28_MAX_SECTORS as u32
+        );
+        assert_eq!(
+            IdePrimary::identify_lba28_capacity(ATA_LBA28_MAX_SECTORS + 1),
+            ATA_LBA28_MAX_SECTORS as u32
+        );
+        assert_eq!(
+            IdePrimary::identify_lba28_capacity(ATA_LBA48_MAX_SECTORS),
+            ATA_LBA28_MAX_SECTORS as u32
+        );
+    }
+
+    /// Spec: ATA/ATAPI-6 §6.20 Table 11 — the two-deep FIFO assembles the
+    /// 48-bit LBA from current/previous halves, and the Device register bits
+    /// 3:0 are reserved (they must not leak into the address like LBA28).
+    #[test]
+    fn lba48_assembles_from_fifo_halves_only() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0xEF); // LBA(31:24)
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0x12); // LBA(7:0)
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0xBE); // LBA(39:32)
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0x34); // LBA(15:8)
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0xAD); // LBA(47:40)
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0x56); // LBA(23:16)
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, u32::from(0xA0 | ATA_DRIVE_LBA) | 0x0F);
+        assert_eq!(ide.lba48(), 0x0000_ADBE_EF56_3412);
+        // The LBA28 view still uses Device bits 3:0 (Table 12).
+        assert_eq!(ide.lba28(), 0x0F56_3412);
+    }
+
+    /// Spec: ATA/ATAPI-6 §6.20 Table 11 / §8.35.8 — Sector Count `0000h`
+    /// requests 65,536 sectors for a 48-bit command.
+    #[test]
+    fn sector_count48_zero_is_65536() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 0x00);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 0x00);
+        assert_eq!(ide.sector_count48_effective(), 65_536);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 0x01); // count(15:8)
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 0x02); // count(7:0)
+        assert_eq!(ide.sector_count48_effective(), 0x0102);
     }
 
     #[test]
