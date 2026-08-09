@@ -1,11 +1,18 @@
 //! Address translation helpers.
 //!
-//! Milestone 1: real-mode style `segment.base + offset` (CS.base is the
-//! Intel reset base `0xFFFF_0000`). Paging is not enabled (CR0.PG = 0).
+//! Segmentation: real-mode style `segment.base + offset` (CS.base is the Intel
+//! reset base `0xFFFF_0000`), with limit checks against the cached effective
+//! limit (SDM Vol. 3 §5.3).
 //!
-//! Segment limit checks use the cached effective limit (SDM Vol. 3 §5.3).
+//! Paging: [`paging`] is a standalone 32-bit paging translation engine (SDM
+//! Vol. 3 Chapter 4). **It is not wired to anything.** The interpreter's memory
+//! path still treats a linear address as a physical address, so no guest can
+//! reach the engine; see the module documentation and
+//! `docs/mmu-r3-32bit-paging.md`.
 
 #![forbid(unsafe_code)]
+
+pub mod paging;
 
 use x86_core::{CpuState, SegmentReg};
 
