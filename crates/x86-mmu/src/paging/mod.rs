@@ -6,12 +6,12 @@
 //!
 //! # Scope
 //!
-//! This is a **standalone engine**. Nothing in the interpreter or the machine
-//! calls it: `CR0.PG`, `CR3`, `CR4` and `#PF` delivery are not wired to it, so
-//! no guest can use it yet. It reads and writes guest physical memory only
-//! through a caller-supplied [`PageTableMemory`], the same shape the `devices`
-//! crate uses for bus-master transfers, so it has no dependency on
-//! `machine-pc`.
+//! The engine has no dependency on the interpreter or the machine: it reads
+//! and writes guest physical memory only through a caller-supplied
+//! [`PageTableMemory`], the same shape the `devices` crate uses for bus-master
+//! transfers. Round 4 supplied that caller — `CR0.PG`, `CR3`, `CR4` and `#PF`
+//! delivery are wired in `x86-interpreter`, described in
+//! `docs/cpu-r4-paging-integration.md`.
 //!
 //! Unsupported and reported rather than guessed: PAE paging (§4.4), 4-level and
 //! 5-level paging (§4.5), long mode, `CR4.SMEP` / `CR4.SMAP` / `CR4.PKE`

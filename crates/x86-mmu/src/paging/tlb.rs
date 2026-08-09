@@ -271,6 +271,60 @@ impl Mmu {
         }
     }
 
+    /// Would `access` at `linear` translate? Answer without any side effect:
+    /// no accessed or dirty flag is written, and nothing is cached.
+    ///
+    /// A caller needs this when one architectural access covers more than one
+    /// page, or when an unrepeatable side effect (a port read, a partially
+    /// written operand) has to be ordered after the guarantee that the store
+    /// can happen. Splitting such an access into probe-everything then
+    /// do-everything is what keeps a faulting access from leaving half of
+    /// itself behind.
+    ///
+    /// The TLB is consulted, because the real access would consult it and the
+    /// two must not disagree; a miss walks the structures read-only. §4.10.2.3
+    /// forbids caching a translation before its accessed flags are set, which
+    /// is exactly why a probe may not populate the TLB. A probe that faults
+    /// performs the §4.10.4.1 invalidation, like any other page fault.
+    pub fn probe<M: PageTableMemory>(
+        &mut self,
+        ctx: &PagingContext,
+        mem: &mut M,
+        linear: u32,
+        access: Access,
+    ) -> Result<(), TranslateError> {
+        let denied = || {
+            TranslateError::Fault(PageFault {
+                linear_address: linear,
+                access,
+                reason: FaultReason::Protection,
+            })
+        };
+
+        if ctx.mode() == PagingMode::Bits32 {
+            if let Some(entry) = self.tlb.lookup(linear).copied() {
+                if rights_permit(ctx, entry.writable, entry.user_accessible, access) {
+                    return Ok(());
+                }
+                self.tlb.invalidate_page(linear);
+                return Err(denied());
+            }
+        }
+
+        let walk = match super::walk(ctx, mem, linear) {
+            Ok(walk) => walk,
+            Err(err) => {
+                self.tlb.invalidate_page(linear);
+                return Err(err.into_translate_error(linear, access));
+            }
+        };
+        if !super::access_permitted(ctx, &walk, access) {
+            self.tlb.invalidate_page(linear);
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     fn translate_hit<M: PageTableMemory>(
         &mut self,
         ctx: &PagingContext,

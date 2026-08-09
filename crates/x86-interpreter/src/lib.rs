@@ -104,6 +104,17 @@ pub trait Bus {
         self.read_u8(addr)
     }
 
+    /// Check that a `size`-byte store at `addr` could happen, without storing.
+    ///
+    /// For instructions whose store is preceded by an effect that cannot be
+    /// replayed — `INS` reads its port before it writes memory — the store has
+    /// to be known possible first, because an instruction-boundary rollback
+    /// cannot un-read a port. Default: nothing can fail, so nothing to check.
+    fn probe_write(&mut self, addr: u64, size: u64) -> Result<(), ExecError> {
+        let _ = (addr, size);
+        Ok(())
+    }
+
     /// A `REP` iteration completed, so a `#PF` in a later iteration must
     /// restart from here rather than from the start of the instruction.
     ///
@@ -256,6 +267,89 @@ impl<'a> PagedBus<'a> {
         }
     }
 
+    /// Check that `access` at `linear` would succeed, with no side effect at
+    /// all — no accessed or dirty flag, no cached translation.
+    ///
+    /// Spec: SDM Vol. 3 §4.8 (the flags a real access would write), §4.10.2.3
+    /// (why a probe may not cache).
+    fn probe(&mut self, linear: u64, access: Access) -> Result<(), ExecError> {
+        if self.identity_mapped() {
+            return Ok(());
+        }
+        let ctx = self.ctx;
+        let mut mem = PageTableWalkBus {
+            inner: &mut *self.inner,
+            error: None,
+        };
+        let result = self.mmu.probe(&ctx, &mut mem, linear as u32, access);
+        if let Some(phys) = mem.error {
+            return Err(ExecError::PageTableFault(phys));
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(TranslateError::Fault(fault)) => Err(ExecError::PageFault {
+                linear: fault.cr2(),
+                error_code: fault.error_code(),
+            }),
+            Err(TranslateError::Unsupported(kind)) => Err(ExecError::UnsupportedPaging(kind)),
+        }
+    }
+
+    /// Translate one architectural access of `size` bytes starting at
+    /// `linear`, which may straddle a 4-KiB page boundary.
+    ///
+    /// The engine translates one address, so splitting the access, translating
+    /// both halves, and discovering a second-half fault **before** the first
+    /// half is written is caller work. That ordering is the whole point: the
+    /// two halves have unrelated translations, and a `#PF` on the second one
+    /// must leave a partially written operand behind no more than it leaves a
+    /// partially updated register.
+    ///
+    /// A split therefore probes both halves before translating either, so a
+    /// faulting access also writes no accessed or dirty flag. An access inside
+    /// a single page skips the probe: the engine already performs every fault
+    /// check before it touches a paging structure.
+    ///
+    /// Splitting at 4 KiB is correct for a 4-MiB page too — the two halves
+    /// simply translate to adjacent physical addresses.
+    ///
+    /// Model choice: when both halves fault, the lower address is reported.
+    /// §4.7 does not pin the order down, and ascending is the order the access
+    /// itself would take.
+    fn translate_span(
+        &mut self,
+        linear: u64,
+        size: usize,
+        access: Access,
+    ) -> Result<Span, ExecError> {
+        if self.identity_mapped() {
+            return Ok(Span::whole(linear, size));
+        }
+        let page_offset = (linear & PAGE_OFFSET_MASK) as usize;
+        let first_len = PAGE_SIZE - page_offset;
+        if first_len >= size {
+            return Ok(Span::whole(self.translate(linear, access)?, size));
+        }
+
+        let second_linear = linear.wrapping_add(first_len as u64) & LINEAR_ADDRESS_MASK;
+        self.probe(linear, access)?;
+        self.probe(second_linear, access)?;
+        Ok(Span {
+            first: self.translate(linear, access)?,
+            first_len,
+            second: self.translate(second_linear, access)?,
+        })
+    }
+
+    /// Physical address of byte `index` of a span.
+    fn byte_of(span: &Span, index: usize) -> u64 {
+        if index < span.first_len {
+            span.first + index as u64
+        } else {
+            span.second + (index - span.first_len) as u64
+        }
+    }
+
     /// The access a data reference of `kind` makes at the current CPL.
     fn data_access(&self, kind: AccessKind) -> Access {
         Access::from_cpl(kind, self.cpl)
@@ -265,6 +359,36 @@ impl<'a> PagedBus<'a> {
     /// or TSS: supervisor mode whatever the CPL is (SDM §4.6.1).
     fn system_access(kind: AccessKind) -> Access {
         Access::new(kind, AccessMode::Supervisor)
+    }
+}
+
+/// 4-KiB page geometry of the linear address space (SDM Vol. 3 §4.3).
+const PAGE_SIZE: usize = 0x1000;
+const PAGE_OFFSET_MASK: u64 = 0xFFF;
+/// Outside 64-bit mode the linear address space is 4 GiB (SDM Vol. 3 §3.3.1),
+/// so an access that runs off the top wraps rather than carrying into bit 32.
+const LINEAR_ADDRESS_MASK: u64 = 0xFFFF_FFFF;
+
+/// One architectural access resolved into at most two physical runs.
+struct Span {
+    first: u64,
+    /// Bytes taken from `first`; the rest come from `second`.
+    first_len: usize,
+    second: u64,
+}
+
+impl Span {
+    fn whole(phys: u64, size: usize) -> Self {
+        Self {
+            first: phys,
+            first_len: size,
+            second: phys,
+        }
+    }
+
+    /// Does the whole access live in one page?
+    fn contiguous(&self, size: usize) -> bool {
+        self.first_len >= size
     }
 }
 
@@ -313,16 +437,20 @@ impl Bus for PagedBus<'_> {
     }
 
     // A multi-byte access can straddle a page boundary, where the two halves
-    // have unrelated translations. Until the page-crossing slice makes that
-    // one planned access, translation happens per byte: correct for reads, and
-    // for a write that crosses into a faulting page it commits the first half
-    // before faulting — the restartability hole the next slices close.
+    // have unrelated translations. `translate_span` resolves the whole access
+    // before any byte of it moves; an access that stays inside one page keeps
+    // its original width on the machine bus, which matters for MMIO.
     fn read_u16(&mut self, addr: u64) -> Result<u16, ExecError> {
         if self.identity_mapped() {
             return self.inner.read_u16(addr);
         }
-        let lo = self.read_u8(addr)?;
-        let hi = self.read_u8(addr.wrapping_add(1))?;
+        let access = self.data_access(AccessKind::Read);
+        let span = self.translate_span(addr, 2, access)?;
+        if span.contiguous(2) {
+            return self.inner.read_u16(span.first);
+        }
+        let lo = self.inner.read_u8(Self::byte_of(&span, 0))?;
+        let hi = self.inner.read_u8(Self::byte_of(&span, 1))?;
         Ok(u16::from_le_bytes([lo, hi]))
     }
 
@@ -330,26 +458,61 @@ impl Bus for PagedBus<'_> {
         if self.identity_mapped() {
             return self.inner.write_u16(addr, val);
         }
+        let access = self.data_access(AccessKind::Write);
+        let span = self.translate_span(addr, 2, access)?;
+        if span.contiguous(2) {
+            return self.inner.write_u16(span.first, val);
+        }
         let bytes = val.to_le_bytes();
-        self.write_u8(addr, bytes[0])?;
-        self.write_u8(addr.wrapping_add(1), bytes[1])
+        for (index, byte) in bytes.iter().enumerate() {
+            self.inner.write_u8(Self::byte_of(&span, index), *byte)?;
+        }
+        Ok(())
     }
 
     fn read_u32(&mut self, addr: u64) -> Result<u32, ExecError> {
         if self.identity_mapped() {
             return self.inner.read_u32(addr);
         }
-        let lo = self.read_u16(addr)?;
-        let hi = self.read_u16(addr.wrapping_add(2))?;
-        Ok(u32::from(lo) | (u32::from(hi) << 16))
+        let access = self.data_access(AccessKind::Read);
+        let span = self.translate_span(addr, 4, access)?;
+        if span.contiguous(4) {
+            return self.inner.read_u32(span.first);
+        }
+        let mut bytes = [0u8; 4];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = self.inner.read_u8(Self::byte_of(&span, index))?;
+        }
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), ExecError> {
         if self.identity_mapped() {
             return self.inner.write_u32(addr, val);
         }
-        self.write_u16(addr, val as u16)?;
-        self.write_u16(addr.wrapping_add(2), (val >> 16) as u16)
+        let access = self.data_access(AccessKind::Write);
+        let span = self.translate_span(addr, 4, access)?;
+        if span.contiguous(4) {
+            return self.inner.write_u32(span.first, val);
+        }
+        let bytes = val.to_le_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            self.inner.write_u8(Self::byte_of(&span, index), *byte)?;
+        }
+        Ok(())
+    }
+
+    fn probe_write(&mut self, addr: u64, size: u64) -> Result<(), ExecError> {
+        if self.identity_mapped() || size == 0 {
+            return Ok(());
+        }
+        let access = self.data_access(AccessKind::Write);
+        let last = addr.wrapping_add(size - 1);
+        self.probe(addr, access)?;
+        if (addr & !PAGE_OFFSET_MASK) != (last & !PAGE_OFFSET_MASK) {
+            self.probe(last & LINEAR_ADDRESS_MASK, access)?;
+        }
+        Ok(())
     }
 
     fn fetch_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
@@ -2582,6 +2745,7 @@ fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 1)?;
+        bus.probe_write(dst, 1).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u8(port)?;
         bus.write_u8(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 1);
@@ -2589,6 +2753,7 @@ fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 1)?;
+        bus.probe_write(dst, 1).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u8(port)?;
         bus.write_u8(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 1);
@@ -2603,6 +2768,7 @@ fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 2)?;
+        bus.probe_write(dst, 2).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u16(port)?;
         bus.write_u16(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 2);
@@ -2610,6 +2776,7 @@ fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 2)?;
+        bus.probe_write(dst, 2).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u16(port)?;
         bus.write_u16(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 2);
@@ -2624,6 +2791,7 @@ fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 4)?;
+        bus.probe_write(dst, 4).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u32(port)?;
         bus.write_u32(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 4);
@@ -2631,6 +2799,7 @@ fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 4)?;
+        bus.probe_write(dst, 4).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u32(port)?;
         bus.write_u32(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 4);
