@@ -14,6 +14,7 @@ mod mem;
 mod ports;
 mod post_code;
 mod post_probe;
+mod post_trace;
 mod step_clock;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
@@ -30,8 +31,10 @@ pub use ports::{
 pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
 pub use post_probe::{
     seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
-    DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
+    TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV,
+    SEABIOS_IMAGE_RELATIVE,
 };
+pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use step_clock::{
     StepClock, StepTicks, CMOS_PERIODIC_HZ, DEFAULT_PIT_CLOCKS_PER_STEP,
     PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
@@ -1087,8 +1090,82 @@ impl MachineBus<'_> {
         }
     }
 
-    /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
+    /// Describe a port access for the POST trace.
+    ///
+    /// PCI Mechanism #1 gets its own events because the raw `OUT 0xCF8` /
+    /// `IN 0xCFC` pair says nothing on its own: what a reader needs is the
+    /// bus/device/function/register the latch decoded to.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.2, Figure 3-2.
+    fn trace_port_event(
+        &self,
+        port: u16,
+        size: u8,
+        value: u32,
+        write: bool,
+    ) -> post_trace::PostTraceEvent {
+        use post_trace::PostTraceEvent;
+        match port {
+            0xCF8..=0xCFB => PostTraceEvent::PciConfigAddress {
+                write,
+                port,
+                size,
+                latched: self.pci.address,
+            },
+            0xCFC..=0xCFF => PostTraceEvent::PciConfigData {
+                write,
+                port,
+                size,
+                value,
+                enabled: self.pci.config_enabled(),
+                bus: self.pci.config_bus(),
+                device: self.pci.config_device(),
+                function: self.pci.config_function(),
+                register: self.pci.config_register(),
+            },
+            _ if write => PostTraceEvent::PortOut { port, size, value },
+            _ => PostTraceEvent::PortIn { port, size, value },
+        }
+    }
+
+    /// Decode classic PC port ownership, recording the access when the POST
+    /// trace is armed. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        let value = self.dispatch_port_read(port, size);
+        if self.ports.trace_enabled() {
+            let event = self.trace_port_event(port, size, value, false);
+            self.ports.record_trace(event);
+        }
+        value
+    }
+
+    fn port_write(&mut self, port: u16, size: u8, value: u32) {
+        // PAM programming is a state change, not an access: snapshot before the
+        // write so the trace can name the registers that actually moved.
+        let pam_before = (self.ports.trace_enabled() && PciConfig::owns_port(port))
+            .then(|| self.pci.pam_registers());
+
+        self.dispatch_port_write(port, size, value);
+
+        if self.ports.trace_enabled() {
+            let event = self.trace_port_event(port, size, value, true);
+            self.ports.record_trace(event);
+            if let Some(before) = pam_before {
+                let after = self.pci.pam_registers();
+                for (index, (old, new)) in before.into_iter().zip(after).enumerate() {
+                    if old != new {
+                        self.ports
+                            .record_trace(post_trace::PostTraceEvent::PamProgram {
+                                index: index as u8,
+                                value: new,
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    fn dispatch_port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
             return self.ide.port_read(port, size);
         }
@@ -1135,7 +1212,7 @@ impl MachineBus<'_> {
         }
     }
 
-    fn port_write(&mut self, port: u16, size: u8, value: u32) {
+    fn dispatch_port_write(&mut self, port: u16, size: u8, value: u32) {
         if IdePrimary::owns_port(port) {
             self.ide.port_write(port, size, value);
             return;
@@ -1256,6 +1333,14 @@ impl Bus for MachineBus<'_> {
         };
         if VgaText::in_aperture(effective) {
             if let Some(b) = self.vga.mmio_read_u8(effective) {
+                if self.ports.trace_enabled() {
+                    self.ports
+                        .record_trace(post_trace::PostTraceEvent::VgaAperture {
+                            write: false,
+                            addr: effective,
+                            value: b,
+                        });
+                }
                 return Ok(b);
             }
         }
@@ -1263,9 +1348,13 @@ impl Bus for MachineBus<'_> {
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
             self.ports.record_unmapped_mmio(effective, false);
         }
-        self.mem
-            .read_u8(addr)
-            .map_err(|_| ExecError::MemoryFault(addr))
+        self.mem.read_u8(addr).map_err(|_| {
+            if self.ports.trace_enabled() {
+                self.ports
+                    .record_trace(post_trace::PostTraceEvent::MemoryFault { write: false, addr });
+            }
+            ExecError::MemoryFault(addr)
+        })
     }
 
     fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
@@ -1277,14 +1366,26 @@ impl Bus for MachineBus<'_> {
             addr & !(1u64 << 20)
         };
         if VgaText::in_aperture(effective) && self.vga.mmio_write_u8(effective, val) {
+            if self.ports.trace_enabled() {
+                self.ports
+                    .record_trace(post_trace::PostTraceEvent::VgaAperture {
+                        write: true,
+                        addr: effective,
+                        value: val,
+                    });
+            }
             return Ok(());
         }
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
             self.ports.record_unmapped_mmio(effective, true);
         }
-        self.mem
-            .write_u8(addr, val)
-            .map_err(|_| ExecError::MemoryFault(addr))
+        self.mem.write_u8(addr, val).map_err(|_| {
+            if self.ports.trace_enabled() {
+                self.ports
+                    .record_trace(post_trace::PostTraceEvent::MemoryFault { write: true, addr });
+            }
+            ExecError::MemoryFault(addr)
+        })
     }
 
     fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError> {
