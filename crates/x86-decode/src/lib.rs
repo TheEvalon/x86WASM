@@ -2315,6 +2315,130 @@ mod tests {
         }
     }
 
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (opcode map 2): the `imm8` forms
+    /// (`0F A4`/`0F AC`) consume exactly one immediate byte at every operand
+    /// size; the `CL` forms (`0F A5`/`0F AD`) consume none.
+    #[test]
+    fn decode_double_precision_shifts() {
+        for (op, mnemonic) in [(0xA4u8, "SHLD"), (0xAC, "SHRD")] {
+            // Register form: 0F A4 D0 10 = SHLD (E)AX, (E)DX, 16.
+            let d = decode(&[0x0F, op, 0xD0, 0x10]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.modrm.unwrap().reg, 2);
+            assert_eq!(d.modrm.unwrap().rm, 0);
+            assert_eq!(d.immediate, 0x10);
+            assert_eq!(d.length, 4);
+
+            // Memory destination with a 16-bit displacement.
+            let d = decode(&[0x0F, op, 0x1E, 0x00, 0x40, 0x04]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.immediate, 4);
+            assert_eq!(d.length, 6);
+
+            // The immediate stays one byte under a 32-bit operand size.
+            let d = decode_with_mode(&[0x0F, op, 0xD0, 0x10], DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.immediate, 0x10);
+            assert_eq!(d.length, 4);
+
+            assert_eq!(decode(&[0x0F, op, 0xD0]), Err(DecodeError::Truncated));
+        }
+
+        for (op, mnemonic) in [(0xA5u8, "SHLD"), (0xAD, "SHRD")] {
+            let d = decode(&[0x0F, op, 0xD0]).unwrap();
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.immediate, 0, "{mnemonic} CL form takes no immediate");
+            assert_eq!(d.length, 3);
+
+            let d = decode(&[0x0F, op, 0x1E, 0x00, 0x40]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.length, 5);
+
+            assert_eq!(decode(&[0x0F, op]), Err(DecodeError::Truncated));
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc" (opcode map 2): a ModR/M form with no
+    /// immediate, at both operand sizes, in 16- and 32-bit addressing.
+    #[test]
+    fn decode_cmovcc_range() {
+        for cc in 0u8..16 {
+            let op = 0x40 | cc;
+
+            // Register form: 0F 4x C1 = CMOVcc r, r.
+            let d = decode(&[0x0F, op, 0xC1]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.opcode, op);
+            assert_eq!(d.modrm.unwrap().reg, 0);
+            assert_eq!(d.modrm.unwrap().rm, 1);
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 3, "0F {op:02X} must not consume an immediate");
+            assert!(!d.operand_size_32);
+
+            // Memory form with a 16-bit displacement.
+            let d = decode(&[0x0F, op, 0x1E, 0x00, 0x40]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.length, 5);
+
+            // `0x66` selects 32 under a 16-bit default; a `D=1` segment defaults
+            // to 32 and `0x66` selects 16.
+            let d = decode(&[0x66, 0x0F, op, 0xC1]).unwrap();
+            assert!(d.operand_size_32);
+            let d = decode_with_mode(&[0x0F, op, 0xC1], DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            let d = decode_with_mode(&[0x66, 0x0F, op, 0xC1], DecodeMode::DEFAULT32).unwrap();
+            assert!(!d.operand_size_32);
+
+            assert_eq!(decode(&[0x0F, op]), Err(DecodeError::Truncated));
+        }
+    }
+
+    /// Intel SDM Vol. 2 "IN"/"OUT"; Appendix A opcode map 1: the accumulator
+    /// port forms `E5`/`E7`/`ED`/`EF` decode at both operand sizes, and the
+    /// `imm8` port number stays one byte in every case.
+    #[test]
+    fn decode_accumulator_port_io_forms() {
+        for (op, mnemonic) in [(0xEDu8, "IN_DX"), (0xEF, "OUT_DX")] {
+            let d = decode(&[op]).unwrap();
+            assert!(!d.two_byte);
+            assert_eq!(d.opcode, op);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert!(d.modrm.is_none());
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 1);
+            assert!(
+                !d.operand_size_32,
+                "{op:02X} defaults to 16-bit in LEGACY16"
+            );
+
+            // `0x66` selects 32 under a 16-bit default and 16 under `D=1`.
+            let d = decode(&[0x66, op]).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.length, 2);
+            let d = decode_with_mode(&[op], DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            let d = decode_with_mode(&[0x66, op], DecodeMode::DEFAULT32).unwrap();
+            assert!(!d.operand_size_32);
+        }
+
+        for (op, mnemonic) in [(0xE5u8, "IN_imm8"), (0xE7, "OUT_imm8")] {
+            let d = decode(&[op, 0x70]).unwrap();
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.immediate, 0x70);
+            assert_eq!(d.length, 2);
+            assert!(!d.operand_size_32);
+
+            // A 32-bit operand size does not widen the port immediate.
+            let d = decode_with_mode(&[op, 0xCF], DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.immediate, 0xCF);
+            assert_eq!(d.length, 2);
+
+            assert_eq!(decode(&[op]), Err(DecodeError::Truncated));
+        }
+    }
+
     /// Intel SDM Vol. 2 "RET" (near/far imm16): the stack-release immediate is
     /// always 16 bits, independent of the operand-size attribute.
     #[test]

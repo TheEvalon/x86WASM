@@ -1199,14 +1199,31 @@ pub const M1_SUBSET: &[InstrDef] = &[
         opcode: 0xE4,
         encoding: Encoding::Imm8Port,
         width: Width::W8,
-        sdm: "IN",
+        sdm: "IN AL, imm8",
+    },
+    // `IN eAX, imm8` / `OUT imm8, eAX` — the port number stays an imm8 at
+    // every operand size; only the accumulator width follows the operand-size
+    // attribute. Spec: Intel SDM Vol. 2 "IN"/"OUT"; Appendix A opcode map 1.
+    InstrDef {
+        mnemonic: "IN_imm8",
+        opcode: 0xE5,
+        encoding: Encoding::Imm8Port,
+        width: Width::OsZ,
+        sdm: "IN eAX, imm8",
     },
     InstrDef {
         mnemonic: "OUT_imm8",
         opcode: 0xE6,
         encoding: Encoding::Imm8Port,
         width: Width::W8,
-        sdm: "OUT",
+        sdm: "OUT imm8, AL",
+    },
+    InstrDef {
+        mnemonic: "OUT_imm8",
+        opcode: 0xE7,
+        encoding: Encoding::Imm8Port,
+        width: Width::OsZ,
+        sdm: "OUT imm8, eAX",
     },
     InstrDef {
         mnemonic: "CALL",
@@ -1241,14 +1258,31 @@ pub const M1_SUBSET: &[InstrDef] = &[
         opcode: 0xEC,
         encoding: Encoding::None,
         width: Width::W8,
-        sdm: "IN",
+        sdm: "IN AL, DX",
+    },
+    // `IN eAX, DX` / `OUT DX, eAX` — no immediate; the accumulator width
+    // follows the operand-size attribute.
+    // Spec: Intel SDM Vol. 2 "IN"/"OUT"; Appendix A opcode map 1.
+    InstrDef {
+        mnemonic: "IN_DX",
+        opcode: 0xED,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "IN eAX, DX",
     },
     InstrDef {
         mnemonic: "OUT_DX",
         opcode: 0xEE,
         encoding: Encoding::None,
         width: Width::W8,
-        sdm: "OUT",
+        sdm: "OUT DX, AL",
+    },
+    InstrDef {
+        mnemonic: "OUT_DX",
+        opcode: 0xEF,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "OUT DX, eAX",
     },
     InstrDef {
         mnemonic: "HLT",
@@ -1395,6 +1429,25 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
     setcc(0x9D, "SETGE"),
     setcc(0x9E, "SETLE"),
     setcc(0x9F, "SETG"),
+    // `CMOVcc r, r/m` — Spec: Intel SDM Vol. 2 "CMOVcc—Conditional Move"
+    // (opcode map 2 — `0F 40`+cc /r). Same low-nibble condition encoding as
+    // `Jcc` and `SETcc`.
+    cmovcc(0x40, "CMOVO"),
+    cmovcc(0x41, "CMOVNO"),
+    cmovcc(0x42, "CMOVB"),
+    cmovcc(0x43, "CMOVAE"),
+    cmovcc(0x44, "CMOVE"),
+    cmovcc(0x45, "CMOVNE"),
+    cmovcc(0x46, "CMOVBE"),
+    cmovcc(0x47, "CMOVA"),
+    cmovcc(0x48, "CMOVS"),
+    cmovcc(0x49, "CMOVNS"),
+    cmovcc(0x4A, "CMOVP"),
+    cmovcc(0x4B, "CMOVNP"),
+    cmovcc(0x4C, "CMOVL"),
+    cmovcc(0x4D, "CMOVGE"),
+    cmovcc(0x4E, "CMOVLE"),
+    cmovcc(0x4F, "CMOVG"),
     // `PUSH`/`POP FS`/`GS` — Spec: Intel SDM Vol. 2 "PUSH"/"POP" (opcode map 2
     // — `0F A0`/`0F A1`/`0F A8`/`0F A9`). No ModR/M; the stack slot width
     // follows the operand-size attribute.
@@ -1521,6 +1574,38 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         encoding: Encoding::ModrmImm8,
         width: Width::OsZ,
         sdm: "BT/BTS/BTR/BTC r/m,imm8",
+    },
+    // Double-precision shifts — Spec: Intel SDM Vol. 2 "SHLD—Double Precision
+    // Shift Left" (`0F A4` ib, `0F A5` CL) and "SHRD—Double Precision Shift
+    // Right" (`0F AC` ib, `0F AD` CL). The destination is `r/m`, the bit source
+    // is `ModR/M.reg`, and both follow the operand-size attribute.
+    InstrDef {
+        mnemonic: "SHLD",
+        opcode: 0xA4,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "SHLD r/m,r,imm8",
+    },
+    InstrDef {
+        mnemonic: "SHLD",
+        opcode: 0xA5,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "SHLD r/m,r,CL",
+    },
+    InstrDef {
+        mnemonic: "SHRD",
+        opcode: 0xAC,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "SHRD r/m,r,imm8",
+    },
+    InstrDef {
+        mnemonic: "SHRD",
+        opcode: 0xAD,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "SHRD r/m,r,CL",
     },
     // Bit scans — Spec: Intel SDM Vol. 2 "BSF"/"BSR" (`0F BC`/`BD`).
     InstrDef {
@@ -1658,6 +1743,20 @@ const fn setcc(opcode: u8, mnemonic: &'static str) -> InstrDef {
     }
 }
 
+/// Two-byte `CMOVcc r, r/m` entry (`0F 40`+cc /r).
+///
+/// The destination is `ModR/M.reg` and the width follows the operand-size
+/// attribute; there is no byte form. Spec: Intel SDM Vol. 2 "CMOVcc".
+const fn cmovcc(opcode: u8, mnemonic: &'static str) -> InstrDef {
+    InstrDef {
+        mnemonic,
+        opcode,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "CMOVcc r16/r32, r/m16/r/m32",
+    }
+}
+
 pub fn lookup_0f(opcode: u8) -> Option<&'static InstrDef> {
     M1_0F_SUBSET.iter().find(|d| d.opcode == opcode)
 }
@@ -1719,6 +1818,35 @@ mod tests {
         assert!(lookup_0f(0x22).is_some(), "missing 0F 22 MOV CRn,r32");
     }
 
+    /// Intel SDM Vol. 2 "IN—Input from Port" / "OUT—Output to Port"; Appendix A
+    /// opcode map 1: both the fixed-`AL` byte forms and the accumulator forms
+    /// that follow the operand-size attribute are present. The port number of
+    /// `E4`–`E7` is an imm8 at every operand size.
+    #[test]
+    fn subset_includes_accumulator_port_io_at_both_operand_sizes() {
+        for (opcode, encoding) in [
+            (0xE4u8, Encoding::Imm8Port),
+            (0xE5, Encoding::Imm8Port),
+            (0xE6, Encoding::Imm8Port),
+            (0xE7, Encoding::Imm8Port),
+            (0xEC, Encoding::None),
+            (0xED, Encoding::None),
+            (0xEE, Encoding::None),
+            (0xEF, Encoding::None),
+        ] {
+            let def = lookup_primary(opcode)
+                .unwrap_or_else(|| panic!("missing primary opcode {opcode:#04X}"));
+            assert_eq!(def.encoding, encoding, "{opcode:#04X} encoding");
+            // Even opcodes are the fixed byte forms; odd ones follow OsZ.
+            let expected_width = if opcode.is_multiple_of(2) {
+                Width::W8
+            } else {
+                Width::OsZ
+            };
+            assert_eq!(def.width, expected_width, "{opcode:#04X} width");
+        }
+    }
+
     /// Intel SDM Vol. 2 "Jcc" / "SETcc" (opcode map 2): the whole `0F 80`–`0F 8F`
     /// and `0F 90`–`0F 9F` condition ranges are present with the documented
     /// mnemonic order, rel16/rel32 vs byte-destination encodings.
@@ -1744,6 +1872,43 @@ mod tests {
             assert_eq!(set.mnemonic, SETCC[cc as usize]);
             assert_eq!(set.encoding, Encoding::Modrm);
             assert_eq!(set.width, Width::W8);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (opcode map 2): the `imm8` count forms
+    /// carry a one-byte immediate, the `CL` count forms carry none, and both
+    /// follow the operand-size attribute.
+    #[test]
+    fn two_byte_double_precision_shifts_are_present() {
+        for (opcode, mnemonic, encoding) in [
+            (0xA4u8, "SHLD", Encoding::ModrmImm8),
+            (0xA5, "SHLD", Encoding::Modrm),
+            (0xAC, "SHRD", Encoding::ModrmImm8),
+            (0xAD, "SHRD", Encoding::Modrm),
+        ] {
+            let def =
+                lookup_0f(opcode).unwrap_or_else(|| panic!("missing 0F {opcode:02X} {mnemonic}"));
+            assert_eq!(def.mnemonic, mnemonic);
+            assert_eq!(def.encoding, encoding);
+            assert_eq!(def.width, Width::OsZ);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc—Conditional Move" (opcode map 2): the whole
+    /// `0F 40`–`0F 4F` range is present, keyed on the same low-nibble condition
+    /// encoding as `Jcc`/`SETcc`, with no byte form (`Width::OsZ` only).
+    #[test]
+    fn two_byte_cmovcc_range_is_complete() {
+        const CMOVCC: [&str; 16] = [
+            "CMOVO", "CMOVNO", "CMOVB", "CMOVAE", "CMOVE", "CMOVNE", "CMOVBE", "CMOVA", "CMOVS",
+            "CMOVNS", "CMOVP", "CMOVNP", "CMOVL", "CMOVGE", "CMOVLE", "CMOVG",
+        ];
+        for cc in 0u8..16 {
+            let def =
+                lookup_0f(0x40 | cc).unwrap_or_else(|| panic!("missing 0F {:02X}", 0x40 | cc));
+            assert_eq!(def.mnemonic, CMOVCC[cc as usize]);
+            assert_eq!(def.encoding, Encoding::Modrm);
+            assert_eq!(def.width, Width::OsZ);
         }
     }
 }

@@ -2332,6 +2332,57 @@ fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     Ok(())
 }
 
+/// `IN` into the accumulator (`E4`/`E5`/`EC`/`ED`), no IP update.
+///
+/// `byte_form` is the fixed-`AL` encoding (`E4`/`EC`); otherwise the
+/// operand-size attribute selects `AX` or `EAX`. A 16-bit destination writes
+/// only `AX`, leaving `EAX[31:16]` untouched (SDM Vol. 1 §3.4.1.1). The access
+/// goes through the width-specific `Bus` port accessors, the same ones
+/// `INSB`/`INSW`/`INSD` use, so a word or doubleword port sees one access of
+/// that width. No flags are affected.
+/// Spec: Intel SDM Vol. 2 "IN—Input from Port"; Vol. 1 §3.6 (Table 3-4).
+fn port_in_accumulator(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    port: u16,
+    byte_form: bool,
+) -> Result<(), ExecError> {
+    if byte_form {
+        let v = bus.port_in_u8(port)?;
+        cpu.set_al(v);
+    } else if opsz32(insn) {
+        let v = bus.port_in_u32(port)?;
+        cpu.set_eax(v);
+    } else {
+        let v = bus.port_in_u16(port)?;
+        cpu.set_ax(v);
+    }
+    Ok(())
+}
+
+/// `OUT` from the accumulator (`E6`/`E7`/`EE`/`EF`), no IP update.
+///
+/// Mirrors [`port_in_accumulator`]: `byte_form` writes `AL`, otherwise the
+/// operand-size attribute selects `AX` or `EAX`, and the transfer is one
+/// access of that width. No flags are affected.
+/// Spec: Intel SDM Vol. 2 "OUT—Output to Port"; Vol. 1 §3.6 (Table 3-4).
+fn port_out_accumulator(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    port: u16,
+    byte_form: bool,
+) -> Result<(), ExecError> {
+    if byte_form {
+        bus.port_out_u8(port, cpu.al())
+    } else if opsz32(insn) {
+        bus.port_out_u32(port, cpu.eax())
+    } else {
+        bus.port_out_u16(port, cpu.ax())
+    }
+}
+
 /// Architectural `#NMI` vector (Intel SDM Vol. 3 §6.3.3 / §6.15).
 const VECTOR_NMI: u8 = 2;
 
@@ -2529,6 +2580,69 @@ fn set_shift_result_flags_u32(cpu: &mut CpuState, result: u32) {
     cpu.set_zf(result == 0);
     cpu.set_sf(result & 0x8000_0000 != 0);
     cpu.set_pf(parity_even(result as u8));
+}
+
+/// Defined result of a double-precision shift: the new destination value and
+/// the last bit shifted out of the original destination (`CF`).
+struct DoublePrecisionShift {
+    result: u32,
+    carry: bool,
+}
+
+/// Evaluate `SHLD` (`left`) or `SHRD` — Spec: Intel SDM Vol. 2 "SHLD—Double
+/// Precision Shift Left" / "SHRD—Double Precision Shift Right" (Operation).
+///
+/// `dest` and `src` are the operand values zero-extended to 32 bits and `bits`
+/// is the operand size (16 or 32). `count` must already be reduced modulo 32,
+/// which is the mask the SDM applies outside 64-bit mode **regardless of the
+/// operand size** — so a 16-bit operand size can legally receive a count of
+/// 17–31.
+///
+/// Returns `None` for the two cases with no architectural result:
+///
+/// - `count == 0`, which the SDM specifies as "no operation": the destination is
+///   unchanged and no flag is affected.
+/// - `count > bits`, which the SDM calls "Bad parameters" and leaves the
+///   destination *and* `CF`/`OF`/`SF`/`ZF`/`AF`/`PF` undefined. **This tree
+///   commits nothing there.** That is one legal instance of the undefined
+///   behavior and keeps the interpreter a deterministic reference for a future
+///   JIT. It is reachable only at a 16-bit operand size, because the modulo-32
+///   mask keeps a 32-bit count at or below 31.
+///
+/// Both cases therefore emit no destination write at all, so a memory
+/// destination is read but not written back.
+fn double_precision_shift(
+    left: bool,
+    dest: u32,
+    src: u32,
+    count: u32,
+    bits: u32,
+) -> Option<DoublePrecisionShift> {
+    debug_assert!(bits == 16 || bits == 32);
+    debug_assert!(count < 32);
+    if count == 0 || count > bits {
+        return None;
+    }
+    let (result, carry) = if left {
+        // CF := BIT[DEST, SIZE - COUNT] — the last bit shifted out.
+        let carry = (dest >> (bits - count)) & 1 != 0;
+        let concat = (u64::from(dest) << bits) | u64::from(src);
+        (((concat << count) >> bits) as u32, carry)
+    } else {
+        // CF := BIT[DEST, COUNT - 1] — the last bit shifted out.
+        let carry = (dest >> (count - 1)) & 1 != 0;
+        let concat = (u64::from(src) << bits) | u64::from(dest);
+        ((concat >> count) as u32, carry)
+    };
+    let mask = if bits == 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    };
+    Some(DoublePrecisionShift {
+        result: result & mask,
+        carry,
+    })
 }
 
 /// Group 2 byte ops (D0/C0/D2). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
@@ -3093,8 +3207,8 @@ fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
 /// **Rule (sparse tables):** do **not** treat every `UnsupportedOpcode` as `#UD`.
 /// Only opcodes the SDM classifies as invalid/unrecognized in real mode vector
 /// through the IVT. Valid-but-unimplemented primaries (x87 `D8`–`DF`, `WAIT`/`9B`,
-/// `IN`/`OUT` EAX forms `E5`/`E7`/`ED`/`EF`, two-byte escape `0F`, Grp1 alias `82`,
-/// …) remain host `Decode(UnsupportedOpcode)`.
+/// two-byte escape `0F` secondaries with no entry, Grp1 alias `82`, …) remain
+/// host `Decode(UnsupportedOpcode)`.
 ///
 /// Note: `D6` and `F1` are reserved/undefined but do **not** generate `#UD`
 /// (Intel SDM Vol. 3 §6.15 — Invalid Opcode Exception).
@@ -3679,6 +3793,37 @@ fn step_two_byte(
             }
             Ok(())
         }
+        0x40..=0x4F => {
+            // CMOVcc r, r/m — Spec: Intel SDM Vol. 2 "CMOVcc—Conditional Move":
+            // `IF condition THEN DEST := SRC`. The condition comes from the
+            // shared low-nibble evaluator, so `CMOVcc` cannot disagree with
+            // `Jcc` or `SETcc`. There is no byte form; the width follows the
+            // operand-size attribute, and no flags are written.
+            //
+            // The source operand is read *before* the condition is evaluated.
+            // The SDM allows the processor to read a memory source regardless of
+            // the condition, so a source the segment limit or the bus rejects
+            // faults whether or not the move happens. Nothing is committed when
+            // the read faults.
+            //
+            // Unsupported here: the REX.W `r64` form, and CPUID leaf 1 EDX bit 15
+            // (`CMOV`) deliberately stays clear — ADR-0007 governs CPUID, and
+            // under-reporting an implemented feature is safe.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            if opsz32(insn) {
+                let src = read_rm_u32(cpu, bus, insn)?;
+                if condition_code(cpu, insn.opcode) {
+                    cpu.set_gpr_u32(m.reg as usize, src);
+                }
+            } else {
+                let src = read_rm_u16(cpu, bus, insn)?;
+                if condition_code(cpu, insn.opcode) {
+                    cpu.set_gpr_u16(m.reg as usize, src);
+                }
+            }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
         0x90..=0x9F => {
             // SETcc r/m8 — Spec: Intel SDM Vol. 2 "SETcc—Set Byte on
             // Condition": `IF condition THEN DEST := 1 ELSE DEST := 0`.
@@ -3866,6 +4011,64 @@ fn step_two_byte(
             let operand_bits = if opsz32(insn) { 32 } else { 16 };
             let bit_offset = (insn.immediate & 0xFF) % operand_bits;
             exec_bit_op(cpu, bus, insn, op, bit_offset)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xA4 | 0xA5 | 0xAC | 0xAD => {
+            // SHLD / SHRD r/m, r, imm8|CL — Spec: Intel SDM Vol. 2 "SHLD—Double
+            // Precision Shift Left" / "SHRD—Double Precision Shift Right".
+            // The destination is `r/m`, the bits shifted in come from
+            // `ModR/M.reg`, and the source register is never modified.
+            //
+            // The count is reduced modulo 32 outside 64-bit mode *independently
+            // of the operand size*, so a 16-bit operand size can receive a count
+            // of 17–31. See `double_precision_shift` for what this tree does
+            // with that architecturally undefined case and with a zero count.
+            //
+            // Flags: `CF` is the last bit shifted out of the destination and
+            // `SF`/`ZF`/`PF` follow the result. `OF` is defined only for a
+            // 1-bit shift (set when the sign changed) and undefined above that,
+            // so it is left unchanged for larger counts — the same deterministic
+            // choice the Group 2 shifts make. `AF` is undefined and is left
+            // unchanged. The destination is written before any flag commits, so
+            // a faulting memory write leaves the flags alone.
+            //
+            // Unsupported here: the REX.W 64-bit forms and the `#UD` a `LOCK`
+            // prefix should raise.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            let left = matches!(insn.opcode, 0xA4 | 0xA5);
+            let raw_count = if matches!(insn.opcode, 0xA4 | 0xAC) {
+                (insn.immediate as u32) & 0xFF
+            } else {
+                u32::from(cpu.gpr_u8_low(CpuState::RCX))
+            };
+            let count = raw_count % 32;
+            if opsz32(insn) {
+                let dest = read_rm_u32(cpu, bus, insn)?;
+                let src = cpu.gpr_u32(m.reg as usize);
+                if let Some(shift) = double_precision_shift(left, dest, src, count, 32) {
+                    write_rm_u32(cpu, bus, insn, shift.result)?;
+                    cpu.set_cf(shift.carry);
+                    if count == 1 {
+                        cpu.set_of((dest ^ shift.result) & 0x8000_0000 != 0);
+                    }
+                    set_shift_result_flags_u32(cpu, shift.result);
+                }
+            } else {
+                let dest = read_rm_u16(cpu, bus, insn)?;
+                let src = cpu.gpr_u16(m.reg as usize);
+                if let Some(shift) =
+                    double_precision_shift(left, u32::from(dest), u32::from(src), count, 16)
+                {
+                    let result = shift.result as u16;
+                    write_rm_u16(cpu, bus, insn, result)?;
+                    cpu.set_cf(shift.carry);
+                    if count == 1 {
+                        cpu.set_of((dest ^ result) & 0x8000 != 0);
+                    }
+                    set_shift_result_flags_u16(cpu, result);
+                }
+            }
             set_current_ip(cpu, next_ip);
             Ok(())
         }
@@ -4082,42 +4285,34 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     }
 
     match op {
-        0x06 => {
-            // PUSH ES — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.es.selector)?;
+        0x06 | 0x0E | 0x16 | 0x1E => {
+            // PUSH ES / CS / SS / DS — Spec: Intel SDM Vol. 2 "PUSH"; Vol. 1
+            // §6.2. The stack slot follows the operand-size attribute exactly
+            // as the two-byte `PUSH FS`/`GS` forms do; the stack-pointer width
+            // itself follows `SS.B`.
+            let selector = match op {
+                0x06 => cpu.es.selector,
+                0x0E => cpu.cs.selector,
+                0x16 => cpu.ss.selector,
+                _ => cpu.ds.selector,
+            };
+            push_sreg(cpu, bus, selector, opsz32(&insn))?;
             set_current_ip(cpu, next_ip);
         }
-        0x07 => {
-            // POP ES — Spec: Intel SDM Vol. 2 "POP".
-            // Unsupported: the 32-bit operand-size doubleword stack slot for the
-            // primary-map `07`/`17`/`1F` forms (still a 16-bit pop here).
-            pop_sreg(cpu, bus, 0, false)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x0E => {
-            // PUSH CS — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.cs.selector)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x16 => {
-            // PUSH SS — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.ss.selector)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x17 => {
-            // POP SS — Spec: Intel SDM Vol. 2 "POP".
-            pop_sreg(cpu, bus, 2, false)?;
-            cpu.arm_maskable_interrupt_shadow();
-            set_current_ip(cpu, next_ip);
-        }
-        0x1E => {
-            // PUSH DS — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.ds.selector)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x1F => {
-            // POP DS — Spec: Intel SDM Vol. 2 "POP".
-            pop_sreg(cpu, bus, 3, false)?;
+        0x07 | 0x17 | 0x1F => {
+            // POP ES / SS / DS — Spec: Intel SDM Vol. 2 "POP"; Vol. 3 §§3.5.1,
+            // 5.4.1, 6.8.3. A 32-bit operand size releases a doubleword slot
+            // and takes the selector from its low word. `POP CS` does not
+            // exist, so `0x0F` is the two-byte escape rather than a POP.
+            let sreg = match op {
+                0x07 => 0,
+                0x17 => 2,
+                _ => 3,
+            };
+            pop_sreg(cpu, bus, sreg, opsz32(&insn))?;
+            if op == 0x17 {
+                cpu.arm_maskable_interrupt_shadow();
+            }
             set_current_ip(cpu, next_ip);
         }
         0xF4 => {
@@ -4206,26 +4401,34 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_direction_flag(true);
             set_current_ip(cpu, next_ip);
         }
-        0xEC => {
+        0xEC | 0xED => {
+            // IN AL, DX / IN eAX, DX — Spec: Intel SDM Vol. 2 "IN—Input from
+            // Port". `DX` supplies the full 16-bit port number in every mode.
+            // Unsupported here: the protected-mode IOPL / TSS I/O-permission
+            // `#GP(0)` (CPL 0 only, no TSS) and the VM86 I/O bitmap.
             let port = cpu.gpr_u16(CpuState::RDX);
-            let v = bus.port_in_u8(port)?;
-            cpu.set_al(v);
+            port_in_accumulator(cpu, bus, &insn, port, op == 0xEC)?;
             set_current_ip(cpu, next_ip);
         }
-        0xEE => {
+        0xEE | 0xEF => {
+            // OUT DX, AL / OUT DX, eAX — Spec: Intel SDM Vol. 2 "OUT—Output to
+            // Port".
             let port = cpu.gpr_u16(CpuState::RDX);
-            bus.port_out_u8(port, cpu.al())?;
+            port_out_accumulator(cpu, bus, &insn, port, op == 0xEE)?;
             set_current_ip(cpu, next_ip);
         }
-        0xE4 => {
+        0xE4 | 0xE5 => {
+            // IN AL, imm8 / IN eAX, imm8 — the imm8 is the port number, so only
+            // ports 0x00–0xFF are reachable through this form.
+            // Spec: Intel SDM Vol. 2 "IN—Input from Port".
             let port = insn.immediate as u16;
-            let v = bus.port_in_u8(port)?;
-            cpu.set_al(v);
+            port_in_accumulator(cpu, bus, &insn, port, op == 0xE4)?;
             set_current_ip(cpu, next_ip);
         }
-        0xE6 => {
+        0xE6 | 0xE7 => {
+            // OUT imm8, AL / OUT imm8, eAX — Spec: Intel SDM Vol. 2 "OUT".
             let port = insn.immediate as u16;
-            bus.port_out_u8(port, cpu.al())?;
+            port_out_accumulator(cpu, bus, &insn, port, op == 0xE6)?;
             set_current_ip(cpu, next_ip);
         }
         0xE0..=0xE2 => {
@@ -9581,6 +9784,184 @@ mod tests {
         assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x5004);
     }
 
+    /// Real-mode fixture over the size-recording port bus used by the
+    /// accumulator `IN`/`OUT` tests. `in_bytes` feeds successive `port_in_u8`
+    /// calls, so a word read consumes two and a doubleword read four.
+    fn port_fixture(code: &[u8], in_bytes: Vec<u8>) -> (CpuState, PortSeqBus) {
+        let mut mem = vec![0u8; 0x10000];
+        mem[..code.len()].copy_from_slice(code);
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        (
+            cpu,
+            PortSeqBus {
+                mem,
+                in_bytes,
+                in_idx: 0,
+                outs: vec![],
+            },
+        )
+    }
+
+    /// Intel SDM Vol. 2 "IN—Input from Port": `EC` always loads `AL`, while
+    /// `ED` loads `AX` or `EAX` from the operand-size attribute. A 16-bit
+    /// destination leaves the upper half of `EAX` untouched (Vol. 1 §3.4.1.1),
+    /// and no form writes flags.
+    #[test]
+    fn accumulator_in_destination_width_follows_operand_size() {
+        // EC = IN AL, DX — one byte into AL only.
+        let (mut cpu, mut bus) = port_fixture(&[0xEC], vec![0x5A]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        let flags = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_445A);
+        assert_eq!(cpu.rflags, flags, "IN must not write flags");
+        assert_eq!(cpu.ip16(), 1);
+
+        // ED = IN AX, DX under a 16-bit operand size.
+        let (mut cpu, mut bus) = port_fixture(&[0xED], vec![0x34, 0x12]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        let flags = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_1234);
+        assert_eq!(cpu.rflags, flags);
+        assert_eq!(cpu.ip16(), 1);
+
+        // 66 ED = IN EAX, DX.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xED], vec![0x01, 0x02, 0x03, 0x04]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_0403_0201);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    /// Intel SDM Vol. 2 "OUT—Output to Port": `EE` always writes `AL`, while
+    /// `EF` writes `AX` or `EAX` in one access of that width through the
+    /// size-aware bus accessors, not as a sequence of byte writes.
+    #[test]
+    fn accumulator_out_source_width_follows_operand_size() {
+        // EE = OUT DX, AL.
+        let (mut cpu, mut bus) = port_fixture(&[0xEE], vec![]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        let flags = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 1, 0x78)]);
+        assert_eq!(cpu.rflags, flags, "OUT must not write flags");
+
+        // EF = OUT DX, AX under a 16-bit operand size.
+        let (mut cpu, mut bus) = port_fixture(&[0xEF], vec![]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 2, 0x5678)]);
+        assert_eq!(cpu.ip16(), 1);
+
+        // 66 EF = OUT DX, EAX.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xEF], vec![]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 4, 0x1234_5678)]);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    /// Intel SDM Vol. 2 "IN"/"OUT": the `E5`/`E7` port number is an `imm8` at
+    /// every operand size, and only the accumulator width changes.
+    #[test]
+    fn accumulator_port_imm8_forms_keep_a_byte_port_number() {
+        // E5 70 = IN AX, 0x70.
+        let (mut cpu, mut bus) = port_fixture(&[0xE5, 0x70], vec![0xCD, 0xAB]);
+        cpu.gpr[CpuState::RAX] = 0x0000_0000_FFFF_FFFF;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xFFFF_ABCD);
+        assert_eq!(cpu.ip16(), 2);
+
+        // 66 E5 70 = IN EAX, 0x70.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xE5, 0x70], vec![0x11, 0x22, 0x33, 0x44]);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x4433_2211);
+        assert_eq!(cpu.ip16(), 3);
+
+        // E7 71 = OUT 0x71, AX.
+        let (mut cpu, mut bus) = port_fixture(&[0xE7, 0x71], vec![]);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x71, 2, 0xBEEF)]);
+        assert_eq!(cpu.ip16(), 2);
+
+        // 66 E7 71 = OUT 0x71, EAX.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xE7, 0x71], vec![]);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x71, 4, 0xDEAD_BEEF)]);
+        assert_eq!(cpu.ip16(), 3);
+    }
+
+    /// Intel SDM Vol. 2 "IN"/"OUT"; Vol. 1 §3.6 Table 3-4: in a `CS.D=1` code
+    /// segment `EF` is `OUT DX, EAX` and `66 ED` is `IN AX, DX`. This is the
+    /// exact byte sequence SeaBIOS uses to drive PCI configuration Mechanism #1
+    /// at `0xCF8`/`0xCFC`, so the two widths appear back to back.
+    #[test]
+    fn accumulator_port_io_default_sizes_invert_under_cs_d1() {
+        // EF = OUT DX, EAX (32-bit default), then 66 ED = IN AX, DX.
+        let (mut cpu, bus) = pm32_fixture(&[0xEF, 0x66, 0xED], PM32_CODE, true);
+        let mut bus = PortSeqBus {
+            mem: bus.mem,
+            in_bytes: vec![0x77, 0x66],
+            in_idx: 0,
+            outs: vec![],
+        };
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x8000_0000);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 4, 0x8000_0000)]);
+        assert_eq!(cpu.rip, (PM32_CODE + 1) as u64);
+
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x8000_6677);
+        assert_eq!(cpu.rip, (PM32_CODE + 3) as u64);
+    }
+
+    /// The accumulator forms and the `INS`/`OUTS` string forms must reach the
+    /// bus through the same width-specific accessors, so a word or doubleword
+    /// transfer is one access of that width either way.
+    /// Spec: Intel SDM Vol. 2 "IN"/"OUT"/"INS"/"OUTS".
+    #[test]
+    fn accumulator_and_string_port_io_use_the_same_access_widths() {
+        for (accumulator, string_op, width, value) in [
+            (vec![0xEEu8], vec![0x6Eu8], 1u8, 0x5Au32),
+            (vec![0xEF], vec![0x6F], 2, 0xBEEF),
+            (vec![0x66, 0xEF], vec![0x66, 0x6F], 4, 0xDEAD_BEEF),
+        ] {
+            let (mut cpu, mut bus) = port_fixture(&accumulator, vec![]);
+            cpu.set_gpr_u16(CpuState::RDX, 0x1F0);
+            cpu.set_gpr_u32(CpuState::RAX, value);
+            step(&mut cpu, &mut bus).unwrap();
+            let accumulator_outs = bus.outs.clone();
+
+            let (mut cpu, mut bus) = port_fixture(&string_op, vec![]);
+            cpu.set_gpr_u16(CpuState::RDX, 0x1F0);
+            cpu.set_gpr_u16(CpuState::RSI, 0x2000);
+            bus.mem[0x2000..0x2004].copy_from_slice(&value.to_le_bytes());
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(
+                accumulator_outs, bus.outs,
+                "width {width} accumulator and string OUT must match"
+            );
+            assert_eq!(accumulator_outs[0].1, width);
+        }
+    }
+
     /// Short Jcc take/not-take for unsigned and signed conditions (SDM Vol. 2 Jcc).
     #[test]
     fn jcc_short_conditions() {
@@ -10655,7 +11036,7 @@ mod tests {
     /// Decode-miss #UD policy (sparse primary table).
     ///
     /// - Architecturally invalid in real-address mode (e.g. ARPL 0x63) → IVT vector 6.
-    /// - Valid-but-unimplemented (x87, WAIT, IN/OUT EAX, unimplemented 0F map, …) stay host Decode errors.
+    /// - Valid-but-unimplemented (x87, WAIT, unimplemented 0F map, …) stay host Decode errors.
     /// - D6/F1 are reserved/undefined but do **not** generate #UD (SDM Vol. 3 §6.15).
     ///
     /// Spec: Intel SDM Vol. 3 §6.15 (#UD); Vol. 2 ARPL (real-address mode).
@@ -10687,7 +11068,10 @@ mod tests {
         assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0100);
 
         // Sparse-table misses that are valid-but-unimplemented must NOT become #UD.
-        for &op in &[0x9Bu8, 0xD8, 0xED, 0xD6, 0xF1] {
+        // `0xED` used to stand in for the unimplemented accumulator port I/O
+        // forms; it now decodes and executes, so another x87 escape (`0xDF`)
+        // covers the same policy.
+        for &op in &[0x9Bu8, 0xD8, 0xDF, 0xD6, 0xF1] {
             let mut mem = vec![0u8; 0x10000];
             mem[6 * 4] = 0x00;
             mem[6 * 4 + 1] = 0x0B;
@@ -18684,6 +19068,407 @@ mod tests {
         assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
     }
 
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): the destination receives
+    /// `COUNT` bits shifted in from `ModR/M.reg`, and `CF` is the last bit
+    /// shifted out of the destination. The `imm8` and `CL` count forms must
+    /// agree, and the bit source is never modified.
+    #[test]
+    fn shld_shrd_results_and_carry_at_both_operand_sizes() {
+        struct Case {
+            imm_op: u8,
+            cl_op: u8,
+            opsize32: bool,
+            dest: u32,
+            src: u32,
+            count: u8,
+            expected: u32,
+            carry: bool,
+        }
+        let cases = [
+            Case {
+                imm_op: 0xA4,
+                cl_op: 0xA5,
+                opsize32: false,
+                dest: 0x1234,
+                src: 0xABCD,
+                count: 4,
+                expected: 0x234A,
+                carry: true,
+            },
+            Case {
+                imm_op: 0xA4,
+                cl_op: 0xA5,
+                opsize32: true,
+                dest: 0x1234_5678,
+                src: 0x9ABC_DEF0,
+                count: 8,
+                expected: 0x3456_789A,
+                carry: false,
+            },
+            Case {
+                imm_op: 0xAC,
+                cl_op: 0xAD,
+                opsize32: false,
+                dest: 0x1234,
+                src: 0xABCD,
+                count: 4,
+                expected: 0xD123,
+                carry: false,
+            },
+            Case {
+                imm_op: 0xAC,
+                cl_op: 0xAD,
+                opsize32: true,
+                dest: 0x1234_5678,
+                src: 0x9ABC_DEF0,
+                count: 8,
+                expected: 0xF012_3456,
+                carry: false,
+            },
+        ];
+        for case in cases {
+            // ModR/M D0 = mod 11, reg = (E)DX, rm = (E)AX.
+            for use_cl in [false, true] {
+                let mut code = Vec::new();
+                if case.opsize32 {
+                    code.push(0x66);
+                }
+                if use_cl {
+                    code.extend_from_slice(&[0x0F, case.cl_op, 0xD0]);
+                } else {
+                    code.extend_from_slice(&[0x0F, case.imm_op, 0xD0, case.count]);
+                }
+                let (mut cpu, mut bus) = real_mode_fixture(&code, |cpu, _| {
+                    cpu.set_gpr_u32(CpuState::RAX, case.dest);
+                    cpu.set_gpr_u32(CpuState::RDX, case.src);
+                    if use_cl {
+                        cpu.set_gpr_u8_low(CpuState::RCX, case.count);
+                    }
+                });
+                step(&mut cpu, &mut bus).unwrap();
+                let got = if case.opsize32 {
+                    cpu.gpr_u32(CpuState::RAX)
+                } else {
+                    u32::from(cpu.gpr_u16(CpuState::RAX))
+                };
+                let op = case.imm_op;
+                let opsize32 = case.opsize32;
+                assert_eq!(
+                    got, case.expected,
+                    "op {op:#04X} opsize32={opsize32} use_cl={use_cl}"
+                );
+                assert_eq!(cpu.rflags & 1 != 0, case.carry, "CF op {op:#04X}");
+                assert_eq!(
+                    cpu.gpr_u32(CpuState::RDX),
+                    case.src,
+                    "source must not change"
+                );
+                assert_eq!(cpu.ip16(), code.len() as u16);
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): `COUNT := COUNT MOD 32`
+    /// outside 64-bit mode, independently of the operand size, and a resulting
+    /// count of zero is an explicit no-operation that leaves every flag alone.
+    #[test]
+    fn shld_shrd_count_is_masked_modulo_32_and_zero_is_a_no_op() {
+        // 0F A4 D0 24 = SHLD AX, DX, 0x24; 0x24 MOD 32 = 4.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x24], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x1234);
+            cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x234A);
+
+        // A count of 32 masks to zero: no destination change and no flag change.
+        for (opcode, count) in [(0xA4u8, 0x20u8), (0xAC, 0x20), (0xA4, 0x00), (0xAC, 0x00)] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xD0, count], |cpu, _| {
+                cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_1234);
+                cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+                cpu.rflags = 0x0002 | (1 << 0) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+            });
+            let flags = cpu.rflags;
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u32(CpuState::RAX),
+                0xAAAA_1234,
+                "0F {opcode:02X} count {count:#04X}"
+            );
+            assert_eq!(cpu.rflags, flags, "0F {opcode:02X} count {count:#04X}");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): a count greater than the
+    /// operand size is "Bad parameters" — the destination and every flag are
+    /// architecturally undefined. Reachable only at a 16-bit operand size, since
+    /// the modulo-32 mask caps a 32-bit count at 31.
+    ///
+    /// **Deterministic model choice:** this tree commits nothing, leaving the
+    /// destination and all six flags unchanged.
+    #[test]
+    fn shld_shrd_count_above_the_operand_size_commits_nothing() {
+        for opcode in [0xA4u8, 0xAC] {
+            for count in [17u8, 31] {
+                let (mut cpu, mut bus) =
+                    real_mode_fixture(&[0x0F, opcode, 0xD0, count], |cpu, _| {
+                        cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_1234);
+                        cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+                        cpu.rflags = 0x0002 | (1 << 4) | (1 << 11);
+                    });
+                let flags = cpu.rflags;
+                step(&mut cpu, &mut bus).unwrap();
+                assert_eq!(
+                    cpu.gpr_u32(CpuState::RAX),
+                    0xAAAA_1234,
+                    "0F {opcode:02X} count {count}"
+                );
+                assert_eq!(cpu.rflags, flags, "0F {opcode:02X} count {count}");
+                assert_eq!(cpu.ip16(), 4);
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): a count *equal* to the
+    /// operand size is defined — every destination bit comes from the source,
+    /// and `CF` is still the last destination bit shifted out.
+    #[test]
+    fn shld_shrd_count_equal_to_the_operand_size_replaces_the_destination() {
+        // 0F A4 D0 10 = SHLD AX, DX, 16 — CF := BIT[DEST, 0].
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x10], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x1235);
+            cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0xABCD);
+        assert!(cpu.rflags & 1 != 0, "CF := BIT[DEST, 0] = 1");
+
+        // 0F AC D0 10 = SHRD AX, DX, 16 — CF := BIT[DEST, 15].
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xAC, 0xD0, 0x10], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x8234);
+            cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0xABCD);
+        assert!(cpu.rflags & 1 != 0, "CF := BIT[DEST, 15] = 1");
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" — Flags Affected: `SF`/`ZF`/`PF` follow
+    /// the result; `OF` is set from a sign change for a 1-bit shift and is
+    /// undefined above that.
+    ///
+    /// **Deterministic model choices:** `OF` is left unchanged for counts above
+    /// one, and `AF` — undefined in every case — is left unchanged too. Both
+    /// match what the Group 2 shifts already do in this tree.
+    #[test]
+    fn shld_shrd_flag_results_including_the_undefined_of_and_af() {
+        // SHLD AX, DX, 1 with AX = 0x4000 → 0x8000: sign changed, so OF = 1.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x01], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x4000);
+            cpu.set_gpr_u16(CpuState::RDX, 0x0000);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x8000);
+        assert_eq!(cpu.rflags & 1, 0, "CF := BIT[DEST, 15] = 0");
+        assert_ne!(cpu.rflags & (1 << 11), 0, "OF set on a 1-bit sign change");
+        assert_ne!(cpu.rflags & (1 << 7), 0, "SF from the result");
+        assert_eq!(cpu.rflags & (1 << 6), 0, "ZF from the result");
+        assert_ne!(cpu.rflags & (1 << 2), 0, "PF from the low byte 0x00");
+
+        // SHLD AX, DX, 1 with AX = 0x8000 → 0x0000: sign changed again, ZF set.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x01], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x8000);
+            cpu.set_gpr_u16(CpuState::RDX, 0x0000);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x0000);
+        assert_ne!(cpu.rflags & 1, 0, "CF := BIT[DEST, 15] = 1");
+        assert_ne!(cpu.rflags & (1 << 11), 0, "OF set on a 1-bit sign change");
+        assert_ne!(cpu.rflags & (1 << 6), 0, "ZF from the zero result");
+
+        // A count above one leaves the undefined OF exactly as it was, in both
+        // directions, and the undefined AF likewise.
+        for preset_of in [false, true] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x02], |cpu, _| {
+                cpu.set_gpr_u16(CpuState::RAX, 0x4000);
+                cpu.set_gpr_u16(CpuState::RDX, 0x0000);
+            });
+            cpu.set_of(preset_of);
+            cpu.set_af(true);
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x0000);
+            assert_eq!(
+                cpu.rflags & (1 << 11) != 0,
+                preset_of,
+                "OF undefined above 1 bit → unchanged"
+            );
+            assert_ne!(cpu.rflags & (1 << 4), 0, "AF undefined → unchanged");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD": the destination may be a memory operand
+    /// at either operand size, with the bits shifted in from `ModR/M.reg`.
+    #[test]
+    fn shld_shrd_memory_destination_forms() {
+        // 0F A4 1E 00 40 04 = SHLD word [0x4000], BX, 4.
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0x0F, 0xA4, 0x1E, 0x00, 0x40, 0x04], |cpu, mem| {
+                mem[0x4000..0x4002].copy_from_slice(&0x1234u16.to_le_bytes());
+                cpu.set_gpr_u16(CpuState::RBX, 0xABCD);
+            });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 0x234A);
+        assert!(cpu.rflags & 1 != 0);
+        assert_eq!(cpu.ip16(), 6);
+
+        // 66 0F AC 1E 00 40 08 = SHRD dword [0x4000], EBX, 8.
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0x66, 0x0F, 0xAC, 0x1E, 0x00, 0x40, 0x08], |cpu, mem| {
+                mem[0x4000..0x4004].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+                cpu.set_gpr_u32(CpuState::RBX, 0x9ABC_DEF0);
+            });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0xF012_3456);
+        assert_eq!(cpu.ip16(), 7);
+    }
+
+    /// The 64-bit-shift idiom SeaBIOS uses, and the instruction POST stopped on
+    /// after slice 1: under `CS.D=1`, `0F AC D0 10` is `SHRD EAX, EDX, 16`.
+    /// Spec: Intel SDM Vol. 2 "SHRD"; Vol. 1 §3.6 Table 3-4.
+    #[test]
+    fn shrd_default32_matches_the_firmware_64_bit_shift_idiom() {
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0xAC, 0xD0, 0x10], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        cpu.set_gpr_u32(CpuState::RDX, 0x9ABC_DEF0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xDEF0_1234);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0x9ABC_DEF0);
+        assert_eq!(cpu.rflags & 1, 0, "CF := BIT[DEST, 15] = 0");
+        assert_eq!(cpu.rip, (PM32_CODE + 4) as u64);
+
+        // 66 0F AC D0 10 selects the 16-bit operand size again under `D=1`.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x66, 0x0F, 0xAC, 0xD0, 0x10], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        cpu.set_gpr_u32(CpuState::RDX, 0x9ABC_DEF0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1234_DEF0);
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc—Conditional Move": `IF condition THEN
+    /// DEST := SRC`. The condition must agree with the short `Jcc` form for
+    /// every condition code and every flag combination, and `CMOVcc` writes no
+    /// flags.
+    #[test]
+    fn cmovcc_condition_matches_short_jcc_for_every_flag_combination() {
+        for cc in 0u8..16 {
+            for flags in condition_flag_combinations() {
+                let (short_cpu, _) = run_real_mode_once(&[0x70 | cc, 0x10], flags);
+                let taken = short_cpu.ip16() == 0x12;
+
+                // 0F 40+cc C3 = CMOVcc AX, BX (mod=11, reg=AX, rm=BX).
+                let mut mem = vec![0u8; 0x10000];
+                mem[..3].copy_from_slice(&[0x0F, 0x40 | cc, 0xC3]);
+                let mut cpu = CpuState::reset();
+                cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+                cpu.rip = 0;
+                cpu.rflags = flags;
+                cpu.set_gpr_u16(CpuState::RAX, 0x1111);
+                cpu.set_gpr_u16(CpuState::RBX, 0x2222);
+                let mut bus = VecBus { mem, ports: vec![] };
+                step(&mut cpu, &mut bus).unwrap();
+                assert_eq!(
+                    cpu.gpr_u16(CpuState::RAX),
+                    if taken { 0x2222 } else { 0x1111 },
+                    "cc {cc:#x} flags {flags:#x}"
+                );
+                assert_eq!(cpu.rflags, flags, "CMOVcc must not write flags");
+                assert_eq!(cpu.ip16(), 3);
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc": the destination width follows the operand-size
+    /// attribute. A taken 16-bit move leaves the upper half of the 32-bit
+    /// destination untouched (Vol. 1 §3.4.1.1), and an untaken move of either
+    /// width leaves the whole destination unchanged.
+    #[test]
+    fn cmovcc_destination_width_follows_operand_size() {
+        // (code, ZF, expected EAX) for 0F 44 C3 = CMOVE (E)AX, (E)BX.
+        let cases: [(&[u8], bool, u32); 4] = [
+            (&[0x0F, 0x44, 0xC3], true, 0x1111_BBBB),
+            (&[0x0F, 0x44, 0xC3], false, 0x1111_2222),
+            (&[0x66, 0x0F, 0x44, 0xC3], true, 0xAAAA_BBBB),
+            (&[0x66, 0x0F, 0x44, 0xC3], false, 0x1111_2222),
+        ];
+        for (code, zf, expected) in cases {
+            let (mut cpu, mut bus) = real_mode_fixture(code, |cpu, _| {
+                cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+                cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            });
+            cpu.set_zf(zf);
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u32(CpuState::RAX),
+                expected,
+                "zf={zf} code={code:?}"
+            );
+            assert_eq!(cpu.ip16(), code.len() as u16);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc": a memory source is read whether or not the
+    /// condition holds, so a source the segment limit forbids faults either way.
+    /// This model always reads the source before evaluating the condition.
+    #[test]
+    fn cmovcc_reads_the_memory_source_regardless_of_the_condition() {
+        for zf in [true, false] {
+            // 0F 44 1E 00 90 = CMOVE BX, word [0x9000], past DS.limit = 0x7FFF.
+            let mut mem = vec![0u8; 0x10000];
+            mem[..5].copy_from_slice(&[0x0F, 0x44, 0x1E, 0x00, 0x90]);
+            // IVT[13] (#GP) → 0000:0D00.
+            mem[13 * 4..13 * 4 + 4].copy_from_slice(&0x0000_0D00u32.to_le_bytes());
+            mem[0xD00] = 0xF4;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ds = x86_core::SegmentReg::real_mode(0);
+            cpu.ds.limit = 0x7FFF;
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFF0);
+            cpu.set_gpr_u16(CpuState::RBX, 0x1234);
+            cpu.set_zf(zf);
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 0x0D00, "zf={zf} must still take #GP");
+            assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1234, "no partial commit");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc": a taken move reads from memory in both 16-
+    /// and 32-bit addressing, including under `CS.D=1`.
+    #[test]
+    fn cmovcc_memory_source_forms() {
+        // 66 0F 45 1E 00 40 = CMOVNE EBX, dword [0x4000].
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0x66, 0x0F, 0x45, 0x1E, 0x00, 0x40], |cpu, mem| {
+                mem[0x4000..0x4004].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+                cpu.set_gpr_u32(CpuState::RBX, 0);
+            });
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0xDEAD_BEEF);
+
+        // 0F 45 1D disp32 = CMOVNE EBX, dword [disp32] under CS.D=1.
+        let mut code = vec![0x0F, 0x45, 0x1D];
+        code.extend_from_slice(&(PM32_DATA as u32).to_le_bytes());
+        let (mut cpu, mut bus) = pm32_fixture(&code, PM32_CODE, true);
+        bus.mem[PM32_DATA..PM32_DATA + 4].copy_from_slice(&0x0BAD_F00Du32.to_le_bytes());
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x0BAD_F00D);
+        assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
+    }
+
     /// Build a real-mode single-step fixture and let the caller seed registers
     /// and memory before the instruction runs.
     fn real_mode_fixture<F>(code: &[u8], setup: F) -> (CpuState, VecBus)
@@ -18853,6 +19638,146 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 2);
         assert_eq!(bus.read_u16(u64::from(PM32_TEST_ESP - 2)).unwrap(), 0x1234);
+    }
+
+    /// Intel SDM Vol. 2 "PUSH" (Operation, segment-register source); Vol. 1
+    /// §6.2: the stack slot of a primary-map segment `PUSH` follows the
+    /// operand-size attribute — a word by default in a 16-bit code segment and
+    /// a doubleword holding the zero-extended selector with `0x66`.
+    #[test]
+    fn primary_map_segment_push_slot_width_follows_operand_size() {
+        for (opcode, selector) in [
+            (0x06u8, 0x1111u16),
+            (0x0E, 0x2222),
+            (0x16, 0x3333),
+            (0x1E, 0x4444),
+        ] {
+            // 16-bit operand size: a word slot.
+            let (mut cpu, mut bus) = real_mode_fixture(&[opcode], |cpu, _| {
+                cpu.es.selector = selector;
+                cpu.cs.selector = selector;
+                cpu.ss.selector = selector;
+                cpu.ds.selector = selector;
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u16(CpuState::RSP),
+                0xFFEE,
+                "{opcode:#04X} word slot"
+            );
+            assert_eq!(bus.read_u16(0xFFEE).unwrap(), selector);
+
+            // 32-bit operand size: a doubleword slot with the selector
+            // zero-extended.
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x66, opcode], |cpu, _| {
+                cpu.es.selector = selector;
+                cpu.cs.selector = selector;
+                cpu.ss.selector = selector;
+                cpu.ds.selector = selector;
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u16(CpuState::RSP),
+                0xFFEC,
+                "{opcode:#04X} doubleword slot"
+            );
+            assert_eq!(bus.read_u32(0xFFEC).unwrap(), u32::from(selector));
+        }
+    }
+
+    /// Intel SDM Vol. 2 "POP" (Operation): the operand-size attribute selects
+    /// how much the stack pointer is released; only the low word of a
+    /// doubleword slot loads into the segment register.
+    #[test]
+    fn primary_map_segment_pop_slot_width_follows_operand_size() {
+        // 1F = POP DS from a word slot.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x1F], |_, mem| {
+            mem[0xFFF0..0xFFF4].copy_from_slice(&0xAAAA_1234u32.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF2);
+
+        // 66 1F = POP DS from a doubleword slot; the upper half is discarded.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x66, 0x1F], |_, mem| {
+            mem[0xFFF0..0xFFF4].copy_from_slice(&0xAAAA_1234u32.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(cpu.ds.base, 0x1_2340);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF4);
+    }
+
+    /// The primary-map (`06`/`0E`/`16`/`1E`, `07`/`17`/`1F`) and two-byte
+    /// (`0F A0`/`A1`/`A8`/`A9`) segment stack forms must size the slot by the
+    /// same rule; round 2 left the primary map always 16-bit, which corrupts a
+    /// 32-bit stack when firmware mixes the two encodings.
+    /// Spec: Intel SDM Vol. 2 "PUSH"/"POP"; Vol. 1 §6.2.
+    #[test]
+    fn primary_and_two_byte_segment_stack_slots_agree() {
+        for prefix in [Vec::new(), vec![0x66u8]] {
+            let expected_delta = if prefix.is_empty() { 4 } else { 2 };
+
+            // PUSH DS versus PUSH FS with the same selector in both registers.
+            let mut primary = prefix.clone();
+            primary.push(0x1E);
+            let mut two_byte = prefix.clone();
+            two_byte.extend_from_slice(&[0x0F, 0xA0]);
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&primary, PM32_CODE, PM32_TEST_ESP);
+            step(&mut cpu, &mut bus).unwrap();
+            let primary_esp = cpu.gpr_u32(CpuState::RSP);
+            let primary_image = bus.mem[primary_esp as usize..PM32_TEST_ESP as usize].to_vec();
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&two_byte, PM32_CODE, PM32_TEST_ESP);
+            cpu.fs = cpu.ds.clone();
+            step(&mut cpu, &mut bus).unwrap();
+            let two_byte_esp = cpu.gpr_u32(CpuState::RSP);
+            let two_byte_image = bus.mem[two_byte_esp as usize..PM32_TEST_ESP as usize].to_vec();
+
+            assert_eq!(primary_esp, two_byte_esp, "PUSH prefix {prefix:?}");
+            assert_eq!(primary_image, two_byte_image, "PUSH prefix {prefix:?}");
+            assert_eq!(PM32_TEST_ESP - primary_esp, expected_delta);
+
+            // POP DS versus POP FS from the same stack image.
+            let mut primary = prefix.clone();
+            primary.push(0x1F);
+            let mut two_byte = prefix.clone();
+            two_byte.extend_from_slice(&[0x0F, 0xA1]);
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&primary, PM32_CODE, PM32_TEST_ESP);
+            bus.mem[PM32_TEST_ESP as usize..PM32_TEST_ESP as usize + 4]
+                .copy_from_slice(&u32::from(PM32_DS).to_le_bytes());
+            step(&mut cpu, &mut bus).unwrap();
+            let primary_esp = cpu.gpr_u32(CpuState::RSP);
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&two_byte, PM32_CODE, PM32_TEST_ESP);
+            bus.mem[PM32_TEST_ESP as usize..PM32_TEST_ESP as usize + 4]
+                .copy_from_slice(&u32::from(PM32_DS).to_le_bytes());
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(
+                primary_esp,
+                cpu.gpr_u32(CpuState::RSP),
+                "POP prefix {prefix:?}"
+            );
+            assert_eq!(primary_esp - PM32_TEST_ESP, expected_delta);
+        }
+    }
+
+    /// Intel SDM Vol. 3 §6.8.3: `POP SS` inhibits maskable interrupts through
+    /// the following instruction, and widening its stack slot does not change
+    /// that. The descriptor is validated before the pointer commits.
+    #[test]
+    fn pop_ss_with_a_32_bit_slot_still_arms_the_interrupt_shadow() {
+        let (mut cpu, mut bus) = pm32_big_stack_fixture(&[0x17], PM32_CODE, PM32_TEST_ESP);
+        bus.mem[PM32_TEST_ESP as usize..PM32_TEST_ESP as usize + 4]
+            .copy_from_slice(&u32::from(PM32_DS).to_le_bytes());
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ss.selector, PM32_DS);
+        assert!(cpu.maskable_interrupts_inhibited());
+        // The pointer width came from the *old* `SS.B=1`, so ESP moved by four.
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP + 4);
     }
 
     /// Intel SDM Vol. 3 §5.4.1: `POP FS`/`POP GS` use the DS/ES data-segment
