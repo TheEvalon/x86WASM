@@ -66,9 +66,13 @@
 //! [`CmosRtc::standard_checksum_valid`]). This device never sets a diagnostic
 //! bit or recomputes a checksum on its own — evaluating them is POST's job.
 //!
-//! All of those bytes are treated as battery backed and survive
-//! [`CmosRtc::reset`]; the rest of the general CMOS configuration area is still
-//! cleared by model reset.
+//! The whole configuration area `0Eh`–`2Fh` — which contains the entire
+//! `10h`–`2Dh` checksum range and the `2Eh`/`2Fh` checksum bytes — plus the
+//! memory-size bytes `30h`/`31h` and `34h`/`35h` are battery backed and survive
+//! [`CmosRtc::reset`] ([`CmosRtc::is_battery_backed`]). A stored checksum
+//! therefore cannot go stale merely because the machine reset; when it *is*
+//! stale, [`CmosRtc::standard_checksum_valid`] reports it and the device takes
+//! no action of its own.
 //!
 //! # Model note: invalid calendar state
 //!
@@ -91,9 +95,12 @@
 //!   [`UIP_WINDOW_PERIODS`]-tick hold after `tick_second` only; not µs-accurate)
 //! - ACPI extended CMOS beyond 128 bytes
 //! - Square-wave output (SQWE)
-//! - Full battery-backed preserve of all non-volatile CMOS (only the indices in
-//!   `PRESERVED_ON_RESET` survive [`CmosRtc::reset`] today; POST action on the
-//!   shutdown code is firmware/Machine, not this device)
+//! - Full battery-backed preserve of *all* CMOS. [`CmosRtc::is_battery_backed`]
+//!   covers `0Eh`–`2Fh`, `30h`/`31h`, and `34h`/`35h`; the MC146818 clock and
+//!   status file `00h`–`0Dh` is returned to its power-on state (no host wall
+//!   clock to carry forward), and the vendor-specific area `32h`/`33h` and
+//!   `36h`–`7Fh` is cleared because nothing in this machine writes it. POST
+//!   action on the shutdown code is firmware/Machine, not this device
 //! - Memory above 4 GB. The CMOS indices conventionally used for it
 //!   (`5Bh`–`5Dh`) appear only in emulator documentation, not in any
 //!   authoritative register map, so this model leaves them zero rather than
@@ -303,23 +310,35 @@ pub const CMOS_EXT_MEMORY_MAX_KB: u16 = 0x3C00;
 /// Block size of the above-16 MB memory pair, in bytes.
 pub const CMOS_MEM_ABOVE_16M_BLOCK_BYTES: u64 = 64 * 1024;
 
-/// CMOS bytes this model treats as battery backed.
+/// First index of the contiguous battery-backed configuration block.
 ///
-/// Spec: IBM PC/AT — CMOS RAM is powered by the system battery, so the
-/// configuration POST writes survives a CPU or device reset. Only these
-/// indices are preserved by [`CmosRtc::reset`] today; the rest of the general
-/// CMOS configuration area is still cleared, which is recorded as a gap in the
-/// module-level "Unsupported" list.
-const PRESERVED_ON_RESET: [u8; 13] = [
-    REG_SHUTDOWN,
-    REG_DIAGNOSTIC,
-    REG_EQUIPMENT,
-    REG_CHECKSUM_HIGH,
-    REG_CHECKSUM_LOW,
-    REG_BASE_MEM_LOW,
-    REG_BASE_MEM_HIGH,
-    REG_EXT_MEM_LOW,
-    REG_EXT_MEM_HIGH,
+/// Spec: IBM PC/AT — CMOS RAM is battery powered, so configuration survives a
+/// CPU or device reset. RBIL CMOS `0Eh` (diagnostic status byte) is the first
+/// byte of the configuration area proper; everything below it (`00h`–`0Dh`) is
+/// the MC146818 clock and status file, which this model returns to its
+/// documented power-on state instead.
+const BATTERY_BACKED_FIRST: u8 = REG_DIAGNOSTIC;
+
+/// Last index of the contiguous battery-backed configuration block.
+///
+/// Spec: RBIL CMOS `2Eh`/`2Fh` — the standard checksum is "a byte-wise additive
+/// sum of the values in locations 10h-2Dh only". The block therefore has to run
+/// through `2Fh`: preserving the checksum bytes while clearing bytes the sum
+/// covers would leave a stored checksum that no longer describes the file.
+const BATTERY_BACKED_LAST: u8 = REG_CHECKSUM_LOW;
+
+// The block must contain the whole checksum range plus the checksum bytes.
+const _: () = assert!(BATTERY_BACKED_FIRST < CMOS_CHECKSUM_FIRST);
+const _: () = assert!(BATTERY_BACKED_LAST > CMOS_CHECKSUM_LAST);
+const _: () = assert!(REG_SHUTDOWN > BATTERY_BACKED_FIRST && REG_SHUTDOWN < CMOS_CHECKSUM_FIRST);
+
+/// Battery-backed indices outside [`BATTERY_BACKED_FIRST`]–[`BATTERY_BACKED_LAST`].
+///
+/// Spec: RBIL CMOS `30h`/`31h` "EXTENDED MEMORY IN KB" and `34h`/`35h`
+/// "EXTENDED MEMORY >16M" — ordinary battery CMOS RAM that POST fills in, sitting
+/// above the checksum range ("30h-33h are not included"). A reset must not erase
+/// the machine's memory map any more than it erases its disk configuration.
+const PRESERVED_ABOVE_BLOCK: [u8; 4] = [
     REG_EXT_MEM2_LOW,
     REG_EXT_MEM2_HIGH,
     REG_MEM_ABOVE_16M_LOW,
@@ -451,11 +470,10 @@ impl CmosRtc {
         // Spec: IBM PC/AT — CMOS RAM is battery backed. SeaBIOS soft-reset
         // relies on the shutdown code at `0x0F` surviving a CPU/device reset,
         // and POST relies on the memory-size bytes surviving for the same
-        // reason: a reset must not erase the machine's memory map.
-        let mut saved = [0u8; PRESERVED_ON_RESET.len()];
-        for (slot, &index) in saved.iter_mut().zip(PRESERVED_ON_RESET.iter()) {
-            *slot = self.ram[index as usize];
-        }
+        // reason: a reset must not erase the machine's memory map. RBIL
+        // `2Eh`/`2Fh` extends that to the whole `10h`-`2Dh` checksum range —
+        // see [`Self::is_battery_backed`].
+        let saved = self.ram;
 
         self.ram = [0; 128];
         self.ram[REG_STATUS_A as usize] = DEFAULT_STATUS_A;
@@ -463,13 +481,36 @@ impl CmosRtc {
         self.ram[REG_STATUS_C as usize] = DEFAULT_STATUS_C;
         self.ram[REG_STATUS_D as usize] = DEFAULT_STATUS_D;
 
-        for (&value, &index) in saved.iter().zip(PRESERVED_ON_RESET.iter()) {
-            self.ram[index as usize] = value;
+        for index in 0u8..128 {
+            if Self::is_battery_backed(index) {
+                self.ram[index as usize] = saved[index as usize];
+            }
         }
 
         self.index = 0;
         self.nmi_disabled = false;
         self.uip_hold_periods = 0;
+    }
+
+    /// Whether this model treats CMOS index `index` as battery backed, i.e.
+    /// whether its value survives [`Self::reset`].
+    ///
+    /// Spec: IBM PC/AT Technical Reference — the whole CMOS RAM is battery
+    /// powered on real hardware. This model preserves the configuration area
+    /// `0Eh`–`2Fh` (RBIL diagnostic status byte through the standard checksum
+    /// low byte, which contains the entire `10h`–`2Dh` checksum range) plus the
+    /// memory-size bytes `30h`/`31h` and `34h`/`35h` that sit above it.
+    ///
+    /// The MC146818 clock and status file `00h`–`0Dh` is deliberately excluded:
+    /// this model has no host wall clock, so reset returns the time registers
+    /// to zero and Status A–D to their documented power-on defaults rather than
+    /// carrying stale time forward. The remaining vendor-specific area
+    /// (`32h`/`33h`, `36h`–`7Fh`) is cleared because nothing in this machine
+    /// writes it; that is a modelling gap, not hardware behavior, and it is
+    /// listed in the module "Unsupported" section.
+    pub fn is_battery_backed(index: u8) -> bool {
+        (BATTERY_BACKED_FIRST..=BATTERY_BACKED_LAST).contains(&index)
+            || PRESERVED_ABOVE_BLOCK.contains(&index)
     }
 
     pub fn reset(&mut self) {
@@ -1212,8 +1253,13 @@ mod tests {
         assert_eq!(c.selected_index(), 0);
         assert!(!c.irq_line());
 
+        // A byte outside the battery-backed set returns the device to exactly
+        // its power-on state. `0x10` is no longer usable for this: it is inside
+        // the `10h`-`2Dh` checksum range and therefore battery backed (see
+        // [`CmosRtc::is_battery_backed`]).
         let mut c2 = CmosRtc::new();
-        c2.port_write(CMOS_INDEX, 1, 0x10);
+        assert!(!CmosRtc::is_battery_backed(0x40));
+        c2.port_write(CMOS_INDEX, 1, 0x40);
         c2.port_write(CMOS_DATA, 1, 0xAB);
         c2.reset();
         assert_eq!(c2, CmosRtc::new());
@@ -1250,15 +1296,21 @@ mod tests {
     }
 
     /// Spec: battery-backed shutdown byte survives model reset (SeaBIOS soft-reset).
+    ///
+    /// `0x10` is now battery backed too — it is inside the RBIL `10h`-`2Dh`
+    /// checksum range — so this checks the shutdown byte against a byte the
+    /// model does *not* preserve (`0x40`, vendor-specific area) instead.
     #[test]
     fn shutdown_status_survives_reset() {
         let mut c = CmosRtc::new();
         c.write_reg(REG_SHUTDOWN, SHUTDOWN_JMP);
-        c.write_reg(0x10, 0xAB); // ordinary config RAM — still cleared on reset
+        c.write_reg(0x10, 0xAB);
+        c.write_reg(0x40, 0xCD);
         c.reset();
         assert_eq!(c.shutdown_status(), SHUTDOWN_JMP);
         assert_eq!(c.read_reg(REG_SHUTDOWN), SHUTDOWN_JMP);
-        assert_eq!(c.read_reg(0x10), 0);
+        assert_eq!(c.read_reg(0x10), 0xAB);
+        assert_eq!(c.read_reg(0x40), 0);
         assert_eq!(c.read_reg(REG_STATUS_A), DEFAULT_STATUS_A);
     }
 

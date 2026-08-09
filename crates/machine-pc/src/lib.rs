@@ -2476,7 +2476,10 @@ mod tests {
         m.pit.port_write(PIT_CONTROL, 1, 0x36);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x10);
-        m.cmos.port_write(CMOS_INDEX, 1, 0x10);
+        // `0x40` is outside the battery-backed configuration area, so reset
+        // clears it. A byte inside `0Eh`-`2Fh` would survive by design — see
+        // `CmosRtc::is_battery_backed`.
+        m.cmos.port_write(CMOS_INDEX, 1, 0x40);
         m.cmos.port_write(CMOS_DATA, 1, 0xAB);
         m.kbd
             .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));
