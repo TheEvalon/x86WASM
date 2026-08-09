@@ -35,22 +35,15 @@ impl PciConfig {
 }
 ```
 
-## Exact PhysMem / Machine APIs needed to wire
+## Exact PhysMem / Machine APIs (wired at integration)
 
 ```rust
 impl PhysMem {
-    /// When `Some(hole)`, CPU accesses in [start,end] must not hit DRAM
-    /// (forward to PCI / open bus). When `None`, restore normal DRAM decode
-    /// for both possible hole ranges.
     pub fn apply_fdhc_hole(&mut self, hole: Option<FdhcHole>);
 }
-
 impl Machine {
-    pub fn sync_fdhc_to_memory(&mut self) {
-        self.mem.apply_fdhc_hole(self.pci.fdhc_hole());
-    }
+    pub fn sync_fdhc_to_memory(&mut self);
 }
-
 // MachineBus CONFIG_DATA write path:
 if self.pci.fdhc_config_write_overlaps(port, size) {
     self.sync_fdhc_to_memory();
@@ -59,5 +52,5 @@ if self.pci.fdhc_config_write_overlaps(port, size) {
 
 ## Not implemented
 
-- Actual hole effect on physical memory (accessor only).
 - Remapping of the hole elsewhere (datasheet: not remapped).
+- PCI initiator modeling of the hole.

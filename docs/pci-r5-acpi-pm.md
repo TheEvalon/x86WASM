@@ -41,15 +41,15 @@ The machine R5 APM sibling advances PM_TMR from the instruction-count step clock
 at **3 × PIT** (`ACPI_PM_CLOCKS_PER_PIT_CLOCK`) by writing those bytes under a
 24-bit mask. That remains coherent with guest I/O reads.
 
-Preferred long-term hook (also sets `TMR_STS` on MSB toggle):
+Preferred long-term hook (also sets `TMR_STS` on MSB toggle) — **now the
+integration path**:
 
 ```rust
 // In Machine::advance_step_clock after PIT ticks:
-pci.tick_acpi_pm((pit_clocks * 3) as u32); // or tick_acpi_pm_ns
-// Optional later: wire pci.acpi_sci_asserted() to IRQ
+pci.tick_acpi_pm((pit_clocks * 3) as u32);
 ```
 
-Until the machine switches to `tick_acpi_pm`, direct `acpi_pm_io` mutation is fine.
+Direct `acpi_pm_io` mutation remains coherent with guest I/O reads.
 
 ## Model choices
 

@@ -56,9 +56,9 @@ use devices::{
     VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY,
     E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED,
     FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD,
-    PCI_CONFIG_DATA, PCI_PIIX_ACPI_PM_TMR, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
-    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
-    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
+    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -373,11 +373,14 @@ impl Machine {
         if ticks.pit_clocks > 0 {
             self.tick_pit(ticks.pit_clocks);
             // Spec: Intel 82371AB — PM_TMR runs at 3.579545 MHz = 3 × PIT CLK.
-            self.advance_acpi_pm_tmr(
-                ticks
-                    .pit_clocks
-                    .saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK),
-            );
+            // Authority lives in `PciConfig::acpi_pm_io[+8]`; prefer
+            // [`PciConfig::tick_acpi_pm`] so MSB toggle can set TMR_STS.
+            let pm = ticks
+                .pit_clocks
+                .saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK);
+            if pm > 0 {
+                self.pci.tick_acpi_pm(pm.min(u64::from(u32::MAX)) as u32);
+            }
         }
         if ticks.cmos_periods > 0 {
             self.tick_cmos(ticks.cmos_periods);
@@ -385,26 +388,6 @@ impl Machine {
         for _ in 0..ticks.cmos_seconds {
             self.tick_cmos_second();
         }
-    }
-
-    /// Advance the PIIX ACPI power-management timer (PMBASE+`08h`).
-    ///
-    /// Spec: Intel 82371AB / ACPI — `PM_TMR` is a 24-bit free-running counter;
-    /// reads return bits 23:0. The PCI I/O stub only store/readbacks the
-    /// dword; the machine layer owns the freerun so SeaBIOS delays complete.
-    fn advance_acpi_pm_tmr(&mut self, ticks: u64) {
-        if ticks == 0 {
-            return;
-        }
-        let off = PCI_PIIX_ACPI_PM_TMR as usize;
-        let cur = u32::from_le_bytes([
-            self.pci.acpi_pm_io[off],
-            self.pci.acpi_pm_io[off + 1],
-            self.pci.acpi_pm_io[off + 2],
-            self.pci.acpi_pm_io[off + 3],
-        ]);
-        let next = cur.wrapping_add(ticks as u32) & ACPI_PM_TMR_MASK;
-        self.pci.acpi_pm_io[off..off + 4].copy_from_slice(&next.to_le_bytes());
     }
 
     /// Attach a raw 1.44MB floppy image to [`Self::fdc`].
@@ -535,6 +518,32 @@ impl Machine {
         true
     }
 
+    /// Mirror i440FX SMRAM (`0x72`) onto [`PhysMem`] for the current SMM mode.
+    ///
+    /// Spec: Intel 440FX 82441FX (PMC) §3.2.23 / Table 4. Until a real SMM path
+    /// exists, callers pass `in_smm = false` after config writes.
+    pub fn sync_smram_to_memory(&mut self, in_smm: bool) {
+        let region = self.pci.smram_region(in_smm);
+        self.mem.apply_smram(region, in_smm);
+    }
+
+    /// Mirror i440FX FDHC (`0x68`) onto [`PhysMem`].
+    ///
+    /// Spec: Intel 440FX 82441FX (PMC) §3.2.20 — CPU cycles in an enabled hole
+    /// forward to PCI (open bus here); the hole is not remapped.
+    pub fn sync_fdhc_to_memory(&mut self) {
+        self.mem.apply_fdhc_hole(self.pci.fdhc_hole());
+    }
+
+    /// Attach a raw CD-ROM image (2048-byte Mode-1 blocks) as ATAPI Device 0.
+    ///
+    /// Wraps [`IdePrimary::attach_atapi_cdrom_image`]. Does not claim a CMOS
+    /// fixed-disk geometry (`ide_disk_sectors` stays unset). ISO 9660 / El
+    /// Torito boot remain deferred.
+    pub fn attach_atapi_cdrom_image(&mut self, image: Vec<u8>) {
+        self.ide.attach_atapi_cdrom_image(image);
+    }
+
     /// Decoded view of a PAM configuration register (reserved bits read 0).
     pub fn pam_register(&self, offset: u8) -> Option<u8> {
         self.mem.pam_register_value(offset)
@@ -586,6 +595,9 @@ impl Machine {
         // Spec: Intel 440FX PMC — PAM0-PAM6 reset to 0x00 (read from ROM, no
         // DRAM writes). Shadow contents survive, like DRAM across PCIRST#.
         self.mem.reset_pam();
+        // Spec: 440FX SMRAM/FDHC reset defaults — re-sync PhysMem after pci.reset().
+        self.sync_smram_to_memory(false);
+        self.sync_fdhc_to_memory();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 / port 0x92 defaults.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
         self.port92.set_a20_enabled(self.kbd.a20_enabled());
@@ -1166,6 +1178,13 @@ impl MachineBus<'_> {
         }
     }
 
+    fn sync_smram_and_fdhc_to_memory(&mut self) {
+        // No SMM entry yet — evaluate Table 4 outside SMM (D_OPEN path).
+        let region = self.pci.smram_region(false);
+        self.mem.apply_smram(region, false);
+        self.mem.apply_fdhc_hole(self.pci.fdhc_hole());
+    }
+
     /// Lane within a Mechanism #1 CONFIG_DATA access that hits XBCS `4Eh`.
     ///
     /// Spec: Intel 82371AB §4.1.9 — XBCS at ISA-bridge config offset `4Eh`.
@@ -1367,6 +1386,8 @@ impl MachineBus<'_> {
             // Spec: Intel 440FX 82441FX (PMC) §3.2.18 — same reason for PAM0–PAM6
             // on the host bridge at 00:00.0; a CONFIG_DATA write can relatch.
             let pam_touch = self.pci.pam_config_write_overlaps(port, size);
+            let smram_touch = self.pci.smram_config_write_overlaps(port, size);
+            let fdhc_touch = self.pci.fdhc_config_write_overlaps(port, size);
             let xbcs_lane = self.xbcs_config_lane(port, size);
             self.pci.port_write(port, size, value);
             // Spec: Intel 82371AB §4.1.9 — XBCS write-protect bit → PhysMem.
@@ -1381,6 +1402,10 @@ impl MachineBus<'_> {
             // model is told. This is the BIOS shadowing seam.
             if pam_touch {
                 self.sync_pam_registers_to_memory();
+            }
+            // Spec: Intel 440FX §3.2.23 / §3.2.20 — SMRAM / FDHC same PAM pattern.
+            if smram_touch || fdhc_touch {
+                self.sync_smram_and_fdhc_to_memory();
             }
             // Spec: Intel 82371 / OSDev ELCR — 0x4D0/0x4D1 bits select DualPic
             // per-IR level vs edge (SeaBIOS/PIIX); OR'd with ICW1.LTIM in Pic8259.
@@ -1455,7 +1480,9 @@ impl Bus for MachineBus<'_> {
         } else {
             addr & !(1u64 << 20)
         };
-        if VgaText::in_aperture(effective) {
+        // Spec: 440FX §3.2.23 Table 4 — when SMRAM steers the window to DRAM,
+        // skip the VGA aperture overlay (same priority as PAM shadowing).
+        if VgaText::in_aperture(effective) && !self.mem.smram_steers_read_to_dram(effective) {
             if let Some(b) = self.vga.mmio_read_u8(effective) {
                 if self.ports.trace_enabled() {
                     self.ports
@@ -1489,7 +1516,10 @@ impl Bus for MachineBus<'_> {
         } else {
             addr & !(1u64 << 20)
         };
-        if VgaText::in_aperture(effective) && self.vga.mmio_write_u8(effective, val) {
+        if VgaText::in_aperture(effective)
+            && !self.mem.smram_steers_write_to_dram(effective)
+            && self.vga.mmio_write_u8(effective, val)
+        {
             if self.ports.trace_enabled() {
                 self.ports
                     .record_trace(post_trace::PostTraceEvent::VgaAperture {

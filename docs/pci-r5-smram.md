@@ -51,40 +51,20 @@ impl PciConfig {
 `smram_region` recomputes from the register file. `D_OPEN ∧ D_CLS` is Table 4
 INVALID and is reported as PCI for both code and data.
 
-## Exact PhysMem / Machine APIs needed to wire
-
-Mirror Round 2 PAM (`MachineBus` → `PhysMem` after a config write that
-`smram_config_write_overlaps`):
+## Exact PhysMem / Machine APIs (wired at integration)
 
 ```rust
-// machine-pc / PhysMem (integrator)
 impl PhysMem {
-    /// Apply compatible SMRAM window attributes for the current CPU SMM mode.
     pub fn apply_smram(&mut self, region: SmramRegion, in_smm: bool);
-    // Suggested effect when code_to_dram/data_to_dram:
-    //   reads/writes to [start,end] go to DRAM (SMM RAM) instead of VGA/PCI.
-    // When false: keep the existing VGA/PCI forward for that access kind.
 }
-
 impl Machine {
-    pub fn sync_smram_to_memory(&mut self, in_smm: bool) {
-        let region = self.pci.smram_region(in_smm);
-        self.mem.apply_smram(region, in_smm);
-    }
+    pub fn sync_smram_to_memory(&mut self, in_smm: bool);
 }
-
 // MachineBus CONFIG_DATA write path (alongside sync_pam_registers_to_memory):
 if self.pci.smram_config_write_overlaps(port, size) {
-    self.sync_smram_to_memory(/* current CPU SMM state */);
+    self.sync_smram_to_memory(/* current CPU SMM state; false until SMM */);
 }
 ```
 
-SMM mode itself is a CPU/machine concern (SMI entry); until that exists the
-integrator can call `sync_smram_to_memory(false)` after config writes and
-`sync_smram_to_memory(true)` only when an SMM path is added.
-
-## Not implemented
-
-- Actual remapping of `A0000h`–`BFFFFh` (accessor only).
-- Extended SMRAM (HSEG/TSEG) — 440FX has only the compatible window.
-- PCI initiator access to SMM space (datasheet forbids it; not modelled).
+SMM mode itself remains unimplemented (no real SMM entry); config writes sync
+with `in_smm = false`.

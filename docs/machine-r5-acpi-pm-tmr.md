@@ -22,9 +22,10 @@ never completed.
 ## Model
 
 When [`StepClock`] is armed (including `--post-probe`), each retired
-instruction that charges `pit_clocks` also adds `pit_clocks × 3` to
-`PciConfig::acpi_pm_io[PM_TMR]` under a 24-bit mask. No change to `pci.rs`
-decode: the machine owns the freerun side effect.
+instruction that charges `pit_clocks` also advances
+`PciConfig::acpi_pm_io[PM_TMR]` via [`PciConfig::tick_acpi_pm`] at
+`pit_clocks × 3` under a 24-bit mask (and sets `TMR_STS` on MSB toggle).
+There is one register authority — no second freerun field.
 
 ## Unsupported
 

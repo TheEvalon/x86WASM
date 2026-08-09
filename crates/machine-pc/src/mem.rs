@@ -1,5 +1,7 @@
 //! Physical RAM + ROM window (+ A20 gate mask).
 
+use devices::{FdhcHole, SmramRegion};
+
 /// Physical address bit 20 — cleared when the A20 gate is disabled (IBM PC AT).
 const A20_ADDR_BIT: u64 = 1 << 20;
 
@@ -139,6 +141,21 @@ pub struct PhysMem {
     /// PIIX XBCS bit2 inverted: when true, BIOSCS# is not asserted for writes
     /// (Intel 82371AB §4.1.9). ROM content is still never stored.
     bios_write_protect: bool,
+    /// Compatible SMRAM window steering (440FX §3.2.23 Table 4).
+    smram: Option<SmramSteer>,
+    /// Shadow store for SMRAM when the configured RAM ends below `A0000h`.
+    smram_shadow: Vec<u8>,
+    /// Fixed DRAM hole inclusive range when FDHC HEN enables one (440FX §3.2.20).
+    fdhc_hole: Option<(u32, u32)>,
+}
+
+/// Cached SMRAM window decode for PhysMem / MachineBus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SmramSteer {
+    start: u32,
+    end: u32,
+    code_to_dram: bool,
+    data_to_dram: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +208,9 @@ impl PhysMem {
             legacy_shadow: Vec::new(),
             // Spec: Intel 82371AB XBCS default `03h` — bit2 clear → write protect.
             bios_write_protect: true,
+            smram: None,
+            smram_shadow: Vec::new(),
+            fdhc_hole: None,
         }
     }
 
@@ -206,6 +226,83 @@ impl PhysMem {
     /// Mirror PIIX XBCS bit2 into the memory model (true = protect / no write CS#).
     pub fn set_bios_write_protect(&mut self, enabled: bool) {
         self.bios_write_protect = enabled;
+    }
+
+    /// Apply i440FX SMRAM Table 4 steering for the compatible `A0000h`–`BFFFFh` window.
+    ///
+    /// Spec: Intel 440FX 82441FX (PMC) §3.2.23. `in_smm` is already baked into
+    /// `region.code_to_dram` / `region.data_to_dram` by [`PciConfig::smram_region`].
+    /// When both are false the window returns to VGA/PCI overlay ownership.
+    pub fn apply_smram(&mut self, region: SmramRegion, _in_smm: bool) {
+        if region.code_to_dram || region.data_to_dram {
+            self.smram = Some(SmramSteer {
+                start: region.start,
+                end: region.end,
+                code_to_dram: region.code_to_dram,
+                data_to_dram: region.data_to_dram,
+            });
+        } else {
+            self.smram = None;
+        }
+    }
+
+    /// Apply i440FX Fixed DRAM Hole Control.
+    ///
+    /// Spec: Intel 440FX 82441FX (PMC) §3.2.20 — CPU cycles matching an enabled
+    /// hole forward to PCI (open bus here); `None` restores normal DRAM decode.
+    pub fn apply_fdhc_hole(&mut self, hole: Option<FdhcHole>) {
+        self.fdhc_hole = hole.map(|h| (h.start, h.end));
+    }
+
+    /// Whether a CPU data reference into the SMRAM window maps to DRAM.
+    pub fn smram_steers_read_to_dram(&self, addr: u64) -> bool {
+        self.smram_contains(addr) && self.smram.is_some_and(|s| s.data_to_dram || s.code_to_dram)
+    }
+
+    /// Whether a CPU data write into the SMRAM window maps to DRAM.
+    pub fn smram_steers_write_to_dram(&self, addr: u64) -> bool {
+        self.smram_contains(addr) && self.smram.is_some_and(|s| s.data_to_dram)
+    }
+
+    fn smram_contains(&self, addr: u64) -> bool {
+        self.smram
+            .is_some_and(|s| addr as u32 >= s.start && addr as u32 <= s.end)
+    }
+
+    fn in_fdhc_hole(&self, addr: u64) -> bool {
+        self.fdhc_hole
+            .is_some_and(|(start, end)| addr as u32 >= start && addr as u32 <= end)
+    }
+
+    fn smram_read(&self, addr: u64) -> u8 {
+        let i = addr as usize;
+        if i < self.ram.len() {
+            return self.ram[i];
+        }
+        let Some(s) = self.smram else {
+            return 0xFF;
+        };
+        let off = (addr as u32).wrapping_sub(s.start) as usize;
+        self.smram_shadow.get(off).copied().unwrap_or(0)
+    }
+
+    fn smram_write(&mut self, addr: u64, val: u8) {
+        let i = addr as usize;
+        if i < self.ram.len() {
+            self.ram[i] = val;
+            return;
+        }
+        let Some(s) = self.smram else {
+            return;
+        };
+        let len = (s.end - s.start + 1) as usize;
+        if self.smram_shadow.is_empty() {
+            self.smram_shadow = vec![0; len];
+        }
+        let off = (addr as u32).wrapping_sub(s.start) as usize;
+        if let Some(slot) = self.smram_shadow.get_mut(off) {
+            *slot = val;
+        }
     }
 
     pub fn a20_enabled(&self) -> bool {
@@ -389,6 +486,12 @@ impl PhysMem {
     /// the POST probe uses this to report unimplemented MMIO regions.
     pub fn is_mapped(&self, addr: u64) -> bool {
         let addr = self.apply_a20(addr);
+        if self.in_fdhc_hole(addr) {
+            return false;
+        }
+        if self.smram_steers_read_to_dram(addr) {
+            return true;
+        }
         if let Some(region) = Self::pam_region_index(addr) {
             if self.pam[region].read == PamRead::ShadowRam {
                 return true;
@@ -399,6 +502,14 @@ impl PhysMem {
 
     pub fn read_u8(&self, addr: u64) -> Result<u8, MemError> {
         let addr = self.apply_a20(addr);
+        // Spec: 440FX §3.2.20 — hole cycles forward to PCI (open bus = 0xFF).
+        if self.in_fdhc_hole(addr) {
+            return Ok(0xFF);
+        }
+        // Spec: 440FX §3.2.23 Table 4 — SMRAM DRAM path (shadow when no RAM).
+        if self.smram_steers_read_to_dram(addr) {
+            return Ok(self.smram_read(addr));
+        }
         if let Some(region) = Self::pam_region_index(addr) {
             if self.pam[region].read == PamRead::ShadowRam {
                 return Ok(self.shadow_read(addr));
@@ -435,6 +546,15 @@ impl PhysMem {
     /// `docs/machine-r4-write-semantics.md` and `docs/machine-r5-xbcs.md`.
     pub fn write_u8_classified(&mut self, addr: u64, val: u8) -> WriteDisposition {
         let addr = self.apply_a20(addr);
+        // Spec: 440FX §3.2.20 — hole cycles forward to PCI (dropped write).
+        if self.in_fdhc_hole(addr) {
+            return WriteDisposition::DroppedUnclaimed;
+        }
+        // Spec: 440FX §3.2.23 Table 4 — SMRAM DRAM path.
+        if self.smram_steers_write_to_dram(addr) {
+            self.smram_write(addr, val);
+            return WriteDisposition::Accepted;
+        }
         if let Some(region) = Self::pam_region_index(addr) {
             if self.pam[region].write == PamWrite::ShadowRam {
                 self.shadow_write(addr, val);

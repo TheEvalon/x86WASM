@@ -183,13 +183,13 @@ Reported explicitly rather than silently approximated:
 * **SMEP, SMAP, protection keys, execute-disable.** No `CR4` bit for them is
   settable, and the `#PF` error code's I/D bit is consequently always clear —
   §4.7 sets it only with SMEP or PAE+NXE.
-* **`#DF` and triple fault.** A fault during exception delivery is reported to
-  the host as `ProtectedModeExceptionDelivery`, not escalated. A `#PF` on the
-  gate's own stack writes lands here.
-* **Privilege-changing gates.** Delivery is same-CPL only, so a ring-3 `#PF`
-  handler has to be a ring-3 code segment. Stack switching through a TSS is a
-  separate slice, and until it exists `PagedBus` can sample CPL once per
-  instruction.
+* **`#DF` and triple fault.** Round 5 escalates a fault during exception delivery
+  to `#DF` / triple-fault synthesis (see `docs/cpu-r5-double-fault.md`). A `#PF`
+  on the gate's own stack writes can still land here depending on nesting.
+* **Privilege-changing gates.** Round 5 landed privilege-changing interrupt
+  delivery and TSS stack switch (`LTR`/`STR`, outer `IRET`), so a ring-3 `#PF`
+  handler can use an inner stack from the TSS. Task gates / call gates / VM86
+  remain out. `PagedBus` can still sample CPL once per instruction.
 * **A page-table walk that cannot reach physical memory** is
   `ExecError::PageTableFault`, not a fabricated not-present page.
 * **Task-switch `CR3` loads.** `PagedBus::new` polls
