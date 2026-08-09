@@ -20,6 +20,11 @@
 //!   for the split those registers report ("AX = extended memory between 1M and
 //!   16M, in K (max 3C00h = 15MB)", "BX = extended memory above 16M, in 64K
 //!   blocks"). See [`CmosRtc::set_memory_size`].
+//! - Ralf Brown's Interrupt List — CMOS `0Eh` IBM PS/2 "DIAGNOSTIC STATUS BYTE"
+//!   (Table C0005), CMOS `14h` IBM "EQUIPMENT BYTE" (Table C0019), and CMOS
+//!   `2Eh`/`2Fh` IBM "Standard CMOS Checksum" — "as defined by the original IBM
+//!   PC/AT specification … a byte-wise additive sum of the values in locations
+//!   10h-2Dh only".
 //! - `docs/machine-model-pc-v1.md`, `plan.md` §15.3 RTC.
 //!
 //! # Scope (this slice)
@@ -51,6 +56,15 @@
 //! `34h`/`35h` (memory above 16 MB in 64 KB blocks) are populated from the
 //! machine's RAM size by [`CmosRtc::set_memory_size`] and stay ordinary R/W
 //! CMOS RAM afterwards.
+//!
+//! The configuration bytes POST validates before trusting the rest of the file
+//! are plain storage with host accessors: the diagnostic status byte `0Eh`
+//! ([`CmosRtc::set_diagnostic_status`]), the equipment byte `14h`
+//! ([`CmosRtc::set_equipment_byte`] / [`CmosRtc::equipment_floppy_field`]), and
+//! the standard checksum `2Eh`/`2Fh` over `10h`–`2Dh`
+//! ([`CmosRtc::standard_checksum`] / [`CmosRtc::store_standard_checksum`] /
+//! [`CmosRtc::standard_checksum_valid`]). This device never sets a diagnostic
+//! bit or recomputes a checksum on its own — evaluating them is POST's job.
 //!
 //! All of those bytes are treated as battery backed and survive
 //! [`CmosRtc::reset`]; the rest of the general CMOS configuration area is still
@@ -85,8 +99,12 @@
 //!   authoritative register map, so this model leaves them zero rather than
 //!   inventing an encoding. A guest with more than 4 GB of RAM sees the map
 //!   saturate, not wrap.
-//! - Everything else POST derives its memory map from: no floppy-type byte
-//!   (`10h`), hard-disk type bytes (`12h`, `19h`–`2Ch`), or boot-device byte
+//! - Floppy-type byte (`10h`), hard-disk type bytes (`12h`, `19h`–`2Ch`), and
+//!   boot-device byte (`2Dh`). They are inside the standard checksum range and
+//!   are *not* battery backed here, so a host that programs them must call
+//!   [`CmosRtc::store_standard_checksum`] again after a reset.
+//! - Any device-side reaction to the diagnostic byte or a stale checksum: both
+//!   are inert storage, and no POST action is taken on them
 
 use crate::PortDevice;
 
@@ -136,6 +154,99 @@ pub const SHUTDOWN_JMP_WITH_EOI: u8 = 0x05;
 pub const SHUTDOWN_BLOCK_MOVE: u8 = 0x09;
 /// Shutdown status `0Ah`: jump via BDA `40:67` (SeaBIOS soft-reset code).
 pub const SHUTDOWN_JMP: u8 = 0x0A;
+
+/// IBM PS/2 diagnostic status byte (index `0x0E`).
+///
+/// Spec: RBIL CMOS `0Eh` — IBM PS/2 "DIAGNOSTIC STATUS BYTE", Table C0005.
+/// Ordinary battery-backed CMOS RAM that POST reads to decide whether the rest
+/// of the register file can be trusted, and writes to record what it found.
+/// This device stores the byte; it never evaluates or synthesizes it.
+pub const REG_DIAGNOSTIC: u8 = 0x0E;
+
+/// Diagnostic bit 7 — "indicates clock has lost power".
+pub const DIAG_CLOCK_LOST_POWER: u8 = 1 << 7;
+/// Diagnostic bit 6 — "incorrect checksum".
+pub const DIAG_BAD_CHECKSUM: u8 = 1 << 6;
+/// Diagnostic bit 5 — "equipment configuration is incorrect".
+pub const DIAG_BAD_CONFIG: u8 = 1 << 5;
+/// Diagnostic bit 4 — "error in memory size".
+pub const DIAG_MEMORY_SIZE_ERROR: u8 = 1 << 4;
+/// Diagnostic bit 3 — "controller or disk drive failed initialization".
+pub const DIAG_DISK_INIT_FAILED: u8 = 1 << 3;
+/// Diagnostic bit 2 — "time is invalid".
+pub const DIAG_TIME_INVALID: u8 = 1 << 2;
+/// Diagnostic bit 1 — "installed adaptors do not match configuration".
+pub const DIAG_ADAPTERS_MISMATCH: u8 = 1 << 1;
+/// Diagnostic bit 0 — "time-out while reading adaptor ID".
+pub const DIAG_ADAPTER_ID_TIMEOUT: u8 = 1 << 0;
+
+/// IBM equipment byte (index `0x14`).
+///
+/// Spec: RBIL CMOS `14h` — IBM "EQUIPMENT BYTE", Table C0019.
+pub const REG_EQUIPMENT: u8 = 0x14;
+
+/// Equipment bits 7-6 — number of floppy drives (`00b` = 1 … `11b` = 4).
+pub const EQUIP_FLOPPY_COUNT_MASK: u8 = 0xC0;
+/// Shift of the floppy-drive count field.
+pub const EQUIP_FLOPPY_COUNT_SHIFT: u8 = 6;
+/// Equipment bits 5-4 — monitor type.
+pub const EQUIP_DISPLAY_MASK: u8 = 0x30;
+/// Monitor type `00b` — "Not CGA or MDA (observed for EGA & VGA)".
+pub const EQUIP_DISPLAY_EGA_VGA: u8 = 0x00;
+/// Monitor type `01b` — 40x25 CGA.
+pub const EQUIP_DISPLAY_CGA_40: u8 = 0x10;
+/// Monitor type `10b` — 80x25 CGA.
+pub const EQUIP_DISPLAY_CGA_80: u8 = 0x20;
+/// Monitor type `11b` — MDA (monochrome).
+pub const EQUIP_DISPLAY_MDA: u8 = 0x30;
+/// Equipment bit 3 — "display enabled".
+pub const EQUIP_DISPLAY_ENABLED: u8 = 1 << 3;
+/// Equipment bit 2 — "keyboard enabled".
+pub const EQUIP_KEYBOARD_ENABLED: u8 = 1 << 2;
+/// Equipment bit 1 — "math coprocessor installed".
+pub const EQUIP_MATH_COPROCESSOR: u8 = 1 << 1;
+/// Equipment bit 0 — "floppy drive installed".
+pub const EQUIP_FLOPPY_INSTALLED: u8 = 1 << 0;
+
+/// Standard CMOS checksum, high byte (index `0x2E`).
+///
+/// Spec: RBIL CMOS `2Eh`/`2Fh` — IBM "Standard CMOS Checksum, High/Low Byte";
+/// "as defined by the original IBM PC/AT specification and represent a
+/// byte-wise additive sum of the values in locations 10h-2Dh only, 00h-0Fh and
+/// 30h-33h are not included".
+pub const REG_CHECKSUM_HIGH: u8 = 0x2E;
+/// Standard CMOS checksum, low byte (index `0x2F`).
+pub const REG_CHECKSUM_LOW: u8 = 0x2F;
+/// First index covered by the standard CMOS checksum (inclusive).
+pub const CMOS_CHECKSUM_FIRST: u8 = 0x10;
+/// Last index covered by the standard CMOS checksum (inclusive).
+pub const CMOS_CHECKSUM_LAST: u8 = 0x2D;
+
+/// Largest floppy-drive count the two-bit equipment field can describe.
+const EQUIP_FLOPPY_COUNT_MAX: u8 = 4;
+
+// Spec: RBIL Table C0019 — the monitor-type encodings live in bits 5-4 and the
+// drive-count encodings in bits 7-6.
+const _: () = assert!(EQUIP_DISPLAY_EGA_VGA & !EQUIP_DISPLAY_MASK == 0);
+const _: () = assert!(EQUIP_DISPLAY_CGA_40 == 1 << 4);
+const _: () = assert!(EQUIP_DISPLAY_CGA_80 == 2 << 4);
+const _: () = assert!(EQUIP_DISPLAY_MDA == EQUIP_DISPLAY_MASK);
+const _: () = assert!(EQUIP_FLOPPY_COUNT_MASK == 0x03 << EQUIP_FLOPPY_COUNT_SHIFT);
+const _: () =
+    assert!(EQUIP_MATH_COPROCESSOR | EQUIP_KEYBOARD_ENABLED | EQUIP_DISPLAY_ENABLED == 0x0E);
+
+// Spec: RBIL Table C0005 — the eight diagnostic conditions occupy one byte.
+const _: () = assert!(
+    DIAG_CLOCK_LOST_POWER
+        | DIAG_BAD_CHECKSUM
+        | DIAG_BAD_CONFIG
+        | DIAG_MEMORY_SIZE_ERROR
+        | DIAG_DISK_INIT_FAILED
+        | DIAG_TIME_INVALID
+        | DIAG_ADAPTERS_MISMATCH
+        | DIAG_ADAPTER_ID_TIMEOUT
+        == 0xFF
+);
 
 /// Base memory size in KB — low byte (index `0x15`).
 ///
@@ -199,8 +310,12 @@ pub const CMOS_MEM_ABOVE_16M_BLOCK_BYTES: u64 = 64 * 1024;
 /// indices are preserved by [`CmosRtc::reset`] today; the rest of the general
 /// CMOS configuration area is still cleared, which is recorded as a gap in the
 /// module-level "Unsupported" list.
-const PRESERVED_ON_RESET: [u8; 9] = [
+const PRESERVED_ON_RESET: [u8; 13] = [
     REG_SHUTDOWN,
+    REG_DIAGNOSTIC,
+    REG_EQUIPMENT,
+    REG_CHECKSUM_HIGH,
+    REG_CHECKSUM_LOW,
     REG_BASE_MEM_LOW,
     REG_BASE_MEM_HIGH,
     REG_EXT_MEM_LOW,
@@ -445,6 +560,85 @@ impl CmosRtc {
     /// Memory above 16 MB in 64 KB blocks as stored in CMOS `34h`/`35h`.
     pub fn memory_above_16m_blocks(&self) -> u16 {
         self.read_le_pair(REG_MEM_ABOVE_16M_LOW, REG_MEM_ABOVE_16M_HIGH)
+    }
+
+    /// IBM PS/2 diagnostic status byte (index [`REG_DIAGNOSTIC`]).
+    ///
+    /// Spec: RBIL CMOS `0Eh` Table C0005. Plain storage — this device never
+    /// sets a diagnostic bit on its own, because deciding that the checksum is
+    /// wrong or the memory size mismatched is POST's job, not the RTC's.
+    pub fn diagnostic_status(&self) -> u8 {
+        self.ram[REG_DIAGNOSTIC as usize]
+    }
+
+    /// Store the diagnostic status byte.
+    pub fn set_diagnostic_status(&mut self, value: u8) {
+        self.ram[REG_DIAGNOSTIC as usize] = value;
+    }
+
+    /// IBM equipment byte (index [`REG_EQUIPMENT`]).
+    ///
+    /// Spec: RBIL CMOS `14h` Table C0019.
+    pub fn equipment_byte(&self) -> u8 {
+        self.ram[REG_EQUIPMENT as usize]
+    }
+
+    /// Store the equipment byte describing the machine's installed hardware.
+    ///
+    /// Compose it from the `EQUIP_*` constants and
+    /// [`Self::equipment_floppy_field`]. The byte is inside the standard
+    /// checksum range, so a host that also maintains the checksum must call
+    /// [`Self::store_standard_checksum`] afterwards.
+    pub fn set_equipment_byte(&mut self, value: u8) {
+        self.ram[REG_EQUIPMENT as usize] = value;
+    }
+
+    /// Encode a floppy-drive count into equipment bits 7-6 plus bit 0.
+    ///
+    /// Spec: RBIL CMOS `14h` Table C0019 — bits 7-6 are "number of floppy
+    /// drives" counting from `00b` = 1 Drive, and bit 0 is "floppy drive
+    /// installed". A count of zero clears both fields; counts above the four
+    /// the two-bit field can describe saturate rather than wrapping.
+    pub const fn equipment_floppy_field(drives: u8) -> u8 {
+        if drives == 0 {
+            return 0;
+        }
+        let capped = if drives > EQUIP_FLOPPY_COUNT_MAX {
+            EQUIP_FLOPPY_COUNT_MAX
+        } else {
+            drives
+        };
+        ((capped - 1) << EQUIP_FLOPPY_COUNT_SHIFT) | EQUIP_FLOPPY_INSTALLED
+    }
+
+    /// Byte-wise additive sum of CMOS `10h`–`2Dh`.
+    ///
+    /// Spec: RBIL CMOS `2Fh` — "a byte-wise additive sum of the values in
+    /// locations 10h-2Dh only, 00h-0Fh and 30h-33h are not included". Thirty
+    /// bytes of `0xFF` cannot overflow 16 bits, so the sum is exact.
+    pub fn standard_checksum(&self) -> u16 {
+        (CMOS_CHECKSUM_FIRST..=CMOS_CHECKSUM_LAST)
+            .map(|i| u16::from(self.ram[i as usize]))
+            .sum()
+    }
+
+    /// Write [`Self::standard_checksum`] into `2Eh` (high) and `2Fh` (low).
+    pub fn store_standard_checksum(&mut self) {
+        let sum = self.standard_checksum();
+        self.ram[REG_CHECKSUM_HIGH as usize] = (sum >> 8) as u8;
+        self.ram[REG_CHECKSUM_LOW as usize] = sum as u8;
+    }
+
+    /// Whether the stored checksum bytes match the current `10h`–`2Dh` sum.
+    ///
+    /// A host query only. POST is what turns a mismatch into
+    /// [`DIAG_BAD_CHECKSUM`]; this device does not.
+    pub fn standard_checksum_valid(&self) -> bool {
+        let stored = u16::from_be_bytes([
+            self.ram[REG_CHECKSUM_HIGH as usize],
+            self.ram[REG_CHECKSUM_LOW as usize],
+        ]);
+        stored == self.standard_checksum()
     }
 
     pub fn read_reg(&self, index: u8) -> u8 {
@@ -1178,6 +1372,144 @@ mod tests {
         c.set_memory_size(4 * MIB);
         assert_eq!(c.extended_memory_kb(), 3 * 1024);
         assert_eq!(c.memory_above_16m_blocks(), 0);
+    }
+
+    /// Spec: RBIL CMOS `0Eh` Table C0005, `14h` Table C0019, `2Eh`/`2Fh`.
+    #[test]
+    fn configuration_byte_indices_match_the_cmos_map() {
+        assert_eq!(REG_DIAGNOSTIC, 0x0E);
+        assert_eq!(REG_EQUIPMENT, 0x14);
+        assert_eq!(REG_CHECKSUM_HIGH, 0x2E);
+        assert_eq!(REG_CHECKSUM_LOW, 0x2F);
+        assert_eq!(CMOS_CHECKSUM_FIRST, 0x10);
+        assert_eq!(CMOS_CHECKSUM_LAST, 0x2D);
+    }
+
+    /// Spec: RBIL Table C0019 — bits 7-6 count from `00b` = 1 Drive, bit 0
+    /// reports that a floppy drive is installed at all.
+    #[test]
+    fn equipment_floppy_field_matches_table_c0019() {
+        assert_eq!(CmosRtc::equipment_floppy_field(0), 0);
+        for (drives, bits) in [(1u8, 0u8), (2, 1), (3, 2), (4, 3)] {
+            let field = CmosRtc::equipment_floppy_field(drives);
+            assert_eq!(field & EQUIP_FLOPPY_INSTALLED, EQUIP_FLOPPY_INSTALLED);
+            assert_eq!(
+                (field & EQUIP_FLOPPY_COUNT_MASK) >> EQUIP_FLOPPY_COUNT_SHIFT,
+                bits,
+                "{drives} drives"
+            );
+        }
+        assert_eq!(
+            CmosRtc::equipment_floppy_field(255),
+            CmosRtc::equipment_floppy_field(EQUIP_FLOPPY_COUNT_MAX)
+        );
+    }
+
+    /// The equipment byte composes from the documented fields and is plain
+    /// read/write CMOS RAM through `0x70`/`0x71`.
+    #[test]
+    fn equipment_byte_composes_and_stores() {
+        let mut c = CmosRtc::new();
+        assert_eq!(c.equipment_byte(), 0);
+
+        let value = CmosRtc::equipment_floppy_field(2)
+            | EQUIP_DISPLAY_CGA_80
+            | EQUIP_DISPLAY_ENABLED
+            | EQUIP_KEYBOARD_ENABLED
+            | EQUIP_MATH_COPROCESSOR;
+        c.set_equipment_byte(value);
+        assert_eq!(c.equipment_byte(), value);
+        assert_eq!(c.read_reg(REG_EQUIPMENT), value);
+        assert_eq!(value & EQUIP_DISPLAY_MASK, EQUIP_DISPLAY_CGA_80);
+
+        c.write_reg(REG_EQUIPMENT, EQUIP_DISPLAY_MDA);
+        assert_eq!(c.equipment_byte(), EQUIP_DISPLAY_MDA);
+    }
+
+    /// Spec: RBIL CMOS `2Fh` — a byte-wise additive sum over `10h`–`2Dh` only,
+    /// stored high byte first.
+    #[test]
+    fn standard_checksum_covers_only_10h_to_2dh() {
+        let mut c = CmosRtc::new();
+        assert_eq!(c.standard_checksum(), 0);
+
+        for i in CMOS_CHECKSUM_FIRST..=CMOS_CHECKSUM_LAST {
+            c.write_reg(i, 0xFF);
+        }
+        let covered = u16::from(CMOS_CHECKSUM_LAST - CMOS_CHECKSUM_FIRST + 1);
+        assert_eq!(covered, 30);
+        assert_eq!(c.standard_checksum(), covered * 0xFF);
+
+        c.store_standard_checksum();
+        assert_eq!(c.read_reg(REG_CHECKSUM_HIGH), 0x1D);
+        assert_eq!(c.read_reg(REG_CHECKSUM_LOW), 0xE2);
+        assert!(c.standard_checksum_valid());
+
+        // Neither the excluded low range nor the bytes at or after `2Eh` count.
+        let before = c.standard_checksum();
+        for outside in [0x00u8, 0x09, 0x0E, 0x0F, 0x2E, 0x2F, 0x30, 0x34, 0x7F] {
+            c.write_reg(outside, 0x77);
+        }
+        assert_eq!(c.standard_checksum(), before);
+    }
+
+    /// Editing a covered byte invalidates the stored checksum until it is
+    /// recomputed — the condition POST reports through `DIAG_BAD_CHECKSUM`.
+    #[test]
+    fn checksum_validity_tracks_covered_bytes() {
+        let mut c = CmosRtc::new();
+        c.set_memory_size(16 * MIB);
+        c.store_standard_checksum();
+        assert!(c.standard_checksum_valid());
+
+        c.set_equipment_byte(EQUIP_DISPLAY_ENABLED);
+        assert!(!c.standard_checksum_valid());
+        c.store_standard_checksum();
+        assert!(c.standard_checksum_valid());
+    }
+
+    /// Spec: RBIL Table C0005 — the diagnostic byte is storage; the device
+    /// neither raises nor clears its bits.
+    #[test]
+    fn diagnostic_status_is_inert_storage() {
+        let mut c = CmosRtc::new();
+        assert_eq!(c.diagnostic_status(), 0);
+
+        c.set_diagnostic_status(DIAG_CLOCK_LOST_POWER | DIAG_BAD_CHECKSUM);
+        assert_eq!(
+            c.read_reg(REG_DIAGNOSTIC),
+            DIAG_CLOCK_LOST_POWER | DIAG_BAD_CHECKSUM
+        );
+
+        // A valid checksum does not clear the bit; POST owns that decision.
+        c.store_standard_checksum();
+        assert!(c.standard_checksum_valid());
+        assert_eq!(c.diagnostic_status() & DIAG_BAD_CHECKSUM, DIAG_BAD_CHECKSUM);
+
+        c.write_reg(REG_DIAGNOSTIC, DIAG_TIME_INVALID);
+        assert_eq!(c.diagnostic_status(), DIAG_TIME_INVALID);
+    }
+
+    /// Spec: IBM PC/AT — battery-backed configuration must survive reset, and
+    /// a preserved checksum must still validate afterwards.
+    #[test]
+    fn configuration_bytes_survive_reset_with_a_valid_checksum() {
+        let mut c = CmosRtc::new();
+        c.set_memory_size(32 * MIB);
+        c.set_equipment_byte(
+            CmosRtc::equipment_floppy_field(1) | EQUIP_DISPLAY_ENABLED | EQUIP_KEYBOARD_ENABLED,
+        );
+        c.set_diagnostic_status(DIAG_CLOCK_LOST_POWER);
+        c.store_standard_checksum();
+        let equipment = c.equipment_byte();
+        let sum = c.standard_checksum();
+
+        c.reset();
+
+        assert_eq!(c.equipment_byte(), equipment);
+        assert_eq!(c.diagnostic_status(), DIAG_CLOCK_LOST_POWER);
+        assert_eq!(c.standard_checksum(), sum);
+        assert!(c.standard_checksum_valid());
     }
 
     #[test]
