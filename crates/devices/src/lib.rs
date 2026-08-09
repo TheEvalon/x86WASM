@@ -3,6 +3,7 @@
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! System Control Port A 0x92 (Fast Gate A20 + fast reset);
+//! APM/SMI ports 0xB2/0xB3 (APM_CNT/APM_STS + SMM handshake stub);
 //! 8237A DMA register/page stubs (no transfer engine);
 //! VGA text frame buffer MMIO stub at 0xB8000 + CRTC 0x3D4/0x3D5 noop;
 //! VGA plane decode (Map Mask/Chain-4/Odd-Even/Extended Memory) + Graphics Controller
@@ -18,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod apm;
 mod cmos;
 mod dma;
 mod fdc;
@@ -30,6 +32,8 @@ mod pit;
 mod port92;
 mod serial;
 mod vga;
+
+pub use apm::{ApmSmi, APM_CNT_PORT, APM_STS_PORT};
 
 pub use cmos::{
     CmosRtc, CMOS_BASE_MEMORY_MAX_KB, CMOS_CHECKSUM_FIRST, CMOS_CHECKSUM_LAST, CMOS_DATA,

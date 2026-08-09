@@ -136,6 +136,9 @@ pub struct PhysMem {
     /// Shadow store for legacy-window addresses with no DRAM behind them.
     /// Allocated on first use; addresses inside `ram` shadow into `ram`.
     legacy_shadow: Vec<u8>,
+    /// PIIX XBCS bit2 inverted: when true, BIOSCS# is not asserted for writes
+    /// (Intel 82371AB §4.1.9). ROM content is still never stored.
+    bios_write_protect: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,11 +189,23 @@ impl PhysMem {
             a20_enabled: true,
             pam: [PamAttributes::default(); PAM_REGION_COUNT],
             legacy_shadow: Vec::new(),
+            // Spec: Intel 82371AB XBCS default `03h` — bit2 clear → write protect.
+            bios_write_protect: true,
         }
     }
 
     pub fn ram_len(&self) -> usize {
         self.ram.len()
+    }
+
+    /// Whether BIOSCS# write-protect is in force (XBCS bit2 clear).
+    pub fn bios_write_protect(&self) -> bool {
+        self.bios_write_protect
+    }
+
+    /// Mirror PIIX XBCS bit2 into the memory model (true = protect / no write CS#).
+    pub fn set_bios_write_protect(&mut self, enabled: bool) {
+        self.bios_write_protect = enabled;
     }
 
     pub fn a20_enabled(&self) -> bool {
@@ -411,11 +426,13 @@ impl PhysMem {
     /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.4 (Master-Abort
     /// discards write data and reports nothing to the processor); Intel 440FX
     /// 82441FX (PMC) §3.2.18 (PAM WE forwards the write off DRAM); Intel
-    /// 82371SB (PIIX3) §XBCS (BIOSCS# is not asserted for a write unless
-    /// BIOS write protect is disabled, so the ROM never claims one); Intel SDM
+    /// 82371SB (PIIX3) / 82371AB §4.1.9 XBCS (BIOSCS# is not asserted for a
+    /// write unless BIOS write-protect enable bit2 is set, so the ROM never
+    /// claims one when protect is in force; with protect lifted the cycle
+    /// reaches a mask ROM / flash that still stores nothing); Intel SDM
     /// Vol. 3 §6.15 (the processor's `#GP` sources for a store are
     /// segmentation and paging, not a bus response). See
-    /// `docs/machine-r4-write-semantics.md`.
+    /// `docs/machine-r4-write-semantics.md` and `docs/machine-r5-xbcs.md`.
     pub fn write_u8_classified(&mut self, addr: u64, val: u8) -> WriteDisposition {
         let addr = self.apply_a20(addr);
         if let Some(region) = Self::pam_region_index(addr) {
@@ -426,6 +443,9 @@ impl PhysMem {
             return WriteDisposition::DroppedPamWriteDisabled;
         }
         if self.rom_read(addr).is_some() {
+            // Spec: Intel 82371AB §4.1.9 — XBCS bit2 gates BIOSCS# on writes.
+            // [`Self::bios_write_protect`] mirrors that bit; ROM image bytes are
+            // never mutated in either setting (see `docs/machine-r5-xbcs.md`).
             return WriteDisposition::DroppedRom;
         }
         let i = addr as usize;

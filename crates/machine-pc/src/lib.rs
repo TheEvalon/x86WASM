@@ -17,6 +17,7 @@ mod post_probe;
 mod post_spin;
 mod post_trace;
 mod step_clock;
+mod xbcs;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
@@ -32,8 +33,8 @@ pub use ports::{
 pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
 pub use post_probe::{
     seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
-    TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV,
-    SEABIOS_IMAGE_RELATIVE,
+    TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_IDLE_TIMER_CLOCKS, POST_OPCODE_WINDOW_LEN,
+    SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
 };
 pub use post_spin::{
     PostPcSite, PostSpinConfig, PostSpinCycle, PostSpinSummary, DEFAULT_POST_SPIN_HOT,
@@ -41,16 +42,21 @@ pub use post_spin::{
 };
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use step_clock::{
-    StepClock, StepTicks, CMOS_PERIODIC_HZ, DEFAULT_PIT_CLOCKS_PER_STEP,
-    PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
+    StepClock, StepTicks, ACPI_PM_CLOCKS_PER_PIT_CLOCK, ACPI_PM_TMR_MASK, CMOS_PERIODIC_HZ,
+    DEFAULT_PIT_CLOCKS_PER_STEP, PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
+};
+pub use xbcs::{
+    Xbcs, XBCS_BIOS_WRITE_PROTECT_ENABLE, XBCS_CONFIG_OFFSET, XBCS_DEFAULT,
+    XBCS_EXTENDED_BIOS_ENABLE, XBCS_LOWER_BIOS_ENABLE,
 };
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
+    ApmSmi, CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
     FwCfgDmaOutcome, IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550,
-    VgaText, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA,
-    EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT,
-    I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+    VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY,
+    E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED,
+    FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD,
+    PCI_CONFIG_DATA, PCI_PIIX_ACPI_PM_TMR, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
     PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
     PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
@@ -105,12 +111,16 @@ pub struct Machine {
     pub kbd: I8042,
     /// System Control Port A (`0x92`) — Fast Gate A20 + fast reset pulse.
     pub port92: Port92,
+    /// APM/SMI command+status (`0xB2`/`0xB3`) with SMM-completion stub.
+    pub apm: ApmSmi,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
     /// VGA color text plane at 0xB8000 + CRTC/Seq/GC/ATC/DAC/Misc stubs.
     pub vga: VgaText,
     /// PCI configuration mechanism #1 (ports 0xCF8 / 0xCFC–0xCFF).
     pub pci: PciConfig,
+    /// PIIX ISA XBCS (`4Eh`) — BIOSCS# write-protect decode (machine-owned).
+    pub xbcs: Xbcs,
     /// Primary IDE — IDENTIFY + READ SECTORS PIO (ports 0x1F0–0x1F7 / 0x3F6).
     pub ide: IdePrimary,
     /// Secondary IDE — same PIO stub remapped (ports 0x170–0x177 / 0x376); IRQ15.
@@ -153,9 +163,11 @@ impl Machine {
             cmos: CmosRtc::new(),
             kbd: I8042::new(),
             port92: Port92::new(),
+            apm: ApmSmi::new(),
             dma: Dma8237::new(),
             vga: VgaText::new(),
             pci: PciConfig::new(),
+            xbcs: Xbcs::new(),
             ide: IdePrimary::new(),
             ide_secondary: IdeSecondary::new(),
             fdc: Fdc82077::new(),
@@ -166,6 +178,9 @@ impl Machine {
             ports: PortBus::new(),
             ide_disk_sectors: None,
         };
+        machine
+            .mem
+            .set_bios_write_protect(machine.xbcs.bios_write_protect_enabled());
         machine.sync_firmware_configuration();
         machine
     }
@@ -345,9 +360,11 @@ impl Machine {
 
     /// Charge one retired instruction to the time source.
     ///
-    /// Spec: Intel 8254 (CLK-driven counter) and Motorola MC146818A (periodic
-    /// quantum + one-second update cycle), driven from the retired-instruction
-    /// count rather than host wall clock so a run is reproducible.
+    /// Spec: Intel 8254 (CLK-driven counter), Motorola MC146818A (periodic
+    /// quantum + one-second update cycle), and Intel 82371AB ACPI `PM_TMR`
+    /// (24-bit free-running counter at 3.579545 MHz), all driven from the
+    /// retired-instruction count rather than host wall clock so a run is
+    /// reproducible.
     fn advance_step_clock(&mut self) {
         let ticks = self.step_clock.charge_step();
         if ticks.is_empty() {
@@ -355,6 +372,12 @@ impl Machine {
         }
         if ticks.pit_clocks > 0 {
             self.tick_pit(ticks.pit_clocks);
+            // Spec: Intel 82371AB — PM_TMR runs at 3.579545 MHz = 3 × PIT CLK.
+            self.advance_acpi_pm_tmr(
+                ticks
+                    .pit_clocks
+                    .saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK),
+            );
         }
         if ticks.cmos_periods > 0 {
             self.tick_cmos(ticks.cmos_periods);
@@ -362,6 +385,26 @@ impl Machine {
         for _ in 0..ticks.cmos_seconds {
             self.tick_cmos_second();
         }
+    }
+
+    /// Advance the PIIX ACPI power-management timer (PMBASE+`08h`).
+    ///
+    /// Spec: Intel 82371AB / ACPI — `PM_TMR` is a 24-bit free-running counter;
+    /// reads return bits 23:0. The PCI I/O stub only store/readbacks the
+    /// dword; the machine layer owns the freerun so SeaBIOS delays complete.
+    fn advance_acpi_pm_tmr(&mut self, ticks: u64) {
+        if ticks == 0 {
+            return;
+        }
+        let off = PCI_PIIX_ACPI_PM_TMR as usize;
+        let cur = u32::from_le_bytes([
+            self.pci.acpi_pm_io[off],
+            self.pci.acpi_pm_io[off + 1],
+            self.pci.acpi_pm_io[off + 2],
+            self.pci.acpi_pm_io[off + 3],
+        ]);
+        let next = cur.wrapping_add(ticks as u32) & ACPI_PM_TMR_MASK;
+        self.pci.acpi_pm_io[off..off + 4].copy_from_slice(&next.to_le_bytes());
     }
 
     /// Attach a raw 1.44MB floppy image to [`Self::fdc`].
@@ -523,9 +566,13 @@ impl Machine {
         self.cmos.reset();
         self.kbd.reset();
         self.port92.reset();
+        self.apm.reset();
         self.dma.reset();
         self.vga.reset();
         self.pci.reset();
+        self.xbcs.reset();
+        self.mem
+            .set_bios_write_protect(self.xbcs.bios_write_protect_enabled());
         self.ide.reset();
         self.ide_secondary.reset();
         self.fdc.reset();
@@ -577,9 +624,11 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             port92: &mut self.port92,
+            apm: &mut self.apm,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
+            xbcs: &mut self.xbcs,
             ide: &mut self.ide,
             ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
@@ -609,9 +658,11 @@ impl Machine {
                 cmos: &mut self.cmos,
                 kbd: &mut self.kbd,
                 port92: &mut self.port92,
+                apm: &mut self.apm,
                 dma: &mut self.dma,
                 vga: &mut self.vga,
                 pci: &mut self.pci,
+                xbcs: &mut self.xbcs,
                 ide: &mut self.ide,
                 ide_secondary: &mut self.ide_secondary,
                 fdc: &mut self.fdc,
@@ -794,9 +845,11 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             port92: &mut self.port92,
+            apm: &mut self.apm,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
+            xbcs: &mut self.xbcs,
             ide: &mut self.ide,
             ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
@@ -988,9 +1041,11 @@ struct MachineBus<'a> {
     cmos: &'a mut CmosRtc,
     kbd: &'a mut I8042,
     port92: &'a mut Port92,
+    apm: &'a mut ApmSmi,
     dma: &'a mut Dma8237,
     vga: &'a mut VgaText,
     pci: &'a mut PciConfig,
+    xbcs: &'a mut Xbcs,
     ide: &'a mut IdePrimary,
     ide_secondary: &'a mut IdeSecondary,
     fdc: &'a mut Fdc82077,
@@ -1111,6 +1166,32 @@ impl MachineBus<'_> {
         }
     }
 
+    /// Lane within a Mechanism #1 CONFIG_DATA access that hits XBCS `4Eh`.
+    ///
+    /// Spec: Intel 82371AB §4.1.9 — XBCS at ISA-bridge config offset `4Eh`.
+    fn xbcs_config_lane(&self, port: u16, size: u8) -> Option<usize> {
+        if !(PCI_CONFIG_DATA..PCI_CONFIG_DATA + 4).contains(&port) {
+            return None;
+        }
+        if !self.pci.config_enabled()
+            || self.pci.config_bus() != 0
+            || self.pci.config_device() != 1
+            || self.pci.config_function() != 0
+        {
+            return None;
+        }
+        let base = usize::from(self.pci.config_register());
+        let lane = usize::from(port - PCI_CONFIG_DATA);
+        let start = base + lane;
+        let end = start + usize::from(size);
+        let xbcs = usize::from(XBCS_CONFIG_OFFSET);
+        if start <= xbcs && end > xbcs {
+            Some(xbcs - start)
+        } else {
+            None
+        }
+    }
+
     /// Describe a port access for the POST trace.
     ///
     /// PCI Mechanism #1 gets its own events because the raw `OUT 0xCF8` /
@@ -1208,7 +1289,16 @@ impl MachineBus<'_> {
             || self.pci.uhci_owns_port(port)
             || PciConfig::owns_port(port)
         {
-            return self.pci.port_read(port, size);
+            let mut value = self.pci.port_read(port, size);
+            // Spec: Intel 82371AB §4.1.9 — XBCS at ISA `4Eh` is machine-owned so
+            // the datasheet default and write-protect bit are visible even though
+            // the PCI stub's register file starts at zero for that byte.
+            if let Some(lane) = self.xbcs_config_lane(port, size) {
+                let mut bytes = value.to_le_bytes();
+                bytes[lane] = self.xbcs.value();
+                value = u32::from_le_bytes(bytes);
+            }
+            return value;
         }
         if self.vga.owns_port(port) {
             return self.vga.port_read(port, size);
@@ -1224,6 +1314,8 @@ impl MachineBus<'_> {
             POST_DIAG_PORT => self.post_diag.port_read(port, size),
             PORT_SYSTEM_CONTROL => u32::from(self.pit.port61_read()),
             PORT_SYSTEM_CONTROL_A => self.port92.port_read(port, size),
+            // Spec: Intel APM_CNT/APM_STS fixed I/O at 0xB2/0xB3 (PIIX/PCH).
+            APM_CNT_PORT | APM_STS_PORT => self.apm.port_read(port, size),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
             0x2F8..0x300 => self.com2.port_read(port, size),
@@ -1275,7 +1367,15 @@ impl MachineBus<'_> {
             // Spec: Intel 440FX 82441FX (PMC) §3.2.18 — same reason for PAM0–PAM6
             // on the host bridge at 00:00.0; a CONFIG_DATA write can relatch.
             let pam_touch = self.pci.pam_config_write_overlaps(port, size);
+            let xbcs_lane = self.xbcs_config_lane(port, size);
             self.pci.port_write(port, size, value);
+            // Spec: Intel 82371AB §4.1.9 — XBCS write-protect bit → PhysMem.
+            if let Some(lane) = xbcs_lane {
+                let byte = value.to_le_bytes()[lane];
+                self.xbcs.write(byte);
+                self.mem
+                    .set_bios_write_protect(self.xbcs.bios_write_protect_enabled());
+            }
             // Spec: Intel 440FX §3.2.18 — a PAM write re-attributes its segments
             // immediately; the register file only has an effect once the memory
             // model is told. This is the BIOS shadowing seam.
@@ -1317,6 +1417,9 @@ impl MachineBus<'_> {
                 self.mem.set_a20_enabled(enabled);
                 self.kbd.set_a20_enabled(enabled);
             }
+            // Spec: Intel APM_CNT/APM_STS — command write stub-completes SMI
+            // handshake (clears status); no architectural SMM entry.
+            APM_CNT_PORT | APM_STS_PORT => self.apm.port_write(port, size, value),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
             I8042_DATA | I8042_STATUS_CMD => {
                 self.kbd.port_write(port, size, value);
@@ -2721,6 +2824,7 @@ mod tests {
         assert_eq!(m.cmos, Machine::new(64 * 1024).cmos);
         assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.port92, Port92::new());
+        assert_eq!(m.apm, ApmSmi::new());
         assert_eq!(m.pci, PciConfig::new());
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
@@ -2918,6 +3022,7 @@ mod tests {
         assert_eq!(m.cpu.gpr[CpuState::RAX], 0);
         assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.port92, Port92::new());
+        assert_eq!(m.apm, ApmSmi::new());
         assert!(!m.service_8042_pulse_reset());
     }
 

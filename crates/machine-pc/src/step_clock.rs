@@ -15,10 +15,21 @@
 //! Spec: Intel 8254 datasheet (the counter is clocked by the external CLK
 //! input); IBM PC/AT — that input is 14.31818 MHz / 12; Motorola MC146818A —
 //! the periodic rate comes from Status A RS (POST default `0110b` = 1024 Hz)
-//! and the update cycle runs once per second.
+//! and the update cycle runs once per second. Intel 82371AB — ACPI `PM_TMR`
+//! is clocked at 14.31818 MHz / 4 = 3.579545 MHz (exactly three PIT clocks).
 
 /// PIT input clocks in one emulated second (IBM PC/AT 1.193182 MHz).
 pub const PIT_CLOCKS_PER_SECOND: u64 = 1_193_182;
+
+/// ACPI PM timer clocks per PIT input clock (3.579545 MHz / 1.193182 MHz = 3).
+///
+/// Spec: Intel 82371AB — `PM_TMR` frequency is 3.579545 MHz.
+pub const ACPI_PM_CLOCKS_PER_PIT_CLOCK: u64 = 3;
+
+/// 24-bit ACPI power-management timer mask.
+///
+/// Spec: Intel 82371AB / ACPI — `PM_TMR` is a 24-bit free-running counter.
+pub const ACPI_PM_TMR_MASK: u32 = 0x00FF_FFFF;
 
 /// Periodic-interrupt rate the model uses for the RTC quantum (POST default).
 pub const CMOS_PERIODIC_HZ: u64 = 1024;

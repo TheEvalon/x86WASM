@@ -31,6 +31,16 @@ pub const POST_OPCODE_WINDOW_LEN: usize = 8;
 /// Default instruction budget for a POST probe run.
 pub const DEFAULT_POST_PROBE_STEPS: u64 = 5_000_000;
 
+/// PIT/ACPI clocks charged to one halt-idle quantum during [`Machine::probe_post`].
+///
+/// Spec: Intel SDM Vol. 2 "HLT" — timers keep ticking while the processor is
+/// halted. The probe already charges one instruction-count clock per idle loop
+/// via [`Machine::step`]; the remaining clocks in this quantum model time
+/// passing during the wait so a firmware `usleep`/`yield` does not consume the
+/// entire step budget as if it were a busy spin. The `post-probe:` header line
+/// stays byte-identical.
+pub const POST_IDLE_TIMER_CLOCKS: u64 = 64;
+
 /// Environment variable overriding the SeaBIOS image path.
 pub const SEABIOS_IMAGE_ENV: &str = "X86WASM_SEABIOS_BIOS";
 
@@ -363,7 +373,17 @@ impl fmt::Display for PostReport {
             }
             writeln!(f, "]")?;
             if self.idle_steps > 0 {
-                writeln!(f, "  halt-idle      idle-steps={}", self.idle_steps)?;
+                let total = self.steps.saturating_add(self.idle_steps);
+                let idle_pct = self
+                    .idle_steps
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(0);
+                writeln!(
+                    f,
+                    "  halt-idle      idle-steps={} busy-steps={} idle-pct={idle_pct}%",
+                    self.idle_steps, self.steps
+                )?;
             }
             if let Some(spin) = &self.spin {
                 writeln!(f, "{spin}")?;
@@ -537,7 +557,16 @@ impl Machine {
                 }
             }
             match self.step() {
-                Ok(()) if idle => idle_steps += 1,
+                Ok(()) if idle => {
+                    idle_steps += 1;
+                    // Spec: Intel SDM Vol. 2 "HLT" — device timers continue while
+                    // halted. Charge the rest of [`POST_IDLE_TIMER_CLOCKS`] so a
+                    // firmware yield is not budgeted as a busy-wait instruction
+                    // storm. One clock already ran inside `step`.
+                    for _ in 1..POST_IDLE_TIMER_CLOCKS {
+                        self.advance_step_clock();
+                    }
+                }
                 Ok(()) => steps += 1,
                 Err(err) => break PostStopReason::Failure(self.capture_post_failure(&err)),
             }

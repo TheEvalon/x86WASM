@@ -97,6 +97,14 @@ fn a_halt_with_interrupts_enabled_is_woken_by_the_timer() {
         report.to_string().contains("halt-idle      idle-steps="),
         "{report}"
     );
+    assert!(
+        report.to_string().contains("busy-steps="),
+        "idle accounting must name busy work: {report}"
+    );
+    assert!(
+        report.to_string().contains("idle-pct="),
+        "idle accounting must report the idle share of the budget: {report}"
+    );
     // The idle is not counted as retired instructions, and not sampled into the
     // spin window either — the summary still shows the code that ran.
     let spin = report.spin.as_ref().expect("armed");
