@@ -2824,6 +2824,129 @@ fn grp2_u32(cpu: &mut CpuState, reg: u8, mut val: u32, raw_count: u8) -> Result<
     }
 }
 
+/// Highest basic `CPUID` leaf this emulator implements.
+const CPUID_MAX_BASIC_LEAF: u32 = 1;
+
+/// Highest extended `CPUID` leaf this emulator implements — the enumerator
+/// itself, meaning there are no extended leaves with content.
+const CPUID_MAX_EXTENDED_LEAF: u32 = 0x8000_0000;
+
+/// Vendor identification string returned by `CPUID` leaf 0.
+///
+/// Deliberately neither `GenuineIntel` nor `AuthenticAMD`: software that keys
+/// off a familiar vendor plus family/model would otherwise infer features this
+/// emulator does not implement. `docs/cpu-profile-core2.md` asks for a
+/// conservative vendor/brand string until the features exist.
+const CPUID_VENDOR: [u8; 12] = *b"x86WASM Emu ";
+
+/// `CPUID` leaf 1 version information: family 5, model 0, stepping 0.
+///
+/// Family 5 is the generation that introduced `RDMSR`/`WRMSR`, which is the
+/// only feature bit reported below, so the signature and the feature bits agree.
+const CPUID_VERSION_INFO: u32 = 0x0000_0500;
+
+/// `CPUID` leaf 1 `EDX` feature bits.
+///
+/// Bit 5 (`MSR`) is the only feature this emulator implements: `RDMSR` and
+/// `WRMSR` decode, check privilege, and raise the architectural `#GP` for the
+/// MSR addresses they do not implement. Every other bit — `FPU`, `TSC`, `PSE`,
+/// `PAE`, `APIC`, `MTRR`, `CX8`, `CMOV`, `MMX`, `SSE`, and the rest — stays
+/// clear because none of those are implemented.
+/// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); `AGENTS.md` truthful-CPUID rule.
+const CPUID_FEATURES_EDX: u32 = 1 << 5;
+
+/// `CPUID` leaf 1 `ECX` feature bits: none are implemented.
+const CPUID_FEATURES_ECX: u32 = 0;
+
+/// The four registers `CPUID` writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CpuidResult {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
+/// `CPUID` output for a basic or extended leaf.
+///
+/// "If a value entered for CPUID.EAX is higher than the maximum input value for
+/// basic or extended function for that processor, then the data for the highest
+/// basic information leaf is returned" — Intel SDM Vol. 2 "CPUID". That rule
+/// covers leaf `0x4000_0000`, which firmware uses to probe for a hypervisor
+/// signature; this emulator is not a hypervisor and reports none.
+fn cpuid_leaf(leaf: u32) -> CpuidResult {
+    let basic_1 = CpuidResult {
+        eax: CPUID_VERSION_INFO,
+        // Brand index, CLFLUSH line size, and maximum logical processors are
+        // only meaningful with feature bits this emulator does not set, and the
+        // initial APIC ID of the single modeled processor is 0.
+        ebx: 0,
+        ecx: CPUID_FEATURES_ECX,
+        edx: CPUID_FEATURES_EDX,
+    };
+    match leaf {
+        0 => CpuidResult {
+            eax: CPUID_MAX_BASIC_LEAF,
+            ebx: u32::from_le_bytes([
+                CPUID_VENDOR[0],
+                CPUID_VENDOR[1],
+                CPUID_VENDOR[2],
+                CPUID_VENDOR[3],
+            ]),
+            edx: u32::from_le_bytes([
+                CPUID_VENDOR[4],
+                CPUID_VENDOR[5],
+                CPUID_VENDOR[6],
+                CPUID_VENDOR[7],
+            ]),
+            ecx: u32::from_le_bytes([
+                CPUID_VENDOR[8],
+                CPUID_VENDOR[9],
+                CPUID_VENDOR[10],
+                CPUID_VENDOR[11],
+            ]),
+        },
+        1 => basic_1,
+        CPUID_MAX_EXTENDED_LEAF => CpuidResult {
+            eax: CPUID_MAX_EXTENDED_LEAF,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        },
+        _ => basic_1,
+    }
+}
+
+/// Read a model-specific register, or `None` when the address is reserved or
+/// unimplemented.
+///
+/// No MSR is implemented in this slice. The emulator models no time-stamp
+/// counter, local APIC, MTRRs, `SYSENTER` state, or `EFER`, so there is nothing
+/// it could report truthfully; every address takes the architectural `#GP` path
+/// rather than returning a fabricated zero.
+/// Spec: Intel SDM Vol. 2 "RDMSR"; Vol. 4 (MSR listings).
+fn read_msr(_index: u32) -> Option<u64> {
+    None
+}
+
+/// Write a model-specific register, returning `false` when the address is
+/// reserved or unimplemented. See [`read_msr`] — no MSR is implemented.
+fn write_msr(_index: u32, _value: u64) -> bool {
+    false
+}
+
+/// `#GP(0)` unless the processor is at CPL 0.
+///
+/// Real-address mode always runs at CPL 0, so only a `PE=1` non-zero `CS` RPL
+/// faults. Spec: Intel SDM Vol. 2 "INVD"/"WBINVD"/"RDMSR"/"WRMSR" (Protected
+/// Mode Exceptions); Vol. 3 §5.5.
+fn require_cpl0(cpu: &CpuState) -> Result<(), ExecError> {
+    if cr0_pe(cpu) && cpu.cs.selector & 3 != 0 {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+    Ok(())
+}
+
 /// What `BT`/`BTS`/`BTR`/`BTC` do to the selected bit after copying it to CF.
 /// Spec: Intel SDM Vol. 2 "BT"/"BTS"/"BTR"/"BTC".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3640,6 +3763,65 @@ fn step_two_byte(
                 cpu.set_gpr_u32(m.reg as usize, value);
             } else {
                 cpu.set_gpr_u16(m.reg as usize, value as u16);
+            }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0x0B => {
+            // UD2 — Spec: Intel SDM Vol. 2 "UD2—Undefined Instruction":
+            // raises `#UD` in every operating mode. It is the architecturally
+            // guaranteed invalid opcode, so it must not be reported as a host
+            // decode gap.
+            Err(arch_fault(6))
+        }
+        0x08 | 0x09 => {
+            // INVD / WBINVD — Spec: Intel SDM Vol. 2 "INVD"/"WBINVD". This
+            // emulator models no processor caches, so both are architectural
+            // no-ops; only the CPL 0 requirement is observable.
+            // Unsupported here: any external write-back cycle or cache-coherence
+            // effect, and the `#UD` for a `LOCK` prefix.
+            require_cpl0(cpu)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xA2 => {
+            // CPUID — Spec: Intel SDM Vol. 2 "CPUID". The leaf comes from EAX
+            // and the result replaces EAX/EBX/ECX/EDX. No flags are affected.
+            // See `cpuid_leaf` for what this emulator honestly reports.
+            // Unsupported here: `ECX` sub-leaf selection (no leaf that uses it
+            // is implemented) and the `#UD` for a `LOCK` prefix.
+            let result = cpuid_leaf(cpu.eax());
+            cpu.set_gpr_u32(CpuState::RAX, result.eax);
+            cpu.set_gpr_u32(CpuState::RBX, result.ebx);
+            cpu.set_gpr_u32(CpuState::RCX, result.ecx);
+            cpu.set_gpr_u32(CpuState::RDX, result.edx);
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0x32 => {
+            // RDMSR — Spec: Intel SDM Vol. 2 "RDMSR". ECX selects the MSR and
+            // the 64-bit value is returned in EDX:EAX. A reserved or
+            // unimplemented address is `#GP`, and outside real-address mode the
+            // instruction requires CPL 0.
+            require_cpl0(cpu)?;
+            let index = cpu.gpr_u32(CpuState::RCX);
+            let value = read_msr(index).ok_or_else(|| arch_fault_with_error_code(13, 0))?;
+            cpu.set_gpr_u32(CpuState::RAX, value as u32);
+            cpu.set_gpr_u32(CpuState::RDX, (value >> 32) as u32);
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0x30 => {
+            // WRMSR — Spec: Intel SDM Vol. 2 "WRMSR". ECX selects the MSR and
+            // EDX:EAX supplies the 64-bit value; a reserved or unimplemented
+            // address is `#GP`, and outside real-address mode the instruction
+            // requires CPL 0.
+            require_cpl0(cpu)?;
+            let index = cpu.gpr_u32(CpuState::RCX);
+            let value = (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
+                | u64::from(cpu.gpr_u32(CpuState::RAX));
+            if !write_msr(index, value) {
+                return Err(arch_fault_with_error_code(13, 0));
             }
             set_current_ip(cpu, next_ip);
             Ok(())
@@ -19185,5 +19367,205 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x1234_5678);
         assert_ne!(cpu.rflags & (1 << 6), 0);
+    }
+
+    /// Intel SDM Vol. 2 "CPUID": leaf 0 reports the highest basic leaf in EAX
+    /// and the vendor string in EBX:EDX:ECX. The string is deliberately not an
+    /// Intel or AMD signature, so software cannot infer unimplemented features
+    /// from a familiar vendor plus family/model (`docs/cpu-profile-core2.md`).
+    #[test]
+    fn cpuid_leaf_0_reports_max_basic_leaf_and_a_conservative_vendor() {
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA2], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 0);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 1, "highest basic leaf");
+        let mut vendor = Vec::new();
+        vendor.extend_from_slice(&cpu.gpr_u32(CpuState::RBX).to_le_bytes());
+        vendor.extend_from_slice(&cpu.gpr_u32(CpuState::RDX).to_le_bytes());
+        vendor.extend_from_slice(&cpu.gpr_u32(CpuState::RCX).to_le_bytes());
+        assert_eq!(vendor, b"x86WASM Emu ");
+        assert_ne!(vendor, b"GenuineIntel");
+        assert_ne!(vendor, b"AuthenticAMD");
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    /// `AGENTS.md`: CPUID must never advertise an unimplemented feature. Leaf 1
+    /// therefore reports only bit 5 (`MSR`), whose instructions this slice
+    /// implements. Every other enumerated feature must stay clear.
+    /// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11).
+    #[test]
+    fn cpuid_leaf_1_advertises_only_implemented_features() {
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA2], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 1);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+
+        let edx = cpu.gpr_u32(CpuState::RDX);
+        let ecx = cpu.gpr_u32(CpuState::RCX);
+        assert_eq!(edx, 1 << 5, "only the MSR feature bit may be set");
+        assert_eq!(ecx, 0, "no ECX feature is implemented");
+
+        // Named guards for the features most likely to be assumed present.
+        for (bit, name) in [
+            (0u32, "FPU"),
+            (1, "VME"),
+            (2, "DE"),
+            (3, "PSE"),
+            (4, "TSC"),
+            (6, "PAE"),
+            (8, "CX8"),
+            (9, "APIC"),
+            (11, "SEP"),
+            (12, "MTRR"),
+            (13, "PGE"),
+            (15, "CMOV"),
+            (16, "PAT"),
+            (19, "CLFSH"),
+            (23, "MMX"),
+            (25, "SSE"),
+            (26, "SSE2"),
+            (28, "HTT"),
+        ] {
+            assert_eq!(edx & (1 << bit), 0, "CPUID must not advertise {name}");
+        }
+
+        // Family 5 is the generation that introduced RDMSR/WRMSR, so the
+        // version information agrees with the one feature bit reported.
+        assert_eq!((cpu.eax() >> 8) & 0xF, 5, "family");
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0, "no brand/APIC-ID claims");
+    }
+
+    /// Intel SDM Vol. 2 "CPUID": a leaf above the maximum basic or extended
+    /// input value returns the data for the highest basic leaf. Firmware probes
+    /// `0x4000_0000` for a hypervisor signature; this emulator is not a
+    /// hypervisor and must not present one.
+    #[test]
+    fn cpuid_out_of_range_leaves_return_the_highest_basic_leaf() {
+        let leaf_1 = cpuid_leaf(1);
+        for leaf in [2u32, 0x0000_000D, 0x4000_0000, 0x8000_0001, 0xFFFF_FFFF] {
+            assert_eq!(cpuid_leaf(leaf), leaf_1, "leaf {leaf:#010X}");
+        }
+
+        // No hypervisor signature is spelled out by the 0x4000_0000 registers.
+        let hv = cpuid_leaf(0x4000_0000);
+        let mut signature = Vec::new();
+        signature.extend_from_slice(&hv.ebx.to_le_bytes());
+        signature.extend_from_slice(&hv.ecx.to_le_bytes());
+        signature.extend_from_slice(&hv.edx.to_le_bytes());
+        assert_ne!(&signature[..9], b"KVMKVMKVM");
+        assert_ne!(&signature[..9], b"TCGTCGTCG");
+
+        // The extended enumerator reports no extended leaves with content.
+        let extended = cpuid_leaf(0x8000_0000);
+        assert_eq!(extended.eax, 0x8000_0000);
+        assert_eq!((extended.ebx, extended.ecx, extended.edx), (0, 0, 0));
+    }
+
+    /// Intel SDM Vol. 2 "CPUID": the instruction replaces EAX/EBX/ECX/EDX and
+    /// affects no flags.
+    #[test]
+    fn cpuid_writes_four_registers_without_touching_flags() {
+        let flags = 0x0002 | 1 | (1 << 6) | (1 << 11);
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA2], |cpu, _| {
+            cpu.rflags = flags;
+            cpu.set_gpr_u32(CpuState::RAX, 0);
+            cpu.set_gpr_u32(CpuState::RBX, 0xDEAD_BEEF);
+            cpu.set_gpr_u32(CpuState::RCX, 0xDEAD_BEEF);
+            cpu.set_gpr_u32(CpuState::RDX, 0xDEAD_BEEF);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags, flags);
+        for idx in [CpuState::RBX, CpuState::RCX, CpuState::RDX] {
+            assert_ne!(cpu.gpr_u32(idx), 0xDEAD_BEEF);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "RDMSR"/"WRMSR": "Specifying a reserved or unimplemented
+    /// MSR address in ECX will also cause a general protection exception." This
+    /// slice implements no MSR, so every address faults rather than returning a
+    /// fabricated zero, and the CPU state is unchanged.
+    #[test]
+    fn rdmsr_wrmsr_fault_on_every_unimplemented_msr_address() {
+        for index in [
+            0x0000_0010u32, // IA32_TIME_STAMP_COUNTER
+            0x0000_001B,    // IA32_APIC_BASE
+            0x0000_00FE,    // IA32_MTRRCAP
+            0x0000_02FF,    // IA32_MTRR_DEF_TYPE
+            0xC000_0080,    // IA32_EFER
+            0x0000_0000,
+        ] {
+            for opcode in [0x32u8, 0x30] {
+                let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode], |cpu, _| {
+                    cpu.set_gpr_u32(CpuState::RCX, index);
+                    cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+                    cpu.set_gpr_u32(CpuState::RDX, 0x3333_4444);
+                });
+                let before = cpu.clone();
+                assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+                assert_eq!(cpu, before, "0F {opcode:02X} MSR {index:#010X}");
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "RDMSR"/"WRMSR"/"INVD"/"WBINVD" (Protected Mode
+    /// Exceptions): `#GP(0)` when the current privilege level is not 0.
+    /// Real-address mode always runs at CPL 0.
+    #[test]
+    fn system_instructions_require_cpl0_in_protected_mode() {
+        for opcode in [0x32u8, 0x30, 0x08, 0x09] {
+            // CPL 0: INVD/WBINVD retire; RDMSR/WRMSR still fault on the address.
+            let (mut cpu, mut bus) = pm32_fixture(&[0x0F, opcode], PM32_CODE, true);
+            let result = step_inner(&mut cpu, &mut bus);
+            if matches!(opcode, 0x08 | 0x09) {
+                result.unwrap();
+                assert_eq!(cpu.rip, (PM32_CODE + 2) as u64);
+            } else {
+                assert_arch_fault(result, 13, Some(0));
+            }
+
+            // CPL 3 faults before anything else is considered.
+            let (mut cpu, mut bus) = pm32_fixture(&[0x0F, opcode], PM32_CODE, true);
+            cpu.cs.selector |= 3;
+            let before = cpu.clone();
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+            assert_eq!(cpu, before, "0F {opcode:02X} at CPL 3");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "UD2—Undefined Instruction": raises `#UD` in every
+    /// operating mode, and must not be reported as a host decode gap.
+    #[test]
+    fn ud2_raises_undefined_opcode() {
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x0B], |_, _| {});
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+        assert_eq!(cpu, before);
+
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x0B], PM32_CODE, true);
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+        assert_eq!(cpu, before);
+    }
+
+    /// Intel SDM Vol. 2 "INVD"/"WBINVD": cache maintenance only. This emulator
+    /// models no caches, so both retire as no-ops that change nothing but the
+    /// instruction pointer.
+    #[test]
+    fn invd_and_wbinvd_are_architectural_no_ops() {
+        for opcode in [0x08u8, 0x09] {
+            let flags = 0x0002 | 1 | (1 << 6);
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode], |cpu, _| {
+                cpu.rflags = flags;
+                cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+            });
+            let before = cpu.clone();
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 2);
+            assert_eq!(cpu.rflags, flags);
+            assert_eq!(cpu.gpr, before.gpr);
+            assert_eq!(cpu.cr0, before.cr0);
+        }
     }
 }

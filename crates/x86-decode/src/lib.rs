@@ -2289,6 +2289,32 @@ mod tests {
         }
     }
 
+    /// Intel SDM Vol. 2 "INVD"/"WBINVD"/"UD2"/"WRMSR"/"RDMSR"/"CPUID": all are
+    /// two-byte opcodes with no ModR/M byte and no immediate.
+    #[test]
+    fn decode_two_byte_system_and_identification() {
+        for (op, mnemonic) in [
+            (0x08u8, "INVD"),
+            (0x09, "WBINVD"),
+            (0x0B, "UD2"),
+            (0x30, "WRMSR"),
+            (0x32, "RDMSR"),
+            (0xA2, "CPUID"),
+        ] {
+            let d = decode(&[0x0F, op]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.opcode, op);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert!(d.modrm.is_none());
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 2);
+
+            let d = decode_with_mode(&[0x0F, op], DecodeMode::DEFAULT32).unwrap();
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.length, 2);
+        }
+    }
+
     /// Intel SDM Vol. 2 "RET" (near/far imm16): the stack-release immediate is
     /// always 16 bits, independent of the operand-size attribute.
     #[test]

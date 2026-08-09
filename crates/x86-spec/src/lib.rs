@@ -1567,6 +1567,52 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "XADD r/m,r",
     },
+    // Cache management and the reserved undefined opcode — Spec: Intel SDM
+    // Vol. 2 "INVD" (`0F 08`), "WBINVD" (`0F 09`), "UD2" (`0F 0B`).
+    InstrDef {
+        mnemonic: "INVD",
+        opcode: 0x08,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "INVD",
+    },
+    InstrDef {
+        mnemonic: "WBINVD",
+        opcode: 0x09,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "WBINVD",
+    },
+    InstrDef {
+        mnemonic: "UD2",
+        opcode: 0x0B,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "UD2",
+    },
+    // Model-specific registers and identification — Spec: Intel SDM Vol. 2
+    // "WRMSR" (`0F 30`), "RDMSR" (`0F 32`), "CPUID" (`0F A2`).
+    InstrDef {
+        mnemonic: "WRMSR",
+        opcode: 0x30,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "WRMSR",
+    },
+    InstrDef {
+        mnemonic: "RDMSR",
+        opcode: 0x32,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "RDMSR",
+    },
+    InstrDef {
+        mnemonic: "CPUID",
+        opcode: 0xA2,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "CPUID",
+    },
     // `BSWAP r32` — Spec: Intel SDM Vol. 2 "BSWAP" (`0F C8`+rd). The register
     // is encoded in the low three opcode bits; there is no ModR/M byte.
     bswap(0xC8),

@@ -137,3 +137,89 @@ Not supported:
 - `LOCK` is decoded but has no atomicity effect (single-processor model), and
   `LOCK` with a register destination does not raise `#UD`.
 - The REX.W 64-bit forms, `CMPXCHG8B`/`CMPXCHG16B`, and `TZCNT`/`LZCNT`.
+
+## Slice 4 — system and identification
+
+Spec: SDM Vol. 2 "CPUID", "RDMSR", "WRMSR", "UD2", "INVD", "WBINVD"; Vol. 3
+§5.5; Vol. 4 (MSR listings).
+
+### What CPUID reports, and why every bit is truthful
+
+`AGENTS.md` forbids advertising an unimplemented feature. Under-reporting is
+safe; over-reporting is not. The complete guest-visible output is:
+
+| Leaf | EAX | EBX | ECX | EDX |
+|---|---|---|---|---|
+| `0` | `0000_0001` | `"x86W"` | `"Emu "` | `"ASM "` |
+| `1` | `0000_0500` | `0000_0000` | `0000_0000` | `0000_0020` |
+| `8000_0000` | `8000_0000` | `0` | `0` | `0` |
+| anything else | same as leaf `1` | | | |
+
+- **Leaf 0 EAX = 1** — the highest basic leaf with content. Leaf 2 (cache
+  descriptors) and beyond are not implemented, so they are not claimed.
+- **Vendor string `x86WASM Emu `** — deliberately neither `GenuineIntel` nor
+  `AuthenticAMD`. Software commonly infers capabilities from a familiar vendor
+  plus family/model rather than from feature bits, and a distinctive vendor
+  removes that inference. `docs/cpu-profile-core2.md` already asks for a
+  conservative vendor/brand string until the features exist.
+- **Leaf 1 EAX = family 5, model 0, stepping 0** — family 5 is the generation
+  that introduced `RDMSR`/`WRMSR`, which is the one feature bit reported, so the
+  signature and the feature bits do not contradict each other. Nothing claims a
+  specific shipping part.
+- **Leaf 1 EBX = 0** — brand index, `CLFLUSH` line size, and maximum logical
+  processors are only meaningful with feature bits that stay clear, and the
+  single modeled processor's initial APIC ID is 0.
+- **Leaf 1 EDX = bit 5 (`MSR`) only** — this bit means "the `RDMSR` and `WRMSR`
+  instructions are supported", and they are: they decode, enforce CPL 0, and
+  raise the architectural `#GP` for MSR addresses the processor does not
+  implement. It does **not** claim that any particular MSR exists. Every other
+  bit is clear because none of those features exist here: no `FPU` (no x87), no
+  `TSC`, `DE`, `VME`, `PSE`, `PAE`, `PGE`, `PAT`, `MTRR`, `APIC`, `SEP`, `CX8`
+  (no `CMPXCHG8B`), `CMOV`, `CLFSH`, `MMX`, `SSE`, `SSE2`, or `HTT`.
+- **Leaf 1 ECX = 0** — no ECX-enumerated feature is implemented.
+- **Leaf `0x8000_0000` EAX = `0x8000_0000`** — extended leaves are enumerable
+  but none has content.
+- **Out-of-range leaves** return the highest basic leaf, which is the documented
+  behavior. This covers `0x4000_0000`, which firmware probes for a hypervisor
+  signature: this emulator is not a hypervisor and presents no such signature.
+
+### MSRs
+
+`RDMSR`/`WRMSR` implement the full instruction mechanics — `ECX` selects the
+MSR, `EDX:EAX` carries the 64-bit value, CPL 0 is required outside real-address
+mode — but **no MSR is implemented**. Every address raises `#GP(0)`, which is
+the architectural response for a reserved or unimplemented MSR address.
+
+This is deliberate rather than a stub returning zero. The emulator models no
+time-stamp counter, local APIC, MTRRs, `SYSENTER` state, or `EFER`, so there is
+nothing it could report truthfully. Modeling MTRRs honestly is out of scope for
+this slice; because CPUID leaf 1 leaves the `MTRR` bit clear, firmware that
+checks CPUID before touching MTRR MSRs skips them entirely, which is what
+SeaBIOS does.
+
+### Other
+
+- `UD2` (`0F 0B`) raises `#UD` in every mode — the architecturally guaranteed
+  invalid opcode, distinct from a host decode gap.
+- `INVD`/`WBINVD` (`0F 08`/`0F 09`) are architectural no-ops because no caches
+  are modeled; only the CPL 0 requirement is observable. No external write-back
+  cycle or cache-coherence effect is produced.
+
+Not supported:
+
+- Any implemented MSR, and therefore any `WRMSR` reserved-bit `#GP`.
+- CPUID `ECX` sub-leaf selection (no leaf that uses it is implemented) and the
+  extended leaves `0x8000_0001`+ (including the processor brand string).
+- The `#UD` that a `LOCK` prefix should raise on `CPUID`, `RDMSR`, `WRMSR`,
+  `INVD`, and `WBINVD`.
+- Virtual-8086 mode, where `RDMSR`/`WRMSR` are not recognized.
+
+## Remaining unimplemented `0F` opcodes
+
+The map still has no entry for `0F 00` (Group 6 `LLDT`/`LTR`/`SLDT`/`STR`/
+`VERR`/`VERW`), `0F 02`/`0F 03` (`LAR`/`LSL`), `0F 05`/`0F 07`/`0F 34`/`0F 35`
+(`SYSCALL`/`SYSRET`/`SYSENTER`/`SYSEXIT`), `0F 0D`/`0F 18`–`0F 1F` (prefetch and
+the multi-byte `NOP`), `0F 21`/`0F 23` (debug registers), `0F 31` (`RDTSC`),
+`0F 33` (`RDPMC`), `0F 40`–`0F 4F` (`CMOVcc`), `0F A4`/`0F A5`/`0F AC`/`0F AD`
+(`SHLD`/`SHRD`), `0F C7` (Group 9 `CMPXCHG8B`), `0F AE` (Group 15), `0F 09`-era
+`0F 0F` 3DNow!, or any MMX/SSE/AVX opcode.
