@@ -73,7 +73,7 @@ pub enum ProtectedModeDeliveryError {
     IdtLimit,
     #[error("IDT gate read failed at {0:#x}")]
     IdtRead(u64),
-    #[error("descriptor is not a 16-bit interrupt/trap gate (access {0:#04x})")]
+    #[error("descriptor is not a 16-bit or 32-bit interrupt/trap gate (access {0:#04x})")]
     GateType(u8),
     #[error("gate is not present")]
     GateNotPresent,
@@ -89,8 +89,10 @@ pub enum ProtectedModeDeliveryError {
     TargetNotPresent,
     #[error("target descriptor is not a same-CPL executable code segment")]
     TargetCode,
-    #[error("target descriptor is not a 16-bit target code segment")]
+    #[error("16-bit gate target descriptor is not a 16-bit code segment")]
     TargetNot16Bit,
+    #[error("target descriptor is a 64-bit (L=1) code segment")]
+    TargetLongMode,
     #[error("target offset exceeds the code-segment limit")]
     TargetOffsetLimit,
     #[error("current code segment is not a supported 16-bit privilege context")]
@@ -2808,15 +2810,22 @@ impl ProtectedGateSource {
     }
 }
 
-/// Deliver one interrupt or architectural fault through a same-CPL 16-bit
-/// protected-mode interrupt or trap gate.
+/// Deliver one interrupt or architectural fault through a same-CPL 286 (16-bit)
+/// or 386 (32-bit) protected-mode interrupt or trap gate.
+///
+/// Gate types `0x6`/`0x7` build a 16-bit `FLAGS`/`CS`/`IP` frame and require a
+/// `D=0` current and target code segment. Gate types `0xE`/`0xF` build a
+/// 32-bit `EFLAGS`/`CS`/`EIP` frame (with a doubleword error code where
+/// applicable), take the entry `EIP` from the gate offset high and low words,
+/// and accept a `D=0` or `D=1` target. The frame element width comes from the
+/// gate type while the stack-pointer width comes from the cached `SS.B` bit.
 ///
 /// This bounded path validates the complete IDT gate and GDT target
 /// before touching the stack. It then snapshots every frame byte and rolls all
-/// writes back if a stack write fails, committing CS:IP, SP, and flags only
-/// after the complete frame is resident. Delivery-time failures are returned as
-/// [`ExecError::ProtectedModeExceptionDelivery`]; nested #DF/triple-fault
-/// machinery is deliberately outside this slice.
+/// writes back if a stack write fails, committing CS:EIP, SP/ESP, and flags
+/// only after the complete frame is resident. Delivery-time failures are
+/// returned as [`ExecError::ProtectedModeExceptionDelivery`]; nested
+/// #DF/triple-fault machinery is deliberately outside this slice.
 ///
 /// Gate DPL is checked only for software INT/INT3/INTO. A violation raises
 /// #GP with IDT=1 and EXT=0; faults, NMI, and external IRQs bypass gate DPL.
@@ -2847,9 +2856,14 @@ fn deliver_protected_mode_gate(
     }
 
     let gate_access = gate[5];
-    let interrupt_gate = match gate_access & 0x1F {
-        0x06 => true,
-        0x07 => false,
+    // Type field: 0x6/0x7 are 286 gates, 0xE/0xF are 386 gates. The low bit of
+    // the pair selects trap (odd) vs interrupt (even).
+    // Spec: Intel SDM Vol. 3 §6.11 (Table 3-2 system-descriptor types).
+    let (gate32, interrupt_gate) = match gate_access & 0x1F {
+        0x06 => (false, true),
+        0x07 => (false, false),
+        0x0E => (true, true),
+        0x0F => (true, false),
         _ => {
             return Err(protected_mode_delivery_error(
                 vector,
@@ -2865,7 +2879,15 @@ fn deliver_protected_mode_gate(
     }
 
     let cpl = (cpu.cs.selector & 3) as u8;
-    if cpu.cs.default_big() || cpu.cs.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
+    if cpu.cs.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::CurrentPrivilege,
+        ));
+    }
+    if !gate32 && cpu.cs.default_big() {
+        // A 16-bit frame cannot carry a 32-bit return EIP; report instead of
+        // silently truncating it.
         return Err(protected_mode_delivery_error(
             vector,
             ProtectedModeDeliveryError::CurrentPrivilege,
@@ -2926,50 +2948,64 @@ fn deliver_protected_mode_gate(
     }
 
     let parsed_target = parse_segment_descriptor(descriptor);
-    if parsed_target.flags
-        & (x86_core::SegmentReg::FLAG_LONG | x86_core::SegmentReg::FLAG_DEFAULT_BIG)
-        != 0
-    {
+    if parsed_target.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TargetLongMode,
+        ));
+    }
+    if !gate32 && parsed_target.flags & x86_core::SegmentReg::FLAG_DEFAULT_BIG != 0 {
         return Err(protected_mode_delivery_error(
             vector,
             ProtectedModeDeliveryError::TargetNot16Bit,
         ));
     }
-    let target_offset = u16::from_le_bytes([gate[0], gate[1]]);
-    if u32::from(target_offset) > parsed_target.limit {
+    // 386 gates hold the entry offset in bytes 1:0 and 7:6; 286 gates keep
+    // bytes 7:6 reserved. Spec: Intel SDM Vol. 3 §6.11 (Figure 6-2).
+    let target_offset = if gate32 {
+        u32::from(u16::from_le_bytes([gate[0], gate[1]]))
+            | (u32::from(u16::from_le_bytes([gate[6], gate[7]])) << 16)
+    } else {
+        u32::from(u16::from_le_bytes([gate[0], gate[1]]))
+    };
+    if target_offset > parsed_target.limit {
         return Err(protected_mode_delivery_error(
             vector,
             ProtectedModeDeliveryError::TargetOffsetLimit,
-        ));
-    }
-    if cpu.ss.stack_width() != 16 {
-        return Err(protected_mode_delivery_error(
-            vector,
-            ProtectedModeDeliveryError::StackWidth,
         ));
     }
 
     // Intel push order is FLAGS, CS, IP, then the exception error code. The
     // final lowest address therefore contains error code (when present), IP,
     // CS, FLAGS. All addresses and original bytes are collected before writes.
+    // The element width comes from the gate type; the stack-pointer width from
+    // the cached `SS.B` bit (SDM Vol. 1 §6.2.2).
     let error_code = source.error_code();
-    let mut frame_words = Vec::with_capacity(if error_code.is_some() { 4 } else { 3 });
-    // The `CS.D=1` rejection above guarantees the return EIP fits in 16 bits.
-    frame_words.extend([cpu.rflags as u16, cpu.cs.selector, return_ip as u16]);
+    let entry_size: usize = if gate32 { 4 } else { 2 };
+    let mut frame_entries = Vec::with_capacity(if error_code.is_some() { 4 } else { 3 });
+    let saved_flags = if gate32 {
+        cpu.rflags as u32
+    } else {
+        u32::from(cpu.rflags as u16)
+    };
+    // The `CS.D=1` rejection above guarantees a 16-bit gate's return EIP fits.
+    frame_entries.extend([saved_flags, u32::from(cpu.cs.selector), return_ip]);
     if let Some(code) = error_code {
-        frame_words.push(code);
+        frame_entries.push(u32::from(code));
     }
 
-    let mut final_sp = cpu.gpr_u16(CpuState::RSP);
-    let mut desired_bytes = Vec::with_capacity(frame_words.len() * 2);
-    for word in frame_words {
-        final_sp = final_sp.wrapping_sub(2);
-        let addr = checked_linear_addr(&cpu.ss, u64::from(final_sp), 2).map_err(|_| {
-            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackLimit)
-        })?;
-        let bytes = word.to_le_bytes();
-        desired_bytes.push((addr, bytes[0]));
-        desired_bytes.push((addr.wrapping_add(1), bytes[1]));
+    let mut final_sp = stack_pointer(cpu);
+    let mut desired_bytes = Vec::with_capacity(frame_entries.len() * entry_size);
+    for entry in frame_entries {
+        final_sp = stack_step(cpu, final_sp, -(entry_size as i32));
+        let addr =
+            checked_linear_addr(&cpu.ss, u64::from(final_sp), entry_size as u64).map_err(|_| {
+                protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackLimit)
+            })?;
+        let bytes = entry.to_le_bytes();
+        for (index, byte) in bytes.iter().take(entry_size).enumerate() {
+            desired_bytes.push((addr.wrapping_add(index as u64), *byte));
+        }
     }
 
     let mut planned_writes = Vec::with_capacity(desired_bytes.len());
@@ -2999,7 +3035,7 @@ fn deliver_protected_mode_gate(
         }
     }
 
-    cpu.set_gpr_u16(CpuState::RSP, final_sp);
+    set_stack_pointer(cpu, final_sp);
     cpu.cs.load_descriptor_cache(
         (target_selector & !3) | u16::from(cpl),
         parsed_target.base,
@@ -6510,7 +6546,8 @@ mod tests {
     /// Spec: Intel SDM Vol. 3 §§6.11.2, 6.12.1.
     #[test]
     fn protected_interrupt_delivery_failures_remain_atomic() {
-        let (mut software_cpu, mut software_bus) = protected_interrupt_fixture(0x30, 0x8E, 0);
+        // 0x5 is a task gate — task-based delivery is out of scope.
+        let (mut software_cpu, mut software_bus) = protected_interrupt_fixture(0x30, 0x85, 0);
         software_bus.mem[PROTECTED_TEST_CODE..PROTECTED_TEST_CODE + 2]
             .copy_from_slice(&[0xCD, 0x30]);
         let software_before = software_cpu.clone();
@@ -6520,7 +6557,7 @@ mod tests {
             error,
             ExecError::ProtectedModeExceptionDelivery {
                 vector: 0x30,
-                reason: ProtectedModeDeliveryError::GateType(0x8E)
+                reason: ProtectedModeDeliveryError::GateType(0x85)
             }
         ));
         assert_eq!(software_cpu, software_before);
@@ -6589,7 +6626,8 @@ mod tests {
     fn protected_fault_gate_validation_is_atomic() {
         let cases = [
             ("IDT limit", 0x86, Some(6 * 8 + 6), "IDT limit"),
-            ("32-bit gate type", 0x8E, None, "16-bit interrupt/trap gate"),
+            // 0x5 is a task gate; task-based delivery is out of scope.
+            ("task gate type", 0x85, None, "interrupt/trap gate"),
             ("not-present gate", 0x06, None, "gate is not present"),
         ];
 
@@ -6668,7 +6706,7 @@ mod tests {
                 encode_seg_desc(0x2000, 0xFFFF, 0x9A, 0x40),
                 15,
                 PROTECTED_TEST_HANDLER,
-                "16-bit target code segment",
+                "16-bit gate target descriptor is not a 16-bit code segment",
             ),
             (
                 "offset past limit",
@@ -17130,5 +17168,347 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
         assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x2222);
+    }
+
+    const PM32_IDT: usize = 0x5000;
+    const PM32_HANDLER: u32 = 0x0002_2000;
+    /// 386 32-bit interrupt gate, present, DPL 0 (SDM Vol. 3 Figure 6-2).
+    const PM32_INTERRUPT_GATE32: u8 = 0x8E;
+    /// 386 32-bit trap gate, present, DPL 0.
+    const PM32_TRAP_GATE32: u8 = 0x8F;
+
+    /// 386 IDT gate descriptor: offset 15:0, selector, 0, access, offset 31:16.
+    /// Spec: Intel SDM Vol. 3 §6.11 (Figure 6-2).
+    fn encode_idt_gate32(offset: u32, selector: u16, access: u8) -> [u8; 8] {
+        let low = (offset as u16).to_le_bytes();
+        let high = ((offset >> 16) as u16).to_le_bytes();
+        let selector = selector.to_le_bytes();
+        [
+            low[0],
+            low[1],
+            selector[0],
+            selector[1],
+            0,
+            access,
+            high[0],
+            high[1],
+        ]
+    }
+
+    /// `CS.D=1` fixture with a 386 IDT gate for `vector` and a same-CPL
+    /// handler code segment. `big_stack` selects `SS.B=1` or `SS.B=0`.
+    ///
+    /// Spec: Intel SDM Vol. 3 §§6.11, 6.12.1.
+    fn pm32_gate_fixture(
+        code: &[u8],
+        vector: u8,
+        gate_access: u8,
+        cpl: u8,
+        big_stack: bool,
+    ) -> (CpuState, VecBus) {
+        let (mut cpu, mut bus) = pm32_fixture(code, PM32_CODE, true);
+        let code_access = 0x9A | (cpl << 5);
+        let data_access = 0x92 | (cpl << 5);
+        bus.mem[PM32_GDT + 8..PM32_GDT + 16].copy_from_slice(&encode_seg_desc(
+            0,
+            0xF_FFFF,
+            code_access,
+            0xC0,
+        ));
+        bus.mem[PM32_GDT + 24..PM32_GDT + 32].copy_from_slice(&encode_seg_desc(
+            0,
+            0xFFFF,
+            data_access,
+            0,
+        ));
+        bus.mem[PM32_GDT + 32..PM32_GDT + 40].copy_from_slice(&encode_seg_desc(
+            0,
+            0xF_FFFF,
+            data_access,
+            0xC0,
+        ));
+        cpu.gdtr.limit = 39;
+
+        let entry = PM32_IDT + usize::from(vector) * 8;
+        bus.mem[entry..entry + 8].copy_from_slice(&encode_idt_gate32(
+            PM32_HANDLER,
+            PM32_CS32 | u16::from(cpl),
+            gate_access,
+        ));
+        cpu.idtr.base = PM32_IDT as u64;
+        cpu.idtr.limit = 0x07FF;
+
+        cpu.cs = x86_core::SegmentReg {
+            selector: PM32_CS32 | u16::from(cpl),
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            flags: 0xC000 | u16::from(code_access),
+        };
+        let stack = if big_stack {
+            x86_core::SegmentReg {
+                selector: PM32_SS32 | u16::from(cpl),
+                base: 0,
+                limit: 0xFFFF_FFFF,
+                flags: 0xC000 | u16::from(data_access),
+            }
+        } else {
+            x86_core::SegmentReg {
+                selector: PM32_DS | u16::from(cpl),
+                base: 0,
+                limit: 0xFFFF,
+                flags: u16::from(data_access),
+            }
+        };
+        cpu.ss = stack;
+        if big_stack {
+            cpu.set_gpr_u32(CpuState::RSP, PM32_TEST_ESP);
+        } else {
+            cpu.set_gpr_u32(CpuState::RSP, 0x0000_FFF0);
+        }
+        (cpu, bus)
+    }
+
+    /// Intel SDM Vol. 3 §6.12.1 (Figure 6-4) and Vol. 2 "INT n": a same-CPL
+    /// 386 interrupt gate builds a 32-bit EFLAGS/CS/EIP frame, takes EIP from
+    /// the gate offset high and low words, and clears IF.
+    #[test]
+    fn protected_interrupt_gate32_delivers_32_bit_frame_and_clears_if() {
+        // CC = INT3.
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, true);
+        cpu.rflags = 0x0000_0000_0001_0A57 | (1 << 9);
+        let saved_flags = cpu.rflags as u32;
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert_eq!(cpu.cs.selector, PM32_CS32);
+        assert!(cpu.cs.default_big());
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 12);
+        let sp = u64::from(PM32_TEST_ESP - 12);
+        assert_eq!(bus.read_u32(sp).unwrap(), (PM32_CODE + 1) as u32);
+        assert_eq!(bus.read_u32(sp + 4).unwrap(), u32::from(PM32_CS32));
+        assert_eq!(bus.read_u32(sp + 8).unwrap(), saved_flags);
+        assert!(!cpu.interrupt_flag(), "interrupt gate must clear IF");
+    }
+
+    /// Intel SDM Vol. 3 §6.12.1: a trap gate leaves IF unchanged. Both gate
+    /// types clear TF, NT, RF, and VM.
+    #[test]
+    fn protected_trap_gate32_preserves_if() {
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_TRAP_GATE32, 0, true);
+        cpu.rflags = 0x0000_0000_0001_4102 | (1 << 9) | (1 << 8);
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert!(cpu.interrupt_flag(), "trap gate must preserve IF");
+        assert_eq!(cpu.rflags & (1 << 8), 0, "TF must be cleared");
+        assert_eq!(cpu.rflags & (1 << 14), 0, "NT must be cleared");
+        assert_eq!(cpu.rflags & (1 << 16), 0, "RF must be cleared");
+    }
+
+    /// Intel SDM Vol. 3 §§6.12.1, 6.13: an exception with an error code pushes
+    /// it as a doubleword below the 32-bit EFLAGS/CS/EIP frame, and the saved
+    /// EIP is the faulting instruction.
+    #[test]
+    fn protected_gate32_pushes_doubleword_error_code() {
+        // 8E D8 = MOV DS, AX with a selector past the GDT limit → #GP(sel).
+        let (mut cpu, mut bus) =
+            pm32_gate_fixture(&[0x8E, 0xD8], 13, PM32_INTERRUPT_GATE32, 0, true);
+        cpu.set_gpr_u16(CpuState::RAX, 0x0084);
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 16);
+        let sp = u64::from(PM32_TEST_ESP - 16);
+        assert_eq!(bus.read_u32(sp).unwrap(), 0x0084);
+        assert_eq!(bus.read_u32(sp + 4).unwrap(), PM32_CODE as u32);
+        assert_eq!(bus.read_u32(sp + 8).unwrap(), u32::from(PM32_CS32));
+    }
+
+    /// Intel SDM Vol. 1 §6.2.2: the gate type selects the frame width, the
+    /// cached `SS.B` bit selects the stack-pointer width. A 386 gate on a
+    /// `B=0` stack pushes doublewords through SP.
+    #[test]
+    fn protected_gate32_frame_width_is_independent_of_stack_width() {
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, false);
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFE4);
+        assert_eq!(bus.read_u32(0xFFE4).unwrap(), (PM32_CODE + 1) as u32);
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+    }
+
+    /// Intel SDM Vol. 3 §6.12.1: a 386 gate taken from a `D=0` code segment
+    /// still builds a 32-bit frame, so 16-bit and 32-bit gates coexist.
+    #[test]
+    fn protected_gate32_from_16_bit_code_still_builds_a_32_bit_frame() {
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, true);
+        cpu.cs = x86_core::SegmentReg {
+            selector: PM32_CS16,
+            base: 0,
+            limit: 0xFFFF,
+            flags: 0x009A,
+        };
+        cpu.rflags = 0x0000_0000_0000_0202;
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert!(cpu.cs.default_big(), "handler runs in the D=1 segment");
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 12);
+        let sp = u64::from(PM32_TEST_ESP - 12);
+        assert_eq!(bus.read_u32(sp).unwrap(), (PM32_CODE + 1) as u32);
+        assert_eq!(bus.read_u32(sp + 4).unwrap(), u32::from(PM32_CS16));
+        assert_eq!(bus.read_u32(sp + 8).unwrap(), 0x0202);
+    }
+
+    /// Intel SDM Vol. 3 §§6.11, 6.12.1: 32-bit gates coexist with the 16-bit
+    /// gate types, and other descriptor types (task gate, data, LDT) are
+    /// rejected deterministically instead of synthesizing a nested fault.
+    #[test]
+    fn protected_gate32_rejects_unsupported_gate_types() {
+        for access in [0x85u8, 0x89, 0x82, 0x8C, 0x00] {
+            let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, access, 0, true);
+            let before = cpu.clone();
+            let error = step(&mut cpu, &mut bus).expect_err("unsupported gate type");
+            assert!(
+                matches!(
+                    error,
+                    ExecError::ProtectedModeExceptionDelivery {
+                        vector: 3,
+                        reason: ProtectedModeDeliveryError::GateType(_)
+                            | ProtectedModeDeliveryError::GateNotPresent,
+                    }
+                ),
+                "access {access:#04x}: {error:?}"
+            );
+            assert_eq!(cpu, before, "access {access:#04x}: state committed");
+        }
+    }
+
+    /// Intel SDM Vol. 3 §6.11.2 / §6.12.1.2: gate DPL is checked for software
+    /// `INT n` / `INT3` / `INTO` and raises `#GP(vector*8 + IDT)` without
+    /// touching the stack; hardware sources (NMI, external IRQ) bypass it.
+    #[test]
+    fn protected_gate32_dpl_applies_to_software_interrupts_only() {
+        // CPL 3 with a DPL 0 gate: the software form is rejected.
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 3, true);
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some((3 << 3) | 2));
+        assert_eq!(cpu, before, "rejected software INT touched state");
+
+        // Raising the gate DPL to 3 lets the same instruction through.
+        let (mut cpu, mut bus) =
+            pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32 | 0x60, 3, true);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert_eq!(cpu.cs.selector, PM32_CS32 | 3);
+
+        // NMI ignores the DPL 0 gate at CPL 3.
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0x90], 2, PM32_INTERRUPT_GATE32, 3, true);
+        cpu.request_nmi();
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert_eq!(
+            bus.read_u32(u64::from(PM32_TEST_ESP - 12)).unwrap(),
+            PM32_CODE as u32
+        );
+
+        // External IRQ likewise ignores the DPL 0 gate at CPL 3.
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0x90], 0x21, PM32_INTERRUPT_GATE32, 3, true);
+        cpu.set_interrupt_flag(true);
+        cpu.request_interrupt(0x21);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert!(!cpu.interrupt_flag());
+    }
+
+    /// Intel SDM Vol. 3 §6.12.1: a 386 gate may target a `D=1` or a `D=0`
+    /// code segment; `L=1` remains unsupported. A 16-bit gate still requires a
+    /// `D=0` target and a `D=0` current code segment.
+    #[test]
+    fn protected_gate32_target_code_segment_d_bit_rules() {
+        // A 32-bit gate into a D=0 handler switches the execution window back.
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, true);
+        bus.mem[PM32_GDT + 8..PM32_GDT + 16].copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9A, 0));
+        let entry = PM32_IDT + 3 * 8;
+        bus.mem[entry..entry + 8].copy_from_slice(&encode_idt_gate32(
+            0x0000_0800,
+            PM32_CS32,
+            PM32_INTERRUPT_GATE32,
+        ));
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(!cpu.cs.default_big());
+        assert_eq!(cpu.ip16(), 0x0800);
+
+        // L=1 targets are rejected.
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, true);
+        bus.mem[PM32_GDT + 8..PM32_GDT + 16]
+            .copy_from_slice(&encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xA0));
+        let before = cpu.clone();
+        assert_eq!(
+            step(&mut cpu, &mut bus),
+            Err(ExecError::ProtectedModeExceptionDelivery {
+                vector: 3,
+                reason: ProtectedModeDeliveryError::TargetLongMode,
+            })
+        );
+        assert_eq!(cpu, before);
+    }
+
+    /// Intel SDM Vol. 3 §6.12.1: a 386 gate whose 32-bit offset is beyond the
+    /// target code-segment limit is rejected before any stack write.
+    #[test]
+    fn protected_gate32_offset_beyond_target_limit_is_rejected() {
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, true);
+        bus.mem[PM32_GDT + 8..PM32_GDT + 16].copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9A, 0));
+        let before = cpu.clone();
+
+        assert_eq!(
+            step(&mut cpu, &mut bus),
+            Err(ExecError::ProtectedModeExceptionDelivery {
+                vector: 3,
+                reason: ProtectedModeDeliveryError::TargetOffsetLimit,
+            })
+        );
+        assert_eq!(cpu, before);
+    }
+
+    /// The 32-bit frame is committed atomically: a stack write failure rolls
+    /// back every byte and leaves CS:EIP, ESP, and EFLAGS untouched.
+    /// Spec: Intel SDM Vol. 3 §6.12.1 (nested #DF/triple fault not modeled).
+    #[test]
+    fn protected_gate32_stack_write_failure_rolls_back() {
+        let (cpu_template, bus_template) =
+            pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, true);
+        // The last frame byte written is the high byte of the saved EIP.
+        let fail_addr = u64::from(PM32_TEST_ESP - 12 + 3);
+        let mut cpu = cpu_template.clone();
+        let mut bus = FailOnceWriteBus {
+            mem: bus_template.mem.clone(),
+            fail_addr,
+            failed: false,
+        };
+        let before = cpu.clone();
+
+        let error = step(&mut cpu, &mut bus).expect_err("stack write must fail");
+        assert!(
+            matches!(
+                error,
+                ExecError::ProtectedModeExceptionDelivery {
+                    vector: 3,
+                    reason: ProtectedModeDeliveryError::StackWrite(_),
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(cpu, before);
+        assert_eq!(
+            bus.mem, bus_template.mem,
+            "frame bytes were not rolled back"
+        );
     }
 }

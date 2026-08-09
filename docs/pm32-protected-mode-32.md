@@ -94,3 +94,34 @@ in terms of `StackSize`; the split above preserves the previously tested
 `ProtectedModeDeliveryError::StackWidth` otherwise); `IRETD`; `IRET16` on a
 `B=1` stack; privilege-level stack switching, TSS `SS0:ESP0`, or expand-down
 stack segments.
+
+## Slice 3 — 32-bit IDT gates
+
+**Supported.** `deliver_protected_mode_gate` now accepts 386 gate types
+`0xE` (interrupt gate) and `0xF` (trap gate) alongside the existing 286 types
+`0x6` and `0x7`. For a 386 gate the entry `EIP` is assembled from the gate
+offset low word (bytes 1:0) and high word (bytes 7:6), and the frame is built
+from doublewords: `EFLAGS`, `CS` zero-extended to 32 bits, the return `EIP`,
+and — for exceptions that define one — a doubleword error code. Interrupt
+gates clear `IF`; trap gates preserve it. Both clear `TF`, `NT`, `RF`, and
+`VM`.
+
+The frame element width comes from the gate type; the stack-pointer width
+comes from the cached `SS.B` bit, so a 386 gate works on both a `B=1` and a
+`B=0` stack. A 386 gate may be taken from `CS.D=0` or `CS.D=1` code, and may
+target a `D=0` or `D=1` ring-0 nonconforming code segment. A 286 gate still
+requires both the current and the target code segment to be `D=0` and reports
+`CurrentPrivilege` / `TargetNot16Bit` otherwise, rather than truncating a
+32-bit return `EIP` into a 16-bit frame. `L=1` targets report the new
+`TargetLongMode` reason.
+
+Gate DPL is still checked only for software `INT n` / `INT3` / taken `INTO`
+(violation ? `#GP((vector << 3) | IDT)` with the stack untouched) and ignored
+for NMI and external IRQ. Delivery remains atomic: the gate, the target
+descriptor, the offset-vs-limit check, and every stack address are validated
+before any write, and a failing stack write rolls all bytes back.
+
+**Not supported by this slice.** `IRETD` (slice 4); privilege-level changes,
+so no stack switch, no TSS `SS0:ESP0`, and no outer-level frame with `SS:ESP`;
+task gates; interrupt/trap gates in the LDT; virtual-8086 delivery; nested
+`#DF` or triple-fault synthesis; the `IST` mechanism.
