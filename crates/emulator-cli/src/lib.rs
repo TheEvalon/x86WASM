@@ -2,8 +2,8 @@
 
 use devices::{VgaRenderMode, VGA_TEXT_COLS, VGA_TEXT_ROWS};
 use machine_pc::{
-    build_hello_rom, Machine, MachineError, PostReport, PostTraceConfig, TracedPostReport,
-    DEFAULT_POST_TRACE_CAPACITY, EXPECTED_HELLO,
+    build_hello_rom, Machine, MachineError, PostReport, PostSpinConfig, PostTraceConfig,
+    TracedPostReport, DEFAULT_POST_SPIN_WINDOW, DEFAULT_POST_TRACE_CAPACITY, EXPECTED_HELLO,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,6 +39,11 @@ pub struct Options {
     /// `None` leaves the probe untraced, which is what keeps the `--post-probe`
     /// output byte-identical to a build without this flag.
     pub post_trace: Option<PostTraceConfig>,
+    /// Trailing program-counter window for the POST spin summary.
+    ///
+    /// Defaults to [`PostSpinConfig::default`]. `None` disables sampling
+    /// (`--post-spin 0`). Implies [`Options::post_probe`] when set via the flag.
+    pub post_spin: Option<PostSpinConfig>,
     /// Dump the 80×25 VGA text buffer after the run / probe.
     pub vga_text: bool,
     /// Render the current display through the VGA display fetch and report it.
@@ -57,6 +62,7 @@ impl Default for Options {
             max_steps: DEFAULT_MAX_STEPS,
             post_probe: false,
             post_trace: None,
+            post_spin: Some(PostSpinConfig::default()),
             vga_text: false,
             vga_frame: false,
             option_rom_path: None,
@@ -287,7 +293,8 @@ impl std::error::Error for CliError {
 pub fn usage() -> String {
     format!(
         "Usage: emulator-cli [--rom path.bin | --bios path.bin] [--steps N] [--post-probe]\n\
-         \x20                  [--post-trace [N]] [--option-rom path.bin [--option-rom-base ADDR]]\n\
+         \x20                  [--post-trace [N]] [--post-spin [N]]\n\
+         \x20                  [--option-rom path.bin [--option-rom-base ADDR]]\n\
          \x20                  [--vga-text] [--vga-frame]\n\
          --rom              Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
          --bios             Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
@@ -298,13 +305,17 @@ pub fn usage() -> String {
          \x20                  programming, VGA aperture, memory faults). Optional N is the\n\
          \x20                  event capacity (default {DEFAULT_POST_TRACE_CAPACITY}). The\n\
          \x20                  --post-probe lines above it are unchanged.\n\
+         --post-spin        Implies --post-probe. Size of the trailing program-counter\n\
+         \x20                  window used for the spin summary (default {DEFAULT_POST_SPIN_WINDOW};\n\
+         \x20                  0 disables it). The --post-probe header line is unchanged.\n\
          --option-rom       Map an option ROM image (e.g. a VGA BIOS) and report its\n\
          \x20                  55AA/size/checksum header. Mapping only: nothing scans or\n\
          \x20                  executes option ROMs yet.\n\
          --option-rom-base  Physical base for --option-rom (default 0x{DEFAULT_OPTION_ROM_BASE:05X}).\n\
          --vga-text         Dump the {VGA_TEXT_COLS}x{VGA_TEXT_ROWS} VGA text buffer after the run.\n\
          --vga-frame        Render the display through the VGA display fetch and report the\n\
-         \x20                  frame geometry and RGBA size. Only text mode 03h and mode 13h\n\
+         \x20                  frame geometry, RGBA size, and whether a font is installed.\n\
+         \x20                  Text mode 03h, mode 13h, and planar 16-color (0Dh/0Eh/10h/12h)\n\
          \x20                  have a renderer; any other programming is reported as having\n\
          \x20                  none rather than rendered.\n\
          Diagnostics are appended after the normal / --post-probe output, which is unchanged.\n\
@@ -359,6 +370,23 @@ where
                 };
                 opts.post_probe = true;
                 opts.post_trace = Some(PostTraceConfig::with_capacity(capacity));
+            }
+            // Optional window: `--post-spin` alone keeps the default; `--post-spin 0`
+            // disables sampling; any other N sizes the window.
+            "--post-spin" => {
+                let window = match iter.peek().and_then(|v| v.as_ref().parse::<usize>().ok()) {
+                    Some(window) => {
+                        iter.next();
+                        window
+                    }
+                    None => DEFAULT_POST_SPIN_WINDOW,
+                };
+                opts.post_probe = true;
+                opts.post_spin = if window == 0 {
+                    None
+                } else {
+                    Some(PostSpinConfig::with_window(window))
+                };
             }
             "--vga-text" => opts.vga_text = true,
             "--vga-frame" => opts.vga_frame = true,
@@ -548,18 +576,28 @@ pub fn run_post_probe(machine: &mut Machine, max_steps: u64) -> PostReport {
     machine.probe_post(max_steps)
 }
 
-/// [`run_post_probe`] with an optional bounded event trace.
+/// [`run_post_probe`] with optional bounded event trace and spin summary.
 ///
-/// With `trace` `None` the printed output is byte-identical to
-/// [`run_post_probe`]: [`TracedPostReport`] renders the report alone when no
-/// trace is armed.
+/// With `trace` `None` and default spin the printed report header stays
+/// byte-identical to [`run_post_probe`]; the spin block is additional output
+/// for halt / step-budget stops only.
 pub fn run_post_probe_traced(
     machine: &mut Machine,
     max_steps: u64,
     trace: Option<PostTraceConfig>,
 ) -> TracedPostReport {
+    run_post_probe_options(machine, max_steps, trace, Some(PostSpinConfig::default()))
+}
+
+/// Full POST-probe wiring used by the CLI (`--post-trace` / `--post-spin`).
+pub fn run_post_probe_options(
+    machine: &mut Machine,
+    max_steps: u64,
+    trace: Option<PostTraceConfig>,
+    spin: Option<PostSpinConfig>,
+) -> TracedPostReport {
     machine.reset();
-    machine.probe_post_traced(max_steps, trace)
+    machine.probe_post_options(max_steps, trace, spin)
 }
 
 /// Render the current display and describe the result.
@@ -582,9 +620,14 @@ pub fn vga_frame_report(machine: &Machine, blink_off_half: bool) -> String {
     };
     let rgba = vga.frame_rgba8(&frame);
     let nonzero = frame.pixels.iter().filter(|index| **index != 0).count();
+    let font = match frame.font_installed {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "n/a",
+    };
     format!(
         "vga-frame: mode={} rendered=yes width={} height={} pixels={} nonzero_indices={} \
-         rgba_bytes={} blink_off_half={}",
+         rgba_bytes={} blink_off_half={} font_installed={}",
         render_mode_name(frame.mode),
         frame.width,
         frame.height,
@@ -592,6 +635,7 @@ pub fn vga_frame_report(machine: &Machine, blink_off_half: bool) -> String {
         nonzero,
         rgba.len(),
         u8::from(blink_off_half),
+        font,
     )
 }
 
@@ -790,6 +834,7 @@ mod tests {
         assert!(line.contains("width=720 height=400"), "{line}");
         assert!(line.contains("pixels=288000"), "{line}");
         assert!(line.contains("rgba_bytes=1152000"), "{line}");
+        assert!(line.contains("font_installed=no"), "{line}");
     }
 
     /// Reset installs no font, so the only non-background pixels in the text

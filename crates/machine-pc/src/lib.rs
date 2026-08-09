@@ -49,10 +49,10 @@ use devices::{
     CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
     FwCfgDmaOutcome, IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550,
     VgaText, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA,
-    EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, I8042, I8042_DATA,
-    I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
-    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT,
+    I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
+    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -60,7 +60,8 @@ use firmware_interface::{
 use ports::PortBus;
 use thiserror::Error;
 use x86_core::CpuState;
-use x86_interpreter::{step, Bus, ExecError};
+use x86_interpreter::{step_with_mmu, Bus, ExecError};
+use x86_mmu::paging::Mmu;
 
 #[derive(Debug, Error)]
 pub enum MachineError {
@@ -122,6 +123,13 @@ pub struct Machine {
     pub post_diag: PostCodePort,
     /// Instruction-count time source for the PIT / RTC (disabled by default).
     step_clock: StepClock,
+    /// Persistent paging TLB across instructions (SDM Vol. 3 §4.10).
+    ///
+    /// Spec: Intel SDM Vol. 3 §4.10.2.2 permits a processor to keep translations
+    /// after the structures change until an invalidation; without a durable
+    /// [`Mmu`] a guest that forgets `INVLPG` works by accident. Round-4
+    /// `step_with_mmu` is the entry point that models that correctly.
+    pub mmu: Mmu,
     ports: PortBus,
     /// 512-byte sectors of the image attached through [`Machine::attach_ide_image`].
     ///
@@ -154,6 +162,7 @@ impl Machine {
             fw_cfg: FwCfg::with_ram_size(ram_size as u64),
             post_diag: PostCodePort::new(),
             step_clock: StepClock::disabled(),
+            mmu: Mmu::new(),
             ports: PortBus::new(),
             ide_disk_sectors: None,
         };
@@ -310,6 +319,11 @@ impl Machine {
         // Spec: RBIL CMOS `2Fh`.
         self.cmos.store_standard_checksum();
         self.fw_cfg.set_ram_size(ram);
+        // Interface reference (ADR-0005): NB_CPUS / max-cpus / etc/max-cpus.
+        // This machine has one execution context and no SMP, so the truthful
+        // count is 1. Host-settable items (UUID, nographic, bootorder,
+        // etc/system-states) stay absent until the host has a truthful value.
+        self.fw_cfg.set_cpu_count(FW_CFG_DEFAULT_CPU_COUNT);
         let entries = self.e820_entries();
         self.fw_cfg.set_e820_entries(&entries);
     }
@@ -520,6 +534,8 @@ impl Machine {
         // Configuration survives reset (like the fw_cfg host configuration);
         // only partial timer quanta are dropped.
         self.step_clock.reset_accumulators();
+        // Spec: Intel SDM Vol. 3 §4.10.4.1 — processor reset invalidates the TLB.
+        self.mmu = Mmu::new();
         // Spec: Intel 440FX PMC — PAM0-PAM6 reset to 0x00 (read from ROM, no
         // DRAM writes). Shadow contents survive, like DRAM across PCIRST#.
         self.mem.reset_pam();
@@ -603,7 +619,7 @@ impl Machine {
                 post_diag: &mut self.post_diag,
                 ports: &mut self.ports,
             };
-            step(&mut self.cpu, &mut view)?;
+            step_with_mmu(&mut self.cpu, &mut view, &mut self.mmu)?;
         }
         // The instruction retired, so it is charged to the time source before a
         // latched system reset can restore the devices it just advanced.

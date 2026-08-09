@@ -1,22 +1,17 @@
 //! Reproducer for the CPU-side defect behind the `0xF0000000` write sweep.
 //!
-//! **These tests are `#[ignore]`d because they fail today, and the fix is in
-//! `crates/x86-interpreter`, which this round's memory-semantics slice does not
-//! own.** Un-ignore them with the fix; see `docs/machine-r4-fseg-sweep.md` for
-//! the measurement that led here.
-//!
-//! The defect: `x86_interpreter::moffs_offset` picks the width of the `MOV`
-//! absolute-offset forms (`A0`–`A3`) from the *presence of the `0x67` prefix*
-//! rather than from the resolved effective address-size attribute. In a
-//! `CS.D = 1` code segment the default address size is 32, so an unprefixed
-//! `A1` carries a 32-bit `moffs32` — but the interpreter truncates the offset
-//! it already decoded to 16 bits and reads the wrong address. The decoder is
-//! correct: it consumes four immediate bytes, so only the address is wrong.
+//! The defect (fixed in round-4 `x86-interpreter`): `moffs_offset` used to pick
+//! the width of the `MOV` absolute-offset forms (`A0`–`A3`) from the *presence
+//! of the `0x67` prefix* rather than from the resolved effective address-size
+//! attribute. In a `CS.D = 1` code segment the default address size is 32, so
+//! an unprefixed `A1` carries a 32-bit `moffs32` — but the interpreter truncated
+//! the offset it already decoded to 16 bits and read the wrong address. The
+//! decoder was already correct: it consumed four immediate bytes.
 //!
 //! Spec: Intel SDM Vol. 1 §3.6 Table 3-4 (effective address size = the
 //! code-segment default `D`, inverted by `67H`); Vol. 2 "MOV" (the `moffs8` /
 //! `moffs16` / `moffs32` operand is sized by the address-size attribute);
-//! Vol. 3 §3.4.5 (the `D` flag).
+//! Vol. 3 §3.4.5 (the `D` flag). See `docs/machine-r4-fseg-sweep.md`.
 
 use machine_pc::Machine;
 
@@ -93,7 +88,6 @@ fn run_protected_tail(tail32: &[u8]) -> Machine {
 /// is what makes its memory-zone list look empty. See
 /// `docs/machine-r4-fseg-sweep.md`.
 #[test]
-#[ignore = "fails until x86-interpreter's moffs_offset uses the resolved address size"]
 fn moffs32_is_the_default_in_a_32_bit_code_segment() {
     #[rustfmt::skip]
     let tail32: &[u8] = &[
@@ -112,10 +106,7 @@ fn moffs32_is_the_default_in_a_32_bit_code_segment() {
 }
 
 /// The mirror case, so a fix cannot simply invert the condition: `67H` in a
-/// `CS.D=1` segment selects a **16-bit** `moffs16`. This one passes today
-/// (the decoder already sizes the immediate correctly, and both the right and
-/// the wrong rule produce the same offset here), and it is not ignored so that
-/// it guards the fix rather than waiting on it.
+/// `CS.D=1` segment selects a **16-bit** `moffs16`.
 ///
 /// Spec: Intel SDM Vol. 1 §3.6 Table 3-4 — `67H` toggles the default, it does
 /// not select 32 unconditionally.

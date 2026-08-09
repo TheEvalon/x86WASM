@@ -70,8 +70,8 @@ for the same reason `set_e820_entries(&[])` removes `etc/e820`.
 
 ## Wiring status
 
-`FwCfg::new()` publishes the CPU-count views, so a running machine answers them
-today. The host-settable items need a call from the machine layer to become
-visible; nothing in `crates/machine-pc` makes those calls yet, so on the
-assembled PC they are still absent. That is a wiring gap, not a device gap, and
-it is stated here so nobody reads the setter list as a claim about the machine.
+`FwCfg::new()` and `Machine::sync_firmware_configuration` both publish the
+CPU-count views (`NB_CPUS` / `max-cpus` / `etc/max-cpus` = 1), so a running
+machine answers them. The host-settable items (UUID, nographic, bootorder,
+`etc/system-states`) remain absent until the host supplies a truthful value —
+nothing in `crates/machine-pc` invents one.

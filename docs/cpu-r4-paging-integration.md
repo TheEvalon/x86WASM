@@ -196,11 +196,10 @@ Reported explicitly rather than silently approximated:
   `Mmu::sync_control_registers` every instruction, so a `CR3` written by a path
   other than `MOV to CR3` is still noticed; there is no task switch yet to test
   it against.
-* **A persistent TLB in the machine.** `step`/`run` create an `Mmu` per
-  instruction, which §4.10.2.2 permits but which means a guest that forgets an
-  `INVLPG` works by accident. `step_with_mmu`/`run_with_mmu` are the entry
-  points that model it properly; wiring `machine-pc` to them is integrator
-  work.
+* **A persistent TLB in the machine — done at integration.** `Machine` now holds
+  an `x86_mmu::paging::Mmu` and calls `step_with_mmu` so the TLB persists across
+  instructions; `Machine::reset` replaces it. Guests that forget `INVLPG` are no
+  longer accidentally correct on every instruction.
 
 ## Fixed in passing
 

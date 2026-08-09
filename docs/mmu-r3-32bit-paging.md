@@ -2,18 +2,19 @@
 
 Milestone 2, round 3. Lives in `crates/x86-mmu/src/paging/`.
 
-## Status: standalone, not wired
+## Status: wired into the interpreter (round 4)
 
-**No guest can use this.** The engine translates linear addresses to physical
-addresses on demand, but nothing calls it. The interpreter's memory path still
-treats a linear address as a physical address, `MOV CR3` / `MOV CR4` do not
-exist, `CR0.PG` is not honored, and `#PF` is never delivered. Wiring it into the
-interpreter is round-4 work; `docs/mmu-r3-integration-surface.md` states exactly
-what that requires.
+A guest can enable paging and run under it. `CR0.PG = 1` translates every data
+access, every instruction fetch and every descriptor-table read; a translation
+failure is delivered as `#PF` (vector 14) with the linear address in `CR2`. See
+`docs/cpu-r4-paging-integration.md` for the interpreter wiring, restartability,
+and the remaining gaps that still prevent a real 32-bit OS from booting
+(privilege-changing gates, TSS stack switch, `#DF`/triple-fault, PAE).
 
-Consequently this document describes tested behavior of a library, not observed
-behavior of a machine. Its only verification is its own unit and integration
-tests: there is no firmware in the tree that enables paging.
+The engine itself still lives in `crates/x86-mmu/src/paging/` with no dependency
+on the interpreter: this document describes the library. Round-4 verification is
+no longer library-only — the `cpu_r4_*` interpreter tests exercise it end to end
+for a flat same-privilege kernel.
 
 ## Authority
 

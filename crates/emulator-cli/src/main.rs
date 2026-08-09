@@ -1,7 +1,7 @@
 //! Native CLI: run a ROM/BIOS (default: built-in HELLO ROM) until HLT.
 
 use emulator_cli::{
-    build_machine, parse_args, run_machine, run_post_probe_traced, usage, vga_frame_report,
+    build_machine, parse_args, run_machine, run_post_probe_options, usage, vga_frame_report,
     vga_text_dump, BuiltMachine, CliError, Options, ParsedArgs,
 };
 use machine_pc::Machine;
@@ -62,7 +62,12 @@ fn main() -> ExitCode {
     if opts.post_probe {
         println!(
             "{}",
-            run_post_probe_traced(&mut machine, opts.max_steps, opts.post_trace)
+            run_post_probe_options(
+                &mut machine,
+                opts.max_steps,
+                opts.post_trace,
+                opts.post_spin
+            )
         );
         print_diagnostics(&machine, option_rom_line, &opts);
         return ExitCode::SUCCESS;
