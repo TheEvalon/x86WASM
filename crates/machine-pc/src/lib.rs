@@ -33,8 +33,8 @@ pub use ports::{
 pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
 pub use post_probe::{
     seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
-    TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV,
-    SEABIOS_IMAGE_RELATIVE,
+    TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_IDLE_TIMER_CLOCKS, POST_OPCODE_WINDOW_LEN,
+    SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
 };
 pub use post_spin::{
     PostPcSite, PostSpinConfig, PostSpinCycle, PostSpinSummary, DEFAULT_POST_SPIN_HOT,
