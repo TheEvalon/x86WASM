@@ -2582,6 +2582,69 @@ fn set_shift_result_flags_u32(cpu: &mut CpuState, result: u32) {
     cpu.set_pf(parity_even(result as u8));
 }
 
+/// Defined result of a double-precision shift: the new destination value and
+/// the last bit shifted out of the original destination (`CF`).
+struct DoublePrecisionShift {
+    result: u32,
+    carry: bool,
+}
+
+/// Evaluate `SHLD` (`left`) or `SHRD` — Spec: Intel SDM Vol. 2 "SHLD—Double
+/// Precision Shift Left" / "SHRD—Double Precision Shift Right" (Operation).
+///
+/// `dest` and `src` are the operand values zero-extended to 32 bits and `bits`
+/// is the operand size (16 or 32). `count` must already be reduced modulo 32,
+/// which is the mask the SDM applies outside 64-bit mode **regardless of the
+/// operand size** — so a 16-bit operand size can legally receive a count of
+/// 17–31.
+///
+/// Returns `None` for the two cases with no architectural result:
+///
+/// - `count == 0`, which the SDM specifies as "no operation": the destination is
+///   unchanged and no flag is affected.
+/// - `count > bits`, which the SDM calls "Bad parameters" and leaves the
+///   destination *and* `CF`/`OF`/`SF`/`ZF`/`AF`/`PF` undefined. **This tree
+///   commits nothing there.** That is one legal instance of the undefined
+///   behavior and keeps the interpreter a deterministic reference for a future
+///   JIT. It is reachable only at a 16-bit operand size, because the modulo-32
+///   mask keeps a 32-bit count at or below 31.
+///
+/// Both cases therefore emit no destination write at all, so a memory
+/// destination is read but not written back.
+fn double_precision_shift(
+    left: bool,
+    dest: u32,
+    src: u32,
+    count: u32,
+    bits: u32,
+) -> Option<DoublePrecisionShift> {
+    debug_assert!(bits == 16 || bits == 32);
+    debug_assert!(count < 32);
+    if count == 0 || count > bits {
+        return None;
+    }
+    let (result, carry) = if left {
+        // CF := BIT[DEST, SIZE - COUNT] — the last bit shifted out.
+        let carry = (dest >> (bits - count)) & 1 != 0;
+        let concat = (u64::from(dest) << bits) | u64::from(src);
+        (((concat << count) >> bits) as u32, carry)
+    } else {
+        // CF := BIT[DEST, COUNT - 1] — the last bit shifted out.
+        let carry = (dest >> (count - 1)) & 1 != 0;
+        let concat = (u64::from(src) << bits) | u64::from(dest);
+        ((concat >> count) as u32, carry)
+    };
+    let mask = if bits == 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    };
+    Some(DoublePrecisionShift {
+        result: result & mask,
+        carry,
+    })
+}
+
 /// Group 2 byte ops (D0/C0/D2). Spec: SDM Vol. 2 ROL/ROR/RCL/RCR/SHL/SHR/SAR.
 /// `raw_count` is masked to 5 bits; count 0 leaves dest and flags unchanged.
 fn grp2_u8(cpu: &mut CpuState, reg: u8, mut val: u8, raw_count: u8) -> Result<u8, ExecError> {
@@ -3948,6 +4011,64 @@ fn step_two_byte(
             let operand_bits = if opsz32(insn) { 32 } else { 16 };
             let bit_offset = (insn.immediate & 0xFF) % operand_bits;
             exec_bit_op(cpu, bus, insn, op, bit_offset)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xA4 | 0xA5 | 0xAC | 0xAD => {
+            // SHLD / SHRD r/m, r, imm8|CL — Spec: Intel SDM Vol. 2 "SHLD—Double
+            // Precision Shift Left" / "SHRD—Double Precision Shift Right".
+            // The destination is `r/m`, the bits shifted in come from
+            // `ModR/M.reg`, and the source register is never modified.
+            //
+            // The count is reduced modulo 32 outside 64-bit mode *independently
+            // of the operand size*, so a 16-bit operand size can receive a count
+            // of 17–31. See `double_precision_shift` for what this tree does
+            // with that architecturally undefined case and with a zero count.
+            //
+            // Flags: `CF` is the last bit shifted out of the destination and
+            // `SF`/`ZF`/`PF` follow the result. `OF` is defined only for a
+            // 1-bit shift (set when the sign changed) and undefined above that,
+            // so it is left unchanged for larger counts — the same deterministic
+            // choice the Group 2 shifts make. `AF` is undefined and is left
+            // unchanged. The destination is written before any flag commits, so
+            // a faulting memory write leaves the flags alone.
+            //
+            // Unsupported here: the REX.W 64-bit forms and the `#UD` a `LOCK`
+            // prefix should raise.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            let left = matches!(insn.opcode, 0xA4 | 0xA5);
+            let raw_count = if matches!(insn.opcode, 0xA4 | 0xAC) {
+                (insn.immediate as u32) & 0xFF
+            } else {
+                u32::from(cpu.gpr_u8_low(CpuState::RCX))
+            };
+            let count = raw_count % 32;
+            if opsz32(insn) {
+                let dest = read_rm_u32(cpu, bus, insn)?;
+                let src = cpu.gpr_u32(m.reg as usize);
+                if let Some(shift) = double_precision_shift(left, dest, src, count, 32) {
+                    write_rm_u32(cpu, bus, insn, shift.result)?;
+                    cpu.set_cf(shift.carry);
+                    if count == 1 {
+                        cpu.set_of((dest ^ shift.result) & 0x8000_0000 != 0);
+                    }
+                    set_shift_result_flags_u32(cpu, shift.result);
+                }
+            } else {
+                let dest = read_rm_u16(cpu, bus, insn)?;
+                let src = cpu.gpr_u16(m.reg as usize);
+                if let Some(shift) =
+                    double_precision_shift(left, u32::from(dest), u32::from(src), count, 16)
+                {
+                    let result = shift.result as u16;
+                    write_rm_u16(cpu, bus, insn, result)?;
+                    cpu.set_cf(shift.carry);
+                    if count == 1 {
+                        cpu.set_of((dest ^ result) & 0x8000 != 0);
+                    }
+                    set_shift_result_flags_u16(cpu, result);
+                }
+            }
             set_current_ip(cpu, next_ip);
             Ok(())
         }
@@ -18945,6 +19066,292 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u8(PM32_DATA as u64).unwrap(), 0);
         assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): the destination receives
+    /// `COUNT` bits shifted in from `ModR/M.reg`, and `CF` is the last bit
+    /// shifted out of the destination. The `imm8` and `CL` count forms must
+    /// agree, and the bit source is never modified.
+    #[test]
+    fn shld_shrd_results_and_carry_at_both_operand_sizes() {
+        struct Case {
+            imm_op: u8,
+            cl_op: u8,
+            opsize32: bool,
+            dest: u32,
+            src: u32,
+            count: u8,
+            expected: u32,
+            carry: bool,
+        }
+        let cases = [
+            Case {
+                imm_op: 0xA4,
+                cl_op: 0xA5,
+                opsize32: false,
+                dest: 0x1234,
+                src: 0xABCD,
+                count: 4,
+                expected: 0x234A,
+                carry: true,
+            },
+            Case {
+                imm_op: 0xA4,
+                cl_op: 0xA5,
+                opsize32: true,
+                dest: 0x1234_5678,
+                src: 0x9ABC_DEF0,
+                count: 8,
+                expected: 0x3456_789A,
+                carry: false,
+            },
+            Case {
+                imm_op: 0xAC,
+                cl_op: 0xAD,
+                opsize32: false,
+                dest: 0x1234,
+                src: 0xABCD,
+                count: 4,
+                expected: 0xD123,
+                carry: false,
+            },
+            Case {
+                imm_op: 0xAC,
+                cl_op: 0xAD,
+                opsize32: true,
+                dest: 0x1234_5678,
+                src: 0x9ABC_DEF0,
+                count: 8,
+                expected: 0xF012_3456,
+                carry: false,
+            },
+        ];
+        for case in cases {
+            // ModR/M D0 = mod 11, reg = (E)DX, rm = (E)AX.
+            for use_cl in [false, true] {
+                let mut code = Vec::new();
+                if case.opsize32 {
+                    code.push(0x66);
+                }
+                if use_cl {
+                    code.extend_from_slice(&[0x0F, case.cl_op, 0xD0]);
+                } else {
+                    code.extend_from_slice(&[0x0F, case.imm_op, 0xD0, case.count]);
+                }
+                let (mut cpu, mut bus) = real_mode_fixture(&code, |cpu, _| {
+                    cpu.set_gpr_u32(CpuState::RAX, case.dest);
+                    cpu.set_gpr_u32(CpuState::RDX, case.src);
+                    if use_cl {
+                        cpu.set_gpr_u8_low(CpuState::RCX, case.count);
+                    }
+                });
+                step(&mut cpu, &mut bus).unwrap();
+                let got = if case.opsize32 {
+                    cpu.gpr_u32(CpuState::RAX)
+                } else {
+                    u32::from(cpu.gpr_u16(CpuState::RAX))
+                };
+                let op = case.imm_op;
+                let opsize32 = case.opsize32;
+                assert_eq!(
+                    got, case.expected,
+                    "op {op:#04X} opsize32={opsize32} use_cl={use_cl}"
+                );
+                assert_eq!(cpu.rflags & 1 != 0, case.carry, "CF op {op:#04X}");
+                assert_eq!(
+                    cpu.gpr_u32(CpuState::RDX),
+                    case.src,
+                    "source must not change"
+                );
+                assert_eq!(cpu.ip16(), code.len() as u16);
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): `COUNT := COUNT MOD 32`
+    /// outside 64-bit mode, independently of the operand size, and a resulting
+    /// count of zero is an explicit no-operation that leaves every flag alone.
+    #[test]
+    fn shld_shrd_count_is_masked_modulo_32_and_zero_is_a_no_op() {
+        // 0F A4 D0 24 = SHLD AX, DX, 0x24; 0x24 MOD 32 = 4.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x24], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x1234);
+            cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x234A);
+
+        // A count of 32 masks to zero: no destination change and no flag change.
+        for (opcode, count) in [(0xA4u8, 0x20u8), (0xAC, 0x20), (0xA4, 0x00), (0xAC, 0x00)] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xD0, count], |cpu, _| {
+                cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_1234);
+                cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+                cpu.rflags = 0x0002 | (1 << 0) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+            });
+            let flags = cpu.rflags;
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u32(CpuState::RAX),
+                0xAAAA_1234,
+                "0F {opcode:02X} count {count:#04X}"
+            );
+            assert_eq!(cpu.rflags, flags, "0F {opcode:02X} count {count:#04X}");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): a count greater than the
+    /// operand size is "Bad parameters" — the destination and every flag are
+    /// architecturally undefined. Reachable only at a 16-bit operand size, since
+    /// the modulo-32 mask caps a 32-bit count at 31.
+    ///
+    /// **Deterministic model choice:** this tree commits nothing, leaving the
+    /// destination and all six flags unchanged.
+    #[test]
+    fn shld_shrd_count_above_the_operand_size_commits_nothing() {
+        for opcode in [0xA4u8, 0xAC] {
+            for count in [17u8, 31] {
+                let (mut cpu, mut bus) =
+                    real_mode_fixture(&[0x0F, opcode, 0xD0, count], |cpu, _| {
+                        cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_1234);
+                        cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+                        cpu.rflags = 0x0002 | (1 << 4) | (1 << 11);
+                    });
+                let flags = cpu.rflags;
+                step(&mut cpu, &mut bus).unwrap();
+                assert_eq!(
+                    cpu.gpr_u32(CpuState::RAX),
+                    0xAAAA_1234,
+                    "0F {opcode:02X} count {count}"
+                );
+                assert_eq!(cpu.rflags, flags, "0F {opcode:02X} count {count}");
+                assert_eq!(cpu.ip16(), 4);
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (Operation): a count *equal* to the
+    /// operand size is defined — every destination bit comes from the source,
+    /// and `CF` is still the last destination bit shifted out.
+    #[test]
+    fn shld_shrd_count_equal_to_the_operand_size_replaces_the_destination() {
+        // 0F A4 D0 10 = SHLD AX, DX, 16 — CF := BIT[DEST, 0].
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x10], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x1235);
+            cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0xABCD);
+        assert!(cpu.rflags & 1 != 0, "CF := BIT[DEST, 0] = 1");
+
+        // 0F AC D0 10 = SHRD AX, DX, 16 — CF := BIT[DEST, 15].
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xAC, 0xD0, 0x10], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x8234);
+            cpu.set_gpr_u16(CpuState::RDX, 0xABCD);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0xABCD);
+        assert!(cpu.rflags & 1 != 0, "CF := BIT[DEST, 15] = 1");
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" — Flags Affected: `SF`/`ZF`/`PF` follow
+    /// the result; `OF` is set from a sign change for a 1-bit shift and is
+    /// undefined above that.
+    ///
+    /// **Deterministic model choices:** `OF` is left unchanged for counts above
+    /// one, and `AF` — undefined in every case — is left unchanged too. Both
+    /// match what the Group 2 shifts already do in this tree.
+    #[test]
+    fn shld_shrd_flag_results_including_the_undefined_of_and_af() {
+        // SHLD AX, DX, 1 with AX = 0x4000 → 0x8000: sign changed, so OF = 1.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x01], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x4000);
+            cpu.set_gpr_u16(CpuState::RDX, 0x0000);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x8000);
+        assert_eq!(cpu.rflags & 1, 0, "CF := BIT[DEST, 15] = 0");
+        assert_ne!(cpu.rflags & (1 << 11), 0, "OF set on a 1-bit sign change");
+        assert_ne!(cpu.rflags & (1 << 7), 0, "SF from the result");
+        assert_eq!(cpu.rflags & (1 << 6), 0, "ZF from the result");
+        assert_ne!(cpu.rflags & (1 << 2), 0, "PF from the low byte 0x00");
+
+        // SHLD AX, DX, 1 with AX = 0x8000 → 0x0000: sign changed again, ZF set.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x01], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RAX, 0x8000);
+            cpu.set_gpr_u16(CpuState::RDX, 0x0000);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x0000);
+        assert_ne!(cpu.rflags & 1, 0, "CF := BIT[DEST, 15] = 1");
+        assert_ne!(cpu.rflags & (1 << 11), 0, "OF set on a 1-bit sign change");
+        assert_ne!(cpu.rflags & (1 << 6), 0, "ZF from the zero result");
+
+        // A count above one leaves the undefined OF exactly as it was, in both
+        // directions, and the undefined AF likewise.
+        for preset_of in [false, true] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA4, 0xD0, 0x02], |cpu, _| {
+                cpu.set_gpr_u16(CpuState::RAX, 0x4000);
+                cpu.set_gpr_u16(CpuState::RDX, 0x0000);
+            });
+            cpu.set_of(preset_of);
+            cpu.set_af(true);
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.gpr_u16(CpuState::RAX), 0x0000);
+            assert_eq!(
+                cpu.rflags & (1 << 11) != 0,
+                preset_of,
+                "OF undefined above 1 bit → unchanged"
+            );
+            assert_ne!(cpu.rflags & (1 << 4), 0, "AF undefined → unchanged");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD": the destination may be a memory operand
+    /// at either operand size, with the bits shifted in from `ModR/M.reg`.
+    #[test]
+    fn shld_shrd_memory_destination_forms() {
+        // 0F A4 1E 00 40 04 = SHLD word [0x4000], BX, 4.
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0x0F, 0xA4, 0x1E, 0x00, 0x40, 0x04], |cpu, mem| {
+                mem[0x4000..0x4002].copy_from_slice(&0x1234u16.to_le_bytes());
+                cpu.set_gpr_u16(CpuState::RBX, 0xABCD);
+            });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 0x234A);
+        assert!(cpu.rflags & 1 != 0);
+        assert_eq!(cpu.ip16(), 6);
+
+        // 66 0F AC 1E 00 40 08 = SHRD dword [0x4000], EBX, 8.
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0x66, 0x0F, 0xAC, 0x1E, 0x00, 0x40, 0x08], |cpu, mem| {
+                mem[0x4000..0x4004].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+                cpu.set_gpr_u32(CpuState::RBX, 0x9ABC_DEF0);
+            });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0xF012_3456);
+        assert_eq!(cpu.ip16(), 7);
+    }
+
+    /// The 64-bit-shift idiom SeaBIOS uses, and the instruction POST stopped on
+    /// after slice 1: under `CS.D=1`, `0F AC D0 10` is `SHRD EAX, EDX, 16`.
+    /// Spec: Intel SDM Vol. 2 "SHRD"; Vol. 1 §3.6 Table 3-4.
+    #[test]
+    fn shrd_default32_matches_the_firmware_64_bit_shift_idiom() {
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0xAC, 0xD0, 0x10], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        cpu.set_gpr_u32(CpuState::RDX, 0x9ABC_DEF0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xDEF0_1234);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0x9ABC_DEF0);
+        assert_eq!(cpu.rflags & 1, 0, "CF := BIT[DEST, 15] = 0");
+        assert_eq!(cpu.rip, (PM32_CODE + 4) as u64);
+
+        // 66 0F AC D0 10 selects the 16-bit operand size again under `D=1`.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x66, 0x0F, 0xAC, 0xD0, 0x10], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        cpu.set_gpr_u32(CpuState::RDX, 0x9ABC_DEF0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1234_DEF0);
     }
 
     /// Intel SDM Vol. 2 "CMOVcc—Conditional Move": `IF condition THEN

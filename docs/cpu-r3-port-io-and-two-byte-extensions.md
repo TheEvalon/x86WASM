@@ -151,3 +151,103 @@ Not supported:
   when the condition is false; that rule has no 16/32-bit analogue and long mode
   is out of scope.
 - The `#UD` a `LOCK` prefix should raise.
+
+## Slice 4 — `SHLD`/`SHRD` (`0F A4`/`A5`/`AC`/`AD`)
+
+Spec: SDM Vol. 2 "SHLD—Double Precision Shift Left" and "SHRD—Double Precision
+Shift Right" (Description, Operation, Flags Affected); Appendix A opcode map 2.
+
+Supported:
+
+- All four encodings — `imm8` count (`0F A4`/`0F AC`) and `CL` count
+  (`0F A5`/`0F AD`) — at both operand sizes, with a register or memory
+  destination. The destination is `r/m`, the bits shifted in come from
+  `ModR/M.reg`, and the source register is never modified.
+- **Count masking.** `COUNT := COUNT MOD 32` outside 64-bit mode,
+  *independently of the operand size*. That is a real subtlety: the mask is 32
+  even when the operand size is 16, so a 16-bit `SHLD` can legally receive a
+  count of 17–31 — which is precisely the "bad parameters" case below. A count
+  that masks to zero is an explicit no-operation with no flag change at all.
+- **Count equal to the operand size** is defined and is *not* the bad-parameter
+  case: every destination bit comes from the source, and `CF` is still the last
+  destination bit shifted out (`BIT[DEST, 0]` for `SHLD`, `BIT[DEST, SIZE-1]`
+  for `SHRD`).
+- `CF` is the last bit shifted out of the destination: `BIT[DEST, SIZE-COUNT]`
+  for `SHLD` and `BIT[DEST, COUNT-1]` for `SHRD`. `SF`, `ZF` and `PF` follow the
+  result through the shared shift-result helpers.
+- The destination is written *before* any flag commits, so a faulting memory
+  write leaves the flags untouched.
+
+Deterministic choices where the SDM says "undefined". The interpreter is the
+semantic reference for a future JIT, so an indeterminate result would be
+untestable; each of these is a legal instance of the undefined behavior, and each
+has a test that pins it:
+
+- **Count greater than the operand size** ("Bad parameters" in the SDM Operation
+  section) leaves the destination *and* all six flags unchanged, and emits no
+  destination write. Reachable only at a 16-bit operand size, since the
+  modulo-32 mask caps a 32-bit count at 31.
+- **`OF` above a 1-bit shift** is left unchanged. For a 1-bit shift it is set
+  when the sign of the destination changed, which is the defined rule. Leaving it
+  alone for larger counts is the same choice the Group 2 shifts
+  (`ROL`/`ROR`/`RCL`/`RCR`/`SHL`/`SHR`/`SAR`) already make in this tree, so the
+  two shift families agree.
+- **`AF`**, undefined in every case, is left unchanged — again matching the
+  Group 2 shifts.
+
+Not supported:
+
+- The REX.W 64-bit forms (and therefore the `COUNT MOD 64` mask).
+- The `#UD` a `LOCK` prefix should raise.
+
+## What POST reached, and the findings past this round
+
+`cargo run -p emulator-cli -- --bios firmware/seabios/bios.bin --post-probe
+--steps 2000000` progressed as follows, one entry per slice:
+
+| After | Steps | Stop |
+|---|---|---|
+| baseline (`0195f78`) | 17,218 | unsupported opcode `0xEF` at `0008:417B` |
+| slice 1 (port I/O) | 50,511 | unsupported opcode `0x0F 0xAC` at `0008:CDDB` |
+| slice 2 (segment stack slots) | 50,511 | unchanged |
+| slice 3 (`CMOVcc`) | 50,511 | unchanged |
+| slice 4 (`SHLD`/`SHRD`) | 2,000,000 | **step budget exhausted — no unsupported opcode at all** |
+
+**There is no longer a CPU decode blocker on SeaBIOS's POST path.** The stop is a
+step budget, and re-running at 50,000,000 steps produces a byte-identical report:
+the same unmapped-MMIO pages with the same counts, no new page touched, no port
+`0x80` checkpoint, and nothing on COM1 or the `0x402` debug console. SeaBIOS is
+spinning in a loop over memory it has already touched.
+
+Two findings, both **outside this area's ownership**, recorded and deliberately
+not fixed:
+
+1. **Linear addresses are not wrapped modulo 2^32.** The probe logs unmapped
+   MMIO at `0x1_000D5000` (86 writes, 10 reads) and `0x1_000FF000` (4 writes,
+   42 reads) — above the 4 GiB boundary. `x86_mmu::linear_addr` is
+   `seg.base.wrapping_add(offset)` in `u64` with no 32-bit truncation, so a
+   segment base near the top of the address space plus a large offset escapes the
+   4 GiB linear space instead of wrapping into low memory. Masked to 32 bits
+   those two pages are `0x000D5000` and `0x000FF000`, both plausible low-memory
+   targets — the second is the top of the `0xF0000`–`0xFFFFF` BIOS segment
+   SeaBIOS uses for its f-segment data. Outside 64-bit mode the linear address
+   space is 4 GiB and the sum wraps (SDM Vol. 3 §3.3.1). The fix belongs in
+   `crates/x86-mmu`.
+2. **A 64 KiB write sweep at `0xF0000000`–`0xF000FFFF`** that no RAM or ROM
+   window covers, walking downward one page at a time (4,096 writes per page,
+   2,048 in the top page). Not explained here; it is either a memory-map gap in
+   `machine-pc`/`devices` or a second consequence of finding 1. Recorded with
+   exact page counts so whoever owns the memory map can start from data.
+
+The probe reports no `CS:IP`/`EIP` when it stops on the step budget, which is now
+the limiting factor on diagnosing further. Adding the current PC (and ideally a
+short trailing PC histogram) to `PostStopReason::StepBudgetExhausted` would turn
+"it spins" into "it spins here"; that is a `machine-pc` change.
+
+## Interaction with `docs/cpu-0f-map.md`
+
+That document's "Remaining unimplemented `0F` opcodes" list still names
+`0F 40`–`0F 4F` (`CMOVcc`) and `0F A4`/`A5`/`AC`/`AD` (`SHLD`/`SHRD`), which this
+round implements, and its slice-2 section still records the primary-map segment
+`PUSH`/`POP` inconsistency as "a round-3 item". Updating it is an integration
+step: this area's ownership covers only new `docs/cpu-r3-*.md` files.

@@ -1575,6 +1575,38 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "BT/BTS/BTR/BTC r/m,imm8",
     },
+    // Double-precision shifts — Spec: Intel SDM Vol. 2 "SHLD—Double Precision
+    // Shift Left" (`0F A4` ib, `0F A5` CL) and "SHRD—Double Precision Shift
+    // Right" (`0F AC` ib, `0F AD` CL). The destination is `r/m`, the bit source
+    // is `ModR/M.reg`, and both follow the operand-size attribute.
+    InstrDef {
+        mnemonic: "SHLD",
+        opcode: 0xA4,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "SHLD r/m,r,imm8",
+    },
+    InstrDef {
+        mnemonic: "SHLD",
+        opcode: 0xA5,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "SHLD r/m,r,CL",
+    },
+    InstrDef {
+        mnemonic: "SHRD",
+        opcode: 0xAC,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "SHRD r/m,r,imm8",
+    },
+    InstrDef {
+        mnemonic: "SHRD",
+        opcode: 0xAD,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "SHRD r/m,r,CL",
+    },
     // Bit scans — Spec: Intel SDM Vol. 2 "BSF"/"BSR" (`0F BC`/`BD`).
     InstrDef {
         mnemonic: "BSF",
@@ -1840,6 +1872,25 @@ mod tests {
             assert_eq!(set.mnemonic, SETCC[cc as usize]);
             assert_eq!(set.encoding, Encoding::Modrm);
             assert_eq!(set.width, Width::W8);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (opcode map 2): the `imm8` count forms
+    /// carry a one-byte immediate, the `CL` count forms carry none, and both
+    /// follow the operand-size attribute.
+    #[test]
+    fn two_byte_double_precision_shifts_are_present() {
+        for (opcode, mnemonic, encoding) in [
+            (0xA4u8, "SHLD", Encoding::ModrmImm8),
+            (0xA5, "SHLD", Encoding::Modrm),
+            (0xAC, "SHRD", Encoding::ModrmImm8),
+            (0xAD, "SHRD", Encoding::Modrm),
+        ] {
+            let def =
+                lookup_0f(opcode).unwrap_or_else(|| panic!("missing 0F {opcode:02X} {mnemonic}"));
+            assert_eq!(def.mnemonic, mnemonic);
+            assert_eq!(def.encoding, encoding);
+            assert_eq!(def.width, Width::OsZ);
         }
     }
 

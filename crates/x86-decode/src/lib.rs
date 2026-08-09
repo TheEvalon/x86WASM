@@ -2315,6 +2315,50 @@ mod tests {
         }
     }
 
+    /// Intel SDM Vol. 2 "SHLD"/"SHRD" (opcode map 2): the `imm8` forms
+    /// (`0F A4`/`0F AC`) consume exactly one immediate byte at every operand
+    /// size; the `CL` forms (`0F A5`/`0F AD`) consume none.
+    #[test]
+    fn decode_double_precision_shifts() {
+        for (op, mnemonic) in [(0xA4u8, "SHLD"), (0xAC, "SHRD")] {
+            // Register form: 0F A4 D0 10 = SHLD (E)AX, (E)DX, 16.
+            let d = decode(&[0x0F, op, 0xD0, 0x10]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.modrm.unwrap().reg, 2);
+            assert_eq!(d.modrm.unwrap().rm, 0);
+            assert_eq!(d.immediate, 0x10);
+            assert_eq!(d.length, 4);
+
+            // Memory destination with a 16-bit displacement.
+            let d = decode(&[0x0F, op, 0x1E, 0x00, 0x40, 0x04]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.immediate, 4);
+            assert_eq!(d.length, 6);
+
+            // The immediate stays one byte under a 32-bit operand size.
+            let d = decode_with_mode(&[0x0F, op, 0xD0, 0x10], DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.immediate, 0x10);
+            assert_eq!(d.length, 4);
+
+            assert_eq!(decode(&[0x0F, op, 0xD0]), Err(DecodeError::Truncated));
+        }
+
+        for (op, mnemonic) in [(0xA5u8, "SHLD"), (0xAD, "SHRD")] {
+            let d = decode(&[0x0F, op, 0xD0]).unwrap();
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.immediate, 0, "{mnemonic} CL form takes no immediate");
+            assert_eq!(d.length, 3);
+
+            let d = decode(&[0x0F, op, 0x1E, 0x00, 0x40]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.length, 5);
+
+            assert_eq!(decode(&[0x0F, op]), Err(DecodeError::Truncated));
+        }
+    }
+
     /// Intel SDM Vol. 2 "CMOVcc" (opcode map 2): a ModR/M form with no
     /// immediate, at both operand sizes, in 16- and 32-bit addressing.
     #[test]
