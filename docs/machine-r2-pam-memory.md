@@ -207,3 +207,49 @@ separately, and `0F` / `0F 38` / `0F 3A` escapes are included, giving
 decoder's byte — and the reconstruction is used only when its final opcode byte
 agrees with that payload. REX and VEX/EVEX prefixes are not recognized (no
 long mode here).
+
+## 4. Option ROM mapping at `0xC0000`
+
+Specs
+
+- PCI Firmware Specification / BIOS Boot Specification, PC-compatible expansion
+  ROM header: byte 0-1 signature `0x55 0xAA`, byte 2 the initialization size in
+  512-byte blocks, byte 3 onwards the entry point; the byte-wise sum over the
+  initialization size must be zero modulo 256.
+- Legacy placement: the option-ROM region is `0xC0000`-`0xDFFFF`, scanned on
+  2 KiB boundaries; the video BIOS is conventionally at `0xC0000`.
+- Intel 440FX PMC PAM1-PAM4 (`0x5A`-`0x5D`) attribute that same region, so an
+  option ROM can be shadowed exactly like the BIOS area.
+
+This source is **not yet listed in `docs/sources.md`**; the PCI Firmware
+Specification / BIOS Boot Specification expansion-ROM header entry needs adding
+by the coordinator.
+
+Supported
+
+- `firmware_interface::prepare_option_rom(phys_base, data)` validates the
+  signature, a non-zero size byte, that the declared size fits inside the
+  supplied image, the checksum over the declared size, 2 KiB base alignment,
+  and containment in `0xC0000`-`0xDFFFF`, returning a `RomImage` carrying
+  exactly the declared bytes. `OptionRomError` names each rejection.
+- `Machine::map_option_rom(phys_base, data)` adds that window alongside the
+  BIOS windows; `Machine::map_vga_option_rom(data)` is the `0xC0000` case.
+- `crates/machine-pc/tests/option_rom.rs` checks what a BIOS scan would see
+  (signature, size byte, zero checksum over the mapped image, open bus at an
+  empty 2 KiB slot on a 640 KiB machine), a guest reading the signature at
+  `C000:0000`, PAM shadowing of the region, rejection of a bad checksum, and
+  coexistence with the BIOS windows.
+
+Not supported
+
+- No PCI expansion-ROM BAR (`0x30`) and no ROM discovery through PCI: the host
+  places the image explicitly.
+- No PnP expansion header (offset `0x1A`), no runtime-size versus
+  initialization-size distinction, no BEV/BCV boot entries, and no automatic
+  packing of several ROMs into the region.
+- `Machine::load_bios_rom` clears every ROM window, so option ROMs must be
+  mapped after the BIOS image; there is no window registry that survives a
+  BIOS reload.
+- Nothing executes the ROM: there is no INT 19h / INT 10h dispatch, no entry
+  call at `base+3`, and no real VGA BIOS image in this tree (a sibling slice
+  owns that).

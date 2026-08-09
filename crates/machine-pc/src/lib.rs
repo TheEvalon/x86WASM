@@ -45,7 +45,9 @@ use devices::{
     PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
     PORT_SYSTEM_CONTROL_A,
 };
-use firmware_interface::{prepare_bios_rom, BiosRomError, RomImage};
+use firmware_interface::{
+    prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
+};
 use ports::PortBus;
 use thiserror::Error;
 use x86_core::CpuState;
@@ -59,6 +61,8 @@ pub enum MachineError {
     RomTooLarge,
     #[error(transparent)]
     BiosRom(#[from] BiosRomError),
+    #[error(transparent)]
+    OptionRom(#[from] OptionRomError),
     /// No IDE LBA0 / floppy CHS (0,0,1) available for [`Machine::load_mbr_to_7c00`].
     #[error("no boot media attached (IDE LBA0 or floppy CHS 0,0,1)")]
     NoBootMedia,
@@ -239,6 +243,31 @@ impl Machine {
         let mut m = Self::new(ram_size);
         m.load_bios_rom(data)?;
         Ok(m)
+    }
+
+    /// Map a validated PC-compatible expansion ROM into the legacy region.
+    ///
+    /// Uses [`firmware_interface::prepare_option_rom`]: `0x55AA` signature,
+    /// non-zero initialization size at offset 2, byte-wise checksum zero over
+    /// that size, 2 KiB base alignment, and containment in `0xC0000`-`0xDFFFF`,
+    /// which is what a BIOS option-ROM scan looks for.
+    ///
+    /// Adds a ROM window without disturbing existing ones, so it must be called
+    /// **after** [`Self::load_bios_rom`] (which clears every window). The window
+    /// sits under PAM regions 0-7, so a guest can shadow the option ROM with
+    /// the same sequence it uses for the BIOS area.
+    pub fn map_option_rom(&mut self, phys_base: u64, data: &[u8]) -> Result<(), MachineError> {
+        let image = prepare_option_rom(phys_base, data)?;
+        self.mem.add_rom(image.phys_base, image.data);
+        Ok(())
+    }
+
+    /// Map an expansion ROM at the conventional video-BIOS base `0xC0000`.
+    ///
+    /// Wraps [`Self::map_option_rom`]. This tree ships no VGA BIOS image and
+    /// nothing executes the ROM; the mapping is what a scan can find.
+    pub fn map_vga_option_rom(&mut self, data: &[u8]) -> Result<(), MachineError> {
+        self.map_option_rom(firmware_interface::VGA_OPTION_ROM_BASE, data)
     }
 
     /// Apply one i440FX PAM configuration register byte (`0x59`-`0x5F`).
