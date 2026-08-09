@@ -12,15 +12,26 @@ mod hello_rom;
 mod mbr;
 mod mem;
 mod ports;
+mod post_code;
+mod post_probe;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::PhysMem;
+pub use ports::{
+    UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
+    UNMAPPED_MMIO_PAGE_SIZE,
+};
+pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
+pub use post_probe::{
+    seabios_image_path, PostFailure, PostFailureKind, PostReport, PostStopReason,
+    DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
+};
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, IdePrimary,
-    IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, CMOS_DATA,
-    CMOS_INDEX, FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, FwCfgDmaOutcome,
+    IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText,
+    CMOS_DATA, CMOS_INDEX, FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
     PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE,
     PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
     PORT_SYSTEM_CONTROL_A,
@@ -85,6 +96,8 @@ pub struct Machine {
     pub fdc: Fdc82077,
     /// QEMU fw_cfg — signature, ID, configured RAM size, and test file.
     pub fw_cfg: FwCfg,
+    /// POST checkpoint latch on the manufacturing diagnostic port `0x80`.
+    pub post_diag: PostCodePort,
     ports: PortBus,
 }
 
@@ -108,6 +121,7 @@ impl Machine {
             ide_secondary: IdeSecondary::new(),
             fdc: Fdc82077::new(),
             fw_cfg: FwCfg::with_ram_size(ram_size as u64),
+            post_diag: PostCodePort::new(),
             ports: PortBus::new(),
         }
     }
@@ -196,6 +210,7 @@ impl Machine {
         self.ide_secondary.reset();
         self.fdc.reset();
         self.fw_cfg.reset();
+        self.post_diag.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 / port 0x92 defaults.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
         self.port92.set_a20_enabled(self.kbd.a20_enabled());
@@ -241,6 +256,7 @@ impl Machine {
             ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
             fw_cfg: &mut self.fw_cfg,
+            post_diag: &mut self.post_diag,
             ports: &mut self.ports,
         }
     }
@@ -272,6 +288,7 @@ impl Machine {
                 ide_secondary: &mut self.ide_secondary,
                 fdc: &mut self.fdc,
                 fw_cfg: &mut self.fw_cfg,
+                post_diag: &mut self.post_diag,
                 ports: &mut self.ports,
             };
             step(&mut self.cpu, &mut view)?;
@@ -428,6 +445,52 @@ impl Machine {
     /// Drive PIC IRQ12 from the current 8042 IRQ12 line (level follow).
     pub fn sync_kbd_irq12(&mut self) {
         self.pic.set_irq_line(12, self.kbd.irq12_line());
+    }
+
+    /// Service a pending fw_cfg DMA operation against [`Self::mem`].
+    ///
+    /// Spec: QEMU fw_cfg "Guest-side DMA Interface". `MachineBus` already does
+    /// this after every fw_cfg port write; this is the host-side entry point
+    /// for tests and diagnostics. Returns `None` when nothing is pending.
+    pub fn service_fw_cfg_dma(&mut self) -> Option<FwCfgDmaOutcome> {
+        let mut view = MachineBus {
+            mem: &mut self.mem,
+            com1: &mut self.com1,
+            com2: &mut self.com2,
+            debug: &mut self.debug,
+            pic: &mut self.pic,
+            pit: &mut self.pit,
+            cmos: &mut self.cmos,
+            kbd: &mut self.kbd,
+            port92: &mut self.port92,
+            dma: &mut self.dma,
+            vga: &mut self.vga,
+            pci: &mut self.pci,
+            ide: &mut self.ide,
+            ide_secondary: &mut self.ide_secondary,
+            fdc: &mut self.fdc,
+            fw_cfg: &mut self.fw_cfg,
+            post_diag: &mut self.post_diag,
+            ports: &mut self.ports,
+        };
+        view.try_fw_cfg_dma()
+    }
+
+    /// Drive PIC IRQ4 from the current COM1 16550 interrupt line (level follow).
+    ///
+    /// Spec: IBM PC/AT ISA interrupt assignment — COM1 (`0x3F8`) is IRQ4 (master
+    /// IR4). The 16550 subset only raises THRE (NS16550A IER bit1 / IIR `010b`);
+    /// receive-data-available is never asserted because there is no receive path.
+    pub fn sync_com1_irq4(&mut self) {
+        self.pic.set_irq_line(4, self.com1.irq_line());
+    }
+
+    /// Drive PIC IRQ3 from the current COM2 16550 interrupt line (level follow).
+    ///
+    /// Spec: IBM PC/AT ISA interrupt assignment — COM2 (`0x2F8`) is IRQ3 (master
+    /// IR3). Same THRE-only source as [`Self::sync_com1_irq4`].
+    pub fn sync_com2_irq3(&mut self) {
+        self.pic.set_irq_line(3, self.com2.irq_line());
     }
 
     /// Assert/deassert a software PIRQA–PIRQD line and sync through PIRQRC to DualPic.
@@ -601,6 +664,7 @@ struct MachineBus<'a> {
     ide_secondary: &'a mut IdeSecondary,
     fdc: &'a mut Fdc82077,
     fw_cfg: &'a mut FwCfg,
+    post_diag: &'a mut PostCodePort,
     ports: &'a mut PortBus,
 }
 
@@ -672,6 +736,27 @@ impl MachineBus<'_> {
         }
     }
 
+    /// Service a triggered fw_cfg DMA operation against [`PhysMem`].
+    ///
+    /// Spec: QEMU fw_cfg "Guest-side DMA Interface". The device supplies the
+    /// state machine; the machine supplies guest-physical byte accessors, so
+    /// the A20 gate applies to fw_cfg DMA exactly as it does to CPU accesses.
+    fn try_fw_cfg_dma(&mut self) -> Option<FwCfgDmaOutcome> {
+        if !self.fw_cfg.dma_pending() {
+            return None;
+        }
+        use std::cell::RefCell;
+        let mem = RefCell::new(std::mem::replace(self.mem, PhysMem::new(0)));
+        let outcome = self.fw_cfg.service_dma(
+            |phys| mem.borrow().read_u8(phys).unwrap_or(0xFF),
+            |phys, b| {
+                let _ = mem.borrow_mut().write_u8(phys, b);
+            },
+        );
+        *self.mem = mem.into_inner();
+        outcome
+    }
+
     /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
@@ -707,6 +792,8 @@ impl MachineBus<'_> {
             PIT_CH0_DATA | PIT_CH1_DATA | PIT_CH2_DATA | PIT_CONTROL => {
                 self.pit.port_read(port, size)
             }
+            // Spec: IBM PC/AT — manufacturing diagnostic port; no read data.
+            POST_DIAG_PORT => self.post_diag.port_read(port, size),
             PORT_SYSTEM_CONTROL => u32::from(self.pit.port61_read()),
             PORT_SYSTEM_CONTROL_A => self.port92.port_read(port, size),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
@@ -739,6 +826,9 @@ impl MachineBus<'_> {
         }
         if FwCfg::owns_port(port) {
             self.fw_cfg.port_write(port, size, value);
+            // Spec: QEMU fw_cfg DMA — a write to the low half of the address
+            // register at `0x518` triggers the operation immediately.
+            self.try_fw_cfg_dma();
             return;
         }
         if Dma8237::owns_port(port) {
@@ -778,6 +868,8 @@ impl MachineBus<'_> {
             PIT_CH0_DATA | PIT_CH1_DATA | PIT_CH2_DATA | PIT_CONTROL => {
                 self.pit.port_write(port, size, value);
             }
+            // Spec: IBM PC/AT — POST checkpoint latch for host diagnostics.
+            POST_DIAG_PORT => self.post_diag.port_write(port, size, value),
             PORT_SYSTEM_CONTROL => self.pit.port61_write(value as u8),
             PORT_SYSTEM_CONTROL_A => {
                 self.port92.port_write(port, size, value);
@@ -821,6 +913,10 @@ impl Bus for MachineBus<'_> {
         if let Some(b) = self.vga.read_u8(effective) {
             return Ok(b);
         }
+        // Probe-only: anything decoding to neither RAM nor ROM is open bus.
+        if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
+            self.ports.record_unmapped_mmio(effective, false);
+        }
         self.mem
             .read_u8(addr)
             .map_err(|_| ExecError::MemoryFault(addr))
@@ -834,6 +930,9 @@ impl Bus for MachineBus<'_> {
         };
         if self.vga.write_u8(effective, val) {
             return Ok(());
+        }
+        if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
+            self.ports.record_unmapped_mmio(effective, true);
         }
         self.mem
             .write_u8(addr, val)
@@ -870,15 +969,21 @@ impl Bus for MachineBus<'_> {
 
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
-    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, FDC IRQ6, CMOS IRQF → IRQ8,
-    /// 8042 AUX OBF∧INT12 → IRQ12, primary IDE INTRQ∧¬nIEN → IRQ14, and secondary
-    /// IDE → IRQ15 (level follow) before acknowledge so edges from prior
+    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, COM2 THRE → IRQ3, COM1
+    /// THRE → IRQ4, FDC IRQ6, CMOS IRQF → IRQ8, 8042 AUX OBF∧INT12 → IRQ12,
+    /// primary IDE INTRQ∧¬nIEN → IRQ14, and secondary IDE → IRQ15 (level follow)
+    /// before acknowledge so edges from prior
     /// [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
     /// [`Machine::kbd_inject_aux_byte`] / [`Machine::tick_cmos`] / FDC
-    /// [`Fdc82077::assert_irq6`] / IDE completion are visible.
+    /// [`Fdc82077::assert_irq6`] / IDE completion / 16550 THR drain are visible.
+    ///
+    /// Spec: IBM PC/AT ISA interrupt assignment — COM1 `0x3F8` → IRQ4, COM2
+    /// `0x2F8` → IRQ3. Only the NS16550A THRE source exists in this UART subset.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());
+        self.pic.set_irq_line(3, self.com2.irq_line());
+        self.pic.set_irq_line(4, self.com1.irq_line());
         self.pic.set_irq_line(6, self.fdc.irq_line());
         self.pic.set_irq_line(8, self.cmos.irq_line());
         self.pic.set_irq_line(12, self.kbd.irq12_line());
@@ -899,15 +1004,18 @@ mod tests {
         FDC_CMD_SENSE_DRIVE_STATUS, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA,
         FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM,
         FDC_SECTOR_SIZE, FDC_ST0_IC_ABNORMAL, FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST3_RESERVED_BIT3,
-        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FW_CFG_DATA, FW_CFG_SELECTOR, FW_CFG_SIGNATURE,
-        FW_CFG_SIGNATURE_BYTES, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS,
-        PCI_CONFIG_DATA, PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA,
-        PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA,
-        PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2, PORT61_OUT2, PORT61_SPKR_DATA, PORT92_A20,
-        PORT92_RESET, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A, REG_STATUS_A, REG_STATUS_B,
-        REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF,
-        STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
-        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
+        FDC_ST3_RESERVED_BIT5, FDC_ST3_TRACK0, FW_CFG_DATA, FW_CFG_DMA_ADDR_HIGH,
+        FW_CFG_DMA_ADDR_LOW, FW_CFG_DMA_CTL_ERROR, FW_CFG_DMA_CTL_READ, FW_CFG_DMA_CTL_SELECT,
+        FW_CFG_DMA_CTL_WRITE, FW_CFG_DMA_SIGNATURE, FW_CFG_ID, FW_CFG_RAM_SIZE, FW_CFG_SELECTOR,
+        FW_CFG_SIGNATURE, FW_CFG_SIGNATURE_BYTES, FW_CFG_VERSION, FW_CFG_VERSION_DMA, I8042,
+        I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
+        PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+        PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
+        PORT61_OUT2, PORT61_SPKR_DATA, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL,
+        PORT_SYSTEM_CONTROL_A, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
+        STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
+        VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
+        VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -1130,6 +1238,276 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xBF); // unmask IR6 (IRQ6)
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR4 (IRQ4 / COM1).
+    fn init_at_pic_unmask_irq4(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xEF); // unmask IR4 (IRQ4)
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR3 (IRQ3 / COM2).
+    fn init_at_pic_unmask_irq3(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xF7); // unmask IR3 (IRQ3)
+    }
+
+    /// Spec: NS16550A IER bit1 (ETBEI) + IIR THRE ID `010b`; IBM PC/AT ISA
+    /// interrupt assignment COM1 `0x3F8` → IRQ4 (master IR4, vector `0x0C`).
+    /// The 16550 subset has no receive path, so ERBFI/RDA never drives the line.
+    #[test]
+    fn com1_thre_asserts_irq4_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq4(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            // No THRE enable → no IRQ4 even though LSR.THRE is set at reset.
+            assert_eq!(bus.poll_external_irq(), None);
+
+            bus.port_out_u8(0x3F9, 0x02).unwrap(); // IER ETBEI
+            assert_eq!(bus.poll_external_irq(), Some(0x0C));
+            assert_eq!(bus.poll_external_irq(), None);
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap(); // non-specific EOI
+        }
+        assert_eq!(m.pic.master.isr, 0);
+        assert!(m.com1.irq_line());
+    }
+
+    /// Spec: IBM PC/AT ISA interrupt assignment COM2 `0x2F8` → IRQ3 (master IR3,
+    /// vector `0x0B`); NS16550A register behavior is base-relative.
+    #[test]
+    fn com2_thre_asserts_irq3_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq3(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), None);
+
+            bus.port_out_u8(0x2F9, 0x02).unwrap(); // IER ETBEI on COM2
+            assert_eq!(bus.poll_external_irq(), Some(0x0B));
+            assert_eq!(bus.poll_external_irq(), None);
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.master.isr, 0);
+    }
+
+    /// Spec: NS16550A — reading IIR while THRE is the reported source clears the
+    /// interrupt, dropping the ISA IR pin; a later THR write re-arms it. IRQ4 is
+    /// edge-triggered (ICW1.LTIM=0, ELCR clear), so redelivery needs that edge.
+    #[test]
+    fn com1_iir_read_drops_irq4_until_next_thr_write() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq4(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(0x3F9, 0x02).unwrap();
+            assert_eq!(bus.poll_external_irq(), Some(0x0C));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+
+            // Line still high but no new edge → no redelivery.
+            assert_eq!(bus.poll_external_irq(), None);
+
+            assert_eq!(bus.port_in_u8(0x3FA).unwrap(), 0x02); // IIR THRE, clears
+            assert_eq!(bus.poll_external_irq(), None);
+
+            bus.port_out_u8(0x3F8, u32::from(b'A') as u8).unwrap();
+            assert_eq!(bus.poll_external_irq(), Some(0x0C));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.com1_text(), "A");
+    }
+
+    /// Spec: COM1 and COM2 are independent ISA IR sources (IRQ4 vs IRQ3).
+    #[test]
+    fn com1_and_com2_irq_lines_are_independent() {
+        let mut m = Machine::new(64 * 1024);
+        // Unmask both IR3 and IR4 on the master.
+        init_at_pic_unmask_irq4(&mut m);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xE7);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(0x2F9, 0x02).unwrap(); // COM2 only
+            assert_eq!(bus.poll_external_irq(), Some(0x0B));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        assert!(!m.com1.irq_line());
+        assert!(m.com2.irq_line());
+    }
+
+    /// Host-side sync helpers mirror the [`MachineBus::poll_external_irq`] wiring.
+    #[test]
+    fn sync_com_irq_helpers_follow_device_lines() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq4(&mut m);
+        m.com1.port_write(0x3F9, 1, 0x02);
+        m.com2.port_write(0x2F9, 1, 0x02);
+        m.sync_com1_irq4();
+        m.sync_com2_irq3();
+        assert_eq!(m.pic.master.irr & 0x18, 0x18);
+    }
+
+    /// Spec: SDM Vol. 3 §6.8.1 + Intel 8259A vector = ICW2 base | IR — a THRE
+    /// interrupt with IF=1 vectors through real-mode IVT entry `0x0C`.
+    #[test]
+    fn guest_sti_delivers_com1_irq4_via_ivt() {
+        let mut m = Machine::new(64 * 1024);
+        // IVT[0x0C] → 0000:0E00; handler HLT.
+        m.mem.write_u8(0x0C * 4, 0x00).unwrap();
+        m.mem.write_u8(0x0C * 4 + 1, 0x0E).unwrap();
+        m.mem.write_u8(0x0C * 4 + 2, 0x00).unwrap();
+        m.mem.write_u8(0x0C * 4 + 3, 0x00).unwrap();
+        m.mem.write_u8(0x0E00, 0xF4).unwrap();
+        m.mem.write_u8(0, 0x90).unwrap(); // NOP
+        m.mem.write_u8(1, 0xF4).unwrap(); // HLT
+        init_at_pic_unmask_irq4(&mut m);
+        m.com1.port_write(0x3F9, 1, 0x02); // IER ETBEI → THRE interrupt pending
+
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.ss = x86_core::SegmentReg::real_mode(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        m.cpu.halted = false;
+        m.cpu.set_interrupt_flag(true);
+
+        m.step().unwrap();
+
+        assert_eq!(m.cpu.ip16(), 0x0E00);
+        assert!(!m.cpu.interrupt_flag());
+        assert_eq!(m.pic.master.isr, 0x10);
+    }
+
+    /// Write a big-endian `FWCfgDmaAccess { control, length, address }` into RAM.
+    fn put_fw_cfg_dma_access(m: &mut Machine, at: u64, control: u32, length: u32, address: u64) {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&control.to_be_bytes());
+        bytes.extend_from_slice(&length.to_be_bytes());
+        bytes.extend_from_slice(&address.to_be_bytes());
+        for (i, b) in bytes.into_iter().enumerate() {
+            m.mem.write_u8(at + i as u64, b).unwrap();
+        }
+    }
+
+    /// Spec: QEMU fw_cfg "Guest-side DMA Interface" — writing the low half of
+    /// the big-endian address register at `0x518` triggers the operation
+    /// described by the `FWCfgDmaAccess` structure in guest RAM.
+    #[test]
+    fn machine_bus_fw_cfg_dma_read_copies_item_into_phys_mem() {
+        let mut m = Machine::new(64 * 1024);
+        put_fw_cfg_dma_access(
+            &mut m,
+            0x1000,
+            FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (u32::from(FW_CFG_SIGNATURE) << 16),
+            4,
+            0x2000,
+        );
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_HIGH, 0).unwrap();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_LOW, 0x1000u32.swap_bytes())
+                .unwrap();
+        }
+
+        let copied: Vec<u8> = (0..4).map(|i| m.mem.read_u8(0x2000 + i).unwrap()).collect();
+        assert_eq!(copied, FW_CFG_SIGNATURE_BYTES);
+        // Control writeback: all bits clear on success.
+        let control: Vec<u8> = (0..4).map(|i| m.mem.read_u8(0x1000 + i).unwrap()).collect();
+        assert_eq!(control, [0, 0, 0, 0]);
+        assert!(!m.fw_cfg.dma_pending());
+        assert_eq!(m.fw_cfg.dma_address(), 0);
+    }
+
+    /// The RAM-size item the machine configures is reachable over DMA too.
+    #[test]
+    fn machine_bus_fw_cfg_dma_reads_configured_ram_size() {
+        let ram_size = 64 * 1024usize;
+        let mut m = Machine::new(ram_size);
+        put_fw_cfg_dma_access(
+            &mut m,
+            0x1000,
+            FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (u32::from(FW_CFG_RAM_SIZE) << 16),
+            8,
+            0x2000,
+        );
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_HIGH, 0).unwrap();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_LOW, 0x1000u32.swap_bytes())
+                .unwrap();
+        }
+
+        let copied: Vec<u8> = (0..8).map(|i| m.mem.read_u8(0x2000 + i).unwrap()).collect();
+        assert_eq!(copied, (ram_size as u64).to_le_bytes());
+    }
+
+    /// Spec: reading the DMA address register returns `QEMU CFG` big-endian, and
+    /// ID bit1 advertises the interface now that the machine services it.
+    #[test]
+    fn machine_bus_fw_cfg_dma_signature_and_id_bit() {
+        let mut m = Machine::new(64 * 1024);
+        let mut bus = m.bus_mut();
+        assert_eq!(
+            bus.port_in_u32(FW_CFG_DMA_ADDR_HIGH).unwrap(),
+            ((FW_CFG_DMA_SIGNATURE >> 32) as u32).swap_bytes()
+        );
+        bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_ID).unwrap();
+        let id: Vec<u8> = (0..4)
+            .map(|_| bus.port_in_u8(FW_CFG_DATA).unwrap())
+            .collect();
+        assert_eq!(
+            u32::from_le_bytes(id.try_into().unwrap()),
+            FW_CFG_VERSION | FW_CFG_VERSION_DMA
+        );
+    }
+
+    /// A DMA write request is refused with the spec error bit (no item
+    /// writeability in this tree) and leaves guest RAM and the item alone.
+    #[test]
+    fn machine_bus_fw_cfg_dma_write_direction_sets_error_bit() {
+        let mut m = Machine::new(64 * 1024);
+        put_fw_cfg_dma_access(
+            &mut m,
+            0x1000,
+            FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_WRITE | (u32::from(FW_CFG_SIGNATURE) << 16),
+            4,
+            0x2000,
+        );
+        for i in 0..4 {
+            m.mem.write_u8(0x2000 + i, b'Z').unwrap();
+        }
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_HIGH, 0).unwrap();
+            bus.port_out_u32(FW_CFG_DMA_ADDR_LOW, 0x1000u32.swap_bytes())
+                .unwrap();
+        }
+
+        let control: Vec<u8> = (0..4).map(|i| m.mem.read_u8(0x1000 + i).unwrap()).collect();
+        assert_eq!(
+            u32::from_be_bytes(control.try_into().unwrap()),
+            FW_CFG_DMA_CTL_ERROR
+        );
+        let mut bus = m.bus_mut();
+        bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_SIGNATURE).unwrap();
+        let sig: Vec<u8> = (0..4)
+            .map(|_| bus.port_in_u8(FW_CFG_DATA).unwrap())
+            .collect();
+        assert_eq!(sig, FW_CFG_SIGNATURE_BYTES);
     }
 
     /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
@@ -1598,8 +1976,9 @@ mod tests {
                 bus.port_in_u8(I8042_STATUS_CMD).unwrap() & (STATUS_OBF | STATUS_IBF),
                 0
             );
-            assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF); // POST — unimplemented
-            bus.port_out_u8(0x80, 0xAA).unwrap(); // ignored
+            // POST diagnostic port: write-only latch, reads stay open bus.
+            assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF);
+            bus.port_out_u8(0x80, 0xAA).unwrap();
             bus.port_out_u8(0x3F8, b'Z').unwrap();
             bus.port_out_u8(0x2F8, b'Y').unwrap();
             bus.port_out_u8(0x402, b'!').unwrap();
@@ -1610,8 +1989,54 @@ mod tests {
         assert_eq!(m.com1_text(), "Z");
         assert_eq!(m.com2_text(), "Y");
         assert_eq!(m.debug_text(), "!");
+        assert_eq!(m.post_diag.last_code(), Some(0xAA));
         assert!(!m.pic.master.initialized);
         assert!(!m.pit.channel0().count_loaded);
+    }
+
+    /// Spec: IBM PC/AT Technical Reference — port `0x80` is the manufacturing
+    /// diagnostic (POST checkpoint) port. Writes latch a code for a POST card;
+    /// the system board defines no read data, so reads stay ISA open bus.
+    #[test]
+    fn machine_bus_post_code_port_80_captures_history() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            for code in [0x01u8, 0x0D, 0x2C] {
+                bus.port_out_u8(POST_DIAG_PORT, code).unwrap();
+            }
+            assert_eq!(bus.port_in_u8(POST_DIAG_PORT).unwrap(), 0xFF);
+            // Wider accesses latch the low byte only (byte-wide port).
+            bus.port_out_u16(POST_DIAG_PORT, 0xBEEF).unwrap();
+        }
+        assert_eq!(m.post_diag.history(), [0x01, 0x0D, 0x2C, 0xEF]);
+        assert_eq!(m.post_diag.last_code(), Some(0xEF));
+        assert_eq!(m.post_diag.write_count(), 4);
+        assert!(!m.post_diag.history_overflow());
+    }
+
+    /// The bounded history flags overflow instead of growing without limit.
+    #[test]
+    fn post_code_history_is_bounded_and_reset_clears_it() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            for i in 0..(POST_CODE_HISTORY_LIMIT + 3) {
+                bus.port_out_u8(POST_DIAG_PORT, i as u8).unwrap();
+            }
+        }
+        assert_eq!(m.post_diag.history().len(), POST_CODE_HISTORY_LIMIT);
+        assert!(m.post_diag.history_overflow());
+        assert_eq!(
+            m.post_diag.write_count(),
+            POST_CODE_HISTORY_LIMIT as u64 + 3
+        );
+
+        m.reset();
+
+        assert!(m.post_diag.history().is_empty());
+        assert_eq!(m.post_diag.last_code(), None);
+        assert!(!m.post_diag.history_overflow());
     }
 
     /// Spec: NS16550A / classic PC COM2 `0x2F8`–`0x2FF` — THR OUT + LSR poll on MachineBus.
@@ -3452,7 +3877,8 @@ mod tests {
             for byte in &mut id {
                 *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
             }
-            assert_eq!(id, [0x01, 0x00, 0x00, 0x00]);
+            // Base revision + DMA interface (the machine services `0x514`).
+            assert_eq!(id, [0x03, 0x00, 0x00, 0x00]);
 
             bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_RAM_SIZE_SELECTOR)
                 .unwrap();
@@ -3482,7 +3908,7 @@ mod tests {
         for byte in &mut id {
             *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
         }
-        assert_eq!(id, [0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(id, [0x03, 0x00, 0x00, 0x00]);
 
         bus.port_out_u16(FW_CFG_SELECTOR, FW_CFG_RAM_SIZE_SELECTOR)
             .unwrap();

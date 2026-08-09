@@ -2,8 +2,10 @@
 //!
 //! 16550 programming model is intentionally minimal (M1/M2 debug UART): writes
 //! to THR (when DLAB=0) and writes to `0x402` append bytes to a per-port sink.
-//! IER/IIR expose the transmitter-holding-register-empty interrupt; routing that
-//! signal to the PIC remains a machine concern.
+//! IER/IIR expose the transmitter-holding-register-empty interrupt as
+//! [`Serial16550::irq_line`]; the machine routes COM1 → IRQ4 and COM2 → IRQ3.
+//! There is no receive path, so received-data-available (IER bit0 / IIR `100b`)
+//! is never signalled.
 //! Spec: NS16550A / classic PC COM1–COM2 I/O map (THR/RBR/IER/IIR/LSR subset).
 
 use crate::PortDevice;
@@ -85,7 +87,11 @@ impl Serial16550 {
         &mut self.output
     }
 
-    /// Current device-level interrupt signal; external COM IRQ routing is out of scope.
+    /// Current device-level interrupt signal (THRE only).
+    ///
+    /// Spec: NS16550A IER bit1 (ETBEI) gates the THRE interrupt. The host wires
+    /// this to ISA IRQ4 (COM1 base `0x3F8`) or IRQ3 (COM2 base `0x2F8`).
+    /// Received-data-available is not modeled — this UART has no receive path.
     pub fn irq_line(&self) -> bool {
         self.ier & IER_THRE != 0 && self.thre_interrupt_pending
     }
