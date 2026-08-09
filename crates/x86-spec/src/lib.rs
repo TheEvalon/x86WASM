@@ -1199,14 +1199,31 @@ pub const M1_SUBSET: &[InstrDef] = &[
         opcode: 0xE4,
         encoding: Encoding::Imm8Port,
         width: Width::W8,
-        sdm: "IN",
+        sdm: "IN AL, imm8",
+    },
+    // `IN eAX, imm8` / `OUT imm8, eAX` — the port number stays an imm8 at
+    // every operand size; only the accumulator width follows the operand-size
+    // attribute. Spec: Intel SDM Vol. 2 "IN"/"OUT"; Appendix A opcode map 1.
+    InstrDef {
+        mnemonic: "IN_imm8",
+        opcode: 0xE5,
+        encoding: Encoding::Imm8Port,
+        width: Width::OsZ,
+        sdm: "IN eAX, imm8",
     },
     InstrDef {
         mnemonic: "OUT_imm8",
         opcode: 0xE6,
         encoding: Encoding::Imm8Port,
         width: Width::W8,
-        sdm: "OUT",
+        sdm: "OUT imm8, AL",
+    },
+    InstrDef {
+        mnemonic: "OUT_imm8",
+        opcode: 0xE7,
+        encoding: Encoding::Imm8Port,
+        width: Width::OsZ,
+        sdm: "OUT imm8, eAX",
     },
     InstrDef {
         mnemonic: "CALL",
@@ -1241,14 +1258,31 @@ pub const M1_SUBSET: &[InstrDef] = &[
         opcode: 0xEC,
         encoding: Encoding::None,
         width: Width::W8,
-        sdm: "IN",
+        sdm: "IN AL, DX",
+    },
+    // `IN eAX, DX` / `OUT DX, eAX` — no immediate; the accumulator width
+    // follows the operand-size attribute.
+    // Spec: Intel SDM Vol. 2 "IN"/"OUT"; Appendix A opcode map 1.
+    InstrDef {
+        mnemonic: "IN_DX",
+        opcode: 0xED,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "IN eAX, DX",
     },
     InstrDef {
         mnemonic: "OUT_DX",
         opcode: 0xEE,
         encoding: Encoding::None,
         width: Width::W8,
-        sdm: "OUT",
+        sdm: "OUT DX, AL",
+    },
+    InstrDef {
+        mnemonic: "OUT_DX",
+        opcode: 0xEF,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "OUT DX, eAX",
     },
     InstrDef {
         mnemonic: "HLT",
@@ -1717,6 +1751,35 @@ mod tests {
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
         assert!(lookup_0f(0x20).is_some(), "missing 0F 20 MOV r32,CRn");
         assert!(lookup_0f(0x22).is_some(), "missing 0F 22 MOV CRn,r32");
+    }
+
+    /// Intel SDM Vol. 2 "IN—Input from Port" / "OUT—Output to Port"; Appendix A
+    /// opcode map 1: both the fixed-`AL` byte forms and the accumulator forms
+    /// that follow the operand-size attribute are present. The port number of
+    /// `E4`–`E7` is an imm8 at every operand size.
+    #[test]
+    fn subset_includes_accumulator_port_io_at_both_operand_sizes() {
+        for (opcode, encoding) in [
+            (0xE4u8, Encoding::Imm8Port),
+            (0xE5, Encoding::Imm8Port),
+            (0xE6, Encoding::Imm8Port),
+            (0xE7, Encoding::Imm8Port),
+            (0xEC, Encoding::None),
+            (0xED, Encoding::None),
+            (0xEE, Encoding::None),
+            (0xEF, Encoding::None),
+        ] {
+            let def = lookup_primary(opcode)
+                .unwrap_or_else(|| panic!("missing primary opcode {opcode:#04X}"));
+            assert_eq!(def.encoding, encoding, "{opcode:#04X} encoding");
+            // Even opcodes are the fixed byte forms; odd ones follow OsZ.
+            let expected_width = if opcode.is_multiple_of(2) {
+                Width::W8
+            } else {
+                Width::OsZ
+            };
+            assert_eq!(def.width, expected_width, "{opcode:#04X} width");
+        }
     }
 
     /// Intel SDM Vol. 2 "Jcc" / "SETcc" (opcode map 2): the whole `0F 80`–`0F 8F`

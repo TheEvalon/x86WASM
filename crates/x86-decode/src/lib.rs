@@ -2315,6 +2315,51 @@ mod tests {
         }
     }
 
+    /// Intel SDM Vol. 2 "IN"/"OUT"; Appendix A opcode map 1: the accumulator
+    /// port forms `E5`/`E7`/`ED`/`EF` decode at both operand sizes, and the
+    /// `imm8` port number stays one byte in every case.
+    #[test]
+    fn decode_accumulator_port_io_forms() {
+        for (op, mnemonic) in [(0xEDu8, "IN_DX"), (0xEF, "OUT_DX")] {
+            let d = decode(&[op]).unwrap();
+            assert!(!d.two_byte);
+            assert_eq!(d.opcode, op);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert!(d.modrm.is_none());
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 1);
+            assert!(
+                !d.operand_size_32,
+                "{op:02X} defaults to 16-bit in LEGACY16"
+            );
+
+            // `0x66` selects 32 under a 16-bit default and 16 under `D=1`.
+            let d = decode(&[0x66, op]).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.length, 2);
+            let d = decode_with_mode(&[op], DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            let d = decode_with_mode(&[0x66, op], DecodeMode::DEFAULT32).unwrap();
+            assert!(!d.operand_size_32);
+        }
+
+        for (op, mnemonic) in [(0xE5u8, "IN_imm8"), (0xE7, "OUT_imm8")] {
+            let d = decode(&[op, 0x70]).unwrap();
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.immediate, 0x70);
+            assert_eq!(d.length, 2);
+            assert!(!d.operand_size_32);
+
+            // A 32-bit operand size does not widen the port immediate.
+            let d = decode_with_mode(&[op, 0xCF], DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.immediate, 0xCF);
+            assert_eq!(d.length, 2);
+
+            assert_eq!(decode(&[op]), Err(DecodeError::Truncated));
+        }
+    }
+
     /// Intel SDM Vol. 2 "RET" (near/far imm16): the stack-release immediate is
     /// always 16 bits, independent of the operand-size attribute.
     #[test]

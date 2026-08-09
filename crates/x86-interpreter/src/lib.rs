@@ -2332,6 +2332,57 @@ fn outsd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resu
     Ok(())
 }
 
+/// `IN` into the accumulator (`E4`/`E5`/`EC`/`ED`), no IP update.
+///
+/// `byte_form` is the fixed-`AL` encoding (`E4`/`EC`); otherwise the
+/// operand-size attribute selects `AX` or `EAX`. A 16-bit destination writes
+/// only `AX`, leaving `EAX[31:16]` untouched (SDM Vol. 1 §3.4.1.1). The access
+/// goes through the width-specific `Bus` port accessors, the same ones
+/// `INSB`/`INSW`/`INSD` use, so a word or doubleword port sees one access of
+/// that width. No flags are affected.
+/// Spec: Intel SDM Vol. 2 "IN—Input from Port"; Vol. 1 §3.6 (Table 3-4).
+fn port_in_accumulator(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    port: u16,
+    byte_form: bool,
+) -> Result<(), ExecError> {
+    if byte_form {
+        let v = bus.port_in_u8(port)?;
+        cpu.set_al(v);
+    } else if opsz32(insn) {
+        let v = bus.port_in_u32(port)?;
+        cpu.set_eax(v);
+    } else {
+        let v = bus.port_in_u16(port)?;
+        cpu.set_ax(v);
+    }
+    Ok(())
+}
+
+/// `OUT` from the accumulator (`E6`/`E7`/`EE`/`EF`), no IP update.
+///
+/// Mirrors [`port_in_accumulator`]: `byte_form` writes `AL`, otherwise the
+/// operand-size attribute selects `AX` or `EAX`, and the transfer is one
+/// access of that width. No flags are affected.
+/// Spec: Intel SDM Vol. 2 "OUT—Output to Port"; Vol. 1 §3.6 (Table 3-4).
+fn port_out_accumulator(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    port: u16,
+    byte_form: bool,
+) -> Result<(), ExecError> {
+    if byte_form {
+        bus.port_out_u8(port, cpu.al())
+    } else if opsz32(insn) {
+        bus.port_out_u32(port, cpu.eax())
+    } else {
+        bus.port_out_u16(port, cpu.ax())
+    }
+}
+
 /// Architectural `#NMI` vector (Intel SDM Vol. 3 §6.3.3 / §6.15).
 const VECTOR_NMI: u8 = 2;
 
@@ -3093,8 +3144,8 @@ fn jcc_condition(cpu: &CpuState, opcode: u8) -> bool {
 /// **Rule (sparse tables):** do **not** treat every `UnsupportedOpcode` as `#UD`.
 /// Only opcodes the SDM classifies as invalid/unrecognized in real mode vector
 /// through the IVT. Valid-but-unimplemented primaries (x87 `D8`–`DF`, `WAIT`/`9B`,
-/// `IN`/`OUT` EAX forms `E5`/`E7`/`ED`/`EF`, two-byte escape `0F`, Grp1 alias `82`,
-/// …) remain host `Decode(UnsupportedOpcode)`.
+/// two-byte escape `0F` secondaries with no entry, Grp1 alias `82`, …) remain
+/// host `Decode(UnsupportedOpcode)`.
 ///
 /// Note: `D6` and `F1` are reserved/undefined but do **not** generate `#UD`
 /// (Intel SDM Vol. 3 §6.15 — Invalid Opcode Exception).
@@ -4206,26 +4257,34 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             cpu.set_direction_flag(true);
             set_current_ip(cpu, next_ip);
         }
-        0xEC => {
+        0xEC | 0xED => {
+            // IN AL, DX / IN eAX, DX — Spec: Intel SDM Vol. 2 "IN—Input from
+            // Port". `DX` supplies the full 16-bit port number in every mode.
+            // Unsupported here: the protected-mode IOPL / TSS I/O-permission
+            // `#GP(0)` (CPL 0 only, no TSS) and the VM86 I/O bitmap.
             let port = cpu.gpr_u16(CpuState::RDX);
-            let v = bus.port_in_u8(port)?;
-            cpu.set_al(v);
+            port_in_accumulator(cpu, bus, &insn, port, op == 0xEC)?;
             set_current_ip(cpu, next_ip);
         }
-        0xEE => {
+        0xEE | 0xEF => {
+            // OUT DX, AL / OUT DX, eAX — Spec: Intel SDM Vol. 2 "OUT—Output to
+            // Port".
             let port = cpu.gpr_u16(CpuState::RDX);
-            bus.port_out_u8(port, cpu.al())?;
+            port_out_accumulator(cpu, bus, &insn, port, op == 0xEE)?;
             set_current_ip(cpu, next_ip);
         }
-        0xE4 => {
+        0xE4 | 0xE5 => {
+            // IN AL, imm8 / IN eAX, imm8 — the imm8 is the port number, so only
+            // ports 0x00–0xFF are reachable through this form.
+            // Spec: Intel SDM Vol. 2 "IN—Input from Port".
             let port = insn.immediate as u16;
-            let v = bus.port_in_u8(port)?;
-            cpu.set_al(v);
+            port_in_accumulator(cpu, bus, &insn, port, op == 0xE4)?;
             set_current_ip(cpu, next_ip);
         }
-        0xE6 => {
+        0xE6 | 0xE7 => {
+            // OUT imm8, AL / OUT imm8, eAX — Spec: Intel SDM Vol. 2 "OUT".
             let port = insn.immediate as u16;
-            bus.port_out_u8(port, cpu.al())?;
+            port_out_accumulator(cpu, bus, &insn, port, op == 0xE6)?;
             set_current_ip(cpu, next_ip);
         }
         0xE0..=0xE2 => {
@@ -9581,6 +9640,184 @@ mod tests {
         assert_eq!(cpu.gpr_u16(CpuState::RSI), 0x5004);
     }
 
+    /// Real-mode fixture over the size-recording port bus used by the
+    /// accumulator `IN`/`OUT` tests. `in_bytes` feeds successive `port_in_u8`
+    /// calls, so a word read consumes two and a doubleword read four.
+    fn port_fixture(code: &[u8], in_bytes: Vec<u8>) -> (CpuState, PortSeqBus) {
+        let mut mem = vec![0u8; 0x10000];
+        mem[..code.len()].copy_from_slice(code);
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+        cpu.ds = x86_core::SegmentReg::real_mode(0);
+        cpu.es = x86_core::SegmentReg::real_mode(0);
+        cpu.ss = x86_core::SegmentReg::real_mode(0);
+        cpu.rip = 0;
+        (
+            cpu,
+            PortSeqBus {
+                mem,
+                in_bytes,
+                in_idx: 0,
+                outs: vec![],
+            },
+        )
+    }
+
+    /// Intel SDM Vol. 2 "IN—Input from Port": `EC` always loads `AL`, while
+    /// `ED` loads `AX` or `EAX` from the operand-size attribute. A 16-bit
+    /// destination leaves the upper half of `EAX` untouched (Vol. 1 §3.4.1.1),
+    /// and no form writes flags.
+    #[test]
+    fn accumulator_in_destination_width_follows_operand_size() {
+        // EC = IN AL, DX — one byte into AL only.
+        let (mut cpu, mut bus) = port_fixture(&[0xEC], vec![0x5A]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        let flags = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_445A);
+        assert_eq!(cpu.rflags, flags, "IN must not write flags");
+        assert_eq!(cpu.ip16(), 1);
+
+        // ED = IN AX, DX under a 16-bit operand size.
+        let (mut cpu, mut bus) = port_fixture(&[0xED], vec![0x34, 0x12]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        let flags = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_3333_1234);
+        assert_eq!(cpu.rflags, flags);
+        assert_eq!(cpu.ip16(), 1);
+
+        // 66 ED = IN EAX, DX.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xED], vec![0x01, 0x02, 0x03, 0x04]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        cpu.gpr[CpuState::RAX] = 0x1111_2222_3333_4444;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr[CpuState::RAX], 0x1111_2222_0403_0201);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    /// Intel SDM Vol. 2 "OUT—Output to Port": `EE` always writes `AL`, while
+    /// `EF` writes `AX` or `EAX` in one access of that width through the
+    /// size-aware bus accessors, not as a sequence of byte writes.
+    #[test]
+    fn accumulator_out_source_width_follows_operand_size() {
+        // EE = OUT DX, AL.
+        let (mut cpu, mut bus) = port_fixture(&[0xEE], vec![]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        let flags = cpu.rflags;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 1, 0x78)]);
+        assert_eq!(cpu.rflags, flags, "OUT must not write flags");
+
+        // EF = OUT DX, AX under a 16-bit operand size.
+        let (mut cpu, mut bus) = port_fixture(&[0xEF], vec![]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 2, 0x5678)]);
+        assert_eq!(cpu.ip16(), 1);
+
+        // 66 EF = OUT DX, EAX.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xEF], vec![]);
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1234_5678);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 4, 0x1234_5678)]);
+        assert_eq!(cpu.ip16(), 2);
+    }
+
+    /// Intel SDM Vol. 2 "IN"/"OUT": the `E5`/`E7` port number is an `imm8` at
+    /// every operand size, and only the accumulator width changes.
+    #[test]
+    fn accumulator_port_imm8_forms_keep_a_byte_port_number() {
+        // E5 70 = IN AX, 0x70.
+        let (mut cpu, mut bus) = port_fixture(&[0xE5, 0x70], vec![0xCD, 0xAB]);
+        cpu.gpr[CpuState::RAX] = 0x0000_0000_FFFF_FFFF;
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xFFFF_ABCD);
+        assert_eq!(cpu.ip16(), 2);
+
+        // 66 E5 70 = IN EAX, 0x70.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xE5, 0x70], vec![0x11, 0x22, 0x33, 0x44]);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x4433_2211);
+        assert_eq!(cpu.ip16(), 3);
+
+        // E7 71 = OUT 0x71, AX.
+        let (mut cpu, mut bus) = port_fixture(&[0xE7, 0x71], vec![]);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x71, 2, 0xBEEF)]);
+        assert_eq!(cpu.ip16(), 2);
+
+        // 66 E7 71 = OUT 0x71, EAX.
+        let (mut cpu, mut bus) = port_fixture(&[0x66, 0xE7, 0x71], vec![]);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x71, 4, 0xDEAD_BEEF)]);
+        assert_eq!(cpu.ip16(), 3);
+    }
+
+    /// Intel SDM Vol. 2 "IN"/"OUT"; Vol. 1 §3.6 Table 3-4: in a `CS.D=1` code
+    /// segment `EF` is `OUT DX, EAX` and `66 ED` is `IN AX, DX`. This is the
+    /// exact byte sequence SeaBIOS uses to drive PCI configuration Mechanism #1
+    /// at `0xCF8`/`0xCFC`, so the two widths appear back to back.
+    #[test]
+    fn accumulator_port_io_default_sizes_invert_under_cs_d1() {
+        // EF = OUT DX, EAX (32-bit default), then 66 ED = IN AX, DX.
+        let (mut cpu, bus) = pm32_fixture(&[0xEF, 0x66, 0xED], PM32_CODE, true);
+        let mut bus = PortSeqBus {
+            mem: bus.mem,
+            in_bytes: vec![0x77, 0x66],
+            in_idx: 0,
+            outs: vec![],
+        };
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CF8);
+        cpu.set_gpr_u32(CpuState::RAX, 0x8000_0000);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.outs, [(0x0CF8, 4, 0x8000_0000)]);
+        assert_eq!(cpu.rip, (PM32_CODE + 1) as u64);
+
+        cpu.set_gpr_u16(CpuState::RDX, 0x0CFC);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x8000_6677);
+        assert_eq!(cpu.rip, (PM32_CODE + 3) as u64);
+    }
+
+    /// The accumulator forms and the `INS`/`OUTS` string forms must reach the
+    /// bus through the same width-specific accessors, so a word or doubleword
+    /// transfer is one access of that width either way.
+    /// Spec: Intel SDM Vol. 2 "IN"/"OUT"/"INS"/"OUTS".
+    #[test]
+    fn accumulator_and_string_port_io_use_the_same_access_widths() {
+        for (accumulator, string_op, width, value) in [
+            (vec![0xEEu8], vec![0x6Eu8], 1u8, 0x5Au32),
+            (vec![0xEF], vec![0x6F], 2, 0xBEEF),
+            (vec![0x66, 0xEF], vec![0x66, 0x6F], 4, 0xDEAD_BEEF),
+        ] {
+            let (mut cpu, mut bus) = port_fixture(&accumulator, vec![]);
+            cpu.set_gpr_u16(CpuState::RDX, 0x1F0);
+            cpu.set_gpr_u32(CpuState::RAX, value);
+            step(&mut cpu, &mut bus).unwrap();
+            let accumulator_outs = bus.outs.clone();
+
+            let (mut cpu, mut bus) = port_fixture(&string_op, vec![]);
+            cpu.set_gpr_u16(CpuState::RDX, 0x1F0);
+            cpu.set_gpr_u16(CpuState::RSI, 0x2000);
+            bus.mem[0x2000..0x2004].copy_from_slice(&value.to_le_bytes());
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(
+                accumulator_outs, bus.outs,
+                "width {width} accumulator and string OUT must match"
+            );
+            assert_eq!(accumulator_outs[0].1, width);
+        }
+    }
+
     /// Short Jcc take/not-take for unsigned and signed conditions (SDM Vol. 2 Jcc).
     #[test]
     fn jcc_short_conditions() {
@@ -10655,7 +10892,7 @@ mod tests {
     /// Decode-miss #UD policy (sparse primary table).
     ///
     /// - Architecturally invalid in real-address mode (e.g. ARPL 0x63) → IVT vector 6.
-    /// - Valid-but-unimplemented (x87, WAIT, IN/OUT EAX, unimplemented 0F map, …) stay host Decode errors.
+    /// - Valid-but-unimplemented (x87, WAIT, unimplemented 0F map, …) stay host Decode errors.
     /// - D6/F1 are reserved/undefined but do **not** generate #UD (SDM Vol. 3 §6.15).
     ///
     /// Spec: Intel SDM Vol. 3 §6.15 (#UD); Vol. 2 ARPL (real-address mode).
@@ -10687,7 +10924,10 @@ mod tests {
         assert_eq!(bus.read_u16(0xFFFA).unwrap(), 0x0100);
 
         // Sparse-table misses that are valid-but-unimplemented must NOT become #UD.
-        for &op in &[0x9Bu8, 0xD8, 0xED, 0xD6, 0xF1] {
+        // `0xED` used to stand in for the unimplemented accumulator port I/O
+        // forms; it now decodes and executes, so another x87 escape (`0xDF`)
+        // covers the same policy.
+        for &op in &[0x9Bu8, 0xD8, 0xDF, 0xD6, 0xF1] {
             let mut mem = vec![0u8; 0x10000];
             mem[6 * 4] = 0x00;
             mem[6 * 4 + 1] = 0x0B;
