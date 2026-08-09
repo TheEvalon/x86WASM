@@ -62,3 +62,51 @@ Not supported:
 - Any notion of port access size being rejected by the CPU; whether a device
   answers a wider access than it implements is the bus's and the device's
   business, not the interpreter's.
+
+## Slice 2 — segment `PUSH`/`POP` operand-size consistency
+
+Spec: SDM Vol. 2 "PUSH" and "POP" (Operation, segment-register source and
+destination); Vol. 1 §6.2 (stack behavior, `StackAddrSize`); Vol. 3 §§3.4.5.1
+(`B` flag), 5.4.1, 6.8.3.
+
+Round 2 added `PUSH`/`POP FS`/`GS` (`0F A0`/`A1`/`A8`/`A9`) that size the stack
+slot from the operand-size attribute, but left the primary-map `ES`/`CS`/`SS`/`DS`
+forms (`06`/`0E`/`16`/`1E` and `07`/`17`/`1F`) always using a 16-bit slot. On a
+32-bit stack that is a live corruption risk: firmware that pushes `DS` and pops
+it with the two-byte encoding — or interleaves segment pushes with `PUSH`
+`imm32` — would see the pointer drift by two bytes per operation.
+
+Supported now:
+
+- All seven primary-map forms take the slot width from the operand-size
+  attribute: a word by default in a `D=0` code segment and a doubleword under
+  `D=1`, with `0x66` inverting either default. The stack-pointer width still
+  comes from `SS.B` independently.
+- A 32-bit `PUSH` writes the **zero-extended** selector into the doubleword slot.
+  The SDM permits either that or a 16-bit move that leaves the upper half of the
+  slot unmodified; this model zero-extends, which is the same choice the
+  `0F A0`-family already made, so the two encodings are now byte-identical. A
+  test asserts that directly rather than assuming it.
+- A 32-bit `POP` releases four bytes and loads the segment register from the low
+  word, discarding the upper half.
+- `POP SS` keeps arming the maskable-interrupt shadow, and its committed pointer
+  still uses the *old* `SS.B` window because the pop happens through the old
+  stack segment.
+- Protected-mode `POP` still validates the descriptor through the shared
+  data/stack-segment paths before either the pointer or the cache commits.
+
+Behavior change and test impact:
+
+This intentionally changes existing behavior. **No existing test needed
+updating**, and that is itself the finding: nothing in the suite pushed or popped
+a primary-map segment register at a 32-bit operand size, which is exactly why the
+inconsistency survived round 2. Four new tests cover the word and doubleword
+slots for push and pop, the primary-versus-two-byte agreement at both operand
+sizes, and `POP SS` with a doubleword slot.
+
+Not supported:
+
+- Loading `SS` from the LDT, privilege-level changes, or expand-down stacks.
+- The 64-bit forms (`PUSH FS`/`GS` with a 64-bit slot; `PUSH ES`/`CS`/`SS`/`DS`
+  do not exist in 64-bit mode at all).
+- `POP CS`, which is not an instruction — `0x0F` is the two-byte escape.

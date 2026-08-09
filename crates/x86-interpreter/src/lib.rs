@@ -4133,42 +4133,34 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     }
 
     match op {
-        0x06 => {
-            // PUSH ES — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.es.selector)?;
+        0x06 | 0x0E | 0x16 | 0x1E => {
+            // PUSH ES / CS / SS / DS — Spec: Intel SDM Vol. 2 "PUSH"; Vol. 1
+            // §6.2. The stack slot follows the operand-size attribute exactly
+            // as the two-byte `PUSH FS`/`GS` forms do; the stack-pointer width
+            // itself follows `SS.B`.
+            let selector = match op {
+                0x06 => cpu.es.selector,
+                0x0E => cpu.cs.selector,
+                0x16 => cpu.ss.selector,
+                _ => cpu.ds.selector,
+            };
+            push_sreg(cpu, bus, selector, opsz32(&insn))?;
             set_current_ip(cpu, next_ip);
         }
-        0x07 => {
-            // POP ES — Spec: Intel SDM Vol. 2 "POP".
-            // Unsupported: the 32-bit operand-size doubleword stack slot for the
-            // primary-map `07`/`17`/`1F` forms (still a 16-bit pop here).
-            pop_sreg(cpu, bus, 0, false)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x0E => {
-            // PUSH CS — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.cs.selector)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x16 => {
-            // PUSH SS — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.ss.selector)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x17 => {
-            // POP SS — Spec: Intel SDM Vol. 2 "POP".
-            pop_sreg(cpu, bus, 2, false)?;
-            cpu.arm_maskable_interrupt_shadow();
-            set_current_ip(cpu, next_ip);
-        }
-        0x1E => {
-            // PUSH DS — Spec: Intel SDM Vol. 2 "PUSH".
-            push16(cpu, bus, cpu.ds.selector)?;
-            set_current_ip(cpu, next_ip);
-        }
-        0x1F => {
-            // POP DS — Spec: Intel SDM Vol. 2 "POP".
-            pop_sreg(cpu, bus, 3, false)?;
+        0x07 | 0x17 | 0x1F => {
+            // POP ES / SS / DS — Spec: Intel SDM Vol. 2 "POP"; Vol. 3 §§3.5.1,
+            // 5.4.1, 6.8.3. A 32-bit operand size releases a doubleword slot
+            // and takes the selector from its low word. `POP CS` does not
+            // exist, so `0x0F` is the two-byte escape rather than a POP.
+            let sreg = match op {
+                0x07 => 0,
+                0x17 => 2,
+                _ => 3,
+            };
+            pop_sreg(cpu, bus, sreg, opsz32(&insn))?;
+            if op == 0x17 {
+                cpu.arm_maskable_interrupt_shadow();
+            }
             set_current_ip(cpu, next_ip);
         }
         0xF4 => {
@@ -19093,6 +19085,146 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP - 2);
         assert_eq!(bus.read_u16(u64::from(PM32_TEST_ESP - 2)).unwrap(), 0x1234);
+    }
+
+    /// Intel SDM Vol. 2 "PUSH" (Operation, segment-register source); Vol. 1
+    /// §6.2: the stack slot of a primary-map segment `PUSH` follows the
+    /// operand-size attribute — a word by default in a 16-bit code segment and
+    /// a doubleword holding the zero-extended selector with `0x66`.
+    #[test]
+    fn primary_map_segment_push_slot_width_follows_operand_size() {
+        for (opcode, selector) in [
+            (0x06u8, 0x1111u16),
+            (0x0E, 0x2222),
+            (0x16, 0x3333),
+            (0x1E, 0x4444),
+        ] {
+            // 16-bit operand size: a word slot.
+            let (mut cpu, mut bus) = real_mode_fixture(&[opcode], |cpu, _| {
+                cpu.es.selector = selector;
+                cpu.cs.selector = selector;
+                cpu.ss.selector = selector;
+                cpu.ds.selector = selector;
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u16(CpuState::RSP),
+                0xFFEE,
+                "{opcode:#04X} word slot"
+            );
+            assert_eq!(bus.read_u16(0xFFEE).unwrap(), selector);
+
+            // 32-bit operand size: a doubleword slot with the selector
+            // zero-extended.
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x66, opcode], |cpu, _| {
+                cpu.es.selector = selector;
+                cpu.cs.selector = selector;
+                cpu.ss.selector = selector;
+                cpu.ds.selector = selector;
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u16(CpuState::RSP),
+                0xFFEC,
+                "{opcode:#04X} doubleword slot"
+            );
+            assert_eq!(bus.read_u32(0xFFEC).unwrap(), u32::from(selector));
+        }
+    }
+
+    /// Intel SDM Vol. 2 "POP" (Operation): the operand-size attribute selects
+    /// how much the stack pointer is released; only the low word of a
+    /// doubleword slot loads into the segment register.
+    #[test]
+    fn primary_map_segment_pop_slot_width_follows_operand_size() {
+        // 1F = POP DS from a word slot.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x1F], |_, mem| {
+            mem[0xFFF0..0xFFF4].copy_from_slice(&0xAAAA_1234u32.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF2);
+
+        // 66 1F = POP DS from a doubleword slot; the upper half is discarded.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x66, 0x1F], |_, mem| {
+            mem[0xFFF0..0xFFF4].copy_from_slice(&0xAAAA_1234u32.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ds.selector, 0x1234);
+        assert_eq!(cpu.ds.base, 0x1_2340);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), 0xFFF4);
+    }
+
+    /// The primary-map (`06`/`0E`/`16`/`1E`, `07`/`17`/`1F`) and two-byte
+    /// (`0F A0`/`A1`/`A8`/`A9`) segment stack forms must size the slot by the
+    /// same rule; round 2 left the primary map always 16-bit, which corrupts a
+    /// 32-bit stack when firmware mixes the two encodings.
+    /// Spec: Intel SDM Vol. 2 "PUSH"/"POP"; Vol. 1 §6.2.
+    #[test]
+    fn primary_and_two_byte_segment_stack_slots_agree() {
+        for prefix in [Vec::new(), vec![0x66u8]] {
+            let expected_delta = if prefix.is_empty() { 4 } else { 2 };
+
+            // PUSH DS versus PUSH FS with the same selector in both registers.
+            let mut primary = prefix.clone();
+            primary.push(0x1E);
+            let mut two_byte = prefix.clone();
+            two_byte.extend_from_slice(&[0x0F, 0xA0]);
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&primary, PM32_CODE, PM32_TEST_ESP);
+            step(&mut cpu, &mut bus).unwrap();
+            let primary_esp = cpu.gpr_u32(CpuState::RSP);
+            let primary_image = bus.mem[primary_esp as usize..PM32_TEST_ESP as usize].to_vec();
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&two_byte, PM32_CODE, PM32_TEST_ESP);
+            cpu.fs = cpu.ds.clone();
+            step(&mut cpu, &mut bus).unwrap();
+            let two_byte_esp = cpu.gpr_u32(CpuState::RSP);
+            let two_byte_image = bus.mem[two_byte_esp as usize..PM32_TEST_ESP as usize].to_vec();
+
+            assert_eq!(primary_esp, two_byte_esp, "PUSH prefix {prefix:?}");
+            assert_eq!(primary_image, two_byte_image, "PUSH prefix {prefix:?}");
+            assert_eq!(PM32_TEST_ESP - primary_esp, expected_delta);
+
+            // POP DS versus POP FS from the same stack image.
+            let mut primary = prefix.clone();
+            primary.push(0x1F);
+            let mut two_byte = prefix.clone();
+            two_byte.extend_from_slice(&[0x0F, 0xA1]);
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&primary, PM32_CODE, PM32_TEST_ESP);
+            bus.mem[PM32_TEST_ESP as usize..PM32_TEST_ESP as usize + 4]
+                .copy_from_slice(&u32::from(PM32_DS).to_le_bytes());
+            step(&mut cpu, &mut bus).unwrap();
+            let primary_esp = cpu.gpr_u32(CpuState::RSP);
+
+            let (mut cpu, mut bus) = pm32_big_stack_fixture(&two_byte, PM32_CODE, PM32_TEST_ESP);
+            bus.mem[PM32_TEST_ESP as usize..PM32_TEST_ESP as usize + 4]
+                .copy_from_slice(&u32::from(PM32_DS).to_le_bytes());
+            step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(
+                primary_esp,
+                cpu.gpr_u32(CpuState::RSP),
+                "POP prefix {prefix:?}"
+            );
+            assert_eq!(primary_esp - PM32_TEST_ESP, expected_delta);
+        }
+    }
+
+    /// Intel SDM Vol. 3 §6.8.3: `POP SS` inhibits maskable interrupts through
+    /// the following instruction, and widening its stack slot does not change
+    /// that. The descriptor is validated before the pointer commits.
+    #[test]
+    fn pop_ss_with_a_32_bit_slot_still_arms_the_interrupt_shadow() {
+        let (mut cpu, mut bus) = pm32_big_stack_fixture(&[0x17], PM32_CODE, PM32_TEST_ESP);
+        bus.mem[PM32_TEST_ESP as usize..PM32_TEST_ESP as usize + 4]
+            .copy_from_slice(&u32::from(PM32_DS).to_le_bytes());
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ss.selector, PM32_DS);
+        assert!(cpu.maskable_interrupts_inhibited());
+        // The pointer width came from the *old* `SS.B=1`, so ESP moved by four.
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP + 4);
     }
 
     /// Intel SDM Vol. 3 §5.4.1: `POP FS`/`POP GS` use the DS/ES data-segment
