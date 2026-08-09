@@ -18,8 +18,7 @@ fn program_pmbase(m: &mut Machine) {
         4,
         PciConfig::make_address(0, 1, 3, PCI_PIIX_ACPI_PMBASE_OFFSET, true),
     );
-    m.pci
-        .port_write(PCI_CONFIG_DATA, 4, u32::from(PMBASE) | 1);
+    m.pci.port_write(PCI_CONFIG_DATA, 4, u32::from(PMBASE) | 1);
     m.pci.port_write(
         PCI_CONFIG_ADDRESS,
         4,

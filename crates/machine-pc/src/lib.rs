@@ -55,10 +55,10 @@ use devices::{
     FwCfgDmaOutcome, IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550,
     VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY,
     E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED,
-    FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_DATA,
-    PCI_PIIX_ACPI_PM_TMR, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
-    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD,
+    PCI_CONFIG_DATA, PCI_PIIX_ACPI_PM_TMR, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
+    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -178,7 +178,9 @@ impl Machine {
             ports: PortBus::new(),
             ide_disk_sectors: None,
         };
-        machine.mem.set_bios_write_protect(machine.xbcs.bios_write_protect_enabled());
+        machine
+            .mem
+            .set_bios_write_protect(machine.xbcs.bios_write_protect_enabled());
         machine.sync_firmware_configuration();
         machine
     }
@@ -371,7 +373,11 @@ impl Machine {
         if ticks.pit_clocks > 0 {
             self.tick_pit(ticks.pit_clocks);
             // Spec: Intel 82371AB — PM_TMR runs at 3.579545 MHz = 3 × PIT CLK.
-            self.advance_acpi_pm_tmr(ticks.pit_clocks.saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK));
+            self.advance_acpi_pm_tmr(
+                ticks
+                    .pit_clocks
+                    .saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK),
+            );
         }
         if ticks.cmos_periods > 0 {
             self.tick_cmos(ticks.cmos_periods);
