@@ -40,9 +40,18 @@
 //!
 //! - Primary channel master only; optional backing image (`Vec<u8>`)
 //! - Commands: IDENTIFY (`0xEC`), READ SECTORS (`0x20`), WRITE SECTORS (`0x30`) PIO
-//! - IDENTIFY PACKET DEVICE (`0xA1`): ATA master → ERR+ABRT (no PACKET device);
-//!   SeaBIOS-friendly reject of ATAPI probe on disk master
-//! - PACKET (`0xA0`): ATA master → ERR+ABRT (no 12-byte packet PIO / DRQ);
+//! - PACKET Command feature set **detection only**
+//!   ([`IdePrimary::attach_atapi_device`]): a configured packet device reports
+//!   the ATA/ATAPI-6 §9.12 signature (`01h`/`01h`/`14h`/`EBh`) with Status
+//!   `00h` after every reset and EXECUTE DEVICE DIAGNOSTIC, aborts IDENTIFY
+//!   DEVICE with that signature in place (§6.8.1 / §8.15.5.2), aborts READ
+//!   SECTOR(S) with the LBA Mid/High signature (§8.34.5.2), and answers
+//!   IDENTIFY PACKET DEVICE (`0xA1`) with a 256-word block (§8.16). See
+//!   `docs/atapi-r3-identify-and-signature.md`
+//! - IDENTIFY PACKET DEVICE (`0xA1`): ATA master → ERR+ABRT (§8.16.2 "use
+//!   prohibited" for non-PACKET devices)
+//! - PACKET (`0xA0`): ERR+ABRT on **both** device types — no command packet
+//!   set is implemented, so there is no CD-ROM and no media;
 //!   absent/slave → status 0; INTRQ follows nIEN like WRITE/IDENTIFY abort
 //! - SMART (`0xB0`): ATA master → ERR+ABRT (no SMART feature-set data);
 //!   absent/slave → status 0; INTRQ follows nIEN like PACKET/READ MULTIPLE abort
@@ -109,16 +118,24 @@
 //!   Device 0 is deselected and reasserted on reselect (§5.2.9) without losing
 //!   interrupt pending. Data port cycles for Device 1 are ignored (Table 18
 //!   defines only BSY=0/DRQ=0 cases; documented model choice)
-//! - Signature: software reset and EXECUTE DEVICE DIAGNOSTIC write the
-//!   non-PACKET signature Sector Count `01h` / LBA Low `01h` / LBA Mid `00h` /
-//!   LBA High `00h` (ATA/ATAPI-6 §9.12)
+//! - Signature: power-on / software reset and EXECUTE DEVICE DIAGNOSTIC write
+//!   the non-PACKET signature Sector Count `01h` / LBA Low `01h` / LBA Mid
+//!   `00h` / LBA High `00h`, or the PACKET signature `01h`/`01h`/`14h`/`EBh`
+//!   on a configured packet device (ATA/ATAPI-6 §9.12)
 //! - IRQ14: assert when DRQ ready / error / command-complete if nIEN=0;
 //!   status register read clears pending IRQ; `irq_line()` for MachineBus
 //! - `PortDevice` for MachineBus wiring
 //!
 //! # Unsupported (explicit)
 //!
-//! - ATAPI PACKET media engine / CD-ROM / ISO boot / slave ATAPI identify buffer
+//! - The PACKET command itself, on either device type: no command packet set
+//!   is implemented (IDENTIFY PACKET DEVICE word 0 reports `1Fh` "unknown or
+//!   no device type"), so there is no packet PIO engine, no SFF-8020i / MMC
+//!   command set, no CD-ROM, no media, and no ISO boot
+//! - DEVICE RESET (`0x08`), which ATA/ATAPI-6 §6.8 makes mandatory for a real
+//!   PACKET device; IDENTIFY PACKET DEVICE word 82 bit 9 stays clear to say so
+//! - A packet device on Device 1 (slave); the packet configuration applies to
+//!   Device 0 of a channel
 //! - SMART feature set (thresholds, return data, enable/disable subcommands)
 //! - SECURITY feature set (passwords, SET PASSWORD PIO, FREEZE LOCK state,
 //!   unlock/ERASE PREPARE/ERASE UNIT)
@@ -389,6 +406,50 @@ pub const ATA_SIGNATURE_LBA_MID: u8 = 0x00;
 /// Non-PACKET device signature LBA High (`0xEB` on ATAPI). Spec: ATA/ATAPI-6 §9.12.
 pub const ATA_SIGNATURE_LBA_HIGH: u8 = 0x00;
 
+/// PACKET (ATAPI) device signature Sector Count / Interrupt Reason.
+///
+/// Spec: ATA/ATAPI-6 §9.12 — "If the device implements the PACKET command
+/// feature set, the signature shall be: Sector Count 01h, LBA Low 01h,
+/// LBA Mid 14h, LBA High EBh".
+pub const ATAPI_SIGNATURE_SECTOR_COUNT: u8 = 0x01;
+/// PACKET device signature LBA Low. Spec: ATA/ATAPI-6 §9.12.
+pub const ATAPI_SIGNATURE_LBA_LOW: u8 = 0x01;
+/// PACKET device signature LBA Mid / Byte Count Low. Spec: ATA/ATAPI-6 §9.12.
+pub const ATAPI_SIGNATURE_LBA_MID: u8 = 0x14;
+/// PACKET device signature LBA High / Byte Count High. Spec: ATA/ATAPI-6 §9.12.
+pub const ATAPI_SIGNATURE_LBA_HIGH: u8 = 0xEB;
+
+/// IDENTIFY PACKET DEVICE word 0 bit15 — the device implements the PACKET
+/// Command feature set (bits 15:14 = `10b`).
+///
+/// Spec: ATA/ATAPI-6 §8.16.9 — "Bit 15 shall be set to one and bit 14 shall be
+/// cleared to zero to indicate the device implements the PACKET Command
+/// feature set."
+const IDENTIFY_PACKET_ATAPI_DEVICE: u16 = 0x8000;
+/// IDENTIFY PACKET DEVICE word 0 bits (12:8) value `1Fh` — "Unknown or no
+/// device type".
+///
+/// Spec: ATA/ATAPI-6 §8.16.9 — bits (12:8) name the command packet set
+/// "following the peripheral device type value as defined in SCSI Primary
+/// Commands". This device implements **no** command packet set, so it reports
+/// the defined "unknown or no device type" value rather than claiming to be a
+/// CD-ROM (`05h`) it cannot act as.
+const IDENTIFY_PACKET_SET_UNKNOWN: u16 = 0x1F;
+/// IDENTIFY PACKET DEVICE word 49 bit9 — "Shall be set to one".
+///
+/// Spec: ATA/ATAPI-6 §8.16.18.
+const IDENTIFY_PACKET_WORD49_MANDATORY: u16 = 1 << 9;
+/// IDENTIFY PACKET DEVICE words 50 / 83 / 84 / 87 bit14 — "Shall be set to one"
+/// (with bit15 cleared) so the word counts as valid.
+///
+/// Spec: ATA/ATAPI-6 §8.16.19 and Table 29 words 83, 84, 87.
+const IDENTIFY_PACKET_WORD_VALID: u16 = 0x4000;
+/// IDENTIFY PACKET DEVICE words 82 / 85 bit4 — "Shall be set to one indicating
+/// the PACKET Command feature set is supported".
+///
+/// Spec: ATA/ATAPI-6 Table 29 words 82 and 85.
+const IDENTIFY_PACKET_FEATURE_SET: u16 = 1 << 4;
+
 const SECTOR_SIZE: usize = 512;
 const IDENTIFY_WORDS: usize = 256;
 /// IDENTIFY words 83/86 bit10 — 48-bit Address feature set supported.
@@ -404,6 +465,15 @@ pub struct IdePrimary {
     pub present: bool,
     /// Backing image bytes (multiple of 512 preferred; short reads zero-pad).
     pub image: Vec<u8>,
+    /// True when the attached device implements the PACKET Command feature set.
+    ///
+    /// Spec: ATA/ATAPI-6 §6.8 — such a device "exhibits responses different
+    /// from those exhibited by devices not implementing this feature set":
+    /// a different reset signature (§9.12), IDENTIFY DEVICE aborted, and
+    /// IDENTIFY PACKET DEVICE answered. This tree implements **detection
+    /// only**: PACKET (`0xA0`) is still aborted, so there is no packet engine
+    /// and no media. See `docs/atapi-r3-identify-and-signature.md`.
+    packet_device: bool,
     error: u8,
     features: u8,
     sector_count: u8,
@@ -476,6 +546,7 @@ impl IdePrimary {
         Self {
             present: false,
             image: Vec::new(),
+            packet_device: false,
             error: 0,
             features: 0,
             sector_count: 0,
@@ -518,28 +589,83 @@ impl IdePrimary {
     pub fn attach_image(&mut self, image: Vec<u8>) {
         self.image = image;
         self.present = true;
+        // An attached disk image is an ATA device, not a packet device.
+        self.packet_device = false;
         self.reset_ready();
     }
 
+    /// Configure Device 0 as a PACKET (ATAPI) device with no media.
+    ///
+    /// The device becomes *detectable* as ATAPI: it reports the ATA/ATAPI-6
+    /// §9.12 PACKET signature after every reset and EXECUTE DEVICE DIAGNOSTIC,
+    /// aborts IDENTIFY DEVICE with that signature in place, and answers
+    /// IDENTIFY PACKET DEVICE. It is **not** a CD-ROM: PACKET (`0xA0`) is
+    /// aborted, no command packet set is implemented, and there is no media.
+    pub fn attach_atapi_device(&mut self) {
+        self.image = Vec::new();
+        self.present = true;
+        self.packet_device = true;
+        self.reset_ready();
+    }
+
+    /// A channel whose Device 0 is a PACKET (ATAPI) device with no media.
+    pub fn with_atapi_device() -> Self {
+        let mut ide = Self::new();
+        ide.attach_atapi_device();
+        ide
+    }
+
+    /// True when Device 0 implements the PACKET Command feature set.
+    pub fn is_packet_device(&self) -> bool {
+        self.packet_device
+    }
+
     pub fn reset(&mut self) {
-        // Preserve backing image / presence across Machine::reset.
+        // Preserve backing image / presence / device type across Machine::reset.
         let image = std::mem::take(&mut self.image);
         let present = self.present;
+        let packet_device = self.packet_device;
         *self = Self::new();
         self.image = image;
         self.present = present;
+        self.packet_device = packet_device;
         if self.present {
             self.reset_ready();
+        }
+    }
+
+    /// Status a device presents at command completion.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.16.5 — IDENTIFY PACKET DEVICE completes with DRDY
+    /// set to one. Bit 4 is SERV rather than DSC on a PACKET device, so this
+    /// model never sets it there: nothing here ever has a service request.
+    fn ready_status(&self) -> u8 {
+        if self.packet_device {
+            ATA_SR_DRDY
+        } else {
+            ATA_SR_DRDY | ATA_SR_DSC
+        }
+    }
+
+    /// Status a device presents after a reset or EXECUTE DEVICE DIAGNOSTIC.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.10 / §9.11 / Figure 17 — "If the device implements
+    /// the PACKET command feature set, the device shall clear bits 6, 5, 4, 3,
+    /// 2, and 0 in the Status register to zero", so a PACKET device reads
+    /// `00h` after a reset. A host distinguishes it from an empty channel by
+    /// the §9.12 signature, not by Status.
+    fn reset_status(&self) -> u8 {
+        if self.packet_device {
+            0
+        } else {
+            ATA_SR_DRDY | ATA_SR_DSC
         }
     }
 
     fn reset_ready(&mut self) {
         self.error = 0;
         self.features = 0;
-        self.sector_count = 1;
-        self.lba_lo = 1;
-        self.lba_mid = 0;
-        self.lba_hi = 0;
+        self.write_device_signature();
         // Spec: ATA/ATAPI-6 §6.20 — the "previous content" halves have no
         // defined value after reset; clear them so no stale HOB byte leaks
         // into the next 48-bit command.
@@ -563,11 +689,7 @@ impl IdePrimary {
         self.multiple_count = 0;
         self.multiple_xfer = false;
         self.block_left = 0;
-        self.status = if self.present {
-            ATA_SR_DRDY | ATA_SR_DSC
-        } else {
-            0
-        };
+        self.status = if self.present { self.reset_status() } else { 0 };
     }
 
     /// True if this device owns the I/O port.
@@ -716,7 +838,7 @@ impl IdePrimary {
         self.pio_off = 0;
         self.pio_in = false;
         self.transferring = true;
-        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_DRQ;
+        self.status = self.ready_status() | ATA_SR_DRQ;
         self.error = 0;
         // Spec: OSDev ATA PIO — IRQ when data ready (DRQ) if nIEN clear.
         self.raise_irq();
@@ -775,7 +897,7 @@ impl IdePrimary {
         self.block_left = 0;
         self.sectors_left = 0;
         self.lba48_xfer = false;
-        self.status = ATA_SR_DRDY | ATA_SR_DSC | ATA_SR_ERR;
+        self.status = self.ready_status() | ATA_SR_ERR;
         // Spec: ATA — INTRQ on error completion when interrupts enabled.
         self.raise_irq();
     }
@@ -804,12 +926,86 @@ impl IdePrimary {
         self.begin_pio_out();
     }
 
-    /// IDENTIFY PACKET DEVICE (`0xA1`) on an ATA-only master.
+    /// Build the IDENTIFY PACKET DEVICE payload (256 words, little-endian).
     ///
-    /// Spec: ATA/ATAPI — PACKET identify is valid for ATAPI devices; ATA disks
-    /// abort with ERR+ABRT (no 256-word PIO). SeaBIOS probes `0xA1` to detect
-    /// ATAPI; master stays ATA in this stub (no slave ATAPI path yet).
+    /// Spec: ATA/ATAPI-6 §8.16 and Table 29. Only the mandatory fields this
+    /// device can answer truthfully are filled; everything else is zero, which
+    /// §8.16.8 requires of reserved words anyway.
+    ///
+    /// The interesting choice is word 0 bits (12:8), the command packet set:
+    /// this device implements **no** packet command set, so it reports the
+    /// defined `1Fh` "unknown or no device type" rather than `05h` CD-ROM.
+    /// Word 82 bit 4 is set because the PACKET Command feature set *is* what
+    /// makes this device answer `0xA1` at all; word 82 bit 9 stays clear
+    /// because DEVICE RESET (`0x08`) is not implemented, and word 53 reports
+    /// words (70:64) and word 88 as invalid because there is no timing model.
+    fn fill_identify_packet(&mut self) {
+        let mut words = [0u16; IDENTIFY_WORDS];
+        // Word 0: ATAPI device (15:14 = 10b), no command packet set,
+        // non-removable, 3 ms DRQ response, 12-byte command packet.
+        words[0] = IDENTIFY_PACKET_ATAPI_DEVICE | (IDENTIFY_PACKET_SET_UNKNOWN << 8);
+        let firmware = b"0001    ";
+        for (i, chunk) in firmware.chunks(2).take(4).enumerate() {
+            let a = chunk.first().copied().unwrap_or(b' ');
+            let b = chunk.get(1).copied().unwrap_or(b' ');
+            words[23 + i] = u16::from(a) << 8 | u16::from(b);
+        }
+        let model = b"x86WASM ATAPI IDENTIFY-ONLY             ";
+        for (i, chunk) in model.chunks(2).take(20).enumerate() {
+            let a = chunk.first().copied().unwrap_or(b' ');
+            let b = chunk.get(1).copied().unwrap_or(b' ');
+            words[27 + i] = u16::from(a) << 8 | u16::from(b);
+        }
+        words[49] = IDENTIFY_PACKET_WORD49_MANDATORY;
+        words[50] = IDENTIFY_PACKET_WORD_VALID;
+        words[82] = IDENTIFY_PACKET_FEATURE_SET;
+        words[83] = IDENTIFY_PACKET_WORD_VALID;
+        words[84] = IDENTIFY_PACKET_WORD_VALID;
+        words[85] = IDENTIFY_PACKET_FEATURE_SET;
+        words[87] = IDENTIFY_PACKET_WORD_VALID;
+
+        for (i, w) in words.iter().enumerate() {
+            let off = i * 2;
+            self.pio[off] = (*w & 0xFF) as u8;
+            self.pio[off + 1] = (*w >> 8) as u8;
+        }
+    }
+
+    /// IDENTIFY PACKET DEVICE (`0xA1`).
+    ///
+    /// Spec: ATA/ATAPI-6 §8.16 — "Use prohibited for devices not implementing
+    /// the PACKET Command feature set", so an ATA disk aborts with ERR+ABRT.
+    /// On a configured packet device the command is PIO data-in of 256 words
+    /// (§8.16.3), is "accepted regardless of the state of DRDY" (§8.16.7), and
+    /// completes with DRDY set to one (§8.16.5).
     fn exec_identify_packet(&mut self) {
+        if !self.present {
+            self.status = 0;
+            self.transferring = false;
+            self.clear_irq();
+            return;
+        }
+        if !self.packet_device {
+            self.abort_command(ATA_ER_ABRT);
+            return;
+        }
+        self.fill_identify_packet();
+        self.multiple_xfer = false;
+        self.block_left = 0;
+        self.sectors_left = 1;
+        self.next_lba = 0;
+        self.begin_pio_out();
+    }
+
+    /// PACKET (`0xA0`) — **not implemented**, on either device type.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.21 / §9.8 — PACKET starts a command-packet PIO
+    /// transfer and then whichever command packet set the device implements.
+    /// This tree implements no command packet set (IDENTIFY PACKET DEVICE word
+    /// 0 says so), so there is nothing to deliver a packet to and the command
+    /// is aborted with ERR+ABRT on an ATA disk and on a configured packet
+    /// device alike. INTRQ follows the usual nIEN rules.
+    fn exec_packet(&mut self) {
         if !self.present {
             self.status = 0;
             self.transferring = false;
@@ -819,20 +1015,50 @@ impl IdePrimary {
         self.abort_command(ATA_ER_ABRT);
     }
 
-    /// PACKET (`0xA0`) on an ATA-only master.
+    /// IDENTIFY DEVICE (`0xEC`) on a configured packet device.
     ///
-    /// Spec: ATA/ATAPI — PACKET starts a 12-byte command packet transfer on
-    /// ATAPI devices (DRQ). Non-ATAPI (ATA disk) devices abort with ERR+ABRT
-    /// and no packet PIO. SeaBIOS-friendly: honest reject without a packet
-    /// engine. INTRQ follows the same nIEN rules as WRITE/IDENTIFY abort.
-    fn exec_packet(&mut self) {
+    /// Spec: ATA/ATAPI-6 §6.8.1 — "the IDENTIFY DEVICE command shall not be
+    /// executed but shall be command aborted and shall return a signature
+    /// unique to devices implementing the PACKET Command feature set"; §8.15.5.2
+    /// repeats it and points at §9.12 for the full Command Block signature.
+    fn exec_identify_on_packet_device(&mut self) {
+        self.abort_command(ATA_ER_ABRT);
+        self.write_device_signature();
+    }
+
+    /// READ SECTOR(S) (`0x20`) on a configured packet device.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.34.5.2 — "devices that implement the PACKET
+    /// Command feature set shall post command aborted and place the PACKET
+    /// Command feature set signature in the LBA High and the LBA Mid register".
+    /// Only those two registers, unlike IDENTIFY DEVICE.
+    fn exec_read_sectors_on_packet_device(&mut self) {
+        self.abort_command(ATA_ER_ABRT);
+        self.lba_mid = ATAPI_SIGNATURE_LBA_MID;
+        self.lba_hi = ATAPI_SIGNATURE_LBA_HIGH;
+    }
+
+    /// Dispatch a Command register write on a configured packet device.
+    ///
+    /// This device implements the PACKET Command feature set only far enough
+    /// to be *detected*. Four commands do something; everything else, PACKET
+    /// (`0xA0`) and DEVICE RESET (`0x08`) included, is aborted with ERR+ABRT,
+    /// which is the ATA/ATAPI-6 §8.x response for an unimplemented command.
+    fn exec_packet_device_command(&mut self, cmd: u8) {
         if !self.present {
             self.status = 0;
             self.transferring = false;
+            self.pio_in = false;
             self.clear_irq();
             return;
         }
-        self.abort_command(ATA_ER_ABRT);
+        match cmd {
+            ATA_CMD_IDENTIFY_PACKET => self.exec_identify_packet(),
+            ATA_CMD_IDENTIFY => self.exec_identify_on_packet_device(),
+            ATA_CMD_READ_SECTORS => self.exec_read_sectors_on_packet_device(),
+            ATA_CMD_DIAGNOSTIC => self.exec_diagnostic(),
+            _ => self.abort_command(ATA_ER_ABRT),
+        }
     }
 
     fn exec_read_sectors(&mut self) {
@@ -967,6 +1193,16 @@ impl IdePrimary {
     /// EXT commands are Reserved on normal completion; this tree reports zero
     /// (both FIFO halves) like the LBA28 path.
     fn clear_transfer_sector_count(&mut self) {
+        if self.packet_device {
+            // Spec: ATA/ATAPI-6 §8.16.5 lists the Command Block registers as
+            // "na" after IDENTIFY PACKET DEVICE, and §9.12 only says the
+            // signature *may* change once a command sets DRDY to one. This
+            // model chooses never to change it, so a host that re-reads the
+            // registers after identifying still sees `01h/01h/14h/EBh`.
+            self.write_device_signature();
+            self.lba48_xfer = false;
+            return;
+        }
         self.sector_count = 0;
         if self.lba48_xfer {
             self.sector_count_prev = 0;
@@ -1661,25 +1897,42 @@ impl IdePrimary {
             return;
         }
         self.error = ATA_DIAG_PASSED;
-        self.write_ata_signature();
+        self.write_device_signature();
         self.transferring = false;
         self.pio_in = false;
         self.sectors_left = 0;
-        self.status = ATA_SR_DRDY | ATA_SR_DSC;
+        // Spec: ATA/ATAPI-6 §9.10 state D0ED3 — a PACKET device clears Status
+        // bits 6, 5, 4, 3, 2 and 0, so it reads `00h` here too.
+        self.status = self.reset_status();
         self.raise_irq();
     }
 
-    /// Place the non-PACKET device signature in the Command Block registers.
+    /// Place this device's signature in the Command Block registers.
     ///
-    /// Spec: ATA/ATAPI-6 §9.12 Signature and persistence — Sector Count `01h`,
-    /// LBA Low `01h`, LBA Mid `00h`, LBA High `00h`. The Device register keeps
-    /// the obsolete ATA-1..5 bits 7/5 (`0xA0`-style) that classic PC firmware
+    /// Spec: ATA/ATAPI-6 §9.12 Signature and persistence — a device *not*
+    /// implementing the PACKET command feature set writes Sector Count `01h`,
+    /// LBA Low `01h`, LBA Mid `00h`, LBA High `00h`; a device implementing it
+    /// writes Sector Count `01h`, LBA Low `01h`, LBA Mid `14h`, LBA High
+    /// `EBh`. Both are written for power-on reset, hardware reset, software
+    /// reset and EXECUTE DEVICE DIAGNOSTIC. The Device register keeps the
+    /// obsolete ATA-1..5 bits 7/5 (`0xA0`-style) that classic PC firmware
     /// expects, and the DEV bit is left as the host selected it.
-    fn write_ata_signature(&mut self) {
-        self.sector_count = ATA_SIGNATURE_SECTOR_COUNT;
-        self.lba_lo = ATA_SIGNATURE_LBA_LOW;
-        self.lba_mid = ATA_SIGNATURE_LBA_MID;
-        self.lba_hi = ATA_SIGNATURE_LBA_HIGH;
+    ///
+    /// §9.12 also notes the PACKET signature persists "until the device
+    /// receives a command that sets DRDY to one"; this device changes it only
+    /// when it writes a new one, so the persistence rule holds trivially.
+    fn write_device_signature(&mut self) {
+        if self.packet_device {
+            self.sector_count = ATAPI_SIGNATURE_SECTOR_COUNT;
+            self.lba_lo = ATAPI_SIGNATURE_LBA_LOW;
+            self.lba_mid = ATAPI_SIGNATURE_LBA_MID;
+            self.lba_hi = ATAPI_SIGNATURE_LBA_HIGH;
+        } else {
+            self.sector_count = ATA_SIGNATURE_SECTOR_COUNT;
+            self.lba_lo = ATA_SIGNATURE_LBA_LOW;
+            self.lba_mid = ATA_SIGNATURE_LBA_MID;
+            self.lba_hi = ATA_SIGNATURE_LBA_HIGH;
+        }
     }
 
     /// SET FEATURES (`0xEF`) — accept features register, succeed without side effects.
@@ -1718,6 +1971,14 @@ impl IdePrimary {
         // Any new command leaves the 48-bit transfer mode; the EXT handlers
         // re-arm it (ATA/ATAPI-6 §6.20 — 28-bit and 48-bit commands intermix).
         self.lba48_xfer = false;
+        // Spec: ATA/ATAPI-6 §6.8 — a device implementing the PACKET Command
+        // feature set "exhibits responses different from those exhibited by
+        // devices not implementing this feature set", so it gets its own
+        // dispatch rather than the ATA command table.
+        if self.packet_device {
+            self.exec_packet_device_command(cmd);
+            return;
+        }
         match cmd {
             ATA_CMD_IDENTIFY => self.exec_identify(),
             ATA_CMD_PACKET => self.exec_packet(),
@@ -1834,7 +2095,7 @@ impl IdePrimary {
             self.multiple_xfer = false;
             self.block_left = 0;
             self.pio_off = 0;
-            self.status = ATA_SR_DRDY | ATA_SR_DSC;
+            self.status = self.ready_status();
             self.clear_transfer_sector_count();
             // Spec: ATA — INTRQ on command completion after final sector.
             self.raise_irq();
@@ -2128,6 +2389,25 @@ impl IdeSecondary {
 
     pub fn attach_image(&mut self, image: Vec<u8>) {
         self.inner.attach_image(image);
+    }
+
+    /// Configure Device 0 as a PACKET (ATAPI) device with no media.
+    ///
+    /// See [`IdePrimary::attach_atapi_device`] — detection only, no CD-ROM.
+    pub fn attach_atapi_device(&mut self) {
+        self.inner.attach_atapi_device();
+    }
+
+    /// A secondary channel whose Device 0 is a PACKET (ATAPI) device.
+    pub fn with_atapi_device() -> Self {
+        Self {
+            inner: IdePrimary::with_atapi_device(),
+        }
+    }
+
+    /// True when Device 0 implements the PACKET Command feature set.
+    pub fn is_packet_device(&self) -> bool {
+        self.inner.is_packet_device()
     }
 
     pub fn reset(&mut self) {
@@ -4543,5 +4823,351 @@ mod tests {
         assert_eq!(ide.port_read(IDE_SECONDARY_STATUS, 1) as u8, 0);
         assert_eq!(ide.port_read(IDE_SECONDARY_ERROR, 1) as u8, 0);
         assert!(!ide.irq_line());
+    }
+}
+
+/// ATAPI detection: the ATA/ATAPI-6 §9.12 PACKET signature and IDENTIFY PACKET
+/// DEVICE on a configured packet device (M2 round 3, slice 4).
+///
+/// This device implements the PACKET Command feature set only far enough to be
+/// *detected*. PACKET (`0xA0`) is still aborted and no command packet set is
+/// implemented, so these tests also pin what the device refuses to do.
+///
+/// They live beside the device rather than in `crates/devices/tests/` because
+/// `crates/devices/src/lib.rs` does not yet re-export the new constants and
+/// `IdePrimary::with_atapi_device`.
+#[cfg(test)]
+mod atapi_detection_tests {
+    use super::*;
+
+    fn clear_nien(ide: &mut IdePrimary) {
+        ide.port_write(IDE_PRIMARY_CTRL, 1, 0);
+    }
+
+    fn select_device0(ide: &mut IdePrimary) {
+        ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+    }
+
+    fn command(ide: &mut IdePrimary, cmd: u8) {
+        ide.port_write(IDE_PRIMARY_STATUS, 1, u32::from(cmd));
+    }
+
+    /// `(Sector Count, LBA Low, LBA Mid, LBA High)` as the host reads them.
+    fn signature(ide: &mut IdePrimary) -> (u8, u8, u8, u8) {
+        (
+            ide.port_read(IDE_PRIMARY_SECCOUNT, 1) as u8,
+            ide.port_read(IDE_PRIMARY_LBA_LO, 1) as u8,
+            ide.port_read(IDE_PRIMARY_LBA_MID, 1) as u8,
+            ide.port_read(IDE_PRIMARY_LBA_HI, 1) as u8,
+        )
+    }
+
+    fn identify_word(pio: &[u8; SECTOR_SIZE], idx: usize) -> u16 {
+        let off = idx * 2;
+        u16::from(pio[off]) | (u16::from(pio[off + 1]) << 8)
+    }
+
+    /// Drain a 256-word PIO data-in block through the Data port.
+    fn drain_pio(ide: &mut IdePrimary) -> [u8; SECTOR_SIZE] {
+        let mut buf = [0u8; SECTOR_SIZE];
+        for pair in buf.chunks_mut(2) {
+            let word = ide.port_read(IDE_PRIMARY_DATA, 2) as u16;
+            pair[0] = (word & 0xFF) as u8;
+            pair[1] = (word >> 8) as u8;
+        }
+        buf
+    }
+
+    /// A channel with no packet device configured keeps exactly the behavior
+    /// this tree already had: the non-PACKET signature and ABRT for both
+    /// `0xA0` and `0xA1`.
+    ///
+    /// Spec: ATA/ATAPI-6 §9.12 (non-PACKET signature `01h/01h/00h/00h`);
+    /// §8.16.2 ("Use prohibited for devices not implementing the PACKET
+    /// Command feature set").
+    #[test]
+    fn a_plain_ata_master_stays_non_atapi() {
+        let mut ide = IdePrimary::with_image(vec![0u8; SECTOR_SIZE]);
+        assert!(!ide.is_packet_device());
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x00, 0x00));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRDY, 0);
+
+        for cmd in [ATA_CMD_IDENTIFY_PACKET, ATA_CMD_PACKET] {
+            select_device0(&mut ide);
+            command(&mut ide, cmd);
+            let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+            assert_ne!(status & ATA_SR_ERR, 0, "cmd {cmd:#04X}");
+            assert_eq!(status & ATA_SR_DRQ, 0, "cmd {cmd:#04X}");
+            assert_eq!(
+                ide.port_read(IDE_PRIMARY_ERROR, 1) as u8,
+                ATA_ER_ABRT,
+                "cmd {cmd:#04X}"
+            );
+        }
+        // The non-PACKET signature is untouched by the aborts.
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x00, 0x00));
+    }
+
+    /// Spec: ATA/ATAPI-6 §9.12 — a device implementing the PACKET command
+    /// feature set places Sector Count `01h`, LBA Low `01h`, LBA Mid `14h`,
+    /// LBA High `EBh` after power-on/hardware reset. §9.11 / Figure 17: it also
+    /// clears Status bits 6, 5, 4, 3, 2 and 0, so Status reads `00h`.
+    #[test]
+    fn a_configured_packet_device_reports_the_atapi_signature() {
+        let mut ide = IdePrimary::with_atapi_device();
+        assert!(ide.is_packet_device());
+        assert!(ide.present);
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x14, 0xEB));
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8, 0x00);
+        assert_eq!(
+            ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRDY,
+            0,
+            "a PACKET device does not report DRDY after reset"
+        );
+    }
+
+    /// An empty channel and a packet device both read Status `00h`; the
+    /// signature is what tells them apart, which is the whole point of §9.12.
+    #[test]
+    fn an_empty_channel_is_distinguishable_only_by_the_signature() {
+        let mut empty = IdePrimary::new();
+        clear_nien(&mut empty);
+        select_device0(&mut empty);
+        assert_eq!(empty.port_read(IDE_PRIMARY_CTRL, 1) as u8, 0x00);
+        assert_eq!(signature(&mut empty), (0x00, 0x00, 0x00, 0x00));
+
+        let mut atapi = IdePrimary::with_atapi_device();
+        clear_nien(&mut atapi);
+        select_device0(&mut atapi);
+        assert_eq!(atapi.port_read(IDE_PRIMARY_CTRL, 1) as u8, 0x00);
+        assert_eq!(signature(&mut atapi), (0x01, 0x01, 0x14, 0xEB));
+    }
+
+    /// Spec: ATA/ATAPI-6 §9.12 — the PACKET signature is written for software
+    /// reset and EXECUTE DEVICE DIAGNOSTIC as well, and §9.10 state D0ED3
+    /// leaves Status `00h` on a PACKET device. §8.11 puts diagnostic code
+    /// `01h` in the Error register.
+    #[test]
+    fn software_reset_and_diagnostic_rewrite_the_atapi_signature() {
+        let mut ide = IdePrimary::with_atapi_device();
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+
+        // Host writes overwrite the signature (§9.12), then SRST restores it.
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0x00);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0x00);
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x00, 0x00));
+
+        ide.port_write(IDE_PRIMARY_CTRL, 1, u32::from(ATA_DC_SRST));
+        ide.port_write(IDE_PRIMARY_CTRL, 1, 0);
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x14, 0xEB));
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8, 0x00);
+
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0x00);
+        command(&mut ide, ATA_CMD_DIAGNOSTIC);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_DIAG_PASSED);
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x14, 0xEB));
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8, 0x00);
+    }
+
+    /// Spec: ATA/ATAPI-6 §6.8.1 / §8.15.5.2 — IDENTIFY DEVICE on a PACKET
+    /// device "shall not be executed but shall be command aborted and shall
+    /// return a signature unique to devices implementing the PACKET Command
+    /// feature set".
+    #[test]
+    fn identify_device_is_aborted_with_the_packet_signature_in_place() {
+        let mut ide = IdePrimary::with_atapi_device();
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0x99);
+
+        command(&mut ide, ATA_CMD_IDENTIFY);
+        let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_ne!(status & ATA_SR_ERR, 0);
+        assert_eq!(status & ATA_SR_DRQ, 0, "no 256-word transfer starts");
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x14, 0xEB));
+    }
+
+    /// Spec: ATA/ATAPI-6 §8.34.5.2 — READ SECTOR(S) on a PACKET device posts
+    /// command aborted and places the signature "in the LBA High and the LBA
+    /// Mid register" — those two only.
+    #[test]
+    fn read_sectors_is_aborted_with_the_mid_and_high_signature_only() {
+        let mut ide = IdePrimary::with_atapi_device();
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+        ide.port_write(IDE_PRIMARY_SECCOUNT, 1, 0x42);
+        ide.port_write(IDE_PRIMARY_LBA_LO, 1, 0x43);
+        ide.port_write(IDE_PRIMARY_LBA_MID, 1, 0x44);
+        ide.port_write(IDE_PRIMARY_LBA_HI, 1, 0x45);
+
+        command(&mut ide, ATA_CMD_READ_SECTORS);
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_ERR, 0);
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+        assert_eq!(
+            signature(&mut ide),
+            (0x42, 0x43, 0x14, 0xEB),
+            "Sector Count and LBA Low keep what the host wrote"
+        );
+    }
+
+    /// Spec: ATA/ATAPI-6 §8.16 — IDENTIFY PACKET DEVICE is PIO data-in of 256
+    /// words, is accepted regardless of DRDY (§8.16.7), and completes with
+    /// DRDY set to one (§8.16.5). Every word asserted here is checked against
+    /// Table 29, not against what the device happens to produce.
+    #[test]
+    fn identify_packet_device_returns_a_truthful_256_word_block() {
+        let mut ide = IdePrimary::with_atapi_device();
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+        // Accepted even though DRDY is clear after reset.
+        assert_eq!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRDY, 0);
+
+        command(&mut ide, ATA_CMD_IDENTIFY_PACKET);
+        let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_ne!(status & ATA_SR_DRQ, 0, "DRQ set for the data-in block");
+        assert_eq!(status & ATA_SR_ERR, 0);
+        assert!(ide.irq_line(), "INTRQ asserted with nIEN clear");
+
+        let pio = drain_pio(&mut ide);
+
+        // Word 0: bit15 set / bit14 clear = PACKET device (§8.16.9); bits 12:8
+        // = 1Fh "unknown or no device type"; bit 7 clear = non-removable;
+        // bits 6:5 = 00b (3 ms DRQ); bits 1:0 = 00b (12-byte packet).
+        assert_eq!(identify_word(&pio, 0), 0x9F00);
+        assert_eq!(identify_word(&pio, 0) & 0xC000, 0x8000);
+        assert_eq!((identify_word(&pio, 0) >> 8) & 0x1F, 0x1F);
+        // Word 49 bit9 "shall be set to one"; no DMA, IORDY or overlap claimed.
+        assert_eq!(identify_word(&pio, 49), 1 << 9);
+        // Word 50 bit15 clear / bit14 set.
+        assert_eq!(identify_word(&pio, 50), 0x4000);
+        // Word 53: words (70:64) and word 88 are reported invalid — this model
+        // has no transfer-timing data to put there.
+        assert_eq!(identify_word(&pio, 53), 0x0000);
+        assert_eq!(identify_word(&pio, 63), 0x0000, "no multiword DMA");
+        assert_eq!(identify_word(&pio, 88), 0x0000, "no Ultra DMA");
+        // Word 82 bit4 "shall be set to one indicating the PACKET Command
+        // feature set is supported"; bit9 stays clear because DEVICE RESET is
+        // not implemented.
+        assert_eq!(identify_word(&pio, 82), 1 << 4);
+        assert_eq!(identify_word(&pio, 82) & (1 << 9), 0);
+        assert_eq!(identify_word(&pio, 83), 0x4000);
+        assert_eq!(identify_word(&pio, 84), 0x4000);
+        assert_eq!(identify_word(&pio, 85), 1 << 4);
+        assert_eq!(identify_word(&pio, 87), 0x4000);
+        // Serial number is optional and "shall be zeros" when not implemented.
+        assert!((10..20).all(|w| identify_word(&pio, w) == 0));
+        // Model number words 27-46, ASCII byte-swapped within each word.
+        let model: Vec<u8> = (27..47)
+            .flat_map(|w| {
+                let word = identify_word(&pio, w);
+                [(word >> 8) as u8, (word & 0xFF) as u8]
+            })
+            .collect();
+        assert_eq!(&model[..27], b"x86WASM ATAPI IDENTIFY-ONLY");
+
+        // Completion: DRQ cleared, DRDY set, no error (§8.16.5).
+        let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_eq!(status & ATA_SR_DRQ, 0);
+        assert_ne!(status & ATA_SR_DRDY, 0);
+        assert_eq!(status & ATA_SR_ERR, 0);
+        // The signature stays readable afterwards (documented model choice).
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x14, 0xEB));
+    }
+
+    /// nIEN still gates INTRQ for the identify transfer.
+    ///
+    /// Spec: ATA/ATAPI-6 §5.2.9 — "When the nIEN bit is set to one ... the
+    /// INTRQ signal shall be released."
+    #[test]
+    fn nien_gates_intrq_on_the_identify_packet_transfer() {
+        let mut ide = IdePrimary::with_atapi_device();
+        select_device0(&mut ide);
+        command(&mut ide, ATA_CMD_IDENTIFY_PACKET);
+        assert!(!ide.irq_line(), "nIEN is set after reset");
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRQ, 0);
+    }
+
+    /// PACKET itself is still refused: this device implements no command
+    /// packet set, and says so in IDENTIFY PACKET DEVICE word 0.
+    #[test]
+    fn packet_is_still_aborted_on_a_configured_packet_device() {
+        let mut ide = IdePrimary::with_atapi_device();
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+        command(&mut ide, ATA_CMD_PACKET);
+
+        let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+        assert_ne!(status & ATA_SR_ERR, 0);
+        assert_eq!(status & ATA_SR_DRQ, 0, "no command packet is accepted");
+        assert_eq!(ide.port_read(IDE_PRIMARY_ERROR, 1) as u8, ATA_ER_ABRT);
+    }
+
+    /// Everything outside the four detection commands is aborted, including
+    /// the ATA commands that succeed on a disk here.
+    #[test]
+    fn non_detection_commands_are_aborted_on_a_packet_device() {
+        for cmd in [
+            ATA_CMD_PACKET,
+            0x08, // DEVICE RESET — mandatory for real ATAPI, absent here
+            ATA_CMD_SET_FEATURES,
+            ATA_CMD_NOP,
+            ATA_CMD_READ_MULTIPLE,
+            ATA_CMD_WRITE_SECTORS,
+            ATA_CMD_READ_SECTORS_EXT,
+            ATA_CMD_CHECK_POWER_MODE,
+        ] {
+            let mut ide = IdePrimary::with_atapi_device();
+            clear_nien(&mut ide);
+            select_device0(&mut ide);
+            command(&mut ide, cmd);
+            let status = ide.port_read(IDE_PRIMARY_CTRL, 1) as u8;
+            assert_ne!(status & ATA_SR_ERR, 0, "cmd {cmd:#04X} should abort");
+            assert_eq!(status & ATA_SR_DRQ, 0, "cmd {cmd:#04X}");
+            assert_eq!(
+                ide.port_read(IDE_PRIMARY_ERROR, 1) as u8,
+                ATA_ER_ABRT,
+                "cmd {cmd:#04X}"
+            );
+        }
+    }
+
+    /// The device type survives `reset`, and attaching a disk image turns the
+    /// channel back into an ATA device with the non-PACKET signature.
+    #[test]
+    fn device_type_survives_reset_and_switches_with_an_image() {
+        let mut ide = IdePrimary::with_atapi_device();
+        ide.reset();
+        assert!(ide.is_packet_device());
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x14, 0xEB));
+
+        ide.attach_image(vec![0u8; SECTOR_SIZE]);
+        assert!(!ide.is_packet_device());
+        clear_nien(&mut ide);
+        select_device0(&mut ide);
+        assert_eq!(signature(&mut ide), (0x01, 0x01, 0x00, 0x00));
+        assert_ne!(ide.port_read(IDE_PRIMARY_CTRL, 1) as u8 & ATA_SR_DRDY, 0);
+    }
+
+    /// The secondary channel exposes the same configuration.
+    #[test]
+    fn the_secondary_channel_can_carry_a_packet_device() {
+        let mut ide = IdeSecondary::with_atapi_device();
+        assert!(ide.is_packet_device());
+        ide.port_write(IDE_SECONDARY_CTRL, 1, 0);
+        ide.port_write(IDE_SECONDARY_DRIVE, 1, 0xA0);
+        assert_eq!(ide.port_read(IDE_SECONDARY_SECCOUNT, 1) as u8, 0x01);
+        assert_eq!(ide.port_read(IDE_SECONDARY_LBA_LO, 1) as u8, 0x01);
+        assert_eq!(ide.port_read(IDE_SECONDARY_LBA_MID, 1) as u8, 0x14);
+        assert_eq!(ide.port_read(IDE_SECONDARY_LBA_HI, 1) as u8, 0xEB);
+        assert_eq!(ide.port_read(IDE_SECONDARY_CTRL, 1) as u8, 0x00);
     }
 }
