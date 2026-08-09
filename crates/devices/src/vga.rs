@@ -77,9 +77,14 @@
 //!
 //! # Scope (this slice)
 //!
-//! - 32 KiB text plane buffer at `VGA_TEXT_BASE`…`VGA_TEXT_END`
-//! - Byte R/W; reset fills first 80×25 with space + attribute `0x07`
+//! - One display memory ([`VgaText::planes`]): four maps of
+//!   [`VGA_PLANE_SIZE`] bytes serving guest MMIO, the host alphanumeric
+//!   helpers, and the character generator alike
+//! - Byte R/W over the `VGA_TEXT_BASE`…`VGA_TEXT_END` alphanumeric window;
+//!   reset fills the first 80×25 cells with space + attribute `0x07`
 //! - Helpers for tests (`char_at` / `attr_at` / `put_char`)
+//! - Character generator and text-mode display fetch
+//!   ([`VgaText::render_frame`] → [`VgaFrame`] of DAC indices)
 //! - CRTC index/data: latch index / store/read register file on the IOAS-selected
 //!   map (`0x3D4`/`0x3D5` color or `0x3B4`/`0x3B5` mono; shared file); cursor
 //!   registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback plus helpers for
@@ -125,9 +130,11 @@
 //!   Enable gating → Memory Map Select window decode → plane addressing → the
 //!   Graphics Controller data path in one call, with
 //!   [`VgaText::aperture`] / [`VgaText::in_aperture`] describing the widest
-//!   decodable range (`0xA0000`–`0xBFFFF`), [`VgaText::mmio_claims`] the
-//!   currently claimed sub-range, and [`VgaText::mmio_uses_text_buffer`] the
-//!   text-buffer/plane-memory split. See `docs/vga-r2-mmio-entry-point.md`.
+//!   decodable range (`0xA0000`–`0xBFFFF`) and [`VgaText::mmio_claims`] the
+//!   currently claimed sub-range. Every claimed access runs the Graphics
+//!   Controller path over the single display memory in [`VgaText::planes`];
+//!   there is no separate text buffer. See `docs/vga-r2-mmio-entry-point.md`
+//!   and `docs/vga-r3-unified-display-memory.md`.
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
 //!   `0x3C1`, flip-flop reset via Input Status #1 (active IOAS map); Mode Control
 //!   `0x10` store/readback with mode-03h reset default `0x0C` + host text attr
@@ -166,21 +173,14 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - `MachineBus` has not adopted [`VgaText::mmio_read_u8`] /
-//!   [`VgaText::mmio_write_u8`] yet: bus routing still uses the static
-//!   [`VgaText::owns_addr`] text range and the legacy `read_u8` / `write_u8`
-//!   pair, so a *guest* still cannot reach the Graphics Controller data path.
-//!   The device side of that seam is complete; the bus side is not this crate's
-//!   to change
-//! - Display memory has two backing stores: the 32 KiB interleaved
-//!   [`VgaText::mem`] text buffer serves the `0xB8000`–`0xBFFFF` addresses of
-//!   whichever window covers them, and [`VgaText::planes`] serves the rest.
-//!   Real hardware has one memory; unification waits for the character
-//!   generator and a display fetch
-//! - Graphics/Alphanumeric (Misc bit0) has no character-generator effect
 //! - Shift Register Interleave and 256-Color Shift Mode have no effect
-//! - No display fetch from [`VgaText::planes`]: character generation, planar
-//!   pixel output, and Chain-4/doubleword display addressing are absent
+//! - The display fetch covers the alphanumeric (character generator) path
+//!   only. Planar 16-color pixel serialization has no renderer; see
+//!   [`VgaText::render_mode`], which reports
+//!   [`VgaRenderMode::Unsupported`] rather than guessing. There is no VBE, no
+//!   host display, and no timing-accurate raster
+//! - No font is installed at reset, so a freshly reset device renders no
+//!   glyphs (`docs/vga-r3-character-generator.md`)
 //! - ATC / Sequencer / GC timing, plane-enable / overscan display side effects,
 //!   map-mask, write-mode, read-map, or bitmask side effects on the text plane;
 //!   Internal Palette + Color Select attr→DAC composition is on host text
@@ -1278,8 +1278,6 @@ impl VgaFrame {
 /// Color text-mode frame buffer + CRTC + Sequencer + GC + ATC + Misc + DAC stubs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VgaText {
-    /// Raw plane bytes (char/attr interleaved).
-    pub mem: Vec<u8>,
     /// Latched CRTC index (written via active IOAS CRTC index port).
     pub crtc_index: u8,
     /// CRTC register file (store/readback; cursor indexes have helpers;
@@ -1293,11 +1291,15 @@ pub struct VgaText {
     pub gc_index: u8,
     /// Graphics Controller register file (noop store/readback).
     pub gc_regs: [u8; VGA_GC_REG_COUNT],
-    /// Display memory maps: [`VGA_PLANE_COUNT`] × [`VGA_PLANE_SIZE`] bytes,
+    /// Display memory: [`VGA_PLANE_COUNT`] × [`VGA_PLANE_SIZE`] bytes,
     /// map-major (map `p` offset `o` at `p * VGA_PLANE_SIZE + o`).
     ///
-    /// Reached through [`VgaText::gc_read_u8`] / [`VgaText::gc_write_u8`];
-    /// the legacy interleaved text buffer [`VgaText::mem`] stays separate.
+    /// This is the **only** display memory. Guest accesses reach it through
+    /// [`VgaText::mmio_read_u8`] / [`VgaText::mmio_write_u8`] and the Graphics
+    /// Controller data path; host helpers (`read_u8` / `write_u8` /
+    /// `char_at` / `attr_at` / `put_char`) address the alphanumeric
+    /// character/attribute interleave over the same bytes; the character
+    /// generator fetches from it.
     pub planes: Vec<u8>,
     /// Graphics Controller data latches, one per map.
     ///
@@ -1347,7 +1349,6 @@ impl Default for VgaText {
 impl VgaText {
     pub fn new() -> Self {
         let mut v = Self {
-            mem: vec![0; VGA_TEXT_SIZE],
             crtc_index: 0,
             crtc_regs: [0; VGA_CRTC_REG_COUNT],
             seq_index: 0,
@@ -1389,14 +1390,13 @@ impl VgaText {
     /// ([`vga_dac_default_ram`]).
     ///
     /// Spec: IBM VGA text — cells are (char, attr) pairs starting at `0xB8000`.
+    /// The pair lives in display memory as map 0 and map 1 at the *same* even
+    /// offset, which is where odd/even CPU addressing and word-mode display
+    /// addressing both put it. **Model choice, not hardware:** real display
+    /// memory holds whatever was there at power-on; this fill keeps the
+    /// long-standing 80×25 blank screen the HELLO ROM path and the host text
+    /// helpers expect. No font is installed in map 2.
     pub fn reset(&mut self) {
-        self.mem.fill(0);
-        let cells = VGA_TEXT_COLS * VGA_TEXT_ROWS;
-        for i in 0..cells {
-            let off = i * VGA_CELL_BYTES;
-            self.mem[off] = VGA_DEFAULT_CHAR;
-            self.mem[off + 1] = VGA_DEFAULT_ATTR;
-        }
         self.crtc_index = 0;
         self.crtc_regs = [0; VGA_CRTC_REG_COUNT];
         self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)] = VGA_CRTC_START_ADDR_HIGH_DEFAULT;
@@ -1410,6 +1410,11 @@ impl VgaText {
         self.gc_index = 0;
         self.gc_regs = VGA_GC_DEFAULTS;
         self.planes.fill(0);
+        for cell in 0..(VGA_TEXT_COLS * VGA_TEXT_ROWS) {
+            let offset = cell * VGA_CELL_BYTES;
+            self.planes[VGA_TEXT_CHAR_PLANE * VGA_PLANE_SIZE + offset] = VGA_DEFAULT_CHAR;
+            self.planes[VGA_TEXT_ATTR_PLANE * VGA_PLANE_SIZE + offset] = VGA_DEFAULT_ATTR;
+        }
         self.gc_latches = [0; VGA_PLANE_COUNT];
         self.atc_index = VGA_ATC_INDEX_DEFAULT;
         self.atc_regs = VGA_ATC_DEFAULTS;
@@ -1867,32 +1872,60 @@ impl VgaText {
         }
     }
 
-    /// Offset into the legacy interleaved text buffer for a claimed CPU access.
+    /// Map and offset in display memory for a host alphanumeric access.
     ///
-    /// Claims require Misc Output RAM Enable, membership of the Memory Map
-    /// Select window ([`Self::owns_display_addr`]), and membership of the
-    /// 32 KiB text buffer that backs this path. Windows that reach below
-    /// `0xB8000` decode there but have no backing in this buffer.
-    fn text_buffer_offset(&self, addr: u64) -> Option<usize> {
+    /// This is the character/attribute interleave the character generator
+    /// fetches in word mode: an even byte is a character code in map 0 and the
+    /// odd byte beside it is that cell's attribute in map 1, both at the same
+    /// even map offset. It is *not* the Graphics Controller path — it applies
+    /// no read mode, no write mode, no Map Mask, and disturbs no latch, which
+    /// is what a host/test caller needs.
+    ///
+    /// Claims require Misc Output RAM Enable and membership of the Memory Map
+    /// Select window ([`Self::owns_display_addr`]); the alphanumeric helpers
+    /// additionally only speak for the `0xB8000`–`0xBFFFF` range they always
+    /// have. The offset is relative to the selected window base, like every
+    /// other address decode in this device.
+    ///
+    /// Spec: FreeVGA "VGA Text Mode Operation" Display Memory Organization
+    /// (map 0 characters, map 1 attributes) + IBM Figure 2-33 (odd/even map
+    /// pairing) + IBM Figure 2-75 (Memory Map Select) + Misc Output bit1.
+    fn text_view_target(&self, addr: u64) -> Option<(usize, usize)> {
         if !self.owns_display_addr(addr) || !Self::owns_addr(addr) {
             // Same `None` / `false` as out-of-window so `MachineBus` falls
-            // through to open-bus / PhysMem. Spec: FreeVGA / IBM Misc Output
-            // bit1 + IBM Figure 2-75 Memory Map Select.
+            // through to open-bus / PhysMem.
             return None;
         }
-        Some((addr - VGA_TEXT_BASE) as usize)
+        let (base, _) = self.display_window();
+        let window_offset = (addr - base) as usize;
+        let plane = if window_offset & 1 == 0 {
+            VGA_TEXT_CHAR_PLANE
+        } else {
+            VGA_TEXT_ATTR_PLANE
+        };
+        Some((plane, (window_offset & !1) % self.plane_size_bytes()))
     }
 
+    /// Host read of the alphanumeric character/attribute interleave.
+    ///
+    /// Reads the one display memory ([`Self::planes`]) without touching the
+    /// Graphics Controller latches. A guest read goes through
+    /// [`Self::mmio_read_u8`] instead.
     pub fn read_u8(&self, addr: u64) -> Option<u8> {
-        let off = self.text_buffer_offset(addr)?;
-        Some(self.mem[off])
+        let (plane, offset) = self.text_view_target(addr)?;
+        Some(self.planes[plane * VGA_PLANE_SIZE + offset])
     }
 
+    /// Host write into the alphanumeric character/attribute interleave.
+    ///
+    /// Writes the one display memory ([`Self::planes`]) directly: no write
+    /// mode, no Set/Reset, no Bit Mask, no Map Mask. A guest write goes
+    /// through [`Self::mmio_write_u8`] instead.
     pub fn write_u8(&mut self, addr: u64, val: u8) -> bool {
-        let Some(off) = self.text_buffer_offset(addr) else {
+        let Some((plane, offset)) = self.text_view_target(addr) else {
             return false;
         };
-        self.mem[off] = val;
+        self.planes[plane * VGA_PLANE_SIZE + offset] = val;
         true
     }
 
@@ -1918,29 +1951,23 @@ impl VgaText {
         self.owns_display_addr(addr)
     }
 
-    /// True when a claimed access to `addr` is served by the legacy
-    /// interleaved text buffer ([`Self::mem`]) instead of plane memory.
-    ///
-    /// This model keeps two backing stores: the 32 KiB `0xB8000` text buffer
-    /// that the text helpers, the HELLO ROM, and the CRTC viewport helpers use,
-    /// and the four 64 KiB maps behind the Graphics Controller. Real hardware
-    /// has one memory; unifying them waits for the character generator and a
-    /// display fetch, neither of which exists yet.
-    pub fn mmio_uses_text_buffer(&self, addr: u64) -> bool {
-        self.text_buffer_offset(addr).is_some()
-    }
-
     /// Guest CPU read of display memory — the single entry point for a bus.
     ///
     /// Performs the whole CPU-side pipeline: Miscellaneous Output RAM Enable
     /// gating, Graphics Controller Miscellaneous window decode, Sequencer plane
     /// addressing, and the Graphics Controller read path (all four latches
     /// loaded, then Read Map Select / Chain-4 map selection in read mode 0 or a
-    /// Color Compare result in read mode 1). Addresses that land in the 32 KiB
-    /// `0xB8000` text buffer are served from it byte-for-byte as before and do
-    /// **not** load the latches (see [`Self::mmio_uses_text_buffer`]).
+    /// Color Compare result in read mode 1).
     ///
-    /// Takes `&mut self` because a graphics read loads the latches.
+    /// Every claimed address takes that path, `0xB8000` included: there is one
+    /// display memory. Under the mode-03h reset programming — odd/even
+    /// addressing, Map Mask `0x03`, read mode 0 with Graphics Mode Host
+    /// Odd/Even read addressing set — a text read still returns the character
+    /// map at even addresses and the attribute map at odd ones, which is what
+    /// the separate text buffer used to return. See
+    /// `docs/vga-r3-unified-display-memory.md`.
+    ///
+    /// Takes `&mut self` because a read loads the latches.
     ///
     /// Returns `None` when the access is not claimed, so the bus can fall
     /// through to open bus / RAM.
@@ -1950,9 +1977,6 @@ impl VgaText {
     /// 2-33 / 2-34 (Memory Mode addressing), 2-71 / 2-72 (Read Map Select,
     /// Read Mode).
     pub fn mmio_read_u8(&mut self, addr: u64) -> Option<u8> {
-        if let Some(off) = self.text_buffer_offset(addr) {
-            return Some(self.mem[off]);
-        }
         self.gc_read_u8(addr)
     }
 
@@ -1961,57 +1985,53 @@ impl VgaText {
     /// Mirrors [`Self::mmio_read_u8`]: RAM Enable gating, window decode, plane
     /// addressing, then the Graphics Controller write path (write modes 0–3
     /// with Set/Reset, Enable Set/Reset, Data Rotate + Function Select, Bit
-    /// Mask, and Map Mask plane write enables). Text-buffer addresses store the
-    /// raw byte exactly as the legacy path did.
+    /// Mask, and Map Mask plane write enables) — for every claimed address,
+    /// `0xB8000` included.
     ///
     /// Returns `false` when the access is not claimed.
     ///
     /// Spec: IBM PS/2 Video Subsystems Figure 2-73 Write Mode Definitions plus
     /// Figures 2-66/2-67, 2-69/2-70, 2-77 and Figure 2-29 Map Mask.
     pub fn mmio_write_u8(&mut self, addr: u64, value: u8) -> bool {
-        if let Some(off) = self.text_buffer_offset(addr) {
-            self.mem[off] = value;
-            return true;
-        }
         self.gc_write_u8(addr, value)
     }
 
-    /// Byte offset of a visible text cell relative to CRTC Start Address.
+    /// Map offset of a visible text cell, as the character generator fetches it.
     ///
     /// Spec: FreeVGA CRT Controller — Start Address is the character index of
-    /// the first displayed cell; Offset is the logical line width in words.
-    /// Host viewport helpers index `(row, col)` as
-    /// `start + row*pitch + col` where `pitch = Offset * 2` character cells
-    /// ([`VgaText::text_row_pitch_chars`]). When that index exceeds the 32 KiB
-    /// plane, wrap within the plane (FreeVGA notes display wrap in video
-    /// memory). CPU MMIO (`read_u8`/`write_u8`) stays absolute at `0xB8000`.
-    fn cell_offset(&self, row: usize, col: usize) -> Option<usize> {
+    /// the first displayed cell; Offset is the logical line width in words, so
+    /// the character pitch is `Offset * 2` ([`VgaText::text_row_pitch_chars`]).
+    /// The resulting CRTC address counter goes through
+    /// [`VgaText::display_map_offset`], so the host helpers and the renderer
+    /// read exactly the same bytes.
+    fn cell_map_offset(&self, row: usize, col: usize) -> Option<usize> {
         if row >= VGA_TEXT_ROWS || col >= VGA_TEXT_COLS {
             return None;
         }
-        let chars_in_plane = VGA_TEXT_SIZE / VGA_CELL_BYTES;
-        let cell =
-            (usize::from(self.text_start_address()) + row * self.text_row_pitch_chars() + col)
-                % chars_in_plane;
-        Some(cell * VGA_CELL_BYTES)
+        let counter =
+            usize::from(self.text_start_address()) + row * self.text_row_pitch_chars() + col;
+        Some(self.display_map_offset(counter))
     }
 
+    /// Character code displayed at `(row, col)` — map 0 at the fetched offset.
     pub fn char_at(&self, row: usize, col: usize) -> Option<u8> {
-        let off = self.cell_offset(row, col)?;
-        Some(self.mem[off])
+        let offset = self.cell_map_offset(row, col)?;
+        Some(self.planes[VGA_TEXT_CHAR_PLANE * VGA_PLANE_SIZE + offset])
     }
 
+    /// Attribute displayed at `(row, col)` — map 1 at the fetched offset.
     pub fn attr_at(&self, row: usize, col: usize) -> Option<u8> {
-        let off = self.cell_offset(row, col)?;
-        Some(self.mem[off + 1])
+        let offset = self.cell_map_offset(row, col)?;
+        Some(self.planes[VGA_TEXT_ATTR_PLANE * VGA_PLANE_SIZE + offset])
     }
 
+    /// Host write of a character/attribute pair at `(row, col)`.
     pub fn put_char(&mut self, row: usize, col: usize, ch: u8, attr: u8) -> bool {
-        let Some(off) = self.cell_offset(row, col) else {
+        let Some(offset) = self.cell_map_offset(row, col) else {
             return false;
         };
-        self.mem[off] = ch;
-        self.mem[off + 1] = attr;
+        self.planes[VGA_TEXT_CHAR_PLANE * VGA_PLANE_SIZE + offset] = ch;
+        self.planes[VGA_TEXT_ATTR_PLANE * VGA_PLANE_SIZE + offset] = attr;
         true
     }
 
@@ -2893,15 +2913,21 @@ mod tests {
 
     #[test]
     fn reset_fills_80x25_space_attr07() {
-        // Spec: IBM VGA text — default light-gray-on-black cells.
+        // Spec: IBM VGA text — default light-gray-on-black cells. The pair now
+        // lives in the one display memory: character in map 0 and attribute in
+        // map 1 at the same even offset.
         let v = VgaText::new();
-        assert_eq!(v.mem.len(), VGA_TEXT_SIZE);
+        assert_eq!(v.planes.len(), VGA_PLANE_COUNT * VGA_PLANE_SIZE);
         assert_eq!(v.char_at(0, 0), Some(b' '));
         assert_eq!(v.attr_at(0, 0), Some(0x07));
         assert_eq!(v.char_at(24, 79), Some(b' '));
         assert_eq!(v.attr_at(24, 79), Some(0x07));
-        // Beyond 80×25 within the 32 KiB plane remains 0 after reset.
-        assert_eq!(v.mem[80 * 25 * 2], 0);
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 0), Some(b' '));
+        assert_eq!(v.plane_byte(VGA_TEXT_ATTR_PLANE, 0), Some(0x07));
+        // Beyond 80×25 the maps remain 0 after reset, and no font is installed.
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 80 * 25 * 2), Some(0));
+        assert_eq!(v.plane_byte(VGA_TEXT_ATTR_PLANE, 80 * 25 * 2), Some(0));
+        assert!((0..VGA_PLANE_SIZE).all(|o| v.plane_byte(VGA_FONT_PLANE, o) == Some(0)));
         assert_eq!(v.crtc_index, 0);
         assert_eq!(
             v.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)],
@@ -5944,8 +5970,9 @@ mod tests {
         assert!(v.plane_access(VGA_TEXT_END - 1).is_some());
     }
 
-    /// The addressing model is register state only: the legacy text-plane CPU
-    /// path at `0xB8000` keeps working while chain-4 is programmed.
+    /// The host alphanumeric helpers address the character/attribute
+    /// interleave in display memory regardless of the Sequencer addressing
+    /// mode, so a chain-4 programming does not disturb them.
     #[test]
     fn plane_addressing_does_not_disturb_text_plane_mmio() {
         let mut v = VgaText::new();
@@ -6166,14 +6193,27 @@ mod character_generator_tests {
         assert_eq!(frame.mode, VgaRenderMode::Text);
     }
 
-    /// Reset clears plane memory and installs no font, so nothing is displayed
-    /// until software loads one. There is no built-in character ROM here.
+    /// Reset installs no font, so no glyph is displayed until software loads
+    /// one. There is no built-in character ROM here.
+    ///
+    /// The reset fill is 80×25 spaces with attribute `0x07`, so every glyph
+    /// pixel is background (Internal Palette entry 0). The one lit region is
+    /// the hardware cursor: the reset CRTC register file leaves Cursor
+    /// Location `0x0000`, Cursor Start `0` and Cursor End `0` with Cursor
+    /// Disable clear, so scan line 0 of the top-left cell is drawn in that
+    /// cell's foreground. Spec: FreeVGA CRTC Cursor Start / End / Location.
     #[test]
-    fn reset_leaves_no_font_so_the_frame_is_uniform_background() {
-        let v = VgaText::new();
+    fn reset_leaves_no_font_so_only_the_hardware_cursor_is_lit() {
+        let mut v = VgaText::new();
         let frame = v.render_frame(false).expect("text mode renders");
-        // Code 0 / attribute 0: foreground and background both resolve to
-        // Internal Palette entry 0 (`0x00`).
+        for dot in 0..9 {
+            assert_eq!(frame.index_at(dot, 0), Some(PALETTE[7]), "cursor dot {dot}");
+        }
+        assert_eq!(frame.index_at(9, 0), Some(PALETTE[0]));
+        assert!((1..400).all(|y| (0..720).all(|x| frame.index_at(x, y) == Some(PALETTE[0]))));
+
+        disable_cursor(&mut v);
+        let frame = v.render_frame(false).expect("text mode renders");
         assert!(frame.pixels.iter().all(|p| *p == PALETTE[0]));
     }
 
@@ -6597,5 +6637,162 @@ mod character_generator_tests {
         assert_eq!(&rgba[..4], &[0xFF, 0x00, 0x55, 0xFF]);
         // Background index 0 is black in the reset DAC RAM.
         assert_eq!(&rgba[4..8], &[0x00, 0x00, 0x00, 0xFF]);
+    }
+}
+
+/// One display memory (M2 round 3, slice 2).
+///
+/// Round 2 kept two backing stores: a 32 KiB interleaved text buffer for
+/// `0xB8000` and four maps for everything else. Real hardware has one memory.
+/// These tests pin the property that made retiring the split safe — under the
+/// mode-03h programming the Graphics Controller resolves a text access to the
+/// same map and offset the alphanumeric view uses — and the places where the
+/// unified model genuinely differs.
+#[cfg(test)]
+mod unified_display_memory_tests {
+    use super::*;
+
+    fn set_gc(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_GC_INDEX, 1, u32::from(index));
+        v.port_write(VGA_GC_DATA, 1, u32::from(value));
+    }
+
+    fn set_seq(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(index));
+        v.port_write(VGA_SEQ_DATA, 1, u32::from(value));
+    }
+
+    /// A guest text write reaches the maps the character generator fetches.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 (odd/even sends even
+    /// addresses to maps 0+2 and odd to maps 1+3) + Figure 2-29 (Map Mask
+    /// `0x03` narrows that to maps 0 and 1) + FreeVGA "VGA Text Mode
+    /// Operation" (map 0 characters, map 1 attributes).
+    #[test]
+    fn a_guest_text_write_lands_in_the_maps_the_renderer_reads() {
+        let mut v = VgaText::new();
+        assert!(v.mmio_write_u8(VGA_TEXT_BASE, b'H'));
+        assert!(v.mmio_write_u8(VGA_TEXT_BASE + 1, 0x1E));
+
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 0), Some(b'H'));
+        assert_eq!(v.plane_byte(VGA_TEXT_ATTR_PLANE, 0), Some(0x1E));
+        // Map Mask 0x03 keeps maps 2 and 3 out, so the font bank is untouched.
+        assert_eq!(v.plane_byte(VGA_FONT_PLANE, 0), Some(0x00));
+        assert_eq!(v.plane_byte(3, 0), Some(0x00));
+
+        assert_eq!(v.char_at(0, 0), Some(b'H'));
+        assert_eq!(v.attr_at(0, 0), Some(0x1E));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(b'H'));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE + 1), Some(0x1E));
+        assert_eq!(v.mmio_read_u8(VGA_TEXT_BASE), Some(b'H'));
+        assert_eq!(v.mmio_read_u8(VGA_TEXT_BASE + 1), Some(0x1E));
+    }
+
+    /// There is no second store to fall out of sync: a direct map write shows
+    /// up in every text view, and a text write shows up in the maps.
+    #[test]
+    fn map_writes_and_text_writes_reach_the_same_bytes() {
+        let mut v = VgaText::new();
+        assert!(v.set_plane_byte(VGA_TEXT_CHAR_PLANE, 0, b'Z'));
+        assert!(v.set_plane_byte(VGA_TEXT_ATTR_PLANE, 0, 0x4E));
+        assert_eq!(v.char_at(0, 0), Some(b'Z'));
+        assert_eq!(v.attr_at(0, 0), Some(0x4E));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(b'Z'));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE + 1), Some(0x4E));
+
+        assert!(v.put_char(0, 0, b'Q', 0x1F));
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 0), Some(b'Q'));
+        assert_eq!(v.plane_byte(VGA_TEXT_ATTR_PLANE, 0), Some(0x1F));
+    }
+
+    /// A graphics-window write at the same display offset is visible to the
+    /// text helpers — the behavior the split backing stores used to hide.
+    ///
+    /// Spec: IBM Figure 2-75 — the `0xA0000` 64 KB window decodes offsets from
+    /// its own base, so window offset 0 is the same display memory the
+    /// alphanumeric cell at CRTC counter 0 uses.
+    #[test]
+    fn a_graphics_window_write_is_visible_to_the_text_helpers() {
+        let mut v = VgaText::new();
+        set_gc(
+            &mut v,
+            VGA_GC_MISC,
+            VGA_GC_MISC_GRAPHICS_MODE
+                | (VGA_GC_MEMORY_MAP_A0000_64K << VGA_GC_MISC_MEMORY_MAP_SHIFT),
+        );
+        set_seq(
+            &mut v,
+            VGA_SEQ_MEMORY_MODE,
+            VGA_SEQ_MEMORY_MODE_EXTENDED | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE,
+        );
+        set_seq(&mut v, VGA_SEQ_MAP_MASK, VGA_SEQ_MAP_MASK_PLANES);
+
+        assert!(v.mmio_write_u8(VGA_WINDOW_A0000_BASE, 0x41));
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 0), Some(0x41));
+        assert_eq!(v.plane_byte(VGA_TEXT_ATTR_PLANE, 0), Some(0x41));
+        assert_eq!(v.char_at(0, 0), Some(0x41));
+        assert_eq!(v.attr_at(0, 0), Some(0x41));
+    }
+
+    /// Every guest access now runs the Graphics Controller, so a text read
+    /// loads all four latches. The host helpers still do not.
+    ///
+    /// Spec: OSDev VGA Hardware "The Latches" — a system read loads all four.
+    #[test]
+    fn a_guest_text_read_loads_the_latches_but_a_host_read_does_not() {
+        let mut v = VgaText::new();
+        assert!(v.set_plane_byte(0, 0, 0x11));
+        assert!(v.set_plane_byte(1, 0, 0x22));
+        assert!(v.set_plane_byte(2, 0, 0x33));
+        assert!(v.set_plane_byte(3, 0, 0x44));
+
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(0x11));
+        assert_eq!(v.gc_latches, [0; VGA_PLANE_COUNT]);
+
+        assert_eq!(v.mmio_read_u8(VGA_TEXT_BASE), Some(0x11));
+        assert_eq!(v.gc_latches, [0x11, 0x22, 0x33, 0x44]);
+    }
+
+    /// A guest text write now goes through the write path, so Map Mask, write
+    /// modes and the Bit Mask apply to `0xB8000` — they could not before.
+    ///
+    /// Spec: IBM Figure 2-73 Write Mode Definitions; Figure 2-29 Map Mask;
+    /// Figure 2-77 Bit Mask.
+    #[test]
+    fn write_modes_and_map_mask_now_apply_at_b8000() {
+        let mut v = VgaText::new();
+        // Map Mask 0x02 keeps the character map out of an even-address write.
+        set_seq(&mut v, VGA_SEQ_MAP_MASK, 0b0010);
+        assert!(v.mmio_write_u8(VGA_TEXT_BASE, b'X'));
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 0), Some(b' '));
+
+        // Bit Mask on a normal text write.
+        set_seq(&mut v, VGA_SEQ_MAP_MASK, VGA_SEQ_MAP_MASK_DEFAULT);
+        set_gc(&mut v, VGA_GC_BIT_MASK, 0x0F);
+        v.mmio_read_u8(VGA_TEXT_BASE); // load latches with the space
+        assert!(v.mmio_write_u8(VGA_TEXT_BASE, 0xFF));
+        assert_eq!(
+            v.plane_byte(VGA_TEXT_CHAR_PLANE, 0),
+            Some((b' ' & 0xF0) | 0x0F)
+        );
+    }
+
+    /// Reset restores the 80×25 blank screen into display memory itself.
+    #[test]
+    fn reset_puts_the_blank_screen_into_display_memory() {
+        let mut v = VgaText::new();
+        assert!(v.set_plane_byte(VGA_TEXT_CHAR_PLANE, 0, 0xAA));
+        assert!(v.set_plane_byte(VGA_FONT_PLANE, 0x1234, 0xBB));
+        v.reset();
+
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 0), Some(VGA_DEFAULT_CHAR));
+        assert_eq!(v.plane_byte(VGA_TEXT_ATTR_PLANE, 0), Some(VGA_DEFAULT_ATTR));
+        let last = (VGA_TEXT_COLS * VGA_TEXT_ROWS - 1) * VGA_CELL_BYTES;
+        assert_eq!(
+            v.plane_byte(VGA_TEXT_CHAR_PLANE, last),
+            Some(VGA_DEFAULT_CHAR)
+        );
+        assert_eq!(v.plane_byte(VGA_FONT_PLANE, 0x1234), Some(0x00));
+        assert_eq!(v.char_at(24, 79), Some(VGA_DEFAULT_CHAR));
     }
 }

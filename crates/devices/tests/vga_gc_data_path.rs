@@ -80,8 +80,12 @@ fn seed_planes(vga: &mut VgaText, offset: usize, values: [u8; 4]) {
     }
 }
 
+/// Reset clears the latches and restores display memory to the 80×25 blank
+/// screen. Since the round-3 unification there is one display memory, so that
+/// blank screen *is* map 0 (spaces) and map 1 (attribute `0x07`) at even
+/// offsets; everything else, maps 2 and 3 included, is zero.
 #[test]
-fn reset_clears_plane_memory_and_latches() {
+fn reset_clears_the_latches_and_restores_the_blank_screen_fill() {
     let mut vga = planar_all_maps();
     seed_planes(&mut vga, 0, [0x11, 0x22, 0x33, 0x44]);
     assert!(vga.gc_read_u8(VGA_TEXT_BASE).is_some());
@@ -89,7 +93,10 @@ fn reset_clears_plane_memory_and_latches() {
 
     vga.reset();
     assert_eq!(vga.gc_latches, [0, 0, 0, 0]);
-    assert_eq!(planes_at(&vga, 0), [0, 0, 0, 0]);
+    assert_eq!(planes_at(&vga, 0), [b' ', 0x07, 0, 0]);
+    assert_eq!(planes_at(&vga, 1), [0, 0, 0, 0], "odd offsets unused");
+    // Past the 80×25 cells display memory is zero.
+    assert_eq!(planes_at(&vga, 80 * 25 * 2), [0, 0, 0, 0]);
 }
 
 /// Spec: OSDev VGA Hardware "The Latches" — a load from video memory fills all
@@ -155,8 +162,11 @@ fn read_mode1_returns_color_compare_result() {
 fn write_mode0_writes_only_map_mask_enabled_maps() {
     let mut vga = planar_all_maps();
     write_seq(&mut vga, SEQ_MAP_MASK, 0b0101);
+    // Offset 8 is inside the 80×25 reset fill, so map 1 already holds the
+    // blank-screen attribute `0x07`. A disabled map keeps whatever it held.
+    assert_eq!(planes_at(&vga, 8), [b' ', 0x07, 0x00, 0x00]);
     assert!(vga.gc_write_u8(VGA_TEXT_BASE + 8, 0x5A));
-    assert_eq!(planes_at(&vga, 8), [0x5A, 0x00, 0x5A, 0x00]);
+    assert_eq!(planes_at(&vga, 8), [0x5A, 0x07, 0x5A, 0x00]);
 }
 
 /// Spec: Figure 2-69 RC — "the number of positions the system data is rotated

@@ -112,27 +112,42 @@ fn mmio_claims_follow_memory_map_select_and_ram_enable() {
     );
 }
 
-/// Every byte of the `0xB8000` text window behaves exactly as the legacy
-/// `read_u8` / `write_u8` text path does, in the reset (mode-03h) programming
-/// the HELLO ROM and the existing text tests depend on.
+/// Every byte of the `0xB8000` text window behaves the same whether it is
+/// reached through the guest Graphics Controller path or the host alphanumeric
+/// helpers, in the reset (mode-03h) programming the HELLO ROM and the existing
+/// text tests depend on.
+///
+/// This is the property that makes one display memory safe: with odd/even
+/// addressing, Map Mask `0x03`, write mode 0 and read mode 0 with Graphics
+/// Mode Host Odd/Even read addressing set, the Graphics Controller resolves a
+/// text access to exactly the map and offset the host interleave view uses.
 #[test]
-fn text_window_is_byte_identical_to_the_legacy_text_path() {
-    let mut legacy = VgaText::new();
-    let mut unified = VgaText::new();
+fn text_window_guest_and_host_paths_address_the_same_bytes() {
+    let mut host = VgaText::new();
+    let mut guest = VgaText::new();
 
     for offset in 0..VGA_TEXT_SIZE {
         let addr = VGA_TEXT_BASE + offset as u64;
         let value = (offset % 251) as u8;
-        assert!(legacy.write_u8(addr, value));
-        assert!(unified.mmio_write_u8(addr, value));
-        assert_eq!(unified.mmio_read_u8(addr), legacy.read_u8(addr));
+        assert!(host.write_u8(addr, value));
+        assert!(guest.mmio_write_u8(addr, value));
+        assert_eq!(guest.mmio_read_u8(addr), host.read_u8(addr), "{addr:#X}");
     }
 
-    assert_eq!(legacy.mem, unified.mem);
-    // The text path never touches plane memory or the latches.
-    assert_eq!(legacy.planes, unified.planes);
-    assert_eq!(unified.gc_latches, [0; 4]);
-    assert!(unified.mmio_uses_text_buffer(VGA_TEXT_BASE));
+    assert_eq!(host.planes, guest.planes);
+    // A guest read now loads all four latches, because it really does go
+    // through the Graphics Controller. The host helpers still do not.
+    let last = VGA_TEXT_SIZE - 2;
+    assert_eq!(
+        guest.gc_latches,
+        [
+            host.plane_byte(0, last).unwrap(),
+            host.plane_byte(1, last).unwrap(),
+            host.plane_byte(2, last).unwrap(),
+            host.plane_byte(3, last).unwrap(),
+        ]
+    );
+    assert_eq!(host.gc_latches, [0; 4]);
 }
 
 /// Host text helpers see what the guest wrote through the unified entry point.
@@ -189,39 +204,51 @@ fn graphics_window_routes_through_the_graphics_controller() {
     select_window(&mut vga, VGA_GC_MEMORY_MAP_A0000_64K);
     write_seq(&mut vga, VGA_SEQ_MAP_MASK, 0b0101);
 
-    assert!(!vga.mmio_uses_text_buffer(VGA_WINDOW_A0000_BASE));
     assert!(vga.mmio_write_u8(VGA_WINDOW_A0000_BASE + 0x10, 0x5A));
 
+    // Map 1 is masked out, so it keeps the 80×25 blank-screen attribute the
+    // reset fill left in the one display memory.
     assert_eq!(vga.plane_byte(0, 0x10), Some(0x5A));
-    assert_eq!(vga.plane_byte(1, 0x10), Some(0x00));
+    assert_eq!(vga.plane_byte(1, 0x10), Some(0x07));
     assert_eq!(vga.plane_byte(2, 0x10), Some(0x5A));
     assert_eq!(vga.plane_byte(3, 0x10), Some(0x00));
 
     assert_eq!(vga.mmio_read_u8(VGA_WINDOW_A0000_BASE + 0x10), Some(0x5A));
-    assert_eq!(vga.gc_latches, [0x5A, 0x00, 0x5A, 0x00]);
+    assert_eq!(vga.gc_latches, [0x5A, 0x07, 0x5A, 0x00]);
 }
 
-/// With the 128 KB window selected, the `0xB8000` half stays on the legacy
-/// interleaved text buffer while the rest reaches plane memory. This split is
-/// a documented model artifact of keeping two backing stores.
+/// With the 128 KB window selected, `0xB8000` is display-memory offset
+/// `0x18000`, wrapped to `0x8000` in a 64 KiB map — it is *not* offset 0.
+///
+/// The separate text buffer used to hide this: it served `0xB8000` from its
+/// own offset 0 whatever window was programmed. With one display memory the
+/// window base decides the offset, for the guest path and the host
+/// alphanumeric view alike. Spec: IBM Figure 2-75 Video Memory Assignments.
 #[test]
-fn the_128k_window_splits_between_plane_memory_and_the_text_buffer() {
+fn the_128k_window_places_b8000_at_its_own_display_offset() {
     let mut vga = VgaText::new();
     planar_all_maps(&mut vga);
     select_window(&mut vga, VGA_GC_MEMORY_MAP_A0000_128K);
 
-    assert!(!vga.mmio_uses_text_buffer(VGA_WINDOW_A0000_BASE));
-    assert!(!vga.mmio_uses_text_buffer(VGA_WINDOW_B0000_BASE));
-    assert!(vga.mmio_uses_text_buffer(VGA_TEXT_BASE));
-
     assert!(vga.mmio_write_u8(VGA_WINDOW_B0000_BASE, 0x11));
     assert!(vga.mmio_write_u8(VGA_TEXT_BASE, b'T'));
 
-    let plane_offset = vga.plane_offset(VGA_WINDOW_B0000_BASE).expect("in window");
-    assert_eq!(vga.plane_byte(0, plane_offset), Some(0x11));
-    assert_eq!(vga.char_at(0, 0), Some(b'T'));
+    // 0xB0000 is window offset 0x10000, which wraps to 0 in a 64 KiB map.
+    let b0000_offset = vga.plane_offset(VGA_WINDOW_B0000_BASE).expect("in window");
+    assert_eq!(b0000_offset, 0x0000);
+    assert_eq!(vga.plane_byte(0, b0000_offset), Some(0x11));
+
+    // 0xB8000 is window offset 0x18000, which wraps to 0x8000.
+    let b8000_offset = vga.plane_offset(VGA_TEXT_BASE).expect("in window");
+    assert_eq!(b8000_offset, 0x8000);
+    assert_eq!(vga.plane_byte(0, b8000_offset), Some(b'T'));
+    assert_eq!(vga.read_u8(VGA_TEXT_BASE), Some(b'T'));
     assert_eq!(vga.mmio_read_u8(VGA_WINDOW_B0000_BASE), Some(0x11));
     assert_eq!(vga.mmio_read_u8(VGA_TEXT_BASE), Some(b'T'));
+
+    // The character generator still fetches CRTC counter 0 at map offset 0,
+    // which is where the 0xB0000 write landed under this window.
+    assert_eq!(vga.char_at(0, 0), Some(0x11));
 }
 
 /// The `0xB0000` 32 KB window decodes plane offsets relative to `0xA0000`,

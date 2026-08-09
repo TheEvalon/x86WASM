@@ -115,8 +115,10 @@ fn guest_reaches_write_mode_0_and_map_mask_through_the_aperture() {
         0xBA, 0x02, 0x04,       // MOV DX, 0x0402
         0xEE,                   // OUT DX, AL
     ]);
-    // Read map 1: Map Mask kept the write out, so it is still zero. Bias it
-    // into printable range so the debug console text stays readable.
+    // Read map 1: Map Mask kept the write out, so map 1 still holds the
+    // reset blank-screen attribute `0x07` that now lives in the one display
+    // memory. Bias it into printable range so the debug console stays readable
+    // (`0x07 + 0x40` = `'G'`).
     code.extend(write_gc(VGA_GC_READ_MAP_SELECT, 1));
     #[rustfmt::skip]
     code.extend_from_slice(&[
@@ -131,12 +133,14 @@ fn guest_reaches_write_mode_0_and_map_mask_through_the_aperture() {
 
     assert_eq!(
         m.debug_text(),
-        "G@",
-        "map 2 holds the written byte and map 1 is untouched"
+        "GG",
+        "map 2 holds the written byte; map 1 still holds the reset attribute"
     );
     assert_eq!(m.vga.plane_byte(2, 0), Some(b'G'));
-    assert_eq!(m.vga.plane_byte(0, 0), Some(0x00));
-    assert_eq!(m.vga.plane_byte(1, 0), Some(0x00));
+    // Maps 0 and 1 keep the 80×25 blank-screen fill that reset now leaves in
+    // the one display memory (space / attribute 0x07); map 3 was never filled.
+    assert_eq!(m.vga.plane_byte(0, 0), Some(b' '));
+    assert_eq!(m.vga.plane_byte(1, 0), Some(0x07));
     assert_eq!(m.vga.plane_byte(3, 0), Some(0x00));
 }
 
@@ -170,11 +174,15 @@ fn guest_reaches_write_mode_2_through_the_aperture() {
     assert_eq!(m.vga.plane_byte(3, 0), Some(0x00));
 }
 
-/// The `0xB8000` text path is unchanged by routing the whole aperture.
+/// The `0xB8000` text path still reads back byte for byte, now through the one
+/// display memory.
 ///
 /// The HELLO ROM and every existing text-mode test depend on a byte written at
-/// `0xB8000` landing in the interleaved character/attribute buffer with no
-/// Graphics Controller involvement, under the mode-3 reset defaults.
+/// `0xB8000` being the byte the host text helpers report, under the mode-3
+/// reset defaults. Since the round-3 unification that byte reaches display
+/// memory through the Graphics Controller — odd/even addressing plus Map Mask
+/// `0x03` put the character in map 0 and the attribute in map 1 at the same
+/// even offset, which is exactly where the character generator fetches them.
 #[test]
 fn text_mode_writes_at_b8000_are_unchanged_by_the_aperture_routing() {
     #[rustfmt::skip]
@@ -201,10 +209,12 @@ fn text_mode_writes_at_b8000_are_unchanged_by_the_aperture_routing() {
     assert_eq!(
         m.debug_text(),
         "H",
-        "the read came back from the text buffer"
+        "the read came back from display memory"
     );
-    // Nothing reached plane memory: text accesses do not touch the latches.
-    assert_eq!(m.vga.plane_byte(0, 0), Some(0x00));
+    // There is one display memory: the character is in map 0 and the attribute
+    // in map 1, both at map offset 0.
+    assert_eq!(m.vga.plane_byte(0, 0), Some(b'H'));
+    assert_eq!(m.vga.plane_byte(1, 0), Some(0x07));
 }
 
 /// With Miscellaneous Output RAM Enable clear the device claims nothing, and
@@ -231,7 +241,11 @@ fn ram_enable_clear_falls_through_to_physical_memory() {
 
     assert!(!m.vga.mmio_claims(VGA_WINDOW_A0000_BASE));
     assert!(VgaText::in_aperture(VGA_WINDOW_A0000_BASE));
-    assert_eq!(m.vga.plane_byte(0, 0), Some(0x00), "no plane was written");
+    assert_eq!(
+        m.vga.plane_byte(0, 0),
+        Some(b' '),
+        "no map was written: still the reset blank-screen fill"
+    );
     assert_eq!(
         m.mem.read_u8(VGA_WINDOW_A0000_BASE),
         Ok(b'Z'),
