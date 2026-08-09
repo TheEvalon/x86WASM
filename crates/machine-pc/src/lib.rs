@@ -14,18 +14,27 @@ mod mem;
 mod ports;
 mod post_code;
 mod post_probe;
+mod step_clock;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
-pub use mem::PhysMem;
+pub use mem::{
+    PamAttributes, PamRead, PamWrite, PhysMem, PAM_BIOS_REGION, PAM_FIELD_MASK, PAM_FIELD_RE,
+    PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST, PAM_REGISTER_LAST,
+    PAM_WINDOW_BASE, PAM_WINDOW_END,
+};
 pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
     UNMAPPED_MMIO_PAGE_SIZE,
 };
 pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
 pub use post_probe::{
-    seabios_image_path, PostFailure, PostFailureKind, PostReport, PostStopReason,
+    seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
     DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
+};
+pub use step_clock::{
+    StepClock, StepTicks, CMOS_PERIODIC_HZ, DEFAULT_PIT_CLOCKS_PER_STEP,
+    PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
 };
 
 use devices::{
@@ -36,7 +45,9 @@ use devices::{
     PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
     PORT_SYSTEM_CONTROL_A,
 };
-use firmware_interface::{prepare_bios_rom, BiosRomError, RomImage};
+use firmware_interface::{
+    prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
+};
 use ports::PortBus;
 use thiserror::Error;
 use x86_core::CpuState;
@@ -50,6 +61,8 @@ pub enum MachineError {
     RomTooLarge,
     #[error(transparent)]
     BiosRom(#[from] BiosRomError),
+    #[error(transparent)]
+    OptionRom(#[from] OptionRomError),
     /// No IDE LBA0 / floppy CHS (0,0,1) available for [`Machine::load_mbr_to_7c00`].
     #[error("no boot media attached (IDE LBA0 or floppy CHS 0,0,1)")]
     NoBootMedia,
@@ -98,6 +111,8 @@ pub struct Machine {
     pub fw_cfg: FwCfg,
     /// POST checkpoint latch on the manufacturing diagnostic port `0x80`.
     pub post_diag: PostCodePort,
+    /// Instruction-count time source for the PIT / RTC (disabled by default).
+    step_clock: StepClock,
     ports: PortBus,
 }
 
@@ -122,7 +137,44 @@ impl Machine {
             fdc: Fdc82077::new(),
             fw_cfg: FwCfg::with_ram_size(ram_size as u64),
             post_diag: PostCodePort::new(),
+            step_clock: StepClock::disabled(),
             ports: PortBus::new(),
+        }
+    }
+
+    /// Current instruction-count time source configuration.
+    pub fn step_clock(&self) -> StepClock {
+        self.step_clock
+    }
+
+    /// Install an instruction-count time source (see [`StepClock`]).
+    ///
+    /// Off by default. The step-to-tick ratio is a documented model choice, not
+    /// accurate timing: see `docs/machine-r2-pam-memory.md`. Accumulators start
+    /// fresh so a configuration change never carries a partial quantum over.
+    pub fn set_step_clock(&mut self, mut clock: StepClock) {
+        clock.reset_accumulators();
+        self.step_clock = clock;
+    }
+
+    /// Charge one retired instruction to the time source.
+    ///
+    /// Spec: Intel 8254 (CLK-driven counter) and Motorola MC146818A (periodic
+    /// quantum + one-second update cycle), driven from the retired-instruction
+    /// count rather than host wall clock so a run is reproducible.
+    fn advance_step_clock(&mut self) {
+        let ticks = self.step_clock.charge_step();
+        if ticks.is_empty() {
+            return;
+        }
+        if ticks.pit_clocks > 0 {
+            self.tick_pit(ticks.pit_clocks);
+        }
+        if ticks.cmos_periods > 0 {
+            self.tick_cmos(ticks.cmos_periods);
+        }
+        for _ in 0..ticks.cmos_seconds {
+            self.tick_cmos_second();
         }
     }
 
@@ -193,6 +245,65 @@ impl Machine {
         Ok(m)
     }
 
+    /// Map a validated PC-compatible expansion ROM into the legacy region.
+    ///
+    /// Uses [`firmware_interface::prepare_option_rom`]: `0x55AA` signature,
+    /// non-zero initialization size at offset 2, byte-wise checksum zero over
+    /// that size, 2 KiB base alignment, and containment in `0xC0000`-`0xDFFFF`,
+    /// which is what a BIOS option-ROM scan looks for.
+    ///
+    /// Adds a ROM window without disturbing existing ones, so it must be called
+    /// **after** [`Self::load_bios_rom`] (which clears every window). The window
+    /// sits under PAM regions 0-7, so a guest can shadow the option ROM with
+    /// the same sequence it uses for the BIOS area.
+    pub fn map_option_rom(&mut self, phys_base: u64, data: &[u8]) -> Result<(), MachineError> {
+        let image = prepare_option_rom(phys_base, data)?;
+        self.mem.add_rom(image.phys_base, image.data);
+        Ok(())
+    }
+
+    /// Map an expansion ROM at the conventional video-BIOS base `0xC0000`.
+    ///
+    /// Wraps [`Self::map_option_rom`]. This tree ships no VGA BIOS image and
+    /// nothing executes the ROM; the mapping is what a scan can find.
+    pub fn map_vga_option_rom(&mut self, data: &[u8]) -> Result<(), MachineError> {
+        self.map_option_rom(firmware_interface::VGA_OPTION_ROM_BASE, data)
+    }
+
+    /// Apply one i440FX PAM configuration register byte (`0x59`-`0x5F`).
+    ///
+    /// **This is the host entry point a PCI-side PAM caller drives.** The PMC
+    /// configuration registers live in `devices::PciConfig`; after a config
+    /// write to host-bridge `00:00.0` offsets `0x59`-`0x5F` the machine layer
+    /// forwards the byte here so [`PhysMem`] re-attributes the two regions the
+    /// register owns. Returns `false` when `offset` is not a PAM register.
+    ///
+    /// Spec: Intel 440FX PMC datasheet, Programmable Attribute Map.
+    pub fn apply_pam_register(&mut self, offset: u8, value: u8) -> bool {
+        self.mem.apply_pam_register(offset, value)
+    }
+
+    /// Decoded view of a PAM configuration register (reserved bits read 0).
+    pub fn pam_register(&self, offset: u8) -> Option<u8> {
+        self.mem.pam_register_value(offset)
+    }
+
+    /// Set one PAM region's attributes directly (host / test path).
+    pub fn set_pam_attributes(
+        &mut self,
+        region: usize,
+        readable_from: PamRead,
+        writable_to: PamWrite,
+    ) -> bool {
+        self.mem
+            .set_region_attributes(region, readable_from, writable_to)
+    }
+
+    /// Current attributes of a PAM region.
+    pub fn pam_attributes(&self, region: usize) -> Option<PamAttributes> {
+        self.mem.region_attributes(region)
+    }
+
     pub fn reset(&mut self) {
         self.cpu = CpuState::reset();
         self.com1 = Serial16550::new(0x3F8);
@@ -211,6 +322,12 @@ impl Machine {
         self.fdc.reset();
         self.fw_cfg.reset();
         self.post_diag.reset();
+        // Configuration survives reset (like the fw_cfg host configuration);
+        // only partial timer quanta are dropped.
+        self.step_clock.reset_accumulators();
+        // Spec: Intel 440FX PMC — PAM0-PAM6 reset to 0x00 (read from ROM, no
+        // DRAM writes). Shadow contents survive, like DRAM across PCIRST#.
+        self.mem.reset_pam();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 / port 0x92 defaults.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
         self.port92.set_a20_enabled(self.kbd.a20_enabled());
@@ -293,6 +410,9 @@ impl Machine {
             };
             step(&mut self.cpu, &mut view)?;
         }
+        // The instruction retired, so it is charged to the time source before a
+        // latched system reset can restore the devices it just advanced.
+        self.advance_step_clock();
         // Spec: OSDev I8042 / A20 Line — system-reset after OUT (CPU not in bus view).
         let _ = self.service_8042_pulse_reset();
         Ok(())
@@ -1060,10 +1180,46 @@ mod tests {
         assert_eq!(m.mem.read_u8(0x000F_FFF0).unwrap(), 0xF4);
         assert_eq!(m.mem.read_u8(0xFFFF_FFFF).unwrap(), 0x55);
         assert_eq!(m.mem.read_u8(0x000F_FFFF).unwrap(), 0x55);
+        // Spec: Intel 440FX PMC — the alias sits under PAM, whose reset
+        // attributes forward the write to PCI (dropped) rather than faulting.
+        assert_eq!(m.mem.write_u8(0x000F_0000, 0x00), Ok(()));
+        assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0xEA);
         assert_eq!(
-            m.mem.write_u8(0x000F_0000, 0x00),
+            m.mem.write_u8(0xFFFF_0000, 0x00),
             Err(crate::mem::MemError::RomWrite)
         );
+    }
+
+    /// Spec: Intel 440FX PMC — a PCI-side PAM register write re-attributes both
+    /// regions of the nibble pair through `Machine::apply_pam_register`, and a
+    /// machine reset restores the `0x00` default.
+    #[test]
+    fn pam_register_write_reattributes_bios_region() {
+        let mut m = Machine::with_bios_rom(1024 * 1024, &synthetic_bios_64k()).unwrap();
+        assert_eq!(
+            m.pam_attributes(PAM_BIOS_REGION),
+            Some(PamAttributes {
+                read: PamRead::Rom,
+                write: PamWrite::Ignored,
+            })
+        );
+
+        // PAM0 (0x59) high nibble RE|WE → BIOS area reads and writes DRAM.
+        assert!(m.apply_pam_register(0x59, (PAM_FIELD_RE | PAM_FIELD_WE) << 4));
+        assert_eq!(
+            m.pam_attributes(PAM_BIOS_REGION),
+            Some(PamAttributes {
+                read: PamRead::ShadowRam,
+                write: PamWrite::ShadowRam,
+            })
+        );
+        assert_eq!(m.pam_register(0x59), Some(0x30));
+        m.mem.write_u8(0x000F_0000, 0x5A).unwrap();
+        assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0x5A);
+
+        m.reset();
+        assert_eq!(m.pam_register(0x59), Some(0x00));
+        assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0xEA);
     }
 
     /// Spec: `with_bios_rom` mirrors [`Machine::with_floppy`] constructor shape.
