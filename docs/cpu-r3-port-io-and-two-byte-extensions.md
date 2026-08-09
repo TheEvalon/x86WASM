@@ -110,3 +110,44 @@ Not supported:
 - The 64-bit forms (`PUSH FS`/`GS` with a 64-bit slot; `PUSH ES`/`CS`/`SS`/`DS`
   do not exist in 64-bit mode at all).
 - `POP CS`, which is not an instruction — `0x0F` is the two-byte escape.
+
+## Slice 3 — `CMOVcc` (`0F 40`–`0F 4F`)
+
+Spec: SDM Vol. 2 "CMOVcc—Conditional Move", Appendix A opcode map 2 and
+Appendix B (condition-code encodings); Vol. 1 §3.4.1.1, §3.6 Table 3-4.
+
+Supported:
+
+- All sixteen conditions at both operand sizes, register and memory sources.
+  The condition goes through the **same** low-nibble evaluator the short `Jcc`
+  (`70`+cc), near `Jcc` (`0F 80`+cc) and `SETcc` (`0F 90`+cc) families use, so
+  the four families cannot disagree. A test walks all sixteen conditions against
+  all thirty-two meaningful CF/PF/ZF/SF/OF combinations and compares each result
+  to the short `Jcc` outcome.
+- The destination is `ModR/M.reg` and its width follows the operand-size
+  attribute. A taken 16-bit move leaves the upper half of the 32-bit destination
+  untouched; an untaken move of either width leaves the destination entirely
+  unchanged. There is no byte form.
+- No flags are written.
+- **The source operand is read before the condition is evaluated.** The SDM
+  allows a processor to read a memory source regardless of whether the condition
+  holds, so a source the segment limit or the bus rejects faults either way. A
+  test asserts the `#GP` occurs with the condition both true and false, and that
+  the destination is not partially committed.
+
+CPUID interaction, stated explicitly:
+
+`CMOVcc` is implemented but **CPUID leaf 1 EDX bit 15 (`CMOV`) stays clear**.
+ADR-0007 governs CPUID and this round does not touch it. Under-reporting an
+implemented feature is safe under the truthful-CPUID rule — the risk the rule
+guards against is the opposite direction. Software that gates `CMOVcc` on the
+feature bit will simply take its non-`CMOV` path. Setting the bit belongs with a
+CPUID revision, not with an instruction slice.
+
+Not supported:
+
+- The REX.W `r64` destination form.
+- 64-bit mode's rule that a 32-bit operand size zero-extends the destination even
+  when the condition is false; that rule has no 16/32-bit analogue and long mode
+  is out of scope.
+- The `#UD` a `LOCK` prefix should raise.

@@ -1429,6 +1429,25 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
     setcc(0x9D, "SETGE"),
     setcc(0x9E, "SETLE"),
     setcc(0x9F, "SETG"),
+    // `CMOVcc r, r/m` — Spec: Intel SDM Vol. 2 "CMOVcc—Conditional Move"
+    // (opcode map 2 — `0F 40`+cc /r). Same low-nibble condition encoding as
+    // `Jcc` and `SETcc`.
+    cmovcc(0x40, "CMOVO"),
+    cmovcc(0x41, "CMOVNO"),
+    cmovcc(0x42, "CMOVB"),
+    cmovcc(0x43, "CMOVAE"),
+    cmovcc(0x44, "CMOVE"),
+    cmovcc(0x45, "CMOVNE"),
+    cmovcc(0x46, "CMOVBE"),
+    cmovcc(0x47, "CMOVA"),
+    cmovcc(0x48, "CMOVS"),
+    cmovcc(0x49, "CMOVNS"),
+    cmovcc(0x4A, "CMOVP"),
+    cmovcc(0x4B, "CMOVNP"),
+    cmovcc(0x4C, "CMOVL"),
+    cmovcc(0x4D, "CMOVGE"),
+    cmovcc(0x4E, "CMOVLE"),
+    cmovcc(0x4F, "CMOVG"),
     // `PUSH`/`POP FS`/`GS` — Spec: Intel SDM Vol. 2 "PUSH"/"POP" (opcode map 2
     // — `0F A0`/`0F A1`/`0F A8`/`0F A9`). No ModR/M; the stack slot width
     // follows the operand-size attribute.
@@ -1692,6 +1711,20 @@ const fn setcc(opcode: u8, mnemonic: &'static str) -> InstrDef {
     }
 }
 
+/// Two-byte `CMOVcc r, r/m` entry (`0F 40`+cc /r).
+///
+/// The destination is `ModR/M.reg` and the width follows the operand-size
+/// attribute; there is no byte form. Spec: Intel SDM Vol. 2 "CMOVcc".
+const fn cmovcc(opcode: u8, mnemonic: &'static str) -> InstrDef {
+    InstrDef {
+        mnemonic,
+        opcode,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "CMOVcc r16/r32, r/m16/r/m32",
+    }
+}
+
 pub fn lookup_0f(opcode: u8) -> Option<&'static InstrDef> {
     M1_0F_SUBSET.iter().find(|d| d.opcode == opcode)
 }
@@ -1807,6 +1840,24 @@ mod tests {
             assert_eq!(set.mnemonic, SETCC[cc as usize]);
             assert_eq!(set.encoding, Encoding::Modrm);
             assert_eq!(set.width, Width::W8);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc—Conditional Move" (opcode map 2): the whole
+    /// `0F 40`–`0F 4F` range is present, keyed on the same low-nibble condition
+    /// encoding as `Jcc`/`SETcc`, with no byte form (`Width::OsZ` only).
+    #[test]
+    fn two_byte_cmovcc_range_is_complete() {
+        const CMOVCC: [&str; 16] = [
+            "CMOVO", "CMOVNO", "CMOVB", "CMOVAE", "CMOVE", "CMOVNE", "CMOVBE", "CMOVA", "CMOVS",
+            "CMOVNS", "CMOVP", "CMOVNP", "CMOVL", "CMOVGE", "CMOVLE", "CMOVG",
+        ];
+        for cc in 0u8..16 {
+            let def =
+                lookup_0f(0x40 | cc).unwrap_or_else(|| panic!("missing 0F {:02X}", 0x40 | cc));
+            assert_eq!(def.mnemonic, CMOVCC[cc as usize]);
+            assert_eq!(def.encoding, Encoding::Modrm);
+            assert_eq!(def.width, Width::OsZ);
         }
     }
 }

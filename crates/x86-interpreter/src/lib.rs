@@ -3730,6 +3730,37 @@ fn step_two_byte(
             }
             Ok(())
         }
+        0x40..=0x4F => {
+            // CMOVcc r, r/m — Spec: Intel SDM Vol. 2 "CMOVcc—Conditional Move":
+            // `IF condition THEN DEST := SRC`. The condition comes from the
+            // shared low-nibble evaluator, so `CMOVcc` cannot disagree with
+            // `Jcc` or `SETcc`. There is no byte form; the width follows the
+            // operand-size attribute, and no flags are written.
+            //
+            // The source operand is read *before* the condition is evaluated.
+            // The SDM allows the processor to read a memory source regardless of
+            // the condition, so a source the segment limit or the bus rejects
+            // faults whether or not the move happens. Nothing is committed when
+            // the read faults.
+            //
+            // Unsupported here: the REX.W `r64` form, and CPUID leaf 1 EDX bit 15
+            // (`CMOV`) deliberately stays clear — ADR-0007 governs CPUID, and
+            // under-reporting an implemented feature is safe.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            if opsz32(insn) {
+                let src = read_rm_u32(cpu, bus, insn)?;
+                if condition_code(cpu, insn.opcode) {
+                    cpu.set_gpr_u32(m.reg as usize, src);
+                }
+            } else {
+                let src = read_rm_u16(cpu, bus, insn)?;
+                if condition_code(cpu, insn.opcode) {
+                    cpu.set_gpr_u16(m.reg as usize, src);
+                }
+            }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
         0x90..=0x9F => {
             // SETcc r/m8 — Spec: Intel SDM Vol. 2 "SETcc—Set Byte on
             // Condition": `IF condition THEN DEST := 1 ELSE DEST := 0`.
@@ -18913,6 +18944,121 @@ mod tests {
         cpu.set_zf(false);
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(bus.read_u8(PM32_DATA as u64).unwrap(), 0);
+        assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc—Conditional Move": `IF condition THEN
+    /// DEST := SRC`. The condition must agree with the short `Jcc` form for
+    /// every condition code and every flag combination, and `CMOVcc` writes no
+    /// flags.
+    #[test]
+    fn cmovcc_condition_matches_short_jcc_for_every_flag_combination() {
+        for cc in 0u8..16 {
+            for flags in condition_flag_combinations() {
+                let (short_cpu, _) = run_real_mode_once(&[0x70 | cc, 0x10], flags);
+                let taken = short_cpu.ip16() == 0x12;
+
+                // 0F 40+cc C3 = CMOVcc AX, BX (mod=11, reg=AX, rm=BX).
+                let mut mem = vec![0u8; 0x10000];
+                mem[..3].copy_from_slice(&[0x0F, 0x40 | cc, 0xC3]);
+                let mut cpu = CpuState::reset();
+                cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+                cpu.rip = 0;
+                cpu.rflags = flags;
+                cpu.set_gpr_u16(CpuState::RAX, 0x1111);
+                cpu.set_gpr_u16(CpuState::RBX, 0x2222);
+                let mut bus = VecBus { mem, ports: vec![] };
+                step(&mut cpu, &mut bus).unwrap();
+                assert_eq!(
+                    cpu.gpr_u16(CpuState::RAX),
+                    if taken { 0x2222 } else { 0x1111 },
+                    "cc {cc:#x} flags {flags:#x}"
+                );
+                assert_eq!(cpu.rflags, flags, "CMOVcc must not write flags");
+                assert_eq!(cpu.ip16(), 3);
+            }
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc": the destination width follows the operand-size
+    /// attribute. A taken 16-bit move leaves the upper half of the 32-bit
+    /// destination untouched (Vol. 1 §3.4.1.1), and an untaken move of either
+    /// width leaves the whole destination unchanged.
+    #[test]
+    fn cmovcc_destination_width_follows_operand_size() {
+        // (code, ZF, expected EAX) for 0F 44 C3 = CMOVE (E)AX, (E)BX.
+        let cases: [(&[u8], bool, u32); 4] = [
+            (&[0x0F, 0x44, 0xC3], true, 0x1111_BBBB),
+            (&[0x0F, 0x44, 0xC3], false, 0x1111_2222),
+            (&[0x66, 0x0F, 0x44, 0xC3], true, 0xAAAA_BBBB),
+            (&[0x66, 0x0F, 0x44, 0xC3], false, 0x1111_2222),
+        ];
+        for (code, zf, expected) in cases {
+            let (mut cpu, mut bus) = real_mode_fixture(code, |cpu, _| {
+                cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+                cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            });
+            cpu.set_zf(zf);
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.gpr_u32(CpuState::RAX),
+                expected,
+                "zf={zf} code={code:?}"
+            );
+            assert_eq!(cpu.ip16(), code.len() as u16);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc": a memory source is read whether or not the
+    /// condition holds, so a source the segment limit forbids faults either way.
+    /// This model always reads the source before evaluating the condition.
+    #[test]
+    fn cmovcc_reads_the_memory_source_regardless_of_the_condition() {
+        for zf in [true, false] {
+            // 0F 44 1E 00 90 = CMOVE BX, word [0x9000], past DS.limit = 0x7FFF.
+            let mut mem = vec![0u8; 0x10000];
+            mem[..5].copy_from_slice(&[0x0F, 0x44, 0x1E, 0x00, 0x90]);
+            // IVT[13] (#GP) → 0000:0D00.
+            mem[13 * 4..13 * 4 + 4].copy_from_slice(&0x0000_0D00u32.to_le_bytes());
+            mem[0xD00] = 0xF4;
+            let mut cpu = CpuState::reset();
+            cpu.cs = x86_core::SegmentReg::real_mode_code(0);
+            cpu.ds = x86_core::SegmentReg::real_mode(0);
+            cpu.ds.limit = 0x7FFF;
+            cpu.ss = x86_core::SegmentReg::real_mode(0);
+            cpu.rip = 0;
+            cpu.set_gpr_u16(CpuState::RSP, 0xFFF0);
+            cpu.set_gpr_u16(CpuState::RBX, 0x1234);
+            cpu.set_zf(zf);
+            let mut bus = VecBus { mem, ports: vec![] };
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ip16(), 0x0D00, "zf={zf} must still take #GP");
+            assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x1234, "no partial commit");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "CMOVcc": a taken move reads from memory in both 16-
+    /// and 32-bit addressing, including under `CS.D=1`.
+    #[test]
+    fn cmovcc_memory_source_forms() {
+        // 66 0F 45 1E 00 40 = CMOVNE EBX, dword [0x4000].
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0x66, 0x0F, 0x45, 0x1E, 0x00, 0x40], |cpu, mem| {
+                mem[0x4000..0x4004].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+                cpu.set_gpr_u32(CpuState::RBX, 0);
+            });
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0xDEAD_BEEF);
+
+        // 0F 45 1D disp32 = CMOVNE EBX, dword [disp32] under CS.D=1.
+        let mut code = vec![0x0F, 0x45, 0x1D];
+        code.extend_from_slice(&(PM32_DATA as u32).to_le_bytes());
+        let (mut cpu, mut bus) = pm32_fixture(&code, PM32_CODE, true);
+        bus.mem[PM32_DATA..PM32_DATA + 4].copy_from_slice(&0x0BAD_F00Du32.to_le_bytes());
+        cpu.set_zf(false);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x0BAD_F00D);
         assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
     }
 
