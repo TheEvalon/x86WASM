@@ -532,7 +532,19 @@ pub fn decode_with_mode(bytes: &[u8], mode: DecodeMode) -> Result<DecodedInsn, D
     // These groups live in the *primary* map only; the two-byte map reuses the
     // same opcode bytes for unrelated instructions (e.g. `0F 80` is `JO rel16`).
     let mnemonic = if two_byte {
-        def.mnemonic
+        // Group 8 (`0F BA`): ModR/M.reg selects the bit operation; /0–/3 are
+        // reserved and keep the group placeholder (#UD at execute).
+        if opcode == 0xBA {
+            match modrm.map(|m| m.reg) {
+                Some(4) => "BT",
+                Some(5) => "BTS",
+                Some(6) => "BTR",
+                Some(7) => "BTC",
+                _ => def.mnemonic,
+            }
+        } else {
+            def.mnemonic
+        }
     } else if matches!(opcode, 0x80 | 0x81 | 0x83) {
         match modrm.map(|m| m.reg) {
             Some(0) => "ADD",
@@ -2181,6 +2193,100 @@ mod tests {
         assert!(!d.two_byte);
         assert_eq!(d.immediate, 0x1234);
         assert_eq!(d.length, 3);
+    }
+
+    /// Intel SDM Vol. 2 "BT"/"BTS"/"BTR"/"BTC": the register bit-offset forms
+    /// are plain ModR/M encodings with no immediate.
+    #[test]
+    fn decode_bt_family_register_offset_forms() {
+        for (op, mnemonic) in [(0xA3u8, "BT"), (0xAB, "BTS"), (0xB3, "BTR"), (0xBB, "BTC")] {
+            // 0F op C8 = xx AX, CX (mod 11, reg = CX, rm = AX)
+            let d = decode(&[0x0F, op, 0xC8]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.modrm.unwrap().reg, 1);
+            assert_eq!(d.modrm.unwrap().rm, 0);
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 3);
+
+            // 0F op 0E 00 40 = xx [0x4000], CX
+            let d = decode(&[0x0F, op, 0x0E, 0x00, 0x40]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.length, 5);
+
+            assert_eq!(decode(&[0x0F, op]), Err(DecodeError::Truncated));
+        }
+    }
+
+    /// Intel SDM Vol. 2 opcode map 2, Group 8 (`0F BA`): ModR/M.reg selects the
+    /// bit operation and an imm8 follows. `/0`–`/3` stay a group placeholder.
+    #[test]
+    fn decode_grp8_bit_immediate_forms() {
+        for (reg, mnemonic) in [(4u8, "BT"), (5, "BTS"), (6, "BTR"), (7, "BTC")] {
+            let modrm = 0xC0 | (reg << 3);
+            let d = decode(&[0x0F, 0xBA, modrm, 0x05]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.opcode, 0xBA);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.modrm.unwrap().reg, reg);
+            assert_eq!(d.immediate, 5);
+            assert_eq!(d.length, 4);
+        }
+
+        // /0–/3 are reserved and keep the group mnemonic.
+        assert_eq!(decode(&[0x0F, 0xBA, 0xC0, 0x00]).unwrap().mnemonic, "GRP8");
+        assert_eq!(decode(&[0x0F, 0xBA, 0xD8, 0x00]).unwrap().mnemonic, "GRP8");
+
+        // Memory form: 0F BA 26 00 40 09 = BT word [0x4000], 9
+        let d = decode(&[0x0F, 0xBA, 0x26, 0x00, 0x40, 0x09]).unwrap();
+        assert_eq!(d.mnemonic, "BT");
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.immediate, 9);
+        assert_eq!(d.length, 6);
+
+        // The imm8 stays one byte under a 32-bit operand size.
+        let d = decode_with_mode(&[0x0F, 0xBA, 0xE0, 0x15], DecodeMode::DEFAULT32).unwrap();
+        assert!(d.operand_size_32);
+        assert_eq!(d.immediate, 0x15);
+        assert_eq!(d.length, 4);
+
+        assert_eq!(decode(&[0x0F, 0xBA, 0xE0]), Err(DecodeError::Truncated));
+    }
+
+    /// Intel SDM Vol. 2 "BSF"/"BSR"/"BSWAP"/"XADD"/"CMPXCHG": ModR/M forms with
+    /// no immediate, plus the register-in-opcode `BSWAP` range.
+    #[test]
+    fn decode_bit_scan_bswap_xadd_cmpxchg() {
+        for (op, mnemonic) in [
+            (0xBCu8, "BSF"),
+            (0xBD, "BSR"),
+            (0xB0, "CMPXCHG"),
+            (0xB1, "CMPXCHG"),
+            (0xC0, "XADD"),
+            (0xC1, "XADD"),
+        ] {
+            let d = decode(&[0x0F, op, 0xC8]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 3, "0F {op:02X} must not consume an immediate");
+
+            let d = decode(&[0x0F, op, 0x0E, 0x00, 0x40]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.length, 5);
+
+            assert_eq!(decode(&[0x0F, op]), Err(DecodeError::Truncated));
+        }
+
+        // BSWAP encodes the register in the opcode and takes no ModR/M.
+        for reg in 0u8..8 {
+            let d = decode(&[0x0F, 0xC8 + reg]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, "BSWAP");
+            assert_eq!(d.opcode, 0xC8 + reg);
+            assert!(d.modrm.is_none());
+            assert_eq!(d.length, 2);
+        }
     }
 
     /// Intel SDM Vol. 2 "RET" (near/far imm16): the stack-release immediate is

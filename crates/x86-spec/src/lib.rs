@@ -1482,7 +1482,113 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::W16,
         sdm: "MOVSX Gv,Ew",
     },
+    // Bit test/modify, register bit-offset forms — Spec: Intel SDM Vol. 2
+    // "BT"/"BTS"/"BTR"/"BTC" (opcode map 2 — `0F A3`/`AB`/`B3`/`BB`).
+    InstrDef {
+        mnemonic: "BT",
+        opcode: 0xA3,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BT r/m,r",
+    },
+    InstrDef {
+        mnemonic: "BTS",
+        opcode: 0xAB,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BTS r/m,r",
+    },
+    InstrDef {
+        mnemonic: "BTR",
+        opcode: 0xB3,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BTR r/m,r",
+    },
+    InstrDef {
+        mnemonic: "BTC",
+        opcode: 0xBB,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BTC r/m,r",
+    },
+    // Group 8: ModR/M.reg selects the bit operation and an imm8 supplies the
+    // bit offset. /4 BT, /5 BTS, /6 BTR, /7 BTC; /0–/3 are reserved (#UD).
+    // Spec: Intel SDM Vol. 2 opcode map 2 (`0F BA`), Group 8 table.
+    InstrDef {
+        mnemonic: "GRP8",
+        opcode: 0xBA,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "BT/BTS/BTR/BTC r/m,imm8",
+    },
+    // Bit scans — Spec: Intel SDM Vol. 2 "BSF"/"BSR" (`0F BC`/`BD`).
+    InstrDef {
+        mnemonic: "BSF",
+        opcode: 0xBC,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BSF r,r/m",
+    },
+    InstrDef {
+        mnemonic: "BSR",
+        opcode: 0xBD,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BSR r,r/m",
+    },
+    // Exchange-and-modify — Spec: Intel SDM Vol. 2 "CMPXCHG" (`0F B0`/`B1`)
+    // and "XADD" (`0F C0`/`C1`).
+    InstrDef {
+        mnemonic: "CMPXCHG",
+        opcode: 0xB0,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "CMPXCHG r/m8,r8",
+    },
+    InstrDef {
+        mnemonic: "CMPXCHG",
+        opcode: 0xB1,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "CMPXCHG r/m,r",
+    },
+    InstrDef {
+        mnemonic: "XADD",
+        opcode: 0xC0,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "XADD r/m8,r8",
+    },
+    InstrDef {
+        mnemonic: "XADD",
+        opcode: 0xC1,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "XADD r/m,r",
+    },
+    // `BSWAP r32` — Spec: Intel SDM Vol. 2 "BSWAP" (`0F C8`+rd). The register
+    // is encoded in the low three opcode bits; there is no ModR/M byte.
+    bswap(0xC8),
+    bswap(0xC9),
+    bswap(0xCA),
+    bswap(0xCB),
+    bswap(0xCC),
+    bswap(0xCD),
+    bswap(0xCE),
+    bswap(0xCF),
 ];
+
+/// Two-byte `BSWAP r32` entry (`0F C8`+rd).
+const fn bswap(opcode: u8) -> InstrDef {
+    InstrDef {
+        mnemonic: "BSWAP",
+        opcode,
+        encoding: Encoding::OpcodeReg,
+        width: Width::OsZ,
+        sdm: "BSWAP r32",
+    }
+}
 
 /// Two-byte near `Jcc rel16/rel32` entry (`0F 80`+cc cw/cd).
 const fn jcc_near(opcode: u8, mnemonic: &'static str) -> InstrDef {

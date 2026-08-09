@@ -91,3 +91,49 @@ Not supported:
   item.
 - `MOVSXD` and the REX.W 64-bit destinations.
 - Loading `SS` from the LDT, or any privilege-level change.
+
+## Slice 3 — bit and exchange instructions
+
+Spec: SDM Vol. 2 "BT", "BTS", "BTR", "BTC", "BSF", "BSR", "BSWAP", "XADD",
+"CMPXCHG"; Vol. 2 §3.1.1.9 (`Bit(BitBase, BitOffset)` notation); Vol. 2
+Appendix A opcode map 2 and the Group 8 table; Vol. 3 §5.3.
+
+Supported:
+
+- `BT`/`BTS`/`BTR`/`BTC` in both the register bit-offset forms
+  (`0F A3`/`AB`/`B3`/`BB`) and the Group 8 immediate forms (`0F BA /4`–`/7`),
+  at both operand sizes. `/0`–`/3` of Group 8 are reserved and raise `#UD`.
+  - A **register** bit base takes `BitOffset MOD OperandSize`, so a negative or
+    oversized offset still selects a bit inside the register.
+  - A **memory** bit base is the start of a bit string. The addressed bit is
+    `BitOffset MOD 8` inside the byte at `BitBase + (BitOffset DIV 8)`, where
+    the division is signed and rounds toward negative infinity and the modulo is
+    non-negative. A register offset therefore reaches bits far above *and below*
+    the nominal operand, and the segment-limit check applies to that displaced
+    byte rather than to the bit base.
+  - `CF` receives the original bit and commits only after the read-modify-write
+    cannot fault.
+- `BSF`/`BSR` (`0F BC`/`BD`) at both operand sizes, register and memory sources.
+- `BSWAP` (`0F C8`–`0F CF`), `XADD` (`0F C0`/`C1`) with the full ADD flag
+  results, and `CMPXCHG` (`0F B0`/`B1`) including the specified destination
+  write-back on a mismatch and the CF/PF/AF/SF/OF results of the comparison.
+
+Deterministic choices where the SDM says "undefined". The interpreter is the
+semantic reference for a future JIT, so an indeterminate result would be
+untestable; each of these is a legal instance of the undefined behavior:
+
+- The `BT` family leaves `OF`, `SF`, `ZF`, `AF`, and `PF` unchanged.
+- `BSF`/`BSR` leave the destination unchanged when the source is zero, and
+  leave `CF`, `OF`, `SF`, `AF`, and `PF` unchanged.
+- `BSWAP` with a 16-bit operand size performs the same full 32-bit byte
+  reversal.
+
+Not supported:
+
+- The Group 8 immediate is reduced modulo the operand size. That is exact over
+  the `0..OperandSize-1` range the SDM defines for the immediate form; larger
+  immediates are outside the defined domain and are masked rather than
+  extending the bit-string address.
+- `LOCK` is decoded but has no atomicity effect (single-processor model), and
+  `LOCK` with a register destination does not raise `#UD`.
+- The REX.W 64-bit forms, `CMPXCHG8B`/`CMPXCHG16B`, and `TZCNT`/`LZCNT`.

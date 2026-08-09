@@ -685,16 +685,13 @@ fn ea(
     }
 }
 
-/// 16-bit effective address from ModRM (real-mode / 16-bit address size).
-fn ea_16(
-    cpu: &CpuState,
+/// Segment, `uses_ss`, and the unchecked effective offset of a 16-bit ModR/M
+/// memory operand (`mod != 11`).
+fn ea_parts_16<'a>(
+    cpu: &'a CpuState,
     insn: &DecodedInsn,
-    access_size: u64,
-) -> Result<(u64, bool, bool), ExecError> {
+) -> Result<(&'a x86_core::SegmentReg, bool, u64), ExecError> {
     let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
-    if m.mod_ == 3 {
-        return Ok((0, true, false));
-    }
     let off = u64::from(calc_ea16(cpu, m.mod_, m.rm, insn.displacement)?);
     let (seg, uses_ss) = match insn.prefixes.segment_override {
         Some(0x2E) => (&cpu.cs, false),
@@ -712,8 +709,21 @@ fn ea_16(
         }
         _ => (&cpu.ds, false),
     };
-    let addr = checked_linear_addr(seg, off, access_size)
-        .map_err(|_| arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0))?;
+    Ok((seg, uses_ss, off))
+}
+
+/// 16-bit effective address from ModRM (real-mode / 16-bit address size).
+fn ea_16(
+    cpu: &CpuState,
+    insn: &DecodedInsn,
+    access_size: u64,
+) -> Result<(u64, bool, bool), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        return Ok((0, true, false));
+    }
+    let (seg, uses_ss, off) = ea_parts_16(cpu, insn)?;
+    let addr = seg_linear_checked(seg, off, access_size, uses_ss)?;
     Ok((addr, false, uses_ss))
 }
 
@@ -750,6 +760,18 @@ fn ea_32(
     if m.mod_ == 3 {
         return Ok((0, true, false));
     }
+    let (seg, uses_ss, off) = ea_parts_32(cpu, insn)?;
+    let addr = seg_linear_checked(seg, off, access_size, uses_ss)?;
+    Ok((addr, false, uses_ss))
+}
+
+/// Segment, `uses_ss`, and the unchecked effective offset of a 32-bit
+/// ModR/M + SIB memory operand (`mod != 11`).
+fn ea_parts_32<'a>(
+    cpu: &'a CpuState,
+    insn: &DecodedInsn,
+) -> Result<(&'a x86_core::SegmentReg, bool, u64), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     let off = u64::from(calc_ea32(cpu, insn)?);
     let (seg, uses_ss) = match insn.prefixes.segment_override {
         Some(0x2E) => (&cpu.cs, false),
@@ -774,9 +796,24 @@ fn ea_32(
         }
         _ => (&cpu.ds, false),
     };
-    let addr = checked_linear_addr(seg, off, access_size)
-        .map_err(|_| arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0))?;
-    Ok((addr, false, uses_ss))
+    Ok((seg, uses_ss, off))
+}
+
+/// Segment, `uses_ss`, and the unchecked effective offset of a ModR/M memory
+/// operand, using the instruction address-size attribute.
+///
+/// Callers that need a plain operand should use [`ea`]; this variant exists for
+/// the `BT`/`BTS`/`BTR`/`BTC` bit-string forms, which displace the effective
+/// address by a bit offset before the segment-limit check.
+fn ea_parts<'a>(
+    cpu: &'a CpuState,
+    insn: &DecodedInsn,
+) -> Result<(&'a x86_core::SegmentReg, bool, u64), ExecError> {
+    if asize32(insn) {
+        ea_parts_32(cpu, insn)
+    } else {
+        ea_parts_16(cpu, insn)
+    }
 }
 
 /// Map a bus `MemoryFault` to `#SS` (vector 12) or `#GP` (vector 13).
@@ -2787,6 +2824,109 @@ fn grp2_u32(cpu: &mut CpuState, reg: u8, mut val: u32, raw_count: u8) -> Result<
     }
 }
 
+/// What `BT`/`BTS`/`BTR`/`BTC` do to the selected bit after copying it to CF.
+/// Spec: Intel SDM Vol. 2 "BT"/"BTS"/"BTR"/"BTC".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BitOp {
+    Test,
+    Set,
+    Reset,
+    Complement,
+}
+
+impl BitOp {
+    /// New value for the selected bit, or `None` when the bit is only tested.
+    fn apply(self, old: bool) -> Option<bool> {
+        match self {
+            Self::Test => None,
+            Self::Set => Some(true),
+            Self::Reset => Some(false),
+            Self::Complement => Some(!old),
+        }
+    }
+}
+
+/// `BT`/`BTS`/`BTR`/`BTC` for both the register and the immediate bit-offset
+/// encodings.
+///
+/// A register bit base takes `BitOffset MOD OperandSize`. A memory bit base is
+/// the start of a bit string: the addressed bit is `BitOffset MOD 8` inside the
+/// byte at `BitBase + (BitOffset DIV 8)`, where `DIV` is signed division
+/// rounding toward negative infinity and `MOD` returns a non-negative value, so
+/// a register bit offset reaches far outside the nominal operand.
+/// Spec: Intel SDM Vol. 2 "BT" (Operation) and §3.1.1.9 (`Bit(BitBase,
+/// BitOffset)` notation); Vol. 3 §5.3 (limit checking).
+///
+/// `CF` receives the original bit. `OF`, `SF`, `ZF`, `AF`, and `PF` are
+/// architecturally undefined; this interpreter leaves them unchanged so the
+/// reference semantics stay deterministic.
+fn exec_bit_op(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    op: BitOp,
+    bit_offset: i32,
+) -> Result<(), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    let operand_bits: i32 = if opsz32(insn) { 32 } else { 16 };
+
+    if m.mod_ == 3 {
+        let index = bit_offset.rem_euclid(operand_bits) as u32;
+        let old_bit = if opsz32(insn) {
+            let old = cpu.gpr_u32(m.rm as usize);
+            let bit = (old >> index) & 1 != 0;
+            if let Some(new_bit) = op.apply(bit) {
+                let mask = 1u32 << index;
+                cpu.set_gpr_u32(
+                    m.rm as usize,
+                    if new_bit { old | mask } else { old & !mask },
+                );
+            }
+            bit
+        } else {
+            let old = cpu.gpr_u16(m.rm as usize);
+            let bit = (old >> index) & 1 != 0;
+            if let Some(new_bit) = op.apply(bit) {
+                let mask = 1u16 << index;
+                cpu.set_gpr_u16(
+                    m.rm as usize,
+                    if new_bit { old | mask } else { old & !mask },
+                );
+            }
+            bit
+        };
+        cpu.set_cf(old_bit);
+        return Ok(());
+    }
+
+    let byte_displacement = bit_offset.div_euclid(8);
+    let index = bit_offset.rem_euclid(8) as u32;
+    let (addr, uses_ss) = {
+        let (seg, uses_ss, base_offset) = ea_parts(cpu, insn)?;
+        // The bit-string byte address wraps inside the address-size window.
+        let offset = if asize32(insn) {
+            u64::from((base_offset as u32).wrapping_add(byte_displacement as u32))
+        } else {
+            u64::from((base_offset as u16).wrapping_add(byte_displacement as u16))
+        };
+        (seg_linear_checked(seg, offset, 1, uses_ss)?, uses_ss)
+    };
+
+    let old = bus
+        .read_u8(addr)
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    let old_bit = (old >> index) & 1 != 0;
+    if let Some(new_bit) = op.apply(old_bit) {
+        let mask = 1u8 << index;
+        let new = if new_bit { old | mask } else { old & !mask };
+        bus.write_u8(addr, new)
+            .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    }
+    // CF commits only after the read-modify-write cannot fault.
+    cpu.set_cf(old_bit);
+    Ok(())
+}
+
 /// Evaluate an x86 condition code against the current `EFLAGS`.
 ///
 /// `cc` is the low nibble shared by the short `Jcc` (`70`+cc), the near `Jcc`
@@ -3500,6 +3640,183 @@ fn step_two_byte(
                 cpu.set_gpr_u32(m.reg as usize, value);
             } else {
                 cpu.set_gpr_u16(m.reg as usize, value as u16);
+            }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xA3 | 0xAB | 0xB3 | 0xBB => {
+            // BT / BTS / BTR / BTC r/m, r — Spec: Intel SDM Vol. 2. The bit
+            // offset is the full signed ModR/M.reg register, so a memory bit
+            // base can address a bit far outside the nominal operand.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            let bit_offset = if opsz32(insn) {
+                cpu.gpr_u32(m.reg as usize) as i32
+            } else {
+                i32::from(cpu.gpr_u16(m.reg as usize) as i16)
+            };
+            let op = match insn.opcode {
+                0xA3 => BitOp::Test,
+                0xAB => BitOp::Set,
+                0xB3 => BitOp::Reset,
+                _ => BitOp::Complement,
+            };
+            exec_bit_op(cpu, bus, insn, op, bit_offset)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xBA => {
+            // Group 8: BT/BTS/BTR/BTC r/m, imm8 — Spec: Intel SDM Vol. 2
+            // opcode map 2, Group 8. `/0`–`/3` are reserved → `#UD`.
+            //
+            // The SDM defines the immediate bit offset over `0..OperandSize-1`;
+            // this interpreter reduces the imm8 modulo the operand size, which
+            // is exact over that documented range. Immediates above it are
+            // outside the defined domain and are masked rather than extending
+            // the bit-string address.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0xBA))?;
+            let op = match m.reg {
+                4 => BitOp::Test,
+                5 => BitOp::Set,
+                6 => BitOp::Reset,
+                7 => BitOp::Complement,
+                _ => return Err(arch_fault(6)),
+            };
+            let operand_bits = if opsz32(insn) { 32 } else { 16 };
+            let bit_offset = (insn.immediate & 0xFF) % operand_bits;
+            exec_bit_op(cpu, bus, insn, op, bit_offset)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xBC | 0xBD => {
+            // BSF / BSR r, r/m — Spec: Intel SDM Vol. 2 "BSF"/"BSR". A zero
+            // source sets ZF and leaves the destination architecturally
+            // undefined; this interpreter leaves it unchanged so the reference
+            // semantics stay deterministic. CF/OF/SF/AF/PF are undefined and
+            // are likewise left unchanged.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            let forward = insn.opcode == 0xBC;
+            if opsz32(insn) {
+                let src = read_rm_u32(cpu, bus, insn)?;
+                if src == 0 {
+                    cpu.set_zf(true);
+                } else {
+                    cpu.set_zf(false);
+                    let index = if forward {
+                        src.trailing_zeros()
+                    } else {
+                        31 - src.leading_zeros()
+                    };
+                    cpu.set_gpr_u32(m.reg as usize, index);
+                }
+            } else {
+                let src = read_rm_u16(cpu, bus, insn)?;
+                if src == 0 {
+                    cpu.set_zf(true);
+                } else {
+                    cpu.set_zf(false);
+                    let index = if forward {
+                        src.trailing_zeros()
+                    } else {
+                        15 - src.leading_zeros()
+                    };
+                    cpu.set_gpr_u16(m.reg as usize, index as u16);
+                }
+            }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xC8..=0xCF => {
+            // BSWAP r32 — Spec: Intel SDM Vol. 2 "BSWAP". Reverses the four
+            // bytes of a doubleword register; no flags are affected.
+            // The 16-bit operand-size form is architecturally undefined; this
+            // interpreter performs the same 32-bit byte reversal so the
+            // reference semantics stay deterministic.
+            // Unsupported here: the REX.W `r64` form.
+            let idx = (insn.opcode - 0xC8) as usize;
+            cpu.set_gpr_u32(idx, cpu.gpr_u32(idx).swap_bytes());
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xC0 | 0xC1 => {
+            // XADD r/m, r — Spec: Intel SDM Vol. 2 "XADD":
+            // `TEMP := SRC + DEST; SRC := DEST; DEST := TEMP`. Flags follow
+            // ADD. The destination write happens before the register exchange
+            // so a faulting memory write leaves nothing committed.
+            // Unsupported here: `LOCK` atomicity (single-processor model) and
+            // the `#UD` for `LOCK` with a register destination.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            if insn.opcode == 0xC0 {
+                let dest = read_rm_u8(cpu, bus, insn)?;
+                let src = read_reg_u8(cpu, m.reg);
+                let sum = dest.wrapping_add(src);
+                write_rm_u8(cpu, bus, insn, sum)?;
+                write_reg_u8(cpu, m.reg, dest);
+                set_add_flags_u8(cpu, dest, src, sum);
+            } else if opsz32(insn) {
+                let dest = read_rm_u32(cpu, bus, insn)?;
+                let src = cpu.gpr_u32(m.reg as usize);
+                let sum = dest.wrapping_add(src);
+                write_rm_u32(cpu, bus, insn, sum)?;
+                cpu.set_gpr_u32(m.reg as usize, dest);
+                set_add_flags_u32(cpu, dest, src, sum);
+            } else {
+                let dest = read_rm_u16(cpu, bus, insn)?;
+                let src = cpu.gpr_u16(m.reg as usize);
+                let sum = dest.wrapping_add(src);
+                write_rm_u16(cpu, bus, insn, sum)?;
+                cpu.set_gpr_u16(m.reg as usize, dest);
+                set_add_flags_u16(cpu, dest, src, sum);
+            }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xB0 | 0xB1 => {
+            // CMPXCHG r/m, r — Spec: Intel SDM Vol. 2 "CMPXCHG":
+            // `TEMP := DEST; IF accumulator = TEMP THEN ZF := 1; DEST := SRC
+            // ELSE ZF := 0; accumulator := TEMP; DEST := TEMP`. The unequal
+            // case still writes the destination back. ZF comes from the
+            // comparison and CF/PF/AF/SF/OF follow the same `accumulator - TEMP`
+            // subtraction, so the shared SUB flag helpers set all six.
+            // Unsupported here: `LOCK` atomicity (single-processor model).
+            let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+            if insn.opcode == 0xB0 {
+                let temp = read_rm_u8(cpu, bus, insn)?;
+                let accumulator = cpu.al();
+                let equal = accumulator == temp;
+                let new_dest = if equal { read_reg_u8(cpu, m.reg) } else { temp };
+                write_rm_u8(cpu, bus, insn, new_dest)?;
+                if !equal {
+                    cpu.set_al(temp);
+                }
+                set_sub_flags_u8(cpu, accumulator, temp, accumulator.wrapping_sub(temp));
+            } else if opsz32(insn) {
+                let temp = read_rm_u32(cpu, bus, insn)?;
+                let accumulator = cpu.eax();
+                let equal = accumulator == temp;
+                let new_dest = if equal {
+                    cpu.gpr_u32(m.reg as usize)
+                } else {
+                    temp
+                };
+                write_rm_u32(cpu, bus, insn, new_dest)?;
+                if !equal {
+                    cpu.set_eax(temp);
+                }
+                set_sub_flags_u32(cpu, accumulator, temp, accumulator.wrapping_sub(temp));
+            } else {
+                let temp = read_rm_u16(cpu, bus, insn)?;
+                let accumulator = cpu.ax();
+                let equal = accumulator == temp;
+                let new_dest = if equal {
+                    cpu.gpr_u16(m.reg as usize)
+                } else {
+                    temp
+                };
+                write_rm_u16(cpu, bus, insn, new_dest)?;
+                if !equal {
+                    cpu.set_ax(temp);
+                }
+                set_sub_flags_u16(cpu, accumulator, temp, accumulator.wrapping_sub(temp));
             }
             set_current_ip(cpu, next_ip);
             Ok(())
@@ -18506,5 +18823,367 @@ mod tests {
         assert_eq!(cpu.eax(), 0x0001_2345);
         assert_eq!(cpu.fs.selector, 0);
         assert_eq!(cpu.fs.flags, 0);
+    }
+
+    /// Intel SDM Vol. 2 "BT"/"BTS"/"BTR"/"BTC": with a register bit base the
+    /// offset is taken modulo the operand size, `CF` receives the original bit,
+    /// and only `BTS`/`BTR`/`BTC` change it.
+    #[test]
+    fn bt_family_register_bit_base_uses_offset_modulo_operand_size() {
+        // 0F op C8 = xx AX, CX (mod 11, reg = CX, rm = AX).
+        // (opcode, CX, seeded AX, expected AX, expected CF)
+        let cases: [(u8, u16, u16, u16, bool); 8] = [
+            (0xA3, 1, 0x0002, 0x0002, true),   // BT AX, 1
+            (0xA3, 17, 0x0002, 0x0002, true),  // offset 17 MOD 16 = 1
+            (0xA3, 16, 0x0002, 0x0002, false), // offset 16 MOD 16 = 0
+            (0xAB, 4, 0x0000, 0x0010, false),  // BTS sets bit 4
+            (0xAB, 4, 0x0010, 0x0010, true),   // already set
+            (0xB3, 4, 0x0010, 0x0000, true),   // BTR clears bit 4
+            (0xBB, 4, 0x0010, 0x0000, true),   // BTC toggles a set bit
+            (0xBB, 4, 0x0000, 0x0010, false),  // BTC toggles a clear bit
+        ];
+        for (opcode, offset, ax, expected_ax, expected_cf) in cases {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xC8], |cpu, _| {
+                cpu.set_ax(ax);
+                cpu.set_gpr_u16(CpuState::RCX, offset);
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ax(), expected_ax, "0F {opcode:02X} offset {offset}");
+            assert_eq!(
+                cpu.rflags & 1 != 0,
+                expected_cf,
+                "0F {opcode:02X} offset {offset} CF"
+            );
+        }
+
+        // 66 0F A3 C8 = BT EAX, ECX — offset 33 MOD 32 = 1.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x66, 0x0F, 0xA3, 0xC8], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 0x0000_0002);
+            cpu.set_gpr_u32(CpuState::RCX, 33);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(cpu.rflags & 1 != 0);
+
+        // A negative register offset is still reduced to a bit inside the
+        // register: -1 MOD 32 = 31.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x66, 0x0F, 0xA3, 0xC8], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 0x8000_0000);
+            cpu.set_gpr_u32(CpuState::RCX, (-1i32) as u32);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(cpu.rflags & 1 != 0);
+    }
+
+    /// Intel SDM Vol. 2 §3.1.1.9 (`Bit(BitBase, BitOffset)`): with a memory bit
+    /// base the addressed bit is `BitOffset MOD 8` inside the byte at
+    /// `BitBase + (BitOffset DIV 8)`, using signed division that rounds toward
+    /// negative infinity, so a register bit offset reaches far outside — and
+    /// below — the nominal operand.
+    #[test]
+    fn bt_memory_bit_string_addresses_bits_outside_the_operand() {
+        // 0F A3 0E 00 40 = BT [0x4000], CX
+        // Offset 100 → byte 0x4000 + 12, bit 4.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA3, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.set_gpr_u16(CpuState::RCX, 100);
+            mem[0x400C] = 1 << 4;
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(cpu.rflags & 1 != 0, "bit 100 of the string must be set");
+
+        // The same offset with the bit clear.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA3, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.set_gpr_u16(CpuState::RCX, 100);
+            mem[0x400C] = !(1 << 4);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & 1, 0);
+
+        // Offset -1 → byte 0x3FFF, bit 7 (DIV rounds toward negative infinity).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA3, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.set_gpr_u16(CpuState::RCX, (-1i16) as u16);
+            mem[0x3FFF] = 0x80;
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(cpu.rflags & 1 != 0, "bit -1 lives in the preceding byte");
+
+        // BTS at offset 100 writes only the addressed byte.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xAB, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.set_gpr_u16(CpuState::RCX, 100);
+            mem[0x4000] = 0x00;
+            mem[0x400C] = 0x01;
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x400C).unwrap(), 0x11);
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0x00);
+        assert_eq!(cpu.rflags & 1, 0);
+    }
+
+    /// Intel SDM Vol. 3 §5.3: the segment-limit check applies to the byte the
+    /// bit offset actually selects, not to the bit base, and a failing access
+    /// commits neither `CF` nor memory.
+    #[test]
+    fn bt_memory_limit_check_follows_the_displaced_byte_address() {
+        // 0F AB 0E FF 3F = BTS [0x3FFF], CX with CX = 8 → byte 0x4000.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xAB, 0x0E, 0xFF, 0x3F], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RCX, 8);
+            cpu.ds.limit = 0x3FFF;
+            cpu.set_cf(false);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before, "BTS committed state before #GP");
+        assert_eq!(bus.read_u8(0x4000).unwrap(), 0);
+
+        // The bit base itself is inside the limit, so offset 0 succeeds.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xAB, 0x0E, 0xFF, 0x3F], |cpu, _| {
+            cpu.set_gpr_u16(CpuState::RCX, 0);
+            cpu.ds.limit = 0x3FFF;
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u8(0x3FFF).unwrap(), 0x01);
+    }
+
+    /// Intel SDM Vol. 2 "BT" family (Flags Affected): only `CF` is defined.
+    /// This interpreter leaves the undefined `OF`/`SF`/`ZF`/`AF`/`PF` unchanged
+    /// so the reference semantics stay deterministic.
+    #[test]
+    fn bt_family_leaves_undefined_flags_unchanged() {
+        let flags = 0x0002 | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+        for opcode in [0xA3u8, 0xAB, 0xB3, 0xBB] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xC8], |cpu, _| {
+                cpu.rflags = flags;
+                cpu.set_ax(0x0002);
+                cpu.set_gpr_u16(CpuState::RCX, 1);
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(
+                cpu.rflags & !1,
+                flags & !1,
+                "0F {opcode:02X} changed an undefined flag"
+            );
+            assert!(cpu.rflags & 1 != 0);
+        }
+    }
+
+    /// Intel SDM Vol. 2 opcode map 2, Group 8: `0F BA /4`–`/7` are the
+    /// immediate bit-offset forms and `/0`–`/3` are reserved (`#UD`).
+    #[test]
+    fn grp8_immediate_bit_forms_and_reserved_encodings() {
+        // (reg, seeded AX, expected AX, expected CF) with imm8 = 4.
+        let cases: [(u8, u16, u16, bool); 4] = [
+            (4, 0x0010, 0x0010, true),  // BT
+            (5, 0x0000, 0x0010, false), // BTS
+            (6, 0x0010, 0x0000, true),  // BTR
+            (7, 0x0010, 0x0000, true),  // BTC
+        ];
+        for (reg, ax, expected_ax, expected_cf) in cases {
+            let modrm = 0xC0 | (reg << 3);
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xBA, modrm, 0x04], |cpu, _| {
+                cpu.set_ax(ax);
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.ax(), expected_ax, "0F BA /{reg}");
+            assert_eq!(cpu.rflags & 1 != 0, expected_cf, "0F BA /{reg} CF");
+            assert_eq!(cpu.ip16(), 4);
+        }
+
+        // Memory form: 0F BA 26 00 40 09 = BT word [0x4000], 9 → byte 0x4001 bit 1.
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0x0F, 0xBA, 0x26, 0x00, 0x40, 0x09], |_, mem| {
+                mem[0x4001] = 0x02;
+            });
+        step(&mut cpu, &mut bus).unwrap();
+        assert!(cpu.rflags & 1 != 0);
+
+        // Reserved /0–/3 are #UD and commit nothing.
+        for reg in 0u8..4 {
+            let modrm = 0xC0 | (reg << 3);
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xBA, modrm, 0x04], |_, _| {});
+            let before = cpu.clone();
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+            assert_eq!(cpu, before, "0F BA /{reg} mutated state");
+        }
+    }
+
+    /// Intel SDM Vol. 2 "BSF"/"BSR": the destination gets the index of the
+    /// least/most significant set bit and `ZF` is clear; a zero source sets `ZF`
+    /// and leaves the destination architecturally undefined, which this
+    /// interpreter models as unchanged.
+    #[test]
+    fn bsf_bsr_index_and_zero_source_rule() {
+        // 0F BC D8 = BSF BX, AX; 0F BD D8 = BSR BX, AX.
+        for (opcode, ax, expected_bx) in [
+            (0xBCu8, 0x0100u16, 8u16),
+            (0xBC, 0x8001, 0),
+            (0xBD, 0x0100, 8),
+            (0xBD, 0x8001, 15),
+        ] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xD8], |cpu, _| {
+                cpu.set_ax(ax);
+                cpu.set_gpr_u16(CpuState::RBX, 0xDEAD);
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.gpr_u16(CpuState::RBX), expected_bx, "0F {opcode:02X}");
+            assert_eq!(cpu.rflags & (1 << 6), 0, "0F {opcode:02X} ZF");
+        }
+
+        // Zero source: ZF set, destination left as it was.
+        for opcode in [0xBCu8, 0xBD] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xD8], |cpu, _| {
+                cpu.set_ax(0);
+                cpu.set_gpr_u16(CpuState::RBX, 0xDEAD);
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_ne!(
+                cpu.rflags & (1 << 6),
+                0,
+                "0F {opcode:02X} ZF on zero source"
+            );
+            assert_eq!(cpu.gpr_u16(CpuState::RBX), 0xDEAD);
+        }
+
+        // 32-bit operand size scans the full doubleword.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x66, 0x0F, 0xBD, 0xD8], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 0x8000_0000);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 31);
+
+        // Memory source: 0F BC 1E 00 40 = BSF BX, [0x4000]
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xBC, 0x1E, 0x00, 0x40], |_, mem| {
+            mem[0x4000] = 0x00;
+            mem[0x4001] = 0x04;
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 10);
+    }
+
+    /// Intel SDM Vol. 2 "BSWAP": reverses the byte order of a doubleword
+    /// register and affects no flags.
+    #[test]
+    fn bswap_reverses_doubleword_registers() {
+        for reg in 0u8..8 {
+            let flags = 0x0002 | 1 | (1 << 6);
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC8 + reg], |cpu, _| {
+                cpu.rflags = flags;
+                cpu.set_gpr_u32(reg as usize, 0x1234_5678);
+            });
+            step(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.gpr_u32(reg as usize), 0x7856_3412, "BSWAP reg {reg}");
+            assert_eq!(cpu.rflags, flags, "BSWAP must not write flags");
+            assert_eq!(cpu.ip16(), 2);
+        }
+    }
+
+    /// Intel SDM Vol. 2 "XADD": `TEMP := SRC + DEST; SRC := DEST; DEST := TEMP`,
+    /// with the ADD flag results.
+    #[test]
+    fn xadd_exchanges_and_adds_in_every_width() {
+        // 0F C1 C8 = XADD AX, CX (dest = r/m = AX, src = reg = CX).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC1, 0xC8], |cpu, _| {
+            cpu.set_ax(5);
+            cpu.set_gpr_u16(CpuState::RCX, 3);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ax(), 8);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 5);
+        assert_eq!(cpu.rflags & 1, 0);
+
+        // Byte form with a carry out: 0F C0 C8 = XADD AL, CL.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC0, 0xC8], |cpu, _| {
+            cpu.set_al(0xFF);
+            cpu.set_gpr_u8_low(CpuState::RCX, 0x02);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x01);
+        assert_eq!(cpu.gpr_u8_low(CpuState::RCX), 0xFF);
+        assert_ne!(cpu.rflags & 1, 0, "CF from the byte add");
+
+        // Memory destination: 0F C1 0E 00 40 = XADD [0x4000], CX.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC1, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.set_gpr_u16(CpuState::RCX, 0x0001);
+            mem[0x4000] = 0x34;
+            mem[0x4001] = 0x12;
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 0x1235);
+        assert_eq!(cpu.gpr_u16(CpuState::RCX), 0x1234);
+
+        // 32-bit form: 66 0F C1 C8 = XADD EAX, ECX.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x66, 0x0F, 0xC1, 0xC8], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 0xFFFF_FFFF);
+            cpu.set_gpr_u32(CpuState::RCX, 1);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0);
+        assert_eq!(cpu.gpr_u32(CpuState::RCX), 0xFFFF_FFFF);
+        assert_ne!(cpu.rflags & 1, 0);
+        assert_ne!(cpu.rflags & (1 << 6), 0, "ZF from the wrapped sum");
+    }
+
+    /// Intel SDM Vol. 2 "CMPXCHG": on a match `ZF=1` and the source is written
+    /// to the destination; otherwise `ZF=0`, the accumulator takes the old
+    /// destination, and the destination is written back with its own value.
+    /// CF/PF/AF/SF/OF follow the same comparison.
+    #[test]
+    fn cmpxchg_equal_and_unequal_paths() {
+        // 0F B1 CB = CMPXCHG BX, CX (dest = r/m = BX, src = reg = CX).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xB1, 0xCB], |cpu, _| {
+            cpu.set_ax(0x1234);
+            cpu.set_gpr_u16(CpuState::RBX, 0x1234);
+            cpu.set_gpr_u16(CpuState::RCX, 0x5678);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u16(CpuState::RBX), 0x5678);
+        assert_eq!(cpu.ax(), 0x1234, "accumulator unchanged on a match");
+        assert_ne!(cpu.rflags & (1 << 6), 0, "ZF set on a match");
+        assert_eq!(cpu.rflags & 1, 0, "CF from 0x1234 - 0x1234");
+
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xB1, 0xCB], |cpu, _| {
+            cpu.set_ax(0x1111);
+            cpu.set_gpr_u16(CpuState::RBX, 0x1234);
+            cpu.set_gpr_u16(CpuState::RCX, 0x5678);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(
+            cpu.gpr_u16(CpuState::RBX),
+            0x1234,
+            "destination written back"
+        );
+        assert_eq!(cpu.ax(), 0x1234, "accumulator takes the old destination");
+        assert_eq!(cpu.rflags & (1 << 6), 0, "ZF clear on a mismatch");
+        assert_ne!(cpu.rflags & 1, 0, "CF from 0x1111 - 0x1234 borrow");
+
+        // Byte form: 0F B0 CB = CMPXCHG BL, CL against AL.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xB0, 0xCB], |cpu, _| {
+            cpu.set_al(0x42);
+            cpu.set_gpr_u8_low(CpuState::RBX, 0x42);
+            cpu.set_gpr_u8_low(CpuState::RCX, 0x99);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u8_low(CpuState::RBX), 0x99);
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+
+        // Memory destination, mismatching: the old value is written back.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xB1, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.set_ax(0x0000);
+            cpu.set_gpr_u16(CpuState::RCX, 0xBEEF);
+            mem[0x4000] = 0xCD;
+            mem[0x4001] = 0xAB;
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u16(0x4000).unwrap(), 0xABCD);
+        assert_eq!(cpu.ax(), 0xABCD);
+        assert_eq!(cpu.rflags & (1 << 6), 0);
+
+        // 32-bit form matching: 66 0F B1 CB = CMPXCHG EBX, ECX against EAX.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x66, 0x0F, 0xB1, 0xCB], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+            cpu.set_gpr_u32(CpuState::RBX, 0xDEAD_BEEF);
+            cpu.set_gpr_u32(CpuState::RCX, 0x1234_5678);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x1234_5678);
+        assert_ne!(cpu.rflags & (1 << 6), 0);
     }
 }
