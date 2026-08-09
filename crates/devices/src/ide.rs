@@ -538,9 +538,19 @@ pub const ATAPI_CMD_REQUEST_SENSE: u8 = 0x03;
 ///
 /// Spec: SFF-8020i §10.8.4 / MMC — returns the standard INQUIRY data.
 pub const ATAPI_CMD_INQUIRY: u8 = 0x12;
+/// Packet command `READ CAPACITY` (10).
+///
+/// Spec: SFF-8020i / MMC — last logical block address and block length.
+pub const ATAPI_CMD_READ_CAPACITY: u8 = 0x25;
+/// Packet command `READ (10)`.
+///
+/// Spec: SFF-8020i / MMC — read logical blocks from CD-ROM medium.
+pub const ATAPI_CMD_READ_10: u8 = 0x28;
 
 /// Sense key `0h` NO SENSE. Spec: SFF-8020i Table "Sense Key Definitions".
 pub const ATAPI_SENSE_NO_SENSE: u8 = 0x00;
+/// Sense key `2h` NOT READY. Spec: SFF-8020i — empty CD-ROM medium.
+pub const ATAPI_SENSE_NOT_READY: u8 = 0x02;
 /// Sense key `5h` ILLEGAL REQUEST. Spec: SFF-8020i "Sense Key Definitions" —
 /// "an illegal parameter in the command packet".
 pub const ATAPI_SENSE_ILLEGAL_REQUEST: u8 = 0x05;
@@ -548,10 +558,14 @@ pub const ATAPI_SENSE_ILLEGAL_REQUEST: u8 = 0x05;
 ///
 /// Spec: SFF-8020i "ASC and ASCQ Definitions".
 pub const ATAPI_ASC_INVALID_COMMAND_OPERATION_CODE: u8 = 0x20;
+/// Additional sense code `21h` LOGICAL BLOCK ADDRESS OUT OF RANGE.
+pub const ATAPI_ASC_LBA_OUT_OF_RANGE: u8 = 0x21;
 /// Additional sense code `24h` INVALID FIELD IN COMMAND PACKET.
 ///
 /// Spec: SFF-8020i "ASC and ASCQ Definitions".
 pub const ATAPI_ASC_INVALID_FIELD_IN_CDB: u8 = 0x24;
+/// Additional sense code `3Ah` MEDIUM NOT PRESENT.
+pub const ATAPI_ASC_MEDIUM_NOT_PRESENT: u8 = 0x3A;
 
 /// Fixed-format sense data length this device returns, in bytes.
 ///
@@ -582,10 +596,20 @@ pub const ATAPI_INQUIRY_RESPONSE_DATA_FORMAT: u8 = 0x02;
 ///
 /// Spec: SCSI Primary Commands peripheral device type table, referenced by
 /// ATA/ATAPI-6 §8.16.9 for IDENTIFY PACKET DEVICE word 0 bits (12:8). This
-/// device has no medium and no medium-capable command packet set, so INQUIRY
-/// byte 0 reports the same `1Fh` the identify block does rather than claiming
-/// `05h` CD-ROM.
+/// minimal PACKET device (no CD-ROM command set) reports this rather than
+/// claiming `05h` CD-ROM.
 pub const ATAPI_PERIPHERAL_DEVICE_TYPE_UNKNOWN: u8 = 0x1F;
+/// Peripheral device type `05h` — CD-ROM.
+///
+/// Spec: SCSI Primary Commands / ATA/ATAPI-6 §8.16.9. Used only when the
+/// device is CD-ROM capable (`docs/atapi-r5-cdrom-medium.md`).
+pub const ATAPI_PERIPHERAL_DEVICE_TYPE_CDROM: u8 = 0x05;
+/// INQUIRY byte 1 bit7 — RMB (removable medium bit).
+pub const ATAPI_INQUIRY_RMB: u8 = 0x80;
+/// CD-ROM logical block length (Mode 1 user data). Spec: SFF-8020i / MMC.
+pub const ATAPI_CDROM_BLOCK_BYTES: usize = 2048;
+/// READ CAPACITY parameter data length in bytes.
+pub const ATAPI_READ_CAPACITY_DATA_BYTES: usize = 8;
 
 /// Where a PACKET command is in the ATA/ATAPI-6 §9.8 protocol.
 ///
@@ -623,10 +647,15 @@ pub struct IdePrimary {
     /// Spec: ATA/ATAPI-6 §6.8 — such a device "exhibits responses different
     /// from those exhibited by devices not implementing this feature set":
     /// a different reset signature (§9.12), IDENTIFY DEVICE aborted, and
-    /// IDENTIFY PACKET DEVICE answered. This tree implements **detection
-    /// only**: PACKET (`0xA0`) is still aborted, so there is no packet engine
-    /// and no media. See `docs/atapi-r3-identify-and-signature.md`.
+    /// IDENTIFY PACKET DEVICE answered. A minimal packet device stays type
+    /// `1Fh`; see [`Self::atapi_cdrom`] for the CD-ROM capable path.
+    /// See `docs/atapi-r3-identify-and-signature.md`.
     packet_device: bool,
+    /// True when Device 0 is CD-ROM capable (peripheral type `05h`).
+    ///
+    /// Spec: ATA/ATAPI-6 §8.16.9 / SFF-8020i — only set when READ CAPACITY and
+    /// READ (10) exist. See `docs/atapi-r5-cdrom-medium.md`.
+    atapi_cdrom: bool,
     error: u8,
     features: u8,
     sector_count: u8,
@@ -726,6 +755,7 @@ impl IdePrimary {
             present: false,
             image: Vec::new(),
             packet_device: false,
+            atapi_cdrom: false,
             error: 0,
             features: 0,
             sector_count: 0,
@@ -780,20 +810,23 @@ impl IdePrimary {
         self.present = true;
         // An attached disk image is an ATA device, not a packet device.
         self.packet_device = false;
+        self.atapi_cdrom = false;
         self.reset_ready();
     }
 
-    /// Configure Device 0 as a PACKET (ATAPI) device with no media.
+    /// Configure Device 0 as a minimal PACKET (ATAPI) device with no media.
     ///
     /// The device becomes *detectable* as ATAPI: it reports the ATA/ATAPI-6
     /// §9.12 PACKET signature after every reset and EXECUTE DEVICE DIAGNOSTIC,
     /// aborts IDENTIFY DEVICE with that signature in place, and answers
-    /// IDENTIFY PACKET DEVICE. It is **not** a CD-ROM: PACKET (`0xA0`) is
-    /// aborted, no command packet set is implemented, and there is no media.
+    /// IDENTIFY PACKET DEVICE. Peripheral type stays `1Fh` — it is **not** a
+    /// CD-ROM (`docs/atapi-r3-identify-and-signature.md`). For a CD-ROM
+    /// capable device see [`Self::attach_atapi_cdrom`].
     pub fn attach_atapi_device(&mut self) {
         self.image = Vec::new();
         self.present = true;
         self.packet_device = true;
+        self.atapi_cdrom = false;
         self.reset_ready();
     }
 
@@ -804,9 +837,83 @@ impl IdePrimary {
         ide
     }
 
+    /// Configure Device 0 as a CD-ROM capable PACKET device with no medium.
+    ///
+    /// Spec: ATA/ATAPI-6 §8.16.9 — word 0 bits (12:8) = `05h` CD-ROM and RMB
+    /// set because READ CAPACITY / READ (10) exist. The tray is empty until
+    /// [`Self::load_atapi_medium`]. See `docs/atapi-r5-cdrom-medium.md`.
+    pub fn attach_atapi_cdrom(&mut self) {
+        self.image = Vec::new();
+        self.present = true;
+        self.packet_device = true;
+        self.atapi_cdrom = true;
+        self.reset_ready();
+    }
+
+    /// CD-ROM capable PACKET device with no medium loaded.
+    pub fn with_atapi_cdrom() -> Self {
+        let mut ide = Self::new();
+        ide.attach_atapi_cdrom();
+        ide
+    }
+
+    /// Configure Device 0 as a CD-ROM and load a raw 2048-byte-sector image.
+    ///
+    /// The image is truncated down to a whole number of
+    /// [`ATAPI_CDROM_BLOCK_BYTES`] blocks. ISO 9660 is not parsed.
+    pub fn attach_atapi_cdrom_image(&mut self, image: Vec<u8>) {
+        self.attach_atapi_cdrom();
+        self.load_atapi_medium(image);
+    }
+
+    /// CD-ROM capable PACKET device with a medium image attached.
+    pub fn with_atapi_cdrom_image(image: Vec<u8>) -> Self {
+        let mut ide = Self::new();
+        ide.attach_atapi_cdrom_image(image);
+        ide
+    }
+
+    /// Load (or replace) the CD-ROM medium image.
+    ///
+    /// Returns `false` without changing state when the device is not CD-ROM
+    /// capable. Truncates to a whole number of 2048-byte blocks.
+    pub fn load_atapi_medium(&mut self, image: Vec<u8>) -> bool {
+        if !self.atapi_cdrom {
+            return false;
+        }
+        let blocks = image.len() / ATAPI_CDROM_BLOCK_BYTES;
+        self.image = image[..blocks * ATAPI_CDROM_BLOCK_BYTES].to_vec();
+        true
+    }
+
+    /// Unload the CD-ROM medium (empty tray). No-op if not CD-ROM capable.
+    pub fn unload_atapi_medium(&mut self) {
+        if self.atapi_cdrom {
+            self.image.clear();
+        }
+    }
+
     /// True when Device 0 implements the PACKET Command feature set.
     pub fn is_packet_device(&self) -> bool {
         self.packet_device
+    }
+
+    /// True when Device 0 is CD-ROM capable (type `05h`).
+    pub fn is_atapi_cdrom(&self) -> bool {
+        self.packet_device && self.atapi_cdrom
+    }
+
+    /// True when a CD-ROM medium image is loaded (at least one 2048-byte block).
+    pub fn atapi_medium_loaded(&self) -> bool {
+        self.is_atapi_cdrom() && !self.image.is_empty()
+    }
+
+    /// Number of 2048-byte logical blocks on the loaded CD-ROM medium.
+    pub fn atapi_cdrom_blocks(&self) -> u64 {
+        if !self.is_atapi_cdrom() {
+            return 0;
+        }
+        (self.image.len() / ATAPI_CDROM_BLOCK_BYTES) as u64
     }
 
     pub fn reset(&mut self) {
@@ -814,10 +921,12 @@ impl IdePrimary {
         let image = std::mem::take(&mut self.image);
         let present = self.present;
         let packet_device = self.packet_device;
+        let atapi_cdrom = self.atapi_cdrom;
         *self = Self::new();
         self.image = image;
         self.present = present;
         self.packet_device = packet_device;
+        self.atapi_cdrom = atapi_cdrom;
         if self.present {
             self.reset_ready();
         }
@@ -1159,24 +1268,43 @@ impl IdePrimary {
     /// §8.16.8 requires of reserved words anyway.
     ///
     /// The interesting choice is word 0 bits (12:8), the command packet set:
-    /// this device implements **no** packet command set, so it reports the
-    /// defined `1Fh` "unknown or no device type" rather than `05h` CD-ROM.
+    /// a minimal packet device reports `1Fh`; a CD-ROM capable device reports
+    /// `05h` with RMB set because READ CAPACITY / READ (10) exist.
     /// Word 82 bit 4 is set because the PACKET Command feature set *is* what
-    /// makes this device answer `0xA1` at all; word 82 bit 9 stays clear
-    /// because DEVICE RESET (`0x08`) is not implemented, and word 53 reports
-    /// words (70:64) and word 88 as invalid because there is no timing model.
+    /// makes this device answer `0xA1` at all; word 82 bit 9 is set because
+    /// DEVICE RESET (`0x08`) is implemented; word 53 reports words (70:64) and
+    /// word 88 as invalid because there is no timing model.
     fn fill_identify_packet(&mut self) {
         let mut words = [0u16; IDENTIFY_WORDS];
-        // Word 0: ATAPI device (15:14 = 10b), no command packet set,
-        // non-removable, 3 ms DRQ response, 12-byte command packet.
-        words[0] = IDENTIFY_PACKET_ATAPI_DEVICE | (IDENTIFY_PACKET_SET_UNKNOWN << 8);
+        let peripheral = if self.atapi_cdrom {
+            u16::from(ATAPI_PERIPHERAL_DEVICE_TYPE_CDROM)
+        } else {
+            IDENTIFY_PACKET_SET_UNKNOWN
+        };
+        // Word 0: ATAPI device (15:14 = 10b), packet set, RMB for CD-ROM,
+        // 3 ms DRQ response, 12-byte command packet.
+        let mut word0 = IDENTIFY_PACKET_ATAPI_DEVICE | (peripheral << 8);
+        if self.atapi_cdrom {
+            word0 |= 1 << 7; // RMB
+        }
+        words[0] = word0;
         let firmware = b"0001    ";
         for (i, chunk) in firmware.chunks(2).take(4).enumerate() {
             let a = chunk.first().copied().unwrap_or(b' ');
             let b = chunk.get(1).copied().unwrap_or(b' ');
             words[23 + i] = u16::from(a) << 8 | u16::from(b);
         }
-        let model = b"x86WASM ATAPI PACKET MINIMAL            ";
+        let model = if self.atapi_cdrom {
+            let mut m = [b' '; 40];
+            let s = b"x86WASM ATAPI CD-ROM";
+            m[..s.len()].copy_from_slice(s);
+            m
+        } else {
+            let mut m = [b' '; 40];
+            let s = b"x86WASM ATAPI PACKET MINIMAL";
+            m[..s.len()].copy_from_slice(s);
+            m
+        };
         for (i, chunk) in model.chunks(2).take(20).enumerate() {
             let a = chunk.first().copied().unwrap_or(b' ');
             let b = chunk.get(1).copied().unwrap_or(b' ');
@@ -1314,17 +1442,17 @@ impl IdePrimary {
 
     /// Dispatch the received command packet.
     ///
-    /// Spec: SFF-8020i / MMC command packet set. Only `TEST UNIT READY` and
-    /// `INQUIRY` are implemented; every other operation code is an honest
-    /// CHECK CONDITION with sense key ILLEGAL REQUEST and additional sense
-    /// code `20h` INVALID COMMAND OPERATION CODE, so a host learns *why* the
-    /// command failed instead of seeing a bare ATA abort.
+    /// Spec: SFF-8020i / MMC command packet set. Minimal PACKET devices run
+    /// `TEST UNIT READY`, `REQUEST SENSE`, and `INQUIRY`. CD-ROM capable
+    /// devices also run `READ CAPACITY` and `READ (10)`.
     fn execute_packet_command(&mut self) {
         self.packet_phase = PacketPhase::Idle;
         match self.packet_cmd[0] {
             ATAPI_CMD_TEST_UNIT_READY => self.exec_packet_test_unit_ready(),
             ATAPI_CMD_REQUEST_SENSE => self.exec_packet_request_sense(),
             ATAPI_CMD_INQUIRY => self.exec_packet_inquiry(),
+            ATAPI_CMD_READ_CAPACITY if self.atapi_cdrom => self.exec_packet_read_capacity(),
+            ATAPI_CMD_READ_10 if self.atapi_cdrom => self.exec_packet_read10(),
             _ => self.complete_packet_check_condition(
                 ATAPI_SENSE_ILLEGAL_REQUEST,
                 ATAPI_ASC_INVALID_COMMAND_OPERATION_CODE,
@@ -1335,18 +1463,22 @@ impl IdePrimary {
 
     /// `TEST UNIT READY` — a non-data packet command.
     ///
-    /// Spec: SFF-8020i §10.8.24 — "provides a means to check if the logical
-    /// unit is ready", returning GOOD status when it is and CHECK CONDITION
-    /// when it is not.
+    /// Spec: SFF-8020i §10.8.24.
     ///
-    /// **This device reports GOOD.** It has no medium model at all — no tray,
-    /// no disc, no capacity, no medium-change notification — so reporting
-    /// NOT READY / `3Ah` MEDIUM NOT PRESENT would assert a medium state it
-    /// cannot have, which is the same kind of claim the `1Fh` peripheral
-    /// device type exists to avoid. The logical unit is ready in the only sense
-    /// this device implements: it accepts the packet commands it advertises.
-    /// When a medium model lands, this command gains the NOT READY path.
+    /// - Minimal PACKET (`1Fh`): GOOD — there is still no medium model.
+    /// - CD-ROM capable, empty: CHECK CONDITION, NOT READY / `3Ah`.
+    /// - CD-ROM capable, medium loaded: GOOD.
+    ///
+    /// See `docs/atapi-r5-medium-sense.md`.
     fn exec_packet_test_unit_ready(&mut self) {
+        if self.atapi_cdrom && !self.atapi_medium_loaded() {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_NOT_READY,
+                ATAPI_ASC_MEDIUM_NOT_PRESENT,
+                0,
+            );
+            return;
+        }
         self.complete_packet_good();
     }
 
@@ -1446,33 +1578,88 @@ impl IdePrimary {
             return;
         }
         let allocation = usize::from(self.packet_cmd[4]);
-        let data = Self::inquiry_data();
+        let data = self.inquiry_data();
         self.begin_packet_data_in(&data, allocation);
     }
 
     /// The standard INQUIRY data this device returns.
     ///
-    /// Spec: SFF-8020i §10.8.4 standard INQUIRY data.
-    ///
-    /// | Byte | Value | Reason |
-    /// |---|---|---|
-    /// | 0 | `1Fh` | qualifier `000b` (device connected) + peripheral device type "unknown or no device type" — the same value IDENTIFY PACKET DEVICE word 0 reports |
-    /// | 1 | `00h` | RMB clear: not removable, matching identify word 0 bit 7 |
-    /// | 2 | `00h` | no ANSI version claimed, because this is not a conforming ATAPI CD-ROM |
-    /// | 3 | `02h` | the data below is the standard-defined layout |
-    /// | 4 | `1Fh` | additional length: 36 − 5 |
-    /// | 8:15 | `"x86WASM "` | vendor identification |
-    /// | 16:31 | `"ATAPI PACKET MIN"` | product identification, saying what this is |
-    /// | 32:35 | `"0001"` | product revision level |
-    fn inquiry_data() -> [u8; ATAPI_INQUIRY_DATA_BYTES] {
+    /// Spec: SFF-8020i §10.8.4 standard INQUIRY data. Peripheral type and RMB
+    /// match IDENTIFY PACKET DEVICE word 0.
+    fn inquiry_data(&self) -> [u8; ATAPI_INQUIRY_DATA_BYTES] {
         let mut data = [0u8; ATAPI_INQUIRY_DATA_BYTES];
-        data[0] = ATAPI_PERIPHERAL_DEVICE_TYPE_UNKNOWN;
+        if self.atapi_cdrom {
+            data[0] = ATAPI_PERIPHERAL_DEVICE_TYPE_CDROM;
+            data[1] = ATAPI_INQUIRY_RMB;
+            data[16..32].copy_from_slice(b"ATAPI CD-ROM    ");
+        } else {
+            data[0] = ATAPI_PERIPHERAL_DEVICE_TYPE_UNKNOWN;
+            data[16..32].copy_from_slice(b"ATAPI PACKET MIN");
+        }
         data[3] = ATAPI_INQUIRY_RESPONSE_DATA_FORMAT;
         data[4] = (ATAPI_INQUIRY_DATA_BYTES - 5) as u8;
         data[8..16].copy_from_slice(b"x86WASM ");
-        data[16..32].copy_from_slice(b"ATAPI PACKET MIN");
         data[32..36].copy_from_slice(b"0001");
         data
+    }
+
+    /// `READ CAPACITY` — last LBA and 2048-byte block length.
+    ///
+    /// Spec: SFF-8020i / MMC. Empty medium → NOT READY / `3Ah`.
+    fn exec_packet_read_capacity(&mut self) {
+        if !self.atapi_medium_loaded() {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_NOT_READY,
+                ATAPI_ASC_MEDIUM_NOT_PRESENT,
+                0,
+            );
+            return;
+        }
+        let blocks = self.atapi_cdrom_blocks();
+        let last_lba = (blocks - 1) as u32;
+        let mut data = [0u8; ATAPI_READ_CAPACITY_DATA_BYTES];
+        data[0..4].copy_from_slice(&last_lba.to_be_bytes());
+        data[4..8].copy_from_slice(&(ATAPI_CDROM_BLOCK_BYTES as u32).to_be_bytes());
+        self.begin_packet_data_in(&data, ATAPI_READ_CAPACITY_DATA_BYTES);
+    }
+
+    /// `READ (10)` — transfer logical blocks from the attached medium.
+    ///
+    /// Spec: SFF-8020i / MMC. CDB: LBA at bytes 2–5, transfer length at 7–8
+    /// (big-endian). Transfer length 0 transfers nothing and completes GOOD.
+    fn exec_packet_read10(&mut self) {
+        if !self.atapi_medium_loaded() {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_NOT_READY,
+                ATAPI_ASC_MEDIUM_NOT_PRESENT,
+                0,
+            );
+            return;
+        }
+        let lba = u32::from_be_bytes([
+            self.packet_cmd[2],
+            self.packet_cmd[3],
+            self.packet_cmd[4],
+            self.packet_cmd[5],
+        ]) as u64;
+        let count = u16::from_be_bytes([self.packet_cmd[7], self.packet_cmd[8]]) as u64;
+        if count == 0 {
+            self.complete_packet_good();
+            return;
+        }
+        let blocks = self.atapi_cdrom_blocks();
+        if lba >= blocks || count > blocks - lba {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_ILLEGAL_REQUEST,
+                ATAPI_ASC_LBA_OUT_OF_RANGE,
+                0,
+            );
+            return;
+        }
+        let start = (lba as usize) * ATAPI_CDROM_BLOCK_BYTES;
+        let len = (count as usize) * ATAPI_CDROM_BLOCK_BYTES;
+        let data = self.image[start..start + len].to_vec();
+        self.begin_packet_data_in(&data, data.len());
     }
 
     /// Start a device-to-host packet data transfer, truncated to the command's
@@ -2964,7 +3151,7 @@ impl IdeSecondary {
 
     /// Configure Device 0 as a PACKET (ATAPI) device with no media.
     ///
-    /// See [`IdePrimary::attach_atapi_device`] — detection only, no CD-ROM.
+    /// See [`IdePrimary::attach_atapi_device`] — minimal packet set, no CD-ROM.
     pub fn attach_atapi_device(&mut self) {
         self.inner.attach_atapi_device();
     }
@@ -2976,9 +3163,58 @@ impl IdeSecondary {
         }
     }
 
+    /// See [`IdePrimary::attach_atapi_cdrom`].
+    pub fn attach_atapi_cdrom(&mut self) {
+        self.inner.attach_atapi_cdrom();
+    }
+
+    /// See [`IdePrimary::with_atapi_cdrom`].
+    pub fn with_atapi_cdrom() -> Self {
+        Self {
+            inner: IdePrimary::with_atapi_cdrom(),
+        }
+    }
+
+    /// See [`IdePrimary::attach_atapi_cdrom_image`].
+    pub fn attach_atapi_cdrom_image(&mut self, image: Vec<u8>) {
+        self.inner.attach_atapi_cdrom_image(image);
+    }
+
+    /// See [`IdePrimary::with_atapi_cdrom_image`].
+    pub fn with_atapi_cdrom_image(image: Vec<u8>) -> Self {
+        Self {
+            inner: IdePrimary::with_atapi_cdrom_image(image),
+        }
+    }
+
+    /// See [`IdePrimary::load_atapi_medium`].
+    pub fn load_atapi_medium(&mut self, image: Vec<u8>) -> bool {
+        self.inner.load_atapi_medium(image)
+    }
+
+    /// See [`IdePrimary::unload_atapi_medium`].
+    pub fn unload_atapi_medium(&mut self) {
+        self.inner.unload_atapi_medium();
+    }
+
     /// True when Device 0 implements the PACKET Command feature set.
     pub fn is_packet_device(&self) -> bool {
         self.inner.is_packet_device()
+    }
+
+    /// See [`IdePrimary::is_atapi_cdrom`].
+    pub fn is_atapi_cdrom(&self) -> bool {
+        self.inner.is_atapi_cdrom()
+    }
+
+    /// See [`IdePrimary::atapi_medium_loaded`].
+    pub fn atapi_medium_loaded(&self) -> bool {
+        self.inner.atapi_medium_loaded()
+    }
+
+    /// See [`IdePrimary::atapi_sense`].
+    pub fn atapi_sense(&self) -> (u8, u8, u8) {
+        self.inner.atapi_sense()
     }
 
     pub fn reset(&mut self) {
