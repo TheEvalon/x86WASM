@@ -5,9 +5,36 @@
 //! write resets the data offset; reads past end return `0x00`; data-port writes
 //! ignored (QEMU ≥2.4 traditional interface).
 //!
+//! Spec: ACPI Specification §15 "System Address Map Interfaces", Table 15.4
+//! "Address Range Descriptor Structure" and §15.2 "Address Range Types" — the
+//! encoding of the `etc/e820` firmware file.
+//!
 //! This device: signature key `0x0000` (`QEMU`), ID key `0x0001`, RAM-size key
 //! `0x0003`, and named files in the file directory (`FW_CFG_FILE_DIR` /
 //! `FW_CFG_FILE_FIRST`).
+//!
+//! Firmware files are keyed by name: [`FwCfg::add_file`] rejects a duplicate,
+//! [`FwCfg::set_file`] replaces contents while keeping the selector stable, and
+//! [`FwCfg::remove_file`] drops both the item and its directory entry.
+//! [`FwCfg::set_e820_entries`] publishes a host-supplied system memory map as
+//! `etc/e820`, encoded as ACPI address range descriptors (ACPI Specification
+//! §15, Table 15.4); an empty map removes the file rather than advertising one
+//! with no content.
+//!
+//! # Selectors this device does not implement
+//!
+//! The fw_cfg specification defines only the signature (`0x0000`), the
+//! revision/feature bitmap (`0x0001`), and the file directory (`0x0019`),
+//! then says of every other key: "Please consult the QEMU source for the most
+//! up-to-date and authoritative list of selector keys and their respective
+//! items' purpose, format and writeability." This tree does not take QEMU
+//! source as a specification, so the numeric keys firmware also probes —
+//! notably `0x0002` UUID, `0x0004` nographic, `0x0005` NB_CPUS and `0x000F`
+//! max-cpus — are **absent**, as are the named files `etc/max-cpus`,
+//! `etc/system-states`, `etc/table-loader` and `bootorder`. Firmware reading
+//! them gets the specification's "past the end of the item" answer of `0x00`
+//! rather than a fabricated value. Adding them needs an approved interface
+//! definition in `docs/sources.md` first.
 //!
 //! DMA interface: the 64-bit big-endian address register lives at `0x514`
 //! (high half) / `0x518` (low half, triggering). Writing it latches the guest
@@ -123,6 +150,84 @@ pub const FW_CFG_SIGNATURE_BYTES: &[u8] = b"QEMU";
 pub const FW_CFG_TEST_FILE_NAME: &str = "opt/org.x86wasm/test";
 /// Default test-file contents (`FWCF` — fw_cfg family tag for probes).
 pub const FW_CFG_TEST_FILE_BYTES: &[u8] = b"FWCF";
+
+/// Longest storable firmware-file name.
+///
+/// Spec: QEMU fw_cfg "File Directory" — `char name[56]` holding a
+/// NUL-terminated ASCII string.
+pub const FW_CFG_FILE_NAME_MAX: usize = 55;
+
+/// Firmware file carrying the system memory map.
+///
+/// The name is the QEMU firmware-interface convention for this blob; the
+/// *contents* follow the ACPI address-range descriptor format below. Because
+/// the fw_cfg specification does not define what a machine model must place
+/// here, this device never synthesizes entries — see
+/// [`FwCfg::set_e820_entries`].
+pub const FW_CFG_FILE_E820: &str = "etc/e820";
+
+/// Size of one `etc/e820` entry, in bytes.
+///
+/// Spec: ACPI Specification §15 "System Address Map Interfaces", Table 15.4
+/// "Address Range Descriptor Structure" — "The minimum size that must be
+/// supported by both the BIOS and the caller is 20 bytes": `BaseAddrLow` (0),
+/// `BaseAddrHigh` (4), `LengthLow` (8), `LengthHigh` (12), `Type` (16). The
+/// ACPI 3.0 Extended Attributes dword at offset 20 is not emitted.
+pub const FW_CFG_E820_ENTRY_SIZE: usize = 20;
+
+/// ACPI address range type 1 — `AddressRangeMemory`, RAM usable by the OS.
+///
+/// Spec: ACPI Specification §15.2 "Address Range Types".
+pub const E820_TYPE_MEMORY: u32 = 1;
+/// ACPI address range type 2 — `AddressRangeReserved`.
+pub const E820_TYPE_RESERVED: u32 = 2;
+/// ACPI address range type 3 — `AddressRangeACPI` (ACPI reclaim memory).
+pub const E820_TYPE_ACPI: u32 = 3;
+/// ACPI address range type 4 — `AddressRangeNVS` (ACPI NVS memory).
+pub const E820_TYPE_NVS: u32 = 4;
+/// ACPI address range type 5 — `AddressRangeUnusable`.
+pub const E820_TYPE_UNUSABLE: u32 = 5;
+
+// Spec: ACPI §15.2 Address Range Types are consecutive from 1.
+const _: () = assert!(E820_TYPE_MEMORY == 1);
+const _: () = assert!(E820_TYPE_RESERVED == E820_TYPE_MEMORY + 1);
+const _: () = assert!(E820_TYPE_ACPI == E820_TYPE_RESERVED + 1);
+const _: () = assert!(E820_TYPE_NVS == E820_TYPE_ACPI + 1);
+const _: () = assert!(E820_TYPE_UNUSABLE == E820_TYPE_NVS + 1);
+
+/// One system-address-map range for the `etc/e820` firmware file.
+///
+/// Spec: ACPI Specification §15, Table 15.4 "Address Range Descriptor
+/// Structure" — a 64-bit base address, a 64-bit length in bytes, and a 32-bit
+/// range type from §15.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct E820Entry {
+    /// Physical address of the start of the range.
+    pub base: u64,
+    /// Physical contiguous length of the range, in bytes.
+    pub length: u64,
+    /// Range type — one of the `E820_TYPE_*` values.
+    pub kind: u32,
+}
+
+impl E820Entry {
+    pub const fn new(base: u64, length: u64, kind: u32) -> Self {
+        Self { base, length, kind }
+    }
+
+    /// Encode as the 20-byte ACPI address range descriptor.
+    ///
+    /// The fields are little-endian: the fw_cfg data register is
+    /// "string-preserving", so a blob is delivered to the guest byte for byte
+    /// and must already be in the guest's native order.
+    pub fn to_descriptor(self) -> [u8; FW_CFG_E820_ENTRY_SIZE] {
+        let mut out = [0u8; FW_CFG_E820_ENTRY_SIZE];
+        out[0..8].copy_from_slice(&self.base.to_le_bytes());
+        out[8..16].copy_from_slice(&self.length.to_le_bytes());
+        out[16..20].copy_from_slice(&self.kind.to_le_bytes());
+        out
+    }
+}
 
 /// One fw_cfg configuration item (blob).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,13 +371,16 @@ impl FwCfg {
         self.rebuild_file_dir();
     }
 
-    /// Insert a named file at the next free selector ≥ [`FW_CFG_FILE_FIRST`].
+    /// Insert a new named file at the next free selector ≥ [`FW_CFG_FILE_FIRST`].
     ///
-    /// Rebuilds [`FW_CFG_FILE_DIR`]. Names longer than 55 ASCII chars (plus NUL)
-    /// are rejected.
+    /// Spec: QEMU fw_cfg "File Directory" — a firmware file is identified by
+    /// its `char name[56]` NUL-terminated name, so a duplicate name would make
+    /// the directory ambiguous and is rejected here. Use [`Self::set_file`] to
+    /// replace the contents of an existing file.
     pub fn add_file(&mut self, name: &str, data: impl Into<Vec<u8>>) -> Result<u16, &'static str> {
-        if name.len() > 55 || name.contains('\0') {
-            return Err("fw_cfg file name must be ≤55 ASCII chars without NUL");
+        Self::check_file_name(name)?;
+        if self.file_selector(name).is_some() {
+            return Err("fw_cfg file name already present");
         }
         let key = self
             .files
@@ -288,6 +396,86 @@ impl FwCfg {
         self.files.push((key, name.to_string()));
         self.rebuild_file_dir();
         Ok(key)
+    }
+
+    /// Insert or replace a named file, keeping the selector stable across a
+    /// replacement so a guest that already walked the directory stays valid.
+    pub fn set_file(&mut self, name: &str, data: impl Into<Vec<u8>>) -> Result<u16, &'static str> {
+        Self::check_file_name(name)?;
+        match self.file_selector(name) {
+            Some(key) => {
+                self.items.insert(key, FwCfgItem::from_bytes(data.into()));
+                self.rebuild_file_dir();
+                Ok(key)
+            }
+            None => self.add_file(name, data),
+        }
+    }
+
+    /// Remove a named file and its directory entry. Returns the freed selector.
+    ///
+    /// The selector is not reused, so a stale guest reference reads an unknown
+    /// item (all `0x00`) rather than someone else's blob.
+    pub fn remove_file(&mut self, name: &str) -> Option<u16> {
+        let key = self.file_selector(name)?;
+        self.files.retain(|(k, _)| *k != key);
+        self.items.remove(&key);
+        self.rebuild_file_dir();
+        Some(key)
+    }
+
+    /// Selector currently assigned to a named firmware file, if present.
+    pub fn file_selector(&self, name: &str) -> Option<u16> {
+        self.files
+            .iter()
+            .find(|(_, n)| n == name)
+            .map(|(key, _)| *key)
+    }
+
+    /// Names of every firmware file in the directory, in selector order.
+    pub fn file_names(&self) -> Vec<&str> {
+        self.files.iter().map(|(_, n)| n.as_str()).collect()
+    }
+
+    fn check_file_name(name: &str) -> Result<(), &'static str> {
+        if name.len() > FW_CFG_FILE_NAME_MAX || name.contains('\0') {
+            return Err("fw_cfg file name must be ≤55 ASCII chars without NUL");
+        }
+        Ok(())
+    }
+
+    /// Build an [`E820Entry`] without having to name the type.
+    ///
+    /// Convenience for callers outside this crate that only need to hand a map
+    /// to [`Self::set_e820_entries`].
+    pub const fn e820_entry(base: u64, length: u64, kind: u32) -> E820Entry {
+        E820Entry::new(base, length, kind)
+    }
+
+    /// Publish the system memory map as the `etc/e820` firmware file.
+    ///
+    /// Spec: ACPI Specification §15, Table 15.4 — each entry is encoded as the
+    /// 20-byte address range descriptor (little-endian 64-bit base, 64-bit
+    /// length, 32-bit type from §15.2). Returns the file's selector, or `None`
+    /// when `entries` is empty, in which case the file is *removed*: the fw_cfg
+    /// specification does not say what a machine model must place in this blob,
+    /// so an emulator that cannot describe its address space must be silent
+    /// rather than publish an empty map that firmware would read as "no RAM".
+    ///
+    /// This device never synthesizes entries from the RAM-size item; the host
+    /// supplies the map it can actually justify.
+    pub fn set_e820_entries(&mut self, entries: &[E820Entry]) -> Option<u16> {
+        if entries.is_empty() {
+            self.remove_file(FW_CFG_FILE_E820);
+            return None;
+        }
+        let mut blob = Vec::with_capacity(entries.len() * FW_CFG_E820_ENTRY_SIZE);
+        for entry in entries {
+            blob.extend_from_slice(&entry.to_descriptor());
+        }
+        self.set_file(FW_CFG_FILE_E820, blob)
+            .expect("etc/e820 is a valid fw_cfg file name")
+            .into()
     }
 
     pub fn item(&self, key: u16) -> Option<&FwCfgItem> {
@@ -910,6 +1098,120 @@ mod tests {
         assert_eq!(cfg.dma_address(), 0);
         assert!(cfg.dma_enabled());
         assert!(cfg.service_dma(|_| 0, |_, _| {}).is_none());
+    }
+
+    /// Spec: ACPI §15 Table 15.4 — the 20-byte descriptor field offsets, and
+    /// §15.2 — the range type values.
+    #[test]
+    fn e820_descriptor_field_layout_matches_acpi_table_15_4() {
+        assert_eq!(FW_CFG_E820_ENTRY_SIZE, 20);
+        let bytes = E820Entry::new(0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, E820_TYPE_NVS)
+            .to_descriptor();
+
+        assert_eq!(&bytes[0..8], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&bytes[8..16], &0x99AA_BBCC_DDEE_FF00u64.to_le_bytes());
+        assert_eq!(&bytes[16..20], &4u32.to_le_bytes());
+    }
+
+    /// Spec: QEMU fw_cfg "File Directory" — a named file gets a selector at or
+    /// above `FW_CFG_FILE_FIRST` and a directory entry reporting its size.
+    #[test]
+    fn set_e820_entries_publishes_and_clears_the_file() {
+        let mut cfg = FwCfg::new();
+        assert_eq!(cfg.file_selector(FW_CFG_FILE_E820), None);
+
+        let entries = [
+            E820Entry::new(0, 0x0009_FC00, E820_TYPE_MEMORY),
+            E820Entry::new(0x0010_0000, 0x00F0_0000, E820_TYPE_MEMORY),
+        ];
+        let selector = cfg.set_e820_entries(&entries).unwrap();
+        assert!(selector >= FW_CFG_FILE_FIRST);
+        assert_eq!(cfg.file_selector(FW_CFG_FILE_E820), Some(selector));
+        assert_eq!(
+            cfg.item(selector).map(|i| i.data.len()),
+            Some(2 * FW_CFG_E820_ENTRY_SIZE)
+        );
+        assert!(cfg.file_names().contains(&FW_CFG_FILE_E820));
+
+        assert_eq!(cfg.set_e820_entries(&[]), None);
+        assert_eq!(cfg.file_selector(FW_CFG_FILE_E820), None);
+        assert!(cfg.item(selector).is_none());
+    }
+
+    /// The named-file directory is keyed by name: adding a duplicate is an
+    /// error, replacing keeps the selector, and removing frees the name.
+    #[test]
+    fn file_directory_is_keyed_by_name() {
+        let mut cfg = FwCfg::new();
+        let a = cfg.add_file("opt/org.x86wasm/a", b"1").unwrap();
+        let b = cfg.add_file("opt/org.x86wasm/b", b"2").unwrap();
+        assert_ne!(a, b);
+        assert!(cfg.add_file("opt/org.x86wasm/a", b"3").is_err());
+
+        assert_eq!(cfg.set_file("opt/org.x86wasm/a", b"333").unwrap(), a);
+        assert_eq!(cfg.item(a).map(|i| i.data.clone()), Some(b"333".to_vec()));
+
+        assert_eq!(cfg.remove_file("opt/org.x86wasm/a"), Some(a));
+        assert_eq!(cfg.remove_file("opt/org.x86wasm/a"), None);
+        assert_eq!(cfg.file_selector("opt/org.x86wasm/a"), None);
+        // The freed selector is not recycled onto the next file.
+        let c = cfg.add_file("opt/org.x86wasm/c", b"4").unwrap();
+        assert_ne!(c, a);
+    }
+
+    /// Spec: QEMU fw_cfg "File Directory" — `char name[56]` NUL-terminated.
+    #[test]
+    fn file_name_length_limit_matches_the_directory_field() {
+        assert_eq!(FW_CFG_FILE_NAME_MAX, 55);
+        let mut cfg = FwCfg::new();
+        assert!(cfg
+            .add_file(&"n".repeat(FW_CFG_FILE_NAME_MAX), b"x")
+            .is_ok());
+        assert!(cfg
+            .add_file(&"m".repeat(FW_CFG_FILE_NAME_MAX + 1), b"x")
+            .is_err());
+    }
+
+    /// The `etc/e820` blob is reachable through the DMA interface, which is how
+    /// firmware fetches a multi-entry memory map in one operation.
+    #[test]
+    fn e820_blob_readable_through_the_dma_interface() {
+        let mut cfg = FwCfg::new();
+        let selector = cfg
+            .set_e820_entries(&[E820Entry::new(0x0010_0000, 0x00F0_0000, E820_TYPE_MEMORY)])
+            .unwrap();
+
+        let mut ram = TestRam::new();
+        ram.put_access(
+            0x100,
+            FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ | (u32::from(selector) << 16),
+            FW_CFG_E820_ENTRY_SIZE as u32,
+            0x200,
+        );
+        let outcome = run_dma(&mut cfg, &mut ram, 0x100);
+
+        assert!(!outcome.error());
+        assert_eq!(outcome.transferred, FW_CFG_E820_ENTRY_SIZE as u32);
+        assert_eq!(
+            u64::from_le_bytes(ram.0[0x200..0x208].try_into().unwrap()),
+            0x0010_0000
+        );
+        assert_eq!(
+            u32::from_le_bytes(ram.0[0x210..0x214].try_into().unwrap()),
+            E820_TYPE_MEMORY
+        );
+    }
+
+    /// Nothing in this device fabricates the numeric keys the specification
+    /// leaves to the QEMU source, so they stay absent and read as `0x00`.
+    #[test]
+    fn unimplemented_numeric_selectors_stay_absent() {
+        let mut cfg = FwCfg::with_ram_size(16 * 1024 * 1024);
+        for selector in [0x0002u16, 0x0004, 0x0005, 0x000F] {
+            assert!(cfg.item(selector).is_none());
+            cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(selector));
+            assert_eq!(read_n(&mut cfg, 4), [0, 0, 0, 0]);
+        }
     }
 
     #[test]
