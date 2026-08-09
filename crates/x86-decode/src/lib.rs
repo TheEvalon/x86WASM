@@ -7,6 +7,52 @@
 use thiserror::Error;
 use x86_spec::{lookup_0f, lookup_primary, Encoding};
 
+/// Default operand-size and address-size attributes supplied by the executing
+/// code segment.
+///
+/// Legacy real-address mode and a `D=0` protected-mode code segment both use
+/// 16-bit defaults; a `D=1` code segment uses 32-bit defaults. The `0x66` and
+/// `0x67` override prefixes always select the *other* size, so they invert
+/// under `D=1`.
+///
+/// Spec: Intel SDM Vol. 1 §3.6 (Table 3-4); Vol. 2 Chapter 2 (66H/67H);
+/// Vol. 3 §3.4.5 (D/B flag).
+///
+/// Unsupported here: 64-bit mode defaults (REX.W / `L=1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeMode {
+    pub default_operand_size_32: bool,
+    pub default_address_size_32: bool,
+}
+
+impl DecodeMode {
+    /// Real-address mode / `D=0` protected mode.
+    pub const LEGACY16: Self = Self {
+        default_operand_size_32: false,
+        default_address_size_32: false,
+    };
+    /// `D=1` protected mode.
+    pub const DEFAULT32: Self = Self {
+        default_operand_size_32: true,
+        default_address_size_32: true,
+    };
+
+    /// Select defaults from the cached code-segment `D` bit.
+    pub const fn from_cs_default_big(default_big: bool) -> Self {
+        if default_big {
+            Self::DEFAULT32
+        } else {
+            Self::LEGACY16
+        }
+    }
+}
+
+impl Default for DecodeMode {
+    fn default() -> Self {
+        Self::LEGACY16
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixState {
     pub op_size_override: bool,
@@ -52,6 +98,16 @@ pub struct DecodedInsn {
     pub immediate: i32,
     pub length: usize,
     pub mnemonic: &'static str,
+    /// Effective operand-size attribute: `true` = 32, `false` = 16.
+    ///
+    /// Computed from the [`DecodeMode`] default and the `0x66` override.
+    /// Spec: Intel SDM Vol. 1 §3.6 (Table 3-4); Vol. 2 Chapter 2.
+    pub operand_size_32: bool,
+    /// Effective address-size attribute: `true` = 32, `false` = 16.
+    ///
+    /// Computed from the [`DecodeMode`] default and the `0x67` override.
+    /// Spec: Intel SDM Vol. 1 §3.6 (Table 3-4); Vol. 2 Chapter 2.
+    pub address_size_32: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -71,8 +127,20 @@ fn is_legacy_prefix(b: u8) -> bool {
     )
 }
 
-/// Decode one instruction from `bytes` (max 15 bytes per SDM).
+/// Decode one instruction from `bytes` (max 15 bytes per SDM) using legacy
+/// 16-bit defaults.
+///
+/// Equivalent to [`decode_with_mode`] with [`DecodeMode::LEGACY16`].
 pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
+    decode_with_mode(bytes, DecodeMode::LEGACY16)
+}
+
+/// Decode one instruction from `bytes` (max 15 bytes per SDM) with explicit
+/// code-segment default operand/address sizes.
+///
+/// Spec: Intel SDM Vol. 2 Chapter 2 (instruction format, 66H/67H);
+/// Vol. 1 §3.6 (Table 3-4).
+pub fn decode_with_mode(bytes: &[u8], mode: DecodeMode) -> Result<DecodedInsn, DecodeError> {
     if bytes.is_empty() {
         return Err(DecodeError::Truncated);
     }
@@ -119,6 +187,11 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         (primary, false, def)
     };
 
+    // Effective attributes: the override prefixes always select the size the
+    // code segment does *not* default to (SDM Vol. 1 §3.6, Table 3-4).
+    let operand_size_32 = mode.default_operand_size_32 != prefixes.op_size_override;
+    let address_size_32 = mode.default_address_size_32 != prefixes.addr_size_override;
+
     let mut modrm = None;
     let mut sib = None;
     let mut displacement = 0i32;
@@ -159,9 +232,9 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         // to/from Control Registers" ("The 2 bits in the mod field ... are
         // ignored").
         let mov_crn = two_byte && matches!(opcode, 0x20 | 0x22);
-        // Address-size attribute: real-mode default 16; 0x67 → 32.
+        // Address-size attribute from the code-segment default plus 0x67.
         // Spec: Intel SDM Vol. 1 §3.6; Vol. 2 Chapter 2 (ModR/M, SIB, displacement).
-        let addr16 = !prefixes.addr_size_override;
+        let addr16 = !address_size_32;
         if mov_crn {
             // No SIB/displacement bytes for MOV CRn — see comment above.
         } else if addr16 {
@@ -285,7 +358,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         immediate = i32::from(bytes[i]);
         i += 1;
     } else if (0xB8..=0xBF).contains(&opcode) {
-        if prefixes.op_size_override {
+        if operand_size_32 {
             if i + 3 >= bytes.len() {
                 return Err(DecodeError::Truncated);
             }
@@ -305,7 +378,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             }
             immediate = i32::from(bytes[i]);
             i += 1;
-        } else if prefixes.op_size_override {
+        } else if operand_size_32 {
             // F7 /0,/1 id — OsZ32. Spec: Intel SDM Vol. 2 Ch. 2 (66H); opcode map.
             if i + 3 >= bytes.len() {
                 return Err(DecodeError::Truncated);
@@ -332,7 +405,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             Encoding::ModrmImm16 => {
                 // OsZ immediate: Imm16 default, Imm32 with 0x66 in 16-bit default modes.
                 // Spec: Intel SDM Vol. 2 Ch. 2 (operand-size override); opcode map 81/C7.
-                if prefixes.op_size_override {
+                if operand_size_32 {
                     if i + 3 >= bytes.len() {
                         return Err(DecodeError::Truncated);
                     }
@@ -357,7 +430,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
             Encoding::Rel16 => {
                 // Near CALL/JMP: rel16 default; rel32 with operand-size override.
                 // Spec: Intel SDM Vol. 2 Ch. 2; "CALL"/"JMP" near relative.
-                if prefixes.op_size_override {
+                if operand_size_32 {
                     if i + 3 >= bytes.len() {
                         return Err(DecodeError::Truncated);
                     }
@@ -377,7 +450,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 // (C2/CA) always take a 16-bit immediate stack-release count.
                 // Spec: Intel SDM Vol. 2 Ch. 2; "RET" (near/far imm16).
                 let always_imm16 = matches!(opcode, 0xC2 | 0xCA);
-                if prefixes.op_size_override && !always_imm16 {
+                if operand_size_32 && !always_imm16 {
                     if i + 3 >= bytes.len() {
                         return Err(DecodeError::Truncated);
                     }
@@ -396,7 +469,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 // Absolute moffs — address-size attribute; real-mode default is 16-bit.
                 // Spec: Intel SDM Vol. 2, MOV AL/AX/EAX/RAX, moffs / moffs, AL/AX/….
                 // 0x67 → moffs32 (unreal-mode high offsets). Unsupported: moffs64 / long mode.
-                if prefixes.addr_size_override {
+                if address_size_32 {
                     if i + 3 >= bytes.len() {
                         return Err(DecodeError::Truncated);
                     }
@@ -424,7 +497,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
                 // Far pointer: offset then segment (segment in `displacement`).
                 // Spec: Intel SDM Vol. 2 CALL/JMP far ptr16:16 / ptr16:32; Ch. 2 (66H).
                 // Operand-size 16 → offset16+selector16; 0x66 → offset32+selector16.
-                if prefixes.op_size_override {
+                if operand_size_32 {
                     if i + 5 >= bytes.len() {
                         return Err(DecodeError::Truncated);
                     }
@@ -530,6 +603,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedInsn, DecodeError> {
         immediate,
         length: i,
         mnemonic,
+        operand_size_32,
+        address_size_32,
     })
 }
 
@@ -1801,5 +1876,102 @@ mod tests {
         assert_eq!(d.sib, Some(0x85));
         assert_eq!(d.displacement, 0x2000);
         assert_eq!(d.length, 8);
+    }
+
+    /// Intel SDM Vol. 1 §3.6 Table 3-4; Vol. 2 Ch. 2 (66H/67H): the code
+    /// segment D flag picks the default operand/address size and the override
+    /// prefixes select the *other* size, so `0x66`/`0x67` invert under D=1.
+    #[test]
+    fn decode_mode_defaults_are_inverted_by_override_prefixes() {
+        assert_eq!(DecodeMode::default(), DecodeMode::LEGACY16);
+        assert_eq!(DecodeMode::from_cs_default_big(false), DecodeMode::LEGACY16);
+        assert_eq!(DecodeMode::from_cs_default_big(true), DecodeMode::DEFAULT32);
+
+        // B8 id — MOV EAX, imm32 without any prefix under D=1.
+        let d = decode_with_mode(&[0xB8, 0x78, 0x56, 0x34, 0x12], DecodeMode::DEFAULT32).unwrap();
+        assert!(d.operand_size_32);
+        assert_eq!(d.immediate, 0x1234_5678);
+        assert_eq!(d.length, 5);
+
+        // 66 B8 iw — the override selects 16-bit operand size under D=1.
+        let d = decode_with_mode(&[0x66, 0xB8, 0x34, 0x12], DecodeMode::DEFAULT32).unwrap();
+        assert!(!d.operand_size_32);
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 4);
+
+        // The same bytes keep their 16-bit default meaning under D=0.
+        let d = decode_with_mode(&[0xB8, 0x34, 0x12], DecodeMode::LEGACY16).unwrap();
+        assert!(!d.operand_size_32);
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 3);
+        assert_eq!(decode(&[0xB8, 0x34, 0x12]).unwrap(), d);
+    }
+
+    /// Intel SDM Vol. 2 Ch. 2 (ModR/M, SIB, displacement): D=1 makes 32-bit
+    /// addressing the default and `0x67` selects the 16-bit ModR/M forms.
+    #[test]
+    fn decode_mode_default32_selects_32_bit_addressing_forms() {
+        // 8B 05 id — MOV EAX, [disp32] (mod=0 rm=5) with no prefix under D=1.
+        let d =
+            decode_with_mode(&[0x8B, 0x05, 0x78, 0x56, 0x34, 0x12], DecodeMode::DEFAULT32).unwrap();
+        assert!(d.address_size_32);
+        assert_eq!(d.displacement, 0x1234_5678);
+        assert_eq!(d.length, 6);
+
+        // 8B 44 24 08 — MOV EAX, [ESP+8]: SIB is decoded without 0x67 under D=1.
+        let d = decode_with_mode(&[0x8B, 0x44, 0x24, 0x08], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.sib, Some(0x24));
+        assert_eq!(d.displacement, 8);
+        assert_eq!(d.length, 4);
+
+        // 67 8B 06 iw — the override restores the 16-bit [disp16] form.
+        let d = decode_with_mode(&[0x67, 0x8B, 0x06, 0x00, 0x30], DecodeMode::DEFAULT32).unwrap();
+        assert!(!d.address_size_32);
+        assert!(d.sib.is_none());
+        assert_eq!(d.displacement, 0x3000);
+        assert_eq!(d.length, 5);
+    }
+
+    /// Intel SDM Vol. 2 "JMP"/"CALL" (near relative) and Ch. 2: the
+    /// displacement width follows the effective operand-size attribute.
+    #[test]
+    fn decode_mode_default32_widens_relative_and_pointer_operands() {
+        let d = decode_with_mode(&[0xE9, 0x00, 0x10, 0x00, 0x00], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.mnemonic, "JMP");
+        assert_eq!(d.immediate, 0x1000);
+        assert_eq!(d.length, 5);
+
+        let d = decode_with_mode(&[0x66, 0xE8, 0x05, 0x00], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.mnemonic, "CALL");
+        assert_eq!(d.immediate, 5);
+        assert_eq!(d.length, 4);
+
+        // EA cd — JMP far ptr16:32 is the D=1 default form.
+        let d = decode_with_mode(
+            &[0xEA, 0x00, 0x20, 0x00, 0x00, 0x18, 0x00],
+            DecodeMode::DEFAULT32,
+        )
+        .unwrap();
+        assert_eq!(d.immediate, 0x2000);
+        assert_eq!(d.displacement, 0x0018);
+        assert_eq!(d.length, 7);
+
+        // Truncated 32-bit forms still fail cleanly.
+        assert_eq!(
+            decode_with_mode(&[0xE9, 0x00, 0x10, 0x00], DecodeMode::DEFAULT32),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    /// Intel SDM Vol. 2 "RET" (near/far imm16): the stack-release immediate is
+    /// always 16 bits, independent of the operand-size attribute.
+    #[test]
+    fn decode_mode_default32_keeps_ret_release_immediate_16_bit() {
+        let d = decode_with_mode(&[0xC2, 0x04, 0x00], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.immediate, 4);
+        assert_eq!(d.length, 3);
+        let d = decode_with_mode(&[0xCA, 0x02, 0x00], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.immediate, 2);
+        assert_eq!(d.length, 3);
     }
 }
