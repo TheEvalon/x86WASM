@@ -38,12 +38,13 @@ pub use step_clock::{
 };
 
 use devices::{
-    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, FwCfgDmaOutcome,
-    IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText,
-    CMOS_DATA, CMOS_INDEX, FDC_DOR_DMA_IRQ, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
-    PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE,
-    PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
-    PORT_SYSTEM_CONTROL_A,
+    CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
+    FwCfgDmaOutcome, IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550,
+    VgaText, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA,
+    EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, I8042, I8042_DATA,
+    I8042_STATUS_CMD, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
+    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -118,7 +119,7 @@ pub struct Machine {
 
 impl Machine {
     pub fn new(ram_size: usize) -> Self {
-        Self {
+        let mut machine = Self {
             cpu: CpuState::reset(),
             mem: PhysMem::new(ram_size),
             com1: Serial16550::new(0x3F8),
@@ -139,7 +140,92 @@ impl Machine {
             post_diag: PostCodePort::new(),
             step_clock: StepClock::disabled(),
             ports: PortBus::new(),
+        };
+        machine.sync_firmware_configuration();
+        machine
+    }
+
+    /// Guest-physical memory map this machine can justify, as `etc/e820`.
+    ///
+    /// Spec: ACPI Specification §15.2 address range types (`AddressRangeMemory`
+    /// = 1, `AddressRangeReserved` = 2) and Table 15.4 (20-byte descriptors);
+    /// IBM PC/AT memory map — conventional memory ends at `0xA0000`, where the
+    /// video buffer starts, and `0xA0000`-`0xFFFFF` carries the video aperture,
+    /// the option-ROM region, and the BIOS area.
+    ///
+    /// Only what this machine actually has is described: the low usable block,
+    /// the legacy reserved hole, and extended memory above 1 MiB when the
+    /// configured RAM reaches that far. No ACPI reclaim / NVS ranges (there are
+    /// no ACPI tables), no PCI hole, and no above-4 GiB range are published,
+    /// because none of them are modelled.
+    pub fn e820_entries(&self) -> Vec<E820Entry> {
+        const LOW_USABLE_END: u64 = 0x000A_0000;
+        const LEGACY_RESERVED_END: u64 = 0x0010_0000;
+
+        let ram = self.mem.ram_len() as u64;
+        let mut entries = Vec::new();
+        let low = ram.min(LOW_USABLE_END);
+        if low > 0 {
+            entries.push(E820Entry::new(0, low, E820_TYPE_MEMORY));
         }
+        entries.push(E820Entry::new(
+            LOW_USABLE_END,
+            LEGACY_RESERVED_END - LOW_USABLE_END,
+            E820_TYPE_RESERVED,
+        ));
+        if ram > LEGACY_RESERVED_END {
+            entries.push(E820Entry::new(
+                LEGACY_RESERVED_END,
+                ram - LEGACY_RESERVED_END,
+                E820_TYPE_MEMORY,
+            ));
+        }
+        entries
+    }
+
+    /// The IBM equipment byte describing what this machine actually has.
+    ///
+    /// Spec: RBIL CMOS `14h` Table C0019. Bits 7-6 / bit 0 are the floppy
+    /// drive count and "floppy installed" flag, bits 5-4 the monitor type,
+    /// bit 3 "display enabled", bit 2 "keyboard enabled", bit 1 "math
+    /// coprocessor installed".
+    ///
+    /// The coprocessor bit stays clear: there is no x87 in this emulator, and
+    /// claiming one here would be the CMOS equivalent of an untruthful CPUID.
+    /// The floppy field counts a drive only when media is attached, because a
+    /// drive with nothing in it is the only thing this FDC model can be.
+    pub fn equipment_byte(&self) -> u8 {
+        let floppies = u8::from(self.fdc.has_media());
+        CmosRtc::equipment_floppy_field(floppies)
+            | EQUIP_DISPLAY_EGA_VGA
+            | EQUIP_DISPLAY_ENABLED
+            | EQUIP_KEYBOARD_ENABLED
+    }
+
+    /// Push this machine's configuration into the byte-level firmware
+    /// interfaces a guest reads it through.
+    ///
+    /// The device crate owns the register layouts but knows nothing about the
+    /// machine; without this call every new CMOS byte and fw_cfg blob is zero
+    /// or absent to a guest. Populates the CMOS memory-size registers
+    /// (`15h`/`16h`, `17h`/`18h`, `30h`/`31h`, `34h`/`35h`), the equipment byte
+    /// (`14h`), the AT standard checksum over `10h`-`2Dh` into `2Eh`/`2Fh`, the
+    /// fw_cfg RAM-size item, and the `etc/e820` memory map.
+    ///
+    /// Called from [`Self::new`] and from anything that changes the answer
+    /// (attaching floppy media). Not called from [`Self::reset`]: the CMOS
+    /// configuration bytes are battery backed and survive it, and re-deriving
+    /// them would discard whatever POST wrote.
+    pub fn sync_firmware_configuration(&mut self) {
+        let ram = self.mem.ram_len() as u64;
+        self.cmos.set_memory_size(ram);
+        self.cmos.set_equipment_byte(self.equipment_byte());
+        // Both `14h` and the memory-size pairs are inside `10h`-`2Dh`, so the
+        // checksum is stored last. Spec: RBIL CMOS `2Fh`.
+        self.cmos.store_standard_checksum();
+        self.fw_cfg.set_ram_size(ram);
+        let entries = self.e820_entries();
+        self.fw_cfg.set_e820_entries(&entries);
     }
 
     /// Current instruction-count time source configuration.
@@ -183,7 +269,11 @@ impl Machine {
     /// Wraps [`Fdc82077::attach_image`] (exact [`devices::FDC_1440_IMAGE_SIZE`]
     /// bytes). Spec: IBM PC 1.44MB MFM. Does not clear DIR DSKCHG.
     pub fn attach_floppy_image(&mut self, image: Vec<u8>) -> Result<(), &'static str> {
-        self.fdc.attach_image(image)
+        self.fdc.attach_image(image)?;
+        // Spec: RBIL CMOS `14h` Table C0019 — the equipment byte now describes a
+        // machine with a floppy drive, and it is inside the checksum range.
+        self.sync_firmware_configuration();
+        Ok(())
     }
 
     /// Construct a machine with a 1.44MB floppy image already attached.
@@ -278,9 +368,18 @@ impl Machine {
     /// forwards the byte here so [`PhysMem`] re-attributes the two regions the
     /// register owns. Returns `false` when `offset` is not a PAM register.
     ///
+    /// The configuration register file is updated too, so the byte a guest
+    /// reads back from `0xCF8`/`0xCFC` matches the attributes memory is using
+    /// no matter which side armed them.
+    ///
     /// Spec: Intel 440FX PMC datasheet, Programmable Attribute Map.
     pub fn apply_pam_register(&mut self, offset: u8, value: u8) -> bool {
-        self.mem.apply_pam_register(offset, value)
+        if !self.mem.apply_pam_register(offset, value) {
+            return false;
+        }
+        self.pci
+            .set_pam_register(usize::from(offset - PAM_REGISTER_FIRST), value);
+        true
     }
 
     /// Decoded view of a PAM configuration register (reserved bits read 0).
@@ -877,6 +976,29 @@ impl MachineBus<'_> {
         outcome
     }
 
+    /// Copy the host bridge's PAM register file onto the memory model.
+    ///
+    /// The two halves of BIOS shadowing live in different crates: `devices`
+    /// owns the i440FX PMC configuration bytes at `00:00.0` `0x59`–`0x5F` and
+    /// has no memory to remap, while [`PhysMem`] owns the region attributes and
+    /// has no configuration space. This is where they meet — the same forward
+    /// [`Machine::apply_pam_register`] performs for a host caller, driven from
+    /// a guest configuration write instead.
+    ///
+    /// [`PciConfig::pam_registers`] is re-read in full rather than tracking
+    /// which byte lanes a `CFC`–`CFF` access touched: the register file is
+    /// authoritative, there is no change notification to subscribe to, and
+    /// seven byte writes cost nothing next to a configuration cycle.
+    ///
+    /// Spec: Intel 440FX PCIset 82441FX (PMC) datasheet §3.2.18 Table 2 / Table
+    /// 3 — RE steers reads at DRAM, WE steers writes at DRAM, per segment.
+    fn sync_pam_registers_to_memory(&mut self) {
+        for (index, value) in self.pci.pam_registers().into_iter().enumerate() {
+            self.mem
+                .apply_pam_register(PAM_REGISTER_FIRST + index as u8, value);
+        }
+    }
+
     /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
@@ -964,7 +1086,16 @@ impl MachineBus<'_> {
             // Spec: Intel 82371SB — detect PIRQRC CONFIG_DATA overlap before write
             // so the latched Type-1 address still describes the target register.
             let pirqrc_touch = self.pci.pirqrc_config_write_overlaps(port, size);
+            // Spec: Intel 440FX 82441FX (PMC) §3.2.18 — same reason for PAM0–PAM6
+            // on the host bridge at 00:00.0; a CONFIG_DATA write can relatch.
+            let pam_touch = self.pci.pam_config_write_overlaps(port, size);
             self.pci.port_write(port, size, value);
+            // Spec: Intel 440FX §3.2.18 — a PAM write re-attributes its segments
+            // immediately; the register file only has an effect once the memory
+            // model is told. This is the BIOS shadowing seam.
+            if pam_touch {
+                self.sync_pam_registers_to_memory();
+            }
             // Spec: Intel 82371 / OSDev ELCR — 0x4D0/0x4D1 bits select DualPic
             // per-IR level vs edge (SeaBIOS/PIIX); OR'd with ICW1.LTIM in Pic8259.
             if port == PIIX_ELCR_MASTER || port == PIIX_ELCR_SLAVE {
@@ -1023,15 +1154,22 @@ impl MachineBus<'_> {
 
 impl Bus for MachineBus<'_> {
     fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
-        // Spec: IBM VGA text — 0xB8000 plane overlays RAM on the CPU bus.
+        // Spec: IBM PS/2 Video Subsystems — the CPU display aperture is fixed at
+        // 0xA0000-0xBFFFF, but which sub-range is claimed moves at runtime with
+        // Miscellaneous Output RAM Enable (bit 1) and Graphics Controller
+        // Miscellaneous Memory Map Select (bits 3:2). The bus therefore routes
+        // the whole aperture and lets the device answer per access; `None`
+        // falls through to open bus / RAM.
         // A20 mask matches PhysMem before VGA vs RAM decode.
         let effective = if self.mem.a20_enabled() {
             addr
         } else {
             addr & !(1u64 << 20)
         };
-        if let Some(b) = self.vga.read_u8(effective) {
-            return Ok(b);
+        if VgaText::in_aperture(effective) {
+            if let Some(b) = self.vga.mmio_read_u8(effective) {
+                return Ok(b);
+            }
         }
         // Probe-only: anything decoding to neither RAM nor ROM is open bus.
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
@@ -1043,12 +1181,14 @@ impl Bus for MachineBus<'_> {
     }
 
     fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        // Same fixed-aperture routing as [`Self::read_u8`]; the write path runs
+        // Graphics Controller write modes 0-3 for a claimed graphics address.
         let effective = if self.mem.a20_enabled() {
             addr
         } else {
             addr & !(1u64 << 20)
         };
-        if self.vga.write_u8(effective, val) {
+        if VgaText::in_aperture(effective) && self.vga.mmio_write_u8(effective, val) {
             return Ok(());
         }
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
@@ -1117,7 +1257,7 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        CmosRtc, DualPic, Fdc82077, PciConfig, Pit8254, Port92, CFG_INT1, CFG_INT12, CFG_TRANSLATE,
+        DualPic, Fdc82077, PciConfig, Pit8254, Port92, CFG_INT1, CFG_INT12, CFG_TRANSLATE,
         CMD_ENABLE_KBD, CMD_PULSE_RESET, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG,
         CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, FDC_1440_IMAGE_SIZE, FDC_CMD_CONFIGURE,
         FDC_CMD_MFM, FDC_CMD_READ_DATA, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK,
@@ -2354,7 +2494,10 @@ mod tests {
         m.reset();
         assert_eq!(m.pic, DualPic::new());
         assert_eq!(m.pit, Pit8254::new());
-        assert_eq!(m.cmos, CmosRtc::new());
+        // Not `CmosRtc::new()`: `Machine::new` writes the battery-backed
+        // configuration bytes (memory size, equipment, checksum), and reset
+        // preserves them the way a system battery does.
+        assert_eq!(m.cmos, Machine::new(64 * 1024).cmos);
         assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.port92, Port92::new());
         assert_eq!(m.pci, PciConfig::new());

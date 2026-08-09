@@ -29,6 +29,30 @@ Policy:
 - `bios.bin` remains gitignored until an explicit licensing review allows committing binaries.
 - OVMF / EDK II is a later firmware path (separate license/provenance when added).
 
+### SeaVGABIOS
+
+| Item | Value |
+|------|--------|
+| Component | VGA BIOS option ROM (`firmware/seavgabios/vgabios.bin`) |
+| Upstream | [SeaVGABIOS](https://www.seabios.org/SeaVGABIOS) — the `vgasrc/` tree of SeaBIOS, not a separate repository |
+| Source mirror | https://gitlab.com/qemu-project/seabios.git |
+| Pinned release | `rel-1.16.3` (`a6ed6b701f0a57db0569ab98b0661c12a6ec3ff8`) — `firmware/manifests/seavgabios.json` |
+| License | **LGPL-3.0-or-later**, dual copyright |
+| Build | `firmware/build-scripts/build-seavgabios.sh` (see `firmware/README.md`) |
+
+The dual copyright matters and is easy to miss. Upstream `vgasrc/` headers carry
+both "Copyright (C) 2009-2013 Kevin O'Connor" and "Copyright (C) 2001-2008 the
+LGPL VGABios developers Team": **this ROM descends from the older LGPL VGABios
+project as well as from SeaBIOS**, so a licensing review of SeaBIOS alone does
+not cover it. Both attributions must survive into any distribution.
+
+Policy is the same as SeaBIOS: sources only under `firmware/seavgabios/.src/`
+(gitignored), never copied into `crates/**`, and the binary is gitignored until
+an explicit review allows committing it.
+
+**The build script has never been executed and no binary exists in this tree.**
+The pin and the notices are recorded ahead of the first build.
+
 ## Provenance rules
 
 - Do **not** copy implementation code from v86, QEMU, Bochs, VirtualBox, DOSBox, or other emulators.

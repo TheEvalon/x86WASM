@@ -16,23 +16,17 @@
 //!   §15.2 "Address Range Types" (1 = AddressRangeMemory, 2 =
 //!   AddressRangeReserved).
 //!
-//! Integration tests may only use the crate's re-exported surface, so the
-//! `etc/e820` file name, entry size, and range types are repeated here as local
-//! literals with their citation, and entries are built through
-//! `FwCfg::e820_entry`, until `devices/src/lib.rs` re-exports the
-//! `FW_CFG_FILE_E820` / `FW_CFG_E820_*` / `E820_TYPE_*` / `E820Entry` items.
+//! The names come from the crate's re-exported constants:
+//! `FW_CFG_FILE_E820` is the QEMU fw_cfg externally provided memory-map file,
+//! `FW_CFG_E820_ENTRY_SIZE` is ACPI §15 Table 15.4's 20-byte Address Range
+//! Descriptor, and `E820_TYPE_MEMORY` / `E820_TYPE_RESERVED` are ACPI §15.2
+//! Address Range Types.
 
 use devices::{
-    FwCfg, PortDevice, FW_CFG_DATA, FW_CFG_FILE_DIR, FW_CFG_FILE_FIRST, FW_CFG_SELECTOR,
+    FwCfg, PortDevice, E820_TYPE_MEMORY, E820_TYPE_RESERVED, FW_CFG_DATA,
+    FW_CFG_E820_ENTRY_SIZE as E820_ENTRY_SIZE, FW_CFG_FILE_DIR, FW_CFG_FILE_E820 as FILE_E820,
+    FW_CFG_FILE_FIRST, FW_CFG_SELECTOR,
 };
-
-/// Spec: QEMU fw_cfg externally provided items — the memory map firmware file.
-const FILE_E820: &str = "etc/e820";
-/// Spec: ACPI §15 Table 15.4 — the 20-byte minimum Address Range Descriptor.
-const E820_ENTRY_SIZE: usize = 20;
-/// Spec: ACPI §15.2 Address Range Types.
-const E820_TYPE_MEMORY: u32 = 1;
-const E820_TYPE_RESERVED: u32 = 2;
 
 fn select(cfg: &mut FwCfg, selector: u16) {
     cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(selector));

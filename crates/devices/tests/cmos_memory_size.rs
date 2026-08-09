@@ -13,24 +13,16 @@
 //!   (max 3C00h = 15MB)" and "BX = extended memory above 16M, in 64K blocks".
 //! - IBM PC/AT CMOS map — these are ordinary battery-backed CMOS RAM bytes.
 //!
-//! Integration tests may only use the crate's re-exported surface, so the CMOS
-//! indices are repeated here as local literals with their citation until
-//! `devices/src/lib.rs` re-exports the `REG_*_MEM*` constants.
+//! The indices come from the crate's re-exported constants:
+//! `REG_BASE_MEM_LOW`/`_HIGH` are RBIL CMOS `15h`/`16h`, `REG_EXT_MEM_LOW`/
+//! `_HIGH` are `17h`/`18h`, `REG_EXT_MEM2_LOW`/`_HIGH` are `30h`/`31h`, and
+//! `REG_MEM_ABOVE_16M_LOW`/`_HIGH` are `34h`/`35h`.
 
-use devices::{CmosRtc, PortDevice, CMOS_DATA, CMOS_INDEX};
-
-/// Spec: RBIL CMOS 15h/16h — base memory in KB, low then high byte.
-const REG_BASE_MEM_LOW: u8 = 0x15;
-const REG_BASE_MEM_HIGH: u8 = 0x16;
-/// Spec: RBIL CMOS 17h/18h — extended memory in KB, low then high byte.
-const REG_EXT_MEM_LOW: u8 = 0x17;
-const REG_EXT_MEM_HIGH: u8 = 0x18;
-/// Spec: RBIL CMOS 30h/31h — extended memory in KB, low then high byte.
-const REG_EXT_MEM2_LOW: u8 = 0x30;
-const REG_EXT_MEM2_HIGH: u8 = 0x31;
-/// Spec: RBIL CMOS 34h/35h — memory above 16 MB in 64 KB blocks.
-const REG_MEM_ABOVE_16M_LOW: u8 = 0x34;
-const REG_MEM_ABOVE_16M_HIGH: u8 = 0x35;
+use devices::{
+    CmosRtc, PortDevice, CMOS_DATA, CMOS_INDEX, REG_BASE_MEM_HIGH, REG_BASE_MEM_LOW,
+    REG_EXT_MEM2_HIGH, REG_EXT_MEM2_LOW, REG_EXT_MEM_HIGH, REG_EXT_MEM_LOW, REG_MEM_ABOVE_16M_HIGH,
+    REG_MEM_ABOVE_16M_LOW,
+};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;

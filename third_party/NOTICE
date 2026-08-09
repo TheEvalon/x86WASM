@@ -46,6 +46,11 @@ No SeaVGABIOS sources are embedded in crates/. The emulator does not scan or
 execute option ROMs; `emulator-cli --option-rom` maps an image for inspection
 only.
 
+Status as of 2026-08-09: the build script has never been executed in this tree
+and no SeaVGABIOS binary exists here. The pin, the license notice, and the
+build configuration above are recorded ahead of the first build so that the
+provenance is settled before a binary appears.
+
 ## OVMF / other firmware
 
 OVMF and other firmware blobs are not yet added. When they are, record license,

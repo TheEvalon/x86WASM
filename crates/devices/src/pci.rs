@@ -318,7 +318,7 @@ pub const PCI_PIIX_IDE_BMICOM_RWCON: u8 = 1 << 3;
 pub const PCI_PIIX_IDE_BMISTA_ACTIVE: u8 = 1 << 0;
 /// BMISTA DMA Error — bit 1, latched when the bounded PRD walk fails.
 /// Spec: Intel 82371SB §2.7.2.
-const PCI_PIIX_IDE_BMISTA_ERROR: u8 = 1 << 1;
+pub const PCI_PIIX_IDE_BMISTA_ERROR: u8 = 1 << 1;
 /// Physical Region Descriptor entry size (8 bytes).
 /// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0 §1.2.
 pub const PCI_PIIX_IDE_PRD_ENTRY_SIZE: usize = 8;
@@ -1209,6 +1209,27 @@ impl PciConfig {
         Some(self.host_bridge[PCI_PMC_PAM0_OFFSET as usize + index])
     }
 
+    /// Store one PAM register byte from the host, `index` 0–6 (PAM0–PAM6).
+    ///
+    /// Applies the same reserved-bit mask a guest configuration write goes
+    /// through, so a host that arms shadowing directly and a guest that
+    /// programs `0xCF8`/`0xCFC` leave the register file in the same state.
+    /// Returns `false` for an index outside PAM0–PAM6.
+    ///
+    /// Spec: 440FX §3.2.18 Table 2 / Table 3.
+    pub fn set_pam_register(&mut self, index: usize, value: u8) -> bool {
+        if index >= PCI_PMC_PAM_COUNT {
+            return false;
+        }
+        let mask = if index == 0 {
+            PCI_PMC_PAM0_WRITABLE_MASK
+        } else {
+            PCI_PMC_PAM_WRITABLE_MASK
+        };
+        self.host_bridge[PCI_PMC_PAM0_OFFSET as usize + index] = value & mask;
+        true
+    }
+
     /// All seven PAM register bytes, PAM0 first.
     pub fn pam_registers(&self) -> [u8; PCI_PMC_PAM_COUNT] {
         let base = PCI_PMC_PAM0_OFFSET as usize;
@@ -1252,6 +1273,29 @@ impl PciConfig {
     /// register, so both return `None` here.
     pub fn pam_region_for_addr(&self, phys: u32) -> Option<PamRegion> {
         self.pam_regions().into_iter().find(|r| r.contains(phys))
+    }
+
+    /// True when a CONFIG_DATA access at `port`/`size` overlaps PAM0–PAM6
+    /// (`0x59`–`0x5F`) on the currently latched Type-1 address, i.e. the PMC
+    /// host bridge at `00:00.0`.
+    ///
+    /// Spec: 440FX §3.2.18 (PAM address offsets) and PCI Local Bus
+    /// Specification Mechanism #1 (CONFIG_ADDRESS latches the register offset;
+    /// `CFC`–`CFF` select the byte lane). Programming PAM has no memory effect
+    /// inside this crate, so a machine that owns physical memory uses this to
+    /// know when to re-read [`Self::pam_registers`].
+    pub fn pam_config_write_overlaps(&self, port: u16, size: u8) -> bool {
+        if !matches!(port, PCI_CONFIG_DATA..=0xCFF) || !self.enable() {
+            return false;
+        }
+        if self.bus() != 0 || self.device() != 0 || self.function() != 0 {
+            return false;
+        }
+        let start = u16::from(self.reg_offset()) + (port - PCI_CONFIG_DATA);
+        let end = start.saturating_add(u16::from(size.max(1)));
+        let pam_first = u16::from(PCI_PMC_PAM0_OFFSET);
+        let pam_end = pam_first + PCI_PMC_PAM_COUNT as u16;
+        start < pam_end && end > pam_first
     }
 
     /// Mask the reserved bits out of the host-bridge PAM block.

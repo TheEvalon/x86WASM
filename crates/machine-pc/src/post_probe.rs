@@ -193,7 +193,14 @@ impl fmt::Display for OpcodeSite {
 pub struct PostFailure {
     pub kind: PostFailureKind,
     pub cs: u16,
+    /// Low 16 bits of the instruction pointer. Only the whole offset when
+    /// [`Self::cs_default_big`] is false.
     pub ip: u16,
+    /// The offset actually executing in the `CS.D` window: `IP` when `CS.D=0`,
+    /// the full `EIP` when `CS.D=1`.
+    pub eip: u32,
+    /// Cached `CS.D`/B bit at the failure site (`true` = 32-bit code segment).
+    pub cs_default_big: bool,
     pub rip: u64,
     pub linear_pc: u64,
     /// Instruction bytes at the failure site; `None` where the fetch failed.
@@ -229,10 +236,13 @@ impl fmt::Display for PostFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} cs:ip={:04X}:{:04X} rip=0x{:016X} linear_pc=0x{:016X} opcode_bytes=[",
+            "{} cs:ip={:04X}:{:04X} cs.d={} eip=0x{:08X} rip=0x{:016X} linear_pc=0x{:016X} \
+             opcode_bytes=[",
             self.kind_text(),
             self.cs,
             self.ip,
+            u8::from(self.cs_default_big),
+            self.eip,
             self.rip,
             self.linear_pc
         )?;
@@ -416,20 +426,38 @@ impl Machine {
 
     /// Capture the faulting site the same way the interpreter fetches it.
     ///
-    /// Spec: Intel SDM Vol. 3 §3.4.2 — a real-mode linear address is the cached
-    /// segment base plus the 16-bit offset; instruction fetch wraps IP at 16 bits.
+    /// The offset is taken from the `CS.D` execution window, not from `IP`
+    /// unconditionally: `CS.D=0` executes in the 16-bit `IP` window and wraps
+    /// there, `CS.D=1` executes with the full 32-bit `EIP`. Truncating to `IP`
+    /// in a 32-bit code segment reports the wrong linear address and an opcode
+    /// window of unrelated bytes.
+    ///
+    /// Spec: Intel SDM Vol. 1 §3.5 (EIP/IP); Vol. 3 §3.4.2 (real-mode linear
+    /// address = cached base + offset); Vol. 3 §3.4.5 (D flag).
     fn capture_post_failure(&self, err: &MachineError) -> PostFailure {
         let rip = self.cpu.rip;
         let ip = rip as u16;
         let cs_base = self.cpu.cs.base;
+        let cs_default_big = self.cpu.cs.default_big();
+        let eip = if cs_default_big {
+            rip as u32
+        } else {
+            u32::from(ip)
+        };
         PostFailure {
             kind: classify(err),
             cs: self.cpu.cs.selector,
             ip,
+            eip,
+            cs_default_big,
             rip,
-            linear_pc: cs_base.wrapping_add(u64::from(ip)),
+            linear_pc: cs_base.wrapping_add(u64::from(eip)),
             opcode_bytes: std::array::from_fn(|index| {
-                let offset = ip.wrapping_add(index as u16);
+                let offset = if cs_default_big {
+                    eip.wrapping_add(index as u32)
+                } else {
+                    u32::from(ip.wrapping_add(index as u16))
+                };
                 self.mem
                     .read_u8(cs_base.wrapping_add(u64::from(offset)))
                     .ok()

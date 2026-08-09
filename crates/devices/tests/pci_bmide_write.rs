@@ -19,8 +19,7 @@ use devices::{
     PCI_PIIX_IDE_PRD_BYTE_COUNT_64K, PCI_PIIX_IDE_PRD_ENTRY_SIZE, PCI_PIIX_IDE_PRD_EOT,
 };
 
-/// BMISTA bit1 DMA Error (Intel 82371SB §2.7.2); not re-exported by `devices`.
-const BMISTA_ERROR: u8 = 1 << 1;
+use devices::PCI_PIIX_IDE_BMISTA_ERROR as BMISTA_ERROR;
 const BMIBA: u16 = 0xF000;
 
 fn program_bmide(pci: &mut PciConfig, bus_master: bool) {

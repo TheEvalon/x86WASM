@@ -18,32 +18,17 @@
 //!   additive sum of the values in locations 10h-2Dh only, 00h-0Fh and 30h-33h
 //!   are not included."
 //!
-//! Integration tests may only use the crate's re-exported surface, so the CMOS
-//! indices and bit names are repeated here as local literals with their
-//! citation until `devices/src/lib.rs` re-exports the `REG_DIAGNOSTIC` /
-//! `REG_EQUIPMENT` / `REG_CHECKSUM_*` / `DIAG_*` / `EQUIP_*` items.
+//! The indices and bit names come from the crate's re-exported constants:
+//! `REG_DIAGNOSTIC` is RBIL CMOS `0Eh`, `REG_EQUIPMENT` is `14h`,
+//! `REG_CHECKSUM_HIGH`/`_LOW` are `2Eh`/`2Fh`, `CMOS_CHECKSUM_FIRST`/`_LAST`
+//! bound the summed `10h`–`2Dh` range, `DIAG_BAD_CHECKSUM` is Table C0005
+//! bit 6, and the `EQUIP_*` bits are Table C0019.
 
-use devices::{CmosRtc, PortDevice, CMOS_DATA, CMOS_INDEX};
-
-/// Spec: RBIL CMOS 0Eh — diagnostic status byte.
-const REG_DIAGNOSTIC: u8 = 0x0E;
-/// Spec: RBIL CMOS 14h — equipment byte.
-const REG_EQUIPMENT: u8 = 0x14;
-/// Spec: RBIL CMOS 2Eh/2Fh — standard checksum, high then low byte.
-const REG_CHECKSUM_HIGH: u8 = 0x2E;
-const REG_CHECKSUM_LOW: u8 = 0x2F;
-/// Spec: RBIL CMOS 2Fh note — the summed range is 10h through 2Dh inclusive.
-const CHECKSUM_FIRST: u8 = 0x10;
-const CHECKSUM_LAST: u8 = 0x2D;
-
-/// Spec: RBIL Table C0005 bit 6 — incorrect checksum.
-const DIAG_BAD_CHECKSUM: u8 = 1 << 6;
-/// Spec: RBIL Table C0019 — monitor type 00b, observed for EGA and VGA.
-const EQUIP_DISPLAY_EGA_VGA: u8 = 0x00;
-/// Spec: RBIL Table C0019 bit 3 / bit 2 / bit 0.
-const EQUIP_DISPLAY_ENABLED: u8 = 1 << 3;
-const EQUIP_KEYBOARD_ENABLED: u8 = 1 << 2;
-const EQUIP_FLOPPY_INSTALLED: u8 = 1 << 0;
+use devices::{
+    CmosRtc, PortDevice, CMOS_CHECKSUM_FIRST, CMOS_CHECKSUM_LAST, CMOS_DATA, CMOS_INDEX,
+    DIAG_BAD_CHECKSUM, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_FLOPPY_INSTALLED,
+    EQUIP_KEYBOARD_ENABLED, REG_CHECKSUM_HIGH, REG_CHECKSUM_LOW, REG_DIAGNOSTIC, REG_EQUIPMENT,
+};
 
 fn cmos_read(c: &mut CmosRtc, index: u8) -> u8 {
     c.port_write(CMOS_INDEX, 1, u32::from(index));
@@ -102,7 +87,7 @@ fn equipment_floppy_field_encodes_drive_count() {
 #[test]
 fn standard_checksum_sums_10h_to_2dh_and_stores_big_endian() {
     let mut c = CmosRtc::new();
-    for index in CHECKSUM_FIRST..=CHECKSUM_LAST {
+    for index in CMOS_CHECKSUM_FIRST..=CMOS_CHECKSUM_LAST {
         cmos_write(&mut c, index, 0xFF);
     }
     // 0x2D - 0x10 + 1 = 30 bytes of 0xFF.
@@ -132,9 +117,9 @@ fn standard_checksum_excludes_the_documented_ranges() {
         );
     }
 
-    cmos_write(&mut c, CHECKSUM_FIRST, 0x01);
+    cmos_write(&mut c, CMOS_CHECKSUM_FIRST, 0x01);
     assert_eq!(c.standard_checksum(), baseline + 1);
-    cmos_write(&mut c, CHECKSUM_LAST, 0x02);
+    cmos_write(&mut c, CMOS_CHECKSUM_LAST, 0x02);
     assert_eq!(c.standard_checksum(), baseline + 3);
 }
 

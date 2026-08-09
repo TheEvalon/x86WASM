@@ -1,5 +1,8 @@
 # Rust
 /target/
+# Per-worktree / per-agent target dirs (CARGO_TARGET_DIR is pinned per branch
+# so parallel builds do not run each other's stale binaries).
+/target-*/
 **/*.rs.bk
 Cargo.lock.bak
 

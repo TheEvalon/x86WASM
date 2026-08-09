@@ -72,31 +72,32 @@ fn probe_reports_first_unsupported_opcode_with_opcode_window() {
 /// A two-byte opcode is named in full, not by the second byte alone.
 ///
 /// Spec: Intel SDM Vol. 2 §2.1.1 — an instruction is prefixes followed by a
-/// one-, two-, or three-byte opcode; `0F 85` is the two-byte near `JNZ`, which
-/// is where the pinned SeaBIOS image stops. The decoder reports only the byte
-/// its tables missed, so the report reconstructs the escape from the window.
+/// one-, two-, or three-byte opcode. The decoder reports only the byte its
+/// tables missed, so the report reconstructs the escape from the window.
+/// `0F 40` (`CMOVO`) stands in for "a two-byte opcode this build does not
+/// decode"; the near `Jcc` map that used to serve that role is implemented now.
 #[test]
 fn probe_names_two_byte_opcode_with_its_escape() {
-    // 0F 85 rel16 (near JNZ) — not in the decode tables.
-    let rom = bios_rom_with_code(&[0x0F, 0x85, 0x8E, 0xF9]);
+    // 0F 40 /r (CMOVO r16, r/m16) — not in the decode tables.
+    let rom = bios_rom_with_code(&[0x0F, 0x40, 0xC1, 0x90]);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
 
     let report = m.probe_post(16);
 
     let failure = report.failure().expect("first failure recorded");
     let site = failure.opcode_site().expect("opcode recovered from window");
-    assert_eq!(site.opcode, vec![0x0F, 0x85]);
+    assert_eq!(site.opcode, vec![0x0F, 0x40]);
     assert!(site.prefixes.is_empty());
     let text = report.to_string();
-    assert!(text.contains("unsupported opcode 0x0F 0x85"), "{text}");
-    assert!(!text.contains("unsupported opcode 0x85 "), "{text}");
+    assert!(text.contains("unsupported opcode 0x0F 0x40"), "{text}");
+    assert!(!text.contains("unsupported opcode 0x40 "), "{text}");
 }
 
 /// Prefixes are reported alongside the opcode instead of being swallowed.
 #[test]
 fn probe_names_prefixes_before_the_opcode() {
-    // 66 0F 85 rel32 — operand-size prefixed near JNZ.
-    let rom = bios_rom_with_code(&[0x66, 0x0F, 0x85, 0x00, 0x01, 0x00, 0x00]);
+    // 66 0F 40 /r — operand-size prefixed CMOVO.
+    let rom = bios_rom_with_code(&[0x66, 0x0F, 0x40, 0xC1, 0x90]);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
 
     let report = m.probe_post(16);
@@ -104,12 +105,73 @@ fn probe_names_prefixes_before_the_opcode() {
     let failure = report.failure().expect("first failure recorded");
     let site = failure.opcode_site().expect("opcode recovered from window");
     assert_eq!(site.prefixes, vec![0x66]);
-    assert_eq!(site.opcode, vec![0x0F, 0x85]);
+    assert_eq!(site.opcode, vec![0x0F, 0x40]);
     let text = report.to_string();
     assert!(
-        text.contains("unsupported opcode 0x0F 0x85 (prefixes 66)"),
+        text.contains("unsupported opcode 0x0F 0x40 (prefixes 66)"),
         "{text}"
     );
+}
+
+/// A 32-bit code segment reports the full `EIP`, not the low 16 bits.
+///
+/// Spec: Intel SDM Vol. 1 §3.5 and Vol. 3 §3.4.5 — `CS.D=0` executes in the
+/// 16-bit `IP` window, `CS.D=1` executes with the whole `EIP`. Truncating to
+/// `IP` once the guest is in 32-bit protected mode reports a linear address
+/// that is off by `EIP[31:16] << 0` and an opcode window of unrelated bytes,
+/// which is exactly the case a firmware bring-up session needs to trust.
+#[test]
+fn probe_reports_protected_mode_d1_failure_with_full_eip() {
+    // Well above the 16-bit window, so an IP-truncated capture reads 0x0000.
+    const CODE_LINEAR: u32 = 0x0002_0000;
+    // 0F 40 /r (CMOVO) — a two-byte opcode this build does not decode.
+    const CODE: [u8; 8] = [0x0F, 0x40, 0xC1, 0x90, 0x11, 0x22, 0x33, 0x44];
+
+    let mut m = Machine::new(1024 * 1024);
+    // Spec: SDM Vol. 3 §9.9.1 — CR0.PE set, then a flat 32-bit code segment
+    // (base 0, 4 GiB limit, present/code/readable, G=1, D=1).
+    m.cpu.cr0 |= 1;
+    m.cpu
+        .cs
+        .load_descriptor_cache(0x0008, 0, 0xFFFF_FFFF, 0xC09B);
+    m.cpu.rip = u64::from(CODE_LINEAR);
+    for (offset, byte) in CODE.iter().enumerate() {
+        m.mem
+            .write_u8(u64::from(CODE_LINEAR) + offset as u64, *byte)
+            .expect("place 32-bit code in RAM");
+    }
+
+    let report = m.probe_post(16);
+
+    let failure = report.failure().expect("first failure recorded");
+    assert_eq!(failure.kind, PostFailureKind::UnsupportedOpcode(0x40));
+    assert!(failure.cs_default_big, "{report}");
+    assert_eq!(failure.eip, CODE_LINEAR);
+    assert_eq!(failure.linear_pc, u64::from(CODE_LINEAR));
+    // The IP16 view is 0x0000 here; the window must not follow it.
+    assert_eq!(failure.ip, 0x0000);
+    assert_eq!(failure.opcode_bytes, CODE.map(Some));
+
+    let text = report.to_string();
+    assert!(text.contains("unsupported opcode 0x0F 0x40"), "{text}");
+    assert!(text.contains("cs.d=1"), "{text}");
+    assert!(text.contains("eip=0x00020000"), "{text}");
+    assert!(text.contains("linear_pc=0x0000000000020000"), "{text}");
+}
+
+/// A 16-bit code segment keeps the legacy `IP` window, including its wrap.
+#[test]
+fn probe_reports_real_mode_failure_in_the_ip16_window() {
+    let rom = bios_rom_with_code(&[0x0F, 0x40, 0xC1]);
+    let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
+
+    let report = m.probe_post(16);
+
+    let failure = report.failure().expect("first failure recorded");
+    assert!(!failure.cs_default_big, "{report}");
+    assert_eq!(failure.ip, 0x0000);
+    assert_eq!(failure.eip, 0x0000);
+    assert_eq!(failure.linear_pc, 0xFFFF_0000);
 }
 
 /// Ports no device claims are recorded (port, direction, size, first value).

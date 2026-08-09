@@ -10,25 +10,17 @@
 //! Reserved-bit treatment follows the PCI Local Bus Specification rule that
 //! reserved configuration fields read as zero.
 //!
-//! These are integration tests, so they may only use the crate's re-exported
-//! surface. The PAM offsets and masks are therefore repeated here as local
-//! literals with their spec citation until `devices/src/lib.rs` re-exports the
-//! `PCI_PMC_PAM_*` constants.
+//! The offsets and masks come from the crate's re-exported constants:
+//! `PCI_PMC_PAM0_OFFSET` is 440FX §3.2.18's `59h`, `PCI_PMC_PAM_COUNT` the
+//! seven registers PAM0 (`59h`) … PAM6 (`5Fh`), `PCI_PMC_PAM_DEFAULT` the
+//! documented "Default Value: 00h", `PCI_PMC_PAM_WRITABLE_MASK` the Table 2
+//! RE|WE bits in both nibbles, and `PCI_PMC_PAM0_WRITABLE_MASK` the high
+//! nibble alone because Table 3 makes `PAM0[3:0]` Reserved.
 
-use devices::{PciConfig, PortDevice, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA};
-
-/// Spec: 440FX §3.2.18 — PAM0 lives at PMC config offset `59h`.
-const PAM0_OFFSET: u8 = 0x59;
-/// Spec: 440FX §3.2.18 — seven registers, PAM0 (`59h`) … PAM6 (`5Fh`).
-const PAM_COUNT: usize = 7;
-/// Spec: 440FX §3.2.18 — "Default Value: 00h".
-const PAM_DEFAULT: u8 = 0x00;
-/// Spec: 440FX Table 2 — RE occupies bits [4, 0] and WE bits [5, 1] of a
-/// register, i.e. both 4-bit attribute fields expose only RE|WE.
-const PAM_WRITABLE_MASK: u8 = 0x33;
-/// Spec: 440FX Table 3 — `PAM0[3:0]` is Reserved, so only the high nibble of
-/// PAM0 (the `0F0000-0FFFFFh` BIOS Area) is writable.
-const PAM0_WRITABLE_MASK: u8 = 0x30;
+use devices::{
+    PciConfig, PortDevice, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA, PCI_PMC_PAM0_OFFSET,
+    PCI_PMC_PAM0_WRITABLE_MASK, PCI_PMC_PAM_COUNT, PCI_PMC_PAM_DEFAULT, PCI_PMC_PAM_WRITABLE_MASK,
+};
 
 fn cfg_read_u8(pci: &mut PciConfig, offset: u8) -> u8 {
     let addr = PciConfig::make_address(0, 0, 0, offset, true);
@@ -53,10 +45,10 @@ fn cfg_write_u8(pci: &mut PciConfig, offset: u8, value: u8) {
 #[test]
 fn pam_registers_default_to_zero_at_reset() {
     let mut pci = PciConfig::new();
-    for i in 0..PAM_COUNT {
+    for i in 0..PCI_PMC_PAM_COUNT {
         assert_eq!(
-            cfg_read_u8(&mut pci, PAM0_OFFSET + i as u8),
-            PAM_DEFAULT,
+            cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET + i as u8),
+            PCI_PMC_PAM_DEFAULT,
             "PAM{i} must reset to 00h"
         );
     }
@@ -69,23 +61,30 @@ fn pam_registers_store_and_read_back_defined_bits() {
     let mut pci = PciConfig::new();
 
     // Read/Write both regions of PAM1–PAM6 (Table 2 encoding `11`).
-    for i in 1..PAM_COUNT {
-        cfg_write_u8(&mut pci, PAM0_OFFSET + i as u8, PAM_WRITABLE_MASK);
+    for i in 1..PCI_PMC_PAM_COUNT {
+        cfg_write_u8(
+            &mut pci,
+            PCI_PMC_PAM0_OFFSET + i as u8,
+            PCI_PMC_PAM_WRITABLE_MASK,
+        );
         assert_eq!(
-            cfg_read_u8(&mut pci, PAM0_OFFSET + i as u8),
-            PAM_WRITABLE_MASK
+            cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET + i as u8),
+            PCI_PMC_PAM_WRITABLE_MASK
         );
     }
     // PAM0 high nibble only: BIOS area Read/Write.
-    cfg_write_u8(&mut pci, PAM0_OFFSET, PAM0_WRITABLE_MASK);
-    assert_eq!(cfg_read_u8(&mut pci, PAM0_OFFSET), PAM0_WRITABLE_MASK);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET, PCI_PMC_PAM0_WRITABLE_MASK);
+    assert_eq!(
+        cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET),
+        PCI_PMC_PAM0_WRITABLE_MASK
+    );
 
     // Read Only (RE=1, WE=0) — the shadowed, write-protected BIOS state.
-    cfg_write_u8(&mut pci, PAM0_OFFSET, 0x10);
-    assert_eq!(cfg_read_u8(&mut pci, PAM0_OFFSET), 0x10);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET, 0x10);
+    assert_eq!(cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET), 0x10);
     // Write Only (RE=0, WE=1) — the state used while copying the ROM into DRAM.
-    cfg_write_u8(&mut pci, PAM0_OFFSET, 0x20);
-    assert_eq!(cfg_read_u8(&mut pci, PAM0_OFFSET), 0x20);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET, 0x20);
+    assert_eq!(cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET), 0x20);
 }
 
 /// Spec: 440FX Table 2 — bits [7, 6, 3, 2] are Reserved; Table 3 — `PAM0[3:0]`
@@ -95,18 +94,18 @@ fn pam_registers_store_and_read_back_defined_bits() {
 fn pam_reserved_bits_read_back_as_zero() {
     let mut pci = PciConfig::new();
 
-    cfg_write_u8(&mut pci, PAM0_OFFSET, 0xFF);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET, 0xFF);
     assert_eq!(
-        cfg_read_u8(&mut pci, PAM0_OFFSET),
-        PAM0_WRITABLE_MASK,
+        cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET),
+        PCI_PMC_PAM0_WRITABLE_MASK,
         "PAM0[3:0] and the reserved nibble bits must read back zero"
     );
 
-    for i in 1..PAM_COUNT {
-        cfg_write_u8(&mut pci, PAM0_OFFSET + i as u8, 0xFF);
+    for i in 1..PCI_PMC_PAM_COUNT {
+        cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET + i as u8, 0xFF);
         assert_eq!(
-            cfg_read_u8(&mut pci, PAM0_OFFSET + i as u8),
-            PAM_WRITABLE_MASK,
+            cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET + i as u8),
+            PCI_PMC_PAM_WRITABLE_MASK,
             "PAM{i} reserved bits [7,6,3,2] must read back zero"
         );
     }
@@ -123,7 +122,7 @@ fn pam_dword_write_applies_the_same_reserved_mask() {
     pci.port_write(PCI_CONFIG_ADDRESS, 4, addr);
     pci.port_write(PCI_CONFIG_DATA, 4, 0xFFFF_FFFF);
     for offset in 0x5Cu8..=0x5F {
-        assert_eq!(cfg_read_u8(&mut pci, offset), PAM_WRITABLE_MASK);
+        assert_eq!(cfg_read_u8(&mut pci, offset), PCI_PMC_PAM_WRITABLE_MASK);
     }
 }
 
@@ -132,12 +131,15 @@ fn pam_dword_write_applies_the_same_reserved_mask() {
 #[test]
 fn pam_registers_clear_on_reset() {
     let mut pci = PciConfig::new();
-    for i in 0..PAM_COUNT {
-        cfg_write_u8(&mut pci, PAM0_OFFSET + i as u8, 0x33);
+    for i in 0..PCI_PMC_PAM_COUNT {
+        cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET + i as u8, 0x33);
     }
     pci.reset();
-    for i in 0..PAM_COUNT {
-        assert_eq!(cfg_read_u8(&mut pci, PAM0_OFFSET + i as u8), PAM_DEFAULT);
+    for i in 0..PCI_PMC_PAM_COUNT {
+        assert_eq!(
+            cfg_read_u8(&mut pci, PCI_PMC_PAM0_OFFSET + i as u8),
+            PCI_PMC_PAM_DEFAULT
+        );
     }
 }
 
@@ -146,12 +148,15 @@ fn pam_registers_clear_on_reset() {
 #[test]
 fn pam_writes_do_not_leak_into_piix_functions() {
     let mut pci = PciConfig::new();
-    cfg_write_u8(&mut pci, PAM0_OFFSET + 1, 0x33);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET + 1, 0x33);
 
     for function in 0u8..=3 {
-        let addr = PciConfig::make_address(0, 1, function, PAM0_OFFSET + 1, true);
+        let addr = PciConfig::make_address(0, 1, function, PCI_PMC_PAM0_OFFSET + 1, true);
         pci.port_write(PCI_CONFIG_ADDRESS, 4, addr);
-        let byte = pci.port_read(PCI_CONFIG_DATA + u16::from((PAM0_OFFSET + 1) & 0x03), 1) as u8;
+        let byte = pci.port_read(
+            PCI_CONFIG_DATA + u16::from((PCI_PMC_PAM0_OFFSET + 1) & 0x03),
+            1,
+        ) as u8;
         assert_eq!(
             byte, 0x00,
             "00:01.{function} must not alias host-bridge PAM"
@@ -194,7 +199,7 @@ fn decoded_bios_area_follows_pam0_high_nibble() {
 
     // Write Only: the datasheet's documented shadowing step — reads still come
     // from the expansion bus while the copy is written into DRAM.
-    cfg_write_u8(&mut pci, PAM0_OFFSET, 0x20);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET, 0x20);
     let bios = pci.pam_regions()[12];
     assert!(!bios.read_from_ram);
     assert!(bios.write_to_ram);
@@ -202,7 +207,7 @@ fn decoded_bios_area_follows_pam0_high_nibble() {
     // Read Only: "After the BIOS is shadowed, the attributes for that memory
     // area are set to read only so that all writes are forwarded to the
     // expansion bus."
-    cfg_write_u8(&mut pci, PAM0_OFFSET, 0x10);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET, 0x10);
     let bios = pci.pam_regions()[12];
     assert!(bios.read_from_ram);
     assert!(!bios.write_to_ram);
@@ -234,7 +239,7 @@ fn decoded_low_and_high_nibbles_select_adjacent_segments() {
 #[test]
 fn decoded_lookup_by_address_skips_unmapped_ranges() {
     let mut pci = PciConfig::new();
-    cfg_write_u8(&mut pci, PAM0_OFFSET, 0x30);
+    cfg_write_u8(&mut pci, PCI_PMC_PAM0_OFFSET, 0x30);
 
     let hit = pci
         .pam_region_for_addr(0x000F_4000)
