@@ -77,6 +77,16 @@
 //!   drives `DualPic` via [`PciConfig::sync_pirq_to_pic`]. Not a full PCI
 //!   device interrupt storm (IDE/UHCI engines remain unwired).
 //!
+//! - Enumeration surface (PCI 3.0 §6.2.1 / §6.2.4). A bus-0 scan of devices
+//!   0–31 × functions 0–7 finds exactly `00:00.0`, `00:01.0`, `00:01.1`,
+//!   `00:01.2` and `00:01.3`; every other address master-aborts to all ones.
+//!   Only `00:01.0` sets the Header Type multi-function bit, which is what
+//!   makes firmware look at functions 1–3 at all. The read-only header bytes
+//!   are enforced rather than assumed: identity/class/header type/BIST
+//!   (`0x00`–`0x03`, `0x08`–`0x0B`, `0x0E`–`0x0F`), CardBus CIS Pointer and
+//!   Subsystem IDs (`0x28`–`0x2F`), Capabilities Pointer and the reserved dword
+//!   (`0x34`–`0x3B`), and Interrupt Pin / Min_Gnt / Max_Lat (`0x3D`–`0x3F`).
+//!   Interrupt Line (`0x3C`) is the one writable byte in that range.
 //! - Base Address Register sizing (PCI 3.0 §6.2.5.1). Every BAR this tree
 //!   implements — PIIX IDE BMIBA (`00:01.1` `0x20`, 16-byte I/O) and PIIX USB
 //!   UHCI (`00:01.2` `0x20`, 32-byte I/O) — carries a [`PciBarSpec`] giving the
@@ -136,7 +146,19 @@
 //!   PIIX IDE Command side effects beyond BMIDE I/O enable;
 //!   PIIX ACPI Command side effects beyond PM I/O enable
 //! - Status error *signaling* (host / ISA / IDE / USB / ACPI never latch RW1C bits from real aborts yet)
-//! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI)
+//! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI;
+//!   the Capabilities Pointer at `0x34` is read-only zero to match)
+//! - PCI interrupts: every function's Interrupt Pin is read-only zero, because
+//!   no function here drives INTA#–INTD#. The PIRQ path is the software
+//!   `assert_pirq` stub only.
+//! - Subsystem identification: Subsystem Vendor ID / Subsystem ID are read-only
+//!   zero, so a guest cannot tell this machine apart by subsystem.
+//! - BIST: read-only zero; no built-in self test exists on any function.
+//! - PIIX IDE programming interface `0x80` advertises the bus-master IDE bit.
+//!   The BMIDE register block and the bounded PRD walkers exist, but there is
+//!   still no ATA-command-driven DMA engine behind them, so that bit is an
+//!   **overstatement inherited from round 2** and is recorded here rather than
+//!   quietly changed under firmware that keys on the PIIX3 device ID.
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI SCI/SMI / GPE / real power transitions / ACPI tables
 //! - Capability lists, MSI, PCIe, hotplug
@@ -223,6 +245,46 @@ pub const PCI_LATENCY_TIMER_OFFSET: u8 = 0x0D;
 /// Host bridge Latency Timer reset default.
 pub const PCI_HOST_BRIDGE_LATENCY_TIMER_DEFAULT: u8 = 0x00;
 const _: () = assert!(PCI_LATENCY_TIMER_OFFSET == 0x0D);
+/// Header Type config offset (Type 0 header byte).
+/// Spec: PCI 3.0 §6.2.1 — bit 7 identifies a multi-function device; bits 6:0
+/// give the layout of bytes `0x10`–`0x3F`.
+pub const PCI_HEADER_TYPE_OFFSET: u8 = 0x0E;
+/// BIST config offset (Type 0 header byte).
+/// Spec: PCI 3.0 §6.2.4 — "Devices that do not support BIST must always return
+/// a value of 0". Nothing in this tree implements a built-in self test.
+pub const PCI_BIST_OFFSET: u8 = 0x0F;
+/// CardBus CIS Pointer config offset.
+/// Spec: PCI 3.0 §6.2.5.4 — read-only; unused by any function here.
+pub const PCI_CARDBUS_CIS_OFFSET: u8 = 0x28;
+/// Subsystem Vendor ID config offset. Spec: PCI 3.0 §6.2.5.3 — read-only.
+pub const PCI_SUBSYSTEM_VENDOR_ID_OFFSET: u8 = 0x2C;
+/// Subsystem ID config offset. Spec: PCI 3.0 §6.2.5.3 — read-only.
+pub const PCI_SUBSYSTEM_ID_OFFSET: u8 = 0x2E;
+/// Capabilities Pointer config offset.
+/// Spec: PCI 3.0 §6.2.4 / §6.7 — "only valid if the 'Capabilities List' bit in
+/// the Status Register is set". That bit is clear on every function here, so
+/// the pointer is honestly zero.
+pub const PCI_CAP_POINTER_OFFSET: u8 = 0x34;
+/// Interrupt Line config offset. Spec: PCI 3.0 §6.2.4 — read/write scratch that
+/// POST fills in with the IRQ the interrupt pin is routed to.
+pub const PCI_INTERRUPT_LINE_OFFSET: u8 = 0x3C;
+/// Interrupt Pin config offset.
+/// Spec: PCI 3.0 §6.2.4 — read-only; "a value of 0 indicates that the device
+/// does not use an interrupt pin". No function here drives one.
+pub const PCI_INTERRUPT_PIN_OFFSET: u8 = 0x3D;
+/// Min_Gnt config offset. Spec: PCI 3.0 §6.2.4 — read-only bus-timing hint.
+pub const PCI_MIN_GNT_OFFSET: u8 = 0x3E;
+/// Max_Lat config offset. Spec: PCI 3.0 §6.2.4 — read-only bus-timing hint.
+pub const PCI_MAX_LAT_OFFSET: u8 = 0x3F;
+
+// Spec: PCI 3.0 §6.1 Figure 6-1 — the Type 0 header layout these offsets index.
+const _: () = assert!(PCI_BIST_OFFSET == PCI_HEADER_TYPE_OFFSET + 1);
+const _: () = assert!(PCI_SUBSYSTEM_VENDOR_ID_OFFSET == PCI_CARDBUS_CIS_OFFSET + 4);
+const _: () = assert!(PCI_SUBSYSTEM_ID_OFFSET == PCI_SUBSYSTEM_VENDOR_ID_OFFSET + 2);
+const _: () = assert!(PCI_INTERRUPT_PIN_OFFSET == PCI_INTERRUPT_LINE_OFFSET + 1);
+const _: () = assert!(PCI_MIN_GNT_OFFSET == PCI_INTERRUPT_PIN_OFFSET + 1);
+const _: () = assert!(PCI_MAX_LAT_OFFSET == PCI_MIN_GNT_OFFSET + 1);
+
 /// Status bit 4: Capabilities List (RO). Stub: 0 — no cap list yet.
 pub const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
 /// Status bit 7: Fast Back-to-Back Capable (RO).
@@ -1186,6 +1248,30 @@ impl PciConfig {
             .find(|bar| bar.covers(usize::from(offset)))
     }
 
+    /// Whether Type 0 configuration header byte `offset` is read-only.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §6.2.1 (Vendor ID, Device
+    /// ID, Revision ID, Class Code and Header Type are read-only), §6.2.4 (BIST
+    /// returns 0 on a device without one; the Capabilities Pointer is valid
+    /// only when Status bit 4 is set; Interrupt Pin, Min_Gnt and Max_Lat are
+    /// read-only), §6.2.5.3 and §6.2.5.4 (Subsystem IDs and the CardBus CIS
+    /// Pointer are read-only), and §6.1 Figure 6-1 for the reserved dword at
+    /// `0x38`. Interrupt Line at `0x3C` stays writable — it is the one byte in
+    /// this range firmware is expected to fill in.
+    ///
+    /// The Base Address Register block is handled separately, because whether a
+    /// BAR is writable depends on the function (see [`PciConfig::bar_specs`]).
+    fn header_readonly(offset: usize) -> bool {
+        let in_range =
+            |first: u8, last: u8| offset >= usize::from(first) && offset <= usize::from(last);
+        in_range(0x00, 0x03)
+            || in_range(0x08, 0x0B)
+            || in_range(PCI_HEADER_TYPE_OFFSET, PCI_BIST_OFFSET)
+            || in_range(PCI_CARDBUS_CIS_OFFSET, PCI_SUBSYSTEM_ID_OFFSET + 1)
+            || in_range(PCI_CAP_POINTER_OFFSET, PCI_INTERRUPT_LINE_OFFSET - 1)
+            || in_range(PCI_INTERRUPT_PIN_OFFSET, PCI_MAX_LAT_OFFSET)
+    }
+
     /// Whether a configuration byte belongs to the Type 0 Base Address Register
     /// block (`0x10`–`0x27`) or the Expansion ROM register (`0x30`–`0x33`).
     fn is_bar_byte(offset: usize) -> bool {
@@ -1304,9 +1390,8 @@ impl PciConfig {
         // function with no ROM, are read-only zero. Storing a sizing write
         // there would report a region this machine does not decode.
         let bars = Self::bar_specs(self.config_device(), self.config_function());
-        // Identity / class / header type are read-only in this stub.
         let readonly = |o: usize| {
-            matches!(o, 0x00..=0x03 | 0x08..=0x0B | 0x0E)
+            Self::header_readonly(o)
                 || (Self::is_bar_byte(o) && !bars.iter().any(|bar| bar.covers(o)))
         };
         let Some(cfg) = self.selected_cfg_mut() else {

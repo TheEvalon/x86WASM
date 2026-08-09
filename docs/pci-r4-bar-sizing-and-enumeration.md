@@ -22,6 +22,57 @@ PCI Local Bus Specification Revision 3.0:
 Intel 440FX PCIset 82441FX (PMC) and Intel 82371SB/82371AB (PIIX3/PIIX4)
 datasheets for the per-function register defaults and reserved ranges.
 
+## The enumeration surface
+
+A scan walks bus 0, devices 0-31, functions 0-7. It reads the Vendor ID first;
+`0xFFFF` means "nothing here". It reads function 0's Header Type next, and only
+looks at functions 1-7 when bit 7 is set. This machine answers on five of those
+256 addresses:
+
+| Address | Vendor:Device | Class | Prog IF | Header Type |
+|---|---|---|---|---|
+| `00:00.0` | `8086:1237` i440FX | `0600` host bridge | `00` | `00` |
+| `00:01.0` | `8086:7000` PIIX3 ISA | `0601` ISA bridge | `00` | `80` |
+| `00:01.1` | `8086:7010` PIIX3 IDE | `0101` IDE | `80` | `00` |
+| `00:01.2` | `8086:7020` PIIX3 USB | `0C03` USB | `00` UHCI | `00` |
+| `00:01.3` | `8086:7113` PIIX4 ACPI | `0680` other bridge | `00` | `00` |
+
+The multi-function bit on `00:01.0` is load-bearing: without it firmware never
+reads `00:01.1`-`00:01.3` at all, and the IDE, USB and ACPI functions become
+invisible no matter how correct their registers are.
+
+### Read-only bytes
+
+Before this slice, every header byte outside the identity and class registers
+was ordinary read/write storage. A scan that probes a register by writing to it
+— which is exactly what BAR sizing does, and what some firmware does to
+Capabilities Pointer and BIST — would have changed what the next reader saw.
+These are now read-only:
+
+| Range | Register | Why zero is the honest answer |
+|---|---|---|
+| `0x00`-`0x03`, `0x08`-`0x0B`, `0x0E` | identity, class, header type | §6.2.1 read-only |
+| `0x0F` | BIST | §6.2.4: no BIST here, so it must return 0 |
+| `0x28`-`0x2B` | CardBus CIS Pointer | unused |
+| `0x2C`-`0x2F` | Subsystem Vendor ID / Subsystem ID | this machine assigns none |
+| `0x34` | Capabilities Pointer | Status bit 4 is clear on every function |
+| `0x38`-`0x3B` | reserved | Figure 6-1 |
+| `0x3D` | Interrupt Pin | no function drives INTA#-INTD# |
+| `0x3E`-`0x3F` | Min_Gnt / Max_Lat | no bus-timing requirement stated |
+
+`0x3C` Interrupt Line stays read/write: §6.2.4 makes it the byte POST fills in
+with the routed IRQ, and nothing reads it back here.
+
+### Known overstatement
+
+`00:01.1`'s programming interface byte is `0x80`, the bus-master IDE bit. The
+BMIDE register block and the bounded PRD walkers exist, but no ATA command
+starts a DMA transfer, so that bit claims more than the tree delivers. It is
+inherited from round 2 and left in place deliberately — firmware that keys on
+the PIIX3 device ID would find a master-incapable PIIX3 stranger than a
+master-capable one — but it is an overstatement, not a truthful advertisement,
+and it is written down here rather than left to be discovered.
+
 ## The sizing protocol
 
 §6.2.5.1: "Software saves the original value of the Base Address register,
