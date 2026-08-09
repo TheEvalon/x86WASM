@@ -214,6 +214,64 @@ either advertise those bits (they are now implemented, so advertising them would
 be truthful) or reject writes that set them. Silently honoring an unadvertised
 `CR4` bit would break the truthful-CPUID rule from the other direction.
 
+## TLB (§4.10.2, §4.10.4)
+
+**An architectural-correctness model, not a performance cache.** The walker is
+already a couple of array reads, so nothing here is about speed. A TLB is
+modeled because it is architecturally visible: software that edits a
+paging-structure entry without invalidating must observe the stale translation,
+the way it would on silicon. A guest that forgets an `INVLPG` should misbehave
+here too, not work by accident.
+
+The implementation is therefore deliberately naive — an unbounded map keyed by
+4-KiB page number, no capacity, no replacement policy, no associativity. §4.10.2.2
+allows exactly that ("Processors need not implement any TLBs. Processors that do
+implement TLBs may invalidate any TLB entry at any time"), and a size-limited
+model would only add nondeterminism to tests.
+
+An entry holds what §4.10.2.2 says it holds: the page frame, the logical-AND of
+the R/W flags, the logical-AND of the U/S flags, and the dirty flag of the entry
+that maps the page — plus that entry's physical address, so a write through a
+cached translation can still set `D` in memory. `CR0.WP` is deliberately *not*
+cached: it is a paging-mode modifier applied per access (§4.1.3), which is why
+changing it needs no invalidation.
+
+An entry is created only from a translation that completed, which by then has
+`P = 1`, no reserved bits, and `A = 1` in every entry used — the §4.10.2.3
+precondition.
+
+| Event | Effect | Section |
+|---|---|---|
+| `INVLPG <linear>` | invalidate entries for that page number, **including global ones**; for a 4-MiB page, every 4-KiB entry cached for it | §4.10.4.1 |
+| Page fault | same invalidation, for the faulting address | §4.10.4.1 |
+| `MOV to CR3` | invalidate everything **except global entries** | §4.10.4.1 |
+| `MOV to CR0` clearing `PG` | invalidate everything, global included | §4.10.4.1 |
+| `MOV to CR4` changing `PGE` | invalidate everything, global included | §4.10.4.1 |
+| `MOV to CR4` changing `PAE` | invalidate everything | §4.10.4.1 |
+| `MOV to CR4` changing `PSE` | invalidate everything — **model choice** | §4.10.4.1 |
+| `MOV to CR0` changing `WP` | nothing | §4.1.3 |
+
+Two of those deserve the emphasis:
+
+* **Global pages are not exempt from a `CR3` load by having `G = 1`.** An entry
+  is global only if it was cached from a final entry with `G = 1` *while*
+  `CR4.PGE = 1` (§4.10.2.4). With `CR4.PGE = 0` no entry is global, so a `CR3`
+  load is a full flush even for pages whose `G` bit is set. `CR4.PGE` is fully
+  implemented here, exemption included, rather than left as an unsupported bit.
+* **The `CR4.PSE` flush is a choice.** §4.10.4.1 says `MOV to CR4` *may*
+  invalidate when `CR4.PSE` changes; it does not require it. This model always
+  flushes, because the change reinterprets every `PS` bit, and §4.10.2.3 warns
+  that leaving translations of both page sizes cached makes which one is used
+  implementation-specific.
+
+`Mmu` exposes both an explicit interface (`invlpg`, `on_mov_to_cr0`,
+`on_mov_to_cr3`, `on_mov_to_cr4`) and a polled one
+(`sync_control_registers(&ctx)`) that applies whatever invalidation the current
+control-register values imply since it last looked. The polled form exists
+because an integration changes `CR3` in more places than `MOV to CR3` — a task
+switch, a reset — and missing one of those is the easiest way to end up with a
+silently stale TLB.
+
 ## Deliberately out of scope
 
 Named so they are not mistaken for oversights: PAE paging (§4.4), 4-level and
@@ -221,4 +279,10 @@ Named so they are not mistaken for oversights: PAE paging (§4.4), 4-level and
 (§4.6.1), `CR4.PKE` protection keys (§4.6.2), `IA32_EFER.NXE` execute-disable,
 PCIDs and `INVPCID` (§4.10.1), the paging-structure caches (§4.10.3), memory
 typing from PWT/PCD/PAT and the MTRRs (§4.9), SGX-induced page faults (§4.7
-bit 15), and shadow or nested paging.
+bit 15), multiple logical processors, speculative or prefetch-driven caching of
+translations that never occur (§4.10.2.3), and shadow or nested paging.
+
+Also absent for a different reason — they belong to the caller, not to the
+engine: splitting a memory access that straddles a page boundary into two
+translations, the `#PF` delivery mechanism itself, and the alignment and
+segment-limit checks that precede paging.

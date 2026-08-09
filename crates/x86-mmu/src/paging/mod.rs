@@ -20,8 +20,10 @@
 //! (§4.9), and shadow or nested paging.
 
 pub mod entry;
+pub mod tlb;
 
 pub use entry::{PagingProfile, Pde, Pte};
+pub use tlb::{Mmu, Tlb, TlbEntry};
 
 /// `CR0.PG` — paging enable, bit 31 (SDM §4.1.1).
 pub const CR0_PG: u64 = 1 << 31;
@@ -576,17 +578,11 @@ pub struct Translation {
 /// * User-mode accesses are permitted only to user-mode addresses, and a
 ///   user-mode write additionally requires R/W = 1 in every entry, regardless
 ///   of `CR0.WP`.
+///
+/// A TLB hit runs the same rules over the rights it cached, through the shared
+/// [`tlb::rights_permit`], so the two paths cannot disagree.
 pub fn access_permitted(ctx: &PagingContext, walk: &Walk, access: Access) -> bool {
-    match access.mode {
-        AccessMode::Supervisor => match access.kind {
-            AccessKind::Read | AccessKind::InstructionFetch => true,
-            AccessKind::Write => !ctx.write_protect() || walk.writable(),
-        },
-        AccessMode::User => match access.kind {
-            AccessKind::Read | AccessKind::InstructionFetch => walk.user_accessible(),
-            AccessKind::Write => walk.user_accessible() && walk.writable(),
-        },
-    }
+    tlb::rights_permit(ctx, walk.writable(), walk.user_accessible(), access)
 }
 
 /// Translate `linear` for `access`: walk the paging structures, apply the §4.6
