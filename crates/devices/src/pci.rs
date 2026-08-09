@@ -77,10 +77,28 @@
 //!   drives `DualPic` via [`PciConfig::sync_pirq_to_pic`]. Not a full PCI
 //!   device interrupt storm (IDE/UHCI engines remain unwired).
 //!
-//! - PIIX IDE BMIDE I/O BAR decode: when Command.IO is set and BMIBA has I/O
-//!   form (bit0), the 16-byte Bus Master IDE register block at
-//!   `BMIBA & 0xFFF0` is a noop store/readback (command/status/PRD pointers;
-//!   primary + secondary).
+//! - Enumeration surface (PCI 3.0 §6.2.1 / §6.2.4). A bus-0 scan of devices
+//!   0–31 × functions 0–7 finds exactly `00:00.0`, `00:01.0`, `00:01.1`,
+//!   `00:01.2` and `00:01.3`; every other address master-aborts to all ones.
+//!   Only `00:01.0` sets the Header Type multi-function bit, which is what
+//!   makes firmware look at functions 1–3 at all. The read-only header bytes
+//!   are enforced rather than assumed: identity/class/header type/BIST
+//!   (`0x00`–`0x03`, `0x08`–`0x0B`, `0x0E`–`0x0F`), CardBus CIS Pointer and
+//!   Subsystem IDs (`0x28`–`0x2F`), Capabilities Pointer and the reserved dword
+//!   (`0x34`–`0x3B`), and Interrupt Pin / Min_Gnt / Max_Lat (`0x3D`–`0x3F`).
+//!   Interrupt Line (`0x3C`) is the one writable byte in that range.
+//! - Base Address Register sizing (PCI 3.0 §6.2.5.1). Every BAR this tree
+//!   implements — PIIX IDE BMIBA (`00:01.1` `0x20`, 16-byte I/O) and PIIX USB
+//!   UHCI (`00:01.2` `0x20`, 32-byte I/O) — carries a [`PciBarSpec`] giving the
+//!   writable-bit mask `!(size - 1)`, the read-only encoding bits, and the rule
+//!   that the register reads back the programmed base ANDed with that mask.
+//!   Both read back their I/O-space bit from reset, so firmware classifies them
+//!   before it sizes them. Every other BAR position on every function, and the
+//!   Expansion ROM register (`0x30`) everywhere, is read-only zero per §6.2.5.2.
+//! - PIIX IDE BMIDE I/O BAR decode: when Command.IO is set and the programmed
+//!   base is inside the 64 KB x86 I/O space, the 16-byte Bus Master IDE
+//!   register block at that base is a noop store/readback (command/status/PRD
+//!   pointers; primary + secondary).
 //! - Bounded BMIDE PRD stubs on the primary channel, both directions, when
 //!   Command.BusMaster is set: [`PciConfig::start_bm_read`] /
 //!   [`PciConfig::run_prd_read_stub`] walk an EOT-terminated PRD table at
@@ -103,6 +121,20 @@
 //!
 //! # Unsupported (explicit)
 //!
+//! - Memory BARs. [`PciBarSpec`] can encode the memory type and prefetchable
+//!   bits, but no function in this tree exposes one, so no memory window is
+//!   ever decoded from a BAR.
+//! - 64-bit BARs, and the model choice that makes sizing work: PCI 3.0
+//!   §6.2.5.1's size calculation requires the writable bits to run to bit 31,
+//!   while the PIIX datasheets mark bits 31:16 of their I/O base registers
+//!   Reserved because that silicon decodes only 16-bit I/O. This model keeps
+//!   them writable and instead refuses to decode a base outside the 64 KB x86
+//!   I/O space — recorded in `docs/pci-r4-bar-sizing-and-enumeration.md`.
+//! - PIIX ACPI PMBASE (`0x40`) is a device-specific base register outside the
+//!   Type 0 BAR block, so no sizing protocol runs on it; unlike the two real
+//!   BARs it also stays fully zero at reset rather than taking the datasheet's
+//!   `00000001h` default, so nothing decodes at I/O port 0 before firmware
+//!   programs it.
 //! - BAR MMIO decode (other than PIIX IDE BMIDE / ACPI PM I/O stubs above), full
 //!   BMIDE / ATA READ|WRITE DMA engine, full PCI device INTx storm (IDE/UHCI);
 //!   PIRQRC software `assert_pirq` stub only
@@ -114,7 +146,19 @@
 //!   PIIX IDE Command side effects beyond BMIDE I/O enable;
 //!   PIIX ACPI Command side effects beyond PM I/O enable
 //! - Status error *signaling* (host / ISA / IDE / USB / ACPI never latch RW1C bits from real aborts yet)
-//! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI)
+//! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI;
+//!   the Capabilities Pointer at `0x34` is read-only zero to match)
+//! - PCI interrupts: every function's Interrupt Pin is read-only zero, because
+//!   no function here drives INTA#–INTD#. The PIRQ path is the software
+//!   `assert_pirq` stub only.
+//! - Subsystem identification: Subsystem Vendor ID / Subsystem ID are read-only
+//!   zero, so a guest cannot tell this machine apart by subsystem.
+//! - BIST: read-only zero; no built-in self test exists on any function.
+//! - PIIX IDE programming interface `0x80` advertises the bus-master IDE bit.
+//!   The BMIDE register block and the bounded PRD walkers exist, but there is
+//!   still no ATA-command-driven DMA engine behind them, so that bit is an
+//!   **overstatement inherited from round 2** and is recorded here rather than
+//!   quietly changed under firmware that keys on the PIIX3 device ID.
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI SCI/SMI / GPE / real power transitions / ACPI tables
 //! - Capability lists, MSI, PCIe, hotplug
@@ -201,6 +245,46 @@ pub const PCI_LATENCY_TIMER_OFFSET: u8 = 0x0D;
 /// Host bridge Latency Timer reset default.
 pub const PCI_HOST_BRIDGE_LATENCY_TIMER_DEFAULT: u8 = 0x00;
 const _: () = assert!(PCI_LATENCY_TIMER_OFFSET == 0x0D);
+/// Header Type config offset (Type 0 header byte).
+/// Spec: PCI 3.0 §6.2.1 — bit 7 identifies a multi-function device; bits 6:0
+/// give the layout of bytes `0x10`–`0x3F`.
+pub const PCI_HEADER_TYPE_OFFSET: u8 = 0x0E;
+/// BIST config offset (Type 0 header byte).
+/// Spec: PCI 3.0 §6.2.4 — "Devices that do not support BIST must always return
+/// a value of 0". Nothing in this tree implements a built-in self test.
+pub const PCI_BIST_OFFSET: u8 = 0x0F;
+/// CardBus CIS Pointer config offset.
+/// Spec: PCI 3.0 §6.2.5.4 — read-only; unused by any function here.
+pub const PCI_CARDBUS_CIS_OFFSET: u8 = 0x28;
+/// Subsystem Vendor ID config offset. Spec: PCI 3.0 §6.2.5.3 — read-only.
+pub const PCI_SUBSYSTEM_VENDOR_ID_OFFSET: u8 = 0x2C;
+/// Subsystem ID config offset. Spec: PCI 3.0 §6.2.5.3 — read-only.
+pub const PCI_SUBSYSTEM_ID_OFFSET: u8 = 0x2E;
+/// Capabilities Pointer config offset.
+/// Spec: PCI 3.0 §6.2.4 / §6.7 — "only valid if the 'Capabilities List' bit in
+/// the Status Register is set". That bit is clear on every function here, so
+/// the pointer is honestly zero.
+pub const PCI_CAP_POINTER_OFFSET: u8 = 0x34;
+/// Interrupt Line config offset. Spec: PCI 3.0 §6.2.4 — read/write scratch that
+/// POST fills in with the IRQ the interrupt pin is routed to.
+pub const PCI_INTERRUPT_LINE_OFFSET: u8 = 0x3C;
+/// Interrupt Pin config offset.
+/// Spec: PCI 3.0 §6.2.4 — read-only; "a value of 0 indicates that the device
+/// does not use an interrupt pin". No function here drives one.
+pub const PCI_INTERRUPT_PIN_OFFSET: u8 = 0x3D;
+/// Min_Gnt config offset. Spec: PCI 3.0 §6.2.4 — read-only bus-timing hint.
+pub const PCI_MIN_GNT_OFFSET: u8 = 0x3E;
+/// Max_Lat config offset. Spec: PCI 3.0 §6.2.4 — read-only bus-timing hint.
+pub const PCI_MAX_LAT_OFFSET: u8 = 0x3F;
+
+// Spec: PCI 3.0 §6.1 Figure 6-1 — the Type 0 header layout these offsets index.
+const _: () = assert!(PCI_BIST_OFFSET == PCI_HEADER_TYPE_OFFSET + 1);
+const _: () = assert!(PCI_SUBSYSTEM_VENDOR_ID_OFFSET == PCI_CARDBUS_CIS_OFFSET + 4);
+const _: () = assert!(PCI_SUBSYSTEM_ID_OFFSET == PCI_SUBSYSTEM_VENDOR_ID_OFFSET + 2);
+const _: () = assert!(PCI_INTERRUPT_PIN_OFFSET == PCI_INTERRUPT_LINE_OFFSET + 1);
+const _: () = assert!(PCI_MIN_GNT_OFFSET == PCI_INTERRUPT_PIN_OFFSET + 1);
+const _: () = assert!(PCI_MAX_LAT_OFFSET == PCI_MIN_GNT_OFFSET + 1);
+
 /// Status bit 4: Capabilities List (RO). Stub: 0 — no cap list yet.
 pub const PCI_STATUS_CAP_LIST: u16 = 1 << 4;
 /// Status bit 7: Fast Back-to-Back Capable (RO).
@@ -284,11 +368,141 @@ pub const PCI_SUBCLASS_USB: u8 = 0x03;
 pub const PCI_PROG_IF_UHCI: u8 = 0x00;
 /// Header type multi-function bit.
 pub const PCI_HEADER_MULTIFUNCTION: u8 = 0x80;
+/// Offset of Base Address Register 0 in a Type 0 configuration header.
+///
+/// Spec: PCI Local Bus Specification Revision 3.0 §6.1 Figure 6-1 — six Base
+/// Address Registers occupy `0x10`–`0x27`.
+pub const PCI_BAR0_OFFSET: u8 = 0x10;
+/// Number of Base Address Registers in a Type 0 configuration header.
+pub const PCI_BAR_COUNT: usize = 6;
+/// One past the last byte of the Type 0 Base Address Register block (`0x28`).
+pub const PCI_BAR_REGION_END: u8 = PCI_BAR0_OFFSET + 4 * PCI_BAR_COUNT as u8;
+/// Expansion ROM Base Address Register offset.
+///
+/// Spec: PCI 3.0 §6.2.5.2 — "Devices that do not support an expansion ROM must
+/// implement this location as read-only and return zero when read."
+pub const PCI_ROM_BAR_OFFSET: u8 = 0x30;
+const _: () = assert!(PCI_BAR_REGION_END == 0x28);
+
+/// BAR bit 0 — Memory Space / I/O Space indicator; `1` selects I/O.
+///
+/// Spec: PCI 3.0 §6.2.5.1 Figures 6-6 and 6-7 — bit 0 is read-only.
+pub const PCI_BAR_IO_SPACE: u32 = 0x01;
+/// I/O BAR bit 1 — reserved, read-only zero. Spec: PCI 3.0 Figure 6-7.
+pub const PCI_BAR_IO_RESERVED: u32 = 0x02;
+/// Memory BAR bits 2:1 — region type field. Spec: PCI 3.0 Figure 6-6.
+pub const PCI_BAR_MEM_TYPE_MASK: u32 = 0x06;
+/// Memory BAR type `00b` — 32-bit, locatable anywhere in the 32-bit space.
+pub const PCI_BAR_MEM_TYPE_32BIT: u32 = 0x00;
+/// Memory BAR type `10b` — 64-bit, using this register and the next one.
+pub const PCI_BAR_MEM_TYPE_64BIT: u32 = 0x04;
+/// Memory BAR bit 3 — prefetchable. Spec: PCI 3.0 §6.2.5.1.
+pub const PCI_BAR_MEM_PREFETCHABLE: u32 = 0x08;
+
+/// One Base Address Register a function of this machine actually implements.
+///
+/// Spec: PCI Local Bus Specification Revision 3.0 §6.2.5.1 "Base Addresses" —
+/// "A device that wants a 1 MB memory address space (using a 32-bit base
+/// address register) would build the top 12 bits of the address register,
+/// hardwiring the other bits to 0", and the sizing protocol: "Software saves
+/// the original value of the Base Address register, writes 0 FFFF FFFFh to the
+/// register, then reads it back. Size calculation can be done from the 32-bit
+/// value read by first clearing encoding information bits (bit 0 for I/O, bits
+/// 0-3 for memory), inverting all 32 bits (logical NOT), then incrementing by
+/// 1."
+///
+/// That protocol only works if the writable bits run all the way to bit 31, so
+/// the model here is the general one: writable above the region size, hardwired
+/// below it, with the read-only type bits underneath. The PIIX datasheets
+/// describe bits 31:16 of their I/O base registers as Reserved because that
+/// silicon decodes only the 16-bit x86 I/O space; this model keeps them
+/// writable so the documented size calculation yields the region size instead
+/// of a nonsense value, and refuses to decode a base outside 16-bit I/O space
+/// (see [`PciConfig::bmide_io_base`]). That difference is a **model choice**,
+/// recorded in `docs/pci-r4-bar-sizing-and-enumeration.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciBarSpec {
+    /// Type 0 configuration header offset of the register.
+    pub offset: u8,
+    /// Size of the decoded region in bytes — a power of two.
+    pub size: u32,
+    /// Read-only low encoding bits the register always reads back.
+    pub type_bits: u32,
+}
+
+impl PciBarSpec {
+    /// Bits a guest write can change: everything at or above the region size.
+    pub const fn writable_mask(&self) -> u32 {
+        !(self.size - 1)
+    }
+
+    /// Value the register reads back after a raw dword has been written into it.
+    pub const fn readback(&self, raw: u32) -> u32 {
+        (raw & self.writable_mask()) | self.type_bits
+    }
+
+    /// Programmed base address with the encoding bits removed.
+    pub const fn base(&self, raw: u32) -> u32 {
+        raw & self.writable_mask()
+    }
+
+    /// Whether this register maps I/O space (bit 0 set) rather than memory.
+    pub const fn is_io(&self) -> bool {
+        self.type_bits & PCI_BAR_IO_SPACE != 0
+    }
+
+    /// Whether byte offset `o` in the configuration header falls in this register.
+    pub const fn covers(&self, o: usize) -> bool {
+        o >= self.offset as usize && o < self.offset as usize + 4
+    }
+}
+
+/// No function in this machine's tree exposes a Base Address Register.
+const NO_BARS: [PciBarSpec; 0] = [];
+
+/// PIIX IDE (`00:01.1`) Base Address Registers: BMIBA at `0x20` only.
+const PIIX_IDE_BARS: [PciBarSpec; 1] = [PciBarSpec {
+    offset: PCI_PIIX_IDE_BMIBA_OFFSET,
+    size: PCI_PIIX_IDE_BMIDE_IO_SIZE as u32,
+    type_bits: PCI_BAR_IO_SPACE,
+}];
+
+/// PIIX USB UHCI (`00:01.2`) Base Address Registers: the I/O BAR at `0x20` only.
+const PIIX_USB_BARS: [PciBarSpec; 1] = [PciBarSpec {
+    offset: PCI_PIIX_USB_BAR0_OFFSET,
+    size: PCI_PIIX_USB_UHCI_IO_SIZE as u32,
+    type_bits: PCI_BAR_IO_SPACE,
+}];
+
+// Spec: PCI 3.0 §6.2.5.1 — a BAR's region size is a power of two, which is what
+// makes `!(size - 1)` the writable-bit mask, and an I/O register must decode at
+// least 4 bytes (bits 1:0 are encoding bits).
+const _: () = assert!(PIIX_IDE_BARS[0].size.is_power_of_two());
+const _: () = assert!(PIIX_USB_BARS[0].size.is_power_of_two());
+const _: () = assert!(PIIX_IDE_BARS[0].size >= 4 && PIIX_USB_BARS[0].size >= 4);
+const _: () = assert!(PIIX_IDE_BARS[0].writable_mask() == 0xFFFF_FFF0);
+const _: () = assert!(PIIX_USB_BARS[0].writable_mask() == 0xFFFF_FFE0);
+const _: () = assert!(PIIX_IDE_BARS[0].is_io() && PIIX_USB_BARS[0].is_io());
+
+// Spec: PCI 3.0 §6.2.5.1 Figures 6-6 and 6-7 — the read-only encoding bits are
+// the low two of an I/O register (space indicator plus one reserved bit) and
+// the low four of a memory register (space indicator, 2-bit type, prefetchable),
+// so neither set ever reaches the address bits of the smallest legal region.
+const _: () = assert!(PCI_BAR_IO_SPACE | PCI_BAR_IO_RESERVED == 0x03);
+const _: () = assert!(PCI_BAR_MEM_TYPE_MASK | PCI_BAR_MEM_PREFETCHABLE == 0x0E);
+const _: () = assert!(PCI_BAR_MEM_TYPE_32BIT & !PCI_BAR_MEM_TYPE_MASK == 0);
+const _: () = assert!(PCI_BAR_MEM_TYPE_64BIT & !PCI_BAR_MEM_TYPE_MASK == 0);
+const _: () = assert!(PCI_BAR_MEM_TYPE_32BIT != PCI_BAR_MEM_TYPE_64BIT);
+
+/// Largest I/O port an x86 `IN`/`OUT` can address.
+///
+/// Spec: Intel SDM Vol. 1 §18.3 — the I/O address space is 64 KB. A PCI I/O
+/// base above that decodes nothing on this machine.
+const PCI_IO_SPACE_LIMIT: u32 = 0x0001_0000;
+
 /// PIIX IDE Bus Master IDE Base Address Register (BMIBA) config offset.
 /// Spec: Intel 82371SB — PCI config dword at `0x20` is an I/O BAR (bit0=1).
 pub const PCI_PIIX_IDE_BMIBA_OFFSET: u8 = 0x20;
-/// BMIBA I/O space indicator bit (PCI I/O BAR bit0).
-pub const PCI_BAR_IO_SPACE: u32 = 0x01;
 /// BMIBA size decode mask — 16-byte aligned I/O base (bits 15:4); low nibble
 /// forced to `0001` (I/O space). Spec: PCI I/O BAR + PIIX BMIBA.
 pub const PCI_PIIX_IDE_BMIBA_MASK: u32 = 0xFFF0;
@@ -808,6 +1022,7 @@ impl PciConfig {
         // Spec: PCI Local Bus — Status at 0x06 CapList=0, FastB2B, DevSel=medium stub.
         let st = PCI_STATUS_OFFSET as usize;
         cfg[st..st + 2].copy_from_slice(&PCI_PIIX_IDE_STATUS_STUB.to_le_bytes());
+        Self::write_bar_reset_values(&mut cfg, &PIIX_IDE_BARS);
         cfg
     }
 
@@ -830,7 +1045,24 @@ impl PciConfig {
         // Spec: PCI Local Bus — Status at 0x06 CapList=0, FastB2B, DevSel=medium stub.
         let st = PCI_STATUS_OFFSET as usize;
         cfg[st..st + 2].copy_from_slice(&PCI_PIIX_USB_STATUS_STUB.to_le_bytes());
+        Self::write_bar_reset_values(&mut cfg, &PIIX_USB_BARS);
         cfg
+    }
+
+    /// Power-on value of every implemented Base Address Register: base zero
+    /// with the read-only encoding bits already set.
+    ///
+    /// Spec: PCI 3.0 §6.2.5.1 — bit 0 (and, for a memory register, bits 3:1)
+    /// are read-only and describe the register's type. Firmware reads them
+    /// *before* the sizing write to decide whether it is looking at an I/O or a
+    /// memory region, so an I/O BAR that read all-zero at reset would be sized
+    /// and assigned as memory. Intel 82371SB gives BMIBA the matching default
+    /// value `00000001h`.
+    fn write_bar_reset_values(cfg: &mut [u8; 256], bars: &[PciBarSpec]) {
+        for bar in bars {
+            let off = usize::from(bar.offset);
+            cfg[off..off + 4].copy_from_slice(&bar.type_bits.to_le_bytes());
+        }
     }
 
     fn init_piix_acpi() -> [u8; 256] {
@@ -994,6 +1226,60 @@ impl PciConfig {
         (lane + usize::from(size) <= CONFIG_DATA_WINDOW).then_some(lane)
     }
 
+    /// Base Address Registers implemented by `00:<device>.<function>`.
+    ///
+    /// Spec: PCI 3.0 §6.2.5.1 — a device implements only the registers whose
+    /// space it decodes; the rest are read-only zero so that a sizing pass
+    /// reports "no region here" rather than whatever firmware just wrote.
+    pub fn bar_specs(device: u8, function: u8) -> &'static [PciBarSpec] {
+        match (device, function) {
+            (1, 1) => &PIIX_IDE_BARS,
+            (1, 2) => &PIIX_USB_BARS,
+            _ => &NO_BARS,
+        }
+    }
+
+    /// The Base Address Register covering configuration byte `offset` on
+    /// `00:<device>.<function>`, if that function implements one there.
+    pub fn bar_spec_at(device: u8, function: u8, offset: u8) -> Option<PciBarSpec> {
+        Self::bar_specs(device, function)
+            .iter()
+            .copied()
+            .find(|bar| bar.covers(usize::from(offset)))
+    }
+
+    /// Whether Type 0 configuration header byte `offset` is read-only.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §6.2.1 (Vendor ID, Device
+    /// ID, Revision ID, Class Code and Header Type are read-only), §6.2.4 (BIST
+    /// returns 0 on a device without one; the Capabilities Pointer is valid
+    /// only when Status bit 4 is set; Interrupt Pin, Min_Gnt and Max_Lat are
+    /// read-only), §6.2.5.3 and §6.2.5.4 (Subsystem IDs and the CardBus CIS
+    /// Pointer are read-only), and §6.1 Figure 6-1 for the reserved dword at
+    /// `0x38`. Interrupt Line at `0x3C` stays writable — it is the one byte in
+    /// this range firmware is expected to fill in.
+    ///
+    /// The Base Address Register block is handled separately, because whether a
+    /// BAR is writable depends on the function (see [`PciConfig::bar_specs`]).
+    fn header_readonly(offset: usize) -> bool {
+        let in_range =
+            |first: u8, last: u8| offset >= usize::from(first) && offset <= usize::from(last);
+        in_range(0x00, 0x03)
+            || in_range(0x08, 0x0B)
+            || in_range(PCI_HEADER_TYPE_OFFSET, PCI_BIST_OFFSET)
+            || in_range(PCI_CARDBUS_CIS_OFFSET, PCI_SUBSYSTEM_ID_OFFSET + 1)
+            || in_range(PCI_CAP_POINTER_OFFSET, PCI_INTERRUPT_LINE_OFFSET - 1)
+            || in_range(PCI_INTERRUPT_PIN_OFFSET, PCI_MAX_LAT_OFFSET)
+    }
+
+    /// Whether a configuration byte belongs to the Type 0 Base Address Register
+    /// block (`0x10`–`0x27`) or the Expansion ROM register (`0x30`–`0x33`).
+    fn is_bar_byte(offset: usize) -> bool {
+        (usize::from(PCI_BAR0_OFFSET)..usize::from(PCI_BAR_REGION_END)).contains(&offset)
+            || (usize::from(PCI_ROM_BAR_OFFSET)..usize::from(PCI_ROM_BAR_OFFSET) + 4)
+                .contains(&offset)
+    }
+
     fn selected_cfg(&self) -> Option<&[u8; 256]> {
         if self.config_bus() != 0 {
             return None;
@@ -1099,8 +1385,15 @@ impl PciConfig {
             } else {
                 None
             };
-        // Identity / class / header type are read-only in this stub.
-        let readonly = |o: usize| matches!(o, 0x00..=0x03 | 0x08..=0x0B | 0x0E);
+        // Spec: PCI 3.0 §6.2.5.1 / §6.2.5.2 — a Base Address Register the
+        // function does not implement, and the Expansion ROM register of a
+        // function with no ROM, are read-only zero. Storing a sizing write
+        // there would report a region this machine does not decode.
+        let bars = Self::bar_specs(self.config_device(), self.config_function());
+        let readonly = |o: usize| {
+            Self::header_readonly(o)
+                || (Self::is_bar_byte(o) && !bars.iter().any(|bar| bar.covers(o)))
+        };
         let Some(cfg) = self.selected_cfg_mut() else {
             return;
         };
@@ -1200,32 +1493,34 @@ impl PciConfig {
             let status = PCI_PIIX_ACPI_STATUS_STUB | rw1c;
             cfg[st_off..st_off + 2].copy_from_slice(&status.to_le_bytes());
         }
-        // Spec: Intel 82371SB / PCI — PIIX IDE BMIBA at config 0x20 is an I/O BAR:
-        // bit0 hardwired 1; address bits 15:4 programmable; bits 3:1 zero.
-        // Port decode of the 16-byte BMIDE block is gated by Command.IO.
-        if is_piix_ide && base == PCI_PIIX_IDE_BMIBA_OFFSET as usize && lane == 0 && size == 4 {
-            let masked = (value & PCI_PIIX_IDE_BMIBA_MASK) | PCI_BAR_IO_SPACE;
-            let bytes = masked.to_le_bytes();
-            cfg[PCI_PIIX_IDE_BMIBA_OFFSET as usize..PCI_PIIX_IDE_BMIBA_OFFSET as usize + 4]
-                .copy_from_slice(&bytes);
+        // Spec: PCI 3.0 §6.2.5.1 — an implemented Base Address Register keeps
+        // the bits above its region size and hardwires the rest, so it always
+        // reads back a naturally aligned base with the read-only type bits
+        // underneath. Applying it to the stored dword (rather than to the
+        // written value) makes byte and word writes obey the same rule.
+        //
+        // Only a write that lands in the register itself re-applies the mask:
+        // the type bits describe a *programmed* base, and this model leaves an
+        // unprogrammed BAR at zero so that nothing decodes before firmware
+        // assigns a window (`bmide_io_base` / `uhci_io_base`).
+        for bar in bars {
+            let off = usize::from(bar.offset);
+            if base != off {
+                continue;
+            }
+            let raw = u32::from_le_bytes([cfg[off], cfg[off + 1], cfg[off + 2], cfg[off + 3]]);
+            cfg[off..off + 4].copy_from_slice(&bar.readback(raw).to_le_bytes());
         }
-        // Spec: Intel 82371SB / PCI — PIIX USB UHCI BAR0 at config 0x20 is an
-        // I/O BAR: bit0 hardwired 1; bits 15:5 programmable (32-byte align);
-        // bits 4:1 zero. Store/readback only — no UHCI port decode yet.
-        if is_piix_usb && base == PCI_PIIX_USB_BAR0_OFFSET as usize && lane == 0 && size == 4 {
-            let masked = (value & PCI_PIIX_USB_BAR0_MASK) | PCI_BAR_IO_SPACE;
-            let bytes = masked.to_le_bytes();
-            cfg[PCI_PIIX_USB_BAR0_OFFSET as usize..PCI_PIIX_USB_BAR0_OFFSET as usize + 4]
-                .copy_from_slice(&bytes);
-        }
-        // Spec: Intel 82371AB / PCI — PIIX ACPI PMBASE at config 0x40 is an I/O
-        // BAR: bit0 hardwired 1; bits 15:6 programmable (64-byte align).
-        // Port decode of the PM block is gated by Command.IO (see acpi_pm_io_base).
-        if is_piix_acpi && base == PCI_PIIX_ACPI_PMBASE_OFFSET as usize && lane == 0 && size == 4 {
-            let masked = (value & PCI_PIIX_ACPI_PMBASE_MASK) | PCI_BAR_IO_SPACE;
-            let bytes = masked.to_le_bytes();
-            cfg[PCI_PIIX_ACPI_PMBASE_OFFSET as usize..PCI_PIIX_ACPI_PMBASE_OFFSET as usize + 4]
-                .copy_from_slice(&bytes);
+        // Spec: Intel 82371AB — PMBASE at config `0x40` is a device-specific
+        // base register outside the Type 0 BAR block, so no sizing protocol
+        // runs on it: bit0 is hardwired 1 and bits 15:6 are programmable
+        // exactly as the datasheet describes. Port decode of the PM block is
+        // gated by Command.IO (see `acpi_pm_io_base`).
+        if is_piix_acpi && base == PCI_PIIX_ACPI_PMBASE_OFFSET as usize {
+            let off = PCI_PIIX_ACPI_PMBASE_OFFSET as usize;
+            let raw = u32::from_le_bytes([cfg[off], cfg[off + 1], cfg[off + 2], cfg[off + 3]]);
+            let masked = (raw & PCI_PIIX_ACPI_PMBASE_MASK) | PCI_BAR_IO_SPACE;
+            cfg[off..off + 4].copy_from_slice(&masked.to_le_bytes());
         }
     }
 
@@ -1387,11 +1682,15 @@ impl PciConfig {
         if self.piix_ide_command() & PCI_COMMAND_IO == 0 {
             return None;
         }
-        let bar = self.piix_ide_bmiba();
-        if bar & PCI_BAR_IO_SPACE == 0 {
+        // Spec: PCI 3.0 §6.2.5.1 — the sizing protocol needs the writable bits
+        // to run to bit 31, so a guest (or a sizing pass that has not been
+        // followed by a real assignment) can leave a base outside the 64 KB
+        // x86 I/O space. Nothing can address it, so nothing decodes.
+        let base = PIIX_IDE_BARS[0].base(self.piix_ide_bmiba());
+        if base >= PCI_IO_SPACE_LIMIT {
             return None;
         }
-        Some((bar & PCI_PIIX_IDE_BMIBA_MASK) as u16)
+        Some(base as u16)
     }
 
     /// True when `port` falls in the decoded BMIDE I/O range.
@@ -1817,11 +2116,14 @@ impl PciConfig {
         if self.piix_usb_command() & PCI_COMMAND_IO == 0 {
             return None;
         }
-        let bar = self.piix_usb_bar0();
-        if bar & PCI_BAR_IO_SPACE == 0 {
+        // Spec: PCI 3.0 §6.2.5.1 sizing leaves the writable bits running to
+        // bit 31, so a base above the 64 KB x86 I/O space is reachable and
+        // decodes nothing (see `bmide_io_base`).
+        let base = PIIX_USB_BARS[0].base(self.piix_usb_bar0());
+        if base >= PCI_IO_SPACE_LIMIT {
             return None;
         }
-        Some((bar & PCI_PIIX_USB_BAR0_MASK) as u16)
+        Some(base as u16)
     }
 
     /// True when `port` falls in the decoded UHCI I/O range.
@@ -2349,8 +2651,10 @@ mod tests {
             4,
             PciConfig::make_address(0, 1, 1, PCI_PIIX_IDE_BMIBA_OFFSET, true),
         );
-        // Default after init is 0.
-        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0);
+        // Spec: PCI 3.0 §6.2.5.1 — bit 0 is read-only and already reads back
+        // as I/O space before firmware programs a base; Intel 82371SB gives
+        // BMIBA the matching default value 00000001h.
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), PCI_BAR_IO_SPACE);
 
         // Guest programs base 0xF000 with junk low bits; device forces I/O BAR form.
         pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F00E);
@@ -2872,9 +3176,11 @@ mod tests {
         assert_eq!(pci.port_read(0xC000, 1) as u8, 0x55);
     }
 
+    /// The BMIBA I/O-BAR rule belongs to `00:01.1` alone. The host bridge has
+    /// no Base Address Register at that offset, so PCI 3.0 §6.2.5.1 makes it
+    /// read-only zero there rather than either an I/O BAR or free storage.
     #[test]
     fn piix_ide_bmiba_does_not_alter_other_functions() {
-        // Writing BMIBA-shaped value at host bridge BAR0 offset must not force I/O form.
         let mut pci = PciConfig::new();
         pci.port_write(
             PCI_CONFIG_ADDRESS,
@@ -2884,8 +3190,8 @@ mod tests {
         pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_F000);
         assert_eq!(
             pci.port_read(PCI_CONFIG_DATA, 4),
-            0x0000_F000,
-            "non-IDE function keeps raw writable dword"
+            0,
+            "the host bridge implements no BAR at 0x20: read-only zero"
         );
     }
 
@@ -4245,7 +4551,9 @@ mod tests {
             4,
             PciConfig::make_address(0, 1, 2, PCI_PIIX_USB_BAR0_OFFSET, true),
         );
-        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), 0);
+        // Spec: PCI 3.0 §6.2.5.1 — the read-only I/O-space bit reads back
+        // before firmware programs a base.
+        assert_eq!(pci.port_read(PCI_CONFIG_DATA, 4), PCI_BAR_IO_SPACE);
 
         // Guest programs base 0xC000 with junk low bits; device forces I/O BAR form.
         pci.port_write(PCI_CONFIG_DATA, 4, 0x0000_C01E);

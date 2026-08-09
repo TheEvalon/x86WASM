@@ -21,20 +21,40 @@
 //! §15, Table 15.4); an empty map removes the file rather than advertising one
 //! with no content.
 //!
-//! # Selectors this device does not implement
+//! # Selector key numbers and ADR-0005
 //!
 //! The fw_cfg specification defines only the signature (`0x0000`), the
 //! revision/feature bitmap (`0x0001`), and the file directory (`0x0019`),
 //! then says of every other key: "Please consult the QEMU source for the most
 //! up-to-date and authoritative list of selector keys and their respective
-//! items' purpose, format and writeability." This tree does not take QEMU
-//! source as a specification, so the numeric keys firmware also probes —
-//! notably `0x0002` UUID, `0x0004` nographic, `0x0005` NB_CPUS and `0x000F`
-//! max-cpus — are **absent**, as are the named files `etc/max-cpus`,
-//! `etc/system-states`, `etc/table-loader` and `bootorder`. Firmware reading
-//! them gets the specification's "past the end of the item" answer of `0x00`
-//! rather than a fabricated value. Adding them needs an approved interface
-//! definition in `docs/sources.md` first.
+//! items' purpose, format and writeability."
+//!
+//! `docs/adr/0005-fw-cfg-key-list-interface-reference.md` settles what that
+//! means here: QEMU's `fw_cfg.h` and SeaBIOS's headers are approved as an
+//! **interface reference only** — key numbers, field widths, blob layouts and
+//! firmware file names, which are facts two implementations must agree on to
+//! interoperate. No implementation logic was read or copied, and the approval
+//! covers fw_cfg interface definitions and nothing else.
+//!
+//! What this device publishes under that approval:
+//!
+//! - [`FW_CFG_NB_CPUS`] (`0x0005`), [`FW_CFG_MAX_CPUS`] (`0x000F`) and
+//!   [`FW_CFG_FILE_MAX_CPUS`], all 16-bit little-endian and all kept in step by
+//!   [`FwCfg::set_cpu_count`]. Default `1`, which is the number of CPUs this
+//!   tree actually has.
+//! - Host-settable and **absent by default**: [`FW_CFG_UUID`] (`0x0002`),
+//!   [`FW_CFG_NOGRAPHIC`] (`0x0004`), [`FW_CFG_FILE_BOOTORDER`] and
+//!   [`FW_CFG_FILE_SYSTEM_STATES`]. Each describes a machine fact this device
+//!   cannot state on its own, so it stays absent until a host supplies it.
+//!
+//! # Still not implemented
+//!
+//! - `etc/table-loader`. It is the ACPI table build script, and this tree
+//!   builds no ACPI tables, so there is nothing to load — not even a
+//!   host-settable blob, because no honest content exists for it.
+//! - Every other numeric key. Absent items read as the specification's "past
+//!   the end of the item" answer of `0x00` rather than a fabricated value.
+//! - Item writeability (selector bit 14 / DMA control bit 4).
 //!
 //! DMA interface: the 64-bit big-endian address register lives at `0x514`
 //! (high half) / `0x518` (low half, triggering). Writing it latches the guest
@@ -64,6 +84,72 @@ pub const FW_CFG_RAM_SIZE: u16 = 0x0003;
 pub const FW_CFG_FILE_DIR: u16 = 0x0019;
 /// First named-file selector key.
 pub const FW_CFG_FILE_FIRST: u16 = 0x0020;
+
+/// System UUID item — 16 raw bytes.
+///
+/// Interface reference (ADR-0005): the key number, the item name and the
+/// 16-byte width are facts two implementations must agree on. Absent unless a
+/// host supplies a UUID it can justify — see [`FwCfg::set_system_uuid`].
+pub const FW_CFG_UUID: u16 = 0x0002;
+/// Length of the system UUID item, in bytes.
+pub const FW_CFG_UUID_SIZE: usize = 16;
+/// "No graphics adapter" flag — 16-bit little-endian.
+///
+/// Interface reference (ADR-0005). Absent unless the host states it; see
+/// [`FwCfg::set_nographic`].
+pub const FW_CFG_NOGRAPHIC: u16 = 0x0004;
+/// Boot CPU count — 16-bit little-endian.
+///
+/// Interface reference (ADR-0005). This is the selector firmware reads during
+/// POST to size its per-CPU structures.
+pub const FW_CFG_NB_CPUS: u16 = 0x0005;
+/// Maximum CPU count — 16-bit little-endian.
+///
+/// Interface reference (ADR-0005). Same width and encoding as
+/// [`FW_CFG_NB_CPUS`]; this tree reports the same value in both because it has
+/// no hotplug.
+pub const FW_CFG_MAX_CPUS: u16 = 0x000F;
+
+/// Firmware file carrying the maximum CPU count, as 16-bit little-endian.
+///
+/// Interface reference (ADR-0005): the file name and the layout. It duplicates
+/// [`FW_CFG_MAX_CPUS`] for firmware that reads the file instead of the numeric
+/// selector, and this device keeps the two in step.
+pub const FW_CFG_FILE_MAX_CPUS: &str = "etc/max-cpus";
+/// Firmware file describing supported ACPI sleep states.
+///
+/// Interface reference (ADR-0005): six bytes indexed by S-state, each with bit
+/// 7 marking the state as supported and bits 6:4 carrying the `SLP_TYP` value
+/// to write. **Absent by default** — this tree implements no ACPI power-state
+/// machine, so it has nothing truthful to say here. See
+/// [`FwCfg::set_system_states`].
+pub const FW_CFG_FILE_SYSTEM_STATES: &str = "etc/system-states";
+/// Number of bytes in the `etc/system-states` blob (one per S-state, S0–S5).
+pub const FW_CFG_SYSTEM_STATES_SIZE: usize = 6;
+/// `etc/system-states` per-state bit 7 — this sleep state is supported.
+pub const FW_CFG_SYSTEM_STATE_ENABLED: u8 = 0x80;
+/// Firmware file carrying the boot order as newline-separated device paths.
+///
+/// Interface reference (ADR-0005): the file name and the NUL-terminated,
+/// newline-separated encoding. **Absent by default** — this machine states no
+/// boot policy. See [`FwCfg::set_boot_order`].
+pub const FW_CFG_FILE_BOOTORDER: &str = "bootorder";
+
+/// CPU count this device reports when the host states nothing else.
+///
+/// This tree has one execution context and no SMP anywhere, so one CPU is a
+/// fact about the machine rather than a placeholder.
+pub const FW_CFG_DEFAULT_CPU_COUNT: u16 = 1;
+
+// Interface reference (ADR-0005): the numeric keys below `FW_CFG_FILE_FIRST`
+// are a flat, non-overlapping space, and the two CPU-count views share a width.
+const _: () = assert!(FW_CFG_UUID < FW_CFG_RAM_SIZE);
+const _: () = assert!(FW_CFG_NOGRAPHIC < FW_CFG_NB_CPUS);
+const _: () = assert!(FW_CFG_MAX_CPUS < FW_CFG_FILE_DIR);
+const _: () = assert!(FW_CFG_UUID_SIZE == 16);
+const _: () = assert!(FW_CFG_SYSTEM_STATES_SIZE == 6);
+const _: () = assert!(FW_CFG_SYSTEM_STATE_ENABLED == 1 << 7);
+const _: () = assert!(FW_CFG_DEFAULT_CPU_COUNT >= 1);
 
 /// DMA address register — high 32 bits (big-endian), x86 I/O.
 pub const FW_CFG_DMA_ADDR_HIGH: u16 = 0x514;
@@ -284,7 +370,97 @@ impl FwCfg {
         cfg.refresh_id_item();
         cfg.add_file(FW_CFG_TEST_FILE_NAME, FW_CFG_TEST_FILE_BYTES)
             .expect("default test file fits fw_cfg name limit");
+        cfg.set_cpu_count(FW_CFG_DEFAULT_CPU_COUNT);
         cfg
+    }
+
+    /// Boot CPU count currently published, as stored in [`FW_CFG_NB_CPUS`].
+    pub fn cpu_count(&self) -> u16 {
+        self.item(FW_CFG_NB_CPUS)
+            .filter(|item| item.data.len() >= 2)
+            .map(|item| u16::from_le_bytes([item.data[0], item.data[1]]))
+            .unwrap_or(FW_CFG_DEFAULT_CPU_COUNT)
+    }
+
+    /// Publish the machine's CPU count through every view firmware may read.
+    ///
+    /// Interface reference (ADR-0005): [`FW_CFG_NB_CPUS`], [`FW_CFG_MAX_CPUS`]
+    /// and [`FW_CFG_FILE_MAX_CPUS`] are all 16-bit little-endian counts. They
+    /// are written together so a guest cannot see two different answers.
+    ///
+    /// A count of zero is clamped to one: a machine with no CPU cannot execute
+    /// the firmware asking the question, so zero is never a truthful answer.
+    /// This tree has no CPU hotplug, so the maximum equals the boot count.
+    pub fn set_cpu_count(&mut self, count: u16) {
+        let count = count.max(1);
+        let le = count.to_le_bytes();
+        self.set_item(FW_CFG_NB_CPUS, FwCfgItem::from_bytes(le));
+        self.set_item(FW_CFG_MAX_CPUS, FwCfgItem::from_bytes(le));
+        self.set_file(FW_CFG_FILE_MAX_CPUS, le)
+            .expect("etc/max-cpus is a valid fw_cfg file name");
+    }
+
+    /// Publish a system UUID at [`FW_CFG_UUID`].
+    ///
+    /// Interface reference (ADR-0005): 16 raw bytes. Nothing in this tree
+    /// generates a UUID, so the item is absent until a host states one; an
+    /// absent item reads as zeros, which is the null UUID rather than an
+    /// invented identity.
+    pub fn set_system_uuid(&mut self, uuid: [u8; FW_CFG_UUID_SIZE]) {
+        self.set_item(FW_CFG_UUID, FwCfgItem::from_bytes(uuid));
+    }
+
+    /// Remove the system UUID item, returning to the absent default.
+    pub fn clear_system_uuid(&mut self) {
+        self.items.remove(&FW_CFG_UUID);
+    }
+
+    /// Publish the nographic flag at [`FW_CFG_NOGRAPHIC`] (16-bit LE, 1 = no
+    /// graphics adapter).
+    ///
+    /// Whether the machine has a display is the machine's fact, not this
+    /// device's, so the item is absent until a host states it.
+    pub fn set_nographic(&mut self, nographic: bool) {
+        self.set_item(
+            FW_CFG_NOGRAPHIC,
+            FwCfgItem::from_bytes(u16::from(nographic).to_le_bytes()),
+        );
+    }
+
+    /// Publish [`FW_CFG_FILE_BOOTORDER`] from a list of firmware device paths.
+    ///
+    /// Interface reference (ADR-0005): the blob is the paths separated by
+    /// newlines, with a trailing newline, NUL-terminated. An empty list
+    /// *removes* the file: a machine with no boot policy must be silent rather
+    /// than publish an empty one, which firmware would read as "boot nothing".
+    pub fn set_boot_order(&mut self, entries: &[&str]) -> Option<u16> {
+        if entries.is_empty() {
+            self.remove_file(FW_CFG_FILE_BOOTORDER);
+            return None;
+        }
+        let mut blob = Vec::new();
+        for entry in entries {
+            blob.extend_from_slice(entry.as_bytes());
+            blob.push(b'\n');
+        }
+        blob.push(0);
+        self.set_file(FW_CFG_FILE_BOOTORDER, blob)
+            .expect("bootorder is a valid fw_cfg file name")
+            .into()
+    }
+
+    /// Publish [`FW_CFG_FILE_SYSTEM_STATES`] from a host-supplied blob.
+    ///
+    /// Interface reference (ADR-0005): six bytes indexed by S-state, each with
+    /// [`FW_CFG_SYSTEM_STATE_ENABLED`] marking the state as supported and bits
+    /// 6:4 carrying the `SLP_TYP` value.
+    ///
+    /// This device never publishes the file on its own. Nothing in this tree
+    /// implements an ACPI power-state machine — the PIIX PM I/O block is a noop
+    /// store/readback — so it has no state it could honestly claim.
+    pub fn set_system_states(&mut self, states: [u8; FW_CFG_SYSTEM_STATES_SIZE]) -> u16 {
+        self.set_file(FW_CFG_FILE_SYSTEM_STATES, states)
+            .expect("etc/system-states is a valid fw_cfg file name")
     }
 
     /// Construct the traditional interface with the host-configured RAM size.
@@ -783,7 +959,9 @@ mod tests {
             let b = read_n(&mut cfg, 4);
             u32::from_be_bytes([b[0], b[1], b[2], b[3]])
         };
-        assert_eq!(count, 1);
+        // The default directory holds the probe file and `etc/max-cpus`, which
+        // `new()` publishes because this tree's CPU count is a known fact.
+        assert_eq!(count, 2);
 
         cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(FW_CFG_FILE_DIR));
         let _ = read_n(&mut cfg, 4); // count
@@ -1202,16 +1380,27 @@ mod tests {
         );
     }
 
-    /// Nothing in this device fabricates the numeric keys the specification
-    /// leaves to the QEMU source, so they stay absent and read as `0x00`.
+    /// ADR-0005 approved the key list as an interface reference, so `0x0005`
+    /// and `0x000F` are now published truthfully. Everything this device still
+    /// cannot fill honestly stays absent and reads as `0x00`, which is the
+    /// discipline the previous version of this test protected.
     #[test]
-    fn unimplemented_numeric_selectors_stay_absent() {
+    fn only_truthfully_fillable_numeric_selectors_are_present() {
         let mut cfg = FwCfg::with_ram_size(16 * 1024 * 1024);
-        for selector in [0x0002u16, 0x0004, 0x0005, 0x000F] {
+
+        assert!(cfg.item(FW_CFG_NB_CPUS).is_some());
+        assert!(cfg.item(FW_CFG_MAX_CPUS).is_some());
+
+        // Machine facts this device cannot state on its own.
+        for selector in [FW_CFG_UUID, FW_CFG_NOGRAPHIC] {
             assert!(cfg.item(selector).is_none());
             cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(selector));
             assert_eq!(read_n(&mut cfg, 4), [0, 0, 0, 0]);
         }
+
+        // An arbitrary unassigned key is still absent.
+        cfg.port_write(FW_CFG_SELECTOR, 2, 0x00FE);
+        assert_eq!(read_n(&mut cfg, 4), [0, 0, 0, 0]);
     }
 
     #[test]
@@ -1228,7 +1417,8 @@ mod tests {
             let b = read_n(&mut cfg, 4);
             u32::from_be_bytes([b[0], b[1], b[2], b[3]])
         };
-        assert_eq!(count, 2);
+        // Probe file, `etc/max-cpus`, and the one this test added.
+        assert_eq!(count, 3);
         cfg.port_write(FW_CFG_SELECTOR, 2, u32::from(extra));
         assert_eq!(read_n(&mut cfg, 1), b"x");
     }

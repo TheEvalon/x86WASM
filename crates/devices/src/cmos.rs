@@ -52,10 +52,21 @@
 //! before a soft CPU reset.
 //!
 //! The memory-size registers `15h`/`16h` (base memory in KB), `17h`/`18h` and
-//! `30h`/`31h` (extended memory above 1 MB in KB, capped at 15 MB), and
-//! `34h`/`35h` (memory above 16 MB in 64 KB blocks) are populated from the
-//! machine's RAM size by [`CmosRtc::set_memory_size`] and stay ordinary R/W
-//! CMOS RAM afterwards.
+//! `30h`/`31h` (extended memory above 1 MB in KB, capped at 15 MB), `34h`/`35h`
+//! (memory from 16 MB to 4 GB in 64 KB blocks) and `5Bh`–`5Dh` (memory above
+//! 4 GB in 64 KiB units) are populated from the machine's RAM size by
+//! [`CmosRtc::set_memory_size`] and stay ordinary R/W CMOS RAM afterwards.
+//!
+//! # Model note: `5Bh`–`5Dh` is a de-facto standard, not silicon
+//!
+//! The MC146818 register file ends at `0Dh`; everything above it is general
+//! CMOS RAM whose meaning is assigned by whoever wrote the BIOS. Bochs
+//! introduced the `5Bh`/`5Ch`/`5Dh` above-4 GB encoding, QEMU follows it, and
+//! SeaBIOS reads exactly those indices — but **no chipset or RTC datasheet
+//! defines them**. This model adopts the convention under ADR-0006
+//! (`docs/adr/0006-cmos-above-4gb-memory.md`), which records the status
+//! explicitly rather than letting it pass as a specification. See
+//! [`REG_MEM_ABOVE_4G_LOW`].
 //!
 //! The configuration bytes POST validates before trusting the rest of the file
 //! are plain storage with host accessors: the diagnostic status byte `0Eh`
@@ -101,11 +112,8 @@
 //!   clock to carry forward), and the vendor-specific area `32h`/`33h` and
 //!   `36h`–`7Fh` is cleared because nothing in this machine writes it. POST
 //!   action on the shutdown code is firmware/Machine, not this device
-//! - Memory above 4 GB. The CMOS indices conventionally used for it
-//!   (`5Bh`–`5Dh`) appear only in emulator documentation, not in any
-//!   authoritative register map, so this model leaves them zero rather than
-//!   inventing an encoding. A guest with more than 4 GB of RAM sees the map
-//!   saturate, not wrap.
+//! - Nothing in the tree configures more than 4 GB of guest RAM yet, so the
+//!   `5Bh`–`5Dh` path below is exercised by tests rather than by a machine.
 //! - Floppy-type byte (`10h`), hard-disk type bytes (`12h`, `19h`–`2Ch`), and
 //!   boot-device byte (`2Dh`). They are inside the standard checksum range and
 //!   are *not* battery backed here, so a host that programs them must call
@@ -368,6 +376,59 @@ pub const CMOS_EXT_MEMORY_MAX_KB: u16 = 0x3C00;
 /// Block size of the above-16 MB memory pair, in bytes.
 pub const CMOS_MEM_ABOVE_16M_BLOCK_BYTES: u64 = 64 * 1024;
 
+/// Memory above 4 GB in 64 KiB units — low byte (index `5Bh`).
+///
+/// **De-facto standard, not silicon-documented behavior.** ADR-0006
+/// (`docs/adr/0006-cmos-above-4gb-memory.md`) records this explicitly: the
+/// MC146818 register file ends at `0Dh` and everything above it is general
+/// CMOS RAM whose meaning is assigned by whoever wrote the BIOS. Bochs
+/// introduced this encoding, QEMU follows it, and SeaBIOS reads exactly these
+/// indices — but no chipset or RTC datasheet defines them, and there is no
+/// authoritative register map to cite.
+///
+/// The encoding: `5Bh` bits 7:0, [`REG_MEM_ABOVE_4G_MID`] bits 15:8 and
+/// [`REG_MEM_ABOVE_4G_HIGH`] bits 23:16 of a count of 64 KiB units of memory
+/// above 4 GB.
+pub const REG_MEM_ABOVE_4G_LOW: u8 = 0x5B;
+/// Memory above 4 GB in 64 KiB units — middle byte (index `5Ch`).
+///
+/// De-facto standard, not silicon-documented behavior — see
+/// [`REG_MEM_ABOVE_4G_LOW`] and ADR-0006.
+pub const REG_MEM_ABOVE_4G_MID: u8 = 0x5C;
+/// Memory above 4 GB in 64 KiB units — high byte (index `5Dh`).
+///
+/// De-facto standard, not silicon-documented behavior — see
+/// [`REG_MEM_ABOVE_4G_LOW`] and ADR-0006.
+pub const REG_MEM_ABOVE_4G_HIGH: u8 = 0x5D;
+
+/// Block size of the above-4 GB memory triple, in bytes.
+///
+/// Same 64 KiB unit as [`CMOS_MEM_ABOVE_16M_BLOCK_BYTES`]; the two ranges are
+/// adjacent, so a different unit would make them impossible to add up.
+pub const CMOS_MEM_ABOVE_4G_BLOCK_BYTES: u64 = CMOS_MEM_ABOVE_16M_BLOCK_BYTES;
+
+/// Largest count the three-byte above-4 GB field can hold.
+pub const CMOS_MEM_ABOVE_4G_MAX_BLOCKS: u32 = 0x00FF_FFFF;
+
+/// Largest count the `34h`/`35h` pair reports, in 64 KiB blocks.
+///
+/// `(4 GiB − 16 MiB) / 64 KiB`. With [`REG_MEM_ABOVE_4G_LOW`] implemented, the
+/// pair covers 16 MB to 4 GB and stops there: the two ranges have to partition
+/// the address space rather than overlap, or firmware counts the same memory
+/// twice. Before ADR-0006 this pair saturated at `FFFFh` instead, which was the
+/// best a model without a >4 GB register could do.
+pub const CMOS_MEM_ABOVE_16M_MAX_BLOCKS: u16 = 0xFF00;
+
+const _: () = assert!(REG_MEM_ABOVE_4G_MID == REG_MEM_ABOVE_4G_LOW + 1);
+const _: () = assert!(REG_MEM_ABOVE_4G_HIGH == REG_MEM_ABOVE_4G_MID + 1);
+const _: () = assert!(CMOS_MEM_ABOVE_4G_MAX_BLOCKS == (1 << 24) - 1);
+// 16 MB plus the largest `34h`/`35h` count is exactly 4 GB, so the two ranges
+// meet without a gap and without overlapping.
+const _: () = assert!(
+    16 * 1024 * 1024 + CMOS_MEM_ABOVE_16M_MAX_BLOCKS as u64 * CMOS_MEM_ABOVE_16M_BLOCK_BYTES
+        == 4 * 1024 * 1024 * 1024
+);
+
 /// First index of the contiguous battery-backed configuration block.
 ///
 /// Spec: IBM PC/AT — CMOS RAM is battery powered, so configuration survives a
@@ -396,11 +457,17 @@ const _: () = assert!(REG_SHUTDOWN > BATTERY_BACKED_FIRST && REG_SHUTDOWN < CMOS
 /// "EXTENDED MEMORY >16M" — ordinary battery CMOS RAM that POST fills in, sitting
 /// above the checksum range ("30h-33h are not included"). A reset must not erase
 /// the machine's memory map any more than it erases its disk configuration.
-const PRESERVED_ABOVE_BLOCK: [u8; 4] = [
+/// `5Bh`–`5Dh` join them: they are memory-size bytes with the same lifetime,
+/// even though their encoding is a de-facto standard rather than a datasheet
+/// register map (ADR-0006).
+const PRESERVED_ABOVE_BLOCK: [u8; 7] = [
     REG_EXT_MEM2_LOW,
     REG_EXT_MEM2_HIGH,
     REG_MEM_ABOVE_16M_LOW,
     REG_MEM_ABOVE_16M_HIGH,
+    REG_MEM_ABOVE_4G_LOW,
+    REG_MEM_ABOVE_4G_MID,
+    REG_MEM_ABOVE_4G_HIGH,
 ];
 
 /// Seconds / minutes / hours (time).
@@ -608,9 +675,11 @@ impl CmosRtc {
     /// battery-backed CMOS would come up. They stay ordinary read/write CMOS
     /// RAM afterwards, so a guest can overwrite them.
     ///
-    /// Memory above 4 GB is **not** reported: the CMOS indices conventionally
-    /// used for it (`5Bh`–`5Dh`) have no authoritative register-map source, so
-    /// this model leaves them zero rather than inventing an encoding.
+    /// Memory above 4 GB goes to `5Bh`–`5Dh` in the same 64 KiB units. That
+    /// encoding is a **de-facto standard, not silicon-documented behavior**
+    /// (ADR-0006); see [`REG_MEM_ABOVE_4G_LOW`]. `34h`/`35h` therefore stops at
+    /// 4 GB rather than saturating, so the two ranges partition the address
+    /// space instead of overlapping.
     pub fn set_memory_size(&mut self, ram_bytes: u64) {
         let base_kb = (ram_bytes / 1024).min(u64::from(CMOS_BASE_MEMORY_MAX_KB)) as u16;
 
@@ -619,7 +688,11 @@ impl CmosRtc {
 
         let above_16m_blocks = (ram_bytes.saturating_sub(16 * 1024 * 1024)
             / CMOS_MEM_ABOVE_16M_BLOCK_BYTES)
-            .min(u64::from(u16::MAX)) as u16;
+            .min(u64::from(CMOS_MEM_ABOVE_16M_MAX_BLOCKS)) as u16;
+
+        let above_4g_blocks = (ram_bytes.saturating_sub(4 * 1024 * 1024 * 1024)
+            / CMOS_MEM_ABOVE_4G_BLOCK_BYTES)
+            .min(u64::from(CMOS_MEM_ABOVE_4G_MAX_BLOCKS)) as u32;
 
         self.write_le_pair(REG_BASE_MEM_LOW, REG_BASE_MEM_HIGH, base_kb);
         self.write_le_pair(REG_EXT_MEM_LOW, REG_EXT_MEM_HIGH, ext_kb);
@@ -629,6 +702,15 @@ impl CmosRtc {
             REG_MEM_ABOVE_16M_HIGH,
             above_16m_blocks,
         );
+        self.write_le_triple(above_4g_blocks);
+    }
+
+    /// Store the 24-bit above-4 GB count across `5Bh`–`5Dh`, low byte first.
+    fn write_le_triple(&mut self, blocks: u32) {
+        let [lo, mid, hi, _] = blocks.to_le_bytes();
+        self.ram[REG_MEM_ABOVE_4G_LOW as usize] = lo;
+        self.ram[REG_MEM_ABOVE_4G_MID as usize] = mid;
+        self.ram[REG_MEM_ABOVE_4G_HIGH as usize] = hi;
     }
 
     fn write_le_pair(&mut self, low: u8, high: u8, value: u16) {
@@ -659,6 +741,19 @@ impl CmosRtc {
     /// Memory above 16 MB in 64 KB blocks as stored in CMOS `34h`/`35h`.
     pub fn memory_above_16m_blocks(&self) -> u16 {
         self.read_le_pair(REG_MEM_ABOVE_16M_LOW, REG_MEM_ABOVE_16M_HIGH)
+    }
+
+    /// Memory above 4 GB in 64 KiB units as stored in CMOS `5Bh`–`5Dh`.
+    ///
+    /// De-facto standard, not silicon-documented behavior — see
+    /// [`REG_MEM_ABOVE_4G_LOW`] and ADR-0006.
+    pub fn memory_above_4g_blocks(&self) -> u32 {
+        u32::from_le_bytes([
+            self.ram[REG_MEM_ABOVE_4G_LOW as usize],
+            self.ram[REG_MEM_ABOVE_4G_MID as usize],
+            self.ram[REG_MEM_ABOVE_4G_HIGH as usize],
+            0,
+        ])
     }
 
     /// IBM PS/2 diagnostic status byte (index [`REG_DIAGNOSTIC`]).
@@ -1642,19 +1737,25 @@ mod tests {
         }
     }
 
-    /// A machine larger than the `34h`/`35h` pair can describe saturates rather
-    /// than wrapping into a nonsense small value. Memory above 4 GB is not
-    /// reported at all (see the module "Unsupported" list).
+    /// The `34h`/`35h` pair stops at 4 GB rather than wrapping or overlapping
+    /// the `5Bh`–`5Dh` range that continues above it (ADR-0006). Before that
+    /// encoding existed it saturated at `FFFFh`, which was the best a model
+    /// with nowhere to put the remainder could do.
     #[test]
-    fn memory_above_16m_saturates_instead_of_wrapping() {
+    fn memory_above_16m_stops_at_four_gigabytes() {
         let mut c = CmosRtc::new();
-        // 16 MB + 65535 blocks is the largest exactly representable size.
-        c.set_memory_size(16 * MIB + u64::from(u16::MAX) * 64 * KIB);
-        assert_eq!(c.memory_above_16m_blocks(), u16::MAX);
+        // The largest size the pair describes exactly: 16 MB + 0xFF00 blocks.
+        c.set_memory_size(16 * MIB + u64::from(CMOS_MEM_ABOVE_16M_MAX_BLOCKS) * 64 * KIB);
+        assert_eq!(c.memory_above_16m_blocks(), CMOS_MEM_ABOVE_16M_MAX_BLOCKS);
+        assert_eq!(c.memory_above_4g_blocks(), 0);
 
         c.set_memory_size(64 * 1024 * MIB);
-        assert_eq!(c.memory_above_16m_blocks(), u16::MAX);
+        assert_eq!(c.memory_above_16m_blocks(), CMOS_MEM_ABOVE_16M_MAX_BLOCKS);
         assert_eq!(c.extended_memory_kb(), CMOS_EXT_MEMORY_MAX_KB);
+        assert_eq!(
+            c.memory_above_4g_blocks(),
+            (60 * 1024 * MIB / (64 * KIB)) as u32
+        );
     }
 
     /// Spec: RBIL CMOS 15h/16h/17h/18h/30h/31h/34h/35h are little-endian
