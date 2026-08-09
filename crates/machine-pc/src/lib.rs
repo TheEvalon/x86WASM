@@ -14,15 +14,16 @@ mod mem;
 mod ports;
 mod post_code;
 mod post_probe;
+mod post_spin;
 mod post_trace;
 mod step_clock;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::{
-    PamAttributes, PamRead, PamWrite, PhysMem, PAM_BIOS_REGION, PAM_FIELD_MASK, PAM_FIELD_RE,
-    PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST, PAM_REGISTER_LAST,
-    PAM_WINDOW_BASE, PAM_WINDOW_END,
+    MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
+    PAM_FIELD_MASK, PAM_FIELD_RE, PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST,
+    PAM_REGISTER_LAST, PAM_WINDOW_BASE, PAM_WINDOW_END,
 };
 pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
@@ -33,6 +34,10 @@ pub use post_probe::{
     seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
     TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV,
     SEABIOS_IMAGE_RELATIVE,
+};
+pub use post_spin::{
+    PostPcSite, PostSpinConfig, PostSpinCycle, PostSpinSummary, DEFAULT_POST_SPIN_HOT,
+    DEFAULT_POST_SPIN_MAX_PERIOD, DEFAULT_POST_SPIN_WINDOW,
 };
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use step_clock::{
@@ -1379,13 +1384,17 @@ impl Bus for MachineBus<'_> {
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
             self.ports.record_unmapped_mmio(effective, true);
         }
-        self.mem.write_u8(addr, val).map_err(|_| {
-            if self.ports.trace_enabled() {
-                self.ports
-                    .record_trace(post_trace::PostTraceEvent::MemoryFault { write: true, addr });
-            }
-            ExecError::MemoryFault(addr)
-        })
+        // Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.4 — a write
+        // no agent claims is discarded, and the processor is told nothing. A
+        // write to a mapped ROM window reaches the same place by a different
+        // route, so it is recorded rather than faulted; see
+        // `docs/machine-r4-write-semantics.md`.
+        let disposition = self.mem.write_u8_classified(addr, val);
+        if disposition == WriteDisposition::DroppedRom && self.ports.trace_enabled() {
+            self.ports
+                .record_trace(post_trace::PostTraceEvent::RomWriteDropped { addr, value: val });
+        }
+        Ok(())
     }
 
     fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError> {
@@ -1513,10 +1522,14 @@ mod tests {
         // attributes forward the write to PCI (dropped) rather than faulting.
         assert_eq!(m.mem.write_u8(0x000F_0000, 0x00), Ok(()));
         assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0xEA);
+        // Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.4 — the high
+        // map is outside PAM, but a write there is declined by the ROM and
+        // discarded, not reported to the processor.
         assert_eq!(
-            m.mem.write_u8(0xFFFF_0000, 0x00),
-            Err(crate::mem::MemError::RomWrite)
+            m.mem.write_u8_classified(0xFFFF_0000, 0x00),
+            WriteDisposition::DroppedRom
         );
+        assert_eq!(m.mem.read_u8(0xFFFF_0000).unwrap(), 0xEA);
     }
 
     /// Spec: Intel 440FX PMC — a PCI-side PAM register write re-attributes both

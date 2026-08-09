@@ -20,6 +20,7 @@ use x86_decode::DecodeError;
 use x86_interpreter::ExecError;
 
 use crate::ports::{UnclaimedPortAccess, UnmappedMmioAccess};
+use crate::post_spin::{PostPcSite, PostSpinConfig, PostSpinSampler, PostSpinSummary};
 use crate::post_trace::{PostTrace, PostTraceConfig};
 use crate::step_clock::StepClock;
 use crate::{Machine, MachineError};
@@ -286,7 +287,34 @@ impl fmt::Display for PostStopReason {
 pub struct PostReport {
     /// Instructions that retired before the stop.
     pub steps: u64,
+    /// Quanta spent halted with interrupts enabled, waiting for a wake.
+    ///
+    /// These retire no instruction, so they are not counted in [`Self::steps`],
+    /// but they do draw on the same budget and they do advance the
+    /// instruction-count time source — which is what lets the PIT reach the
+    /// interrupt that ends the wait.
+    pub idle_steps: u64,
     pub stop: PostStopReason,
+    /// Instruction bytes at [`Self::stop_site`]; `None` where the fetch failed.
+    ///
+    /// For [`PostStopReason::Halted`] the window starts one byte earlier, on
+    /// the single-byte `HLT` itself, because `stop_site` is the resume point.
+    /// A halted stop is otherwise unreadable: `F4 EB FD` says "`HLT` then
+    /// `JMP $-1`", a permanent firmware hang loop, and nothing else in the
+    /// report distinguishes that from an idle that never woke.
+    pub stop_bytes: [Option<u8>; POST_OPCODE_WINDOW_LEN],
+    /// Where the CPU was when the probe stopped: the architectural `CS:EIP`,
+    /// i.e. the instruction that would execute next.
+    ///
+    /// For [`PostStopReason::Failure`] this repeats the failure's own site; for
+    /// the other two it is the only location the report carries, and the reason
+    /// this field exists — a step-budget stop used to name no address at all.
+    /// After [`PostStopReason::Halted`] it is the instruction **after** the
+    /// `HLT`, because that is where an interrupt would resume; the `HLT` itself
+    /// is the last entry in [`Self::spin`]'s cycle.
+    pub stop_site: PostPcSite,
+    /// What the trailing instructions were doing, when a sampler was armed.
+    pub spin: Option<PostSpinSummary>,
     /// Ports no device claimed, in first-touch order.
     pub unclaimed_ports: Vec<UnclaimedPortAccess>,
     /// More distinct unclaimed ports existed than the bounded log holds.
@@ -319,6 +347,28 @@ impl PostReport {
 impl fmt::Display for PostReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "post-probe: steps={} stop={}", self.steps, self.stop)?;
+        // The header line is byte-identical to what it has always been, and a
+        // failure stop already names its site in that line — so the location
+        // block is emitted only for the two stops that reported nothing.
+        if self.failure().is_none() {
+            write!(f, "  stop-pc        {} bytes=[", self.stop_site)?;
+            for (index, byte) in self.stop_bytes.iter().enumerate() {
+                if index != 0 {
+                    f.write_str(" ")?;
+                }
+                match byte {
+                    Some(byte) => write!(f, "{byte:02X}")?,
+                    None => f.write_str("??")?,
+                }
+            }
+            writeln!(f, "]")?;
+            if self.idle_steps > 0 {
+                writeln!(f, "  halt-idle      idle-steps={}", self.idle_steps)?;
+            }
+            if let Some(spin) = &self.spin {
+                writeln!(f, "{spin}")?;
+            }
+        }
         for access in &self.unclaimed_ports {
             writeln!(
                 f,
@@ -424,14 +474,34 @@ impl Machine {
         max_steps: u64,
         trace: Option<PostTraceConfig>,
     ) -> TracedPostReport {
-        let report = self.run_post_probe(max_steps, trace);
+        self.probe_post_options(max_steps, trace, Some(PostSpinConfig::default()))
+    }
+
+    /// [`Self::probe_post_traced`] with the trailing-PC sampler under caller
+    /// control.
+    ///
+    /// `spin` `None` (or a zero window) records no program counters and omits
+    /// the spin block from the report; the stop program counter is reported
+    /// either way, because it costs nothing.
+    pub fn probe_post_options(
+        &mut self,
+        max_steps: u64,
+        trace: Option<PostTraceConfig>,
+        spin: Option<PostSpinConfig>,
+    ) -> TracedPostReport {
+        let report = self.run_post_probe(max_steps, trace, spin);
         TracedPostReport {
             report,
             trace: self.ports.take_trace(),
         }
     }
 
-    fn run_post_probe(&mut self, max_steps: u64, trace: Option<PostTraceConfig>) -> PostReport {
+    fn run_post_probe(
+        &mut self,
+        max_steps: u64,
+        trace: Option<PostTraceConfig>,
+        spin: Option<PostSpinConfig>,
+    ) -> PostReport {
         self.ports.clear_diagnostics();
         self.ports.set_trace(trace);
         self.post_diag.reset();
@@ -440,16 +510,34 @@ impl Machine {
         if !host_clock.enabled {
             self.set_step_clock(StepClock::enabled_default());
         }
+        let mut sampler = spin.and_then(PostSpinSampler::new);
 
         let mut steps = 0u64;
+        let mut idle_steps = 0u64;
         let stop = loop {
-            if self.cpu.halted {
+            // Spec: Intel SDM Vol. 2 "HLT" — a halted processor resumes on an
+            // enabled interrupt, NMI, SMI, debug exception, INIT or RESET; Vol.
+            // 3 §6.8.1 — a maskable interrupt needs `IF=1`. Intel 8254: the
+            // counter is clocked by CLK whatever the processor is doing, so a
+            // timer interrupt still arrives during a halt. With `IF=0` and no
+            // NMI source in this machine the halt is permanent, and that is the
+            // only case that ends the probe.
+            let idle = self.cpu.halted;
+            if idle && !self.cpu.interrupt_flag() {
                 break PostStopReason::Halted;
             }
-            if steps >= max_steps {
+            if steps + idle_steps >= max_steps {
                 break PostStopReason::StepBudgetExhausted;
             }
+            // Idle quanta are not sampled: a wait loop would otherwise fill the
+            // spin window with one address and hide the code that led there.
+            if !idle {
+                if let Some(sampler) = sampler.as_mut() {
+                    sampler.record(PostPcSite::from_cpu(&self.cpu));
+                }
+            }
             match self.step() {
+                Ok(()) if idle => idle_steps += 1,
                 Ok(()) => steps += 1,
                 Err(err) => break PostStopReason::Failure(self.capture_post_failure(&err)),
             }
@@ -459,9 +547,27 @@ impl Machine {
         if !host_clock.enabled {
             self.set_step_clock(host_clock);
         }
+        let stop_site = PostPcSite::from_cpu(&self.cpu);
+        // A halt reports the resume point, which is one byte past the `HLT`.
+        // `HLT` is the single-byte opcode `F4` (Intel SDM Vol. 2), so backing
+        // up by one lands exactly on the instruction that stopped the machine —
+        // and the bytes after it usually say whether it is a hang loop.
+        let window_at = if stop == PostStopReason::Halted {
+            PostPcSite {
+                eip: stop_site.eip.wrapping_sub(1),
+                linear_pc: stop_site.linear_pc.wrapping_sub(1),
+                ..stop_site
+            }
+        } else {
+            stop_site
+        };
         PostReport {
             steps,
+            idle_steps,
             stop,
+            stop_bytes: self.opcode_window_at(&window_at),
+            stop_site,
+            spin: sampler.as_ref().and_then(PostSpinSampler::summarize),
             unclaimed_ports: self.ports.unclaimed_ports().to_vec(),
             unclaimed_port_overflow: self.ports.unclaimed_port_overflow(),
             unmapped_mmio: self.ports.unmapped_mmio().to_vec(),
@@ -472,6 +578,23 @@ impl Machine {
             com1: self.com1_text(),
             debug: self.debug_text(),
         }
+    }
+
+    /// Read the instruction window at a site through the `CS.D` execution
+    /// window, wrapping the offset the way the fetch does.
+    ///
+    /// Spec: Intel SDM Vol. 3 §3.4.2 (linear address = cached base + offset);
+    /// §3.4.5 (the `D` flag chooses a 16- or 32-bit offset window).
+    fn opcode_window_at(&self, site: &PostPcSite) -> [Option<u8>; POST_OPCODE_WINDOW_LEN] {
+        std::array::from_fn(|index| {
+            let offset = if site.cs_default_big {
+                site.eip.wrapping_add(index as u32)
+            } else {
+                u32::from((site.eip as u16).wrapping_add(index as u16))
+            };
+            let base = site.linear_pc.wrapping_sub(u64::from(site.eip));
+            self.mem.read_u8(base.wrapping_add(u64::from(offset))).ok()
+        })
     }
 
     /// Capture the faulting site the same way the interpreter fetches it.
