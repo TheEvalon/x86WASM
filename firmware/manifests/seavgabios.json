@@ -1,0 +1,17 @@
+{
+  "name": "seavgabios",
+  "component": "vgabios.bin",
+  "repo": "https://gitlab.com/qemu-project/seabios.git",
+  "ref": "rel-1.16.3",
+  "commit": "a6ed6b701f0a57db0569ab98b0661c12a6ec3ff8",
+  "config": [
+    "CONFIG_QEMU=y",
+    "CONFIG_VGA_STANDARD_VGA=y",
+    "CONFIG_VGA_VBE=n",
+    "CONFIG_VGA_PCI=n"
+  ],
+  "license": "LGPL-3.0-or-later",
+  "output_path": "firmware/seavgabios/vgabios.bin",
+  "build_script": "firmware/build-scripts/build-seavgabios.sh",
+  "notes": "Pinned revision for reproducible builds. Binary is gitignored; rebuild locally or in Linux CI."
+}

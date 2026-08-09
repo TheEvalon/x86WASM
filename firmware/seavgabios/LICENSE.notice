@@ -1,0 +1,45 @@
+SeaVGABIOS (when built into this directory)
+===========================================
+
+Upstream project: SeaVGABIOS — the VGA BIOS option ROM built from the
+                  `vgasrc/` tree of SeaBIOS (not a separate repository)
+Canonical docs:   https://www.seabios.org/SeaVGABIOS
+Source mirror:    https://gitlab.com/qemu-project/seabios.git
+Pinned release:   rel-1.16.3 (see ../manifests/seavgabios.json)
+
+License: GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later).
+Upstream `vgasrc/` file headers read "This file may be distributed under the
+terms of the GNU LGPLv3 license" and carry two copyright lines:
+
+    Copyright (C) 2009-2013  Kevin O'Connor <kevin@koconnor.net>
+    Copyright (C) 2001-2008 the LGPL VGABios developers Team
+
+So the ROM descends from the older LGPL VGABios project as well as SeaBIOS.
+The full upstream license text is copied beside vgabios.bin as
+COPYING.SeaVGABIOS when you run ../build-scripts/build-seavgabios.sh.
+
+Build configuration
+-------------------
+The pinned build selects the plain 256 KB standard VGA target with no SVGA
+extensions, no VBE, and no PCI ROM header:
+
+    CONFIG_QEMU=y
+    CONFIG_VGA_STANDARD_VGA=y
+    CONFIG_VGA_VBE=n
+    CONFIG_VGA_PCI=n
+
+VBE and the PCI ROM header are disabled because this emulator implements
+neither; a ROM must not advertise a capability the machine does not have.
+
+x86WASM project policy
+----------------------
+- Keep SeaVGABIOS sources and binaries under firmware/ only.
+- Do not vendor SeaVGABIOS (or other LGPL/GPL firmware) sources into
+  MIT/Apache Rust crates (firmware-interface, machine-pc, devices, …).
+- Do not commit vgabios.bin until licensing review explicitly allows it
+  (*.bin under this tree is gitignored).
+- Building the ROM here does not imply the emulator scans or executes option
+  ROMs. `emulator-cli --option-rom` maps an image for inspection only.
+
+See also: docs/licensing.md, docs/adr/0004-firmware-seabios-ovmf.md,
+third_party/NOTICE, firmware/README.md.

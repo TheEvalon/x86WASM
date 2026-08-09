@@ -1,0 +1,7 @@
+# SeaVGABIOS build outputs. The repository-root .gitignore already covers
+# firmware/seavgabios/*.bin; these are the rest of the build tree.
+seavgabios/.src/
+seavgabios/.build/
+seavgabios/.config.seavgabios
+seavgabios/manifest.json
+seavgabios/COPYING.SeaVGABIOS

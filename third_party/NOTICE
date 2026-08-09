@@ -20,6 +20,32 @@ code that ships with or is built alongside x86WASM.
 No SeaBIOS sources are embedded in crates/. Building or loading the ROM does
 not constitute a SeaBIOS POST integration claim.
 
+## SeaVGABIOS (build-time / optional firmware binary)
+
+- Project: SeaVGABIOS — the VGA BIOS option ROM built from the vgasrc/ tree of
+  SeaBIOS; it is not a separate upstream repository
+- Purpose: VGA BIOS option ROM for the classic PC video path (Milestone 2+)
+- Upstream: https://www.seabios.org/SeaVGABIOS
+- Source (QEMU mirror): https://gitlab.com/qemu-project/seabios.git
+- Pinned revision: rel-1.16.3 (commit a6ed6b701f0a57db0569ab98b0661c12a6ec3ff8)
+- License: LGPL-3.0-or-later. Upstream vgasrc/ headers state "This file may be
+  distributed under the terms of the GNU LGPLv3 license" and carry both
+  "Copyright (C) 2009-2013 Kevin O'Connor" and "Copyright (C) 2001-2008 the
+  LGPL VGABios developers Team", so the ROM also descends from the older LGPL
+  VGABios project. See firmware/seavgabios/LICENSE.notice and
+  firmware/seavgabios/COPYING.SeaVGABIOS after build
+- Build script: firmware/build-scripts/build-seavgabios.sh
+- Build configuration: CONFIG_QEMU=y, CONFIG_VGA_STANDARD_VGA=y,
+  CONFIG_VGA_VBE=n, CONFIG_VGA_PCI=n (plain 256 KB standard VGA; no SVGA
+  extensions, no VBE, no PCI ROM header)
+- Output location: firmware/seavgabios/vgabios.bin (gitignored; not vendored
+  into MIT/Apache Rust crates)
+- Manifest pin: firmware/manifests/seavgabios.json
+
+No SeaVGABIOS sources are embedded in crates/. The emulator does not scan or
+execute option ROMs; `emulator-cli --option-rom` maps an image for inspection
+only.
+
 ## OVMF / other firmware
 
 OVMF and other firmware blobs are not yet added. When they are, record license,

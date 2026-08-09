@@ -32,6 +32,7 @@ version = "0.1.0"
 name = "emulator-cli"
 version = "0.1.0"
 dependencies = [
+ "devices",
  "machine-pc",
 ]
 
