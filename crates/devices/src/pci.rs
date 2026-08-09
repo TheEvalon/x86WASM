@@ -71,11 +71,16 @@
 //!   form (bit0), the 16-byte Bus Master IDE register block at
 //!   `BMIBA & 0xFFF0` is a noop store/readback (command/status/PRD pointers;
 //!   primary + secondary).
-//! - Bounded BMIDE PRD read stub: [`PciConfig::start_bm_read`] /
-//!   [`PciConfig::run_prd_read_stub`] walks an EOT-terminated primary PRD table
-//!   at BMIDTP and splits a supplied device buffer across its memory regions
-//!   when Command.BusMaster is set. No ATA DMA command engine, write direction,
-//!   or secondary-channel engine.
+//! - Bounded BMIDE PRD stubs on the primary channel, both directions, when
+//!   Command.BusMaster is set: [`PciConfig::start_bm_read`] /
+//!   [`PciConfig::run_prd_read_stub`] walk an EOT-terminated PRD table at
+//!   BMIDTP and split a supplied device buffer across its memory regions
+//!   (RWCON cleared), and [`PciConfig::start_bm_write`] /
+//!   [`PciConfig::run_prd_write_stub`] walk the same table in the opposite
+//!   direction to fill a device buffer from those regions (RWCON set). Both
+//!   honor zero count = 64 KiB, the 256-entry missing-EOT cap, 32-bit
+//!   address-wrap rejection, and BMISTA Active/Error latching. No ATA DMA
+//!   command engine and no secondary-channel engine.
 //! - PIIX ACPI PM I/O decode: when Command.IO is set and PMBASE has I/O form
 //!   (bit0), the 64-byte PM register block at `PMBASE & 0xFFC0` is a noop
 //!   store/readback (`PM1a_EVT` / `PM1a_CNT` / `PM_TMR` + remainder). No SCI,
@@ -89,8 +94,12 @@
 //! # Unsupported (explicit)
 //!
 //! - BAR MMIO decode (other than PIIX IDE BMIDE / ACPI PM I/O stubs above), full
-//!   BMIDE / ATA READ DMA engine, full PCI device INTx storm (IDE/UHCI);
+//!   BMIDE / ATA READ|WRITE DMA engine, full PCI device INTx storm (IDE/UHCI);
 //!   PIRQRC software `assert_pirq` stub only
+//! - Secondary-channel PRDT walking (BMIDTP at `0x0C` is store/readback only),
+//!   BMIDE interrupt (BMISTA bit2) generation, and PRD-driven IDE task-file
+//!   sequencing: both directions are host-called walkers, not a DMA engine
+//!   started by an ATA command or by a guest write to BMICOM.SSBM
 //! - Host-bridge / PIIX ISA / PIIX USB Command decode side effects;
 //!   PIIX IDE Command side effects beyond BMIDE I/O enable;
 //!   PIIX ACPI Command side effects beyond PM I/O enable
@@ -1203,27 +1212,18 @@ impl PciConfig {
         }
 
         // Spec: BMICOM — SSBM=1 starts; RWCON=0 selects Read (IDE→memory).
-        let cmd_off = PCI_PIIX_IDE_BMICOM_PRIMARY as usize;
-        self.bmide_io[cmd_off] =
-            (self.bmide_io[cmd_off] | PCI_PIIX_IDE_BMICOM_SSBM) & !PCI_PIIX_IDE_BMICOM_RWCON;
-        let st_off = PCI_PIIX_IDE_BMISTA_PRIMARY as usize;
-        self.bmide_io[st_off] |= PCI_PIIX_IDE_BMISTA_ACTIVE;
+        self.begin_bm_primary(false);
 
         let prdt = self.bmide_prd_table_ptr_primary();
         let mut bytes_copied = 0usize;
         for entry_index in 0..PCI_PIIX_IDE_PRD_MAX_ENTRIES {
-            let byte_offset = (entry_index * PCI_PIIX_IDE_PRD_ENTRY_SIZE) as u32;
-            let Some(prd_addr) = prdt.checked_add(byte_offset) else {
-                self.finish_bm_read_primary(true);
-                return Err(BmidePrdError::PrdTableAddressOverflow { entry_index });
+            let prd_addr = match Self::bm_prd_entry_addr(prdt, entry_index) {
+                Some(addr) => addr,
+                None => {
+                    self.finish_bm_primary(true);
+                    return Err(BmidePrdError::PrdTableAddressOverflow { entry_index });
+                }
             };
-            if prd_addr
-                .checked_add(PCI_PIIX_IDE_PRD_ENTRY_SIZE as u32 - 1)
-                .is_none()
-            {
-                self.finish_bm_read_primary(true);
-                return Err(BmidePrdError::PrdTableAddressOverflow { entry_index });
-            }
 
             let mut prd_bytes = [0u8; PCI_PIIX_IDE_PRD_ENTRY_SIZE];
             for (i, b) in prd_bytes.iter_mut().enumerate() {
@@ -1234,7 +1234,7 @@ impl PciConfig {
             let remaining = &device_buf[bytes_copied..];
             let n = (entry.byte_count as usize).min(remaining.len());
             if n != 0 && entry.phys_addr.checked_add((n - 1) as u32).is_none() {
-                self.finish_bm_read_primary(true);
+                self.finish_bm_primary(true);
                 return Err(BmidePrdError::GuestAddressOverflow {
                     phys_addr: entry.phys_addr,
                     bytes_requested: n,
@@ -1246,7 +1246,7 @@ impl PciConfig {
             bytes_copied += n;
 
             if entry.eot {
-                self.finish_bm_read_primary(false);
+                self.finish_bm_primary(false);
                 return Ok(BmidePrdTransfer {
                     entry,
                     entries_walked: entry_index + 1,
@@ -1255,14 +1255,136 @@ impl PciConfig {
             }
         }
 
-        self.finish_bm_read_primary(true);
+        self.finish_bm_primary(true);
         Err(BmidePrdError::MissingEot {
             entries_walked: PCI_PIIX_IDE_PRD_MAX_ENTRIES,
             bytes_copied,
         })
     }
 
-    fn finish_bm_read_primary(&mut self, error: bool) {
+    /// Walk the primary-channel PRDT and fill `device_buf` from guest memory
+    /// (BMIDE Write).
+    ///
+    /// This is the write-direction counterpart of [`Self::start_bm_read`] and
+    /// keeps the same bounds: descriptors are fetched at BMIDTP until EOT, a
+    /// zero byte-count field means 64 KiB, a table without EOT stops at the
+    /// deterministic 256-entry cap with [`BmidePrdError::MissingEot`], and a
+    /// region that would wrap the 32-bit guest physical address space is
+    /// rejected before any byte is copied. A device buffer shorter than the
+    /// described regions is filled and the remaining PRDs are still walked to
+    /// require EOT.
+    ///
+    /// Spec: Intel Programming Interface for Bus Master IDE Controller Rev 1.0
+    /// §§1.1–1.2 + Intel 82371SB §2.7 — BMICOM RWCON selects the transfer
+    /// direction; this call sets SSBM and RWCON (Write), sets BMISTA.Active
+    /// while walking, then clears Active + SSBM, latching BMISTA.Error on a
+    /// malformed or out-of-bounds table.
+    ///
+    /// Requires PIIX IDE Command.BusMaster. Does **not** issue ATA WRITE DMA:
+    /// there is still no ATA command engine, no secondary-channel engine, and
+    /// no PCI abort modeling.
+    pub fn start_bm_write<R>(
+        &mut self,
+        device_buf: &mut [u8],
+        mut mem_read: R,
+    ) -> Result<BmidePrdTransfer, BmidePrdError>
+    where
+        R: FnMut(u32) -> u8,
+    {
+        if self.piix_ide_command() & PCI_COMMAND_BUS_MASTER == 0 {
+            return Err(BmidePrdError::BusMasterDisabled);
+        }
+        if device_buf.is_empty() {
+            return Err(BmidePrdError::EmptyBuffer);
+        }
+
+        // Spec: BMICOM — SSBM=1 starts; RWCON=1 selects Write (memory→IDE).
+        self.begin_bm_primary(true);
+
+        let prdt = self.bmide_prd_table_ptr_primary();
+        let mut bytes_copied = 0usize;
+        for entry_index in 0..PCI_PIIX_IDE_PRD_MAX_ENTRIES {
+            let prd_addr = match Self::bm_prd_entry_addr(prdt, entry_index) {
+                Some(addr) => addr,
+                None => {
+                    self.finish_bm_primary(true);
+                    return Err(BmidePrdError::PrdTableAddressOverflow { entry_index });
+                }
+            };
+
+            let mut prd_bytes = [0u8; PCI_PIIX_IDE_PRD_ENTRY_SIZE];
+            for (i, b) in prd_bytes.iter_mut().enumerate() {
+                *b = mem_read(prd_addr + i as u32);
+            }
+            let entry = decode_bmide_prd(&prd_bytes);
+
+            let n = (entry.byte_count as usize).min(device_buf.len() - bytes_copied);
+            if n != 0 && entry.phys_addr.checked_add((n - 1) as u32).is_none() {
+                self.finish_bm_primary(true);
+                return Err(BmidePrdError::GuestAddressOverflow {
+                    phys_addr: entry.phys_addr,
+                    bytes_requested: n,
+                });
+            }
+            for (i, slot) in device_buf[bytes_copied..bytes_copied + n]
+                .iter_mut()
+                .enumerate()
+            {
+                *slot = mem_read(entry.phys_addr + i as u32);
+            }
+            bytes_copied += n;
+
+            if entry.eot {
+                self.finish_bm_primary(false);
+                return Ok(BmidePrdTransfer {
+                    entry,
+                    entries_walked: entry_index + 1,
+                    bytes_copied,
+                });
+            }
+        }
+
+        self.finish_bm_primary(true);
+        Err(BmidePrdError::MissingEot {
+            entries_walked: PCI_PIIX_IDE_PRD_MAX_ENTRIES,
+            bytes_copied,
+        })
+    }
+
+    /// Alias for [`Self::start_bm_write`] — bounded primary-channel PRDT Write stub.
+    #[inline]
+    pub fn run_prd_write_stub<R>(
+        &mut self,
+        device_buf: &mut [u8],
+        mem_read: R,
+    ) -> Result<BmidePrdTransfer, BmidePrdError>
+    where
+        R: FnMut(u32) -> u8,
+    {
+        self.start_bm_write(device_buf, mem_read)
+    }
+
+    /// Address of PRD `entry_index`, or `None` when the fetch would wrap.
+    fn bm_prd_entry_addr(prdt: u32, entry_index: usize) -> Option<u32> {
+        let byte_offset = (entry_index * PCI_PIIX_IDE_PRD_ENTRY_SIZE) as u32;
+        let prd_addr = prdt.checked_add(byte_offset)?;
+        prd_addr.checked_add(PCI_PIIX_IDE_PRD_ENTRY_SIZE as u32 - 1)?;
+        Some(prd_addr)
+    }
+
+    /// Latch BMICOM SSBM + the requested RWCON direction and BMISTA Active.
+    fn begin_bm_primary(&mut self, write_direction: bool) {
+        let cmd_off = PCI_PIIX_IDE_BMICOM_PRIMARY as usize;
+        let started = self.bmide_io[cmd_off] | PCI_PIIX_IDE_BMICOM_SSBM;
+        self.bmide_io[cmd_off] = if write_direction {
+            started | PCI_PIIX_IDE_BMICOM_RWCON
+        } else {
+            started & !PCI_PIIX_IDE_BMICOM_RWCON
+        };
+        self.bmide_io[PCI_PIIX_IDE_BMISTA_PRIMARY as usize] |= PCI_PIIX_IDE_BMISTA_ACTIVE;
+    }
+
+    fn finish_bm_primary(&mut self, error: bool) {
         let st_off = PCI_PIIX_IDE_BMISTA_PRIMARY as usize;
         self.bmide_io[st_off] &= !PCI_PIIX_IDE_BMISTA_ACTIVE;
         if error {
@@ -2056,6 +2178,42 @@ mod tests {
             .expect("alias");
         assert_eq!(xfer2.bytes_copied, 8);
         assert_eq!(&mem.borrow()[BUF as usize..BUF as usize + 8], &device);
+    }
+
+    /// Spec: Intel 82371SB §2.7.1 BMICOM RWCON — the write direction moves
+    /// guest memory into the device buffer and leaves RWCON latched; reset
+    /// clears the whole BMIDE register file.
+    #[test]
+    fn start_bm_write_fills_device_buffer_and_reset_clears_bmide() {
+        let mut pci = PciConfig::new();
+        program_bmide_bar_and_bus_master(&mut pci, 0xF000);
+
+        const PRDT: u32 = 0x0000_1000;
+        const SRC: u32 = 0x0000_3000;
+        pci.port_write(0xF000 + u16::from(PCI_PIIX_IDE_BMIDTP_PRIMARY), 4, PRDT);
+
+        let mut mem = vec![0u8; 0x4000];
+        store_test_bmide_prd(&mut mem, PRDT, 0, SRC, 4, true);
+        mem[SRC as usize..SRC as usize + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let mut device = [0u8; 4];
+        let xfer = pci
+            .start_bm_write(&mut device, |phys| mem[phys as usize])
+            .expect("bm write");
+        assert_eq!(device, [0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(xfer.bytes_copied, 4);
+        assert_eq!(
+            pci.bmide_io[PCI_PIIX_IDE_BMICOM_PRIMARY as usize] & PCI_PIIX_IDE_BMICOM_RWCON,
+            PCI_PIIX_IDE_BMICOM_RWCON
+        );
+        assert_eq!(
+            pci.bmide_io[PCI_PIIX_IDE_BMISTA_PRIMARY as usize] & PCI_PIIX_IDE_BMISTA_ACTIVE,
+            0
+        );
+
+        pci.reset();
+        assert_eq!(pci.bmide_io, [0; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize]);
+        assert_eq!(pci.bmide_io_base(), None);
     }
 
     /// Spec: Bus Master IDE Interface Rev. 1.0 §1.2; Intel 82371SB §2.7.
