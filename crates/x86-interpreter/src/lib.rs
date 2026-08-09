@@ -622,7 +622,7 @@ pub enum ProtectedModeDeliveryError {
     GdtRead(u64),
     #[error("target code segment is not present")]
     TargetNotPresent,
-    #[error("target descriptor is not a same-CPL executable code segment")]
+    #[error("target descriptor is not a usable executable code segment")]
     TargetCode,
     #[error("16-bit gate target descriptor is not a 16-bit code segment")]
     TargetNot16Bit,
@@ -634,6 +634,14 @@ pub enum ProtectedModeDeliveryError {
     CurrentPrivilege,
     #[error("current stack is not 16-bit")]
     StackWidth,
+    #[error("TR does not reference a usable 32-bit TSS")]
+    TssInvalid,
+    #[error("TSS limit excludes the inner-level stack pointers")]
+    TssLimit,
+    #[error("TSS read failed at {0:#x}")]
+    TssRead(u64),
+    #[error("inner-level stack selector is invalid")]
+    InnerStackSelector,
     #[error("stack limit excludes the protected-mode frame")]
     StackLimit,
     #[error("stack read failed at {0:#x}")]
@@ -1578,14 +1586,19 @@ fn set_stack_pointer(cpu: &mut CpuState, value: u32) {
     }
 }
 
-/// Step a stack pointer, wrapping modulo 2^32 (`B=1`) or 2^16 (`B=0`).
-fn stack_step(cpu: &CpuState, base: u32, delta: i32) -> u32 {
+/// Step a stack pointer with an explicit `SS.B` width.
+fn stack_step_width(addr_size_32: bool, base: u32, delta: i32) -> u32 {
     let stepped = base.wrapping_add(delta as u32);
-    if stack_addr_size_32(cpu) {
+    if addr_size_32 {
         stepped
     } else {
         u32::from(stepped as u16)
     }
+}
+
+/// Step a stack pointer, wrapping modulo 2^32 (`B=1`) or 2^16 (`B=0`).
+fn stack_step(cpu: &CpuState, base: u32, delta: i32) -> u32 {
+    stack_step_width(stack_addr_size_32(cpu), base, delta)
 }
 
 /// Stack push without `#SS` classification (used by IVT delivery itself).
@@ -2096,17 +2109,19 @@ fn parse_stack_segment_descriptor(
     Ok((parsed.base, parsed.limit, parsed.flags))
 }
 
-/// Prepare a protected-mode SS cache without mutating CPU state.
-fn prepare_ss_from_gdt(
+/// Prepare a stack-segment cache for a specific CPL (privilege-change delivery).
+///
+/// Spec: Intel SDM Vol. 3 §6.12.1 (stack switch), §5.4.1 / §5.7 (SS checks).
+fn prepare_ss_from_gdt_for_cpl(
     cpu: &CpuState,
     bus: &mut dyn Bus,
     selector: u16,
+    cpl: u8,
 ) -> Result<x86_core::SegmentReg, ExecError> {
     if is_null_selector(selector) {
         return Err(selector_fault(13, selector));
     }
     let descriptor = read_gdt_segment_descriptor(cpu, bus, selector)?;
-    let cpl = (cpu.cs.selector & 3) as u8;
     let (base, limit, flags) = parse_stack_segment_descriptor(descriptor, selector, cpl)?;
     Ok(x86_core::SegmentReg {
         selector,
@@ -2114,6 +2129,73 @@ fn prepare_ss_from_gdt(
         limit,
         flags,
     })
+}
+
+/// Read `SSn:ESPn` for an inner privilege level from the current 32-bit TSS.
+///
+/// Spec: Intel SDM Vol. 3 §6.12.1 Figure 6-5; §7.2.1 (TSS offsets).
+fn read_tss32_inner_stack(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    new_cpl: u8,
+    vector: u8,
+) -> Result<(u16, u32), ExecError> {
+    let type_field = (cpu.tr.flags & 0x0F) as u8;
+    if type_field != DESC_TYPE_TSS32_BUSY && type_field != DESC_TYPE_TSS32_AVAILABLE {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TssInvalid,
+        ));
+    }
+    if cpu.tr.limit < TSS32_MIN_LIMIT {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TssLimit,
+        ));
+    }
+    let (esp_off, ss_off) = match new_cpl {
+        0 => (4u32, 8u32),
+        1 => (12, 16),
+        2 => (20, 24),
+        _ => {
+            return Err(protected_mode_delivery_error(
+                vector,
+                ProtectedModeDeliveryError::TssInvalid,
+            ));
+        }
+    };
+    if ss_off + 1 > cpu.tr.limit {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TssLimit,
+        ));
+    }
+    let base = cpu.tr.base;
+    let mut esp_bytes = [0u8; 4];
+    for (index, byte) in esp_bytes.iter_mut().enumerate() {
+        let addr = base.wrapping_add(u64::from(esp_off) + index as u64);
+        *byte = bus.read_system_u8(addr).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::TssRead(addr))
+        })?;
+    }
+    let mut ss_bytes = [0u8; 2];
+    for (index, byte) in ss_bytes.iter_mut().enumerate() {
+        let addr = base.wrapping_add(u64::from(ss_off) + index as u64);
+        *byte = bus.read_system_u8(addr).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::TssRead(addr))
+        })?;
+    }
+    Ok((u16::from_le_bytes(ss_bytes), u32::from_le_bytes(esp_bytes)))
+}
+
+/// Prepare a protected-mode SS cache without mutating CPU state.
+fn prepare_ss_from_gdt(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<x86_core::SegmentReg, ExecError> {
+    let cpl = (cpu.cs.selector & 3) as u8;
+    prepare_ss_from_gdt_for_cpl(cpu, bus, selector, cpl)
 }
 
 /// Protected-mode load of SS from the GDT.
@@ -3962,22 +4044,22 @@ impl ProtectedGateSource {
     }
 }
 
-/// Deliver one interrupt or architectural fault through a same-CPL 286 (16-bit)
-/// or 386 (32-bit) protected-mode interrupt or trap gate.
+/// Deliver one interrupt or architectural fault through a 286 (16-bit) or 386
+/// (32-bit) protected-mode interrupt or trap gate.
 ///
 /// Gate types `0x6`/`0x7` build a 16-bit `FLAGS`/`CS`/`IP` frame and require a
 /// `D=0` current and target code segment. Gate types `0xE`/`0xF` build a
 /// 32-bit `EFLAGS`/`CS`/`EIP` frame (with a doubleword error code where
 /// applicable), take the entry `EIP` from the gate offset high and low words,
 /// and accept a `D=0` or `D=1` target. The frame element width comes from the
-/// gate type while the stack-pointer width comes from the cached `SS.B` bit.
+/// gate type while the stack-pointer width comes from the destination `SS.B`.
 ///
-/// This bounded path validates the complete IDT gate and GDT target
-/// before touching the stack. It then snapshots every frame byte and rolls all
-/// writes back if a stack write fails, committing CS:EIP, SP/ESP, and flags
-/// only after the complete frame is resident. Delivery-time failures are
-/// returned as [`ExecError::ProtectedModeExceptionDelivery`]; nested
-/// #DF/triple-fault machinery is deliberately outside this slice.
+/// When the target code segment's DPL is less than CPL, delivery performs a
+/// privilege-changing stack switch: `SSn:ESPn` are read from the current
+/// 32-bit TSS, the new SS is validated at the inner CPL, and the outer
+/// `SS:ESP` are pushed ahead of the ordinary frame (Vol. 3 §6.12.1 Figure 6-5).
+/// Inner-stack accesses use supervisor mode (§4.6.1). Same-CPL delivery is
+/// unchanged. Task gates, VM86, and nested #DF/triple-fault remain out of scope.
 ///
 /// Gate DPL is checked only for software INT/INT3/INTO. A violation raises
 /// #GP with IDT=1 and EXT=0; faults, NMI, and external IRQs bypass gate DPL.
@@ -4091,13 +4173,18 @@ fn deliver_protected_mode_gate(
     }
     let system = target_access & 0x10 == 0;
     let executable = target_access & 0x08 != 0;
+    let conforming = executable && target_access & 0x04 != 0;
     let dpl = (target_access >> 5) & 3;
-    if system || !executable || dpl != cpl {
+    // Same-CPL: DPL == CPL. Privilege-changing: nonconforming DPL < CPL.
+    // Spec: Intel SDM Vol. 3 §6.12.1.
+    let privilege_change = dpl < cpl;
+    if system || !executable || dpl > cpl || (privilege_change && conforming) {
         return Err(protected_mode_delivery_error(
             vector,
             ProtectedModeDeliveryError::TargetCode,
         ));
     }
+    let new_cpl = dpl;
 
     let parsed_target = parse_segment_descriptor(descriptor);
     if parsed_target.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
@@ -4127,31 +4214,64 @@ fn deliver_protected_mode_gate(
         ));
     }
 
-    // Intel push order is FLAGS, CS, IP, then the exception error code. The
-    // final lowest address therefore contains error code (when present), IP,
-    // CS, FLAGS. All addresses and original bytes are collected before writes.
-    // The element width comes from the gate type; the stack-pointer width from
-    // the cached `SS.B` bit (SDM Vol. 1 §6.2.2).
+    // Privilege-changing delivery loads SS:ESP from the TSS, then pushes the
+    // outer SS:ESP before the ordinary FLAGS/CS/IP[/error] frame (Figure 6-5).
+    // Same-CPL keeps the current stack. Spec: Intel SDM Vol. 3 §6.12.1.
     let error_code = source.error_code();
     let entry_size: usize = if gate32 { 4 } else { 2 };
-    let mut frame_entries = Vec::with_capacity(if error_code.is_some() { 4 } else { 3 });
     let saved_flags = if gate32 {
         cpu.rflags as u32
     } else {
         u32::from(cpu.rflags as u16)
     };
+    let old_ss = cpu.ss.selector;
+    let old_sp = stack_pointer(cpu);
+
+    let (stack_seg, mut final_sp, system_stack_access) = if privilege_change {
+        let (ss_sel, esp) = read_tss32_inner_stack(cpu, bus, new_cpl, vector)?;
+        let loaded = prepare_ss_from_gdt_for_cpl(cpu, bus, ss_sel, new_cpl).map_err(|err| {
+            match err {
+                ExecError::ArchFault { .. } | ExecError::MemoryFault(_) => {
+                    protected_mode_delivery_error(
+                        vector,
+                        ProtectedModeDeliveryError::InnerStackSelector,
+                    )
+                }
+                other => other,
+            }
+        })?;
+        (loaded, esp, true)
+    } else {
+        (cpu.ss.clone(), old_sp, false)
+    };
+
+    let mut frame_entries = Vec::with_capacity(if privilege_change {
+        if error_code.is_some() {
+            6
+        } else {
+            5
+        }
+    } else if error_code.is_some() {
+        4
+    } else {
+        3
+    });
+    if privilege_change {
+        frame_entries.push(u32::from(old_ss));
+        frame_entries.push(old_sp);
+    }
     // The `CS.D=1` rejection above guarantees a 16-bit gate's return EIP fits.
     frame_entries.extend([saved_flags, u32::from(cpu.cs.selector), return_ip]);
     if let Some(code) = error_code {
         frame_entries.push(code);
     }
 
-    let mut final_sp = stack_pointer(cpu);
+    let stack_b32 = stack_seg.default_big();
     let mut desired_bytes = Vec::with_capacity(frame_entries.len() * entry_size);
     for entry in frame_entries {
-        final_sp = stack_step(cpu, final_sp, -(entry_size as i32));
-        let addr =
-            checked_linear_addr(&cpu.ss, u64::from(final_sp), entry_size as u64).map_err(|_| {
+        final_sp = stack_step_width(stack_b32, final_sp, -(entry_size as i32));
+        let addr = checked_linear_addr(&stack_seg, u64::from(final_sp), entry_size as u64)
+            .map_err(|_| {
                 protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackLimit)
             })?;
         let bytes = entry.to_le_bytes();
@@ -4162,7 +4282,12 @@ fn deliver_protected_mode_gate(
 
     let mut planned_writes = Vec::with_capacity(desired_bytes.len());
     for (addr, value) in desired_bytes {
-        let original = bus.read_u8(addr).map_err(|_| {
+        let original = if system_stack_access {
+            bus.read_system_u8(addr)
+        } else {
+            bus.read_u8(addr)
+        }
+        .map_err(|_| {
             protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackRead(addr))
         })?;
         planned_writes.push((addr, original, value));
@@ -4170,12 +4295,20 @@ fn deliver_protected_mode_gate(
 
     for index in 0..planned_writes.len() {
         let (addr, _, value) = planned_writes[index];
-        if bus.write_u8(addr, value).is_err() {
+        let write_ok = if system_stack_access {
+            bus.write_system_u8(addr, value)
+        } else {
+            bus.write_u8(addr, value)
+        };
+        if write_ok.is_err() {
             let mut rollback_failure = None;
-            // Include the failed byte in case a bus reported failure after a
-            // side effect; continue restoring earlier bytes after any error.
             for &(restore_addr, original, _) in planned_writes[..=index].iter().rev() {
-                if bus.write_u8(restore_addr, original).is_err() && rollback_failure.is_none() {
+                let restore_ok = if system_stack_access {
+                    bus.write_system_u8(restore_addr, original)
+                } else {
+                    bus.write_u8(restore_addr, original)
+                };
+                if restore_ok.is_err() && rollback_failure.is_none() {
                     rollback_failure = Some(restore_addr);
                 }
             }
@@ -4187,9 +4320,16 @@ fn deliver_protected_mode_gate(
         }
     }
 
-    set_stack_pointer(cpu, final_sp);
+    if privilege_change {
+        cpu.ss = stack_seg;
+    }
+    if stack_b32 {
+        cpu.set_gpr_u32(CpuState::RSP, final_sp);
+    } else {
+        cpu.set_gpr_u16(CpuState::RSP, final_sp as u16);
+    }
     cpu.cs.load_descriptor_cache(
-        (target_selector & !3) | u16::from(cpl),
+        (target_selector & !3) | u16::from(new_cpl),
         parsed_target.base,
         parsed_target.limit,
         parsed_target.flags,
@@ -8489,7 +8629,7 @@ mod tests {
                 encode_seg_desc(0x2000, 0xFFFF, 0x92, 0),
                 15,
                 PROTECTED_TEST_HANDLER,
-                "same-CPL executable code",
+                "usable executable code",
             ),
             (
                 "ring 1 code",
@@ -8497,7 +8637,7 @@ mod tests {
                 encode_seg_desc(0x2000, 0xFFFF, 0xBA, 0),
                 15,
                 PROTECTED_TEST_HANDLER,
-                "same-CPL executable code",
+                "usable executable code",
             ),
             (
                 "default-32 code",
