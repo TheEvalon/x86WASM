@@ -20,6 +20,7 @@ use x86_decode::DecodeError;
 use x86_interpreter::ExecError;
 
 use crate::ports::{UnclaimedPortAccess, UnmappedMmioAccess};
+use crate::step_clock::StepClock;
 use crate::{Machine, MachineError};
 
 /// Bytes of instruction stream captured at the failure site.
@@ -97,6 +98,96 @@ impl fmt::Display for PostFailureKind {
     }
 }
 
+/// Legacy prefix bytes that may precede an opcode.
+///
+/// Spec: Intel SDM Vol. 2 §2.1.1 — group 1 lock/repeat (`F0`, `F2`, `F3`),
+/// group 2 segment override and branch hints (`2E`, `36`, `3E`, `26`, `64`,
+/// `65`), group 3 operand size (`66`), group 4 address size (`67`).
+const LEGACY_PREFIXES: [u8; 11] = [
+    0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3,
+];
+
+/// Two-byte opcode escape.
+const OPCODE_ESCAPE: u8 = 0x0F;
+/// Three-byte opcode escapes following [`OPCODE_ESCAPE`].
+const OPCODE_ESCAPE_3BYTE: [u8; 2] = [0x38, 0x3A];
+
+/// The prefixes and the full opcode at a failure site.
+///
+/// The decoder reports only the byte its tables missed, so a two-byte opcode
+/// such as `0F 85` surfaces as `0x85`. Recovering the escape and any prefixes
+/// from the captured instruction window keeps the report honest about which
+/// encoding is actually missing.
+///
+/// Spec: Intel SDM Vol. 2 §2.1.1 (instruction format: prefixes, then a one-,
+/// two-, or three-byte opcode).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpcodeSite {
+    /// Legacy prefixes preceding the opcode, in stream order.
+    pub prefixes: Vec<u8>,
+    /// Opcode bytes including any `0F` / `0F 38` / `0F 3A` escape.
+    pub opcode: Vec<u8>,
+}
+
+impl OpcodeSite {
+    /// Recover the site from a captured opcode window.
+    ///
+    /// Returns `None` when the window holds no complete opcode (every byte a
+    /// prefix, or an escape with nothing after it).
+    pub fn from_window(window: &[Option<u8>; POST_OPCODE_WINDOW_LEN]) -> Option<Self> {
+        let mut prefixes = Vec::new();
+        let mut index = 0;
+        while let Some(Some(byte)) = window.get(index) {
+            if !LEGACY_PREFIXES.contains(byte) {
+                break;
+            }
+            prefixes.push(*byte);
+            index += 1;
+        }
+
+        let first = (*window.get(index)?)?;
+        let mut opcode = vec![first];
+        if first == OPCODE_ESCAPE {
+            index += 1;
+            let second = (*window.get(index)?)?;
+            opcode.push(second);
+            if OPCODE_ESCAPE_3BYTE.contains(&second) {
+                index += 1;
+                let third = (*window.get(index)?)?;
+                opcode.push(third);
+            }
+        }
+        Some(Self { prefixes, opcode })
+    }
+
+    /// Whether the decoder's reported byte is this site's final opcode byte.
+    ///
+    /// A mismatch means the window and the decode error disagree (a wrapped
+    /// fetch, say), in which case the raw decoder byte is reported instead.
+    pub fn reports(&self, decoded: u8) -> bool {
+        self.opcode.last() == Some(&decoded)
+    }
+}
+
+impl fmt::Display for OpcodeSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, byte) in self.opcode.iter().enumerate() {
+            if index != 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "0x{byte:02X}")?;
+        }
+        if !self.prefixes.is_empty() {
+            f.write_str(" (prefixes")?;
+            for byte in &self.prefixes {
+                write!(f, " {byte:02X}")?;
+            }
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
+}
+
 /// Where and how the first failure happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostFailure {
@@ -109,12 +200,41 @@ pub struct PostFailure {
     pub opcode_bytes: [Option<u8>; POST_OPCODE_WINDOW_LEN],
 }
 
+impl PostFailure {
+    /// Prefixes and full opcode recovered from the captured window.
+    pub fn opcode_site(&self) -> Option<OpcodeSite> {
+        OpcodeSite::from_window(&self.opcode_bytes)
+    }
+
+    /// The stop-reason text, naming the whole opcode rather than the single
+    /// byte the decode tables missed.
+    fn kind_text(&self) -> String {
+        let site = match self.opcode_site() {
+            Some(site) => site,
+            None => return self.kind.to_string(),
+        };
+        match self.kind {
+            PostFailureKind::UnsupportedOpcode(op) if site.reports(op) => {
+                format!("unsupported opcode {site}")
+            }
+            PostFailureKind::UnsupportedEncoding(op) if site.reports(op) => {
+                format!("unsupported encoding for opcode {site}")
+            }
+            _ => self.kind.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for PostFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{} cs:ip={:04X}:{:04X} rip=0x{:016X} linear_pc=0x{:016X} opcode_bytes=[",
-            self.kind, self.cs, self.ip, self.rip, self.linear_pc
+            self.kind_text(),
+            self.cs,
+            self.ip,
+            self.rip,
+            self.linear_pc
         )?;
         for (index, byte) in self.opcode_bytes.iter().enumerate() {
             if index != 0 {
@@ -245,10 +365,21 @@ impl Machine {
     /// (or reset explicitly) first. Diagnostic logging is armed for the duration
     /// of the run only, and the POST checkpoint history is cleared so the report
     /// covers this run alone.
+    ///
+    /// A time source is armed the same way: when the host has not configured a
+    /// [`StepClock`], the probe installs [`StepClock::enabled_default`] for the
+    /// run and restores the previous configuration afterwards. Without it,
+    /// firmware that waits on the PIT or the RTC exhausts the step budget in a
+    /// delay loop and the probe measures nothing. A host-configured clock is
+    /// left exactly as it was set.
     pub fn probe_post(&mut self, max_steps: u64) -> PostReport {
         self.ports.clear_diagnostics();
         self.post_diag.reset();
         self.ports.set_probe(true);
+        let host_clock = self.step_clock();
+        if !host_clock.enabled {
+            self.set_step_clock(StepClock::enabled_default());
+        }
 
         let mut steps = 0u64;
         let stop = loop {
@@ -265,6 +396,9 @@ impl Machine {
         };
 
         self.ports.set_probe(false);
+        if !host_clock.enabled {
+            self.set_step_clock(host_clock);
+        }
         PostReport {
             steps,
             stop,

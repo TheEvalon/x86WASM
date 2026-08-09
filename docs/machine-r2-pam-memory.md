@@ -143,3 +143,67 @@ Not supported
   writes dropped, which is what real hardware does before PAM is programmed.
 - The copy is a plain byte copy: no cacheability, no write combining, and no
   modeling of the fetch-versus-data distinction during the transition.
+
+## 3. Instruction-count step clock
+
+Specs
+
+- Intel 8254 Programmable Interval Timer datasheet — the counter is clocked by
+  the external CLK input; the IBM PC/AT drives it at 1.193182 MHz
+  (14.31818 MHz ÷ 12).
+- Motorola MC146818A — the periodic interrupt rate comes from the Status A RS
+  field (POST default `0110b` = 1024 Hz), and the update cycle runs once per
+  second; Status C UF latches at update-ended.
+- Intel 8259A — master IR0 carries PIT channel 0.
+
+Model choice (explicitly not accurate timing)
+
+- Device time is tied to **retired instructions**, not wall clock, so a run is
+  reproducible. Each retired instruction charges `pit_clocks_per_step` PIT
+  input clocks (default 1). Every `PIT_CLOCKS_PER_CMOS_PERIOD` (1165 =
+  1_193_182 ÷ 1024) accumulated clocks runs one `tick_cmos` period, and every
+  `PIT_CLOCKS_PER_SECOND` (1_193_182) accumulated clocks runs one
+  `tick_cmos_second`. Remainders carry across steps.
+- With the default ratio the guest sees a machine retiring 1.193182 million
+  instructions per emulated second. That number is **not** derived from any
+  processor's IPC and is not host real time; firmware that measures the CPU
+  against the PIT will compute a nonsense frequency. The ratio exists so timer
+  polling loops terminate deterministically, and it is configurable
+  (`StepClock::with_pit_clocks_per_step`).
+- The clock is **off by default**, so `Machine::step` behaves exactly as before
+  and every existing test that ticks devices by hand is unaffected.
+- `Machine::probe_post` arms `StepClock::enabled_default()` for the duration of
+  a run when the host has not configured one, and restores the previous
+  configuration afterwards. A host-configured clock is used as-is. The probe is
+  a diagnostic, and a firmware `usleep` that never returns measures nothing.
+- Only a **retired** instruction charges the clock: a step that fails does not,
+  and the charge happens before a latched 8042 / port `0x92` system reset is
+  serviced, so a reset never sees ticks applied to freshly reset devices.
+- `Machine::reset` drops partial quanta and keeps the configuration, matching
+  the way host-configured fw_cfg state survives a reset.
+
+Not supported
+
+- No wall-clock or host-monotonic source, no TSC / HPET / APIC timer, no
+  per-instruction cost model (every instruction is one step), and no PIT gate
+  or latency modeling beyond the existing device model.
+- The RTC periodic quantum is derived from the nominal 1024 Hz POST default,
+  not from the guest's current Status A RS field, so reprogramming RS does not
+  change how fast periods accumulate.
+- PIT channels 1 and 2 are advanced only as far as the existing `tick_pit`
+  helper does (channel 0 plus channel 2); the channel-1 refresh counter still
+  needs `tick_ch1`.
+
+### POST probe opcode reporting
+
+The stop-reason line named a two-byte opcode by its second byte, so the pinned
+SeaBIOS stop printed `unsupported opcode 0x85` for what is really `0F 85`. The
+decoder only reports the byte its tables missed, so `PostFailure` now
+reconstructs the site from the captured window (`OpcodeSite::from_window`):
+legacy prefixes per Intel SDM Vol. 2 §2.1.1 are skipped and reported
+separately, and `0F` / `0F 38` / `0F 3A` escapes are included, giving
+`unsupported opcode 0x0F 0x85` and `... (prefixes 66)` when prefixed. The
+`PostFailureKind::UnsupportedOpcode(u8)` payload is unchanged — it is still the
+decoder's byte — and the reconstruction is used only when its final opcode byte
+agrees with that payload. REX and VEX/EVEX prefixes are not recognized (no
+long mode here).

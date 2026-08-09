@@ -14,6 +14,7 @@ mod mem;
 mod ports;
 mod post_code;
 mod post_probe;
+mod step_clock;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
@@ -28,8 +29,12 @@ pub use ports::{
 };
 pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
 pub use post_probe::{
-    seabios_image_path, PostFailure, PostFailureKind, PostReport, PostStopReason,
+    seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
     DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
+};
+pub use step_clock::{
+    StepClock, StepTicks, CMOS_PERIODIC_HZ, DEFAULT_PIT_CLOCKS_PER_STEP,
+    PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
 };
 
 use devices::{
@@ -102,6 +107,8 @@ pub struct Machine {
     pub fw_cfg: FwCfg,
     /// POST checkpoint latch on the manufacturing diagnostic port `0x80`.
     pub post_diag: PostCodePort,
+    /// Instruction-count time source for the PIT / RTC (disabled by default).
+    step_clock: StepClock,
     ports: PortBus,
 }
 
@@ -126,7 +133,44 @@ impl Machine {
             fdc: Fdc82077::new(),
             fw_cfg: FwCfg::with_ram_size(ram_size as u64),
             post_diag: PostCodePort::new(),
+            step_clock: StepClock::disabled(),
             ports: PortBus::new(),
+        }
+    }
+
+    /// Current instruction-count time source configuration.
+    pub fn step_clock(&self) -> StepClock {
+        self.step_clock
+    }
+
+    /// Install an instruction-count time source (see [`StepClock`]).
+    ///
+    /// Off by default. The step-to-tick ratio is a documented model choice, not
+    /// accurate timing: see `docs/machine-r2-pam-memory.md`. Accumulators start
+    /// fresh so a configuration change never carries a partial quantum over.
+    pub fn set_step_clock(&mut self, mut clock: StepClock) {
+        clock.reset_accumulators();
+        self.step_clock = clock;
+    }
+
+    /// Charge one retired instruction to the time source.
+    ///
+    /// Spec: Intel 8254 (CLK-driven counter) and Motorola MC146818A (periodic
+    /// quantum + one-second update cycle), driven from the retired-instruction
+    /// count rather than host wall clock so a run is reproducible.
+    fn advance_step_clock(&mut self) {
+        let ticks = self.step_clock.charge_step();
+        if ticks.is_empty() {
+            return;
+        }
+        if ticks.pit_clocks > 0 {
+            self.tick_pit(ticks.pit_clocks);
+        }
+        if ticks.cmos_periods > 0 {
+            self.tick_cmos(ticks.cmos_periods);
+        }
+        for _ in 0..ticks.cmos_seconds {
+            self.tick_cmos_second();
         }
     }
 
@@ -249,6 +293,9 @@ impl Machine {
         self.fdc.reset();
         self.fw_cfg.reset();
         self.post_diag.reset();
+        // Configuration survives reset (like the fw_cfg host configuration);
+        // only partial timer quanta are dropped.
+        self.step_clock.reset_accumulators();
         // Spec: Intel 440FX PMC — PAM0-PAM6 reset to 0x00 (read from ROM, no
         // DRAM writes). Shadow contents survive, like DRAM across PCIRST#.
         self.mem.reset_pam();
@@ -334,6 +381,9 @@ impl Machine {
             };
             step(&mut self.cpu, &mut view)?;
         }
+        // The instruction retired, so it is charged to the time source before a
+        // latched system reset can restore the devices it just advanced.
+        self.advance_step_clock();
         // Spec: OSDev I8042 / A20 Line — system-reset after OUT (CPU not in bus view).
         let _ = self.service_8042_pulse_reset();
         Ok(())

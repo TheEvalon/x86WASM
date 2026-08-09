@@ -69,6 +69,49 @@ fn probe_reports_first_unsupported_opcode_with_opcode_window() {
     assert_eq!(report.steps, 2);
 }
 
+/// A two-byte opcode is named in full, not by the second byte alone.
+///
+/// Spec: Intel SDM Vol. 2 §2.1.1 — an instruction is prefixes followed by a
+/// one-, two-, or three-byte opcode; `0F 85` is the two-byte near `JNZ`, which
+/// is where the pinned SeaBIOS image stops. The decoder reports only the byte
+/// its tables missed, so the report reconstructs the escape from the window.
+#[test]
+fn probe_names_two_byte_opcode_with_its_escape() {
+    // 0F 85 rel16 (near JNZ) — not in the decode tables.
+    let rom = bios_rom_with_code(&[0x0F, 0x85, 0x8E, 0xF9]);
+    let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
+
+    let report = m.probe_post(16);
+
+    let failure = report.failure().expect("first failure recorded");
+    let site = failure.opcode_site().expect("opcode recovered from window");
+    assert_eq!(site.opcode, vec![0x0F, 0x85]);
+    assert!(site.prefixes.is_empty());
+    let text = report.to_string();
+    assert!(text.contains("unsupported opcode 0x0F 0x85"), "{text}");
+    assert!(!text.contains("unsupported opcode 0x85 "), "{text}");
+}
+
+/// Prefixes are reported alongside the opcode instead of being swallowed.
+#[test]
+fn probe_names_prefixes_before_the_opcode() {
+    // 66 0F 85 rel32 — operand-size prefixed near JNZ.
+    let rom = bios_rom_with_code(&[0x66, 0x0F, 0x85, 0x00, 0x01, 0x00, 0x00]);
+    let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
+
+    let report = m.probe_post(16);
+
+    let failure = report.failure().expect("first failure recorded");
+    let site = failure.opcode_site().expect("opcode recovered from window");
+    assert_eq!(site.prefixes, vec![0x66]);
+    assert_eq!(site.opcode, vec![0x0F, 0x85]);
+    let text = report.to_string();
+    assert!(
+        text.contains("unsupported opcode 0x0F 0x85 (prefixes 66)"),
+        "{text}"
+    );
+}
+
 /// Ports no device claims are recorded (port, direction, size, first value).
 #[test]
 fn probe_records_unclaimed_port_accesses() {
