@@ -1147,9 +1147,11 @@ mod tests {
 
         // Truncated escape / unknown secondary.
         assert_eq!(decode(&[0x0F]), Err(DecodeError::Truncated));
+        // GRP6 (0F 00) needs a ModRM byte.
+        assert_eq!(decode(&[0x0F, 0x00]), Err(DecodeError::Truncated));
         assert!(matches!(
-            decode(&[0x0F, 0x00]),
-            Err(DecodeError::UnsupportedOpcode(0x00))
+            decode(&[0x0F, 0x04]),
+            Err(DecodeError::UnsupportedOpcode(0x04))
         ));
         // Primary AF remains SCASW (not two-byte).
         let d = decode(&[0xAF]).unwrap();

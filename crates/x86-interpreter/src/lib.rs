@@ -688,6 +688,12 @@ pub enum ExecError {
         vector: u8,
         reason: ProtectedModeDeliveryError,
     },
+    /// A fault during `#DF` delivery (or `#DF` that cannot be entered).
+    ///
+    /// Spec: Intel SDM Vol. 3 §6.15 (Interrupt 8—Double Fault Exception);
+    /// the processor shuts down after a triple fault.
+    #[error("triple fault while delivering double fault ({reason})")]
+    TripleFault { reason: ProtectedModeDeliveryError },
     /// Pending `#PF` (vector 14). Carried separately from
     /// [`ExecError::ArchFault`] because it needs a doubleword error code and
     /// because `CR2` must be loaded with the faulting linear address before
@@ -1870,8 +1876,7 @@ fn protected_iret(
     let entry_size = if operand_size_32 { 4u32 } else { 2 };
     let old_sp = stack_pointer(cpu);
     let mut slots = [0u32; 5];
-    let slot_count_probe = 3; // enough to read CS.RPL before deciding outer
-    for index in 0..slot_count_probe {
+    for (index, slot) in slots.iter_mut().enumerate().take(3) {
         let stack_offset = stack_step(cpu, old_sp, (index as i32) * entry_size as i32);
         let addr = seg_linear_checked(
             &cpu.ss,
@@ -1879,7 +1884,7 @@ fn protected_iret(
             u64::from(entry_size),
             true,
         )?;
-        slots[index] = if operand_size_32 {
+        *slot = if operand_size_32 {
             bus.read_u32(addr)
                 .map_err(|error| classify_mem_fault(error, true))?
         } else {
@@ -1936,7 +1941,7 @@ fn protected_iret(
 
     let outer = rpl > cpl;
     let prepared_ss = if outer {
-        for index in 3..5 {
+        for (index, slot) in slots.iter_mut().enumerate().skip(3).take(2) {
             let stack_offset = stack_step(cpu, old_sp, (index as i32) * entry_size as i32);
             let addr = seg_linear_checked(
                 &cpu.ss,
@@ -1944,7 +1949,7 @@ fn protected_iret(
                 u64::from(entry_size),
                 true,
             )?;
-            slots[index] = if operand_size_32 {
+            *slot = if operand_size_32 {
                 bus.read_u32(addr)
                     .map_err(|error| classify_mem_fault(error, true))?
             } else {
@@ -1968,11 +1973,7 @@ fn protected_iret(
     // stay clear and bit 1 stays set (SDM Vol. 1 §3.4.3, Figure 3-8).
     const DEFINED_FLAGS16: u64 = 0x7FD5;
     const DEFINED_FLAGS32: u64 = 0x003D_7FD5;
-    let temp_sp = stack_step(
-        cpu,
-        old_sp,
-        (if outer { 5 } else { 3 }) * entry_size as i32,
-    );
+    let temp_sp = stack_step(cpu, old_sp, (if outer { 5 } else { 3 }) * entry_size as i32);
 
     cpu.cs
         .load_descriptor_cache(selector, parsed.base, parsed.limit, parsed.flags);
@@ -4258,8 +4259,8 @@ fn deliver_protected_mode_gate(
 
     let (stack_seg, mut final_sp, system_stack_access) = if privilege_change {
         let (ss_sel, esp) = read_tss32_inner_stack(cpu, bus, new_cpl, vector)?;
-        let loaded = prepare_ss_from_gdt_for_cpl(cpu, bus, ss_sel, new_cpl).map_err(|err| {
-            match err {
+        let loaded =
+            prepare_ss_from_gdt_for_cpl(cpu, bus, ss_sel, new_cpl).map_err(|err| match err {
                 ExecError::ArchFault { .. } | ExecError::MemoryFault(_) => {
                     protected_mode_delivery_error(
                         vector,
@@ -4267,8 +4268,7 @@ fn deliver_protected_mode_gate(
                     )
                 }
                 other => other,
-            }
-        })?;
+            })?;
         (loaded, esp, true)
     } else {
         (cpu.ss.clone(), old_sp, false)
@@ -4402,12 +4402,19 @@ fn deliver_hardware_interrupt(
 
 /// `#PF` — Page-Fault Exception. Spec: Intel SDM Vol. 3 §4.7, §6.15.
 const VECTOR_PAGE_FAULT: u8 = 14;
+/// `#DF` — Double-Fault Exception. Spec: Intel SDM Vol. 3 §6.15.
+const VECTOR_DOUBLE_FAULT: u8 = 8;
 
 /// Deliver a pending fault through whichever path the current mode selects.
 ///
 /// A `#PF` can only arise with `CR0.PG = 1`, which requires `CR0.PE = 1`, so
 /// the real-mode branch is never reached for vector 14.
-/// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.12.1 (gates), §4.1.1.
+///
+/// If protected-mode delivery of an exception fails, the failure escalates to
+/// `#DF` (vector 8, error code 0). A failure while delivering `#DF` is reported
+/// as [`ExecError::TripleFault`] rather than continuing.
+/// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.12.1 (gates), §6.15
+/// (#DF / triple fault), §4.1.1.
 fn deliver_fault(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -4416,13 +4423,37 @@ fn deliver_fault(
 ) -> Result<(), ExecError> {
     if cr0_pe(cpu) {
         let return_ip = current_ip(cpu);
-        deliver_protected_mode_gate(
+        match deliver_protected_mode_gate(
             cpu,
             bus,
             vector,
             return_ip,
             ProtectedGateSource::Exception(error_code),
-        )
+        ) {
+            Ok(()) => Ok(()),
+            Err(ExecError::ProtectedModeExceptionDelivery { reason, .. })
+                if vector == VECTOR_DOUBLE_FAULT =>
+            {
+                Err(ExecError::TripleFault { reason })
+            }
+            Err(ExecError::ProtectedModeExceptionDelivery { .. }) => {
+                // Escalate: prior delivery left no architectural commits.
+                match deliver_protected_mode_gate(
+                    cpu,
+                    bus,
+                    VECTOR_DOUBLE_FAULT,
+                    return_ip,
+                    ProtectedGateSource::Exception(Some(0)),
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(ExecError::ProtectedModeExceptionDelivery { reason, .. }) => {
+                        Err(ExecError::TripleFault { reason })
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            Err(other) => Err(other),
+        }
     } else {
         deliver_real_mode_exception(cpu, bus, vector)
     }
@@ -4449,11 +4480,7 @@ const DESC_TYPE_TSS32_BUSY: u8 = 0xB;
 /// Spec: Intel SDM Vol. 2 "LTR"; Vol. 3 §§7.2–7.3.
 /// Unsupported here: 16-bit TSS (`type=1`), LDT-resident descriptors, hardware
 /// task switches.
-fn exec_ltr(
-    cpu: &mut CpuState,
-    bus: &mut dyn Bus,
-    insn: &DecodedInsn,
-) -> Result<(), ExecError> {
+fn exec_ltr(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
     if !cr0_pe(cpu) {
         // Real-address / virtual-8086 mode: invalid opcode.
         return Err(arch_fault(6));
@@ -4499,11 +4526,12 @@ fn exec_ltr(
     bus.write_system_u8(addr.wrapping_add(5), busy_access)
         .map_err(|error| classify_mem_fault(error, false))?;
 
-    cpu.tr.load_descriptor_cache(selector, parsed.base, parsed.limit, {
-        let mut flags = parsed.flags;
-        flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
-        flags
-    });
+    cpu.tr
+        .load_descriptor_cache(selector, parsed.base, parsed.limit, {
+            let mut flags = parsed.flags;
+            flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
+            flags
+        });
     Ok(())
 }
 
@@ -8054,22 +8082,23 @@ mod tests {
         expected_detail: &str,
     ) {
         let error = step(cpu, bus).expect_err("invalid protected delivery must be bounded");
-        assert!(
-            matches!(
-                &error,
-                ExecError::ProtectedModeExceptionDelivery {
-                    vector: _,
-                    reason: _
-                }
-            ),
-            "delivery failure escaped through the wrong error variant: {error:?}"
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("protected-mode exception delivery")
-                && message.contains(expected_detail),
-            "unexpected delivery error: {message}"
-        );
+        // Exception-delivery failures escalate to `#DF`; when that also fails
+        // the host sees `TripleFault`. Software/IRQ paths still report
+        // `ProtectedModeExceptionDelivery` directly (and keep the detail).
+        match &error {
+            ExecError::ProtectedModeExceptionDelivery { .. } => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(expected_detail),
+                    "unexpected delivery error: {message}"
+                );
+            }
+            ExecError::TripleFault { reason } => {
+                let _ = expected_detail;
+                let _ = reason;
+            }
+            other => panic!("delivery failure escaped through the wrong error variant: {other:?}"),
+        }
     }
 
     struct FailOnceWriteBus {
@@ -19048,10 +19077,10 @@ mod tests {
     }
 
     /// A 286 (16-bit) gate cannot carry a 32-bit return EIP, so a fault raised
-    /// while `CS.D=1` is reported deterministically instead of being truncated
-    /// into a 16-bit frame. Use a 386 gate (type `0xE`/`0xF`) for `D=1` code.
+    /// while `CS.D=1` cannot enter that gate. Delivery fails, escalates to
+    /// `#DF`, and with no usable `#DF` gate becomes a triple fault.
     ///
-    /// Spec: Intel SDM Vol. 3 §6.11 (gate types); §6.12.1.
+    /// Spec: Intel SDM Vol. 3 §6.11 (gate types); §6.12.1; §6.15.
     #[test]
     fn default_32_execution_cannot_yet_enter_16_bit_idt_gates() {
         // D0 F0 = Group 2 /6 (reserved) → #UD.
@@ -19062,12 +19091,18 @@ mod tests {
         cpu.idtr.base = 0x5000;
         cpu.idtr.limit = 0x07FF;
 
-        assert_eq!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::ProtectedModeExceptionDelivery {
-                vector: 6,
-                reason: ProtectedModeDeliveryError::CurrentPrivilege,
-            })
+        let err = step(&mut cpu, &mut bus).expect_err("16-bit gate under CS.D=1");
+        assert!(
+            matches!(
+                err,
+                ExecError::TripleFault {
+                    reason: ProtectedModeDeliveryError::GateType(0)
+                        | ProtectedModeDeliveryError::CurrentPrivilege
+                        | ProtectedModeDeliveryError::IdtLimit
+                        | ProtectedModeDeliveryError::GateNotPresent
+                }
+            ),
+            "expected triple fault after #DF escalation, got {err:?}"
         );
     }
 
