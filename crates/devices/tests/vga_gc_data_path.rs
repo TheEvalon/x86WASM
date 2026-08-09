@@ -23,7 +23,10 @@ const GC_DATA_ROTATE: u32 = 0x03;
 const GC_READ_MAP_SELECT: u32 = 0x04;
 const GC_MODE: u32 = 0x05;
 const GC_COLOR_DONT_CARE: u32 = 0x07;
+const GC_MISC: u32 = 0x06;
 const GC_BIT_MASK: u32 = 0x08;
+/// Miscellaneous: graphics mode, Chain Odd/Even clear, Memory Map Select `11`.
+const GC_MISC_GRAPHICS_B8000: u32 = 0x0D;
 
 /// Sequencer indexes.
 const SEQ_MAP_MASK: u32 = 0x02;
@@ -42,11 +45,14 @@ fn write_seq(vga: &mut VgaText, index: u32, value: u32) {
 }
 
 /// Planar addressing with every map write-enabled — the mode-11h-class setup
-/// the graphics write path is specified against.
+/// the graphics write path is specified against. Graphics Controller
+/// Miscellaneous also has to leave Chain Odd/Even clear (IBM Figure 2-74 OE);
+/// the window stays at `0xB8000` so the tests keep one address base.
 fn planar_all_maps() -> VgaText {
     let mut vga = VgaText::new();
     write_seq(&mut vga, SEQ_MEMORY_MODE, MEMORY_MODE_PLANAR);
     write_seq(&mut vga, SEQ_MAP_MASK, 0x0F);
+    write_gc(&mut vga, GC_MISC, GC_MISC_GRAPHICS_B8000);
     vga
 }
 

@@ -67,6 +67,10 @@ fn chain4_programming_selects_one_map_per_low_address_pair() {
 #[test]
 fn planar_programming_reports_map_mask_and_unshifted_offset() {
     let mut vga = VgaText::new();
+    // Graphics Controller Miscellaneous must also drop Chain Odd/Even
+    // (IBM Figure 2-74 OE) for planar host addressing; keep the B8000 window.
+    vga.port_write(devices::VGA_GC_INDEX, 1, 0x06);
+    vga.port_write(devices::VGA_GC_DATA, 1, 0x0D);
     write_seq(
         &mut vga,
         SEQ_MEMORY_MODE,

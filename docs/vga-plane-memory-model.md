@@ -42,6 +42,31 @@ the size, not what happens to a host access beyond the 64 KB configuration, so
 this model wraps the per-map offset within the enabled region
 (16 KiB per map when clear, 64 KiB when set).
 
+## CPU display window (Graphics Controller Miscellaneous, index `0x06`)
+
+Memory Map Select (bits 3:2) chooses which host addresses the video subsystem
+claims — IBM Figure 2-75 Video Memory Assignments:
+
+| Field | Window |
+|---|---|
+| `00` | `0xA0000`–`0xBFFFF` (128 KB) |
+| `01` | `0xA0000`–`0xAFFFF` (64 KB) |
+| `10` | `0xB0000`–`0xB7FFF` (32 KB) |
+| `11` | `0xB8000`–`0xBFFFF` (32 KB, mode-03h default) |
+
+Host offsets used by the plane decode are relative to the base of the selected
+window. Misc Output RAM Enable still gates every claim.
+
+`VgaText::read_u8` / `write_u8` are backed only by the legacy 32 KiB text buffer
+at `0xB8000`, so they claim the intersection of the selected window with that
+range: selecting `10` or `01` makes `0xB8000` accesses fall through to the bus,
+while addresses below `0xB8000` decode for the plane path but have no text
+buffer behind them.
+
+Chain Odd/Even (bit1, IBM Figure 2-74 OE) is an independent source of odd/even
+host addressing: either it or Sequencer Memory Mode bit2 selects odd/even, and
+Chain 4 still overrides both.
+
 ## Graphics Controller data path
 
 `VgaText::gc_read_u8` / `VgaText::gc_write_u8` operate on the four maps in

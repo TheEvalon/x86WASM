@@ -141,6 +141,12 @@
 //! - Misc Output store/readback (`0x3C2`/`0x3CC`); IOAS bit remaps Input Status
 //!   #1 and CRTC index/data ownership; RAM Enable (bit1) gates CPU text-plane
 //!   `read_u8`/`write_u8` (not clock select)
+//! - Graphics Controller Miscellaneous `0x06` decode: Memory Map Select
+//!   (bits 3:2) selects the CPU display window (`A0000` 128 KB / `A0000` 64 KB
+//!   / `B0000` 32 KB / `B8000` 32 KB) reported by [`VgaText::display_window`]
+//!   and enforced by [`VgaText::owns_display_addr`], `read_u8` / `write_u8`,
+//!   and the GC data path; Chain Odd/Even (bit1) is a second source of
+//!   odd/even host addressing; Graphics/Alphanumeric (bit0) is tracked
 //! - DAC / PEL store/readback: write index `0x3C8`, data `0x3C9` (R→G→B), read
 //!   index write / state read `0x3C7`; 256×3 RAM with mode-03h-ish defaults
 //! - PEL Mask `0x3C6` R/W store/readback (default `0xFF`) + display-path AND on
@@ -155,6 +161,12 @@
 //!   `write_u8` (used by `MachineBus`) still address the interleaved text
 //!   buffer directly, so guest writes do not flow through write modes, latches,
 //!   Map Mask, or the plane decode
+//! - Only the 32 KiB `0xB8000` text buffer backs `read_u8` / `write_u8`. A
+//!   Memory Map Select window reaching below `0xB8000` decodes for
+//!   [`VgaText::plane_access`] and the GC data path but is not claimed by the
+//!   text-buffer CPU path, and `MachineBus` routing still uses the static
+//!   [`VgaText::owns_addr`] text range
+//! - Graphics/Alphanumeric (Misc bit0) has no character-generator effect
 //! - Graphics Mode bit4 host odd/even *read* addressing does not steer read
 //!   mode 0 map selection (IBM Figure 2-71's odd/even note is ambiguous);
 //!   Shift Register Interleave and 256-Color Shift Mode have no effect
@@ -722,6 +734,43 @@ pub const VGA_GC_MISC: u8 = 0x06;
 /// (Chain Odd/Even + Memory Map Select `11` = `B8000`–`BFFFF`). Store/readback
 /// only; no memory-map / chain-odd/even side effects on the text plane.
 pub const VGA_GC_MISC_DEFAULT: u8 = 0x0E;
+/// Miscellaneous bit0 — Graphics / Alphanumeric Mode.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-74 GM — set selects graphics modes
+/// and disables the character generator latches. This model tracks the bit; it
+/// has no display-path effect because there is no renderer.
+pub const VGA_GC_MISC_GRAPHICS_MODE: u8 = 0x01;
+/// Miscellaneous bit1 — Chain Odd/Even Enable.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-74 OE — "directs the system address
+/// bit, A0, to be replaced by a higher-order bit. The odd map is then selected
+/// when A0 is 1, and the even map when A0 is 0."
+pub const VGA_GC_MISC_CHAIN_ODD_EVEN: u8 = 0x02;
+/// Miscellaneous bits 3:2 — Memory Map Select.
+pub const VGA_GC_MISC_MEMORY_MAP_MASK: u8 = 0x0C;
+/// Shift of the Memory Map Select field within Miscellaneous.
+pub const VGA_GC_MISC_MEMORY_MAP_SHIFT: u32 = 2;
+/// Memory Map Select `00` — `0xA0000` for 128 KB. Spec: IBM Figure 2-75.
+pub const VGA_GC_MEMORY_MAP_A0000_128K: u8 = 0b00;
+/// Memory Map Select `01` — `0xA0000` for 64 KB. Spec: IBM Figure 2-75.
+pub const VGA_GC_MEMORY_MAP_A0000_64K: u8 = 0b01;
+/// Memory Map Select `10` — `0xB0000` for 32 KB. Spec: IBM Figure 2-75.
+pub const VGA_GC_MEMORY_MAP_B0000_32K: u8 = 0b10;
+/// Memory Map Select `11` — `0xB8000` for 32 KB. Spec: IBM Figure 2-75.
+pub const VGA_GC_MEMORY_MAP_B8000_32K: u8 = 0b11;
+/// Base of the `0xA0000` display windows.
+pub const VGA_WINDOW_A0000_BASE: u64 = 0x000A_0000;
+/// Base of the `0xB0000` 32 KB display window.
+pub const VGA_WINDOW_B0000_BASE: u64 = 0x000B_0000;
+/// Mode-03h default selects `0xB8000` for 32 KB with Chain Odd/Even set.
+const _: () = assert!(
+    (VGA_GC_MISC_DEFAULT & VGA_GC_MISC_MEMORY_MAP_MASK) >> VGA_GC_MISC_MEMORY_MAP_SHIFT
+        == VGA_GC_MEMORY_MAP_B8000_32K
+        && VGA_GC_MISC_DEFAULT & VGA_GC_MISC_CHAIN_ODD_EVEN != 0
+        && VGA_GC_MISC_DEFAULT & VGA_GC_MISC_GRAPHICS_MODE == 0
+        && VGA_WINDOW_A0000_BASE < VGA_WINDOW_B0000_BASE
+        && VGA_WINDOW_B0000_BASE < VGA_TEXT_BASE
+);
 /// Graphics Controller Bit Mask Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x08`. Bits 7:0 select
@@ -1253,24 +1302,57 @@ impl VgaText {
         }
     }
 
-    /// CPU display window claimed by the video subsystem (`base..end`).
-    ///
-    /// This slice keeps the historical color text window; Graphics Controller
-    /// Miscellaneous Memory Map Select decode is a separate slice.
-    pub fn display_window(&self) -> (u64, u64) {
-        (VGA_TEXT_BASE, VGA_TEXT_END)
+    /// Graphics Controller Miscellaneous Memory Map Select field (bits 3:2).
+    pub fn gc_memory_map_select(&self) -> u8 {
+        (self.gc_regs[usize::from(VGA_GC_MISC)] & VGA_GC_MISC_MEMORY_MAP_MASK)
+            >> VGA_GC_MISC_MEMORY_MAP_SHIFT
     }
 
-    /// Addressing model currently programmed in Sequencer Memory Mode.
+    /// True when Graphics Controller Miscellaneous Chain Odd/Even (bit1) is set.
+    pub fn gc_chain_odd_even(&self) -> bool {
+        self.gc_regs[usize::from(VGA_GC_MISC)] & VGA_GC_MISC_CHAIN_ODD_EVEN != 0
+    }
+
+    /// True when Graphics Controller Miscellaneous selects graphics mode (bit0).
+    pub fn gc_graphics_mode(&self) -> bool {
+        self.gc_regs[usize::from(VGA_GC_MISC)] & VGA_GC_MISC_GRAPHICS_MODE != 0
+    }
+
+    /// CPU display window currently decoded (`base..end`).
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-75 Video Memory Assignments —
+    /// Memory Map Select `00` = `A0000` for 128 KB, `01` = `A0000` for 64 KB,
+    /// `10` = `B0000` for 32 KB, `11` = `B8000` for 32 KB.
+    pub fn display_window(&self) -> (u64, u64) {
+        match self.gc_memory_map_select() {
+            VGA_GC_MEMORY_MAP_A0000_128K => (VGA_WINDOW_A0000_BASE, VGA_TEXT_END),
+            VGA_GC_MEMORY_MAP_A0000_64K => (VGA_WINDOW_A0000_BASE, VGA_WINDOW_B0000_BASE),
+            VGA_GC_MEMORY_MAP_B0000_32K => (VGA_WINDOW_B0000_BASE, VGA_TEXT_BASE),
+            _ => (VGA_TEXT_BASE, VGA_TEXT_END),
+        }
+    }
+
+    /// True when the video subsystem currently claims CPU accesses to `addr`.
+    ///
+    /// Requires Misc Output RAM Enable and membership of the Memory Map Select
+    /// window. Spec: FreeVGA / IBM Misc Output bit1 + IBM Figure 2-75.
+    pub fn owns_display_addr(&self, addr: u64) -> bool {
+        let (base, end) = self.display_window();
+        self.misc_ram_enable() && (base..end).contains(&addr)
+    }
+
+    /// Addressing model currently programmed.
     ///
     /// Spec: IBM PS/2 Video Subsystems Figures 2-33 / 2-34 — Chain 4 takes
     /// precedence over odd/even (it replaces map selection entirely with
-    /// A1/A0); otherwise OE = 0 gives odd/even and OE = 1 gives planar
-    /// Map-Mask-only addressing.
+    /// A1/A0); otherwise Memory Mode OE = 0 gives odd/even and OE = 1 gives
+    /// planar Map-Mask-only addressing. Graphics Controller Miscellaneous
+    /// Chain Odd/Even (Figure 2-74 OE) is a second, independent source of
+    /// odd/even host addressing, so either bit selects it.
     pub fn plane_addressing(&self) -> VgaPlaneAddressing {
         if self.seq_chain4_enabled() {
             VgaPlaneAddressing::Chain4
-        } else if self.seq_odd_even_enabled() {
+        } else if self.seq_odd_even_enabled() || self.gc_chain_odd_even() {
             VgaPlaneAddressing::OddEven
         } else {
             VgaPlaneAddressing::Planar
@@ -1561,24 +1643,31 @@ impl VgaText {
         }
     }
 
-    pub fn read_u8(&self, addr: u64) -> Option<u8> {
-        if !Self::owns_addr(addr) || !self.misc_ram_enable() {
-            // Choice when RAM Enable clear: same `None` as out-of-window so
-            // `MachineBus` falls through to open-bus / PhysMem (does not expose
-            // plane data). Spec: FreeVGA / IBM Misc Output bit1.
+    /// Offset into the legacy interleaved text buffer for a claimed CPU access.
+    ///
+    /// Claims require Misc Output RAM Enable, membership of the Memory Map
+    /// Select window ([`Self::owns_display_addr`]), and membership of the
+    /// 32 KiB text buffer that backs this path. Windows that reach below
+    /// `0xB8000` decode there but have no backing in this buffer.
+    fn text_buffer_offset(&self, addr: u64) -> Option<usize> {
+        if !self.owns_display_addr(addr) || !Self::owns_addr(addr) {
+            // Same `None` / `false` as out-of-window so `MachineBus` falls
+            // through to open-bus / PhysMem. Spec: FreeVGA / IBM Misc Output
+            // bit1 + IBM Figure 2-75 Memory Map Select.
             return None;
         }
-        let off = (addr - VGA_TEXT_BASE) as usize;
+        Some((addr - VGA_TEXT_BASE) as usize)
+    }
+
+    pub fn read_u8(&self, addr: u64) -> Option<u8> {
+        let off = self.text_buffer_offset(addr)?;
         Some(self.mem[off])
     }
 
     pub fn write_u8(&mut self, addr: u64, val: u8) -> bool {
-        if !Self::owns_addr(addr) || !self.misc_ram_enable() {
-            // Choice when RAM Enable clear: ignore write (`false`), plane
-            // unchanged — same "not handled" as out-of-window.
+        let Some(off) = self.text_buffer_offset(addr) else {
             return false;
-        }
-        let off = (addr - VGA_TEXT_BASE) as usize;
+        };
         self.mem[off] = val;
         true
     }
@@ -5180,6 +5269,13 @@ mod tests {
     #[test]
     fn plane_access_planar_addresses_all_maps_at_one_offset() {
         let mut v = VgaText::new();
+        // Planar host addressing also needs GC Miscellaneous Chain Odd/Even
+        // clear (IBM Figure 2-74 OE); keep Memory Map Select on `0xB8000`.
+        set_gc_reg(
+            &mut v,
+            VGA_GC_MISC,
+            VGA_GC_MISC_GRAPHICS_MODE | VGA_GC_MISC_MEMORY_MAP_MASK,
+        );
         set_seq_memory_mode(
             &mut v,
             VGA_SEQ_MEMORY_MODE_EXTENDED | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE,
