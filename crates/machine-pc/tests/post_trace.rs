@@ -182,23 +182,27 @@ fn the_trace_is_bounded_and_reports_what_it_dropped() {
     );
 }
 
-/// A run that dies on a memory fault records the fault, so the trace explains
-/// the stop instead of ending one access early.
+/// A guest store into a mapped ROM window is **dropped, not faulted**, and the
+/// trace is what tells a reader it happened.
 ///
-/// The fault used here is a guest write into the top-of-4 GiB ROM window, which
-/// is outside the `0xC0000`-`0xFFFFF` PAM range and therefore has no "forward
-/// it to PCI" behavior to fall back on. Reads never fault in this machine
-/// (unmapped physical space is open bus), so this is the reachable case.
+/// This replaces a round-3 test that asserted the same store produced a
+/// `MemoryFault` event and stopped the run. That behavior was the bug: no
+/// processor exception exists for a store the platform declines, so the guest
+/// here runs on to its `HLT` instead of taking `#GP`. See
+/// `docs/machine-r4-write-semantics.md`.
 ///
 /// Spec: Intel SDM Vol. 3 §9.1.4 — after reset `CS.base = 0xFFFF0000`, which a
-/// near jump preserves; Intel 440FX §3.2.18 for the PAM window this is outside.
+/// near jump preserves; Intel 440FX 82441FX (PMC) §3.2.18 for the PAM window
+/// this address is outside; PCI Local Bus Specification Revision 3.0
+/// §3.2.2.3.4 for the discarded write data.
 #[test]
-fn a_memory_fault_is_recorded_next_to_the_accesses_that_led_to_it() {
+fn a_write_into_rom_is_dropped_recorded_and_does_not_stop_the_run() {
     #[rustfmt::skip]
     let code: &[u8] = &[
         0xB0, 0xAA, 0xE6, 0x80, // MOV AL, 0xAA ; OUT 0x80, AL
         0x31, 0xFF,             // XOR DI, DI
         0x2E, 0x88, 0x05,       // MOV CS:[DI], AL — writes ROM at 0xFFFF0000
+        0x2E, 0x8A, 0x1D,       // MOV BL, CS:[DI] — reads it back
         0xF4,
     ];
     // High-map only: no below-1 MiB alias, so `CS.base` stays 0xFFFF0000.
@@ -210,17 +214,33 @@ fn a_memory_fault_is_recorded_next_to_the_accesses_that_led_to_it() {
     m.load_rom(&rom).expect("map lab ROM");
     let traced = m.probe_post_traced(1_000, Some(PostTraceConfig::default()));
 
+    assert!(
+        m.cpu.halted,
+        "the store must not stop execution; stopped with {}",
+        traced.report
+    );
+    // The ROM kept its byte, and the guest read it back rather than 0xAA.
+    assert_eq!(
+        m.cpu.gpr[3] as u8, code[0],
+        "ROM content survived the store"
+    );
+
     let trace = traced.trace.as_ref().expect("tracing was armed");
     assert_eq!(
         trace.count_matching(|e| matches!(
             e,
-            PostTraceEvent::MemoryFault {
-                write: true,
-                addr: 0xFFFF_0000
+            PostTraceEvent::RomWriteDropped {
+                addr: 0xFFFF_0000,
+                value: 0xAA
             }
         )),
         1,
-        "the faulting access is in the trace: {trace}"
+        "the dropped store is in the trace: {trace}"
+    );
+    assert_eq!(
+        trace.count_matching(|e| matches!(e, PostTraceEvent::MemoryFault { .. })),
+        0,
+        "and it is not reported as a fault: {trace}"
     );
     assert!(
         trace.count_matching(|e| matches!(e, PostTraceEvent::PortOut { port: 0x0080, .. })) == 1,

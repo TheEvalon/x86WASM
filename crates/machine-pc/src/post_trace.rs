@@ -89,6 +89,13 @@ pub enum PostTraceEvent {
     VgaAperture { write: bool, addr: u64, value: u8 },
     /// A CPU access that decoded to neither RAM, ROM, nor a claimed device.
     MemoryFault { write: bool, addr: u64 },
+    /// A CPU write the platform discarded because the address decoded to a
+    /// ROM window. The processor completes the store normally — this event is
+    /// the only trace of it.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.4; see
+    /// `docs/machine-r4-write-semantics.md` for why this is not a fault.
+    RomWriteDropped { addr: u64, value: u8 },
 }
 
 impl fmt::Display for PostTraceEvent {
@@ -143,6 +150,12 @@ impl fmt::Display for PostTraceEvent {
             ),
             Self::MemoryFault { write, addr } => {
                 write!(f, "mem-fault {} addr=0x{addr:016X}", direction(*write))
+            }
+            Self::RomWriteDropped { addr, value } => {
+                write!(
+                    f,
+                    "rom-write wr addr=0x{addr:016X} value=0x{value:02X} dropped"
+                )
             }
         }
     }

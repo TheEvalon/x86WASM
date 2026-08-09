@@ -141,7 +141,41 @@ pub struct PhysMem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemError {
     OutOfRange,
+    /// A write resolved to a ROM window. **No longer returned by
+    /// [`PhysMem::write_u8`]** — see [`WriteDisposition::DroppedRom`] and
+    /// `docs/machine-r4-write-semantics.md`. Retained so a host that wants the
+    /// old diagnostic distinction has a name for it.
     RomWrite,
+}
+
+/// What the memory model did with a write. Diagnostics only: every `Dropped*`
+/// variant is architecturally identical to the processor, which sees a normal
+/// bus completion in all three cases.
+///
+/// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.4 (Master-Abort:
+/// write data discarded, reads all ones, no error to the initiator unless
+/// error reporting is enabled); Intel 440FX 82441FX (PMC) §3.2.18 (PAM WE);
+/// Intel SDM Vol. 3 §6.15 (`#GP` sources for a data write — none of them is a
+/// bus response).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDisposition {
+    /// Landed in DRAM, or in the shadow DRAM behind a PAM region with WE set.
+    Accepted,
+    /// The address decoded to a ROM window. The ROM does not accept write
+    /// cycles, so the data is discarded.
+    DroppedRom,
+    /// Inside the PAM window with WE clear: the DRAM controller forwards the
+    /// write to PCI, where nothing claims it.
+    DroppedPamWriteDisabled,
+    /// No RAM, no ROM, no device: PCI Master-Abort, data discarded.
+    DroppedUnclaimed,
+}
+
+impl WriteDisposition {
+    /// Whether the write reached storage.
+    pub fn accepted(self) -> bool {
+        self == Self::Accepted
+    }
 }
 
 impl PhysMem {
@@ -367,29 +401,48 @@ impl PhysMem {
         }
     }
 
-    pub fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), MemError> {
+    /// Write a byte, never failing, and report where it went.
+    ///
+    /// A write this platform cannot store is **dropped**, not faulted, in all
+    /// three cases: a ROM window, a PAM region with WE clear, and unclaimed
+    /// physical space. The returned [`WriteDisposition`] is a diagnostic for
+    /// the host; the guest cannot tell the cases apart, which is the point.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.4 (Master-Abort
+    /// discards write data and reports nothing to the processor); Intel 440FX
+    /// 82441FX (PMC) §3.2.18 (PAM WE forwards the write off DRAM); Intel
+    /// 82371SB (PIIX3) §XBCS (BIOSCS# is not asserted for a write unless
+    /// BIOS write protect is disabled, so the ROM never claims one); Intel SDM
+    /// Vol. 3 §6.15 (the processor's `#GP` sources for a store are
+    /// segmentation and paging, not a bus response). See
+    /// `docs/machine-r4-write-semantics.md`.
+    pub fn write_u8_classified(&mut self, addr: u64, val: u8) -> WriteDisposition {
         let addr = self.apply_a20(addr);
-        // Spec: Intel 440FX PMC - inside the PAM window the DRAM controller
-        // either accepts the write (WE set) or forwards it to PCI, where
-        // nothing claims it. Neither case is an error to the CPU, so the
-        // `RomWrite` diagnostic applies only outside this window.
         if let Some(region) = Self::pam_region_index(addr) {
             if self.pam[region].write == PamWrite::ShadowRam {
                 self.shadow_write(addr, val);
+                return WriteDisposition::Accepted;
             }
-            return Ok(());
+            return WriteDisposition::DroppedPamWriteDisabled;
         }
         if self.rom_read(addr).is_some() {
-            return Err(MemError::RomWrite);
+            return WriteDisposition::DroppedRom;
         }
         let i = addr as usize;
         if i < self.ram.len() {
             self.ram[i] = val;
-            Ok(())
+            WriteDisposition::Accepted
         } else {
-            // Ignore writes to unmapped space (MMIO stub).
-            Ok(())
+            WriteDisposition::DroppedUnclaimed
         }
+    }
+
+    /// [`Self::write_u8_classified`] for callers that do not want the
+    /// disposition. Always `Ok(())`: no write raises a bus error on this
+    /// platform.
+    pub fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), MemError> {
+        self.write_u8_classified(addr, val);
+        Ok(())
     }
 }
 
@@ -403,7 +456,58 @@ mod tests {
         m.ram[0] = 0x11;
         m.map_rom(0, vec![0xF4]);
         assert_eq!(m.read_u8(0).unwrap(), 0xF4);
-        assert_eq!(m.write_u8(0, 0x00), Err(MemError::RomWrite));
+        // Spec: the ROM does not accept the cycle and nothing else claims it,
+        // so the data is discarded and the processor sees a normal completion.
+        assert_eq!(m.write_u8(0, 0x00), Ok(()));
+        assert_eq!(m.read_u8(0).unwrap(), 0xF4);
+    }
+
+    /// The whole point of the round-4 write-semantics slice: **all three** ways
+    /// a write can fail to reach storage behave identically to the processor.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.4 — an
+    /// unclaimed cycle terminates with Master-Abort, write data discarded, no
+    /// error signalled to the initiator unless SERR#/PERR# reporting is armed
+    /// (it is not, at reset). Intel 440FX 82441FX (PMC) §3.2.18 — a PAM region
+    /// with WE clear forwards the write to PCI. Intel SDM Vol. 3 §6.15 — the
+    /// processor has no exception for a store the platform declines; `#GP` for
+    /// a data write comes from segmentation, not from the bus.
+    #[test]
+    fn every_dropped_write_case_completes_and_they_are_distinguishable() {
+        let mut m = PhysMem::new(1024 * 1024);
+        m.add_rom(0xFFFF_0000, vec![0xAA; 64 * 1024]);
+        m.add_rom(0x000F_0000, vec![0xAA; 64 * 1024]);
+
+        // 1. Mapped ROM outside the PAM window (top-of-4 GiB reset alias).
+        assert_eq!(m.write_u8(0xFFFF_0000, 0x5A), Ok(()));
+        assert_eq!(
+            m.write_u8_classified(0xFFFF_0000, 0x5A),
+            WriteDisposition::DroppedRom
+        );
+        assert_eq!(m.read_u8(0xFFFF_0000).unwrap(), 0xAA);
+
+        // 2. PAM region with WE clear (the reset attribute).
+        assert_eq!(m.write_u8(0x000F_0000, 0x5A), Ok(()));
+        assert_eq!(
+            m.write_u8_classified(0x000F_0000, 0x5A),
+            WriteDisposition::DroppedPamWriteDisabled
+        );
+        assert_eq!(m.read_u8(0x000F_0000).unwrap(), 0xAA);
+
+        // 3. Unclaimed physical space (no RAM, no ROM, no device).
+        assert_eq!(m.write_u8(0xF000_0000, 0x5A), Ok(()));
+        assert_eq!(
+            m.write_u8_classified(0xF000_0000, 0x5A),
+            WriteDisposition::DroppedUnclaimed
+        );
+        assert_eq!(m.read_u8(0xF000_0000).unwrap(), 0xFF);
+
+        // And a write that does land is reported as such.
+        assert_eq!(
+            m.write_u8_classified(0x0000_1000, 0x5A),
+            WriteDisposition::Accepted
+        );
+        assert_eq!(m.read_u8(0x0000_1000).unwrap(), 0x5A);
     }
 
     /// Spec: machine-model — BIOS may appear at high map and `0xF0000` alias.
@@ -419,8 +523,10 @@ mod tests {
         // instead of faulting; the ROM contents stay visible.
         assert_eq!(m.write_u8(0x000F_0001, 0x00), Ok(()));
         assert_eq!(m.read_u8(0x000F_0001).unwrap(), 0xBB);
-        // Outside the PAM window a ROM write still reports the diagnostic.
-        assert_eq!(m.write_u8(0xFFFF_0000, 0x00), Err(MemError::RomWrite));
+        // Outside the PAM window the write is declined by the ROM rather than
+        // by the DRAM controller, but the processor sees the same thing.
+        assert_eq!(m.write_u8(0xFFFF_0000, 0x00), Ok(()));
+        assert_eq!(m.read_u8(0xFFFF_0000).unwrap(), 0xAA);
     }
 
     /// Spec: Intel 440FX PMC §3.2.19 (PAM0–PAM6, config `0x59`–`0x5F`) —
@@ -565,15 +671,20 @@ mod tests {
         assert_eq!(m.read_u8(0x000C_4000).unwrap(), 0x00);
     }
 
-    /// The PAM window is below 1 MiB only: the top-of-4 GiB BIOS window keeps
-    /// its ROM semantics, including the `RomWrite` diagnostic.
+    /// The PAM window is below 1 MiB only: re-attributing the `0xF0000` alias
+    /// does not make the top-of-4 GiB window writable, and a write there is
+    /// dropped by the ROM rather than shadowed.
     #[test]
     fn pam_does_not_touch_high_rom_window() {
         let mut m = PhysMem::new(1024 * 1024);
         m.add_rom(0xFFFF_0000, vec![0xAA; 64 * 1024]);
         m.set_region_attributes(PAM_BIOS_REGION, PamRead::ShadowRam, PamWrite::ShadowRam);
         assert_eq!(m.read_u8(0xFFFF_0000).unwrap(), 0xAA);
-        assert_eq!(m.write_u8(0xFFFF_0000, 0x00), Err(MemError::RomWrite));
+        assert_eq!(
+            m.write_u8_classified(0xFFFF_0000, 0x00),
+            WriteDisposition::DroppedRom
+        );
+        assert_eq!(m.read_u8(0xFFFF_0000).unwrap(), 0xAA);
     }
 
     /// A machine without DRAM behind the legacy window still shadows, using the
