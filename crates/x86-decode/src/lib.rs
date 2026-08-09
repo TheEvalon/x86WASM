@@ -348,16 +348,22 @@ pub fn decode_with_mode(bytes: &[u8], mode: DecodeMode) -> Result<DecodedInsn, D
 
     // Group 3 TEST (F6/F7 /0 and /1) takes an immediate; other /r forms do not.
     // Spec: Intel SDM Vol. 2 opcode map — F6 /0,/1 ib; F7 /0,/1 iw|id (OsZ).
-    let grp3_test_imm =
-        matches!(opcode, 0xF6 | 0xF7) && matches!(modrm.map(|m| m.reg), Some(0) | Some(1));
+    //
+    // The immediate rules below (and the `B0`–`BF` MOV-imm ranges) belong to the
+    // *primary* map only. The two-byte map reuses those opcode bytes for
+    // instructions with no immediate at all (e.g. `0F B6` is `MOVZX Gv,Eb`), so
+    // a two-byte opcode must never consume immediate bytes here.
+    let grp3_test_imm = !two_byte
+        && matches!(opcode, 0xF6 | 0xF7)
+        && matches!(modrm.map(|m| m.reg), Some(0) | Some(1));
 
-    if (0xB0..=0xB7).contains(&opcode) {
+    if !two_byte && (0xB0..=0xB7).contains(&opcode) {
         if i >= bytes.len() {
             return Err(DecodeError::Truncated);
         }
         immediate = i32::from(bytes[i]);
         i += 1;
-    } else if (0xB8..=0xBF).contains(&opcode) {
+    } else if !two_byte && (0xB8..=0xBF).contains(&opcode) {
         if operand_size_32 {
             if i + 3 >= bytes.len() {
                 return Err(DecodeError::Truncated);
@@ -2073,6 +2079,108 @@ mod tests {
             decode(&[0x0F, 0x95, 0x06, 0x00]),
             Err(DecodeError::Truncated)
         );
+    }
+
+    /// Intel SDM Vol. 2 "PUSH"/"POP" (opcode map 2): `0F A0`/`A1`/`A8`/`A9`
+    /// take no ModR/M and no immediate, in either code-segment default.
+    #[test]
+    fn decode_push_pop_fs_gs() {
+        for (bytes, mnemonic) in [
+            ([0x0Fu8, 0xA0], "PUSH_FS"),
+            ([0x0F, 0xA1], "POP_FS"),
+            ([0x0F, 0xA8], "PUSH_GS"),
+            ([0x0F, 0xA9], "POP_GS"),
+        ] {
+            let d = decode(&bytes).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert!(d.modrm.is_none());
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 2);
+
+            let d = decode_with_mode(&bytes, DecodeMode::DEFAULT32).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.length, 2);
+        }
+
+        // 66 0F A0 — the override selects the other operand size, still 2+1 bytes.
+        let d = decode(&[0x66, 0x0F, 0xA0]).unwrap();
+        assert!(d.operand_size_32);
+        assert_eq!(d.length, 3);
+    }
+
+    /// Intel SDM Vol. 2 "LDS/LES/LFS/LGS/LSS": `0F B2`/`B4`/`B5` are ModR/M
+    /// forms with no immediate. The primary map's `B0`–`B7` `MOV r8, imm8`
+    /// range must not make them swallow an immediate byte.
+    #[test]
+    fn decode_lss_lfs_lgs() {
+        for (op, mnemonic) in [(0xB2u8, "LSS"), (0xB4, "LFS"), (0xB5, "LGS")] {
+            // 0F op 06 00 20 = Lxx AX, [0x2000]
+            let d = decode(&[0x0F, op, 0x06, 0x00, 0x20]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.modrm.unwrap().reg, 0);
+            assert_eq!(d.displacement, 0x2000);
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 5, "{mnemonic} must not consume an immediate");
+
+            // Register form decodes; #UD is an interpreter concern.
+            let d = decode(&[0x0F, op, 0xC0]).unwrap();
+            assert_eq!(d.modrm.unwrap().mod_, 3);
+            assert_eq!(d.length, 3);
+
+            assert_eq!(decode(&[0x0F, op]), Err(DecodeError::Truncated));
+        }
+
+        // D=1: 32-bit addressing with SIB, still no immediate.
+        let d = decode_with_mode(&[0x0F, 0xB2, 0x64, 0x24, 0x04], DecodeMode::DEFAULT32).unwrap();
+        assert_eq!(d.sib, Some(0x24));
+        assert_eq!(d.displacement, 4);
+        assert_eq!(d.length, 5);
+    }
+
+    /// Intel SDM Vol. 2 "MOVZX"/"MOVSX": `0F B6`/`B7`/`BE`/`BF` are ModR/M
+    /// forms with no immediate, even though the primary map uses `B0`–`BF` for
+    /// `MOV r8/r16/r32, imm`.
+    #[test]
+    fn decode_movzx_movsx() {
+        for (op, mnemonic) in [
+            (0xB6u8, "MOVZX"),
+            (0xB7, "MOVZX"),
+            (0xBE, "MOVSX"),
+            (0xBF, "MOVSX"),
+        ] {
+            // mod=11: 0F op D8 = Mxx BX, AL/AX
+            let d = decode(&[0x0F, op, 0xD8]).unwrap();
+            assert!(d.two_byte);
+            assert_eq!(d.mnemonic, mnemonic);
+            assert_eq!(d.modrm.unwrap().reg, 3);
+            assert_eq!(d.modrm.unwrap().rm, 0);
+            assert_eq!(d.immediate, 0);
+            assert_eq!(d.length, 3, "{mnemonic} must not consume an immediate");
+
+            // Memory form: 0F op 1E 00 40
+            let d = decode(&[0x0F, op, 0x1E, 0x00, 0x40]).unwrap();
+            assert_eq!(d.displacement, 0x4000);
+            assert_eq!(d.length, 5);
+
+            // 66 selects the other destination width without changing length.
+            let d = decode(&[0x66, 0x0F, op, 0xD8]).unwrap();
+            assert!(d.operand_size_32);
+            assert_eq!(d.length, 4);
+
+            assert_eq!(decode(&[0x0F, op]), Err(DecodeError::Truncated));
+        }
+
+        // Primary B6/BE keep their `MOV r8, imm8` / `MOV r32, imm32` meanings.
+        let d = decode(&[0xB6, 0x12]).unwrap();
+        assert!(!d.two_byte);
+        assert_eq!(d.immediate, 0x12);
+        assert_eq!(d.length, 2);
+        let d = decode(&[0xBE, 0x34, 0x12]).unwrap();
+        assert!(!d.two_byte);
+        assert_eq!(d.immediate, 0x1234);
+        assert_eq!(d.length, 3);
     }
 
     /// Intel SDM Vol. 2 "RET" (near/far imm16): the stack-release immediate is

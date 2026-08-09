@@ -53,3 +53,41 @@ Not supported:
   interpreter.
 - 64-bit mode (`rel32` sign-extended into `RIP`) and the branch hint prefixes
   `2E`/`3E`.
+
+## Slice 2 — extension moves and segment loads
+
+Spec: SDM Vol. 2 "MOVZX—Move with Zero-Extend", "MOVSX—Move with
+Sign-Extension", "PUSH", "POP", "LDS/LES/LFS/LGS/LSS—Load Far Pointer";
+Vol. 3 §§3.4.2–3.4.5, 5.4.1, 6.8.3, 6.15.
+
+Supported:
+
+- `MOVZX`/`MOVSX` (`0F B6`/`B7`/`BE`/`BF`) in all eight source/destination
+  width combinations. The opcode fixes the source width and the operand-size
+  attribute fixes the destination width, so a word source with a 16-bit
+  operand size is an ordinary word move. A 16-bit destination leaves the upper
+  half of the 32-bit register untouched. Byte sources reach memory and the
+  legacy `AL..BH` registers. No flags are written.
+- `PUSH FS`/`GS` and `POP FS`/`GS` (`0F A0`/`A1`/`A8`/`A9`). The stack slot is
+  a word under a 16-bit operand size and a doubleword holding the zero-extended
+  selector under a 32-bit one; the stack-pointer width itself still follows
+  `SS.B`. In protected mode `POP FS`/`GS` validate the selector through the
+  shared DS/ES data-descriptor path (null selectors allowed, clearing the
+  cache) before either the stack pointer or the cache commits.
+- `LSS`/`LFS`/`LGS` (`0F B2`/`B4`/`B5`) with `m16:16` and `m16:32` pointers.
+  They reuse the same descriptor helpers as `LDS`/`LES`, so `SS` gets the
+  stack-segment rules (null selector `#GP(0)`, writable ring-matched data
+  required, `P=0` reported as `#SS`) and `FS`/`GS` get the DS/ES data rules.
+  Nothing commits until the whole pointer is read and the descriptor validates.
+  `LSS` arms the same maskable-interrupt shadow as `MOV SS`/`POP SS`;
+  `LFS`/`LGS` do not. The register form (`mod=11`) is `#UD`.
+
+Not supported:
+
+- The primary-map `POP ES`/`SS`/`DS` (`07`/`17`/`1F`) and `PUSH ES`/`CS`/`SS`/`DS`
+  (`06`/`0E`/`16`/`1E`) still use a 16-bit stack slot regardless of the
+  operand-size attribute. That is pre-existing behavior outside this slice, but
+  it is now inconsistent with `0F A0`/`A1`/`A8`/`A9` and should be a round-3
+  item.
+- `MOVSXD` and the REX.W 64-bit destinations.
+- Loading `SS` from the LDT, or any privilege-level change.

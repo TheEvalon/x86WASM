@@ -1395,6 +1395,93 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
     setcc(0x9D, "SETGE"),
     setcc(0x9E, "SETLE"),
     setcc(0x9F, "SETG"),
+    // `PUSH`/`POP FS`/`GS` — Spec: Intel SDM Vol. 2 "PUSH"/"POP" (opcode map 2
+    // — `0F A0`/`0F A1`/`0F A8`/`0F A9`). No ModR/M; the stack slot width
+    // follows the operand-size attribute.
+    InstrDef {
+        mnemonic: "PUSH_FS",
+        opcode: 0xA0,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH FS",
+    },
+    InstrDef {
+        mnemonic: "POP_FS",
+        opcode: 0xA1,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POP FS",
+    },
+    InstrDef {
+        mnemonic: "PUSH_GS",
+        opcode: 0xA8,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH GS",
+    },
+    InstrDef {
+        mnemonic: "POP_GS",
+        opcode: 0xA9,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POP GS",
+    },
+    // `LSS`/`LFS`/`LGS r16/r32, m16:16/m16:32` — Spec: Intel SDM Vol. 2
+    // "LDS/LES/LFS/LGS/LSS—Load Far Pointer" (opcode map 2 — `0F B2`/`B4`/`B5`).
+    // Memory operand only; the register form is `#UD` at execute.
+    InstrDef {
+        mnemonic: "LSS",
+        opcode: 0xB2,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LSS",
+    },
+    InstrDef {
+        mnemonic: "LFS",
+        opcode: 0xB4,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LFS",
+    },
+    InstrDef {
+        mnemonic: "LGS",
+        opcode: 0xB5,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LGS",
+    },
+    // `MOVZX`/`MOVSX Gv, Eb|Ew` — Spec: Intel SDM Vol. 2 "MOVZX"/"MOVSX"
+    // (opcode map 2 — `0F B6`/`B7`/`BE`/`BF`). `width` records the *source*
+    // width, which the opcode fixes; the destination follows the operand-size
+    // attribute.
+    InstrDef {
+        mnemonic: "MOVZX",
+        opcode: 0xB6,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "MOVZX Gv,Eb",
+    },
+    InstrDef {
+        mnemonic: "MOVZX",
+        opcode: 0xB7,
+        encoding: Encoding::Modrm,
+        width: Width::W16,
+        sdm: "MOVZX Gv,Ew",
+    },
+    InstrDef {
+        mnemonic: "MOVSX",
+        opcode: 0xBE,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "MOVSX Gv,Eb",
+    },
+    InstrDef {
+        mnemonic: "MOVSX",
+        opcode: 0xBF,
+        encoding: Encoding::Modrm,
+        width: Width::W16,
+        sdm: "MOVSX Gv,Ew",
+    },
 ];
 
 /// Two-byte near `Jcc rel16/rel32` entry (`0F 80`+cc cw/cd).
