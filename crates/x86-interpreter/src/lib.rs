@@ -104,6 +104,20 @@ pub trait Bus {
         self.read_u8(addr)
     }
 
+    /// A `REP` iteration completed, so a `#PF` in a later iteration must
+    /// restart from here rather than from the start of the instruction.
+    ///
+    /// Spec: Intel SDM Vol. 2 "REP/REPE/REPZ/REPNE/REPNZ" — after a suspending
+    /// exception "the source and destination registers point to the next
+    /// string elements to be operated on, the EIP register points to the
+    /// string instruction, and the ECX register has the value it held
+    /// following the last successful iteration".
+    ///
+    /// Default: nothing, for a bus on which no access can fault mid-instruction.
+    fn commit_string_iteration(&mut self, cpu: &CpuState) {
+        let _ = cpu;
+    }
+
     /// Read one byte of a GDT, LDT, IDT or TSS entry.
     ///
     /// §4.6.1 makes accesses the processor performs to those tables
@@ -133,6 +147,30 @@ pub struct PagedBus<'a> {
     /// this interpreter implements are same-CPL, so it cannot change mid-
     /// instruction; a future privilege-changing gate must resample it.
     cpl: u8,
+    /// Architectural state a `#PF` in this instruction restarts from.
+    ///
+    /// `#PF` is a fault, so the instruction re-executes and must therefore
+    /// have committed nothing (SDM Vol. 3 §6.5). Rather than auditing every
+    /// opcode for the order in which it writes registers, flags and memory,
+    /// the interpreter checkpoints the architectural state at the instruction
+    /// boundary and rolls back to it when a translation fails. Two properties
+    /// make that exact rather than approximate:
+    ///
+    /// * `RFLAGS` in the checkpoint is always the instruction-boundary value,
+    ///   even after [`Bus::commit_string_iteration`] advances the rest. That
+    ///   is the SDM's own rule for a faulting `REPE`/`REPNE` `CMPS`/`SCAS`:
+    ///   "the EFLAGS value is restored to the state prior to the execution of
+    ///   the instruction".
+    /// * It is armed only while `CR0.PG = 1`. Nothing can page-fault with
+    ///   paging off, so the pre-paging execution path is untouched and pays
+    ///   nothing for this.
+    ///
+    /// What a checkpoint cannot undo is a memory write. The instructions that
+    /// write more than one location before they can fault write only to the
+    /// stack below the restored pointer, where the retry rewrites the same
+    /// bytes. A *single* operand that straddles a page boundary is the case
+    /// that genuinely needs both halves translated before either is written.
+    restart_point: Option<CpuState>,
 }
 
 impl<'a> PagedBus<'a> {
@@ -155,7 +193,19 @@ impl<'a> PagedBus<'a> {
                 // Real-address mode executes at CPL 0 (SDM Vol. 3 §5.5).
                 0
             },
+            restart_point: None,
         }
+    }
+
+    /// Checkpoint the architectural state this instruction would restart from.
+    /// A no-op with paging off, where nothing can page-fault.
+    fn arm_restart_point(&mut self, cpu: &CpuState) {
+        self.restart_point = self.ctx.paging_enabled().then(|| cpu.clone());
+    }
+
+    /// The checkpoint to roll back to, consumed by the `#PF` path.
+    fn take_restart_point(&mut self) -> Option<CpuState> {
+        self.restart_point.take()
     }
 
     /// The control-register state this path is translating with.
@@ -312,6 +362,17 @@ impl Bus for PagedBus<'_> {
         let access = Self::system_access(AccessKind::Read);
         let phys = self.translate(addr, access)?;
         self.inner.read_u8(phys)
+    }
+
+    fn commit_string_iteration(&mut self, cpu: &CpuState) {
+        if let Some(point) = &mut self.restart_point {
+            // Keep the instruction-boundary RFLAGS: a faulting REPE/REPNE
+            // CMPS/SCAS restores flags to their pre-instruction value even
+            // though its index and count progress survives.
+            let boundary_flags = point.rflags;
+            *point = cpu.clone();
+            point.rflags = boundary_flags;
+        }
     }
 
     fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError> {
@@ -2811,6 +2872,12 @@ where
             once(cpu, bus, insn)?;
             cpu.set_gpr_u16(CpuState::RCX, cx.wrapping_sub(1));
         }
+        // The count is decremented only once the iteration's accesses have all
+        // succeeded, and each `once` advances SI/DI last, so a fault inside an
+        // iteration leaves the count and the indices describing the iteration
+        // to retry. Publishing that as the restart point is what stops the
+        // instruction-boundary rollback from discarding finished iterations.
+        bus.commit_string_iteration(cpu);
         if let Some(continue_while_zf) = zf_terminate {
             // REPE (`true`): stop when ZF=0. REPNE (`false`): stop when ZF=1.
             let zf = zf_set(cpu);
@@ -4744,11 +4811,17 @@ fn step_paged(cpu: &mut CpuState, bus: &mut PagedBus<'_>) -> Result<(), ExecErro
     if cpu.halted {
         return Ok(());
     }
+    bus.arm_restart_point(cpu);
     let result = match step_inner(cpu, bus) {
         Err(ExecError::ArchFault { vector, error_code }) => {
             deliver_fault(cpu, bus, vector, error_code.map(u32::from))
         }
         Err(ExecError::PageFault { linear, error_code }) => {
+            // A fault re-executes the instruction, so undo everything the
+            // partially executed instruction committed (SDM Vol. 3 §6.5).
+            if let Some(restart) = bus.take_restart_point() {
+                *cpu = restart;
+            }
             // SDM Vol. 3 §4.7: `CR2` receives the faulting linear address, and
             // it is loaded whether or not delivery itself then succeeds.
             cpu.cr2 = linear;
