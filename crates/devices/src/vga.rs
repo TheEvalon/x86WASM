@@ -1122,6 +1122,159 @@ pub fn vga_dac_default_ram() -> [[u8; 3]; VGA_DAC_ENTRY_COUNT] {
     ram
 }
 
+// ---------------------------------------------------------------------------
+// Display fetch (character generator / renderer)
+// ---------------------------------------------------------------------------
+
+/// Map that supplies character codes during a text-mode display fetch.
+///
+/// Spec: FreeVGA "VGA Text Mode Operation", Display Memory Organization —
+/// "Each byte in plane 0 is used to store an index into the character font map."
+pub const VGA_TEXT_CHAR_PLANE: usize = 0;
+/// Map that supplies attribute bytes during a text-mode display fetch.
+///
+/// Spec: FreeVGA "VGA Text Mode Operation" — "The corresponding byte in plane 1
+/// is used to specify the attributes of the character".
+pub const VGA_TEXT_ATTR_PLANE: usize = 1;
+/// Map that holds the character generator font banks.
+///
+/// Spec: FreeVGA "VGA Text Mode Operation", Fonts — "Display plane 2 is used to
+/// store the bitmaps for the characters themselves."
+pub const VGA_FONT_PLANE: usize = 2;
+
+/// Bytes per glyph in a font bank.
+///
+/// Spec: FreeVGA Fonts — "Each character is on a 32 byte boundary and is 32
+/// bytes long."
+pub const VGA_FONT_GLYPH_BYTES: usize = 32;
+/// Bytes per font bank (256 glyphs × 32 bytes).
+///
+/// Spec: FreeVGA Fonts — "Display memory plane 2 is divided up into eight 8K
+/// banks of characters, each of which holds 256 character bitmaps."
+pub const VGA_FONT_BANK_BYTES: usize = 256 * VGA_FONT_GLYPH_BYTES;
+const _: () = assert!(VGA_FONT_BANK_BYTES == 0x2000);
+/// Maximum glyph height the character generator can address (32 scan lines).
+///
+/// Spec: FreeVGA Fonts — "Fonts are either 8 or 9 pixels wide and can be from 1
+/// to 32 pixels high."
+pub const VGA_FONT_MAX_SCAN_LINES: usize = VGA_FONT_GLYPH_BYTES;
+
+/// Sequencer Character Map Select bits that form Character Set A Select
+/// (bit 5 is field bit 2, bits 3:2 are field bits 1:0).
+///
+/// Spec: FreeVGA Sequencer Character Map Select Register (index `03h`).
+pub const VGA_SEQ_CHAR_MAP_A_MASK: u8 = 0b0010_1100;
+/// Sequencer Character Map Select bits that form Character Set B Select
+/// (bit 4 is field bit 2, bits 1:0 are field bits 1:0).
+///
+/// Spec: FreeVGA Sequencer Character Map Select Register (index `03h`).
+pub const VGA_SEQ_CHAR_MAP_B_MASK: u8 = 0b0001_0011;
+
+/// Text attribute bit 3 — foreground intensity *and* character-set select.
+///
+/// Spec: FreeVGA Fonts — "If bit 3 of a character's attribute byte is set to 1,
+/// then the character set selected by Character Set A Select field, otherwise
+/// the character set specified by Character Set B Select field is used."
+pub const VGA_TEXT_ATTR_FONT_SELECT: u8 = 0x08;
+
+/// Attribute Controller Mode Control bit0 — Attribute Controller Graphics
+/// Enable. Spec: FreeVGA Attribute Mode Control Register (index `10h`) `ATGE`.
+pub const VGA_ATC_MODE_ATGE: u8 = 0x01;
+/// Attribute Controller Mode Control bit2 — Line Graphics Enable.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-79 Mode Control — the ninth dot of
+/// character codes `C0h`–`DFh` is made identical to the eighth when this bit is
+/// set. FreeVGA's `LGA` prose states the inverse polarity; see
+/// `docs/vga-r3-character-generator.md`.
+pub const VGA_ATC_MODE_LINE_GRAPHICS: u8 = 0x04;
+const _: () = assert!(VGA_ATC_MODE_CONTROL_DEFAULT & VGA_ATC_MODE_LINE_GRAPHICS != 0);
+
+/// CRTC Mode Control register index.
+///
+/// Spec: FreeVGA CRT Controller Registers — index `17h`.
+pub const VGA_CRTC_MODE_CONTROL: u8 = 0x17;
+/// CRTC Mode Control bit6 — Word/Byte Mode Select (set selects byte mode).
+///
+/// Spec: FreeVGA CRTC Mode Control — "When this bit is set to 0, the word mode
+/// is selected. The word mode shifts the memory-address counter bits to the
+/// left by one bit ... When set to 1, bit 6 selects the byte address mode."
+pub const VGA_CRTC_MODE_BYTE_ADDRESSING: u8 = 0x40;
+
+/// Text cell width in dots when Sequencer Clocking Mode selects 9 dots.
+///
+/// Spec: FreeVGA Clocking Mode Register (index `01h`) bit0 — "0 - Selects 9
+/// dots per character. 1 - Selects 8 dots per character."
+pub const VGA_TEXT_CELL_WIDTH_9DOT: usize = 9;
+/// Text cell width in dots when Sequencer Clocking Mode selects 8 dots.
+pub const VGA_TEXT_CELL_WIDTH_8DOT: usize = 8;
+
+/// First character code whose ninth dot replicates the eighth under Line
+/// Graphics Enable. Spec: IBM PS/2 Video Subsystems Figure 2-79; FreeVGA Fonts.
+pub const VGA_LINE_GRAPHICS_FIRST_CODE: u8 = 0xC0;
+/// Last character code whose ninth dot replicates the eighth under Line
+/// Graphics Enable.
+pub const VGA_LINE_GRAPHICS_LAST_CODE: u8 = 0xDF;
+
+/// Attribute foreground bits (2:0) that select underline in text mode.
+///
+/// Spec: FreeVGA "VGA Text Mode Operation", Attributes — "If bits 2-0 of the
+/// attribute byte is equal to 001b and bits 6-4 of the attribute byte is equal
+/// to 000b, then the line of the character specified by the Underline Location
+/// field is replaced with the foreground color."
+pub const VGA_TEXT_UNDERLINE_FG_BITS: u8 = 0x07;
+/// Attribute foreground pattern that selects underline.
+pub const VGA_TEXT_UNDERLINE_FG_VALUE: u8 = 0x01;
+/// Attribute background bits (6:4) that must be zero for underline.
+pub const VGA_TEXT_UNDERLINE_BG_BITS: u8 = 0x70;
+
+/// Display mode the renderer can currently produce.
+///
+/// This model renders exactly two programmings and says so; it is not general
+/// VGA mode coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VgaRenderMode {
+    /// Alphanumeric (character generator) fetch: codes from map 0, attributes
+    /// from map 1, glyphs from map 2.
+    Text,
+    /// Programming the renderer does not model. No frame is produced.
+    Unsupported,
+}
+
+/// One rendered frame as DAC indices, one byte per pixel, row-major.
+///
+/// The indices have already passed the display path this model implements —
+/// for text, ATC Internal Palette → Color Select → PEL Mask. A host converts
+/// them to colors through the DAC with [`VgaText::frame_rgba8`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VgaFrame {
+    /// Frame width in pixels.
+    pub width: usize,
+    /// Frame height in pixels.
+    pub height: usize,
+    /// `width * height` DAC indices, row-major, top-left origin.
+    pub pixels: Vec<u8>,
+    /// Which display fetch produced this frame.
+    pub mode: VgaRenderMode,
+}
+
+impl VgaFrame {
+    /// DAC index at `(x, y)`, or `None` outside the frame.
+    pub fn index_at(&self, x: usize, y: usize) -> Option<u8> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        self.pixels.get(y * self.width + x).copied()
+    }
+
+    /// One row of DAC indices, or `None` outside the frame.
+    pub fn row(&self, y: usize) -> Option<&[u8]> {
+        if y >= self.height {
+            return None;
+        }
+        self.pixels.get(y * self.width..(y + 1) * self.width)
+    }
+}
+
 /// Color text-mode frame buffer + CRTC + Sequencer + GC + ATC + Misc + DAC stubs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VgaText {
@@ -2300,6 +2453,325 @@ impl VgaText {
     /// Spec: FreeVGA / RBIL — read `0x3C6` returns the current PEL Mask.
     fn read_dac_pel_mask(&self) -> u8 {
         self.dac_pel_mask
+    }
+}
+
+/// Display fetch: the character generator and the frame it produces.
+///
+/// See `docs/vga-r3-character-generator.md` for the source list, the two
+/// places where the sources conflict, and the model choices this section
+/// makes where the hardware behavior depends on CRTC timing registers that
+/// have no meaning in this model.
+impl VgaText {
+    /// Text cell width in dots from Sequencer Clocking Mode bit0.
+    ///
+    /// Spec: FreeVGA Clocking Mode Register (index `01h`) — bit0 clear selects
+    /// 9 dots per character, set selects 8. The mode-03h reset default
+    /// ([`VGA_SEQ_DEFAULTS`]) leaves it clear, so text cells are 9 dots wide.
+    pub fn text_cell_width(&self) -> usize {
+        if self.seq_regs[usize::from(VGA_SEQ_CLOCKING_MODE)] & VGA_SEQ_CLOCKING_8DOT != 0 {
+            VGA_TEXT_CELL_WIDTH_8DOT
+        } else {
+            VGA_TEXT_CELL_WIDTH_9DOT
+        }
+    }
+
+    /// Text cell height in scan lines from CRTC Maximum Scan Line (`0x09`).
+    ///
+    /// Spec: FreeVGA CRT Controller Maximum Scan Line Register — "In text
+    /// modes, this field is programmed with the character height - 1". The
+    /// mode-03h reset default `0x0F` gives 16 scan lines.
+    pub fn text_cell_height(&self) -> usize {
+        usize::from(self.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)] & VGA_CRTC_MAX_SCAN_MASK)
+            + 1
+    }
+
+    /// True when CRTC Mode Control (`0x17`) bit6 selects byte addressing.
+    ///
+    /// Spec: FreeVGA CRTC Mode Control — bit6 clear is word mode, set is byte
+    /// mode. The reset register file leaves it clear, which is also the
+    /// mode-03h programming.
+    pub fn crtc_byte_addressing(&self) -> bool {
+        self.crtc_regs[usize::from(VGA_CRTC_MODE_CONTROL)] & VGA_CRTC_MODE_BYTE_ADDRESSING != 0
+    }
+
+    /// True when Underline Location (`0x14`) bit6 selects doubleword addressing.
+    ///
+    /// Spec: FreeVGA Underline Location Register — `DW`: "When this bit is set
+    /// to 1, memory addresses are doubleword addresses."
+    pub fn crtc_doubleword_addressing(&self) -> bool {
+        self.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)] & VGA_CRTC_UNDERLINE_DW != 0
+    }
+
+    /// Multiplier applied to the CRTC address counter before it indexes a map.
+    ///
+    /// Spec: FreeVGA CRTC Mode Control (word/byte) and Underline Location
+    /// (`DW`) — doubleword addressing shifts the counter left by two, word mode
+    /// by one, byte mode not at all. This is the display-side counterpart of
+    /// the CPU-side odd/even offset (`addr & !1`) recorded in
+    /// `docs/vga-plane-memory-model.md`: in the mode-03h word-mode default the
+    /// character at counter value *n* lives at map offset `2n`, exactly where
+    /// an odd/even CPU write to `0xB8000 + 2n` puts it.
+    ///
+    /// The word-mode Address Wrap (`0x17` bit5) rotation of MA13/MA15 onto MA0
+    /// is **not** modeled; this is a plain shift.
+    pub fn crtc_address_multiplier(&self) -> usize {
+        if self.crtc_doubleword_addressing() {
+            4
+        } else if self.crtc_byte_addressing() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// Map offset a display fetch reads for CRTC address-counter value `index`.
+    ///
+    /// The counter is 16 bits (FreeVGA Start Address Low: "this 16-bit field is
+    /// sufficient to allow the screen to start at any memory address"), so it
+    /// wraps at `0x10000`; the resulting map offset wraps inside the enabled
+    /// map size ([`Self::plane_size_bytes`]).
+    pub fn display_map_offset(&self, index: usize) -> usize {
+        let counter = index & 0xFFFF;
+        (counter * self.crtc_address_multiplier()) % self.plane_size_bytes()
+    }
+
+    /// Byte offset in map 2 of the font bank named by a 3-bit select field.
+    ///
+    /// Spec: FreeVGA Sequencer Character Map Select Register — the field is not
+    /// contiguous for EGA compatibility: `000b` → `0000h`, `001b` → `4000h`,
+    /// `010b` → `8000h`, `011b` → `C000h`, `100b` → `2000h`, `101b` → `6000h`,
+    /// `110b` → `A000h`, `111b` → `E000h`.
+    pub fn char_map_bank_offset(select: u8) -> usize {
+        let select = usize::from(select & 0b111);
+        ((select & 0b011) << 14) | ((select >> 2) << 13)
+    }
+
+    /// Character Set A Select field (Sequencer `0x03` bits 5, 3:2).
+    ///
+    /// Spec: FreeVGA Sequencer Character Map Select Register.
+    pub fn seq_char_map_a_select(&self) -> u8 {
+        let reg = self.seq_regs[usize::from(VGA_SEQ_CHAR_MAP_SELECT)] & VGA_SEQ_CHAR_MAP_A_MASK;
+        ((reg & 0x20) >> 3) | ((reg & 0x0C) >> 2)
+    }
+
+    /// Character Set B Select field (Sequencer `0x03` bits 4, 1:0).
+    ///
+    /// Spec: FreeVGA Sequencer Character Map Select Register.
+    pub fn seq_char_map_b_select(&self) -> u8 {
+        let reg = self.seq_regs[usize::from(VGA_SEQ_CHAR_MAP_SELECT)] & VGA_SEQ_CHAR_MAP_B_MASK;
+        ((reg & 0x10) >> 2) | (reg & 0x03)
+    }
+
+    /// Map-2 byte offset of the font bank used for a given attribute byte.
+    ///
+    /// Spec: FreeVGA Fonts — attribute bit 3 set selects Character Set A,
+    /// clear selects Character Set B. Spec: FreeVGA Sequencer Memory Mode
+    /// `Ext. Mem` — "This bit must be set to 1 to enable the character map
+    /// selection described for the previous register", so with Extended Memory
+    /// clear this model falls back to bank `0000h`.
+    pub fn text_font_bank_offset(&self, attr: u8) -> usize {
+        if !self.seq_extended_memory() {
+            return 0;
+        }
+        let select = if attr & VGA_TEXT_ATTR_FONT_SELECT != 0 {
+            self.seq_char_map_a_select()
+        } else {
+            self.seq_char_map_b_select()
+        };
+        Self::char_map_bank_offset(select)
+    }
+
+    /// One scan-line row of a glyph, as the character generator fetches it.
+    ///
+    /// `row` is the scan line within the cell. Rows at or beyond
+    /// [`VGA_FONT_MAX_SCAN_LINES`] have no font byte and read as background.
+    ///
+    /// Spec: FreeVGA Fonts — "The offset in plane 2 of a character within a
+    /// bank is determined by taking the character's value and multiplying it by
+    /// 32. The first byte at this offset contains the 8 pixels of the top scan
+    /// line".
+    pub fn text_glyph_row(&self, code: u8, attr: u8, row: usize) -> u8 {
+        if row >= VGA_FONT_MAX_SCAN_LINES {
+            return 0;
+        }
+        let offset =
+            (self.text_font_bank_offset(attr) + usize::from(code) * VGA_FONT_GLYPH_BYTES + row)
+                % self.plane_size_bytes();
+        self.planes[VGA_FONT_PLANE * VGA_PLANE_SIZE + offset]
+    }
+
+    /// True when Attribute Mode Control Line Graphics Enable is set.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-79 Mode Control bit2. Set means
+    /// character codes `C0h`–`DFh` get a ninth dot identical to their eighth.
+    pub fn atc_line_graphics_enabled(&self) -> bool {
+        self.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)] & VGA_ATC_MODE_LINE_GRAPHICS != 0
+    }
+
+    /// True when Attribute Mode Control selects graphics (`ATGE`, bit0).
+    ///
+    /// Spec: FreeVGA Attribute Mode Control Register — "When set to 1, this bit
+    /// selects the graphics mode of operation."
+    pub fn atc_graphics_enabled(&self) -> bool {
+        self.atc_regs[usize::from(VGA_ATC_MODE_CONTROL)] & VGA_ATC_MODE_ATGE != 0
+    }
+
+    /// Scan line within a cell on which an underline is drawn.
+    ///
+    /// Spec: FreeVGA CRT Controller Underline Location Register bits 4:0. The
+    /// mode-03h reset default `0x1F` puts it past a 16-line cell, which
+    /// disables underlining — FreeVGA "VGA Text Mode Operation": "if the line
+    /// specified by the Underline Location field is not normally displayed
+    /// because it is greater than the maximum scan line ... then the underline
+    /// capability is effectively disabled."
+    pub fn crtc_underline_scanline(&self) -> u8 {
+        self.crtc_regs[usize::from(VGA_CRTC_UNDERLINE_LOCATION)] & VGA_CRTC_UNDERLINE_MASK
+    }
+
+    /// True when this attribute byte selects the underline attribute.
+    ///
+    /// Spec: FreeVGA "VGA Text Mode Operation", Attributes — attribute bits 2:0
+    /// equal `001b` and bits 6:4 equal `000b`.
+    pub fn text_attr_underlines(&self, attr: u8) -> bool {
+        attr & VGA_TEXT_UNDERLINE_FG_BITS == VGA_TEXT_UNDERLINE_FG_VALUE
+            && attr & VGA_TEXT_UNDERLINE_BG_BITS == 0
+    }
+
+    /// Display fetch this model can produce with the current programming.
+    ///
+    /// Only the alphanumeric (character generator) fetch exists in this slice.
+    /// Any graphics programming reports [`VgaRenderMode::Unsupported`] rather
+    /// than rendering something that is not what the hardware would show.
+    pub fn render_mode(&self) -> VgaRenderMode {
+        if self.gc_graphics_mode() || self.atc_graphics_enabled() {
+            return VgaRenderMode::Unsupported;
+        }
+        VgaRenderMode::Text
+    }
+
+    /// Render the current display, or `None` when [`Self::render_mode`] reports
+    /// a programming this model does not fetch.
+    ///
+    /// `blink_off_half` selects the invisible half of the blink cycle; the
+    /// caller owns the phase because there is no vertical-retrace timer.
+    pub fn render_frame(&self, blink_off_half: bool) -> Option<VgaFrame> {
+        match self.render_mode() {
+            VgaRenderMode::Text => Some(self.render_text_frame(blink_off_half)),
+            VgaRenderMode::Unsupported => None,
+        }
+    }
+
+    /// Render the alphanumeric display from plane memory.
+    ///
+    /// The fetch is the real hardware path: character codes from map 0,
+    /// attributes from map 1, and glyph rows from the font bank in map 2 that
+    /// Character Map Select and attribute bit 3 name. Every pixel is a DAC
+    /// index that has already passed ATC Internal Palette → Color Select →
+    /// PEL Mask.
+    ///
+    /// Spec: FreeVGA "VGA Text Mode Operation" (Display Memory Organization,
+    /// Attributes, Fonts, Cursor); FreeVGA CRT Controller Start Address /
+    /// Offset / Maximum Scan Line / Cursor Start / Cursor End / Cursor Location
+    /// / Underline Location; FreeVGA Sequencer Clocking Mode and Character Map
+    /// Select; IBM PS/2 Video Subsystems Figure 2-79 Mode Control.
+    ///
+    /// **Model choice:** the character grid is the fixed
+    /// [`VGA_TEXT_COLS`]×[`VGA_TEXT_ROWS`] host grid the rest of this device
+    /// uses. Horizontal and Vertical Display End are stored but do not size the
+    /// frame, because this model has no CRTC timing and those registers have no
+    /// reset defaults here. Maximum Scan Line bit7 (Scan Doubling), Preset Row
+    /// Scan, Line Compare, Cursor Skew, Horizontal PEL Panning, Color Plane
+    /// Enable, Overscan/border, and Screen Disable are not applied.
+    pub fn render_text_frame(&self, blink_off_half: bool) -> VgaFrame {
+        let cell_w = self.text_cell_width();
+        let cell_h = self.text_cell_height();
+        let width = VGA_TEXT_COLS * cell_w;
+        let height = VGA_TEXT_ROWS * cell_h;
+        let mut pixels = vec![0u8; width * height];
+
+        let start = usize::from(self.text_start_address());
+        let pitch = self.text_row_pitch_chars();
+        let cursor_location = usize::from(self.crtc_cursor_location());
+        let cursor_enabled = !self.crtc_cursor_disabled();
+        let cursor_first = usize::from(self.crtc_cursor_start_scanline());
+        let cursor_last = usize::from(self.crtc_cursor_end_scanline());
+        let underline_row = usize::from(self.crtc_underline_scanline());
+        let line_graphics = self.atc_line_graphics_enabled();
+
+        for row in 0..VGA_TEXT_ROWS {
+            for col in 0..VGA_TEXT_COLS {
+                let counter = start + row * pitch + col;
+                let offset = self.display_map_offset(counter);
+                let code = self.planes[VGA_TEXT_CHAR_PLANE * VGA_PLANE_SIZE + offset];
+                let attr = self.planes[VGA_TEXT_ATTR_PLANE * VGA_PLANE_SIZE + offset];
+
+                let fg = self.text_attr_fg_dac_index_for_phase(attr, blink_off_half);
+                let bg = self.text_attr_bg_dac_index(attr);
+                let underlines = self.text_attr_underlines(attr);
+                // Spec: FreeVGA Cursor Location Low — the hardware compares the
+                // address of the character being displayed with the Cursor
+                // Location field. The counter is 16 bits wide.
+                let cursor_cell = cursor_enabled
+                    && (counter & 0xFFFF) == cursor_location
+                    && cursor_first <= cursor_last;
+                let ninth_dot_repeats = line_graphics
+                    && (VGA_LINE_GRAPHICS_FIRST_CODE..=VGA_LINE_GRAPHICS_LAST_CODE).contains(&code);
+
+                for scan in 0..cell_h {
+                    let glyph = self.text_glyph_row(code, attr, scan);
+                    let solid = (underlines && scan == underline_row)
+                        || (cursor_cell && (cursor_first..=cursor_last).contains(&scan));
+                    let base = (row * cell_h + scan) * width + col * cell_w;
+                    for dot in 0..cell_w {
+                        let lit = if solid {
+                            true
+                        } else if dot < VGA_TEXT_CELL_WIDTH_8DOT {
+                            glyph & (0x80 >> dot) != 0
+                        } else {
+                            // Spec: IBM Figure 2-79 / FreeVGA Fonts — the ninth
+                            // dot is background unless Line Graphics Enable
+                            // repeats the eighth for codes C0h-DFh.
+                            ninth_dot_repeats && glyph & 0x01 != 0
+                        };
+                        pixels[base + dot] = if lit { fg } else { bg };
+                    }
+                }
+            }
+        }
+
+        VgaFrame {
+            width,
+            height,
+            pixels,
+            mode: VgaRenderMode::Text,
+        }
+    }
+
+    /// DAC RAM entry for an already-masked display index (6-bit components).
+    ///
+    /// Spec: FreeVGA Color Registers — the DAC RAM stores 6-bit R, G and B.
+    /// Unlike [`Self::display_dac_rgb`] this applies no PEL Mask, because a
+    /// [`VgaFrame`] index has already passed it.
+    pub fn dac_rgb6(&self, dac_index: u8) -> [u8; 3] {
+        self.dac_ram[usize::from(dac_index)]
+    }
+
+    /// Expand a rendered frame to 8-bit RGBA for a host canvas or CLI.
+    ///
+    /// Four bytes per pixel in `R, G, B, 255` order, row-major. 6-bit DAC
+    /// components are scaled to 8 bits by replicating the high bits
+    /// (`v << 2 | v >> 4`), which maps `0x3F` to `0xFF` and `0x00` to `0x00`.
+    pub fn frame_rgba8(&self, frame: &VgaFrame) -> Vec<u8> {
+        let mut out = Vec::with_capacity(frame.pixels.len() * 4);
+        for index in &frame.pixels {
+            let [r, g, b] = self.dac_rgb6(*index);
+            out.push((r << 2) | (r >> 4));
+            out.push((g << 2) | (g >> 4));
+            out.push((b << 2) | (b >> 4));
+            out.push(0xFF);
+        }
+        out
     }
 }
 
@@ -5564,5 +6036,566 @@ mod tests {
         assert_eq!(v.seq_map_mask(), VGA_SEQ_MAP_MASK_DEFAULT);
         assert!(v.seq_extended_memory());
         assert_eq!(v.plane_write_mask(VGA_TEXT_BASE), 0b0001);
+    }
+}
+
+/// Character generator and text-mode display fetch (M2 round 3, slice 1).
+///
+/// Every expected pixel value here is computed from the specification —
+/// FreeVGA "VGA Text Mode Operation" for the fetch, the FreeVGA Sequencer /
+/// CRTC / Attribute Controller register pages for the fields, and the
+/// mode-03h reset defaults this device already asserts elsewhere — not read
+/// back out of the renderer.
+///
+/// These live beside the device rather than in `crates/devices/tests/` because
+/// `crates/devices/src/lib.rs` does not yet re-export [`VgaFrame`],
+/// [`VgaRenderMode`] or the new constants; see `docs/vga-r3-character-generator.md`.
+#[cfg(test)]
+mod character_generator_tests {
+    use super::*;
+
+    /// Mode-03h default ATC Internal Palette, from [`VGA_ATC_DEFAULTS`].
+    const PALETTE: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
+        0x3F,
+    ];
+
+    fn set_crtc(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_CRTC_INDEX, 1, u32::from(index));
+        v.port_write(VGA_CRTC_DATA, 1, u32::from(value));
+    }
+
+    fn set_seq(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(index));
+        v.port_write(VGA_SEQ_DATA, 1, u32::from(value));
+    }
+
+    fn set_atc(v: &mut VgaText, index: u8, value: u8) {
+        // Spec: FreeVGA Attribute Controller — `0x3C0` alternates address and
+        // data; a status read resets the flip-flop to the address state.
+        v.port_read(VGA_INPUT_STATUS_1, 1);
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(index));
+        v.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(value));
+    }
+
+    fn set_gc(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_GC_INDEX, 1, u32::from(index));
+        v.port_write(VGA_GC_DATA, 1, u32::from(value));
+    }
+
+    /// Spec: FreeVGA CRT Controller Cursor Start Register bit5 `CD`.
+    fn disable_cursor(v: &mut VgaText) {
+        set_crtc(v, VGA_CRTC_CURSOR_START, VGA_CRTC_CURSOR_DISABLE);
+    }
+
+    /// Store a character/attribute pair at CRTC address-counter value `counter`.
+    fn put_cell(v: &mut VgaText, counter: usize, code: u8, attr: u8) {
+        let offset = v.display_map_offset(counter);
+        assert!(v.set_plane_byte(VGA_TEXT_CHAR_PLANE, offset, code));
+        assert!(v.set_plane_byte(VGA_TEXT_ATTR_PLANE, offset, attr));
+    }
+
+    /// Store glyph scan lines for `code` in the font bank at `bank`.
+    fn put_glyph(v: &mut VgaText, bank: usize, code: u8, rows: &[u8]) {
+        for (scan, byte) in rows.iter().enumerate() {
+            let offset = bank + usize::from(code) * VGA_FONT_GLYPH_BYTES + scan;
+            assert!(v.set_plane_byte(VGA_FONT_PLANE, offset, *byte));
+        }
+    }
+
+    /// Spec: FreeVGA Sequencer Character Map Select Register — the field is
+    /// deliberately non-contiguous for EGA compatibility.
+    #[test]
+    fn char_map_bank_offsets_follow_the_documented_table() {
+        let expected = [
+            0x0000usize,
+            0x4000,
+            0x8000,
+            0xC000,
+            0x2000,
+            0x6000,
+            0xA000,
+            0xE000,
+        ];
+        for (select, want) in expected.iter().enumerate() {
+            assert_eq!(
+                VgaText::char_map_bank_offset(select as u8),
+                *want,
+                "select {select:03b}"
+            );
+        }
+    }
+
+    /// Spec: FreeVGA Sequencer Character Map Select — bit5 and bits 3:2 form
+    /// Character Set A Select; bit4 and bits 1:0 form Character Set B Select.
+    #[test]
+    fn char_map_select_field_bits_are_split_the_documented_way() {
+        let mut v = VgaText::new();
+        assert_eq!(v.seq_char_map_a_select(), 0);
+        assert_eq!(v.seq_char_map_b_select(), 0);
+
+        // A = 111b (bit5 + bits3:2), B = 000b.
+        set_seq(&mut v, VGA_SEQ_CHAR_MAP_SELECT, 0b0010_1100);
+        assert_eq!(v.seq_char_map_a_select(), 0b111);
+        assert_eq!(v.seq_char_map_b_select(), 0b000);
+
+        // A = 000b, B = 111b (bit4 + bits1:0).
+        set_seq(&mut v, VGA_SEQ_CHAR_MAP_SELECT, 0b0001_0011);
+        assert_eq!(v.seq_char_map_a_select(), 0b000);
+        assert_eq!(v.seq_char_map_b_select(), 0b111);
+        assert_eq!(
+            VGA_SEQ_CHAR_MAP_A_MASK | VGA_SEQ_CHAR_MAP_B_MASK,
+            0b0011_1111
+        );
+    }
+
+    /// Spec: FreeVGA Clocking Mode bit0 (9 dots when clear) + CRTC Maximum Scan
+    /// Line ("character height - 1"). Mode-03h defaults are `0x00` and `0x0F`,
+    /// so cells are 9×16 and the 80×25 grid is 720×400 pixels.
+    #[test]
+    fn mode03h_defaults_give_9x16_cells_and_a_720x400_frame() {
+        let v = VgaText::new();
+        assert_eq!(v.text_cell_width(), 9);
+        assert_eq!(v.text_cell_height(), 16);
+        assert_eq!(v.render_mode(), VgaRenderMode::Text);
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.width, 720);
+        assert_eq!(frame.height, 400);
+        assert_eq!(frame.pixels.len(), 720 * 400);
+        assert_eq!(frame.mode, VgaRenderMode::Text);
+    }
+
+    /// Reset clears plane memory and installs no font, so nothing is displayed
+    /// until software loads one. There is no built-in character ROM here.
+    #[test]
+    fn reset_leaves_no_font_so_the_frame_is_uniform_background() {
+        let v = VgaText::new();
+        let frame = v.render_frame(false).expect("text mode renders");
+        // Code 0 / attribute 0: foreground and background both resolve to
+        // Internal Palette entry 0 (`0x00`).
+        assert!(frame.pixels.iter().all(|p| *p == PALETTE[0]));
+    }
+
+    /// Spec: FreeVGA CRTC Mode Control bit6 / Underline Location `DW` — the
+    /// display-side address multiplier. Word mode (the mode-03h default) puts
+    /// counter value *n* at map offset `2n`, matching the CPU-side odd/even
+    /// offset form.
+    #[test]
+    fn display_map_offset_follows_word_byte_and_doubleword_addressing() {
+        let mut v = VgaText::new();
+        assert!(!v.crtc_byte_addressing());
+        assert!(!v.crtc_doubleword_addressing());
+        assert_eq!(v.crtc_address_multiplier(), 2);
+        assert_eq!(v.display_map_offset(0), 0);
+        assert_eq!(v.display_map_offset(1), 2);
+        assert_eq!(v.display_map_offset(80), 160);
+
+        set_crtc(&mut v, VGA_CRTC_MODE_CONTROL, VGA_CRTC_MODE_BYTE_ADDRESSING);
+        assert!(v.crtc_byte_addressing());
+        assert_eq!(v.crtc_address_multiplier(), 1);
+        assert_eq!(v.display_map_offset(80), 80);
+
+        set_crtc(
+            &mut v,
+            VGA_CRTC_UNDERLINE_LOCATION,
+            VGA_CRTC_UNDERLINE_LOCATION_DEFAULT | VGA_CRTC_UNDERLINE_DW,
+        );
+        assert!(v.crtc_doubleword_addressing());
+        assert_eq!(v.crtc_address_multiplier(), 4);
+        assert_eq!(v.display_map_offset(80), 320);
+
+        // The counter is 16 bits and the map offset wraps inside the enabled
+        // map size (64 KiB with Extended Memory set).
+        set_crtc(&mut v, VGA_CRTC_UNDERLINE_LOCATION, 0x00);
+        set_crtc(&mut v, VGA_CRTC_MODE_CONTROL, 0x00);
+        assert_eq!(v.display_map_offset(0x1_0000), 0);
+        assert_eq!(v.display_map_offset(0x8000), 0);
+    }
+
+    /// The fetch reads the code from map 0, the attribute from map 1, and the
+    /// glyph from map 2 — and the resulting pixels are the ATC-composed DAC
+    /// indices for that attribute.
+    ///
+    /// Spec: FreeVGA "VGA Text Mode Operation", Display Memory Organization +
+    /// Fonts + Attributes.
+    #[test]
+    fn text_fetch_takes_code_attribute_and_glyph_from_maps_0_1_and_2() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        // Attribute 0x1E: foreground index 14, background index 1. With the
+        // mode-03h Internal Palette, P54S clear and Color Select 0, the DAC
+        // indices are the palette entries themselves.
+        let attr = 0x1E;
+        let fg = PALETTE[14];
+        let bg = PALETTE[1];
+        assert_eq!(v.text_attr_fg_dac_index(attr), fg);
+        assert_eq!(v.text_attr_bg_dac_index(attr), bg);
+
+        put_cell(&mut v, 0, b'A', attr);
+        put_glyph(&mut v, 0, b'A', &[0b1000_0001, 0b0011_1100]);
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        // Scan line 0: dots 0 and 7 lit, dot 8 (the ninth) is background
+        // because code 0x41 is outside the C0h-DFh line-graphics range.
+        let want_row0 = [fg, bg, bg, bg, bg, bg, bg, fg, bg];
+        for (dot, want) in want_row0.iter().enumerate() {
+            assert_eq!(frame.index_at(dot, 0), Some(*want), "row 0 dot {dot}");
+        }
+        let want_row1 = [bg, bg, fg, fg, fg, fg, bg, bg, bg];
+        for (dot, want) in want_row1.iter().enumerate() {
+            assert_eq!(frame.index_at(dot, 1), Some(*want), "row 1 dot {dot}");
+        }
+        // Rows with no glyph bits set are all background.
+        assert!((2..16).all(|y| (0..9).all(|x| frame.index_at(x, y) == Some(bg))));
+        // The neighbouring cell was never written, so it is code 0 / attr 0.
+        assert_eq!(frame.index_at(9, 0), Some(PALETTE[0]));
+    }
+
+    /// A byte the CPU writes through the Graphics Controller in the mode-03h
+    /// odd/even programming is the byte the character generator fetches.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 (odd/even) + Figure 2-29
+    /// (Map Mask `0x03`) on the CPU side; FreeVGA CRTC Mode Control word mode
+    /// on the display side.
+    #[test]
+    fn a_cpu_odd_even_write_is_what_the_character_generator_fetches() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        put_glyph(&mut v, 0, b'H', &[0xFF]);
+
+        assert!(v.gc_write_u8(VGA_TEXT_BASE, b'H'));
+        assert!(v.gc_write_u8(VGA_TEXT_BASE + 1, 0x1E));
+        assert_eq!(v.plane_byte(VGA_TEXT_CHAR_PLANE, 0), Some(b'H'));
+        assert_eq!(v.plane_byte(VGA_TEXT_ATTR_PLANE, 0), Some(0x1E));
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        for dot in 0..8 {
+            assert_eq!(frame.index_at(dot, 0), Some(PALETTE[14]), "dot {dot}");
+        }
+        assert_eq!(frame.index_at(8, 0), Some(PALETTE[1]), "ninth dot");
+    }
+
+    /// Spec: FreeVGA Fonts — attribute bit 3 set selects Character Set A,
+    /// clear selects Character Set B.
+    #[test]
+    fn attribute_bit3_selects_character_set_a_or_b() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        // Character Set A = 001b (bank 0x4000), Character Set B = 000b.
+        set_seq(&mut v, VGA_SEQ_CHAR_MAP_SELECT, 0b0000_0100);
+        assert_eq!(v.seq_char_map_a_select(), 0b001);
+        assert_eq!(v.seq_char_map_b_select(), 0b000);
+        assert_eq!(v.text_font_bank_offset(0x0F), 0x4000);
+        assert_eq!(v.text_font_bank_offset(0x07), 0x0000);
+
+        put_glyph(&mut v, 0x0000, b'#', &[0b1000_0000]);
+        put_glyph(&mut v, 0x4000, b'#', &[0b0000_0001]);
+        // Cell 0 uses set B (bit3 clear), cell 1 uses set A (bit3 set).
+        put_cell(&mut v, 0, b'#', 0x07);
+        put_cell(&mut v, 1, b'#', 0x0F);
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.index_at(0, 0), Some(PALETTE[7]), "set B leftmost dot");
+        assert_eq!(frame.index_at(7, 0), Some(PALETTE[0]));
+        assert_eq!(frame.index_at(9, 0), Some(PALETTE[0]));
+        assert_eq!(frame.index_at(16, 0), Some(PALETTE[15]), "set A eighth dot");
+
+        // Spec: FreeVGA Sequencer Memory Mode `Ext. Mem` — character map
+        // selection requires Extended Memory.
+        set_seq(
+            &mut v,
+            VGA_SEQ_MEMORY_MODE,
+            VGA_SEQ_MEMORY_MODE_DEFAULT & !0x02,
+        );
+        assert!(!v.seq_extended_memory());
+        assert_eq!(v.text_font_bank_offset(0x0F), 0x0000);
+    }
+
+    /// Spec: FreeVGA CRTC Maximum Scan Line — "programmed with the character
+    /// height - 1".
+    #[test]
+    fn maximum_scan_line_sets_the_cell_height_and_frame_height() {
+        let mut v = VgaText::new();
+        set_crtc(&mut v, VGA_CRTC_MAX_SCAN_LINE, 7);
+        assert_eq!(v.text_cell_height(), 8);
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.height, 200);
+        assert_eq!(frame.width, 720);
+
+        set_crtc(&mut v, VGA_CRTC_MAX_SCAN_LINE, 0);
+        assert_eq!(v.text_cell_height(), 1);
+        assert_eq!(v.render_frame(false).unwrap().height, 25);
+    }
+
+    /// Spec: FreeVGA CRTC Start Address (first displayed character) and Offset
+    /// ("the address difference between ... two lines of characters"; character
+    /// pitch is `Offset * 2`).
+    #[test]
+    fn start_address_and_offset_place_the_fetched_cells() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        put_glyph(&mut v, 0, b'S', &[0xFF]);
+        put_glyph(&mut v, 0, b'R', &[0x80]);
+
+        // Start Address 0x0003 → the top-left cell is counter 3.
+        set_crtc(&mut v, VGA_CRTC_START_ADDR_HIGH, 0x00);
+        set_crtc(&mut v, VGA_CRTC_START_ADDR_LOW, 0x03);
+        assert_eq!(v.text_start_address(), 3);
+        put_cell(&mut v, 3, b'S', 0x0F);
+
+        // Offset 0x14 → 40-character row pitch, so row 1 starts at counter 43.
+        set_crtc(&mut v, VGA_CRTC_OFFSET, 0x14);
+        assert_eq!(v.text_row_pitch_chars(), 40);
+        put_cell(&mut v, 43, b'R', 0x0F);
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(
+            frame.index_at(0, 0),
+            Some(PALETTE[15]),
+            "start address cell"
+        );
+        assert_eq!(frame.index_at(7, 0), Some(PALETTE[15]));
+        // Row 1 begins at scan line 16 with the 'R' glyph's single left dot.
+        assert_eq!(frame.index_at(0, 16), Some(PALETTE[15]), "offset row 1");
+        assert_eq!(frame.index_at(1, 16), Some(PALETTE[0]));
+    }
+
+    /// Spec: FreeVGA CRTC Cursor Location Low — the scan lines between Cursor
+    /// Scan Line Start and End "are replaced with the foreground color" in the
+    /// cell whose display address matches Cursor Location; Cursor Start bit5
+    /// disables the cursor and an End below Start draws nothing.
+    #[test]
+    fn cursor_registers_replace_scan_lines_with_the_foreground_color() {
+        let mut v = VgaText::new();
+        // Cursor at cell 1, scan lines 14..=15, attribute foreground 15.
+        put_cell(&mut v, 1, b' ', 0x0F);
+        set_crtc(&mut v, VGA_CRTC_CURSOR_LOC_HIGH, 0x00);
+        set_crtc(&mut v, VGA_CRTC_CURSOR_LOC_LOW, 0x01);
+        set_crtc(&mut v, VGA_CRTC_CURSOR_START, 14);
+        set_crtc(&mut v, VGA_CRTC_CURSOR_END, 15);
+        assert!(!v.crtc_cursor_disabled());
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        for scan in 0..16 {
+            let want = if (14..=15).contains(&scan) {
+                PALETTE[15]
+            } else {
+                PALETTE[0]
+            };
+            assert_eq!(frame.index_at(9, scan), Some(want), "cursor scan {scan}");
+        }
+        // The neighbouring cell has no cursor.
+        assert_eq!(frame.index_at(0, 14), Some(PALETTE[0]));
+
+        // Cursor Disable blanks it.
+        set_crtc(&mut v, VGA_CRTC_CURSOR_START, VGA_CRTC_CURSOR_DISABLE | 14);
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.index_at(9, 14), Some(PALETTE[0]));
+
+        // End below Start draws nothing.
+        set_crtc(&mut v, VGA_CRTC_CURSOR_START, 15);
+        set_crtc(&mut v, VGA_CRTC_CURSOR_END, 14);
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.index_at(9, 15), Some(PALETTE[0]));
+        assert_eq!(frame.index_at(9, 14), Some(PALETTE[0]));
+    }
+
+    /// Spec: FreeVGA "VGA Text Mode Operation", Attributes — with Blink Enable
+    /// set, attribute bit7 makes the foreground alternate with the background.
+    #[test]
+    fn blink_attribute_draws_the_foreground_as_background_on_the_off_half() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        assert!(v.atc_blink_enabled());
+        put_glyph(&mut v, 0, b'B', &[0xFF]);
+        // Attribute 0x87: blink bit set, foreground 7, background bits 6:4 = 0.
+        put_cell(&mut v, 0, b'B', 0x87);
+        // Attribute 0x07: no blink bit.
+        put_cell(&mut v, 1, b'B', 0x07);
+
+        let on = v.render_frame(false).expect("text mode renders");
+        assert_eq!(on.index_at(0, 0), Some(PALETTE[7]));
+        assert_eq!(on.index_at(9, 0), Some(PALETTE[7]));
+
+        let off = v.render_frame(true).expect("text mode renders");
+        assert_eq!(
+            off.index_at(0, 0),
+            Some(PALETTE[0]),
+            "blinked cell is hidden"
+        );
+        assert_eq!(off.index_at(9, 0), Some(PALETTE[7]), "non-blinking cell");
+
+        // With Blink Enable clear, attribute bit7 is background intensity and
+        // the off half changes nothing.
+        set_atc(&mut v, VGA_ATC_MODE_CONTROL, VGA_ATC_MODE_LINE_GRAPHICS);
+        assert!(!v.atc_blink_enabled());
+        let off = v.render_frame(true).expect("text mode renders");
+        assert_eq!(off.index_at(0, 0), Some(PALETTE[7]));
+        assert_eq!(off.index_at(1, 0), Some(PALETTE[7]));
+        // Background is now the full 4-bit field: 0x8 → palette entry 8.
+        assert_eq!(off.index_at(0, 1), Some(PALETTE[8]));
+    }
+
+    /// The rendered indices pass the whole ATC Internal Palette → Color Select
+    /// → PEL Mask chain, not just the palette.
+    ///
+    /// Spec: FreeVGA Attribute Controller Color Select / Attribute Mode Control
+    /// `P54S`; FreeVGA Color Registers PEL Mask.
+    #[test]
+    fn palette_color_select_and_pel_mask_compose_into_the_frame() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        put_glyph(&mut v, 0, b'C', &[0xFF]);
+        put_cell(&mut v, 0, b'C', 0x0E);
+
+        // Color Select bits 3:2 = 11b supply DAC bits 7:6.
+        set_atc(&mut v, VGA_ATC_COLOR_SELECT, 0b0000_1100);
+        let want = 0xC0 | PALETTE[14];
+        assert_eq!(v.text_attr_fg_dac_index(0x0E), want);
+        assert_eq!(v.render_frame(false).unwrap().index_at(0, 0), Some(want));
+
+        // PEL Mask is applied last.
+        v.port_write(VGA_DAC_PEL_MASK, 1, 0x0F);
+        let masked = want & 0x0F;
+        assert_eq!(v.text_attr_fg_dac_index(0x0E), masked);
+        assert_eq!(v.render_frame(false).unwrap().index_at(0, 0), Some(masked));
+
+        // P54S set replaces palette bits 5:4 with Color Select bits 1:0.
+        v.port_write(VGA_DAC_PEL_MASK, 1, u32::from(VGA_DAC_PEL_MASK_DEFAULT));
+        set_atc(
+            &mut v,
+            VGA_ATC_MODE_CONTROL,
+            VGA_ATC_MODE_CONTROL_DEFAULT | VGA_ATC_MODE_P54S,
+        );
+        set_atc(&mut v, VGA_ATC_COLOR_SELECT, 0b0000_0001);
+        let want = 0x10 | (PALETTE[14] & 0x0F);
+        assert_eq!(v.render_frame(false).unwrap().index_at(0, 0), Some(want));
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-79 Mode Control bit2 — with
+    /// Line Graphics Enable set, codes `C0h`–`DFh` repeat their eighth dot in
+    /// the ninth column; every other code has a background ninth dot.
+    #[test]
+    fn ninth_dot_repeats_only_for_line_graphics_codes_under_lge() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        assert!(v.atc_line_graphics_enabled());
+        put_glyph(&mut v, 0, 0xC4, &[0xFF]);
+        put_glyph(&mut v, 0, 0xBF, &[0xFF]);
+        put_glyph(&mut v, 0, 0xE0, &[0xFF]);
+        put_cell(&mut v, 0, 0xC4, 0x0F);
+        put_cell(&mut v, 1, 0xBF, 0x0F);
+        put_cell(&mut v, 2, 0xE0, 0x0F);
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.index_at(8, 0), Some(PALETTE[15]), "C4h repeats");
+        assert_eq!(frame.index_at(17, 0), Some(PALETTE[0]), "BFh does not");
+        assert_eq!(frame.index_at(26, 0), Some(PALETTE[0]), "E0h does not");
+
+        // The eighth dot must be clear for the ninth to follow it.
+        put_glyph(&mut v, 0, 0xC4, &[0xFE]);
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.index_at(7, 0), Some(PALETTE[0]));
+        assert_eq!(frame.index_at(8, 0), Some(PALETTE[0]));
+
+        // Clearing Line Graphics Enable blanks the ninth dot for C0h-DFh too.
+        put_glyph(&mut v, 0, 0xC4, &[0xFF]);
+        set_atc(&mut v, VGA_ATC_MODE_CONTROL, VGA_ATC_MODE_BLINK);
+        assert!(!v.atc_line_graphics_enabled());
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.index_at(7, 0), Some(PALETTE[15]));
+        assert_eq!(frame.index_at(8, 0), Some(PALETTE[0]));
+    }
+
+    /// Spec: FreeVGA Clocking Mode bit0 set selects 8 dots per character, so
+    /// there is no ninth column at all.
+    #[test]
+    fn eight_dot_mode_removes_the_ninth_column() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        put_glyph(&mut v, 0, 0xC4, &[0xFF]);
+        put_cell(&mut v, 0, 0xC4, 0x0F);
+        put_cell(&mut v, 1, 0xC4, 0x0F);
+
+        set_seq(&mut v, VGA_SEQ_CLOCKING_MODE, VGA_SEQ_CLOCKING_8DOT);
+        assert_eq!(v.text_cell_width(), 8);
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.width, 640);
+        // Cell 1 starts at dot 8, so there is no background gap.
+        assert_eq!(frame.index_at(7, 0), Some(PALETTE[15]));
+        assert_eq!(frame.index_at(8, 0), Some(PALETTE[15]));
+    }
+
+    /// Spec: FreeVGA "VGA Text Mode Operation", Attributes — underline needs
+    /// attribute bits 2:0 = `001b` and bits 6:4 = `000b`, and the mode-03h
+    /// Underline Location default puts the line outside a 16-line cell.
+    #[test]
+    fn underline_attribute_replaces_the_underline_location_row() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        assert!(v.text_attr_underlines(0x01));
+        assert!(v.text_attr_underlines(0x81));
+        assert!(!v.text_attr_underlines(0x11));
+        assert!(!v.text_attr_underlines(0x07));
+
+        put_cell(&mut v, 0, b' ', 0x01);
+        // Default 0x1F is past a 16-line cell: nothing is drawn.
+        assert_eq!(v.crtc_underline_scanline(), 0x1F);
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert!((0..16).all(|y| frame.index_at(0, y) == Some(PALETTE[0])));
+
+        set_crtc(&mut v, VGA_CRTC_UNDERLINE_LOCATION, 15);
+        let frame = v.render_frame(false).expect("text mode renders");
+        for dot in 0..9 {
+            assert_eq!(frame.index_at(dot, 15), Some(PALETTE[1]), "dot {dot}");
+        }
+        assert_eq!(frame.index_at(0, 14), Some(PALETTE[0]));
+    }
+
+    /// Graphics programming is reported rather than rendered as text.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-74 Miscellaneous bit0
+    /// (Graphics/Alphanumeric) and FreeVGA Attribute Mode Control `ATGE`.
+    #[test]
+    fn graphics_programming_reports_unsupported_and_renders_nothing() {
+        let mut v = VgaText::new();
+        set_gc(
+            &mut v,
+            VGA_GC_MISC,
+            VGA_GC_MISC_DEFAULT | VGA_GC_MISC_GRAPHICS_MODE,
+        );
+        assert_eq!(v.render_mode(), VgaRenderMode::Unsupported);
+        assert!(v.render_frame(false).is_none());
+
+        let mut v = VgaText::new();
+        set_atc(
+            &mut v,
+            VGA_ATC_MODE_CONTROL,
+            VGA_ATC_MODE_CONTROL_DEFAULT | VGA_ATC_MODE_ATGE,
+        );
+        assert_eq!(v.render_mode(), VgaRenderMode::Unsupported);
+        assert!(v.render_frame(false).is_none());
+    }
+
+    /// The host conversion scales 6-bit DAC components to 8 bits by bit
+    /// replication and emits opaque RGBA.
+    #[test]
+    fn frame_rgba8_expands_dac_entries_to_opaque_rgba() {
+        let mut v = VgaText::new();
+        disable_cursor(&mut v);
+        v.dac_ram[usize::from(PALETTE[14])] = [0x3F, 0x00, 0x15];
+        put_glyph(&mut v, 0, b'D', &[0b1000_0000]);
+        put_cell(&mut v, 0, b'D', 0x0E);
+
+        let frame = v.render_frame(false).expect("text mode renders");
+        assert_eq!(frame.index_at(0, 0), Some(PALETTE[14]));
+        assert_eq!(v.dac_rgb6(PALETTE[14]), [0x3F, 0x00, 0x15]);
+
+        let rgba = v.frame_rgba8(&frame);
+        assert_eq!(rgba.len(), frame.pixels.len() * 4);
+        assert_eq!(&rgba[..4], &[0xFF, 0x00, 0x55, 0xFF]);
+        // Background index 0 is black in the reset DAC RAM.
+        assert_eq!(&rgba[4..8], &[0x00, 0x00, 0x00, 0xFF]);
     }
 }
