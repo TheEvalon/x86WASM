@@ -17,7 +17,11 @@ mod post_probe;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
-pub use mem::PhysMem;
+pub use mem::{
+    PamAttributes, PamRead, PamWrite, PhysMem, PAM_BIOS_REGION, PAM_FIELD_MASK, PAM_FIELD_RE,
+    PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST, PAM_REGISTER_LAST,
+    PAM_WINDOW_BASE, PAM_WINDOW_END,
+};
 pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
     UNMAPPED_MMIO_PAGE_SIZE,
@@ -193,6 +197,40 @@ impl Machine {
         Ok(m)
     }
 
+    /// Apply one i440FX PAM configuration register byte (`0x59`-`0x5F`).
+    ///
+    /// **This is the host entry point a PCI-side PAM caller drives.** The PMC
+    /// configuration registers live in `devices::PciConfig`; after a config
+    /// write to host-bridge `00:00.0` offsets `0x59`-`0x5F` the machine layer
+    /// forwards the byte here so [`PhysMem`] re-attributes the two regions the
+    /// register owns. Returns `false` when `offset` is not a PAM register.
+    ///
+    /// Spec: Intel 440FX PMC datasheet, Programmable Attribute Map.
+    pub fn apply_pam_register(&mut self, offset: u8, value: u8) -> bool {
+        self.mem.apply_pam_register(offset, value)
+    }
+
+    /// Decoded view of a PAM configuration register (reserved bits read 0).
+    pub fn pam_register(&self, offset: u8) -> Option<u8> {
+        self.mem.pam_register_value(offset)
+    }
+
+    /// Set one PAM region's attributes directly (host / test path).
+    pub fn set_pam_attributes(
+        &mut self,
+        region: usize,
+        readable_from: PamRead,
+        writable_to: PamWrite,
+    ) -> bool {
+        self.mem
+            .set_region_attributes(region, readable_from, writable_to)
+    }
+
+    /// Current attributes of a PAM region.
+    pub fn pam_attributes(&self, region: usize) -> Option<PamAttributes> {
+        self.mem.region_attributes(region)
+    }
+
     pub fn reset(&mut self) {
         self.cpu = CpuState::reset();
         self.com1 = Serial16550::new(0x3F8);
@@ -211,6 +249,9 @@ impl Machine {
         self.fdc.reset();
         self.fw_cfg.reset();
         self.post_diag.reset();
+        // Spec: Intel 440FX PMC — PAM0-PAM6 reset to 0x00 (read from ROM, no
+        // DRAM writes). Shadow contents survive, like DRAM across PCIRST#.
+        self.mem.reset_pam();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 / port 0x92 defaults.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
         self.port92.set_a20_enabled(self.kbd.a20_enabled());
@@ -1060,10 +1101,46 @@ mod tests {
         assert_eq!(m.mem.read_u8(0x000F_FFF0).unwrap(), 0xF4);
         assert_eq!(m.mem.read_u8(0xFFFF_FFFF).unwrap(), 0x55);
         assert_eq!(m.mem.read_u8(0x000F_FFFF).unwrap(), 0x55);
+        // Spec: Intel 440FX PMC — the alias sits under PAM, whose reset
+        // attributes forward the write to PCI (dropped) rather than faulting.
+        assert_eq!(m.mem.write_u8(0x000F_0000, 0x00), Ok(()));
+        assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0xEA);
         assert_eq!(
-            m.mem.write_u8(0x000F_0000, 0x00),
+            m.mem.write_u8(0xFFFF_0000, 0x00),
             Err(crate::mem::MemError::RomWrite)
         );
+    }
+
+    /// Spec: Intel 440FX PMC — a PCI-side PAM register write re-attributes both
+    /// regions of the nibble pair through `Machine::apply_pam_register`, and a
+    /// machine reset restores the `0x00` default.
+    #[test]
+    fn pam_register_write_reattributes_bios_region() {
+        let mut m = Machine::with_bios_rom(1024 * 1024, &synthetic_bios_64k()).unwrap();
+        assert_eq!(
+            m.pam_attributes(PAM_BIOS_REGION),
+            Some(PamAttributes {
+                read: PamRead::Rom,
+                write: PamWrite::Ignored,
+            })
+        );
+
+        // PAM0 (0x59) high nibble RE|WE → BIOS area reads and writes DRAM.
+        assert!(m.apply_pam_register(0x59, (PAM_FIELD_RE | PAM_FIELD_WE) << 4));
+        assert_eq!(
+            m.pam_attributes(PAM_BIOS_REGION),
+            Some(PamAttributes {
+                read: PamRead::ShadowRam,
+                write: PamWrite::ShadowRam,
+            })
+        );
+        assert_eq!(m.pam_register(0x59), Some(0x30));
+        m.mem.write_u8(0x000F_0000, 0x5A).unwrap();
+        assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0x5A);
+
+        m.reset();
+        assert_eq!(m.pam_register(0x59), Some(0x00));
+        assert_eq!(m.mem.read_u8(0x000F_0000).unwrap(), 0xEA);
     }
 
     /// Spec: `with_bios_rom` mirrors [`Machine::with_floppy`] constructor shape.
