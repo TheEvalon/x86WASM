@@ -374,11 +374,11 @@ impl fmt::Display for PostReport {
             writeln!(f, "]")?;
             if self.idle_steps > 0 {
                 let total = self.steps.saturating_add(self.idle_steps);
-                let idle_pct = if total == 0 {
-                    0
-                } else {
-                    (self.idle_steps.saturating_mul(100)) / total
-                };
+                let idle_pct = self
+                    .idle_steps
+                    .saturating_mul(100)
+                    .checked_div(total)
+                    .unwrap_or(0);
                 writeln!(
                     f,
                     "  halt-idle      idle-steps={} busy-steps={} idle-pct={idle_pct}%",
