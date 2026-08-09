@@ -180,20 +180,6 @@ fn pde_ps_is_ignored_when_cr4_pse_is_clear() {
     assert_eq!(result.phys_addr, 0x0090_0000);
 }
 
-/// 4-MiB pages are a later slice. Until then the engine refuses instead of
-/// translating a PS = 1 PDE as if it referenced a page table.
-#[test]
-fn large_page_is_reported_unsupported_for_now() {
-    let mut tables = PageTables::new();
-    let linear = 0x0080_1000;
-    tables.map_4mib(linear, 0x0080_0000, ENTRY_RW);
-
-    let ctx = ctx(&tables, CR4_PSE);
-    let err = walk(&ctx, &mut tables.mem, linear).expect_err("4-MiB pages not implemented yet");
-    assert_eq!(err, WalkError::Unsupported(UnsupportedPaging::LargePage));
-    assert!(err.as_fault_reason().is_none());
-}
-
 /// SDM §4.1.1: with CR0.PG = 0 there is nothing to translate, and with
 /// CR4.PAE = 1 the mode is PAE or IA-32e paging, neither of which this engine
 /// implements.

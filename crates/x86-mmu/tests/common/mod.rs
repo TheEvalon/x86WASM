@@ -12,8 +12,10 @@ use x86_mmu::paging::PageTableMemory;
 pub const PD_BASE: u64 = 0x0001_0000;
 /// First page table handed out by the bump allocator.
 pub const FIRST_TABLE: u64 = 0x0002_0000;
-/// Size of the flat memory the tests allocate.
-pub const MEM_SIZE: usize = 1 << 20;
+/// Size of the flat memory the tests allocate. Large enough that a frame
+/// address a test hands to a large PDE can also be read back as a (zeroed)
+/// page table when `CR4.PSE` is cleared.
+pub const MEM_SIZE: usize = 16 << 20;
 
 /// Flat physical memory that records every paging-structure write, so a test
 /// can assert that a faulting translation wrote nothing at all.

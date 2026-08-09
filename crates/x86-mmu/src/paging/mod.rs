@@ -400,10 +400,6 @@ pub enum UnsupportedPaging {
     PagingDisabled,
     /// `CR4.PAE = 1`: PAE paging (§4.4) or IA-32e paging (§4.5).
     PaeOrLongMode,
-    /// `CR4.PSE = 1` and the PDE's PS flag is 1. 4-MiB pages arrive in a later
-    /// slice; until then this engine refuses rather than translating the
-    /// address as if the PDE referenced a page table.
-    LargePage,
 }
 
 /// Failure of a translation attempt.
@@ -593,12 +589,18 @@ pub fn access_permitted(ctx: &PagingContext, walk: &Walk, access: Access) -> boo
     }
 }
 
-/// Translate `linear` for `access`: walk the paging structures, then apply the
-/// §4.6 access rights.
+/// Translate `linear` for `access`: walk the paging structures, apply the §4.6
+/// access rights, and only then update the §4.8 accessed and dirty flags.
 ///
 /// Returns a structured [`PageFault`] rather than raising anything. Delivering
 /// `#PF` with [`PageFault::error_code`] and [`PageFault::cr2`] is the
 /// interpreter's job.
+///
+/// # Accessed/dirty ordering
+///
+/// Every fault check runs before any paging-structure write, so **a faulting
+/// access leaves the paging structures byte-for-byte unchanged**. See
+/// [`commit_accessed_dirty`] for what the SDM does and does not pin down here.
 pub fn translate<M: PageTableMemory>(
     ctx: &PagingContext,
     mem: &mut M,
@@ -615,6 +617,8 @@ pub fn translate<M: PageTableMemory>(
         }));
     }
 
+    let dirty = commit_accessed_dirty(mem, &walk, access);
+
     Ok(Translation {
         linear_address: linear,
         phys_addr: walk.phys_addr,
@@ -624,8 +628,78 @@ pub fn translate<M: PageTableMemory>(
         user_accessible: walk.user_accessible(),
         global: walk.global_flag() && ctx.pge(),
         final_entry_addr: walk.final_entry_addr(),
-        dirty: walk.dirty(),
+        dirty,
     })
+}
+
+/// Set the accessed flag in every entry the translation used, and the dirty
+/// flag in the entry that maps the page when the access is a write. Returns the
+/// dirty flag of that entry afterwards.
+///
+/// Spec: SDM §4.8 — "Whenever the processor uses a paging-structure entry as
+/// part of linear-address translation, it sets the accessed flag in that entry
+/// (if it is not already set)"; "Whenever there is a write to a linear address,
+/// the processor sets the dirty flag (if it is not already set) in the
+/// paging-structure entry that identifies the final physical address for the
+/// linear address (either a PTE or a paging-structure entry in which the PS
+/// flag is 1)". The flags are sticky, so an entry that already has the bits set
+/// is not rewritten. Bit 6 of a PDE that references a page table is ignored
+/// (Table 4-5) and is never touched.
+///
+/// # The one model choice here
+///
+/// This function runs only after the walk succeeded **and** the access-rights
+/// check passed, so a faulting access performs no paging-structure write at
+/// all. The SDM's own ordering is looser than that in two places:
+///
+/// * An entry with `P = 0`, or one that sets a reserved bit, "is used neither
+///   to reference another paging-structure entry nor to map a page" (§4.3), so
+///   its own accessed flag is certainly not set. But a *higher-level* entry was
+///   read before the failure, and a literal reading of §4.8 would set its
+///   accessed flag. This engine does not.
+/// * §4.6 checks access rights after the translation has been produced, so a
+///   literal reading would also set accessed flags on a protection violation.
+///   This engine does not.
+///
+/// §4.10.2.3 states the tighter rule this follows: "the processor does not
+/// cache a translation for a page number unless the accessed flag is 1 in each
+/// of the paging-structure entries used during translation; before caching a
+/// translation, the processor sets any of these accessed flags that is not
+/// already 1" — accessed-flag setting tied to a translation that actually
+/// completes. The difference is invisible to conforming software, because these
+/// flags are sticky hints that software may not read as "this did not happen"
+/// (§4.10.4.2); it matters only to a guest inspecting flags after a fault, and
+/// erring toward *fewer* updates cannot invent an access that never occurred.
+pub fn commit_accessed_dirty<M: PageTableMemory>(mem: &mut M, walk: &Walk, access: Access) -> bool {
+    let write = access.is_write();
+    let large_page = walk.pte.is_none();
+
+    // One write per entry: an entry needing both A and D gets them together.
+    let mut pde_bits = walk.pde.bits();
+    let mut wanted = pde_bits | entry::ENTRY_A;
+    if large_page && write {
+        wanted |= entry::ENTRY_D;
+    }
+    if wanted != pde_bits {
+        mem.write_entry_u32(walk.pde_addr, wanted);
+        pde_bits = wanted;
+    }
+
+    match walk.pte {
+        Some((pte_addr, pte)) => {
+            let mut pte_bits = pte.bits();
+            let mut wanted = pte_bits | entry::ENTRY_A;
+            if write {
+                wanted |= entry::ENTRY_D;
+            }
+            if wanted != pte_bits {
+                mem.write_entry_u32(pte_addr, wanted);
+                pte_bits = wanted;
+            }
+            pte_bits & entry::ENTRY_D != 0
+        }
+        None => pde_bits & entry::ENTRY_D != 0,
+    }
 }
 
 /// Walk the 32-bit paging structures for `linear`, with no access-rights check
@@ -669,7 +743,19 @@ pub fn walk<M: PageTableMemory>(
     }
 
     if pde.maps_large_page(cr4_pse) {
-        return Err(WalkError::Unsupported(UnsupportedPaging::LargePage));
+        // SDM §4.3: "Bits 39:32 are bits 20:13 of the PDE. Bits 31:22 are bits
+        // 31:22 of the PDE. Bits 21:0 are from the original linear address."
+        let frame_base = pde.large_page_base(&profile);
+        let offset = u64::from(linear) & PageSize::Size4MiB.offset_mask();
+        return Ok(Walk {
+            linear_address: linear,
+            page_size: PageSize::Size4MiB,
+            frame_base,
+            phys_addr: frame_base + offset,
+            pde_addr,
+            pde,
+            pte: None,
+        });
     }
 
     // SDM §4.3: "Bits 31:12 are from the PDE. Bits 11:2 are bits 21:12 of the

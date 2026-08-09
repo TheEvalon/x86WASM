@@ -94,6 +94,45 @@ of them when the PSE-36 mechanism is in use (§4.3).
     note), so such an entry reports a not-present fault.
 * `PS` (PDE bit 7) is ignored when `CR4.PSE = 0`, so the entry references a page
   table (Table 4-5).
+* With `CR4.PSE = 1` and `PS = 1` the PDE maps a 4-MiB page and no page table is
+  read: the frame is PDE bits 31:22 (plus PDE bits 20:13 as physical bits 39:32
+  under PSE-36) and the offset is linear bits 21:0 (§4.3, Figure 4-3).
+
+## Accessed and dirty flags (§4.8)
+
+`A` is set in every entry the translation used; `D` is set only in the entry
+that identifies the final physical address — the PTE, or the PDE of a 4-MiB
+page. Bit 6 of a PDE that references a page table is ignored (Table 4-5) and is
+never written. Both flags are sticky, so an entry that already has them is not
+rewritten at all, and an entry that needs both gets them in a single write.
+
+### Ordering against faults — the one model choice
+
+`walk` is a pure read. `translate` writes flags **only after** the walk
+succeeded and the access-rights check passed, so **a faulting access leaves the
+paging structures byte-for-byte unchanged**. Two places where the SDM's own
+wording is looser than that:
+
+* An entry with `P = 0` or a reserved bit "is used neither to reference another
+  paging-structure entry nor to map a page" (§4.3), so its own `A` is certainly
+  untouched — but a higher-level entry *was* read, and a literal reading of §4.8
+  ("whenever the processor uses a paging-structure entry as part of
+  linear-address translation") would set that entry's `A`. This engine does not.
+* §4.6 checks rights after the translation has been produced, so a literal
+  reading would also set `A` on a protection violation. This engine does not.
+
+The tighter rule this follows is §4.10.2.3: "the processor does not cache a
+translation for a page number unless the accessed flag is 1 in each of the
+paging-structure entries used during translation; before caching a translation,
+the processor sets any of these accessed flags that is not already 1." That ties
+`A` to a translation that actually completes.
+
+Stated plainly because it is a choice, not a derivation: the difference is
+unobservable to conforming software, since these flags are sticky hints and
+§4.10.4.2 warns software that it "cannot interpret the bit being clear as an
+indication that such an access has not occurred". Erring toward fewer updates
+cannot invent an access that never happened; erring the other way could tell a
+guest a page was touched when the instruction faulted before touching it.
 
 ## Access rights (§4.6.1)
 
@@ -159,6 +198,13 @@ width of a 4-MiB page frame: PAT support, PSE-36 support, and MAXPHYADDR. The
 default is the profile this emulator's CPUID actually reports — no PAT, no
 PSE-36, 32 physical address bits — so the default engine behavior matches what a
 guest would infer from `CPUID.01H:EDX`.
+
+PSE-36 is implemented because §4.3 and Table 4-4 state it completely: physical
+bits 39:32 come from PDE bits 20:13, and bits 21:(M–19) are reserved with M the
+minimum of 40 and MAXPHYADDR. It is **off by default**, so the default engine
+produces 32-bit physical addresses and treats PDE bits 21:13 as reserved. Turn
+it on with `PagingProfile::with_pse36(maxphyaddr)`; physical addresses are `u64`
+so the wider frames need no API change.
 
 **This matters for round 4.** `CPUID` in this tree reports exactly one feature
 bit (`MSR`); `PSE` (`EDX[3]`), `PGE` (`EDX[13]`), `PAT` (`EDX[16]`) and `PSE-36`
