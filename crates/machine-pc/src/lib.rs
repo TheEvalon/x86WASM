@@ -430,6 +430,23 @@ impl Machine {
         self.pic.set_irq_line(12, self.kbd.irq12_line());
     }
 
+    /// Drive PIC IRQ4 from the current COM1 16550 interrupt line (level follow).
+    ///
+    /// Spec: IBM PC/AT ISA interrupt assignment — COM1 (`0x3F8`) is IRQ4 (master
+    /// IR4). The 16550 subset only raises THRE (NS16550A IER bit1 / IIR `010b`);
+    /// receive-data-available is never asserted because there is no receive path.
+    pub fn sync_com1_irq4(&mut self) {
+        self.pic.set_irq_line(4, self.com1.irq_line());
+    }
+
+    /// Drive PIC IRQ3 from the current COM2 16550 interrupt line (level follow).
+    ///
+    /// Spec: IBM PC/AT ISA interrupt assignment — COM2 (`0x2F8`) is IRQ3 (master
+    /// IR3). Same THRE-only source as [`Self::sync_com1_irq4`].
+    pub fn sync_com2_irq3(&mut self) {
+        self.pic.set_irq_line(3, self.com2.irq_line());
+    }
+
     /// Assert/deassert a software PIRQA–PIRQD line and sync through PIRQRC to DualPic.
     ///
     /// Spec: Intel 82371SB — PIRQ# → ISA IRQ selected by PIRQRC[A:D] when bit7
@@ -870,15 +887,21 @@ impl Bus for MachineBus<'_> {
 
     /// Spec: Intel 8259A INTA vectoring; SDM Vol. 3 §6.8.1 maskable interrupts.
     ///
-    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, FDC IRQ6, CMOS IRQF → IRQ8,
-    /// 8042 AUX OBF∧INT12 → IRQ12, primary IDE INTRQ∧¬nIEN → IRQ14, and secondary
-    /// IDE → IRQ15 (level follow) before acknowledge so edges from prior
+    /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, COM2 THRE → IRQ3, COM1
+    /// THRE → IRQ4, FDC IRQ6, CMOS IRQF → IRQ8, 8042 AUX OBF∧INT12 → IRQ12,
+    /// primary IDE INTRQ∧¬nIEN → IRQ14, and secondary IDE → IRQ15 (level follow)
+    /// before acknowledge so edges from prior
     /// [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
     /// [`Machine::kbd_inject_aux_byte`] / [`Machine::tick_cmos`] / FDC
-    /// [`Fdc82077::assert_irq6`] / IDE completion are visible.
+    /// [`Fdc82077::assert_irq6`] / IDE completion / 16550 THR drain are visible.
+    ///
+    /// Spec: IBM PC/AT ISA interrupt assignment — COM1 `0x3F8` → IRQ4, COM2
+    /// `0x2F8` → IRQ3. Only the NS16550A THRE source exists in this UART subset.
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());
+        self.pic.set_irq_line(3, self.com2.irq_line());
+        self.pic.set_irq_line(4, self.com1.irq_line());
         self.pic.set_irq_line(6, self.fdc.irq_line());
         self.pic.set_irq_line(8, self.cmos.irq_line());
         self.pic.set_irq_line(12, self.kbd.irq12_line());
@@ -1130,6 +1153,158 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xBF); // unmask IR6 (IRQ6)
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR4 (IRQ4 / COM1).
+    fn init_at_pic_unmask_irq4(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xEF); // unmask IR4 (IRQ4)
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR3 (IRQ3 / COM2).
+    fn init_at_pic_unmask_irq3(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xF7); // unmask IR3 (IRQ3)
+    }
+
+    /// Spec: NS16550A IER bit1 (ETBEI) + IIR THRE ID `010b`; IBM PC/AT ISA
+    /// interrupt assignment COM1 `0x3F8` → IRQ4 (master IR4, vector `0x0C`).
+    /// The 16550 subset has no receive path, so ERBFI/RDA never drives the line.
+    #[test]
+    fn com1_thre_asserts_irq4_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq4(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            // No THRE enable → no IRQ4 even though LSR.THRE is set at reset.
+            assert_eq!(bus.poll_external_irq(), None);
+
+            bus.port_out_u8(0x3F9, 0x02).unwrap(); // IER ETBEI
+            assert_eq!(bus.poll_external_irq(), Some(0x0C));
+            assert_eq!(bus.poll_external_irq(), None);
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap(); // non-specific EOI
+        }
+        assert_eq!(m.pic.master.isr, 0);
+        assert!(m.com1.irq_line());
+    }
+
+    /// Spec: IBM PC/AT ISA interrupt assignment COM2 `0x2F8` → IRQ3 (master IR3,
+    /// vector `0x0B`); NS16550A register behavior is base-relative.
+    #[test]
+    fn com2_thre_asserts_irq3_eoi_clears() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq3(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), None);
+
+            bus.port_out_u8(0x2F9, 0x02).unwrap(); // IER ETBEI on COM2
+            assert_eq!(bus.poll_external_irq(), Some(0x0B));
+            assert_eq!(bus.poll_external_irq(), None);
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.master.isr, 0);
+    }
+
+    /// Spec: NS16550A — reading IIR while THRE is the reported source clears the
+    /// interrupt, dropping the ISA IR pin; a later THR write re-arms it. IRQ4 is
+    /// edge-triggered (ICW1.LTIM=0, ELCR clear), so redelivery needs that edge.
+    #[test]
+    fn com1_iir_read_drops_irq4_until_next_thr_write() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq4(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(0x3F9, 0x02).unwrap();
+            assert_eq!(bus.poll_external_irq(), Some(0x0C));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+
+            // Line still high but no new edge → no redelivery.
+            assert_eq!(bus.poll_external_irq(), None);
+
+            assert_eq!(bus.port_in_u8(0x3FA).unwrap(), 0x02); // IIR THRE, clears
+            assert_eq!(bus.poll_external_irq(), None);
+
+            bus.port_out_u8(0x3F8, u32::from(b'A') as u8).unwrap();
+            assert_eq!(bus.poll_external_irq(), Some(0x0C));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.com1_text(), "A");
+    }
+
+    /// Spec: COM1 and COM2 are independent ISA IR sources (IRQ4 vs IRQ3).
+    #[test]
+    fn com1_and_com2_irq_lines_are_independent() {
+        let mut m = Machine::new(64 * 1024);
+        // Unmask both IR3 and IR4 on the master.
+        init_at_pic_unmask_irq4(&mut m);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xE7);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(0x2F9, 0x02).unwrap(); // COM2 only
+            assert_eq!(bus.poll_external_irq(), Some(0x0B));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        assert!(!m.com1.irq_line());
+        assert!(m.com2.irq_line());
+    }
+
+    /// Host-side sync helpers mirror the [`MachineBus::poll_external_irq`] wiring.
+    #[test]
+    fn sync_com_irq_helpers_follow_device_lines() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq4(&mut m);
+        m.com1.port_write(0x3F9, 1, 0x02);
+        m.com2.port_write(0x2F9, 1, 0x02);
+        m.sync_com1_irq4();
+        m.sync_com2_irq3();
+        assert_eq!(m.pic.master.irr & 0x18, 0x18);
+    }
+
+    /// Spec: SDM Vol. 3 §6.8.1 + Intel 8259A vector = ICW2 base | IR — a THRE
+    /// interrupt with IF=1 vectors through real-mode IVT entry `0x0C`.
+    #[test]
+    fn guest_sti_delivers_com1_irq4_via_ivt() {
+        let mut m = Machine::new(64 * 1024);
+        // IVT[0x0C] → 0000:0E00; handler HLT.
+        m.mem.write_u8(0x0C * 4, 0x00).unwrap();
+        m.mem.write_u8(0x0C * 4 + 1, 0x0E).unwrap();
+        m.mem.write_u8(0x0C * 4 + 2, 0x00).unwrap();
+        m.mem.write_u8(0x0C * 4 + 3, 0x00).unwrap();
+        m.mem.write_u8(0x0E00, 0xF4).unwrap();
+        m.mem.write_u8(0, 0x90).unwrap(); // NOP
+        m.mem.write_u8(1, 0xF4).unwrap(); // HLT
+        init_at_pic_unmask_irq4(&mut m);
+        m.com1.port_write(0x3F9, 1, 0x02); // IER ETBEI → THRE interrupt pending
+
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.ss = x86_core::SegmentReg::real_mode(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
+        m.cpu.halted = false;
+        m.cpu.set_interrupt_flag(true);
+
+        m.step().unwrap();
+
+        assert_eq!(m.cpu.ip16(), 0x0E00);
+        assert!(!m.cpu.interrupt_flag());
+        assert_eq!(m.pic.master.isr, 0x10);
     }
 
     /// Spec: Intel 8254 mode 0 OUT rising → 8259A IRQ0 → vector 0x08; EOI clears ISR.
