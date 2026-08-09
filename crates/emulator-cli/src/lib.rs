@@ -1,5 +1,6 @@
 //! Native CLI helpers for the x86WASM emulator runner.
 
+use devices::{VGA_TEXT_COLS, VGA_TEXT_ROWS};
 use machine_pc::{build_hello_rom, Machine, MachineError, PostReport, EXPECTED_HELLO};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,9 +9,19 @@ use std::sync::Arc;
 /// Default instruction budget when `--steps` is omitted.
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
 
+/// Default physical base for `--option-rom`.
+///
+/// Spec: IBM PC/AT memory map — the video option ROM region starts at
+/// `0xC0000`, which is where a VGA BIOS (SeaVGABIOS included) is mapped.
+pub const DEFAULT_OPTION_ROM_BASE: u64 = 0x000C_0000;
+
+/// Option ROM size granularity. Spec: IBM PC option ROM header — the byte at
+/// offset 2 counts 512-byte blocks.
+pub const OPTION_ROM_BLOCK_BYTES: usize = 512;
+
 const OPCODE_WINDOW_LEN: usize = 8;
 
-/// Parsed CLI options (firmware path + run budget).
+/// Parsed CLI options (firmware path + run budget + diagnostics).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// Lab / HELLO path — high map only via [`Machine::load_rom`].
@@ -20,6 +31,12 @@ pub struct Options {
     pub max_steps: u64,
     /// Run the POST first-contact diagnostic instead of the normal run.
     pub post_probe: bool,
+    /// Dump the 80×25 VGA text buffer after the run / probe.
+    pub vga_text: bool,
+    /// Option ROM image to map before running (e.g. a VGA BIOS).
+    pub option_rom_path: Option<PathBuf>,
+    /// Physical base for [`Options::option_rom_path`].
+    pub option_rom_base: u64,
 }
 
 impl Default for Options {
@@ -29,8 +46,109 @@ impl Default for Options {
             bios_path: None,
             max_steps: DEFAULT_MAX_STEPS,
             post_probe: false,
+            vga_text: false,
+            option_rom_path: None,
+            option_rom_base: DEFAULT_OPTION_ROM_BASE,
         }
     }
+}
+
+/// Decoded PC option ROM header for an image the CLI mapped.
+///
+/// Spec: IBM PC option ROM convention — `55 AA` signature, a 512-byte block
+/// count at offset 2, and a whole-image checksum of zero modulo 256 over the
+/// declared extent. The same rules `firmware/build-scripts/check-option-rom.py`
+/// applies to a fresh SeaVGABIOS build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptionRomInfo {
+    /// Physical base the image was mapped at.
+    pub base: u64,
+    /// Length of the file on disk.
+    pub size: usize,
+    /// `55 AA` present at offset 0.
+    pub signature_ok: bool,
+    /// Block count byte at offset 2 (`None` when the image is too short).
+    pub blocks: Option<u8>,
+    /// `blocks * 512`, the extent the header declares.
+    pub declared_bytes: Option<usize>,
+    /// Checksum over the declared extent; `None` when that extent does not fit.
+    pub checksum: Option<u8>,
+}
+
+impl OptionRomInfo {
+    /// True when the header is well formed and the declared extent sums to zero.
+    pub fn is_valid(&self) -> bool {
+        self.signature_ok
+            && self
+                .declared_bytes
+                .is_some_and(|d| d != 0 && d <= self.size)
+            && self.checksum == Some(0)
+    }
+}
+
+impl std::fmt::Display for OptionRomInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "option-rom: base=0x{:08X} size={} signature={} blocks=",
+            self.base,
+            self.size,
+            if self.signature_ok { "55AA" } else { "missing" }
+        )?;
+        match self.blocks {
+            Some(blocks) => write!(f, "{blocks}")?,
+            None => f.write_str("none")?,
+        }
+        f.write_str(" declared=")?;
+        match self.declared_bytes {
+            Some(declared) => write!(f, "{declared}")?,
+            None => f.write_str("none")?,
+        }
+        f.write_str(" checksum=")?;
+        match self.checksum {
+            Some(sum) => write!(f, "0x{sum:02X}")?,
+            None => f.write_str("none")?,
+        }
+        write!(
+            f,
+            " status={}",
+            if self.is_valid() { "ok" } else { "invalid" }
+        )
+    }
+}
+
+/// Decode a PC option ROM header without mapping anything.
+pub fn describe_option_rom(base: u64, data: &[u8]) -> OptionRomInfo {
+    let signature_ok = data.len() >= 2 && data[0] == 0x55 && data[1] == 0xAA;
+    let blocks = data.get(2).copied();
+    let declared_bytes = blocks.map(|b| usize::from(b) * OPTION_ROM_BLOCK_BYTES);
+    let checksum = declared_bytes.and_then(|declared| {
+        if declared == 0 || declared > data.len() {
+            None
+        } else {
+            Some(
+                data[..declared]
+                    .iter()
+                    .fold(0u8, |acc, b| acc.wrapping_add(*b)),
+            )
+        }
+    });
+    OptionRomInfo {
+        base,
+        size: data.len(),
+        signature_ok,
+        blocks,
+        declared_bytes,
+        checksum,
+    }
+}
+
+/// A built machine plus what was installed into it.
+pub struct BuiltMachine {
+    pub machine: Machine,
+    pub kind: FirmwareKind,
+    /// Present when `--option-rom` mapped an image.
+    pub option_rom: Option<OptionRomInfo>,
 }
 
 /// Result of parsing argv (excluding program name).
@@ -117,6 +235,7 @@ pub enum CliError {
     UnknownArgument(String),
     MissingValue(&'static str),
     InvalidSteps(String),
+    InvalidAddress(String),
     RomAndBios,
     Io(String),
     Machine(String),
@@ -129,6 +248,7 @@ impl std::fmt::Display for CliError {
             Self::UnknownArgument(a) => write!(f, "Unknown argument: {a}"),
             Self::MissingValue(flag) => write!(f, "Missing value for {flag}"),
             Self::InvalidSteps(v) => write!(f, "Invalid --steps value: {v}"),
+            Self::InvalidAddress(v) => write!(f, "Invalid --option-rom-base value: {v}"),
             Self::RomAndBios => write!(f, "Use only one of --rom or --bios"),
             Self::Io(msg) => write!(f, "{msg}"),
             Self::Machine(msg) => write!(f, "{msg}"),
@@ -155,12 +275,32 @@ impl std::error::Error for CliError {
 pub fn usage() -> String {
     format!(
         "Usage: emulator-cli [--rom path.bin | --bios path.bin] [--steps N] [--post-probe]\n\
-         --rom         Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
-         --bios        Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
-         --post-probe  Report POST first contact (first failure, unclaimed ports,\n\
-         \x20             unmapped MMIO) instead of validating the run.\n\
+         \x20                  [--option-rom path.bin [--option-rom-base ADDR]] [--vga-text]\n\
+         --rom              Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
+         --bios             Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
+         --post-probe       Report POST first contact (first failure, unclaimed ports,\n\
+         \x20                  unmapped MMIO) instead of validating the run.\n\
+         --option-rom       Map an option ROM image (e.g. a VGA BIOS) and report its\n\
+         \x20                  55AA/size/checksum header. Mapping only: nothing scans or\n\
+         \x20                  executes option ROMs yet.\n\
+         --option-rom-base  Physical base for --option-rom (default 0x{DEFAULT_OPTION_ROM_BASE:05X}).\n\
+         --vga-text         Dump the {VGA_TEXT_COLS}x{VGA_TEXT_ROWS} VGA text buffer after the run.\n\
+         Diagnostics are appended after the normal / --post-probe output, which is unchanged.\n\
          Default ROM prints '{EXPECTED_HELLO}' via COM1 and port 0x402."
     )
+}
+
+/// Parse a decimal or `0x`-prefixed physical address.
+fn parse_address(value: &str) -> Result<u64, CliError> {
+    let trimmed = value.trim();
+    let parsed = match trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => trimmed.parse(),
+    };
+    parsed.map_err(|_| CliError::InvalidAddress(value.to_string()))
 }
 
 /// Parse CLI arguments (excluding argv[0]).
@@ -184,6 +324,17 @@ where
                 opts.bios_path = Some(PathBuf::from(path.as_ref()));
             }
             "--post-probe" => opts.post_probe = true,
+            "--vga-text" => opts.vga_text = true,
+            "--option-rom" => {
+                let path = iter.next().ok_or(CliError::MissingValue("--option-rom"))?;
+                opts.option_rom_path = Some(PathBuf::from(path.as_ref()));
+            }
+            "--option-rom-base" => {
+                let v = iter
+                    .next()
+                    .ok_or(CliError::MissingValue("--option-rom-base"))?;
+                opts.option_rom_base = parse_address(v.as_ref())?;
+            }
             "--steps" => {
                 let v = iter.next().ok_or(CliError::MissingValue("--steps"))?;
                 opts.max_steps = v
@@ -204,22 +355,94 @@ where
 ///
 /// `--bios` uses [`Machine::with_bios_rom`] (→ [`Machine::load_bios_rom`]).
 /// `--rom` / default HELLO use [`Machine::load_rom`].
-pub fn build_machine(opts: &Options) -> Result<(Machine, FirmwareKind), CliError> {
+///
+/// `--option-rom` appends a further ROM window via `PhysMem::add_rom`, which
+/// leaves the firmware windows in place and survives [`Machine::reset`]. An
+/// image with a malformed header is still mapped, and reported as `invalid`,
+/// because inspecting a broken ROM is a legitimate bring-up step.
+pub fn build_machine(opts: &Options) -> Result<BuiltMachine, CliError> {
     const RAM: usize = 16 * 1024 * 1024;
-    if let Some(path) = &opts.bios_path {
+    let (mut machine, kind) = if let Some(path) = &opts.bios_path {
         let data = read_file(path)?;
-        let machine = Machine::with_bios_rom(RAM, &data).map_err(machine_err)?;
-        return Ok((machine, FirmwareKind::Bios));
-    }
-    let mut machine = Machine::new(RAM);
-    if let Some(path) = &opts.rom_path {
-        let data = read_file(path)?;
-        machine.load_rom(&data).map_err(machine_err)?;
-        Ok((machine, FirmwareKind::Rom))
+        (
+            Machine::with_bios_rom(RAM, &data).map_err(machine_err)?,
+            FirmwareKind::Bios,
+        )
     } else {
-        machine.load_rom(&build_hello_rom()).map_err(machine_err)?;
-        Ok((machine, FirmwareKind::Hello))
+        let mut machine = Machine::new(RAM);
+        if let Some(path) = &opts.rom_path {
+            let data = read_file(path)?;
+            machine.load_rom(&data).map_err(machine_err)?;
+            (machine, FirmwareKind::Rom)
+        } else {
+            machine.load_rom(&build_hello_rom()).map_err(machine_err)?;
+            (machine, FirmwareKind::Hello)
+        }
+    };
+
+    let option_rom = match &opts.option_rom_path {
+        Some(path) => {
+            let data = read_file(path)?;
+            let info = describe_option_rom(opts.option_rom_base, &data);
+            machine.mem.add_rom(opts.option_rom_base, data);
+            Some(info)
+        }
+        None => None,
+    };
+
+    Ok(BuiltMachine {
+        machine,
+        kind,
+        option_rom,
+    })
+}
+
+/// Render the 80×25 VGA text buffer as lines of text.
+///
+/// Bytes outside printable ASCII (`0x20`–`0x7E`) render as `.`; there is no
+/// CP437 glyph translation and attributes are not shown. Rows are bracketed by
+/// `|` so trailing spaces stay visible. The viewport follows the CRTC Start
+/// Address and Offset the guest programmed, matching `VgaText::char_at`.
+pub fn vga_text_dump(machine: &Machine) -> String {
+    let vga = &machine.vga;
+    let (cursor_row, cursor_col) = vga.crtc_cursor_row_col();
+    let mut rows = Vec::with_capacity(VGA_TEXT_ROWS);
+    let mut nonblank_rows = 0;
+
+    for row in 0..VGA_TEXT_ROWS {
+        let mut line = String::with_capacity(VGA_TEXT_COLS);
+        let mut blank = true;
+        for col in 0..VGA_TEXT_COLS {
+            let ch = vga.char_at(row, col).unwrap_or(0);
+            if ch != b' ' && ch != 0 {
+                blank = false;
+            }
+            line.push(if (0x20..=0x7E).contains(&ch) {
+                ch as char
+            } else {
+                '.'
+            });
+        }
+        if !blank {
+            nonblank_rows += 1;
+        }
+        rows.push(line);
     }
+
+    let mut out = format!(
+        "vga-text: cols={} rows={} cursor=({},{}) start=0x{:04X} pitch={} nonblank_rows={}",
+        VGA_TEXT_COLS,
+        VGA_TEXT_ROWS,
+        cursor_row,
+        cursor_col,
+        vga.text_start_address(),
+        vga.text_row_pitch_chars(),
+        nonblank_rows
+    );
+    for (index, line) in rows.iter().enumerate() {
+        out.push_str(&format!("\n{index:02} |{line}|"));
+    }
+    out
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, CliError> {
@@ -291,6 +514,7 @@ pub fn run_post_probe(machine: &mut Machine, max_steps: u64) -> PostReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use devices::PortDevice;
     use std::io::Write;
 
     /// Tiny synthetic BIOS (not SeaBIOS): HLT at Intel reset vector offset.
@@ -356,9 +580,8 @@ mod tests {
             parsed,
             ParsedArgs::Run(Options {
                 bios_path: Some(PathBuf::from("fw.bin")),
-                rom_path: None,
                 max_steps: 42,
-                post_probe: false,
+                ..Options::default()
             })
         );
     }
@@ -424,7 +647,9 @@ mod tests {
             bios_path: Some(temp.path.clone()),
             ..Options::default()
         };
-        let (mut machine, kind) = build_machine(&opts).expect("build with --bios");
+        let BuiltMachine {
+            mut machine, kind, ..
+        } = build_machine(&opts).expect("build with --bios");
         assert_eq!(kind, FirmwareKind::Bios);
 
         // Dual map: image start marker at high base and low alias.
@@ -534,7 +759,9 @@ mod tests {
 
     #[test]
     fn hello_rom_success_output_is_unchanged() {
-        let (mut machine, kind) = build_machine(&Options::default()).expect("build HELLO");
+        let BuiltMachine {
+            mut machine, kind, ..
+        } = build_machine(&Options::default()).expect("build HELLO");
 
         let (steps, com1, debug) =
             run_machine(&mut machine, kind, DEFAULT_MAX_STEPS).expect("run HELLO");
@@ -543,5 +770,290 @@ mod tests {
         assert!(machine.cpu.halted);
         assert_eq!(com1, EXPECTED_HELLO);
         assert_eq!(debug, EXPECTED_HELLO);
+    }
+
+    // -----------------------------------------------------------------
+    // VGA / option-ROM diagnostics
+    // -----------------------------------------------------------------
+
+    /// A minimal well-formed option ROM: `55 AA`, `blocks` 512-byte blocks,
+    /// last byte fixed up so the declared extent sums to zero mod 256.
+    fn synthetic_option_rom(blocks: u8) -> Vec<u8> {
+        let mut rom = vec![0u8; usize::from(blocks) * OPTION_ROM_BLOCK_BYTES];
+        rom[0] = 0x55;
+        rom[1] = 0xAA;
+        rom[2] = blocks;
+        rom[3] = 0xCB; // plausible RETF entry stub; nothing executes it
+        let sum = rom.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+        let last = rom.len() - 1;
+        rom[last] = rom[last].wrapping_sub(sum);
+        rom
+    }
+
+    fn temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "x86wasm-cli-{tag}-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn create(tag: &str, data: &[u8]) -> Self {
+            let path = temp_path(tag);
+            fs::write(&path, data).expect("write temp file");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn parse_diagnostic_flags() {
+        let parsed = parse_args([
+            "--vga-text",
+            "--option-rom",
+            "vga.bin",
+            "--option-rom-base",
+            "0xC0000",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(Options {
+                vga_text: true,
+                option_rom_path: Some(PathBuf::from("vga.bin")),
+                option_rom_base: 0x000C_0000,
+                ..Options::default()
+            })
+        );
+
+        let u = usage();
+        assert!(u.contains("--vga-text"), "{u}");
+        assert!(u.contains("--option-rom"), "{u}");
+    }
+
+    #[test]
+    fn option_rom_base_accepts_decimal_and_rejects_garbage() {
+        let ParsedArgs::Run(opts) = parse_args(["--option-rom-base", "786432"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(opts.option_rom_base, DEFAULT_OPTION_ROM_BASE);
+
+        assert_eq!(
+            parse_args(["--option-rom-base", "0xZZ"]),
+            Err(CliError::InvalidAddress("0xZZ".to_string()))
+        );
+        assert_eq!(
+            parse_args(["--option-rom"]),
+            Err(CliError::MissingValue("--option-rom"))
+        );
+    }
+
+    /// Spec: IBM PC option ROM header — `55 AA`, 512-byte block count at
+    /// offset 2, declared extent checksums to zero mod 256.
+    #[test]
+    fn describe_option_rom_accepts_a_well_formed_image() {
+        let rom = synthetic_option_rom(4);
+        let info = describe_option_rom(DEFAULT_OPTION_ROM_BASE, &rom);
+
+        assert!(info.signature_ok);
+        assert_eq!(info.blocks, Some(4));
+        assert_eq!(info.declared_bytes, Some(2048));
+        assert_eq!(info.checksum, Some(0));
+        assert_eq!(info.size, 2048);
+        assert!(info.is_valid());
+        assert_eq!(
+            info.to_string(),
+            "option-rom: base=0x000C0000 size=2048 signature=55AA blocks=4 \
+             declared=2048 checksum=0x00 status=ok"
+        );
+    }
+
+    #[test]
+    fn describe_option_rom_reports_each_malformed_header() {
+        // Bad signature.
+        let mut rom = synthetic_option_rom(1);
+        rom[0] = 0x00;
+        let info = describe_option_rom(0, &rom);
+        assert!(!info.signature_ok);
+        assert!(!info.is_valid());
+        assert!(info.to_string().contains("signature=missing"), "{info}");
+
+        // Bad checksum.
+        let mut rom = synthetic_option_rom(1);
+        rom[4] = rom[4].wrapping_add(1);
+        let info = describe_option_rom(0, &rom);
+        assert_eq!(info.checksum, Some(1));
+        assert!(!info.is_valid());
+        assert!(info.to_string().contains("status=invalid"), "{info}");
+
+        // Size byte claims more than the image holds.
+        let mut rom = synthetic_option_rom(1);
+        rom[2] = 8;
+        let info = describe_option_rom(0, &rom);
+        assert_eq!(info.declared_bytes, Some(4096));
+        assert_eq!(
+            info.checksum, None,
+            "cannot sum an extent that does not fit"
+        );
+        assert!(!info.is_valid());
+
+        // Zero block count.
+        let mut rom = synthetic_option_rom(1);
+        rom[2] = 0;
+        assert!(!describe_option_rom(0, &rom).is_valid());
+
+        // Truncated image.
+        let info = describe_option_rom(0, &[0x55, 0xAA]);
+        assert!(info.signature_ok);
+        assert_eq!(info.blocks, None);
+        assert!(!info.is_valid());
+    }
+
+    /// The option ROM lands at its base, keeps the firmware ROM windows, and
+    /// survives the `reset` that `run_machine` performs.
+    #[test]
+    fn option_rom_is_mapped_alongside_firmware_and_survives_reset() {
+        let rom = synthetic_option_rom(2);
+        let file = TempFile::create("optrom", &rom);
+        let opts = Options {
+            option_rom_path: Some(file.0.clone()),
+            ..Options::default()
+        };
+
+        let BuiltMachine {
+            mut machine,
+            kind,
+            option_rom,
+        } = build_machine(&opts).expect("build with --option-rom");
+
+        assert_eq!(kind, FirmwareKind::Hello);
+        assert!(option_rom.expect("info").is_valid());
+        assert_eq!(
+            machine.mem.read_u8(DEFAULT_OPTION_ROM_BASE).unwrap(),
+            0x55,
+            "option ROM signature at its base"
+        );
+        assert_eq!(
+            machine.mem.read_u8(DEFAULT_OPTION_ROM_BASE + 1).unwrap(),
+            0xAA
+        );
+
+        // The HELLO ROM is still mapped, so the run still succeeds.
+        let (_, com1, _) = run_machine(&mut machine, kind, DEFAULT_MAX_STEPS).expect("run HELLO");
+        assert_eq!(com1, EXPECTED_HELLO);
+        assert_eq!(machine.mem.read_u8(DEFAULT_OPTION_ROM_BASE).unwrap(), 0x55);
+    }
+
+    #[test]
+    fn option_rom_honors_a_custom_base() {
+        let rom = synthetic_option_rom(1);
+        let file = TempFile::create("optrom-base", &rom);
+        let opts = Options {
+            option_rom_path: Some(file.0.clone()),
+            option_rom_base: 0x000E_0000,
+            ..Options::default()
+        };
+
+        let built = build_machine(&opts).expect("build");
+        assert_eq!(built.option_rom.expect("info").base, 0x000E_0000);
+        assert_eq!(built.machine.mem.read_u8(0x000E_0000).unwrap(), 0x55);
+    }
+
+    /// A malformed image is still mapped so a developer can inspect it, but it
+    /// is reported as invalid.
+    #[test]
+    fn malformed_option_rom_is_mapped_and_reported_invalid() {
+        let file = TempFile::create("optrom-bad", &[0x12, 0x34, 0x56, 0x78]);
+        let opts = Options {
+            option_rom_path: Some(file.0.clone()),
+            ..Options::default()
+        };
+
+        let built = build_machine(&opts).expect("build");
+        let info = built.option_rom.expect("info");
+        assert!(!info.is_valid());
+        assert_eq!(
+            built.machine.mem.read_u8(DEFAULT_OPTION_ROM_BASE).unwrap(),
+            0x12
+        );
+    }
+
+    #[test]
+    fn missing_option_rom_file_is_an_io_error() {
+        let opts = Options {
+            option_rom_path: Some(temp_path("optrom-absent")),
+            ..Options::default()
+        };
+        assert!(matches!(build_machine(&opts), Err(CliError::Io(_))));
+    }
+
+    /// A blank machine dumps 25 empty rows with the mode-03h header fields.
+    #[test]
+    fn vga_text_dump_reports_a_blank_screen() {
+        let built = build_machine(&Options::default()).expect("build HELLO");
+        let dump = vga_text_dump(&built.machine);
+        let lines: Vec<&str> = dump.lines().collect();
+
+        assert_eq!(lines.len(), 1 + VGA_TEXT_ROWS);
+        assert_eq!(
+            lines[0],
+            "vga-text: cols=80 rows=25 cursor=(0,0) start=0x0000 pitch=80 nonblank_rows=0"
+        );
+        assert_eq!(lines[1], format!("00 |{}|", " ".repeat(VGA_TEXT_COLS)));
+        assert_eq!(
+            lines[VGA_TEXT_ROWS],
+            format!("24 |{}|", " ".repeat(VGA_TEXT_COLS))
+        );
+    }
+
+    /// Text written through the guest-facing MMIO entry point shows up in the
+    /// dump, and non-printable bytes render as `.`.
+    #[test]
+    fn vga_text_dump_shows_guest_written_text() {
+        let mut built = build_machine(&Options::default()).expect("build HELLO");
+        let vga = &mut built.machine.vga;
+        for (index, ch) in b"POST OK".iter().enumerate() {
+            assert!(vga.mmio_write_u8(0x000B_8000 + (index as u64) * 2, *ch));
+            assert!(vga.mmio_write_u8(0x000B_8000 + (index as u64) * 2 + 1, 0x0F));
+        }
+        // A CP437 box-drawing byte has no ASCII glyph.
+        assert!(vga.mmio_write_u8(0x000B_8000 + 14, 0xB0));
+
+        let dump = vga_text_dump(&built.machine);
+        let lines: Vec<&str> = dump.lines().collect();
+
+        assert!(lines[0].contains("nonblank_rows=1"), "{}", lines[0]);
+        assert!(lines[1].starts_with("00 |POST OK."), "{}", lines[1]);
+        assert_eq!(lines[1].len(), "00 ||".len() + VGA_TEXT_COLS);
+    }
+
+    /// The dump follows the CRTC Start Address viewport, like `char_at`.
+    #[test]
+    fn vga_text_dump_follows_the_crtc_start_address() {
+        let mut built = build_machine(&Options::default()).expect("build HELLO");
+        let vga = &mut built.machine.vga;
+        // One row of 80 cells in, write 'Q' so a start address of 80 shows it
+        // at row 0 column 0.
+        assert!(vga.mmio_write_u8(0x000B_8000 + 80 * 2, b'Q'));
+        vga.port_write(0x3D4, 1, 0x0C);
+        vga.port_write(0x3D5, 1, 0x00);
+        vga.port_write(0x3D4, 1, 0x0D);
+        vga.port_write(0x3D5, 1, 80);
+
+        let dump = vga_text_dump(&built.machine);
+        let lines: Vec<&str> = dump.lines().collect();
+        assert!(lines[0].contains("start=0x0050"), "{}", lines[0]);
+        assert!(lines[1].starts_with("00 |Q"), "{}", lines[1]);
     }
 }
