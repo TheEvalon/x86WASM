@@ -60,10 +60,11 @@
 //!   programmed fill R=1..=SC on `pcn`/head with D, ST0 IC=00 + IRQ6;
 //!   media+WP / no-media / wrong N → ST0 IC=01 + ST1 NW + IRQ6;
 //!   READ ID (`0x0A` with optional MFM in bit6, Table 5-1 / §5.1.8) one HD|US
-//!   parameter then 7-byte result; with media → ST0 IC=00 + ST1=0 + sector-ID
-//!   stub C=`pcn[unit]` / H from HD / R=1 / N=2 + IRQ6; no-media → ST0 IC=01
-//!   with ST1 ND and C/H/R/N=0 + IRQ6; DOR bit3 DMA/IRQ enable; IRQ6 on
-//!   command / reset completion.
+//!   parameter then 7-byte result; readable ID field → ST0 IC=00 + ST1=0 +
+//!   C=`pcn[unit]` / H from HD / R = next ID field under the head / N=2 + IRQ6;
+//!   no ID Address Mark (no media, or head past the formatted cylinders) →
+//!   ST0 IC=01 with ST1 MA|ND and C/H/R/N=0 + IRQ6; DOR bit3 DMA/IRQ enable;
+//!   IRQ6 on command / reset completion.
 //! - OSDev Wiki Floppy Disk Controller — port map; MSR RQM/DIO; Specify timing
 //!   params; Recalibrate/Seek → IRQ then Sense Interrupt; Sense Interrupt clears
 //!   IRQ; post-reset Sense Interrupt polling; Sense Drive Status ST3 fields;
@@ -227,10 +228,14 @@
 //!   result byte); SC latched into `sc_eot`. Per-sector ID DMA deferred.
 //! - READ ID (`0x0A` | MFM): Spec Intel 82077AA Table 5-1 / §5.1.8 — command
 //!   byte lower 5 bits `01010`; optional MFM (`0x40`); one HD|US param; 7-byte
-//!   result. With media → ST0 IC=00 | H | US, ST1=ST2=0, sector-ID stub
-//!   C=`pcn[unit]`, H from HD bit, R=1, N=2; no media → ST0 IC=01 | H | US,
-//!   ST1 ND, C/H/R/N=0; asserts IRQ6 (cleared on first result byte). Full IDAM
-//!   track scan deferred.
+//!   result. Track ID-field scan: with media and `pcn[unit]` inside the
+//!   formatted cylinders → ST0 IC=00 | H | US, ST1=ST2=0, C=`pcn[unit]`, H from
+//!   HD bit, R = the next ID field under the head (1..=18, advancing per
+//!   successful command and wrapping), N=2; head parked past the last
+//!   formatted cylinder or no media → ST0 IC=01 | H | US, ST1 MA|ND, C/H/R/N=0
+//!   and the scan position is unchanged. Asserts IRQ6 (cleared on the first
+//!   result byte). The scan position is per drive, survives Seek, and restarts
+//!   on hardware/software reset. See `docs/fdc-read-id-scan.md`.
 //! - VERIFY (`0x16` | MT/MFM/SK): Spec Intel 82077AA Table 5-1 — command byte
 //!   lower 5 bits `10110`; optional MT/MFM/SK; same eight params and 7-byte
 //!   result as READ DATA. VERIFY compares/reads without a host DMA buffer:
@@ -490,6 +495,9 @@ pub const FDC_ST0_HEAD: u8 = 0x04;
 /// ST1 bit1 Not Writable (NW) — WP pin asserted / write not possible.
 /// Spec: Intel 82077AA §6.2 Status Register 1.
 pub const FDC_ST1_NW: u8 = 0x02;
+/// ST1 bit0 Missing Address Mark (MA) — no ID Address Mark found after the
+/// second index pulse. Spec: Intel 82077AA §6.2 / READ ID (§5.1.8).
+pub const FDC_ST1_MA: u8 = 0x01;
 /// ST1 bit2 No Data (ND) — specified sector not found. Spec: Intel 82077AA §6.2.
 pub const FDC_ST1_ND: u8 = 0x04;
 /// ST1 bit7 End of Cylinder (EN). Spec: Intel 82077AA §6.2.
@@ -707,6 +715,17 @@ pub struct Fdc82077 {
     /// MachineBus fills via DMA Read + [`Self::commit_dma_write_sector`].
     /// Cleared on NW/abnormal completion.
     last_write: Option<Vec<u8>>,
+    /// Per-drive rotational position for the READ ID track ID-field scan.
+    ///
+    /// Zero-based index of the next ID field that will pass under the head, so
+    /// the reported sector number is `read_id_position[unit] + 1`. Spec: Intel
+    /// 82077AA §5.1.8 — READ ID "is used to find the present position of the
+    /// recording heads" and stores "the first ID Field it is able to read".
+    /// The diskette keeps turning, so a successful READ ID advances the
+    /// position (wrapping at [`FDC_1440_SECTORS_PER_TRACK`]) while a failed one
+    /// (no media, head past the formatted cylinders) leaves it alone. Seeks do
+    /// not restart it; hardware and software reset do.
+    read_id_position: [u8; 4],
 }
 
 impl Default for Fdc82077 {
@@ -759,6 +778,7 @@ impl Fdc82077 {
             dma_read_pending: false,
             dma_write_pending: false,
             last_write: None,
+            read_id_position: [0; 4],
         }
     }
 
@@ -1217,6 +1237,9 @@ impl Fdc82077 {
         self.dma_write_pending = false;
         self.last_write = None;
         self.configure_byte0 = 0;
+        // Spec: Intel 82077AA §5.1.8 — the READ ID scan has no defined position
+        // after a reset; restart it at the first ID field of the track.
+        self.read_id_position = [0; 4];
 
         // Spec: §5.3.2 — LOCK itself survives. It protects only EFIFO,
         // FIFOTHR, and PRETRK; EIS/POLL return to defaults on every soft reset.
@@ -2222,29 +2245,44 @@ impl Fdc82077 {
     /// Spec: Intel 82077AA Table 5-1 / §5.1.8 — one HD|US param; 7-byte result
     /// ST0/ST1/ST2/C/H/R/N; IRQ6 when DOR enables (cleared on first result byte).
     ///
-    /// - With media: normal termination (ST0 IC=00 | H | US), ST1=ST2=0, and a
-    ///   sector-ID stub: C = `pcn[unit]`, H from the HD bit of the param, R=1,
-    ///   N=`FDC_SECTOR_N` (512-byte / IBM 1.44MB). Full IDAM track scan deferred.
-    /// - No media: ST0 IC=01 | H | US, ST1 ND, ST2=0, C/H/R/N=0.
+    /// - When an ID field can be read (media present and `pcn[unit]` inside the
+    ///   formatted cylinder range): normal termination (ST0 IC=00 | H | US),
+    ///   ST1=ST2=0, and the ID field currently under the head — C =
+    ///   `pcn[unit]`, H from the HD bit of the param, R =
+    ///   `read_id_position[unit] + 1`, N = [`FDC_SECTOR_N`]. The position then
+    ///   advances (wrapping at [`FDC_1440_SECTORS_PER_TRACK`]) so successive
+    ///   READ ID commands walk the track's ID fields as the diskette turns.
+    /// - When no ID Address Mark can be found (no media, or the head is parked
+    ///   past the last formatted cylinder): ST0 IC=01 | H | US, ST1 MA|ND,
+    ///   ST2=0, C/H/R/N=0, and the scan position is left unchanged.
     fn finish_read_id(&mut self, head_unit: u8) {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let st0_head = if head != 0 { FDC_ST0_HEAD } else { 0 };
-        if self.has_media() {
-            let c = self.pcn[unit as usize];
+        let cylinder = self.pcn[unit as usize];
+        // The raw 1.44MB image carries no explicit ID fields; an ID field
+        // exists exactly where the IBM MFM format has one (§ IBM PC / OSDev
+        // Floppy Disk geometry), so the head must be over a formatted cylinder.
+        let id_field_readable =
+            self.has_media() && cylinder < FDC_1440_CYLINDERS && head < FDC_1440_HEADS;
+        if id_field_readable {
+            let index = self.read_id_position[unit as usize] % FDC_1440_SECTORS_PER_TRACK;
+            self.read_id_position[unit as usize] = (index + 1) % FDC_1440_SECTORS_PER_TRACK;
             self.read_result = [
                 FDC_ST0_IC_NORMAL | st0_head | unit,
                 0x00,
                 0x00,
-                c,
+                cylinder,
                 head,
-                0x01,
+                index + 1,
                 FDC_SECTOR_N,
             ];
         } else {
+            // Spec: §5.1.8 — no ID Address Mark after the second index pulse →
+            // IC=01 and MA; §6.2 ND records that no ID field was read.
             self.read_result = [
                 FDC_ST0_IC_ABNORMAL | st0_head | unit,
-                FDC_ST1_ND,
+                FDC_ST1_MA | FDC_ST1_ND,
                 0x00,
                 0x00,
                 0x00,
@@ -5247,8 +5285,9 @@ mod tests {
         }
     }
 
-    /// Spec: Intel 82077AA Table 5-1 — READ ID (`0x0A` / MFM `0x4A`) no-media:
-    /// 1 param HD|US → ST0 IC=01|H|US, ST1 ND, C/H/R/N=0 + IRQ6.
+    /// Spec: Intel 82077AA Table 5-1 / §5.1.8 — READ ID (`0x0A` / MFM `0x4A`)
+    /// no-media: 1 param HD|US → ST0 IC=01|H|US, ST1 MA|ND (no ID Address Mark
+    /// after the second index pulse), C/H/R/N=0 + IRQ6.
     #[test]
     fn read_id_mfm_no_media_abnormal_result_and_irq() {
         let mut f = Fdc82077::new();
@@ -5262,7 +5301,7 @@ mod tests {
         let st0 = f.port_read(FDC_FIFO, 1) as u8;
         assert_eq!(st0, FDC_ST0_IC_ABNORMAL | FDC_ST0_HEAD);
         assert!(!f.irq_line(), "first result byte clears IRQ6");
-        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_MA | FDC_ST1_ND);
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0); // ST2
         for _ in 0..4 {
             assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0); // C/H/R/N
@@ -5271,8 +5310,8 @@ mod tests {
     }
 
     /// Spec: Intel 82077AA Table 5-1 / §5.1.8 — READ ID with media: normal ST0
-    /// (IC=00 | H | US), ST1=ST2=0, sector-ID stub C=`pcn[unit]`, H from HD|US
-    /// param, R=1, N=2; IRQ6. No full IDAM scan this slice.
+    /// (IC=00 | H | US), ST1=ST2=0, first ID field under the head after reset
+    /// is C=`pcn[unit]`, H from HD|US param, R=1, N=2; IRQ6.
     #[test]
     fn read_id_with_media_normal_sector_id_stub() {
         let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
@@ -5312,7 +5351,11 @@ mod tests {
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x00, "ST2 clear");
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 12, "C = pcn[unit]");
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01, "H from HD param bit");
-        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0x01, "R=1 sector-ID stub");
+        assert_eq!(
+            f.port_read(FDC_FIFO, 1) as u8,
+            0x01,
+            "R = first ID field of the scan"
+        );
         assert_eq!(
             f.port_read(FDC_FIFO, 1) as u8,
             FDC_SECTOR_N,
@@ -5321,8 +5364,8 @@ mod tests {
         assert_eq!(f.phase, Phase::Command);
     }
 
-    /// Spec: Intel 82077AA — READ ID media path still uses ND abnormal when
-    /// media is ejected (no-media stub preserved).
+    /// Spec: Intel 82077AA §5.1.8 — READ ID reports MA|ND abnormal when media
+    /// is ejected: with no diskette there is no ID Address Mark to read.
     #[test]
     fn read_id_after_eject_still_nd_abnormal() {
         let mut f = Fdc82077::with_image(vec![0u8; FDC_1440_IMAGE_SIZE]);
@@ -5334,7 +5377,7 @@ mod tests {
         f.port_write(FDC_FIFO, 1, 0x00);
         assert!(f.irq_line());
         assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST0_IC_ABNORMAL);
-        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_ND);
+        assert_eq!(f.port_read(FDC_FIFO, 1) as u8, FDC_ST1_MA | FDC_ST1_ND);
         for _ in 0..5 {
             assert_eq!(f.port_read(FDC_FIFO, 1) as u8, 0);
         }
