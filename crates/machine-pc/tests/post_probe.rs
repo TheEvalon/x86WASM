@@ -148,6 +148,46 @@ fn probe_report_display_is_structured() {
     assert!(text.contains("opcode_bytes=[9B"), "{text}");
 }
 
+/// A POST-shaped prologue makes its progress visible through port `0x80`.
+///
+/// Spec: IBM PC/AT Technical Reference — POST writes checkpoint codes to the
+/// manufacturing diagnostic port `0x80`; the AT POST sequence masks both 8259A
+/// interrupt masks (OCW1 `0xFF`) and reads CMOS shutdown status `0x0F` with NMI
+/// disabled (`0x70` bit 7).
+#[test]
+fn probe_captures_post_checkpoint_codes() {
+    #[rustfmt::skip]
+    let rom = bios_rom_with_code(&[
+        0xFA,                   // CLI
+        0xB0, 0x01, 0xE6, 0x80, // checkpoint 01
+        0xB0, 0xFF,             // OCW1 mask-all
+        0xE6, 0xA1,             // slave IMR
+        0xE6, 0x21,             // master IMR
+        0xB0, 0x02, 0xE6, 0x80, // checkpoint 02
+        0xB0, 0x8F, 0xE6, 0x70, // CMOS index 0x0F, NMI disabled
+        0xE4, 0x71,             // read shutdown status
+        0xB0, 0x03, 0xE6, 0x80, // checkpoint 03
+        0xF4,                   // HLT
+    ]);
+    let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
+
+    let report = m.probe_post(64);
+
+    assert_eq!(report.stop, PostStopReason::Halted, "{report}");
+    assert_eq!(report.post_codes, vec![0x01, 0x02, 0x03], "{report}");
+    assert_eq!(report.last_post_code, Some(0x03));
+    assert!(!report.post_code_overflow);
+    // Port 0x80 is claimed now, so it is no longer an unclaimed-port finding.
+    assert!(
+        !report.unclaimed_ports.iter().any(|a| a.port == 0x80),
+        "{report}"
+    );
+    assert!(
+        report.to_string().contains("post-codes=[01 02 03]"),
+        "{report}"
+    );
+}
+
 /// Real-firmware first contact. Skips when `firmware/seabios/bios.bin` is
 /// absent (it is git-ignored and produced by
 /// `firmware/build-scripts/build-seabios.sh`). Run with `--nocapture` to read

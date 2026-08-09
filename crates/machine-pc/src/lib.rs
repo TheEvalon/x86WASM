@@ -12,6 +12,7 @@ mod hello_rom;
 mod mbr;
 mod mem;
 mod ports;
+mod post_code;
 mod post_probe;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
@@ -21,6 +22,7 @@ pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
     UNMAPPED_MMIO_PAGE_SIZE,
 };
+pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
 pub use post_probe::{
     seabios_image_path, PostFailure, PostFailureKind, PostReport, PostStopReason,
     DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
@@ -94,6 +96,8 @@ pub struct Machine {
     pub fdc: Fdc82077,
     /// QEMU fw_cfg — signature, ID, configured RAM size, and test file.
     pub fw_cfg: FwCfg,
+    /// POST checkpoint latch on the manufacturing diagnostic port `0x80`.
+    pub post_diag: PostCodePort,
     ports: PortBus,
 }
 
@@ -117,6 +121,7 @@ impl Machine {
             ide_secondary: IdeSecondary::new(),
             fdc: Fdc82077::new(),
             fw_cfg: FwCfg::with_ram_size(ram_size as u64),
+            post_diag: PostCodePort::new(),
             ports: PortBus::new(),
         }
     }
@@ -205,6 +210,7 @@ impl Machine {
         self.ide_secondary.reset();
         self.fdc.reset();
         self.fw_cfg.reset();
+        self.post_diag.reset();
         // Spec: IBM PC AT — A20 open at reset; follow 8042 / port 0x92 defaults.
         self.mem.set_a20_enabled(self.kbd.a20_enabled());
         self.port92.set_a20_enabled(self.kbd.a20_enabled());
@@ -250,6 +256,7 @@ impl Machine {
             ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
             fw_cfg: &mut self.fw_cfg,
+            post_diag: &mut self.post_diag,
             ports: &mut self.ports,
         }
     }
@@ -281,6 +288,7 @@ impl Machine {
                 ide_secondary: &mut self.ide_secondary,
                 fdc: &mut self.fdc,
                 fw_cfg: &mut self.fw_cfg,
+                post_diag: &mut self.post_diag,
                 ports: &mut self.ports,
             };
             step(&mut self.cpu, &mut view)?;
@@ -462,6 +470,7 @@ impl Machine {
             ide_secondary: &mut self.ide_secondary,
             fdc: &mut self.fdc,
             fw_cfg: &mut self.fw_cfg,
+            post_diag: &mut self.post_diag,
             ports: &mut self.ports,
         };
         view.try_fw_cfg_dma()
@@ -655,6 +664,7 @@ struct MachineBus<'a> {
     ide_secondary: &'a mut IdeSecondary,
     fdc: &'a mut Fdc82077,
     fw_cfg: &'a mut FwCfg,
+    post_diag: &'a mut PostCodePort,
     ports: &'a mut PortBus,
 }
 
@@ -782,6 +792,8 @@ impl MachineBus<'_> {
             PIT_CH0_DATA | PIT_CH1_DATA | PIT_CH2_DATA | PIT_CONTROL => {
                 self.pit.port_read(port, size)
             }
+            // Spec: IBM PC/AT — manufacturing diagnostic port; no read data.
+            POST_DIAG_PORT => self.post_diag.port_read(port, size),
             PORT_SYSTEM_CONTROL => u32::from(self.pit.port61_read()),
             PORT_SYSTEM_CONTROL_A => self.port92.port_read(port, size),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
@@ -856,6 +868,8 @@ impl MachineBus<'_> {
             PIT_CH0_DATA | PIT_CH1_DATA | PIT_CH2_DATA | PIT_CONTROL => {
                 self.pit.port_write(port, size, value);
             }
+            // Spec: IBM PC/AT — POST checkpoint latch for host diagnostics.
+            POST_DIAG_PORT => self.post_diag.port_write(port, size, value),
             PORT_SYSTEM_CONTROL => self.pit.port61_write(value as u8),
             PORT_SYSTEM_CONTROL_A => {
                 self.port92.port_write(port, size, value);
@@ -1962,8 +1976,9 @@ mod tests {
                 bus.port_in_u8(I8042_STATUS_CMD).unwrap() & (STATUS_OBF | STATUS_IBF),
                 0
             );
-            assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF); // POST — unimplemented
-            bus.port_out_u8(0x80, 0xAA).unwrap(); // ignored
+            // POST diagnostic port: write-only latch, reads stay open bus.
+            assert_eq!(bus.port_in_u8(0x80).unwrap(), 0xFF);
+            bus.port_out_u8(0x80, 0xAA).unwrap();
             bus.port_out_u8(0x3F8, b'Z').unwrap();
             bus.port_out_u8(0x2F8, b'Y').unwrap();
             bus.port_out_u8(0x402, b'!').unwrap();
@@ -1974,8 +1989,54 @@ mod tests {
         assert_eq!(m.com1_text(), "Z");
         assert_eq!(m.com2_text(), "Y");
         assert_eq!(m.debug_text(), "!");
+        assert_eq!(m.post_diag.last_code(), Some(0xAA));
         assert!(!m.pic.master.initialized);
         assert!(!m.pit.channel0().count_loaded);
+    }
+
+    /// Spec: IBM PC/AT Technical Reference — port `0x80` is the manufacturing
+    /// diagnostic (POST checkpoint) port. Writes latch a code for a POST card;
+    /// the system board defines no read data, so reads stay ISA open bus.
+    #[test]
+    fn machine_bus_post_code_port_80_captures_history() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            for code in [0x01u8, 0x0D, 0x2C] {
+                bus.port_out_u8(POST_DIAG_PORT, code).unwrap();
+            }
+            assert_eq!(bus.port_in_u8(POST_DIAG_PORT).unwrap(), 0xFF);
+            // Wider accesses latch the low byte only (byte-wide port).
+            bus.port_out_u16(POST_DIAG_PORT, 0xBEEF).unwrap();
+        }
+        assert_eq!(m.post_diag.history(), [0x01, 0x0D, 0x2C, 0xEF]);
+        assert_eq!(m.post_diag.last_code(), Some(0xEF));
+        assert_eq!(m.post_diag.write_count(), 4);
+        assert!(!m.post_diag.history_overflow());
+    }
+
+    /// The bounded history flags overflow instead of growing without limit.
+    #[test]
+    fn post_code_history_is_bounded_and_reset_clears_it() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            for i in 0..(POST_CODE_HISTORY_LIMIT + 3) {
+                bus.port_out_u8(POST_DIAG_PORT, i as u8).unwrap();
+            }
+        }
+        assert_eq!(m.post_diag.history().len(), POST_CODE_HISTORY_LIMIT);
+        assert!(m.post_diag.history_overflow());
+        assert_eq!(
+            m.post_diag.write_count(),
+            POST_CODE_HISTORY_LIMIT as u64 + 3
+        );
+
+        m.reset();
+
+        assert!(m.post_diag.history().is_empty());
+        assert_eq!(m.post_diag.last_code(), None);
+        assert!(!m.post_diag.history_overflow());
     }
 
     /// Spec: NS16550A / classic PC COM2 `0x2F8`–`0x2FF` — THR OUT + LSR poll on MachineBus.

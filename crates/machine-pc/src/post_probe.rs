@@ -163,6 +163,12 @@ pub struct PostReport {
     /// Physical pages outside RAM and every ROM window, in first-touch order.
     pub unmapped_mmio: Vec<UnmappedMmioAccess>,
     pub unmapped_mmio_overflow: bool,
+    /// POST checkpoint codes written to port `0x80`, in order.
+    pub post_codes: Vec<u8>,
+    /// Most recent checkpoint code (survives history overflow).
+    pub last_post_code: Option<u8>,
+    /// More checkpoint codes were written than the bounded history holds.
+    pub post_code_overflow: bool,
     /// Bytes the firmware wrote to COM1.
     pub com1: String,
     /// Bytes the firmware wrote to the `0x402` debug console.
@@ -208,6 +214,21 @@ impl fmt::Display for PostReport {
         if self.unmapped_mmio_overflow {
             writeln!(f, "  unmapped-mmio log overflowed")?;
         }
+        let codes: Vec<String> = self.post_codes.iter().map(|c| format!("{c:02X}")).collect();
+        writeln!(
+            f,
+            "  post-codes=[{}]{} last={}",
+            codes.join(" "),
+            if self.post_code_overflow {
+                " (truncated)"
+            } else {
+                ""
+            },
+            match self.last_post_code {
+                Some(code) => format!("0x{code:02X}"),
+                None => "none".to_string(),
+            }
+        )?;
         write!(
             f,
             "  com1={:?} debug={:?}",
@@ -222,9 +243,11 @@ impl Machine {
     ///
     /// Does not reset the machine: map firmware with [`Machine::with_bios_rom`]
     /// (or reset explicitly) first. Diagnostic logging is armed for the duration
-    /// of the run only.
+    /// of the run only, and the POST checkpoint history is cleared so the report
+    /// covers this run alone.
     pub fn probe_post(&mut self, max_steps: u64) -> PostReport {
         self.ports.clear_diagnostics();
+        self.post_diag.reset();
         self.ports.set_probe(true);
 
         let mut steps = 0u64;
@@ -249,6 +272,9 @@ impl Machine {
             unclaimed_port_overflow: self.ports.unclaimed_port_overflow(),
             unmapped_mmio: self.ports.unmapped_mmio().to_vec(),
             unmapped_mmio_overflow: self.ports.unmapped_mmio_overflow(),
+            post_codes: self.post_diag.history().to_vec(),
+            last_post_code: self.post_diag.last_code(),
+            post_code_overflow: self.post_diag.history_overflow(),
             com1: self.com1_text(),
             debug: self.debug_text(),
         }

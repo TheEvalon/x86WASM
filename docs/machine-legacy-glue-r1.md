@@ -132,3 +132,54 @@ Not supported
   RTC will exhaust the step budget rather than progress.
 - Unmapped physical accesses are folded to 4 KiB pages and still behave as open
   bus (reads `0xFF`, writes dropped); they are recorded, not faulted.
+
+### What the harness found against real SeaBIOS
+
+Running the probe over the pinned SeaBIOS `rel-1.16.3` `bios.bin` stops after
+two retired instructions:
+
+```text
+post-probe: steps=2 stop=unsupported opcode 0x85 cs:ip=F000:E062
+  rip=0x000000000000E062 linear_pc=0x00000000000FE062
+  opcode_bytes=[0F 85 8E F9 31 D2 8E D2]
+```
+
+The reset vector far-jumps to `F000:E05B`, which executes
+`CMP DWORD PTR CS:[0x9228], 0` and then reaches a two-byte `0F 85` near `JNZ`.
+Near `Jcc rel16/rel32` (`0F 80`–`0F 8F`) is not in the decode tables, so SeaBIOS
+cannot get past its first branch. That gap lives in `x86-decode` /
+`x86-interpreter`, outside this slice's ownership; it is reported as the top
+blocker for the next round rather than fixed here.
+
+## 4. POST checkpoint port `0x80`
+
+Specs
+
+- IBM PC/AT Technical Reference — the system board decodes `0x80` as the
+  manufacturing diagnostic port. POST writes a checkpoint code before each test
+  phase so a diagnostic card displays the code of the failing step. The board
+  drives no read data for the port.
+- OSDev Wiki "I/O Ports" — `0x80` is also the conventional I/O-delay target, so
+  writes can far outnumber real checkpoints.
+- Observed in the pinned SeaBIOS image: one `OUT 0x80, AL` site at `0xF35F6`.
+
+Supported
+
+- `PostCodePort` claims port `0x80` from the open-bus fallback and latches every
+  write as a checkpoint code, exposing `last_code`, an ordered `history` bounded
+  at 256 entries with an explicit overflow flag, and a total `write_count` that
+  keeps counting past the bound (so I/O-delay traffic is visible without
+  unbounded growth).
+- Reads still return ISA open bus (`0xFF`), matching a board that drives no data.
+- A wider-than-byte write latches the low byte only.
+- `Machine::reset` clears the latch and history; `Machine::probe_post` clears it
+  at the start of a run and reports `post_codes` / `last_post_code` /
+  `post_code_overflow` in the `PostReport`.
+
+Not supported
+
+- No display or POST-card model, no chipset-specific extended POST ports
+  (`0x84`, `0x300`, `0x680`), and no distinction between a genuine checkpoint
+  write and an I/O-delay write beyond the separate write count.
+- `0x80` is not a DMA page register in this machine (the 8237A page decode
+  already excludes it), and this slice does not change that.
