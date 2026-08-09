@@ -1227,40 +1227,67 @@ fn protected_far_jump(
     Ok(())
 }
 
-/// Same-CPL protected-mode IRET through a 16-bit ring-0 frame.
+/// Same-CPL protected-mode `IRET` / `IRETD` through a ring-0 frame.
 ///
-/// The complete IP, CS, FLAGS frame and target descriptor are read and
-/// validated before any architectural state changes. This bounded path accepts
-/// only a nonconforming, present, D=0/L=0 ring-0 GDT code segment. Outer-level,
-/// conforming, task, VM86, LDT, 32-bit-stack, and default-32 returns remain
-/// separate slices.
+/// `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame (`IRETD`,
+/// 12 bytes) or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`, 6 bytes). The
+/// stack-pointer width follows the cached `SS.B` bit, so both frame sizes work
+/// on a 16-bit or 32-bit stack. The complete frame and target descriptor are
+/// read and validated before any architectural state changes. This bounded
+/// path accepts only a nonconforming, present, `L=0` ring-0 GDT code segment
+/// with either `D=0` or `D=1`; the reloaded CS cache keeps the descriptor's
+/// access byte plus its AVL, D/B, and G attributes.
 ///
-/// At CPL 0, 16-bit IRET restores all defined FLAGS bits, including IF, IOPL,
-/// and NT. Reserved bits 3, 5, and 15 are zero, bit 1 is one, and
-/// EFLAGS[63:16] are unchanged.
+/// At CPL 0 the popped image restores all defined flags. A 16-bit return
+/// restores `FLAGS[15:0]` and leaves `RFLAGS[63:16]` unchanged; a 32-bit
+/// return restores `EFLAGS` bits through `ID` (bit 21) and leaves
+/// `RFLAGS[63:32]` unchanged. Reserved bits 3, 5, and 15 are zero and bit 1 is
+/// one in both cases.
+///
+/// Outer-level returns, conforming targets, task returns (`NT=1`), returns to
+/// virtual-8086 mode (`VM=1` in the image), and LDT selectors remain out of
+/// scope and are reported as `Unsupported` or a selector `#GP`.
 ///
 /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ (Operation; Protected Mode
 /// Exceptions); Vol. 1 §3.4.3; Vol. 3 §§2.3.1, 3.4.2–3.4.5, 5.5, 6.12.1,
 /// 6.13.
-fn protected_iret16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
-    if cpu.cs.selector & 3 != 0
-        || cpu.cs.default_big()
-        || cpu.ss.stack_width() != 16
-        || cpu.rflags & ((1 << 14) | (1 << 17)) != 0
-    {
+fn protected_iret(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    operand_size_32: bool,
+) -> Result<(), ExecError> {
+    if cpu.cs.selector & 3 != 0 || cpu.rflags & ((1 << 14) | (1 << 17)) != 0 {
         return Err(ExecError::Unsupported(0xCF));
     }
 
-    let old_sp = cpu.gpr_u16(CpuState::RSP);
-    let mut frame = [0u16; 3];
-    for (index, word) in frame.iter_mut().enumerate() {
-        let stack_offset = old_sp.wrapping_add((index as u16) * 2);
-        let addr = seg_linear_checked(&cpu.ss, u64::from(stack_offset), 2, true)?;
-        *word = bus
-            .read_u16(addr)
-            .map_err(|error| classify_mem_fault(error, true))?;
+    let entry_size = if operand_size_32 { 4u32 } else { 2 };
+    let old_sp = stack_pointer(cpu);
+    let mut frame = [0u32; 3];
+    for (index, slot) in frame.iter_mut().enumerate() {
+        let stack_offset = stack_step(cpu, old_sp, (index as i32) * entry_size as i32);
+        let addr = seg_linear_checked(
+            &cpu.ss,
+            u64::from(stack_offset),
+            u64::from(entry_size),
+            true,
+        )?;
+        *slot = if operand_size_32 {
+            bus.read_u32(addr)
+                .map_err(|error| classify_mem_fault(error, true))?
+        } else {
+            u32::from(
+                bus.read_u16(addr)
+                    .map_err(|error| classify_mem_fault(error, true))?,
+            )
+        };
     }
-    let [target_ip, selector, flags] = frame;
+    // A 16-bit return clears EIP[31:16]; the frame read already zero-extends.
+    let [target_ip, selector_image, flags] = frame;
+    let selector = selector_image as u16;
+    // Returning to virtual-8086 mode is a separate milestone.
+    if operand_size_32 && flags & (1 << 17) != 0 {
+        return Err(ExecError::Unsupported(0xCF));
+    }
 
     if is_null_selector(selector) {
         return Err(selector_fault(13, selector));
@@ -1299,24 +1326,30 @@ fn protected_iret16(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecErr
     }
 
     let parsed = parse_segment_descriptor(descriptor);
-    if parsed.flags & (x86_core::SegmentReg::FLAG_LONG | x86_core::SegmentReg::FLAG_DEFAULT_BIG)
-        != 0
-    {
+    if parsed.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
         return Err(selector_fault(13, selector));
     }
-    if u32::from(target_ip) > parsed.limit {
+    if target_ip > parsed.limit {
         return Err(arch_fault_with_error_code(13, 0));
     }
 
+    // Defined flag bits at CPL 0: CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL, NT
+    // in the low word, plus RF, AC, VIF, VIP, and ID in the high word. VM is
+    // excluded — a `VM=1` image was rejected above. Reserved bits 3, 5, and 15
+    // stay clear and bit 1 stays set (SDM Vol. 1 §3.4.3, Figure 3-8).
     const DEFINED_FLAGS16: u64 = 0x7FD5;
-    let restored_flags = (u64::from(flags) & DEFINED_FLAGS16) | 2;
-    let final_sp = old_sp.wrapping_add(6);
+    const DEFINED_FLAGS32: u64 = 0x003D_7FD5;
+    let final_sp = stack_step(cpu, old_sp, 3 * entry_size as i32);
 
     cpu.cs
         .load_descriptor_cache(selector, parsed.base, parsed.limit, parsed.flags);
     cpu.rip = u64::from(target_ip);
-    cpu.rflags = (cpu.rflags & !0xFFFF) | restored_flags;
-    cpu.set_gpr_u16(CpuState::RSP, final_sp);
+    if operand_size_32 {
+        cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | (u64::from(flags) & DEFINED_FLAGS32) | 2;
+    } else {
+        cpu.rflags = (cpu.rflags & !0xFFFF) | (u64::from(flags) & DEFINED_FLAGS16) | 2;
+    }
+    set_stack_pointer(cpu, final_sp);
     Ok(())
 }
 
@@ -3903,13 +3936,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xCF => {
             // IRET/IRETD — Spec: Intel SDM Vol. 2 "IRET/IRETD/IRETQ".
+            // The effective operand size selects the 6-byte or 12-byte frame.
             if cr0_pe(cpu) {
-                if opsz32(&insn) {
-                    return Err(ExecError::Unsupported(op));
-                }
-                protected_iret16(cpu, bus)?;
+                protected_iret(cpu, bus, opsz32(&insn))?;
             } else {
                 // Preserve the existing real-address 16-bit stack-frame path.
+                // Real-address `IRETD` (`0x66 CF`, 12-byte frame) is not modeled.
                 let ip = pop16(cpu, bus)?;
                 let cs_sel = pop16(cpu, bus)?;
                 let flags = pop16(cpu, bus)?;
@@ -6920,10 +6952,12 @@ mod tests {
                 13,
                 0x0020,
             ),
+            // `D=1` return segments are accepted since the IRETD slice; `L=1`
+            // (64-bit) code segments remain rejected here.
             (
-                "default-32 code",
+                "long-mode code",
                 0x0020,
-                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x9A, 0x40),
+                encode_seg_desc(PROTECTED_IRET_RETURN_BASE, 0xFFFF, 0x9A, 0x20),
                 0x00FF,
                 0x0100,
                 13,
@@ -16852,12 +16886,11 @@ mod tests {
         assert_eq!(cpu, before, "far JMP committed state before #GP");
     }
 
-    /// Documented gap for this slice: architectural faults raised while
-    /// `CS.D=1` cannot be delivered yet, because the bounded IDT path only
-    /// implements 16-bit gates. This is reported deterministically rather than
-    /// silently truncating a 32-bit return EIP into a 16-bit frame.
+    /// A 286 (16-bit) gate cannot carry a 32-bit return EIP, so a fault raised
+    /// while `CS.D=1` is reported deterministically instead of being truncated
+    /// into a 16-bit frame. Use a 386 gate (type `0xE`/`0xF`) for `D=1` code.
     ///
-    /// Spec: Intel SDM Vol. 3 §6.11 (gate types); §6.14.
+    /// Spec: Intel SDM Vol. 3 §6.11 (gate types); §6.12.1.
     #[test]
     fn default_32_execution_cannot_yet_enter_16_bit_idt_gates() {
         // D0 F0 = Group 2 /6 (reserved) → #UD.
@@ -17510,5 +17543,231 @@ mod tests {
             bus.mem, bus_template.mem,
             "frame bytes were not rolled back"
         );
+    }
+
+    /// `IRETD` fixture: a 32-bit frame at `PM32_TEST_ESP - 12` and a return
+    /// code descriptor written at `return_selector`'s GDT index.
+    ///
+    /// Spec: Intel SDM Vol. 2 "IRET/IRETD" (Protected Mode, same privilege).
+    fn pm32_iretd_fixture(
+        return_eip: u32,
+        return_selector: u16,
+        return_eflags: u32,
+        descriptor: [u8; 8],
+    ) -> (CpuState, VecBus) {
+        // CF = IRET; under CS.D=1 the default operand size makes it IRETD.
+        let (mut cpu, mut bus) = pm32_fixture(&[0xCF], PM32_CODE, true);
+        let index = usize::from(return_selector >> 3);
+        bus.mem[PM32_GDT + index * 8..PM32_GDT + index * 8 + 8].copy_from_slice(&descriptor);
+        cpu.gdtr.limit = 0x00FF;
+        cpu.ss = x86_core::SegmentReg {
+            selector: PM32_SS32,
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            flags: 0xC092,
+        };
+        let frame = (PM32_TEST_ESP - 12) as usize;
+        bus.mem[frame..frame + 4].copy_from_slice(&return_eip.to_le_bytes());
+        bus.mem[frame + 4..frame + 8].copy_from_slice(&u32::from(return_selector).to_le_bytes());
+        bus.mem[frame + 8..frame + 12].copy_from_slice(&return_eflags.to_le_bytes());
+        cpu.set_gpr_u32(CpuState::RSP, PM32_TEST_ESP - 12);
+        (cpu, bus)
+    }
+
+    /// Intel SDM Vol. 2 "IRET/IRETD" (Operation, same-privilege return);
+    /// Vol. 3 §§3.4.5, 6.12.1: a 32-bit frame restores EIP, CS with its full
+    /// cached attributes, EFLAGS, and steps ESP by 12.
+    #[test]
+    fn protected_iretd_restores_32_bit_frame_and_cs_cache() {
+        // Return CS: ring-0, nonconforming, present, G=1, D=1, AVL=1.
+        let descriptor = encode_seg_desc(0x0000_1000, 0xF_FFFF, 0x9A, 0xD0);
+        let (mut cpu, mut bus) =
+            pm32_iretd_fixture(0x0002_1234, PM32_CS32, 0x0000_0A57, descriptor);
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.rip, 0x0002_1234);
+        assert_eq!(cpu.cs.selector, PM32_CS32);
+        assert_eq!(cpu.cs.base, 0x0000_1000);
+        assert_eq!(cpu.cs.limit, 0xFFFF_FFFF);
+        assert_eq!(cpu.cs.flags, 0xD09A);
+        assert!(cpu.cs.default_big());
+        assert_eq!(cpu.rflags, 0x0000_0A57);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+    }
+
+    /// Intel SDM Vol. 1 §3.4.3; Vol. 2 "IRET/IRETD": at CPL 0 the 32-bit frame
+    /// restores the defined EFLAGS bits (through ID). Reserved bits 3, 5, and
+    /// 15 stay clear, bit 1 stays set, and `RFLAGS[63:32]` is unchanged.
+    #[test]
+    fn protected_iretd_restores_defined_eflags_only() {
+        let descriptor = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
+        let (mut cpu, mut bus) =
+            pm32_iretd_fixture(0x0000_2000, PM32_CS32, !(1u32 << 17), descriptor);
+        cpu.rflags = 0xDEAD_BEEF_0000_0002;
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.rflags >> 32, 0xDEAD_BEEF);
+        assert_eq!(cpu.rflags as u32, 0x003D_7FD7);
+    }
+
+    /// Intel SDM Vol. 2 "IRET/IRETD": a `0x66` override on `CS.D=1` code takes
+    /// the 16-bit frame, clears `EIP[31:16]`, steps ESP by 6, and leaves
+    /// `EFLAGS[31:16]` untouched.
+    #[test]
+    fn protected_iret16_on_a_32_bit_stack_uses_a_six_byte_frame() {
+        let descriptor = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
+        let (mut cpu, mut bus) = pm32_iretd_fixture(0, PM32_CS32, 0, descriptor);
+        bus.mem[PM32_CODE..PM32_CODE + 2].copy_from_slice(&[0x66, 0xCF]);
+        let frame = (PM32_TEST_ESP - 6) as usize;
+        bus.mem[frame..frame + 2].copy_from_slice(&0x2468u16.to_le_bytes());
+        bus.mem[frame + 2..frame + 4].copy_from_slice(&PM32_CS32.to_le_bytes());
+        bus.mem[frame + 4..frame + 6].copy_from_slice(&0x0A57u16.to_le_bytes());
+        cpu.set_gpr_u32(CpuState::RSP, PM32_TEST_ESP - 6);
+        cpu.rflags = 0x0000_0000_00A5_0002;
+
+        step(&mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.rip, 0x2468);
+        assert_eq!(cpu.gpr_u32(CpuState::RSP), PM32_TEST_ESP);
+        assert_eq!(cpu.rflags, 0x0000_0000_00A5_0A57);
+    }
+
+    /// Intel SDM Vol. 3 §6.12.1: entering a 386 interrupt gate and returning
+    /// with `IRETD` restores the exact architectural state, including `IF`.
+    #[test]
+    fn protected_iretd_round_trips_a_32_bit_interrupt_gate() {
+        let (mut cpu, mut bus) = pm32_gate_fixture(&[0xCC], 3, PM32_INTERRUPT_GATE32, 0, true);
+        bus.mem[PM32_HANDLER as usize] = 0xCF;
+        cpu.rflags = 0x0000_0000_0000_0A57 | (1 << 9);
+        let before = cpu.clone();
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rip, u64::from(PM32_HANDLER));
+        assert!(!cpu.interrupt_flag());
+
+        step(&mut cpu, &mut bus).unwrap();
+        let mut expected = before.clone();
+        // INT3 saves the address of the following instruction.
+        expected.rip = (PM32_CODE + 1) as u64;
+        assert_eq!(cpu, expected);
+    }
+
+    /// Intel SDM Vol. 2 "IRET/IRETD" (Protected Mode Exceptions): every frame
+    /// and descriptor check happens before any architectural commit.
+    #[test]
+    fn protected_iretd_validation_faults_are_atomic() {
+        /// name, return selector, descriptor, return EIP, vector, error code.
+        type IretdFaultCase = (&'static str, u16, [u8; 8], u32, u8, u16);
+
+        let valid = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
+        let cases: [IretdFaultCase; 8] = [
+            ("null selector", 0x0000, valid, 0x2000, 13, 0x0000),
+            ("LDT selector", 0x000C, valid, 0x2000, 13, 0x000C),
+            (
+                "data descriptor",
+                PM32_CS32,
+                encode_seg_desc(0, 0xF_FFFF, 0x92, 0xC0),
+                0x2000,
+                13,
+                PM32_CS32,
+            ),
+            (
+                "conforming code",
+                PM32_CS32,
+                encode_seg_desc(0, 0xF_FFFF, 0x9E, 0xC0),
+                0x2000,
+                13,
+                PM32_CS32,
+            ),
+            ("outer RPL", 0x000B, valid, 0x2000, 13, 0x0008),
+            (
+                "ring 1 DPL",
+                PM32_CS32,
+                encode_seg_desc(0, 0xF_FFFF, 0xBA, 0xC0),
+                0x2000,
+                13,
+                PM32_CS32,
+            ),
+            (
+                "not present",
+                PM32_CS32,
+                encode_seg_desc(0, 0xF_FFFF, 0x1A, 0xC0),
+                0x2000,
+                11,
+                PM32_CS32,
+            ),
+            (
+                "long-mode code",
+                PM32_CS32,
+                encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xE0),
+                0x2000,
+                13,
+                PM32_CS32,
+            ),
+        ];
+
+        for (name, selector, descriptor, eip, vector, error_code) in cases {
+            let (mut cpu, mut bus) = pm32_iretd_fixture(eip, selector, 0x0002, descriptor);
+            let before = cpu.clone();
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), vector, Some(error_code));
+            assert_eq!(
+                cpu, before,
+                "{name}: IRETD committed state before the fault"
+            );
+        }
+
+        // A 32-bit EIP beyond the return segment limit is #GP(0).
+        let (mut cpu, mut bus) = pm32_iretd_fixture(
+            0x0001_0000,
+            PM32_CS32,
+            0x0002,
+            encode_seg_desc(0, 0xFFFF, 0x9A, 0x40),
+        );
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before, "EIP past limit committed state");
+    }
+
+    /// Returning to virtual-8086 mode (`VM=1` in the popped image) and nested
+    /// task returns (`NT=1`) are outside this bounded same-CPL slice and are
+    /// reported instead of being silently ignored.
+    /// Spec: Intel SDM Vol. 2 "IRET/IRETD" (Operation); Vol. 3 §§6.12.1, 20.2.
+    #[test]
+    fn protected_iretd_rejects_vm86_and_nested_task_returns() {
+        let descriptor = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
+        let (mut cpu, mut bus) =
+            pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002 | (1 << 17), descriptor);
+        let before = cpu.clone();
+        assert_eq!(
+            step_inner(&mut cpu, &mut bus),
+            Err(ExecError::Unsupported(0xCF))
+        );
+        assert_eq!(cpu, before);
+
+        let (mut cpu, mut bus) = pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002, descriptor);
+        cpu.rflags |= 1 << 14; // NT
+        let before = cpu.clone();
+        assert_eq!(
+            step_inner(&mut cpu, &mut bus),
+            Err(ExecError::Unsupported(0xCF))
+        );
+        assert_eq!(cpu, before);
+    }
+
+    /// A stack-limit fault during the 32-bit frame load leaves the CPU
+    /// untouched. Spec: Intel SDM Vol. 2 "IRET/IRETD" (Protected Mode
+    /// Exceptions); Vol. 3 §5.3.
+    #[test]
+    fn protected_iretd_frame_reads_are_atomic() {
+        let descriptor = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
+        let (mut cpu, mut bus) = pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002, descriptor);
+        // Only the first two frame doublewords stay inside the stack limit.
+        cpu.ss.limit = PM32_TEST_ESP - 5;
+        let before = cpu.clone();
+
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 12, Some(0));
+        assert_eq!(cpu, before);
     }
 }

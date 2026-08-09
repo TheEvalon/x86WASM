@@ -125,3 +125,38 @@ before any write, and a failing stack write rolls all bytes back.
 so no stack switch, no TSS `SS0:ESP0`, and no outer-level frame with `SS:ESP`;
 task gates; interrupt/trap gates in the LDT; virtual-8086 delivery; nested
 `#DF` or triple-fault synthesis; the `IST` mechanism.
+
+## Slice 4 — `IRETD`
+
+**Supported.** `protected_iret16` became `protected_iret`, driven by the
+effective operand size: `IRETD` (`CS.D=1` default, or `0x66` from `D=0` code)
+pops a 12-byte `EIP`/`CS`/`EFLAGS` frame, `IRET` pops the existing 6-byte
+`IP`/`CS`/`FLAGS` frame. The stack-pointer width follows `SS.B`, so both frame
+sizes work on 16-bit and 32-bit stacks and the pointer is advanced by 12 or 6
+through `ESP` or `SP` respectively.
+
+The frame and the return descriptor are read and fully validated before any
+architectural commit. The return code segment must be a non-null, GDT,
+non-system, executable, nonconforming, present, ring-0 (`RPL=DPL=0`) segment
+with `L=0`; `D=0` and `D=1` are both accepted and the reloaded CS cache keeps
+the access byte plus the AVL, D/B, and G attributes, so `IRETD` can switch the
+execution window in either direction. A return `EIP` beyond the effective
+segment limit raises `#GP(0)`; selector problems raise `#GP(selector)` or
+`#NP(selector)`.
+
+Flag restore at CPL 0: a 16-bit return restores `FLAGS[15:0]` (mask `0x7FD5`)
+and leaves `RFLAGS[63:16]` unchanged; a 32-bit return restores `EFLAGS`
+through `ID` (mask `0x003D_7FD5`: CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL,
+NT, RF, AC, VIF, VIP, ID) and leaves `RFLAGS[63:32]` unchanged. Reserved bits
+3, 5, and 15 stay clear and bit 1 stays set in both cases.
+
+A round-trip test enters a 386 interrupt gate and returns with `IRETD`,
+asserting that the full `CpuState` (except the saved next `EIP`) matches the
+pre-interrupt state.
+
+**Not supported by this slice.** Outer-level returns (no `SS:ESP` pop, no
+privilege change); returns to virtual-8086 mode — `VM=1` in the popped image
+is reported as `Unsupported(0xCF)` rather than silently ignored; nested task
+returns (`NT=1` in the current `EFLAGS`) are likewise `Unsupported`;
+conforming return segments; LDT return selectors; real-address-mode `IRETD`
+(`0x66 CF` with `CR0.PE=0`) still pops the 6-byte real-mode frame; `IRETQ`.
