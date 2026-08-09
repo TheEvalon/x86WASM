@@ -12,10 +12,19 @@ mod hello_rom;
 mod mbr;
 mod mem;
 mod ports;
+mod post_probe;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::PhysMem;
+pub use ports::{
+    UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
+    UNMAPPED_MMIO_PAGE_SIZE,
+};
+pub use post_probe::{
+    seabios_image_path, PostFailure, PostFailureKind, PostReport, PostStopReason,
+    DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
+};
 
 use devices::{
     CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, Fdc82077, FwCfg, FwCfgDmaOutcome,
@@ -890,6 +899,10 @@ impl Bus for MachineBus<'_> {
         if let Some(b) = self.vga.read_u8(effective) {
             return Ok(b);
         }
+        // Probe-only: anything decoding to neither RAM nor ROM is open bus.
+        if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
+            self.ports.record_unmapped_mmio(effective, false);
+        }
         self.mem
             .read_u8(addr)
             .map_err(|_| ExecError::MemoryFault(addr))
@@ -903,6 +916,9 @@ impl Bus for MachineBus<'_> {
         };
         if self.vga.write_u8(effective, val) {
             return Ok(());
+        }
+        if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
+            self.ports.record_unmapped_mmio(effective, true);
         }
         self.mem
             .write_u8(addr, val)

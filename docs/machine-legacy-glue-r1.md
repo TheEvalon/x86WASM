@@ -88,3 +88,47 @@ Not supported
   retires, so the "transfer still in progress" control state never appears.
 - MMIO register layout (base+0 data / base+8 selector / base+16 DMA) and the
   full firmware blob set (ACPI/SMBIOS tables, boot order, kernel/initrd).
+
+## 3. POST first-contact harness
+
+Specs
+
+- Intel SDM Vol. 3 §9.1.4 — processor state after reset: first instruction is
+  fetched from `0xFFFFFFF0` with `CS.selector = 0xF000` and
+  `CS.base = 0xFFFF0000`.
+- Intel SDM Vol. 3 §3.4.2 — real-mode linear address is the cached segment base
+  plus the 16-bit offset; instruction fetch wraps `IP` at 16 bits.
+- Intel SDM Vol. 2 §2.1.1 — instructions are at most 15 bytes, so an eight-byte
+  window is a prefix of the faulting instruction, not the whole of it.
+- `docs/sources.md` (Firmware) — SeaBIOS is mapped at the top of 4 GiB with the
+  last 128 KiB aliased below 1 MiB.
+
+Supported
+
+- `Machine::probe_post(max_steps)` single-steps mapped firmware and returns a
+  `PostReport`: retired step count, a classified `PostStopReason`
+  (`Halted`, `StepBudgetExhausted`, or `Failure`), the unclaimed I/O ports
+  touched, the unmapped physical pages touched, and the COM1 / `0x402` output.
+- A `Failure` records the kind (unsupported opcode, truncated instruction,
+  instruction too long, unsupported encoding, memory fault, architectural fault
+  with vector and error code, or protected-mode delivery failure) together with
+  `CS:IP`, RIP, the linear PC, and the eight-byte wrapping opcode window. A
+  two-byte `0F` escape is visible in that window even though the decode error
+  names only the second byte.
+- Diagnostic logging is armed only while the probe runs, so ordinary execution
+  is unchanged. Both logs are bounded (64 distinct port sites, 32 distinct
+  4 KiB pages) with explicit overflow flags.
+- `emulator-cli --post-probe` runs the same harness over `--rom` / `--bios` and
+  prints the report.
+- `machine_pc::seabios_image_path` resolves `firmware/seabios/bios.bin` (or
+  `X86WASM_SEABIOS_BIOS`) and returns `None` so tests skip gracefully when the
+  git-ignored image has not been built.
+
+Not supported
+
+- This is a diagnostic only. It does not make POST succeed, does not resume past
+  a failure, and does not enumerate blockers beyond the first CPU-level one.
+- No time source is advanced during a probe, so firmware that polls the PIT or
+  RTC will exhaust the step budget rather than progress.
+- Unmapped physical accesses are folded to 4 KiB pages and still behave as open
+  bus (reads `0xFF`, writes dropped); they are recorded, not faulted.

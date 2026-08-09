@@ -85,6 +85,15 @@ impl PhysMem {
         None
     }
 
+    /// Whether an A20-masked physical address decodes to RAM or a ROM window.
+    ///
+    /// Everything else is open bus (reads return `0xFF`, writes are dropped);
+    /// the POST probe uses this to report unimplemented MMIO regions.
+    pub fn is_mapped(&self, addr: u64) -> bool {
+        let addr = self.apply_a20(addr);
+        self.rom_read(addr).is_some() || (addr as usize) < self.ram.len()
+    }
+
     pub fn read_u8(&self, addr: u64) -> Result<u8, MemError> {
         let addr = self.apply_a20(addr);
         if let Some(b) = self.rom_read(addr) {

@@ -1,6 +1,6 @@
 //! Native CLI helpers for the x86WASM emulator runner.
 
-use machine_pc::{build_hello_rom, Machine, MachineError, EXPECTED_HELLO};
+use machine_pc::{build_hello_rom, Machine, MachineError, PostReport, EXPECTED_HELLO};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +18,8 @@ pub struct Options {
     /// Classic BIOS path — dual-map via [`Machine::load_bios_rom`].
     pub bios_path: Option<PathBuf>,
     pub max_steps: u64,
+    /// Run the POST first-contact diagnostic instead of the normal run.
+    pub post_probe: bool,
 }
 
 impl Default for Options {
@@ -26,6 +28,7 @@ impl Default for Options {
             rom_path: None,
             bios_path: None,
             max_steps: DEFAULT_MAX_STEPS,
+            post_probe: false,
         }
     }
 }
@@ -151,9 +154,11 @@ impl std::error::Error for CliError {
 /// Usage / help text for `--help` / `-h`.
 pub fn usage() -> String {
     format!(
-        "Usage: emulator-cli [--rom path.bin | --bios path.bin] [--steps N]\n\
-         --rom   Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
-         --bios  Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
+        "Usage: emulator-cli [--rom path.bin | --bios path.bin] [--steps N] [--post-probe]\n\
+         --rom         Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
+         --bios        Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
+         --post-probe  Report POST first contact (first failure, unclaimed ports,\n\
+         \x20             unmapped MMIO) instead of validating the run.\n\
          Default ROM prints '{EXPECTED_HELLO}' via COM1 and port 0x402."
     )
 }
@@ -178,6 +183,7 @@ where
                 let path = iter.next().ok_or(CliError::MissingValue("--bios"))?;
                 opts.bios_path = Some(PathBuf::from(path.as_ref()));
             }
+            "--post-probe" => opts.post_probe = true,
             "--steps" => {
                 let v = iter.next().ok_or(CliError::MissingValue("--steps"))?;
                 opts.max_steps = v
@@ -272,6 +278,16 @@ pub fn run_machine(
     Ok((steps, com1, dbg))
 }
 
+/// Run the POST first-contact diagnostic and return its structured report.
+///
+/// Unlike [`run_machine`] this makes no claim about success: it reports how far
+/// the firmware got and what stopped it. Resets the machine first so the run
+/// starts from the architectural reset state.
+pub fn run_post_probe(machine: &mut Machine, max_steps: u64) -> PostReport {
+    machine.reset();
+    machine.probe_post(max_steps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,8 +358,40 @@ mod tests {
                 bios_path: Some(PathBuf::from("fw.bin")),
                 rom_path: None,
                 max_steps: 42,
+                post_probe: false,
             })
         );
+    }
+
+    #[test]
+    fn parse_post_probe_flag() {
+        let parsed = parse_args(["--bios", "fw.bin", "--post-probe"]).unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(Options {
+                bios_path: Some(PathBuf::from("fw.bin")),
+                post_probe: true,
+                ..Options::default()
+            })
+        );
+        assert!(usage().contains("--post-probe"));
+    }
+
+    /// `--post-probe` reports first contact instead of validating output.
+    #[test]
+    fn post_probe_reports_first_unsupported_opcode() {
+        let mut machine =
+            Machine::with_bios_rom(16 * 1024 * 1024, &failing_bios_rom()).expect("load BIOS");
+
+        let report = run_post_probe(&mut machine, 16);
+
+        let failure = report.failure().expect("first failure");
+        assert_eq!(
+            failure.kind,
+            machine_pc::PostFailureKind::UnsupportedOpcode(0x9B)
+        );
+        assert_eq!(failure.opcode_bytes[0], Some(0x9B));
+        assert_eq!(report.steps, 1);
     }
 
     #[test]
