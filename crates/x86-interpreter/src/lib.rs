@@ -1841,30 +1841,22 @@ fn protected_far_jump(
     Ok(())
 }
 
-/// Same-CPL protected-mode `IRET` / `IRETD` through a ring-0 frame.
+/// Protected-mode `IRET` / `IRETD`: same-CPL or outer-privilege return.
 ///
-/// `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame (`IRETD`,
-/// 12 bytes) or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`, 6 bytes). The
-/// stack-pointer width follows the cached `SS.B` bit, so both frame sizes work
-/// on a 16-bit or 32-bit stack. The complete frame and target descriptor are
-/// read and validated before any architectural state changes. This bounded
-/// path accepts only a nonconforming, present, `L=0` ring-0 GDT code segment
-/// with either `D=0` or `D=1`; the reloaded CS cache keeps the descriptor's
-/// access byte plus its AVL, D/B, and G attributes.
+/// `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame (`IRETD`)
+/// or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`). Stack-pointer width follows
+/// the current `SS.B`. When the return CS.RPL is greater than CPL, the frame
+/// also carries outer `ESP`/`SS`, which are validated and loaded so CPL drops
+/// to the return RPL (Vol. 2 IRET; Vol. 3 §6.12.1).
 ///
-/// At CPL 0 the popped image restores all defined flags. A 16-bit return
-/// restores `FLAGS[15:0]` and leaves `RFLAGS[63:16]` unchanged; a 32-bit
-/// return restores `EFLAGS` bits through `ID` (bit 21) and leaves
-/// `RFLAGS[63:32]` unchanged. Reserved bits 3, 5, and 15 are zero and bit 1 is
-/// one in both cases.
+/// This bounded path still requires the instruction itself to execute at
+/// CPL 0. Same-CPL returns reload a nonconforming present `L=0` ring-0 GDT
+/// code segment; outer returns require a nonconforming segment whose DPL
+/// equals the return RPL, plus a matching writable SS. `NT=1` task returns
+/// and `VM=1` images remain unsupported.
 ///
-/// Outer-level returns, conforming targets, task returns (`NT=1`), returns to
-/// virtual-8086 mode (`VM=1` in the image), and LDT selectors remain out of
-/// scope and are reported as `Unsupported` or a selector `#GP`.
-///
-/// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ (Operation; Protected Mode
-/// Exceptions); Vol. 1 §3.4.3; Vol. 3 §§2.3.1, 3.4.2–3.4.5, 5.5, 6.12.1,
-/// 6.13.
+/// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ; Vol. 1 §3.4.3; Vol. 3
+/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13.
 fn protected_iret(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1873,11 +1865,13 @@ fn protected_iret(
     if cpu.cs.selector & 3 != 0 || cpu.rflags & ((1 << 14) | (1 << 17)) != 0 {
         return Err(ExecError::Unsupported(0xCF));
     }
+    let cpl = 0u8;
 
     let entry_size = if operand_size_32 { 4u32 } else { 2 };
     let old_sp = stack_pointer(cpu);
-    let mut frame = [0u32; 3];
-    for (index, slot) in frame.iter_mut().enumerate() {
+    let mut slots = [0u32; 5];
+    let slot_count_probe = 3; // enough to read CS.RPL before deciding outer
+    for index in 0..slot_count_probe {
         let stack_offset = stack_step(cpu, old_sp, (index as i32) * entry_size as i32);
         let addr = seg_linear_checked(
             &cpu.ss,
@@ -1885,7 +1879,7 @@ fn protected_iret(
             u64::from(entry_size),
             true,
         )?;
-        *slot = if operand_size_32 {
+        slots[index] = if operand_size_32 {
             bus.read_u32(addr)
                 .map_err(|error| classify_mem_fault(error, true))?
         } else {
@@ -1895,9 +1889,9 @@ fn protected_iret(
             )
         };
     }
-    // A 16-bit return clears EIP[31:16]; the frame read already zero-extends.
-    let [target_ip, selector_image, flags] = frame;
-    let selector = selector_image as u16;
+    let target_ip = slots[0];
+    let selector = slots[1] as u16;
+    let flags = slots[2];
     // Returning to virtual-8086 mode is a separate milestone.
     if operand_size_32 && flags & (1 << 17) != 0 {
         return Err(ExecError::Unsupported(0xCF));
@@ -1910,18 +1904,7 @@ fn protected_iret(
         return Err(selector_fault(13, selector));
     }
 
-    let descriptor_offset = u64::from(selector >> 3) * 8;
-    if descriptor_offset + 7 > u64::from(cpu.gdtr.limit) {
-        return Err(selector_fault(13, selector));
-    }
-    let descriptor_addr = cpu.gdtr.base.wrapping_add(descriptor_offset);
-    let mut descriptor = [0u8; 8];
-    for (index, byte) in descriptor.iter_mut().enumerate() {
-        *byte = bus
-            .read_u8(descriptor_addr.wrapping_add(index as u64))
-            .map_err(|error| classify_mem_fault(error, false))?;
-    }
-
+    let descriptor = read_gdt_segment_descriptor(cpu, bus, selector)?;
     let access = descriptor[5];
     let system = access & 0x10 == 0;
     let executable = access & 0x08 != 0;
@@ -1932,7 +1915,11 @@ fn protected_iret(
 
     let rpl = (selector & 3) as u8;
     let dpl = (access >> 5) & 3;
-    if rpl != 0 || dpl != 0 {
+    if rpl < cpl {
+        return Err(selector_fault(13, selector));
+    }
+    // Nonconforming code: DPL must equal the return RPL (new CPL).
+    if dpl != rpl {
         return Err(selector_fault(13, selector));
     }
     if access & 0x80 == 0 {
@@ -1947,13 +1934,45 @@ fn protected_iret(
         return Err(arch_fault_with_error_code(13, 0));
     }
 
+    let outer = rpl > cpl;
+    let prepared_ss = if outer {
+        for index in 3..5 {
+            let stack_offset = stack_step(cpu, old_sp, (index as i32) * entry_size as i32);
+            let addr = seg_linear_checked(
+                &cpu.ss,
+                u64::from(stack_offset),
+                u64::from(entry_size),
+                true,
+            )?;
+            slots[index] = if operand_size_32 {
+                bus.read_u32(addr)
+                    .map_err(|error| classify_mem_fault(error, true))?
+            } else {
+                u32::from(
+                    bus.read_u16(addr)
+                        .map_err(|error| classify_mem_fault(error, true))?,
+                )
+            };
+        }
+        let outer_esp = slots[3];
+        let outer_ss = slots[4] as u16;
+        let prepared = prepare_ss_from_gdt_for_cpl(cpu, bus, outer_ss, rpl)?;
+        Some((outer_esp, prepared))
+    } else {
+        None
+    };
+
     // Defined flag bits at CPL 0: CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL, NT
     // in the low word, plus RF, AC, VIF, VIP, and ID in the high word. VM is
     // excluded — a `VM=1` image was rejected above. Reserved bits 3, 5, and 15
     // stay clear and bit 1 stays set (SDM Vol. 1 §3.4.3, Figure 3-8).
     const DEFINED_FLAGS16: u64 = 0x7FD5;
     const DEFINED_FLAGS32: u64 = 0x003D_7FD5;
-    let final_sp = stack_step(cpu, old_sp, 3 * entry_size as i32);
+    let temp_sp = stack_step(
+        cpu,
+        old_sp,
+        (if outer { 5 } else { 3 }) * entry_size as i32,
+    );
 
     cpu.cs
         .load_descriptor_cache(selector, parsed.base, parsed.limit, parsed.flags);
@@ -1963,7 +1982,17 @@ fn protected_iret(
     } else {
         cpu.rflags = (cpu.rflags & !0xFFFF) | (u64::from(flags) & DEFINED_FLAGS16) | 2;
     }
-    set_stack_pointer(cpu, final_sp);
+
+    if let Some((outer_esp, ss)) = prepared_ss {
+        cpu.ss = ss;
+        if cpu.ss.default_big() {
+            cpu.set_gpr_u32(CpuState::RSP, outer_esp);
+        } else {
+            cpu.set_gpr_u16(CpuState::RSP, outer_esp as u16);
+        }
+    } else {
+        set_stack_pointer(cpu, temp_sp);
+    }
     Ok(())
 }
 
