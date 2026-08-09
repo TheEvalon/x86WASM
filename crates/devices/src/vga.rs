@@ -446,6 +446,89 @@ const _: () = assert!(
         && VGA_SEQ_MEMORY_MODE_DEFAULT == 0x02
         && VGA_SEQ_DEFAULTS[VGA_SEQ_MEMORY_MODE as usize] == VGA_SEQ_MEMORY_MODE_DEFAULT
 );
+/// Memory Mode bit1 — Extended Memory (EM).
+///
+/// Spec: IBM PS/2 Hardware Interface Technical Reference — Video Subsystems
+/// (Sep 1992) Figure 2-33, Memory Mode Register index hex 04: "When set to 1,
+/// the Extended Memory field (bit 1) enables the video memory from 64KB to
+/// 256KB." Clear therefore leaves [`VGA_PLANE_SIZE_NO_EXTENDED`] addressable
+/// per map instead of [`VGA_PLANE_SIZE`].
+pub const VGA_SEQ_MEMORY_MODE_EXTENDED: u8 = 0x02;
+/// Memory Mode bit2 — Odd/Even (OE); `0` selects odd/even host addressing.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-33: "When the Odd/Even field
+/// (bit 2) is set to 0, even system addresses access maps 0 and 2, while odd
+/// system addresses access maps 1 and 3. When set to 1, system addresses
+/// sequentially access data within a bit map, and the maps are accessed
+/// according to the value in the Map Mask register." OSDev VGA Hardware names
+/// the same bit "Odd/Even Disable".
+pub const VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE: u8 = 0x04;
+/// Memory Mode bit3 — Chain 4 (CH4).
+///
+/// Spec: IBM PS/2 Video Subsystems Figures 2-33 / 2-34: when set, "the 2
+/// low-order bits select the map accessed" (A1 A0 → map 0–3).
+pub const VGA_SEQ_MEMORY_MODE_CHAIN4: u8 = 0x08;
+/// Mode-03h default has Chain 4 clear, Odd/Even addressing on, Extended set.
+const _: () = assert!(
+    VGA_SEQ_MEMORY_MODE_DEFAULT & VGA_SEQ_MEMORY_MODE_CHAIN4 == 0
+        && VGA_SEQ_MEMORY_MODE_DEFAULT & VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE == 0
+        && VGA_SEQ_MEMORY_MODE_DEFAULT & VGA_SEQ_MEMORY_MODE_EXTENDED != 0
+);
+
+/// Number of VGA memory maps (planes).
+///
+/// Spec: IBM PS/2 Video Subsystems §2 "Graphics Controller" / Figure 2-15
+/// 256KB Video Memory Map — four 64 KB maps.
+pub const VGA_PLANE_COUNT: usize = 4;
+/// Addressable bytes per map with Memory Mode Extended Memory set (256 KB total).
+pub const VGA_PLANE_SIZE: usize = 0x1_0000;
+/// Addressable bytes per map with Extended Memory clear (64 KB total).
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-33 documents the 64 KB / 256 KB
+/// memory size, not what a host access above the 64 KB boundary does. This
+/// emulator wraps the per-map offset within the enabled region as a
+/// deterministic model choice (see `docs/vga-plane-memory-model.md`).
+pub const VGA_PLANE_SIZE_NO_EXTENDED: usize = VGA_PLANE_SIZE / VGA_PLANE_COUNT;
+/// All four map-enable bits of the Map Mask register.
+pub const VGA_SEQ_MAP_MASK_PLANES: u8 = 0x0F;
+const _: () = assert!(
+    VGA_PLANE_COUNT == 4
+        && VGA_PLANE_SIZE == 0x1_0000
+        && VGA_PLANE_SIZE_NO_EXTENDED == 0x4000
+        && VGA_SEQ_MAP_MASK_PLANES == 0x0F
+);
+
+/// Host-address → map (plane) addressing model currently programmed.
+///
+/// Spec: IBM PS/2 Video Subsystems Figures 2-33 / 2-34 (Sequencer Memory Mode)
+/// and OSDev VGA Hardware "Addressing Logic".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VgaPlaneAddressing {
+    /// Chain 4: A1/A0 select the map (Memory Mode bit3 set).
+    Chain4,
+    /// Odd/Even: even host addresses reach maps 0+2, odd addresses maps 1+3.
+    OddEven,
+    /// Planar: every map sees the same offset; Map Mask alone selects writes.
+    Planar,
+}
+
+/// Decoded plane targets and per-map offset for one CPU display-window access.
+///
+/// Produced by [`VgaText::plane_access`]. `planes` is the address-logic result
+/// before the Map Mask; `write_planes` is that value ANDed with the Map Mask
+/// (OSDev VGA Hardware, Write Mode 0: "The Memory Plane Write Enable field is
+/// ANDed with the input from the address logic").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VgaPlaneAccess {
+    /// Maps selected by address decode alone (bit *n* = map *n*).
+    pub planes: u8,
+    /// Maps actually write-enabled (`planes` AND Map Mask).
+    pub write_planes: u8,
+    /// Byte offset within each selected map.
+    pub offset: usize,
+    /// Addressing model that produced this mapping.
+    pub addressing: VgaPlaneAddressing,
+}
 
 /// Miscellaneous Output Register write port.
 ///
@@ -1043,6 +1126,113 @@ impl VgaText {
     /// Misc Output VSYNC polarity bit (bit7). Spec: FreeVGA / IBM VGA.
     pub fn misc_vsync_polarity(&self) -> bool {
         self.misc_output & VGA_MISC_VSYNC_POLARITY != 0
+    }
+
+    /// Sequencer Map Mask (`0x02`) map-enable bits 3:0.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-29 — M3E–M0E enable system
+    /// access to the corresponding map.
+    pub fn seq_map_mask(&self) -> u8 {
+        self.seq_regs[usize::from(VGA_SEQ_MAP_MASK)] & VGA_SEQ_MAP_MASK_PLANES
+    }
+
+    /// True when Memory Mode Chain 4 (bit3) is set.
+    pub fn seq_chain4_enabled(&self) -> bool {
+        self.seq_regs[usize::from(VGA_SEQ_MEMORY_MODE)] & VGA_SEQ_MEMORY_MODE_CHAIN4 != 0
+    }
+
+    /// True when odd/even host addressing is active (Memory Mode bit2 clear).
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 — OE = 0 sends even system
+    /// addresses to maps 0 and 2 and odd addresses to maps 1 and 3.
+    pub fn seq_odd_even_enabled(&self) -> bool {
+        self.seq_regs[usize::from(VGA_SEQ_MEMORY_MODE)] & VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE == 0
+    }
+
+    /// True when Memory Mode Extended Memory (bit1) is set (256 KB enabled).
+    pub fn seq_extended_memory(&self) -> bool {
+        self.seq_regs[usize::from(VGA_SEQ_MEMORY_MODE)] & VGA_SEQ_MEMORY_MODE_EXTENDED != 0
+    }
+
+    /// Addressable bytes per map for the current Extended Memory setting.
+    pub fn plane_size_bytes(&self) -> usize {
+        if self.seq_extended_memory() {
+            VGA_PLANE_SIZE
+        } else {
+            VGA_PLANE_SIZE_NO_EXTENDED
+        }
+    }
+
+    /// CPU display window claimed by the video subsystem (`base..end`).
+    ///
+    /// This slice keeps the historical color text window; Graphics Controller
+    /// Miscellaneous Memory Map Select decode is a separate slice.
+    pub fn display_window(&self) -> (u64, u64) {
+        (VGA_TEXT_BASE, VGA_TEXT_END)
+    }
+
+    /// Addressing model currently programmed in Sequencer Memory Mode.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figures 2-33 / 2-34 — Chain 4 takes
+    /// precedence over odd/even (it replaces map selection entirely with
+    /// A1/A0); otherwise OE = 0 gives odd/even and OE = 1 gives planar
+    /// Map-Mask-only addressing.
+    pub fn plane_addressing(&self) -> VgaPlaneAddressing {
+        if self.seq_chain4_enabled() {
+            VgaPlaneAddressing::Chain4
+        } else if self.seq_odd_even_enabled() {
+            VgaPlaneAddressing::OddEven
+        } else {
+            VgaPlaneAddressing::Planar
+        }
+    }
+
+    /// Decode a CPU display-window address into map targets plus map offset.
+    ///
+    /// Returns `None` when `addr` is outside [`Self::display_window`].
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-34 (Chain 4: A1 A0 select the
+    /// map) and Figure 2-33 (odd/even: even addresses → maps 0+2, odd → maps
+    /// 1+3). Per-map offsets follow the officially documented, hardware-observed
+    /// forms recorded in OSDev VGA Hardware "Addressing Logic": chain-4 keeps
+    /// the host address with A1:A0 cleared, odd/even keeps it with A0 cleared,
+    /// and planar mode passes it through. QEMU's alternative chain-4 offset
+    /// (`addr >> 2`) is **not** modeled.
+    pub fn plane_access(&self, addr: u64) -> Option<VgaPlaneAccess> {
+        let (base, end) = self.display_window();
+        if !(base..end).contains(&addr) {
+            return None;
+        }
+        let window_offset = (addr - base) as usize;
+        let addressing = self.plane_addressing();
+        let (planes, raw_offset) = match addressing {
+            VgaPlaneAddressing::Chain4 => (1u8 << (window_offset & 0b11), window_offset & !0b11),
+            VgaPlaneAddressing::OddEven => {
+                // Even → maps 0 and 2; odd → maps 1 and 3.
+                let low = (window_offset & 1) as u8;
+                ((0b0001 << low) | (0b0100 << low), window_offset & !1)
+            }
+            VgaPlaneAddressing::Planar => (VGA_SEQ_MAP_MASK_PLANES, window_offset),
+        };
+        let offset = raw_offset % self.plane_size_bytes();
+        Some(VgaPlaneAccess {
+            planes,
+            write_planes: planes & self.seq_map_mask(),
+            offset,
+            addressing,
+        })
+    }
+
+    /// Maps that a CPU write to `addr` would update (address decode AND Map Mask).
+    pub fn plane_write_mask(&self, addr: u64) -> u8 {
+        self.plane_access(addr)
+            .map(|access| access.write_planes)
+            .unwrap_or(0)
+    }
+
+    /// Per-map byte offset a CPU access to `addr` resolves to.
+    pub fn plane_offset(&self, addr: u64) -> Option<usize> {
+        self.plane_access(addr).map(|access| access.offset)
     }
 
     /// True if this device owns the I/O port (CRTC + Sequencer + GC + ATC +
@@ -4590,5 +4780,181 @@ mod tests {
         assert_eq!(v.dac_write_channel, 0);
         assert_eq!(v.dac_read_channel, 0);
         assert_eq!(v.dac_state, VGA_DAC_STATE_WRITE);
+    }
+
+    /// Program Sequencer Memory Mode (`0x3C4`/`0x3C5` index `0x04`).
+    fn set_seq_memory_mode(v: &mut VgaText, value: u8) {
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_MEMORY_MODE));
+        v.port_write(VGA_SEQ_DATA, 1, u32::from(value));
+    }
+
+    /// Program Sequencer Map Mask (`0x3C4`/`0x3C5` index `0x02`).
+    fn set_seq_map_mask(v: &mut VgaText, value: u8) {
+        v.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_MAP_MASK));
+        v.port_write(VGA_SEQ_DATA, 1, u32::from(value));
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 — mode-03h Memory Mode
+    /// `0x02` means Extended Memory set, Odd/Even addressing on, Chain 4 off;
+    /// Figure 2-29 — mode-03h Map Mask `0x03` enables maps 0 and 1.
+    #[test]
+    fn seq_memory_mode_reset_defaults_select_odd_even_addressing() {
+        let v = VgaText::new();
+        assert!(v.seq_extended_memory());
+        assert!(v.seq_odd_even_enabled());
+        assert!(!v.seq_chain4_enabled());
+        assert_eq!(v.seq_map_mask(), VGA_SEQ_MAP_MASK_DEFAULT);
+        assert_eq!(v.plane_addressing(), VgaPlaneAddressing::OddEven);
+        assert_eq!(v.plane_size_bytes(), VGA_PLANE_SIZE);
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 — "even system addresses
+    /// access maps 0 and 2, while odd system addresses access maps 1 and 3";
+    /// OSDev VGA Hardware "Odd/Even Disable Bit" — `offset = addr & 0xfffe`.
+    /// The Map Mask then narrows mode 03h to maps 0 (character) and 1 (attribute).
+    #[test]
+    fn plane_access_odd_even_maps_even_addresses_to_maps_0_and_2() {
+        let v = VgaText::new();
+
+        let even = v.plane_access(VGA_TEXT_BASE).expect("in window");
+        assert_eq!(even.addressing, VgaPlaneAddressing::OddEven);
+        assert_eq!(
+            even.planes, 0b0101,
+            "even host address selects maps 0 and 2"
+        );
+        assert_eq!(even.write_planes, 0b0001, "Map Mask 0x03 keeps map 0");
+        assert_eq!(even.offset, 0);
+
+        let odd = v.plane_access(VGA_TEXT_BASE + 1).expect("in window");
+        assert_eq!(odd.planes, 0b1010, "odd host address selects maps 1 and 3");
+        assert_eq!(odd.write_planes, 0b0010, "Map Mask 0x03 keeps map 1");
+        assert_eq!(odd.offset, 0, "A0 is dropped from the map offset");
+
+        let cell1_char = v.plane_access(VGA_TEXT_BASE + 2).expect("in window");
+        assert_eq!(cell1_char.planes, 0b0101);
+        assert_eq!(cell1_char.offset, 2);
+        let cell1_attr = v.plane_access(VGA_TEXT_BASE + 3).expect("in window");
+        assert_eq!(cell1_attr.planes, 0b1010);
+        assert_eq!(cell1_attr.offset, 2);
+
+        // Map Mask widening exposes the chained upper maps.
+        let mut v = v;
+        set_seq_map_mask(&mut v, VGA_SEQ_MAP_MASK_PLANES);
+        assert_eq!(v.plane_write_mask(VGA_TEXT_BASE), 0b0101);
+        assert_eq!(v.plane_write_mask(VGA_TEXT_BASE + 1), 0b1010);
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-34 "Map Selection, Chain 4" —
+    /// A1 A0 select maps 0–3; OSDev VGA Hardware records the hardware offset
+    /// form as the host address with the two low bits cleared.
+    #[test]
+    fn plane_access_chain4_selects_map_by_two_low_address_bits() {
+        let mut v = VgaText::new();
+        set_seq_memory_mode(
+            &mut v,
+            VGA_SEQ_MEMORY_MODE_EXTENDED | VGA_SEQ_MEMORY_MODE_CHAIN4,
+        );
+        set_seq_map_mask(&mut v, VGA_SEQ_MAP_MASK_PLANES);
+        assert_eq!(v.plane_addressing(), VgaPlaneAddressing::Chain4);
+
+        for (i, expected_plane) in [0b0001u8, 0b0010, 0b0100, 0b1000].iter().enumerate() {
+            let access = v.plane_access(VGA_TEXT_BASE + i as u64).expect("in window");
+            assert_eq!(access.planes, *expected_plane, "A1:A0 = {i}");
+            assert_eq!(access.write_planes, *expected_plane);
+            assert_eq!(access.offset, 0, "A1:A0 do not contribute to the offset");
+        }
+        let next = v.plane_access(VGA_TEXT_BASE + 4).expect("in window");
+        assert_eq!(next.planes, 0b0001);
+        assert_eq!(next.offset, 4);
+
+        // Chain 4 still runs through the Map Mask (IBM: all maps should be
+        // enabled in chain 4; OSDev reports plane write enable applies on
+        // QEMU/ATI/NVidia).
+        set_seq_map_mask(&mut v, 0b0011);
+        assert_eq!(v.plane_write_mask(VGA_TEXT_BASE + 2), 0);
+        assert_eq!(v.plane_write_mask(VGA_TEXT_BASE + 1), 0b0010);
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 — with OE = 1 "system
+    /// addresses sequentially access data within a bit map, and the maps are
+    /// accessed according to the value in the Map Mask register".
+    #[test]
+    fn plane_access_planar_addresses_all_maps_at_one_offset() {
+        let mut v = VgaText::new();
+        set_seq_memory_mode(
+            &mut v,
+            VGA_SEQ_MEMORY_MODE_EXTENDED | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE,
+        );
+        set_seq_map_mask(&mut v, 0b1001);
+        assert_eq!(v.plane_addressing(), VgaPlaneAddressing::Planar);
+
+        let access = v.plane_access(VGA_TEXT_BASE + 0x123).expect("in window");
+        assert_eq!(access.planes, VGA_SEQ_MAP_MASK_PLANES);
+        assert_eq!(access.write_planes, 0b1001);
+        assert_eq!(access.offset, 0x123, "planar offsets are not shifted");
+        assert_eq!(v.plane_offset(VGA_TEXT_BASE + 0x124), Some(0x124));
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 — Extended Memory clear
+    /// leaves 64 KB of video memory (16 KB per map). Wrapping the per-map
+    /// offset inside that region is this emulator's documented model choice.
+    #[test]
+    fn plane_access_without_extended_memory_wraps_offset_in_16k_map() {
+        let mut v = VgaText::new();
+        set_seq_memory_mode(&mut v, VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE);
+        assert!(!v.seq_extended_memory());
+        assert_eq!(v.plane_size_bytes(), VGA_PLANE_SIZE_NO_EXTENDED);
+        assert_eq!(v.plane_offset(VGA_TEXT_BASE + 0x0004), Some(0x0004));
+        assert_eq!(v.plane_offset(VGA_TEXT_BASE + 0x4004), Some(0x0004));
+
+        set_seq_memory_mode(
+            &mut v,
+            VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE | VGA_SEQ_MEMORY_MODE_EXTENDED,
+        );
+        assert_eq!(v.plane_offset(VGA_TEXT_BASE + 0x4004), Some(0x4004));
+    }
+
+    /// Addresses outside the CPU display window have no map mapping.
+    #[test]
+    fn plane_access_outside_display_window_is_none() {
+        let v = VgaText::new();
+        assert_eq!(v.display_window(), (VGA_TEXT_BASE, VGA_TEXT_END));
+        assert!(v.plane_access(VGA_TEXT_BASE - 1).is_none());
+        assert!(v.plane_access(VGA_TEXT_END).is_none());
+        assert_eq!(v.plane_write_mask(VGA_TEXT_END), 0);
+        assert!(v.plane_offset(VGA_TEXT_BASE - 1).is_none());
+        assert!(v.plane_access(VGA_TEXT_END - 1).is_some());
+    }
+
+    /// The addressing model is register state only: the legacy text-plane CPU
+    /// path at `0xB8000` keeps working while chain-4 is programmed.
+    #[test]
+    fn plane_addressing_does_not_disturb_text_plane_mmio() {
+        let mut v = VgaText::new();
+        set_seq_memory_mode(
+            &mut v,
+            VGA_SEQ_MEMORY_MODE_EXTENDED | VGA_SEQ_MEMORY_MODE_CHAIN4,
+        );
+        assert!(v.write_u8(VGA_TEXT_BASE, b'A'));
+        assert!(v.write_u8(VGA_TEXT_BASE + 1, 0x1F));
+        assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(b'A'));
+        assert_eq!(v.char_at(0, 0), Some(b'A'));
+        assert_eq!(v.attr_at(0, 0), Some(0x1F));
+    }
+
+    /// Reset restores mode-03h Memory Mode / Map Mask, hence odd/even decode.
+    #[test]
+    fn reset_restores_plane_addressing_defaults() {
+        let mut v = VgaText::new();
+        set_seq_memory_mode(&mut v, VGA_SEQ_MEMORY_MODE_CHAIN4);
+        set_seq_map_mask(&mut v, VGA_SEQ_MAP_MASK_PLANES);
+        assert_eq!(v.plane_addressing(), VgaPlaneAddressing::Chain4);
+        assert!(!v.seq_extended_memory());
+
+        v.reset();
+        assert_eq!(v.plane_addressing(), VgaPlaneAddressing::OddEven);
+        assert_eq!(v.seq_map_mask(), VGA_SEQ_MAP_MASK_DEFAULT);
+        assert!(v.seq_extended_memory());
+        assert_eq!(v.plane_write_mask(VGA_TEXT_BASE), 0b0001);
     }
 }
