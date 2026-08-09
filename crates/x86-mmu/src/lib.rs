@@ -4,11 +4,10 @@
 //! reset base `0xFFFF_0000`), with limit checks against the cached effective
 //! limit (SDM Vol. 3 §5.3).
 //!
-//! Paging: [`paging`] is a standalone 32-bit paging translation engine (SDM
-//! Vol. 3 Chapter 4). **It is not wired to anything.** The interpreter's memory
-//! path still treats a linear address as a physical address, so no guest can
-//! reach the engine; see the module documentation and
-//! `docs/mmu-r3-32bit-paging.md`.
+//! Paging: [`paging`] is a 32-bit paging translation engine (SDM Vol. 3
+//! Chapter 4). Round 4 wired it to the interpreter, so a guest that sets
+//! `CR0.PG` runs under it; engine behavior is in `docs/mmu-r3-32bit-paging.md`
+//! and the integration in `docs/cpu-r4-paging-integration.md`.
 
 #![forbid(unsafe_code)]
 

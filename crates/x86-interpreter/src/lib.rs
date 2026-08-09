@@ -7,9 +7,19 @@
 use thiserror::Error;
 use x86_core::CpuState;
 use x86_decode::{decode_with_mode, DecodeError, DecodedInsn};
+use x86_mmu::paging::{
+    Access, AccessKind, AccessMode, Mmu, PageTableMemory, PagingContext, TranslateError,
+    UnsupportedPaging,
+};
 use x86_mmu::{checked_linear_addr, linear_addr};
 
 /// Memory + port callbacks supplied by `machine-pc`.
+///
+/// Addresses are **linear**, not physical. When `CR0.PG = 1` the interpreter
+/// wraps the machine's bus in [`PagedBus`], which translates each access
+/// through the 32-bit paging engine before forwarding a physical address here;
+/// with `CR0.PG = 0` a linear address *is* the physical address and the wrapper
+/// forwards it unchanged (SDM Vol. 3 §4.1.1).
 pub trait Bus {
     fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError>;
     fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError>;
@@ -62,6 +72,516 @@ pub trait Bus {
     /// REP can observe an interrupt between iterations. Full 8259 is later.
     fn poll_external_irq(&mut self) -> Option<u8> {
         None
+    }
+
+    /// The guest executed `MOV to CR0`, `MOV to CR3`, `MOV to CR4`, `LMSW` or
+    /// `CLTS`; `reg` is the control-register number that was written and the
+    /// three values are the state after the write.
+    ///
+    /// [`PagedBus`] uses this to refresh its [`PagingContext`] and to apply the
+    /// SDM §4.10.4.1 TLB invalidation for the specific register written — which
+    /// is not the same as noticing a changed value, because `MOV to CR3`
+    /// invalidates even when it stores the value `CR3` already held.
+    ///
+    /// Default: nothing, for a bus that models no translation.
+    fn on_mov_to_control_register(&mut self, reg: u8, cr0: u64, cr3: u64, cr4: u64) {
+        let _ = (reg, cr0, cr3, cr4);
+    }
+
+    /// The guest executed `INVLPG` for this linear address (SDM §4.10.4.1).
+    ///
+    /// Default: nothing. A bus that caches no translation has nothing to drop.
+    fn invalidate_page(&mut self, linear: u64) {
+        let _ = linear;
+    }
+
+    /// Read one instruction byte.
+    ///
+    /// Separate from [`Bus::read_u8`] only so the paging path can pass
+    /// `AccessKind::InstructionFetch` (SDM §4.6.1, §4.7). Default: an ordinary
+    /// read, which is what a bus with no translation does.
+    fn fetch_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        self.read_u8(addr)
+    }
+
+    /// Check that a `size`-byte store at `addr` could happen, without storing.
+    ///
+    /// For instructions whose store is preceded by an effect that cannot be
+    /// replayed — `INS` reads its port before it writes memory — the store has
+    /// to be known possible first, because an instruction-boundary rollback
+    /// cannot un-read a port. Default: nothing can fail, so nothing to check.
+    fn probe_write(&mut self, addr: u64, size: u64) -> Result<(), ExecError> {
+        let _ = (addr, size);
+        Ok(())
+    }
+
+    /// A `REP` iteration completed, so a `#PF` in a later iteration must
+    /// restart from here rather than from the start of the instruction.
+    ///
+    /// Spec: Intel SDM Vol. 2 "REP/REPE/REPZ/REPNE/REPNZ" — after a suspending
+    /// exception "the source and destination registers point to the next
+    /// string elements to be operated on, the EIP register points to the
+    /// string instruction, and the ECX register has the value it held
+    /// following the last successful iteration".
+    ///
+    /// Default: nothing, for a bus on which no access can fault mid-instruction.
+    fn commit_string_iteration(&mut self, cpu: &CpuState) {
+        let _ = cpu;
+    }
+
+    /// Read one byte of a GDT, LDT, IDT or TSS entry.
+    ///
+    /// §4.6.1 makes accesses the processor performs to those tables
+    /// supervisor-mode accesses *regardless of CPL*, so they cannot derive
+    /// their access mode from the current privilege level. Default: an
+    /// ordinary read.
+    fn read_system_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        self.read_u8(addr)
+    }
+}
+
+/// The interpreter's memory path with 32-bit paging in it.
+///
+/// Every access the interpreter makes goes through one of these, whether or not
+/// paging is enabled, so that the translated and untranslated paths cannot
+/// drift apart. With `CR0.PG = 0` it forwards linear addresses to the machine
+/// bus unchanged, which is exactly what the interpreter did before paging
+/// existed; with `CR0.PG = 1` it translates through [`Mmu`] first.
+///
+/// Spec: Intel SDM Vol. 3 §4.1.1 (a linear address is a physical address when
+/// `CR0.PG = 0`), §4.3 (32-bit paging), §4.6.1 (access rights).
+pub struct PagedBus<'a> {
+    inner: &'a mut dyn Bus,
+    mmu: &'a mut Mmu,
+    ctx: PagingContext,
+    /// CPL sampled at the instruction boundary (SDM §4.6.1). The delivery paths
+    /// this interpreter implements are same-CPL, so it cannot change mid-
+    /// instruction; a future privilege-changing gate must resample it.
+    cpl: u8,
+    /// Architectural state a `#PF` in this instruction restarts from.
+    ///
+    /// `#PF` is a fault, so the instruction re-executes and must therefore
+    /// have committed nothing (SDM Vol. 3 §6.5). Rather than auditing every
+    /// opcode for the order in which it writes registers, flags and memory,
+    /// the interpreter checkpoints the architectural state at the instruction
+    /// boundary and rolls back to it when a translation fails. Two properties
+    /// make that exact rather than approximate:
+    ///
+    /// * `RFLAGS` in the checkpoint is always the instruction-boundary value,
+    ///   even after [`Bus::commit_string_iteration`] advances the rest. That
+    ///   is the SDM's own rule for a faulting `REPE`/`REPNE` `CMPS`/`SCAS`:
+    ///   "the EFLAGS value is restored to the state prior to the execution of
+    ///   the instruction".
+    /// * It is armed only while `CR0.PG = 1`. Nothing can page-fault with
+    ///   paging off, so the pre-paging execution path is untouched and pays
+    ///   nothing for this.
+    ///
+    /// What a checkpoint cannot undo is a memory write. The instructions that
+    /// write more than one location before they can fault write only to the
+    /// stack below the restored pointer, where the retry rewrites the same
+    /// bytes. A *single* operand that straddles a page boundary is the case
+    /// that genuinely needs both halves translated before either is written.
+    restart_point: Option<CpuState>,
+}
+
+impl<'a> PagedBus<'a> {
+    /// Wrap `inner` with the paging state `cpu` currently selects.
+    ///
+    /// Construction polls [`Mmu::sync_control_registers`], which applies any
+    /// invalidation implied by a control-register change that did not come
+    /// through `MOV to CRn` — a reset, or a path a later slice adds. The
+    /// explicit `MOV to CRn` hooks stay the precise interface (SDM §4.10.4.1).
+    pub fn new(inner: &'a mut dyn Bus, mmu: &'a mut Mmu, cpu: &CpuState) -> Self {
+        let ctx = PagingContext::new(cpu.cr0, cpu.cr3, cpu.cr4);
+        mmu.sync_control_registers(&ctx);
+        Self {
+            inner,
+            mmu,
+            ctx,
+            cpl: if cr0_pe(cpu) {
+                (cpu.cs.selector & 3) as u8
+            } else {
+                // Real-address mode executes at CPL 0 (SDM Vol. 3 §5.5).
+                0
+            },
+            restart_point: None,
+        }
+    }
+
+    /// Checkpoint the architectural state this instruction would restart from.
+    /// A no-op with paging off, where nothing can page-fault.
+    fn arm_restart_point(&mut self, cpu: &CpuState) {
+        self.restart_point = self.ctx.paging_enabled().then(|| cpu.clone());
+    }
+
+    /// The checkpoint to roll back to, consumed by the `#PF` path.
+    fn take_restart_point(&mut self) -> Option<CpuState> {
+        self.restart_point.take()
+    }
+
+    /// The control-register state this path is translating with.
+    pub fn paging_context(&self) -> &PagingContext {
+        &self.ctx
+    }
+
+    /// CPL of the accesses this path makes (SDM §4.6.1).
+    pub fn cpl(&self) -> u8 {
+        self.cpl
+    }
+
+    /// Is a linear address a physical address right now? (`CR0.PG = 0`.)
+    fn identity_mapped(&self) -> bool {
+        !self.ctx.paging_enabled()
+    }
+
+    /// Translate one linear address for one access.
+    ///
+    /// Returns the physical address, or the error the interpreter must raise:
+    /// [`ExecError::PageFault`] for an architectural `#PF`,
+    /// [`ExecError::PageTableFault`] when the walk itself could not reach
+    /// physical memory, or [`ExecError::UnsupportedPaging`] for a mode this
+    /// engine does not model.
+    ///
+    /// Spec: SDM Vol. 3 §4.3 (the walk), §4.6.1 (access rights and the
+    /// supervisor/user split), §4.7 (`CR2` and the error code).
+    fn translate(&mut self, linear: u64, access: Access) -> Result<u64, ExecError> {
+        if self.identity_mapped() {
+            return Ok(linear);
+        }
+        let ctx = self.ctx;
+        let mut mem = PageTableWalkBus {
+            inner: &mut *self.inner,
+            error: None,
+        };
+        let result = self.mmu.translate(&ctx, &mut mem, linear as u32, access);
+        if let Some(phys) = mem.error {
+            return Err(ExecError::PageTableFault(phys));
+        }
+        match result {
+            Ok(translation) => Ok(translation.phys_addr),
+            Err(TranslateError::Fault(fault)) => Err(ExecError::PageFault {
+                linear: fault.cr2(),
+                error_code: fault.error_code(),
+            }),
+            Err(TranslateError::Unsupported(kind)) => Err(ExecError::UnsupportedPaging(kind)),
+        }
+    }
+
+    /// Check that `access` at `linear` would succeed, with no side effect at
+    /// all — no accessed or dirty flag, no cached translation.
+    ///
+    /// Spec: SDM Vol. 3 §4.8 (the flags a real access would write), §4.10.2.3
+    /// (why a probe may not cache).
+    fn probe(&mut self, linear: u64, access: Access) -> Result<(), ExecError> {
+        if self.identity_mapped() {
+            return Ok(());
+        }
+        let ctx = self.ctx;
+        let mut mem = PageTableWalkBus {
+            inner: &mut *self.inner,
+            error: None,
+        };
+        let result = self.mmu.probe(&ctx, &mut mem, linear as u32, access);
+        if let Some(phys) = mem.error {
+            return Err(ExecError::PageTableFault(phys));
+        }
+        match result {
+            Ok(()) => Ok(()),
+            Err(TranslateError::Fault(fault)) => Err(ExecError::PageFault {
+                linear: fault.cr2(),
+                error_code: fault.error_code(),
+            }),
+            Err(TranslateError::Unsupported(kind)) => Err(ExecError::UnsupportedPaging(kind)),
+        }
+    }
+
+    /// Translate one architectural access of `size` bytes starting at
+    /// `linear`, which may straddle a 4-KiB page boundary.
+    ///
+    /// The engine translates one address, so splitting the access, translating
+    /// both halves, and discovering a second-half fault **before** the first
+    /// half is written is caller work. That ordering is the whole point: the
+    /// two halves have unrelated translations, and a `#PF` on the second one
+    /// must leave a partially written operand behind no more than it leaves a
+    /// partially updated register.
+    ///
+    /// A split therefore probes both halves before translating either, so a
+    /// faulting access also writes no accessed or dirty flag. An access inside
+    /// a single page skips the probe: the engine already performs every fault
+    /// check before it touches a paging structure.
+    ///
+    /// Splitting at 4 KiB is correct for a 4-MiB page too — the two halves
+    /// simply translate to adjacent physical addresses.
+    ///
+    /// Model choice: when both halves fault, the lower address is reported.
+    /// §4.7 does not pin the order down, and ascending is the order the access
+    /// itself would take.
+    fn translate_span(
+        &mut self,
+        linear: u64,
+        size: usize,
+        access: Access,
+    ) -> Result<Span, ExecError> {
+        if self.identity_mapped() {
+            return Ok(Span::whole(linear, size));
+        }
+        let page_offset = (linear & PAGE_OFFSET_MASK) as usize;
+        let first_len = PAGE_SIZE - page_offset;
+        if first_len >= size {
+            return Ok(Span::whole(self.translate(linear, access)?, size));
+        }
+
+        let second_linear = linear.wrapping_add(first_len as u64) & LINEAR_ADDRESS_MASK;
+        self.probe(linear, access)?;
+        self.probe(second_linear, access)?;
+        Ok(Span {
+            first: self.translate(linear, access)?,
+            first_len,
+            second: self.translate(second_linear, access)?,
+        })
+    }
+
+    /// Physical address of byte `index` of a span.
+    fn byte_of(span: &Span, index: usize) -> u64 {
+        if index < span.first_len {
+            span.first + index as u64
+        } else {
+            span.second + (index - span.first_len) as u64
+        }
+    }
+
+    /// The access a data reference of `kind` makes at the current CPL.
+    fn data_access(&self, kind: AccessKind) -> Access {
+        Access::from_cpl(kind, self.cpl)
+    }
+
+    /// An access the processor makes on software's behalf to the GDT, LDT, IDT
+    /// or TSS: supervisor mode whatever the CPL is (SDM §4.6.1).
+    fn system_access(kind: AccessKind) -> Access {
+        Access::new(kind, AccessMode::Supervisor)
+    }
+}
+
+/// 4-KiB page geometry of the linear address space (SDM Vol. 3 §4.3).
+const PAGE_SIZE: usize = 0x1000;
+const PAGE_OFFSET_MASK: u64 = 0xFFF;
+/// Outside 64-bit mode the linear address space is 4 GiB (SDM Vol. 3 §3.3.1),
+/// so an access that runs off the top wraps rather than carrying into bit 32.
+const LINEAR_ADDRESS_MASK: u64 = 0xFFFF_FFFF;
+
+/// One architectural access resolved into at most two physical runs.
+struct Span {
+    first: u64,
+    /// Bytes taken from `first`; the rest come from `second`.
+    first_len: usize,
+    second: u64,
+}
+
+impl Span {
+    fn whole(phys: u64, size: usize) -> Self {
+        Self {
+            first: phys,
+            first_len: size,
+            second: phys,
+        }
+    }
+
+    /// Does the whole access live in one page?
+    fn contiguous(&self, size: usize) -> bool {
+        self.first_len >= size
+    }
+}
+
+/// Guest physical memory as the page walker sees it: the machine bus, so a
+/// paging-structure access goes through exactly the same address decode,
+/// shadowing and A20 masking as any other physical access.
+///
+/// A bus failure cannot be reported through [`PageTableMemory`], so the first
+/// failing address is latched and [`PagedBus::translate`] turns it into
+/// [`ExecError::PageTableFault`] rather than letting a zero entry masquerade as
+/// a not-present page.
+struct PageTableWalkBus<'b> {
+    inner: &'b mut dyn Bus,
+    error: Option<u64>,
+}
+
+impl PageTableMemory for PageTableWalkBus<'_> {
+    fn read_entry_u32(&mut self, phys_addr: u64) -> u32 {
+        match self.inner.read_u32(phys_addr) {
+            Ok(value) => value,
+            Err(_) => {
+                self.error.get_or_insert(phys_addr);
+                0
+            }
+        }
+    }
+
+    fn write_entry_u32(&mut self, phys_addr: u64, value: u32) {
+        if self.inner.write_u32(phys_addr, value).is_err() {
+            self.error.get_or_insert(phys_addr);
+        }
+    }
+}
+
+impl Bus for PagedBus<'_> {
+    fn read_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        let access = self.data_access(AccessKind::Read);
+        let phys = self.translate(addr, access)?;
+        self.inner.read_u8(phys)
+    }
+
+    fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        let access = self.data_access(AccessKind::Write);
+        let phys = self.translate(addr, access)?;
+        self.inner.write_u8(phys, val)
+    }
+
+    // A multi-byte access can straddle a page boundary, where the two halves
+    // have unrelated translations. `translate_span` resolves the whole access
+    // before any byte of it moves; an access that stays inside one page keeps
+    // its original width on the machine bus, which matters for MMIO.
+    fn read_u16(&mut self, addr: u64) -> Result<u16, ExecError> {
+        if self.identity_mapped() {
+            return self.inner.read_u16(addr);
+        }
+        let access = self.data_access(AccessKind::Read);
+        let span = self.translate_span(addr, 2, access)?;
+        if span.contiguous(2) {
+            return self.inner.read_u16(span.first);
+        }
+        let lo = self.inner.read_u8(Self::byte_of(&span, 0))?;
+        let hi = self.inner.read_u8(Self::byte_of(&span, 1))?;
+        Ok(u16::from_le_bytes([lo, hi]))
+    }
+
+    fn write_u16(&mut self, addr: u64, val: u16) -> Result<(), ExecError> {
+        if self.identity_mapped() {
+            return self.inner.write_u16(addr, val);
+        }
+        let access = self.data_access(AccessKind::Write);
+        let span = self.translate_span(addr, 2, access)?;
+        if span.contiguous(2) {
+            return self.inner.write_u16(span.first, val);
+        }
+        let bytes = val.to_le_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            self.inner.write_u8(Self::byte_of(&span, index), *byte)?;
+        }
+        Ok(())
+    }
+
+    fn read_u32(&mut self, addr: u64) -> Result<u32, ExecError> {
+        if self.identity_mapped() {
+            return self.inner.read_u32(addr);
+        }
+        let access = self.data_access(AccessKind::Read);
+        let span = self.translate_span(addr, 4, access)?;
+        if span.contiguous(4) {
+            return self.inner.read_u32(span.first);
+        }
+        let mut bytes = [0u8; 4];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = self.inner.read_u8(Self::byte_of(&span, index))?;
+        }
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), ExecError> {
+        if self.identity_mapped() {
+            return self.inner.write_u32(addr, val);
+        }
+        let access = self.data_access(AccessKind::Write);
+        let span = self.translate_span(addr, 4, access)?;
+        if span.contiguous(4) {
+            return self.inner.write_u32(span.first, val);
+        }
+        let bytes = val.to_le_bytes();
+        for (index, byte) in bytes.iter().enumerate() {
+            self.inner.write_u8(Self::byte_of(&span, index), *byte)?;
+        }
+        Ok(())
+    }
+
+    fn probe_write(&mut self, addr: u64, size: u64) -> Result<(), ExecError> {
+        if self.identity_mapped() || size == 0 {
+            return Ok(());
+        }
+        let access = self.data_access(AccessKind::Write);
+        let last = addr.wrapping_add(size - 1);
+        self.probe(addr, access)?;
+        if (addr & !PAGE_OFFSET_MASK) != (last & !PAGE_OFFSET_MASK) {
+            self.probe(last & LINEAR_ADDRESS_MASK, access)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        let access = self.data_access(AccessKind::InstructionFetch);
+        let phys = self.translate(addr, access)?;
+        self.inner.read_u8(phys)
+    }
+
+    fn read_system_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
+        let access = Self::system_access(AccessKind::Read);
+        let phys = self.translate(addr, access)?;
+        self.inner.read_u8(phys)
+    }
+
+    fn commit_string_iteration(&mut self, cpu: &CpuState) {
+        if let Some(point) = &mut self.restart_point {
+            // Keep the instruction-boundary RFLAGS: a faulting REPE/REPNE
+            // CMPS/SCAS restores flags to their pre-instruction value even
+            // though its index and count progress survives.
+            let boundary_flags = point.rflags;
+            *point = cpu.clone();
+            point.rflags = boundary_flags;
+        }
+    }
+
+    fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError> {
+        self.inner.port_in_u8(port)
+    }
+
+    fn port_out_u8(&mut self, port: u16, val: u8) -> Result<(), ExecError> {
+        self.inner.port_out_u8(port, val)
+    }
+
+    fn port_in_u16(&mut self, port: u16) -> Result<u16, ExecError> {
+        self.inner.port_in_u16(port)
+    }
+
+    fn port_out_u16(&mut self, port: u16, val: u16) -> Result<(), ExecError> {
+        self.inner.port_out_u16(port, val)
+    }
+
+    fn port_in_u32(&mut self, port: u16) -> Result<u32, ExecError> {
+        self.inner.port_in_u32(port)
+    }
+
+    fn port_out_u32(&mut self, port: u16, val: u32) -> Result<(), ExecError> {
+        self.inner.port_out_u32(port, val)
+    }
+
+    fn poll_external_irq(&mut self) -> Option<u8> {
+        self.inner.poll_external_irq()
+    }
+
+    fn on_mov_to_control_register(&mut self, reg: u8, cr0: u64, cr3: u64, cr4: u64) {
+        let previous = self.ctx;
+        self.ctx = PagingContext::with_profile(cr0, cr3, cr4, previous.profile);
+        match reg {
+            0 => self.mmu.on_mov_to_cr0(previous.cr0, cr0),
+            3 => self.mmu.on_mov_to_cr3(cr3),
+            4 => self.mmu.on_mov_to_cr4(previous.cr4, cr4),
+            _ => {}
+        }
+        // Keep the polled shadow level with the explicit hook so the next
+        // `sync_control_registers` does not repeat the same invalidation.
+        self.mmu.sync_control_registers(&self.ctx);
+    }
+
+    fn invalidate_page(&mut self, linear: u64) {
+        self.mmu.invlpg(linear as u32);
     }
 }
 
@@ -145,6 +665,24 @@ pub enum ExecError {
         vector: u8,
         reason: ProtectedModeDeliveryError,
     },
+    /// Pending `#PF` (vector 14). Carried separately from
+    /// [`ExecError::ArchFault`] because it needs a doubleword error code and
+    /// because `CR2` must be loaded with the faulting linear address before
+    /// delivery. Consumed by [`step`].
+    /// Spec: Intel SDM Vol. 3 §4.7; Vol. 3 "Interrupt 14—Page-Fault Exception".
+    #[error("page fault at linear {linear:#x}, error code {error_code:#x}")]
+    PageFault { linear: u64, error_code: u32 },
+    /// A page-table walk could not reach physical memory. This is a machine
+    /// failure, not an architectural `#PF`: an entry read that the bus rejects
+    /// must not be mistaken for a not-present entry, so it is reported rather
+    /// than turned into a guest-visible exception.
+    #[error("page-table walk could not reach physical memory at {0:#x}")]
+    PageTableFault(u64),
+    /// A paging mode the 32-bit engine does not model. Never deliverable as a
+    /// guest exception; `MOV to CR4` already refuses `CR4.PAE`, so nothing in
+    /// this build can reach it.
+    #[error("unsupported paging mode: {0:?}")]
+    UnsupportedPaging(UnsupportedPaging),
 }
 
 fn arch_fault(vector: u8) -> ExecError {
@@ -739,11 +1277,16 @@ fn seg_linear_checked(
         .map_err(|_| arch_fault_with_error_code(if uses_ss { 12 } else { 13 }, 0))
 }
 
-/// Absolute moffs offset from address-size attribute.
-/// Spec: Intel SDM Vol. 2 MOV (moffs16 / moffs32).
+/// Absolute moffs offset from the effective address-size attribute.
+///
+/// `moffs16` vs `moffs32` follows the *attribute*, not the presence of a
+/// `0x67` prefix: under `CS.D=1` the offset is 32 bits with no prefix and 16
+/// bits with one, which is the inverse of the `D=0` case the decoder already
+/// resolves into `insn.address_size_32`.
+/// Spec: Intel SDM Vol. 2 MOV (moffs8/moffs16/moffs32); Vol. 1 §3.6 Table 3-4.
 fn moffs_offset(insn: &DecodedInsn) -> u64 {
-    if insn.prefixes.addr_size_override {
-        insn.immediate as u32 as u64
+    if asize32(insn) {
+        u64::from(insn.immediate as u32)
     } else {
         u64::from(insn.immediate as u16)
     }
@@ -1416,8 +1959,11 @@ fn read_gdt_segment_descriptor(
     let addr = cpu.gdtr.base.wrapping_add(offset);
     let mut descriptor = [0u8; 8];
     for (index, byte) in descriptor.iter_mut().enumerate() {
+        // A descriptor-table read is a supervisor-mode access whatever the CPL
+        // is (SDM Vol. 3 §4.6.1), so it must not go through the CPL-derived
+        // data path.
         *byte = bus
-            .read_u8(addr.wrapping_add(index as u64))
+            .read_system_u8(addr.wrapping_add(index as u64))
             .map_err(|error| classify_mem_fault(error, false))?;
     }
     Ok(descriptor)
@@ -2199,6 +2745,7 @@ fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 1)?;
+        bus.probe_write(dst, 1).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u8(port)?;
         bus.write_u8(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 1);
@@ -2206,6 +2753,7 @@ fn insb_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 1)?;
+        bus.probe_write(dst, 1).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u8(port)?;
         bus.write_u8(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 1);
@@ -2220,6 +2768,7 @@ fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 2)?;
+        bus.probe_write(dst, 2).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u16(port)?;
         bus.write_u16(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 2);
@@ -2227,6 +2776,7 @@ fn insw_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 2)?;
+        bus.probe_write(dst, 2).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u16(port)?;
         bus.write_u16(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 2);
@@ -2241,6 +2791,7 @@ fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     if asize32(insn) {
         let di = cpu.gpr_u32(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 4)?;
+        bus.probe_write(dst, 4).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u32(port)?;
         bus.write_u32(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta32(cpu, 4);
@@ -2248,6 +2799,7 @@ fn insd_once(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Resul
     } else {
         let di = cpu.gpr_u16(CpuState::RDI);
         let dst = string_es_linear(cpu, u64::from(di), 4)?;
+        bus.probe_write(dst, 4).map_err(map_es_mem_fault)?;
         let v = bus.port_in_u32(port)?;
         bus.write_u32(dst, v).map_err(map_es_mem_fault)?;
         let d = string_index_delta(cpu, 4);
@@ -2489,6 +3041,12 @@ where
             once(cpu, bus, insn)?;
             cpu.set_gpr_u16(CpuState::RCX, cx.wrapping_sub(1));
         }
+        // The count is decremented only once the iteration's accesses have all
+        // succeeded, and each `once` advances SI/DI last, so a fault inside an
+        // iteration leaves the count and the indices describing the iteration
+        // to retry. Publishing that as the restart point is what stops the
+        // instruction-boundary rollback from discarding finished iterations.
+        bus.commit_string_iteration(cpu);
         if let Some(continue_while_zf) = zf_terminate {
             // REPE (`true`): stop when ZF=0. REPNE (`false`): stop when ZF=1.
             let zf = zf_set(cpu);
@@ -2953,21 +3511,46 @@ const CPUID_MAX_EXTENDED_LEAF: u32 = 0x8000_0000;
 /// conservative vendor/brand string until the features exist.
 const CPUID_VENDOR: [u8; 12] = *b"x86WASM Emu ";
 
-/// `CPUID` leaf 1 version information: family 5, model 0, stepping 0.
+/// `CPUID` leaf 1 version information: family 6, model 0, stepping 0.
 ///
-/// Family 5 is the generation that introduced `RDMSR`/`WRMSR`, which is the
-/// only feature bit reported below, so the signature and the feature bits agree.
-const CPUID_VERSION_INFO: u32 = 0x0000_0500;
+/// Family 6 is the generation that introduced the two newest features reported
+/// below — `PGE` and `CMOV` — so the signature and the feature bits still
+/// agree. It was family 5 while `MSR` was the only bit set.
+const CPUID_VERSION_INFO: u32 = 0x0000_0600;
+
+/// `CPUID.01H:EDX[3]` — page size extensions, i.e. 4-MiB pages through
+/// `CR4.PSE` (SDM Vol. 3 §4.1.4, §4.3).
+const CPUID_FEATURE_PSE: u32 = 1 << 3;
+/// `CPUID.01H:EDX[5]` — `RDMSR`/`WRMSR`.
+const CPUID_FEATURE_MSR: u32 = 1 << 5;
+/// `CPUID.01H:EDX[13]` — global pages through `CR4.PGE` (SDM Vol. 3 §4.1.4,
+/// §4.10.2.4).
+const CPUID_FEATURE_PGE: u32 = 1 << 13;
+/// `CPUID.01H:EDX[15]` — `CMOVcc` (and `FCMOVcc` when an FPU is present, which
+/// this emulator does not report).
+const CPUID_FEATURE_CMOV: u32 = 1 << 15;
 
 /// `CPUID` leaf 1 `EDX` feature bits.
 ///
-/// Bit 5 (`MSR`) is the only feature this emulator implements: `RDMSR` and
-/// `WRMSR` decode, check privilege, and raise the architectural `#GP` for the
-/// MSR addresses they do not implement. Every other bit — `FPU`, `TSC`, `PSE`,
-/// `PAE`, `APIC`, `MTRR`, `CX8`, `CMOV`, `MMX`, `SSE`, and the rest — stays
-/// clear because none of those are implemented.
-/// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); `AGENTS.md` truthful-CPUID rule.
-const CPUID_FEATURES_EDX: u32 = 1 << 5;
+/// Four features are implemented and therefore advertised:
+///
+/// * `PSE` — `CR4.PSE` and 4-MiB pages are implemented by the paging engine,
+///   and §4.1.4 makes the CPUID bit the guest's licence to set `CR4.PSE`.
+/// * `MSR` — `RDMSR`/`WRMSR` decode, check privilege, and raise the
+///   architectural `#GP` for the MSR addresses they do not implement.
+/// * `PGE` — `CR4.PGE` and global-page TLB retention are implemented.
+/// * `CMOV` — the `0F 40`–`0F 4F` conditional moves are implemented. The
+///   `FCMOVcc` half of this bit's definition needs an FPU, which `FPU`
+///   (`EDX[0]`) correctly reports as absent.
+///
+/// Deliberately still clear: `PAE` (`EDX[6]`), `PAT` (`EDX[16]`) and `PSE-36`
+/// (`EDX[17]`) — the paging engine models none of them, and its default profile
+/// assumes exactly that. Everything else — `FPU`, `TSC`, `APIC`, `MTRR`, `CX8`,
+/// `MMX`, `SSE` — stays clear because none of those are implemented.
+/// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); Vol. 3 §4.1.4; `AGENTS.md`
+/// truthful-CPUID rule.
+const CPUID_FEATURES_EDX: u32 =
+    CPUID_FEATURE_PSE | CPUID_FEATURE_MSR | CPUID_FEATURE_PGE | CPUID_FEATURE_CMOV;
 
 /// `CPUID` leaf 1 `ECX` feature bits: none are implemented.
 const CPUID_FEATURES_ECX: u32 = 0;
@@ -3059,6 +3642,40 @@ fn require_cpl0(cpu: &CpuState) -> Result<(), ExecError> {
         return Err(arch_fault_with_error_code(13, 0));
     }
     Ok(())
+}
+
+/// The `CR4` bits a guest may set, derived from the `CPUID` bits that advertise
+/// them so the two cannot drift apart.
+///
+/// SDM Vol. 3 §4.1.4 makes each paging feature's `CR4` bit conditional on its
+/// `CPUID` bit ("`CR4.PSE` … can be set only if `CPUID.01H:EDX.PSE [bit 3]` is
+/// 1"), and Vol. 2 "MOV—Move to/from Control Registers" raises `#GP(0)` on a
+/// write of 1 to a reserved `CR4` bit. Every bit outside this mask — `VME`,
+/// `PVI`, `TSD`, `DE`, `PAE`, `MCE`, `PCE`, `OSFXSR`, `OSXMMEXCPT`, `UMIP`,
+/// `SMEP`, `SMAP`, `PKE`, and the rest — is unimplemented here, so it is
+/// reserved and refused rather than silently stored. In particular `CR4.PAE`
+/// is refused, which keeps a guest from selecting the PAE paging mode the
+/// engine reports as unsupported.
+const fn cr4_reserved_mask() -> u64 {
+    let mut implemented = 0u64;
+    if CPUID_FEATURES_EDX & CPUID_FEATURE_PSE != 0 {
+        implemented |= x86_mmu::paging::CR4_PSE;
+    }
+    if CPUID_FEATURES_EDX & CPUID_FEATURE_PGE != 0 {
+        implemented |= x86_mmu::paging::CR4_PGE;
+    }
+    !implemented
+}
+
+/// `CR0.PG`, bit 31 (SDM Vol. 3 §4.1.1).
+const CR0_PG: u64 = x86_mmu::paging::CR0_PG;
+
+/// Commit a control-register write and tell the memory path about it.
+///
+/// Every `MOV to CRn`, `LMSW` and `CLTS` routes through here so the TLB
+/// invalidation hooks (SDM §4.10.4.1) cannot be forgotten on one path.
+fn note_control_register_write(cpu: &CpuState, bus: &mut dyn Bus, reg: u8) {
+    bus.on_mov_to_control_register(reg, cpu.cr0, cpu.cr3, cpu.cr4);
 }
 
 /// What `BT`/`BTS`/`BTR`/`BTC` do to the selected bit after copying it to CF.
@@ -3239,8 +3856,11 @@ fn fetch_decode(cpu: &CpuState, bus: &mut dyn Bus) -> Result<x86_decode::Decoded
             u64::from((base as u16).wrapping_add(buf.len() as u16))
         };
         let addr = seg_linear_checked(&cpu.cs, ip, 1, false)?;
+        // `fetch_u8` so paging sees `AccessKind::InstructionFetch` (SDM §4.6.1).
+        // Each byte is translated on its own, so an instruction that straddles
+        // a page boundary faults on the byte that is actually unreachable.
         buf.push(
-            bus.read_u8(addr)
+            bus.fetch_u8(addr)
                 .map_err(|e| classify_mem_fault(e, false))?,
         );
         match decode_with_mode(&buf, mode) {
@@ -3312,11 +3932,14 @@ fn deliver_real_mode_exception(
 enum ProtectedGateSource {
     Software,
     Hardware,
-    Exception(Option<u16>),
+    /// A fault or trap, with the error code its gate pushes. The code is a
+    /// doubleword because `#PF` uses one (SDM Vol. 3 §4.7); the selector-style
+    /// codes of §6.13 occupy only its low word.
+    Exception(Option<u32>),
 }
 
 impl ProtectedGateSource {
-    fn error_code(self) -> Option<u16> {
+    fn error_code(self) -> Option<u32> {
         match self {
             Self::Exception(error_code) => error_code,
             Self::Software | Self::Hardware => None,
@@ -3364,7 +3987,7 @@ fn deliver_protected_mode_gate(
     let mut gate = [0u8; 8];
     for (index, byte) in gate.iter_mut().enumerate() {
         let addr = gate_addr.wrapping_add(index as u64);
-        *byte = bus.read_u8(addr).map_err(|_| {
+        *byte = bus.read_system_u8(addr).map_err(|_| {
             protected_mode_delivery_error(vector, ProtectedModeDeliveryError::IdtRead(addr))
         })?;
     }
@@ -3439,7 +4062,7 @@ fn deliver_protected_mode_gate(
     let mut descriptor = [0u8; 8];
     for (index, byte) in descriptor.iter_mut().enumerate() {
         let addr = descriptor_addr.wrapping_add(index as u64);
-        *byte = bus.read_u8(addr).map_err(|_| {
+        *byte = bus.read_system_u8(addr).map_err(|_| {
             protected_mode_delivery_error(vector, ProtectedModeDeliveryError::GdtRead(addr))
         })?;
     }
@@ -3505,7 +4128,7 @@ fn deliver_protected_mode_gate(
     // The `CS.D=1` rejection above guarantees a 16-bit gate's return EIP fits.
     frame_entries.extend([saved_flags, u32::from(cpu.cs.selector), return_ip]);
     if let Some(code) = error_code {
-        frame_entries.push(u32::from(code));
+        frame_entries.push(code);
     }
 
     let mut final_sp = stack_pointer(cpu);
@@ -3593,6 +4216,34 @@ fn deliver_hardware_interrupt(
     }
 }
 
+/// `#PF` — Page-Fault Exception. Spec: Intel SDM Vol. 3 §4.7, §6.15.
+const VECTOR_PAGE_FAULT: u8 = 14;
+
+/// Deliver a pending fault through whichever path the current mode selects.
+///
+/// A `#PF` can only arise with `CR0.PG = 1`, which requires `CR0.PE = 1`, so
+/// the real-mode branch is never reached for vector 14.
+/// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.12.1 (gates), §4.1.1.
+fn deliver_fault(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    error_code: Option<u32>,
+) -> Result<(), ExecError> {
+    if cr0_pe(cpu) {
+        let return_ip = current_ip(cpu);
+        deliver_protected_mode_gate(
+            cpu,
+            bus,
+            vector,
+            return_ip,
+            ProtectedGateSource::Exception(error_code),
+        )
+    } else {
+        deliver_real_mode_exception(cpu, bus, vector)
+    }
+}
+
 /// #UD — Invalid Opcode Exception (vector 6).
 /// Spec: Intel SDM Vol. 3 §6.15 (#UD).
 fn real_mode_ud(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
@@ -3660,6 +4311,7 @@ fn step_two_byte(
             // CR0 bits (including PE) are unchanged. Real-mode path only —
             // protected-mode CPL=0 / #GP(0) checks are out of scope here.
             cpu.cr0 &= !(1u64 << 3);
+            note_control_register_write(cpu, bus, 0);
             set_current_ip(cpu, next_ip);
             Ok(())
         }
@@ -3719,17 +4371,33 @@ fn step_two_byte(
                         low |= 1; // Spec: LMSW cannot clear PE
                     }
                     cpu.cr0 = (cpu.cr0 & !0xFFFF) | low;
+                    // LMSW reaches only CR0[15:0], so it can change neither PG
+                    // (bit 31) nor WP (bit 16) and implies no invalidation; the
+                    // hook still runs so the memory path's shadow of CR0 stays
+                    // exact. Spec: SDM Vol. 3 §4.10.4.1.
+                    note_control_register_write(cpu, bus, 0);
                     set_current_ip(cpu, next_ip);
                     Ok(())
                 }
                 7 => {
                     // INVLPG m — Spec: Intel SDM Vol. 2 "INVLPG—Invalidate TLB
-                    // Entries". Register form (mod=11) → #UD. In real-address
-                    // mode the instruction is an architectural NOP (no TLB /
-                    // paging here); GPRs and CR0 are unchanged.
+                    // Entries"; Vol. 3 §4.10.4.1. Register form (mod=11) → #UD,
+                    // and CPL != 0 → #GP(0).
+                    //
+                    // The operand is an address, not an operand the processor
+                    // reads: the effective address is formed and limit-checked
+                    // (§5.3) but no byte is loaded or stored, so `INVLPG` can
+                    // raise `#GP`/`#SS` for a limit violation and never `#PF`.
+                    // With no translation cached — which includes every
+                    // real-address-mode execution — invalidating nothing is
+                    // still the architectural result, so this stays a NOP by
+                    // consequence rather than by special case.
                     if m.mod_ == 3 {
                         return Err(arch_fault(6));
                     }
+                    require_cpl0(cpu)?;
+                    let (addr, _, _) = ea(cpu, insn, 1)?;
+                    bus.invalidate_page(addr);
                     set_current_ip(cpu, next_ip);
                     Ok(())
                 }
@@ -3742,18 +4410,20 @@ fn step_two_byte(
             // register; the mod field is architecturally ignored (decoder
             // never populates SIB/displacement for this opcode). Operand
             // size is always 32 bits regardless of any 0x66 prefix.
-            // CR1 → #UD. CR2/CR3/CR4 → explicit Unsupported (out of scope).
+            // CR1 and CR5-CR7 → #UD. CPL != 0 → #GP(0) (Vol. 3 §5.5).
+            // Unsupported here: CR8 (`REX.R` in 64-bit mode).
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x20))?;
-            match m.reg {
-                0 => {
-                    cpu.set_gpr_u32(m.rm as usize, cpu.cr0 as u32);
-                    set_current_ip(cpu, next_ip);
-                    Ok(())
-                }
-                1 => real_mode_ud(cpu, bus),
-                2..=4 => Err(ExecError::Unsupported(0x20)),
-                _ => real_mode_ud(cpu, bus),
-            }
+            let value = match m.reg {
+                0 => cpu.cr0,
+                2 => cpu.cr2,
+                3 => cpu.cr3,
+                4 => cpu.cr4,
+                _ => return real_mode_ud(cpu, bus),
+            };
+            require_cpl0(cpu)?;
+            cpu.set_gpr_u32(m.rm as usize, value as u32);
+            set_current_ip(cpu, next_ip);
+            Ok(())
         }
         0x22 => {
             // MOV CR0, r32 — Spec: Intel SDM Vol. 2 "MOV—Move to/from Control
@@ -3761,18 +4431,51 @@ fn step_two_byte(
             // MAY clear PE. PE=1 enables GDT descriptor loads for MOV
             // DS/ES/FS/GS/SS and bounded direct far JMP16 transfers. Clearing PE
             // restores the sticky-unreal data-segment and real-mode far-JMP paths.
+            //
+            // CR1 and CR5-CR7 → #UD; CPL != 0 → #GP(0). Writing 1 to a reserved
+            // bit of CR0 or CR4 → #GP(0). Outside 64-bit mode the write is 32
+            // bits wide and clears the register's upper doubleword.
+            // Unsupported here: CR8, and the CR0 reserved-bit and
+            // NW/CD/PE/PG-combination checks other than the PG-without-PE one
+            // below.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x22))?;
+            if !matches!(m.reg, 0 | 2 | 3 | 4) {
+                return real_mode_ud(cpu, bus);
+            }
+            require_cpl0(cpu)?;
+            let src = u64::from(cpu.gpr_u32(m.rm as usize));
             match m.reg {
                 0 => {
-                    let src = cpu.gpr_u32(m.rm as usize);
-                    cpu.cr0 = u64::from(src);
-                    set_current_ip(cpu, next_ip);
-                    Ok(())
+                    // Spec: SDM Vol. 2 MOV CRn — "#GP(0) if an attempt is made
+                    // to set CR0.PG when CR0.PE is clear"; Vol. 3 §4.1.1 makes
+                    // protected mode a precondition of paging.
+                    if src & CR0_PG != 0 && src & 1 == 0 {
+                        return Err(arch_fault_with_error_code(13, 0));
+                    }
+                    cpu.cr0 = src;
                 }
-                1 => real_mode_ud(cpu, bus),
-                2..=4 => Err(ExecError::Unsupported(0x22)),
-                _ => real_mode_ud(cpu, bus),
+                2 => {
+                    // CR2 holds the linear address of the last page fault
+                    // (SDM Vol. 3 §4.7); it has no reserved bits.
+                    cpu.cr2 = src;
+                }
+                3 => {
+                    // Spec: SDM Vol. 3 Table 4-3 — with 32-bit paging, CR3 bits
+                    // 2:0 and 11:5 are *ignored*, not reserved, so no bit of a
+                    // 32-bit write can raise #GP. Bits 31:12 locate the page
+                    // directory; PWT/PCD are stored and inert.
+                    cpu.cr3 = src;
+                }
+                _ => {
+                    if src & cr4_reserved_mask() != 0 {
+                        return Err(arch_fault_with_error_code(13, 0));
+                    }
+                    cpu.cr4 = src;
+                }
             }
+            note_control_register_write(cpu, bus, m.reg);
+            set_current_ip(cpu, next_ip);
+            Ok(())
         }
         0x80..=0x8F => {
             // Jcc rel16/rel32 (near) — Spec: Intel SDM Vol. 2 "Jcc—Jump if
@@ -4241,6 +4944,31 @@ fn step_two_byte(
 /// not consume the shadow because no recoverable architectural boundary commits.
 /// Spec: Intel SDM Vol. 3 §6.3.3 / §6.7 (NMI); §§6.8.1, 6.8.3.
 pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
+    // No caller-owned MMU: the TLB lives for exactly this instruction. §4.10.2.2
+    // permits that ("Processors need not implement any TLBs"), so translation
+    // stays correct, but software that edits a paging-structure entry without
+    // invalidating will see the new entry rather than the stale translation
+    // real hardware may keep. Use [`step_with_mmu`] to model that.
+    let mut mmu = Mmu::new();
+    step_with_mmu(cpu, bus, &mut mmu)
+}
+
+/// One instruction with a caller-owned [`Mmu`], so the TLB survives across
+/// instructions and `INVLPG` / `MOV to CR3` are observable.
+///
+/// This is the entry point a machine integration should use: it is the only
+/// way a guest that forgets an invalidation misbehaves here the way it would on
+/// silicon (SDM Vol. 3 §4.10.2, §4.10.4.1).
+pub fn step_with_mmu(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    mmu: &mut Mmu,
+) -> Result<(), ExecError> {
+    let mut paged = PagedBus::new(bus, mmu, cpu);
+    step_paged(cpu, &mut paged)
+}
+
+fn step_paged(cpu: &mut CpuState, bus: &mut PagedBus<'_>) -> Result<(), ExecError> {
     // Platform `#NMI` outranks maskable IRQs and can wake HLT.
     if service_pending_nmi(cpu, bus)? {
         return Ok(());
@@ -4252,20 +4980,21 @@ pub fn step(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     if cpu.halted {
         return Ok(());
     }
+    bus.arm_restart_point(cpu);
     let result = match step_inner(cpu, bus) {
         Err(ExecError::ArchFault { vector, error_code }) => {
-            if cr0_pe(cpu) {
-                let return_ip = current_ip(cpu);
-                deliver_protected_mode_gate(
-                    cpu,
-                    bus,
-                    vector,
-                    return_ip,
-                    ProtectedGateSource::Exception(error_code),
-                )
-            } else {
-                deliver_real_mode_exception(cpu, bus, vector)
+            deliver_fault(cpu, bus, vector, error_code.map(u32::from))
+        }
+        Err(ExecError::PageFault { linear, error_code }) => {
+            // A fault re-executes the instruction, so undo everything the
+            // partially executed instruction committed (SDM Vol. 3 §6.5).
+            if let Some(restart) = bus.take_restart_point() {
+                *cpu = restart;
             }
+            // SDM Vol. 3 §4.7: `CR2` receives the faulting linear address, and
+            // it is loaded whether or not delivery itself then succeeds.
+            cpu.cr2 = linear;
+            deliver_fault(cpu, bus, VECTOR_PAGE_FAULT, Some(error_code))
         }
         other => other,
     };
@@ -5848,8 +6577,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
         }
         0xA0 => {
-            // MOV AL, moffs8 — Spec: Intel SDM Vol. 2 "MOV".
-            // Address-size 16 → moffs16; 0x67 → moffs32 (unreal high offsets).
+            // MOV AL, moffs8 — Spec: Intel SDM Vol. 2 "MOV": "the address-size
+            // attribute of the instruction determines the size of the offset".
             let off = moffs_offset(&insn);
             let seg = data_seg_for_string_src(cpu, &insn);
             let uses_ss = string_src_uses_ss(&insn);
@@ -6722,9 +7451,21 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
 
 /// Run until HLT or `max_steps`.
 pub fn run(cpu: &mut CpuState, bus: &mut dyn Bus, max_steps: u64) -> Result<u64, ExecError> {
+    let mut mmu = Mmu::new();
+    run_with_mmu(cpu, bus, &mut mmu, max_steps)
+}
+
+/// Run until HLT or `max_steps` with a caller-owned [`Mmu`]; see
+/// [`step_with_mmu`] for why that matters.
+pub fn run_with_mmu(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    mmu: &mut Mmu,
+    max_steps: u64,
+) -> Result<u64, ExecError> {
     let mut n = 0u64;
     while n < max_steps && !cpu.halted {
-        step(cpu, bus)?;
+        step_with_mmu(cpu, bus, mmu)?;
         n += 1;
     }
     Ok(n)
@@ -15143,11 +15884,13 @@ mod tests {
         assert_eq!(cpu.ip16(), 0x0B00);
     }
 
-    /// MOV to/from CR2/CR3/CR4 are valid on real hardware but out of scope for
-    /// this slice — must fail explicitly rather than silently faking behavior.
-    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"; Vol. 3 §2.5.
+    /// MOV to/from CR2/CR3/CR4 are implemented as of round 4; they were
+    /// `Unsupported` while the paging engine was unwired.
+    /// Spec: Intel SDM Vol. 2 "MOV—Move to/from Control Registers"; Vol. 3
+    /// §2.5, §4.7 (CR2), Table 4-3 (CR3), §4.1.4 (CR4).
+    /// Behavioral coverage lives in `tests/cpu_r4_control_registers.rs`.
     #[test]
-    fn mov_cr2_cr3_cr4_are_explicitly_unsupported() {
+    fn mov_cr2_cr3_cr4_are_implemented() {
         let mut mem = vec![0u8; 0x10000];
         let code = 0x1000usize;
         // +0: 0F 20 D0   MOV EAX, CR2  (reg=2)
@@ -15168,14 +15911,16 @@ mod tests {
         cpu.ds = x86_core::SegmentReg::real_mode(0);
         cpu.ss = x86_core::SegmentReg::real_mode(0);
         cpu.rip = code as u64;
+        cpu.cr2 = 0x1234_5678;
         cpu.set_gpr_u16(CpuState::RSP, 0xFFFE);
         let mut bus = VecBus { mem, ports: vec![] };
 
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x20)));
-        cpu.set_ip16(cpu.ip16().wrapping_add(3));
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x22)));
-        cpu.set_ip16(cpu.ip16().wrapping_add(3));
-        assert_eq!(step(&mut cpu, &mut bus), Err(ExecError::Unsupported(0x20)));
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1234_5678, "EAX ← CR2");
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cr3, 0x1234_5678, "CR3 ← EAX");
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0, "EAX ← CR4 (still zero)");
     }
 
     /// LIDT/SIDT m16&32 — opcode 0F 01 /3 and /1 (SDM Vol. 2 LIDT/SIDT; Vol. 3 §2.4.3).
@@ -16326,6 +17071,46 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.al(), 0x5A);
         assert_eq!(cpu.ds.limit, 0xFFFF);
+    }
+
+    /// A `moffs` offset follows the *effective address-size attribute*, so
+    /// under `CS.D=1` it is 32 bits with no prefix and 16 bits with `0x67` —
+    /// the inverse of the `D=0` case. Keying on the prefix instead truncated
+    /// every 32-bit `moffs` reference to its low word, which sent SeaBIOS's
+    /// POST writes to `CS.base + offset16` in the ROM window.
+    /// Spec: Intel SDM Vol. 2 "MOV" (moffs8/moffs16/moffs32); Vol. 1 §3.6.
+    #[test]
+    fn moffs_offset_width_follows_the_address_size_attribute() {
+        let mut mem = vec![0u8; 0x3_0000];
+        mem[0x2_1234] = 0x5A;
+        mem[0x1234] = 0xA5;
+        // A0 34 12 02 00      MOV AL, moffs32 0x21234   (D=1, no prefix)
+        // 67 A0 34 12         MOV AL, moffs16 0x1234    (D=1, 0x67 → 16-bit)
+        mem[0..5].copy_from_slice(&[0xA0, 0x34, 0x12, 0x02, 0x00]);
+        mem[5..9].copy_from_slice(&[0x67, 0xA0, 0x34, 0x12]);
+
+        let mut cpu = CpuState::reset();
+        cpu.cs = x86_core::SegmentReg {
+            selector: 0x08,
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            flags: 0xC09B,
+        };
+        cpu.ds = x86_core::SegmentReg {
+            selector: 0x10,
+            base: 0,
+            limit: 0xFFFF_FFFF,
+            flags: 0xC093,
+        };
+        cpu.ss = cpu.ds.clone();
+        cpu.cr0 = 1;
+        cpu.rip = 0;
+        let mut bus = VecBus { mem, ports: vec![] };
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0x5A, "no prefix under D=1 is a 32-bit offset");
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.al(), 0xA5, "0x67 under D=1 is a 16-bit offset");
     }
 
     /// Expanded DS limit (unreal): moffs32 beyond 64KiB succeeds; beyond limit → #GP via IVT.
@@ -20317,9 +21102,16 @@ mod tests {
     }
 
     /// `AGENTS.md`: CPUID must never advertise an unimplemented feature. Leaf 1
-    /// therefore reports only bit 5 (`MSR`), whose instructions this slice
-    /// implements. Every other enumerated feature must stay clear.
-    /// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11).
+    /// reports `PSE`, `MSR`, `PGE` and `CMOV`, all of which are implemented;
+    /// every other enumerated feature must stay clear.
+    ///
+    /// Round 4 added `PSE` (bit 3) and `PGE` (bit 13) because §4.1.4 makes
+    /// those bits a guest's licence to set `CR4.PSE` / `CR4.PGE`, and the
+    /// paging engine implements 4-MiB pages and global pages; and `CMOV`
+    /// (bit 15) because round 3 implemented `CMOVcc` and left the bit clear
+    /// only for want of a reason to change it. `PAE`, `PAT` and `PSE-36` stay
+    /// clear: the paging engine's default profile assumes exactly that.
+    /// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); Vol. 3 §4.1.4.
     #[test]
     fn cpuid_leaf_1_advertises_only_implemented_features() {
         let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xA2], |cpu, _| {
@@ -20329,7 +21121,11 @@ mod tests {
 
         let edx = cpu.gpr_u32(CpuState::RDX);
         let ecx = cpu.gpr_u32(CpuState::RCX);
-        assert_eq!(edx, 1 << 5, "only the MSR feature bit may be set");
+        assert_eq!(
+            edx,
+            (1 << 3) | (1 << 5) | (1 << 13) | (1 << 15),
+            "exactly PSE, MSR, PGE and CMOV"
+        );
         assert_eq!(ecx, 0, "no ECX feature is implemented");
 
         // Named guards for the features most likely to be assumed present.
@@ -20337,16 +21133,14 @@ mod tests {
             (0u32, "FPU"),
             (1, "VME"),
             (2, "DE"),
-            (3, "PSE"),
             (4, "TSC"),
             (6, "PAE"),
             (8, "CX8"),
             (9, "APIC"),
             (11, "SEP"),
             (12, "MTRR"),
-            (13, "PGE"),
-            (15, "CMOV"),
             (16, "PAT"),
+            (17, "PSE-36"),
             (19, "CLFSH"),
             (23, "MMX"),
             (25, "SSE"),
@@ -20356,9 +21150,9 @@ mod tests {
             assert_eq!(edx & (1 << bit), 0, "CPUID must not advertise {name}");
         }
 
-        // Family 5 is the generation that introduced RDMSR/WRMSR, so the
-        // version information agrees with the one feature bit reported.
-        assert_eq!((cpu.eax() >> 8) & 0xF, 5, "family");
+        // Family 6 is the generation that introduced PGE and CMOV, so the
+        // version information still agrees with the feature bits reported.
+        assert_eq!((cpu.eax() >> 8) & 0xF, 6, "family");
         assert_eq!(cpu.gpr_u32(CpuState::RBX), 0, "no brand/APIC-ID claims");
     }
 
