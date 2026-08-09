@@ -45,6 +45,10 @@
 //!   [`PciConfig::pam_regions`] / [`PciConfig::pam_region_for_addr`] reporting
 //!   read-from-DRAM and write-to-DRAM per Table 3 segment. The register file is
 //!   standalone — nothing in this crate steers memory from it.
+//! - i440FX PMC SMRAM (`0x72`) and FDHC (`0x68`): register decode + host
+//!   accessors ([`PciConfig::smram_region`] / [`PciConfig::fdhc_hole`]) matching
+//!   the PAM pattern. Attribute effects on `PhysMem` are left for the machine
+//!   layer (see `docs/pci-r5-smram.md`, `docs/pci-r5-fdhc.md`).
 //! - PIIX ISA bridge (`00:01.0`) Command (`0x04`) store/readback: sticky IO/MEM/BusMaster
 //!   (`PCI_PIIX_ISA_COMMAND_MASK` = `0x0007`, same as host bridge); other bits hardwired 0.
 //! - PIIX ISA Status (`0x06`) readback stub: same CapList/FastB2B/DevSel as host bridge
@@ -110,9 +114,13 @@
 //!   address-wrap rejection, and BMISTA Active/Error latching. No ATA DMA
 //!   command engine and no secondary-channel engine.
 //! - PIIX ACPI PM I/O decode: when Command.IO is set and PMBASE has I/O form
-//!   (bit0), the 64-byte PM register block at `PMBASE & 0xFFC0` is a noop
-//!   store/readback (`PM1a_EVT` / `PM1a_CNT` / `PM_TMR` + remainder). No SCI,
-//!   SMI, or power-state machine.
+//!   (bit0), the 64-byte PM register block at `PMBASE & 0xFFC0` implements a
+//!   bounded ACPI PM subset — `PM1a_STS`/`PM1a_EN`/`PM1a_CNT` stubs and a
+//!   24-bit `PM_TMR` in `acpi_pm_io[+8]` at 3.579545 MHz. Advance via
+//!   [`PciConfig::tick_acpi_pm`] (preferred machine hook: 3 PM ticks per PIT
+//!   step-clock) or by writing the same `acpi_pm_io` bytes. SCI is reported
+//!   via [`PciConfig::acpi_sci_asserted`]; no PIC/APIC wire, SMI, GPE, or
+//!   sleep-state machine.
 //!
 //! - PIIX USB UHCI BAR0 I/O decode: when Command.IO is set and UHCI BAR0 has
 //!   I/O form (bit0), the 32-byte UHCI register block at `BAR0 & 0xFFE0` is a
@@ -145,7 +153,10 @@
 //! - Host-bridge / PIIX ISA / PIIX USB Command decode side effects;
 //!   PIIX IDE Command side effects beyond BMIDE I/O enable;
 //!   PIIX ACPI Command side effects beyond PM I/O enable
-//! - Status error *signaling* (host / ISA / IDE / USB / ACPI never latch RW1C bits from real aborts yet)
+//! - Status error *signaling* beyond config Master-Abort: host / ISA / IDE /
+//!   USB / ACPI still do not latch RW1C bits from data-path parity / target
+//!   abort / SERR events. Config Mechanism #1 absent-target cycles **do** set
+//!   Received Master Abort on the host-bridge Status (PCI 3.0 §6.2.3).
 //! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI;
 //!   the Capabilities Pointer at `0x34` is read-only zero to match)
 //! - PCI interrupts: every function's Interrupt Pin is read-only zero, because
@@ -160,15 +171,15 @@
 //!   **overstatement inherited from round 2** and is recorded here rather than
 //!   quietly changed under firmware that keys on the PIIX3 device ID.
 //! - USB host controller (UHCI frame list / ports / IRQ)
-//! - ACPI SCI/SMI / GPE / real power transitions / ACPI tables
+//! - ACPI SCI delivery onto the interrupt controller / SMI / GPE / sleep-state
+//!   transitions (`SLP_EN`) / ACPI tables
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
 //! - PAM *effect*: programming PAM0–PAM6 changes only this register file and
 //!   the decoded accessors. No physical memory is remapped here, so BIOS
 //!   shadowing does not work until the machine layer consumes
-//!   [`PciConfig::pam_regions`]. The neighbouring PMC registers that complete
-//!   the legacy memory map — FDHC (`0x68`, the `080000-09FFFFh` DRAM hole) and
-//!   SMRAM (`0x72`) — are plain read/write config bytes with no decode.
+//!   [`PciConfig::pam_regions`]. FDHC and SMRAM are decoded register files with
+//!   host accessors; the machine layer still has to apply them to `PhysMem`.
 
 use crate::PortDevice;
 
@@ -689,6 +700,74 @@ const _: () =
 const _: () = assert!(PCI_PMC_PAM0_WRITABLE_MASK == PCI_PMC_PAM_FIELD_MASK << 4);
 const _: () = assert!(PCI_PMC_PAM_DEFAULT & PCI_PMC_PAM_WRITABLE_MASK == 0);
 
+/// i440FX PMC Fixed DRAM Hole Control register.
+///
+/// Spec: Intel 440FX PCIset 82441FX (PMC) datasheet §3.2.20 "FDHC — Fixed DRAM
+/// Hole Control Register" — Address Offset `68h`, Default Value `00h`,
+/// Attribute Read/Write. Bits [7:6] Hole Enable (HEN); bits [5:0] Reserved.
+pub const PCI_PMC_FDHC_OFFSET: u8 = 0x68;
+/// FDHC power-on / reset value. Spec: 440FX §3.2.20 "Default Value: 00h".
+pub const PCI_PMC_FDHC_DEFAULT: u8 = 0x00;
+/// FDHC Hole Enable field in bits [7:6].
+pub const PCI_PMC_FDHC_HEN_SHIFT: u8 = 6;
+/// FDHC HEN encoding: no hole.
+pub const PCI_PMC_FDHC_HEN_NONE: u8 = 0b00;
+/// FDHC HEN encoding: 512 KB–640 KB (`080000h`–`09FFFFh`, 128 KiB).
+pub const PCI_PMC_FDHC_HEN_512K_640K: u8 = 0b01;
+/// FDHC HEN encoding: 15 MB–16 MB (`00F0_0000h`–`00FF_FFFFh`, 1 MiB).
+pub const PCI_PMC_FDHC_HEN_15M_16M: u8 = 0b10;
+/// FDHC HEN encoding: reserved (treated as no hole).
+pub const PCI_PMC_FDHC_HEN_RESERVED: u8 = 0b11;
+/// Writable bits of FDHC (HEN only). Spec: 440FX §3.2.20 bits [5:0] Reserved.
+pub const PCI_PMC_FDHC_WRITABLE_MASK: u8 = 0xC0;
+/// Inclusive start of the 512 KB–640 KB FDHC hole.
+pub const PCI_PMC_FDHC_512K_START: u32 = 0x0008_0000;
+/// Inclusive end of the 512 KB–640 KB FDHC hole.
+pub const PCI_PMC_FDHC_512K_END: u32 = 0x0009_FFFF;
+/// Inclusive start of the 15 MB–16 MB FDHC hole.
+pub const PCI_PMC_FDHC_15M_START: u32 = 0x00F0_0000;
+/// Inclusive end of the 15 MB–16 MB FDHC hole.
+pub const PCI_PMC_FDHC_15M_END: u32 = 0x00FF_FFFF;
+
+/// i440FX PMC System Management RAM Control register.
+///
+/// Spec: Intel 440FX PCIset 82441FX (PMC) datasheet §3.2.23 "SMRAM — System
+/// Management RAM Control Register" — Address Offset `72h`, Default Value
+/// `02h`, Attribute Read/Write. Bit names below use the modern D_/G_/C_
+/// spellings that match later Intel documents; the 440FX datasheet labels the
+/// same bits DOPEN/DCLS/DLCK/SMRAME/DBASESEG.
+pub const PCI_PMC_SMRAM_OFFSET: u8 = 0x72;
+/// SMRAM power-on / reset value. Spec: 440FX §3.2.23 "Default Value: 02h"
+/// (`C_BASE_SEG` = `010b` → `A0000h`–`BFFFFh`).
+pub const PCI_PMC_SMRAM_DEFAULT: u8 = 0x02;
+/// SMRAM bit 6: D_OPEN (DOPEN) — SMM space visible outside SMM when unlocked.
+pub const PCI_PMC_SMRAM_D_OPEN: u8 = 1 << 6;
+/// SMRAM bit 5: D_CLS (DCLS) — close data references to SMM space.
+pub const PCI_PMC_SMRAM_D_CLS: u8 = 1 << 5;
+/// SMRAM bit 4: D_LCK (DLCK) — lock D_OPEN/D_LCK until power-on reset.
+pub const PCI_PMC_SMRAM_D_LCK: u8 = 1 << 4;
+/// SMRAM bit 3: G_SMRAME (SMRAME) — global SMRAM enable.
+pub const PCI_PMC_SMRAM_G_SMRAME: u8 = 1 << 3;
+/// SMRAM bits [2:0]: C_BASE_SEG (DBASESEG) mask.
+pub const PCI_PMC_SMRAM_C_BASE_SEG_MASK: u8 = 0x07;
+/// Compatible C_BASE_SEG encoding selecting `A0000h`–`BFFFFh`.
+pub const PCI_PMC_SMRAM_C_BASE_SEG_A0000: u8 = 0b010;
+/// Writable defined bits of SMRAM (bit 7 Reserved → hardwired 0).
+pub const PCI_PMC_SMRAM_WRITABLE_MASK: u8 = PCI_PMC_SMRAM_D_OPEN
+    | PCI_PMC_SMRAM_D_CLS
+    | PCI_PMC_SMRAM_D_LCK
+    | PCI_PMC_SMRAM_G_SMRAME
+    | PCI_PMC_SMRAM_C_BASE_SEG_MASK;
+/// Inclusive start of compatible SMRAM (`C_BASE_SEG = 010b`).
+pub const PCI_PMC_SMRAM_COMPAT_START: u32 = 0x000A_0000;
+/// Inclusive end of compatible SMRAM (`C_BASE_SEG = 010b`).
+pub const PCI_PMC_SMRAM_COMPAT_END: u32 = 0x000B_FFFF;
+
+const _: () = assert!(PCI_PMC_FDHC_DEFAULT == 0x00);
+const _: () = assert!(PCI_PMC_FDHC_WRITABLE_MASK == 0xC0);
+const _: () = assert!(PCI_PMC_SMRAM_DEFAULT == PCI_PMC_SMRAM_C_BASE_SEG_A0000);
+const _: () = assert!(PCI_PMC_SMRAM_WRITABLE_MASK == 0x7F);
+
 /// Number of legacy memory segments controlled by the PAM registers.
 ///
 /// Spec: 440FX §3.2.18 — "The PMC allows programmable memory attributes on 13
@@ -753,6 +832,120 @@ impl PamRegion {
     }
 }
 
+/// Decoded SMRAM attributes for the compatible `A0000h`–`BFFFFh` window.
+///
+/// Spec: 440FX §3.2.23 / Table 4. This is the host-side view the machine layer
+/// consumes to steer the video-buffer range at DRAM (SMM) or at PCI; the device
+/// crate itself owns no memory. Re-export from `devices` when wiring PhysMem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmramRegion {
+    /// Inclusive guest-physical start (`0xA0000` when `C_BASE_SEG = 010b`).
+    pub start: u32,
+    /// Inclusive guest-physical end (`0xBFFFF` when `C_BASE_SEG = 010b`).
+    pub end: u32,
+    /// G_SMRAME — SMRAM function enabled.
+    pub g_smrame: bool,
+    /// D_OPEN — SMM DRAM visible outside SMM (cleared and locked by D_LCK).
+    pub d_open: bool,
+    /// D_CLS — data references closed even in SMM; code may still hit DRAM.
+    pub d_cls: bool,
+    /// D_LCK — D_OPEN/D_LCK sticky until power-on reset.
+    pub d_lck: bool,
+    /// C_BASE_SEG field (compatible value is `0b010`).
+    pub c_base_seg: u8,
+    /// Table 4: a CPU code fetch into the window maps to DRAM for this state
+    /// when `in_smm` matches the current CPU SMM-mode request.
+    pub code_to_dram: bool,
+    /// Table 4: a CPU data reference into the window maps to DRAM.
+    pub data_to_dram: bool,
+}
+
+impl SmramRegion {
+    pub const fn len(&self) -> u32 {
+        self.end - self.start + 1
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub const fn contains(&self, phys: u32) -> bool {
+        phys >= self.start && phys <= self.end
+    }
+}
+
+/// Decoded Fixed DRAM Hole Control hole, if HEN selects a defined hole.
+///
+/// Spec: 440FX §3.2.20. CPU cycles matching the hole are forwarded to PCI; the
+/// hole is not remapped. Re-export from `devices` when wiring PhysMem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdhcHole {
+    /// Inclusive guest-physical start.
+    pub start: u32,
+    /// Inclusive guest-physical end.
+    pub end: u32,
+    /// Raw HEN field (bits [7:6] of FDHC).
+    pub hen: u8,
+}
+
+impl FdhcHole {
+    pub const fn len(&self) -> u32 {
+        self.end - self.start + 1
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub const fn contains(&self, phys: u32) -> bool {
+        phys >= self.start && phys <= self.end
+    }
+}
+
+/// ACPI PM Timer frequency in Hz.
+///
+/// Spec: ACPI Specification — Power Management Timer runs at 3.579545 MHz
+/// (same crystal as the 8254). Model choice recorded in `docs/pci-r5-acpi-pm.md`.
+pub const ACPI_PM_TIMER_HZ: u32 = 3_579_545;
+/// ACPI PM Timer width implemented here (PIIX4 / ACPI fixed hardware timer).
+pub const ACPI_PM_TIMER_BITS: u32 = 24;
+/// Mask for the 24-bit PM timer value.
+pub const ACPI_PM_TIMER_MASK: u32 = (1 << ACPI_PM_TIMER_BITS) - 1;
+
+/// PM1_STS bit 0: TMR_STS (timer carry). Spec: ACPI PM1 Status Registers.
+pub const ACPI_PM1_STS_TMR: u16 = 1 << 0;
+/// PM1_STS bit 5: GBL_STS.
+pub const ACPI_PM1_STS_GBL: u16 = 1 << 5;
+/// PM1_STS bit 8: PWRBTN_STS (power button). Spec: ACPI / Intel 82371AB.
+pub const ACPI_PM1_STS_PWRBTN: u16 = 1 << 8;
+/// PM1_STS bits that generate SCI when enabled and SCI_EN is set.
+pub const ACPI_PM1_STS_SCI_MASK: u16 = ACPI_PM1_STS_TMR | ACPI_PM1_STS_GBL | ACPI_PM1_STS_PWRBTN;
+/// PM1_STS bits software may clear by writing 1 (write-1-to-clear).
+pub const ACPI_PM1_STS_WRITE_CLEAR_MASK: u16 =
+    ACPI_PM1_STS_TMR | ACPI_PM1_STS_GBL | ACPI_PM1_STS_PWRBTN | (1 << 9) | (1 << 10) | (1 << 15);
+
+/// PM1_EN bit 0: TMR_EN.
+pub const ACPI_PM1_EN_TMR: u16 = 1 << 0;
+/// PM1_EN bit 5: GBL_EN.
+pub const ACPI_PM1_EN_GBL: u16 = 1 << 5;
+/// PM1_EN bit 8: PWRBTN_EN.
+pub const ACPI_PM1_EN_PWRBTN: u16 = 1 << 8;
+/// Writable PM1_EN bits in this stub.
+pub const ACPI_PM1_EN_WRITABLE_MASK: u16 = ACPI_PM1_EN_TMR | ACPI_PM1_EN_GBL | ACPI_PM1_EN_PWRBTN;
+
+/// PM1_CNT bit 0: SCI_EN — SCI vs SMI select for PM1 events.
+/// Spec: ACPI §4.8.1.3 / Intel 82371AB PM1_CNT.
+pub const ACPI_PM1_CNT_SCI_EN: u16 = 1 << 0;
+/// PM1_CNT bit 2: GBL_RLS (write strobe; not latched as level here).
+pub const ACPI_PM1_CNT_GBL_RLS: u16 = 1 << 2;
+/// PM1_CNT bits [12:10]: SLP_TYPx field.
+pub const ACPI_PM1_CNT_SLP_TYP_MASK: u16 = 0x1C00;
+/// PM1_CNT bit 13: SLP_EN (write-only trigger; ignored — no sleep machine).
+pub const ACPI_PM1_CNT_SLP_EN: u16 = 1 << 13;
+/// Sticky PM1_CNT bits stored across writes (SCI_EN | BM_RLD | SLP_TYP).
+pub const ACPI_PM1_CNT_STICKY_MASK: u16 =
+    ACPI_PM1_CNT_SCI_EN | (1 << 1) | ACPI_PM1_CNT_SLP_TYP_MASK;
+
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
 
@@ -803,8 +996,10 @@ pub struct PciConfig {
     /// Port store/readback plus bounded PRDT [`Self::start_bm_read`] stub. Reset all zeros.
     pub bmide_io: [u8; PCI_PIIX_IDE_BMIDE_IO_SIZE as usize],
     /// PIIX ACPI PM I/O register file (64 bytes at PMBASE).
-    /// Spec: Intel 82371AB — `PM1a_EVT` / `PM1a_CNT` / `PM_TMR` (+ remainder).
-    /// Store/readback only; no SCI/SMI/power-state machine. Reset all zeros.
+    /// Spec: Intel 82371AB / ACPI — `PM1a_EVT` / `PM1a_CNT` / `PM_TMR`.
+    /// PM1a status/enable/control and the 24-bit `PM_TMR` dword at +8 live in
+    /// this file so the machine step clock and [`Self::tick_acpi_pm`] share one
+    /// register authority. Reset all zeros.
     pub acpi_pm_io: [u8; PCI_PIIX_ACPI_PM_IO_SIZE as usize],
     /// PIIX USB UHCI I/O register file (32 bytes at BAR0).
     /// Spec: UHCI 1.1 — USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC.
@@ -973,6 +1168,9 @@ impl PciConfig {
         // Spec: PCI Status at 0x06 — CapList=0, FastB2B, DevSel=medium stub.
         let st = PCI_STATUS_OFFSET as usize;
         cfg[st..st + 2].copy_from_slice(&PCI_HOST_BRIDGE_STATUS_STUB.to_le_bytes());
+        // Spec: 440FX §3.2.23 — SMRAM default `02h` (C_BASE_SEG = A0000–BFFFF).
+        cfg[PCI_PMC_SMRAM_OFFSET as usize] = PCI_PMC_SMRAM_DEFAULT;
+        // Spec: 440FX §3.2.20 — FDHC default `00h` (no hole); already zeroed.
         cfg
     }
 
@@ -1339,8 +1537,9 @@ impl PciConfig {
     ///
     /// Spec: PCI 3.0 §3.2.2.3.2 — the access must fall inside the dword
     /// beginning at CONFIG_DATA and the Enable bit must be set; footnote 15 and
-    /// §3.2.2.3.4 make an unclaimed target return all ones (Master-Abort).
-    fn read_data(&self, size: u8, port: u16) -> u32 {
+    /// §3.2.2.3.4 make an unclaimed target return all ones (Master-Abort). When
+    /// that happens, §6.2.3 Received Master Abort is set on the host bridge.
+    fn read_data(&mut self, size: u8, port: u16) -> u32 {
         let Some(lane) = Self::config_data_lane(port, size) else {
             return OPEN_BUS;
         };
@@ -1348,12 +1547,27 @@ impl PciConfig {
             return OPEN_BUS;
         }
         let Some(cfg) = self.selected_cfg() else {
+            self.set_host_bridge_received_master_abort();
             return OPEN_BUS;
         };
         let off = self.config_register() as usize + lane;
         let mut bytes = [0u8; 4];
         bytes[..usize::from(size)].copy_from_slice(&cfg[off..off + usize::from(size)]);
         u32::from_le_bytes(bytes)
+    }
+
+    /// Latch Received Master Abort on the host-bridge Status register.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §6.2.3 "Status Register"
+    /// — "Received Master Abort: This bit must be set by a master device
+    /// whenever its transaction (except for Special Cycle) is terminated with
+    /// Master-Abort." Mechanism #1 config cycles are initiated by the host
+    /// bridge, so an absent target sets this bit there (RW1C).
+    fn set_host_bridge_received_master_abort(&mut self) {
+        let st = PCI_STATUS_OFFSET as usize;
+        let mut status = u16::from_le_bytes([self.host_bridge[st], self.host_bridge[st + 1]]);
+        status |= PCI_STATUS_REC_MASTER_ABORT;
+        self.host_bridge[st..st + 2].copy_from_slice(&status.to_le_bytes());
     }
 
     fn write_data(&mut self, size: u8, port: u16, value: u32) {
@@ -1385,6 +1599,11 @@ impl PciConfig {
             } else {
                 None
             };
+        let old_smram = if is_host_bridge {
+            Some(self.host_bridge[PCI_PMC_SMRAM_OFFSET as usize])
+        } else {
+            None
+        };
         // Spec: PCI 3.0 §6.2.5.1 / §6.2.5.2 — a Base Address Register the
         // function does not implement, and the Expansion ROM register of a
         // function with no ROM, are read-only zero. Storing a sizing write
@@ -1395,6 +1614,9 @@ impl PciConfig {
                 || (Self::is_bar_byte(o) && !bars.iter().any(|bar| bar.covers(o)))
         };
         let Some(cfg) = self.selected_cfg_mut() else {
+            // Spec: PCI 3.0 §6.2.3 / §3.2.2.3.4 — Master-Abort on an absent
+            // target. The host bridge is the initiator of Mechanism #1 cycles.
+            self.set_host_bridge_received_master_abort();
             return;
         };
         // `config_data_lane` bounded the access to one dword, and the register
@@ -1425,6 +1647,12 @@ impl PciConfig {
             // Spec: Intel 440FX §3.2.18 — PAM0–PAM6 at 0x59–0x5F are R/W, but
             // Table 2 bits [7, 6, 3, 2] and Table 3 `PAM0[3:0]` are Reserved.
             Self::apply_pam_reserved_mask(cfg);
+            // Spec: 440FX §3.2.20 / §3.2.23 — FDHC reserved bits and SMRAM
+            // D_LCK sticky behaviour.
+            Self::apply_smram_fdhc_masks(cfg);
+            if let Some(old) = old_smram {
+                Self::apply_smram_after_write(cfg, old);
+            }
         }
         // Spec: PCI Local Bus + Intel 82371SB — PIIX ISA bridge Command at 0x04
         // keeps IO/MEM/BusMaster sticky (same mask as host bridge); other bits
@@ -1625,6 +1853,179 @@ impl PciConfig {
         let pam_first = u16::from(PCI_PMC_PAM0_OFFSET);
         let pam_end = pam_first + PCI_PMC_PAM_COUNT as u16;
         start < pam_end && end > pam_first
+    }
+
+    /// Raw SMRAM register byte at PMC config `0x72`.
+    ///
+    /// Spec: 440FX §3.2.23. Bit 7 always reads zero.
+    pub fn smram_register(&self) -> u8 {
+        self.host_bridge[PCI_PMC_SMRAM_OFFSET as usize]
+    }
+
+    /// Store the SMRAM register from the host, applying D_LCK sticky rules.
+    ///
+    /// Spec: 440FX §3.2.23 — when D_LCK is set, D_OPEN is forced clear and both
+    /// D_LCK and D_OPEN become read-only until power-on reset. Returns the value
+    /// actually stored.
+    pub fn set_smram_register(&mut self, value: u8) -> u8 {
+        let stored = Self::smram_write_value(self.smram_register(), value);
+        self.host_bridge[PCI_PMC_SMRAM_OFFSET as usize] = stored;
+        stored
+    }
+
+    /// Apply a guest/host SMRAM write against the current locked state.
+    fn smram_write_value(old: u8, value: u8) -> u8 {
+        let incoming = value & PCI_PMC_SMRAM_WRITABLE_MASK;
+        if old & PCI_PMC_SMRAM_D_LCK != 0 {
+            // Spec: 440FX §3.2.23 — DLCK and DOPEN become read-only; DOPEN stays 0.
+            (incoming
+                & (PCI_PMC_SMRAM_D_CLS | PCI_PMC_SMRAM_G_SMRAME | PCI_PMC_SMRAM_C_BASE_SEG_MASK))
+                | PCI_PMC_SMRAM_D_LCK
+        } else {
+            let mut v = incoming;
+            if v & PCI_PMC_SMRAM_D_LCK != 0 {
+                v &= !PCI_PMC_SMRAM_D_OPEN;
+            }
+            v
+        }
+    }
+
+    /// Decoded SMRAM attributes for the compatible window, evaluated at `in_smm`.
+    ///
+    /// Spec: 440FX §3.2.23 Table 4. When `C_BASE_SEG != 010b` the compatible
+    /// window is undefined (reserved encodings); the accessor still reports the
+    /// programmed base-seg field but forces both code/data maps to PCI.
+    ///
+    /// Note: this type is crate-public for a PAM-style host accessor. Re-export
+    /// `SmramRegion` from `devices` before the machine layer wires PhysMem.
+    pub fn smram_region(&self, in_smm: bool) -> SmramRegion {
+        let byte = self.smram_register();
+        let g_smrame = byte & PCI_PMC_SMRAM_G_SMRAME != 0;
+        let d_open = byte & PCI_PMC_SMRAM_D_OPEN != 0;
+        let d_cls = byte & PCI_PMC_SMRAM_D_CLS != 0;
+        let d_lck = byte & PCI_PMC_SMRAM_D_LCK != 0;
+        let c_base_seg = byte & PCI_PMC_SMRAM_C_BASE_SEG_MASK;
+        let compatible = c_base_seg == PCI_PMC_SMRAM_C_BASE_SEG_A0000;
+        let (code_to_dram, data_to_dram) = if !g_smrame || !compatible {
+            (false, false)
+        } else {
+            Self::smram_table4_maps(d_lck, d_cls, d_open, in_smm)
+        };
+        SmramRegion {
+            start: PCI_PMC_SMRAM_COMPAT_START,
+            end: PCI_PMC_SMRAM_COMPAT_END,
+            g_smrame,
+            d_open,
+            d_cls,
+            d_lck,
+            c_base_seg,
+            code_to_dram,
+            data_to_dram,
+        }
+    }
+
+    /// 440FX Table 4 — whether code / data references hit DRAM for the current
+    /// D_LCK / D_CLS / D_OPEN / SMM-mode combination (G_SMRAME already true).
+    fn smram_table4_maps(d_lck: bool, d_cls: bool, d_open: bool, in_smm: bool) -> (bool, bool) {
+        // Software should keep D_OPEN and D_CLS mutually exclusive; Table 4
+        // marks D_CLS=1 ∧ D_OPEN=1 as INVALID — this model treats that as PCI.
+        if d_cls && d_open {
+            return (false, false);
+        }
+        match (d_lck, d_cls, d_open, in_smm) {
+            // SMRAME=1, unlocked, closed for data only when D_CLS; open outside SMM when D_OPEN.
+            (false, false, false, true) => (true, true),
+            (false, false, false, false) => (false, false),
+            (false, false, true, _) => (true, true),
+            (false, true, false, true) => (true, false),
+            (false, true, false, false) => (false, false),
+            // Locked: D_OPEN is always 0 in the register file.
+            (true, false, _, true) => (true, true),
+            (true, false, _, false) => (false, false),
+            (true, true, _, true) => (true, false),
+            (true, true, _, false) => (false, false),
+            // D_CLS ∧ D_OPEN already handled.
+            (false, true, true, _) => (false, false),
+        }
+    }
+
+    /// True when a CONFIG_DATA access overlaps SMRAM (`0x72`) on `00:00.0`.
+    pub fn smram_config_write_overlaps(&self, port: u16, size: u8) -> bool {
+        self.host_bridge_config_write_overlaps(port, size, PCI_PMC_SMRAM_OFFSET, 1)
+    }
+
+    /// Raw FDHC register byte at PMC config `0x68`.
+    ///
+    /// Spec: 440FX §3.2.20. Bits [5:0] always read zero.
+    pub fn fdhc_register(&self) -> u8 {
+        self.host_bridge[PCI_PMC_FDHC_OFFSET as usize]
+    }
+
+    /// Store the FDHC register from the host (HEN bits only).
+    pub fn set_fdhc_register(&mut self, value: u8) -> u8 {
+        let stored = value & PCI_PMC_FDHC_WRITABLE_MASK;
+        self.host_bridge[PCI_PMC_FDHC_OFFSET as usize] = stored;
+        stored
+    }
+
+    /// HEN field of FDHC (bits [7:6]).
+    pub fn fdhc_hen(&self) -> u8 {
+        self.fdhc_register() >> PCI_PMC_FDHC_HEN_SHIFT
+    }
+
+    /// Decoded DRAM hole when HEN selects a defined hole; `None` for none/reserved.
+    ///
+    /// Spec: 440FX §3.2.20 — HEN `01` → `080000h`–`09FFFFh`; `10` →
+    /// `00F0_0000h`–`00FF_FFFFh`; `00`/`11` → no hole. Re-export `FdhcHole`
+    /// from `devices` when wiring PhysMem.
+    pub fn fdhc_hole(&self) -> Option<FdhcHole> {
+        let hen = self.fdhc_hen();
+        let (start, end) = match hen {
+            PCI_PMC_FDHC_HEN_512K_640K => (PCI_PMC_FDHC_512K_START, PCI_PMC_FDHC_512K_END),
+            PCI_PMC_FDHC_HEN_15M_16M => (PCI_PMC_FDHC_15M_START, PCI_PMC_FDHC_15M_END),
+            _ => return None,
+        };
+        Some(FdhcHole { start, end, hen })
+    }
+
+    /// True when a CONFIG_DATA access overlaps FDHC (`0x68`) on `00:00.0`.
+    pub fn fdhc_config_write_overlaps(&self, port: u16, size: u8) -> bool {
+        self.host_bridge_config_write_overlaps(port, size, PCI_PMC_FDHC_OFFSET, 1)
+    }
+
+    fn host_bridge_config_write_overlaps(&self, port: u16, size: u8, reg: u8, len: u8) -> bool {
+        let Some(lane) = Self::config_data_lane(port, size) else {
+            return false;
+        };
+        if !self.config_enabled() {
+            return false;
+        }
+        if self.config_bus() != 0 || self.config_device() != 0 || self.config_function() != 0 {
+            return false;
+        }
+        let start = u16::from(self.config_register()) + lane as u16;
+        let end = start + u16::from(size);
+        let first = u16::from(reg);
+        let last = first + u16::from(len);
+        start < last && end > first
+    }
+
+    /// Mask reserved SMRAM / FDHC bits after a host-bridge config write.
+    fn apply_smram_fdhc_masks(cfg: &mut [u8; 256]) {
+        let smram_off = PCI_PMC_SMRAM_OFFSET as usize;
+        let old = cfg[smram_off];
+        // Re-apply sticky lock against the value already stored in the file
+        // (write_data stored raw bytes first). Use the pre-mask old as both
+        // old and new when called after a bulk write — callers that need
+        // sticky behavior go through [`Self::apply_smram_after_write`].
+        cfg[smram_off] = old & PCI_PMC_SMRAM_WRITABLE_MASK;
+        cfg[PCI_PMC_FDHC_OFFSET as usize] &= PCI_PMC_FDHC_WRITABLE_MASK;
+    }
+
+    /// Recompute SMRAM after raw bytes land, honouring D_LCK against `old`.
+    fn apply_smram_after_write(cfg: &mut [u8; 256], old: u8) {
+        let off = PCI_PMC_SMRAM_OFFSET as usize;
+        cfg[off] = Self::smram_write_value(old, cfg[off]);
     }
 
     /// Mask the reserved bits out of the host-bridge PAM block.
@@ -2042,6 +2443,16 @@ impl PciConfig {
             return 0xFFFFFFFF;
         };
         let off = (port - base) as usize;
+        // Spec: ACPI PM_TMR_BLK — 24-bit free-running timer in acpi_pm_io[+8].
+        if off == PCI_PIIX_ACPI_PM_TMR as usize {
+            let tmr = self.acpi_pm_timer();
+            return match size {
+                1 => tmr & 0xFF,
+                2 => tmr & 0xFFFF,
+                4 => tmr,
+                _ => 0xFFFFFFFF,
+            };
+        }
         match size {
             1 => u32::from(self.acpi_pm_io.get(off).copied().unwrap_or(0xFF)),
             2 => {
@@ -2056,6 +2467,20 @@ impl PciConfig {
                         *b = *v;
                     }
                 }
+                // Dword covering PM_TMR (+8) must expose the 24-bit mask.
+                if off < PCI_PIIX_ACPI_PM_TMR as usize + 4
+                    && off + 4 > PCI_PIIX_ACPI_PM_TMR as usize
+                {
+                    let tmr = self.acpi_pm_timer().to_le_bytes();
+                    for (i, byte) in bytes.iter_mut().enumerate() {
+                        let abs = off + i;
+                        if (PCI_PIIX_ACPI_PM_TMR as usize..PCI_PIIX_ACPI_PM_TMR as usize + 4)
+                            .contains(&abs)
+                        {
+                            *byte = tmr[abs - PCI_PIIX_ACPI_PM_TMR as usize];
+                        }
+                    }
+                }
                 u32::from_le_bytes(bytes)
             }
             _ => 0xFFFFFFFF,
@@ -2068,29 +2493,116 @@ impl PciConfig {
         };
         let off = (port - base) as usize;
         match size {
-            1 => {
-                if let Some(slot) = self.acpi_pm_io.get_mut(off) {
-                    *slot = value as u8;
-                }
-            }
-            2 => {
-                let bytes = (value as u16).to_le_bytes();
-                for (i, b) in bytes.iter().enumerate() {
-                    if let Some(slot) = self.acpi_pm_io.get_mut(off + i) {
-                        *slot = *b;
-                    }
-                }
-            }
-            4 => {
-                let bytes = value.to_le_bytes();
-                for (i, b) in bytes.iter().enumerate() {
-                    if let Some(slot) = self.acpi_pm_io.get_mut(off + i) {
-                        *slot = *b;
-                    }
-                }
-            }
+            1 => self.acpi_pm_write_bytes(off, &[value as u8]),
+            2 => self.acpi_pm_write_bytes(off, &(value as u16).to_le_bytes()),
+            4 => self.acpi_pm_write_bytes(off, &value.to_le_bytes()),
             _ => {}
         }
+    }
+
+    fn acpi_pm_write_bytes(&mut self, off: usize, bytes: &[u8]) {
+        // Spec: ACPI fixed hardware — PM1_EN is R/W; PM1_CNT stores sticky
+        // control bits. PM1_STS remains store/readback (hardware events OR bits
+        // via assert_power_button / tick_acpi_pm); full W1C is deferred so the
+        // existing MachineBus decode test keeps working. PM_TMR lives in
+        // acpi_pm_io[+8] (24-bit) so machine step-clock freerun and
+        // [`Self::tick_acpi_pm`] share one register file.
+        for (i, b) in bytes.iter().enumerate() {
+            let abs = off + i;
+            if abs >= PCI_PIIX_ACPI_PM_IO_SIZE as usize {
+                break;
+            }
+            self.acpi_pm_io[abs] = *b;
+        }
+        // Mask PM_TMR to 24 bits after any overlapping write.
+        if off < PCI_PIIX_ACPI_PM_TMR as usize + 4
+            && off + bytes.len() > PCI_PIIX_ACPI_PM_TMR as usize
+        {
+            let tmr = self.acpi_pm_timer();
+            let off_t = PCI_PIIX_ACPI_PM_TMR as usize;
+            self.acpi_pm_io[off_t..off_t + 4].copy_from_slice(&tmr.to_le_bytes());
+        }
+        let en = u16::from_le_bytes([self.acpi_pm_io[2], self.acpi_pm_io[3]])
+            & ACPI_PM1_EN_WRITABLE_MASK;
+        self.acpi_pm_io[2..4].copy_from_slice(&en.to_le_bytes());
+        let cnt =
+            u16::from_le_bytes([self.acpi_pm_io[4], self.acpi_pm_io[5]]) & ACPI_PM1_CNT_STICKY_MASK;
+        self.acpi_pm_io[4..6].copy_from_slice(&cnt.to_le_bytes());
+    }
+
+    /// PM1a status word (`PMBASE + 0`).
+    pub fn acpi_pm1_sts(&self) -> u16 {
+        u16::from_le_bytes([self.acpi_pm_io[0], self.acpi_pm_io[1]])
+    }
+
+    /// PM1a enable word (`PMBASE + 2`).
+    pub fn acpi_pm1_en(&self) -> u16 {
+        u16::from_le_bytes([self.acpi_pm_io[2], self.acpi_pm_io[3]])
+    }
+
+    /// PM1a control word (`PMBASE + 4`).
+    pub fn acpi_pm1_cnt(&self) -> u16 {
+        u16::from_le_bytes([self.acpi_pm_io[4], self.acpi_pm_io[5]])
+    }
+
+    /// Current 24-bit PM timer value from `acpi_pm_io` at PMBASE+8.
+    ///
+    /// The machine step clock may advance these bytes directly (R5 APM/machine
+    /// sibling) or call [`Self::tick_acpi_pm`]; both share this register file.
+    pub fn acpi_pm_timer(&self) -> u32 {
+        let off = PCI_PIIX_ACPI_PM_TMR as usize;
+        u32::from_le_bytes([
+            self.acpi_pm_io[off],
+            self.acpi_pm_io[off + 1],
+            self.acpi_pm_io[off + 2],
+            self.acpi_pm_io[off + 3],
+        ]) & ACPI_PM_TIMER_MASK
+    }
+
+    /// Advance the ACPI PM timer by `ticks` at [`ACPI_PM_TIMER_HZ`].
+    ///
+    /// Spec: ACPI — when the timer's MSB (bit 23) toggles, TMR_STS is set.
+    /// Preferred machine hook (compose with step clock: 3 PM ticks per PIT
+    /// clock). Mutating `acpi_pm_io[PM_TMR..]` directly remains coherent.
+    pub fn tick_acpi_pm(&mut self, ticks: u32) {
+        if ticks == 0 {
+            return;
+        }
+        let before = self.acpi_pm_timer();
+        let after = before.wrapping_add(ticks) & ACPI_PM_TIMER_MASK;
+        let msb = 1u32 << (ACPI_PM_TIMER_BITS - 1);
+        if (before ^ after) & msb != 0 {
+            let sts = self.acpi_pm1_sts() | ACPI_PM1_STS_TMR;
+            self.acpi_pm_io[0..2].copy_from_slice(&sts.to_le_bytes());
+        }
+        let off = PCI_PIIX_ACPI_PM_TMR as usize;
+        self.acpi_pm_io[off..off + 4].copy_from_slice(&after.to_le_bytes());
+    }
+
+    /// Advance the ACPI PM timer by approximately `nanos` nanoseconds.
+    pub fn tick_acpi_pm_ns(&mut self, nanos: u64) {
+        let ticks = nanos.saturating_mul(u64::from(ACPI_PM_TIMER_HZ)) / 1_000_000_000;
+        if ticks > 0 {
+            self.tick_acpi_pm(ticks.min(u64::from(u32::MAX)) as u32);
+        }
+    }
+
+    /// Latch PWRBTN_STS. Spec: ACPI PM1_STS power-button bit / Intel 82371AB.
+    pub fn acpi_assert_power_button(&mut self) {
+        let sts = self.acpi_pm1_sts() | ACPI_PM1_STS_PWRBTN;
+        self.acpi_pm_io[0..2].copy_from_slice(&sts.to_le_bytes());
+    }
+
+    /// True when SCI_EN is set and an enabled PM1 status bit in the SCI mask is set.
+    ///
+    /// Spec: ACPI §4.8.1 — SCI is the OR of (STS & EN) for SCI-capable bits while
+    /// SCI_EN=1. This stub does not drive a PIC/APIC line; the host polls or wires
+    /// [`Self::acpi_sci_asserted`].
+    pub fn acpi_sci_asserted(&self) -> bool {
+        if self.acpi_pm1_cnt() & ACPI_PM1_CNT_SCI_EN == 0 {
+            return false;
+        }
+        (self.acpi_pm1_sts() & self.acpi_pm1_en() & ACPI_PM1_STS_SCI_MASK) != 0
     }
 
     fn piix_usb_command(&self) -> u16 {
@@ -4317,7 +4829,7 @@ mod tests {
         assert!(!pci.acpi_pm_owns_port(0x0000));
     }
 
-    /// Spec: Intel 82371AB PM — `PM1a_EVT` / `PM1a_CNT` / `PM_TMR` store/readback.
+    /// Spec: Intel 82371AB / ACPI — PM1a EN/CNT sticky; PM_TMR free-running + loadable.
     #[test]
     fn piix_acpi_pm_store_readback_when_io_enabled() {
         let mut pci = PciConfig::new();
@@ -4341,31 +4853,44 @@ mod tests {
         assert!(pci.acpi_pm_owns_port(0xB03F));
         assert!(!pci.acpi_pm_owns_port(0xB040));
 
-        // PM1a_EVT (STS+EN), PM1a_CNT, PM_TMR.
+        // PM1_STS store/readback (hardware events also OR bits).
         pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2, 0x0101);
-        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2, 2, 0x0202);
-        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2, 0x0001);
-        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM_TMR), 4, 0x00AB_CDEF);
-
         assert_eq!(
             pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2) as u16,
             0x0101
         );
+        // EN keeps TMR|GBL|PWRBTN only.
+        pci.port_write(
+            0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2,
+            2,
+            u32::from(ACPI_PM1_EN_WRITABLE_MASK),
+        );
         assert_eq!(
             pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2, 2) as u16,
-            0x0202
+            ACPI_PM1_EN_WRITABLE_MASK
+        );
+        pci.port_write(
+            0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT),
+            2,
+            u32::from(ACPI_PM1_CNT_SCI_EN),
         );
         assert_eq!(
             pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2) as u16,
-            0x0001
+            ACPI_PM1_CNT_SCI_EN
         );
+        // PM_TMR accepts a load and is also advanced by tick.
+        pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM_TMR), 4, 0x00AB_CDEF);
         assert_eq!(
             pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM_TMR), 4),
             0x00AB_CDEF
         );
+        let before = pci.acpi_pm_timer();
+        pci.tick_acpi_pm(0x11);
+        assert_eq!(pci.acpi_pm_timer(), (before + 0x11) & ACPI_PM_TIMER_MASK);
 
         pci.reset();
         assert_eq!(pci.acpi_pm_io, [0; PCI_PIIX_ACPI_PM_IO_SIZE as usize]);
+        assert_eq!(pci.acpi_pm_timer(), 0);
         assert_eq!(pci.acpi_pm_io_base(), None);
     }
 
@@ -4386,10 +4911,11 @@ mod tests {
         );
         pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
         assert_eq!(pci.acpi_pm_io_base(), Some(0x4000));
-        pci.port_write(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2, 0x0005);
+        // SCI_EN | BM_RLD — both sticky; GBL_RLS/SLP_EN do not latch.
+        pci.port_write(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2, 0x0003);
         assert_eq!(
             pci.port_read(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2) as u16,
-            0x0005
+            0x0003
         );
 
         // Clear IO; BusMaster alone must not enable decode.
@@ -4407,7 +4933,7 @@ mod tests {
         pci.port_write(PCI_CONFIG_DATA, 2, u32::from(PCI_COMMAND_IO));
         assert_eq!(
             pci.port_read(0x4000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 2) as u16,
-            0x0005
+            0x0003
         );
     }
 
