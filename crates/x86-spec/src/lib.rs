@@ -1356,7 +1356,307 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "MOV CRn,r32",
     },
+    // Near `Jcc rel16/rel32` — Spec: Intel SDM Vol. 2 "Jcc—Jump if Condition
+    // Is Met" (opcode map 2 — `0F 80`+cc). The displacement follows the
+    // operand-size attribute, so `Encoding::Rel16` widens to rel32 under a
+    // 32-bit operand size exactly as the near `E8`/`E9` forms do.
+    jcc_near(0x80, "JO"),
+    jcc_near(0x81, "JNO"),
+    jcc_near(0x82, "JB"),
+    jcc_near(0x83, "JAE"),
+    jcc_near(0x84, "JE"),
+    jcc_near(0x85, "JNE"),
+    jcc_near(0x86, "JBE"),
+    jcc_near(0x87, "JA"),
+    jcc_near(0x88, "JS"),
+    jcc_near(0x89, "JNS"),
+    jcc_near(0x8A, "JP"),
+    jcc_near(0x8B, "JNP"),
+    jcc_near(0x8C, "JL"),
+    jcc_near(0x8D, "JGE"),
+    jcc_near(0x8E, "JLE"),
+    jcc_near(0x8F, "JG"),
+    // `SETcc r/m8` — Spec: Intel SDM Vol. 2 "SETcc—Set Byte on Condition"
+    // (opcode map 2 — `0F 90`+cc /r). Always an 8-bit destination; the
+    // operand-size attribute has no effect. ModR/M.reg is not used.
+    setcc(0x90, "SETO"),
+    setcc(0x91, "SETNO"),
+    setcc(0x92, "SETB"),
+    setcc(0x93, "SETAE"),
+    setcc(0x94, "SETE"),
+    setcc(0x95, "SETNE"),
+    setcc(0x96, "SETBE"),
+    setcc(0x97, "SETA"),
+    setcc(0x98, "SETS"),
+    setcc(0x99, "SETNS"),
+    setcc(0x9A, "SETP"),
+    setcc(0x9B, "SETNP"),
+    setcc(0x9C, "SETL"),
+    setcc(0x9D, "SETGE"),
+    setcc(0x9E, "SETLE"),
+    setcc(0x9F, "SETG"),
+    // `PUSH`/`POP FS`/`GS` — Spec: Intel SDM Vol. 2 "PUSH"/"POP" (opcode map 2
+    // — `0F A0`/`0F A1`/`0F A8`/`0F A9`). No ModR/M; the stack slot width
+    // follows the operand-size attribute.
+    InstrDef {
+        mnemonic: "PUSH_FS",
+        opcode: 0xA0,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH FS",
+    },
+    InstrDef {
+        mnemonic: "POP_FS",
+        opcode: 0xA1,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POP FS",
+    },
+    InstrDef {
+        mnemonic: "PUSH_GS",
+        opcode: 0xA8,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "PUSH GS",
+    },
+    InstrDef {
+        mnemonic: "POP_GS",
+        opcode: 0xA9,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "POP GS",
+    },
+    // `LSS`/`LFS`/`LGS r16/r32, m16:16/m16:32` — Spec: Intel SDM Vol. 2
+    // "LDS/LES/LFS/LGS/LSS—Load Far Pointer" (opcode map 2 — `0F B2`/`B4`/`B5`).
+    // Memory operand only; the register form is `#UD` at execute.
+    InstrDef {
+        mnemonic: "LSS",
+        opcode: 0xB2,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LSS",
+    },
+    InstrDef {
+        mnemonic: "LFS",
+        opcode: 0xB4,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LFS",
+    },
+    InstrDef {
+        mnemonic: "LGS",
+        opcode: 0xB5,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LGS",
+    },
+    // `MOVZX`/`MOVSX Gv, Eb|Ew` — Spec: Intel SDM Vol. 2 "MOVZX"/"MOVSX"
+    // (opcode map 2 — `0F B6`/`B7`/`BE`/`BF`). `width` records the *source*
+    // width, which the opcode fixes; the destination follows the operand-size
+    // attribute.
+    InstrDef {
+        mnemonic: "MOVZX",
+        opcode: 0xB6,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "MOVZX Gv,Eb",
+    },
+    InstrDef {
+        mnemonic: "MOVZX",
+        opcode: 0xB7,
+        encoding: Encoding::Modrm,
+        width: Width::W16,
+        sdm: "MOVZX Gv,Ew",
+    },
+    InstrDef {
+        mnemonic: "MOVSX",
+        opcode: 0xBE,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "MOVSX Gv,Eb",
+    },
+    InstrDef {
+        mnemonic: "MOVSX",
+        opcode: 0xBF,
+        encoding: Encoding::Modrm,
+        width: Width::W16,
+        sdm: "MOVSX Gv,Ew",
+    },
+    // Bit test/modify, register bit-offset forms — Spec: Intel SDM Vol. 2
+    // "BT"/"BTS"/"BTR"/"BTC" (opcode map 2 — `0F A3`/`AB`/`B3`/`BB`).
+    InstrDef {
+        mnemonic: "BT",
+        opcode: 0xA3,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BT r/m,r",
+    },
+    InstrDef {
+        mnemonic: "BTS",
+        opcode: 0xAB,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BTS r/m,r",
+    },
+    InstrDef {
+        mnemonic: "BTR",
+        opcode: 0xB3,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BTR r/m,r",
+    },
+    InstrDef {
+        mnemonic: "BTC",
+        opcode: 0xBB,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BTC r/m,r",
+    },
+    // Group 8: ModR/M.reg selects the bit operation and an imm8 supplies the
+    // bit offset. /4 BT, /5 BTS, /6 BTR, /7 BTC; /0–/3 are reserved (#UD).
+    // Spec: Intel SDM Vol. 2 opcode map 2 (`0F BA`), Group 8 table.
+    InstrDef {
+        mnemonic: "GRP8",
+        opcode: 0xBA,
+        encoding: Encoding::ModrmImm8,
+        width: Width::OsZ,
+        sdm: "BT/BTS/BTR/BTC r/m,imm8",
+    },
+    // Bit scans — Spec: Intel SDM Vol. 2 "BSF"/"BSR" (`0F BC`/`BD`).
+    InstrDef {
+        mnemonic: "BSF",
+        opcode: 0xBC,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BSF r,r/m",
+    },
+    InstrDef {
+        mnemonic: "BSR",
+        opcode: 0xBD,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "BSR r,r/m",
+    },
+    // Exchange-and-modify — Spec: Intel SDM Vol. 2 "CMPXCHG" (`0F B0`/`B1`)
+    // and "XADD" (`0F C0`/`C1`).
+    InstrDef {
+        mnemonic: "CMPXCHG",
+        opcode: 0xB0,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "CMPXCHG r/m8,r8",
+    },
+    InstrDef {
+        mnemonic: "CMPXCHG",
+        opcode: 0xB1,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "CMPXCHG r/m,r",
+    },
+    InstrDef {
+        mnemonic: "XADD",
+        opcode: 0xC0,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "XADD r/m8,r8",
+    },
+    InstrDef {
+        mnemonic: "XADD",
+        opcode: 0xC1,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "XADD r/m,r",
+    },
+    // Cache management and the reserved undefined opcode — Spec: Intel SDM
+    // Vol. 2 "INVD" (`0F 08`), "WBINVD" (`0F 09`), "UD2" (`0F 0B`).
+    InstrDef {
+        mnemonic: "INVD",
+        opcode: 0x08,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "INVD",
+    },
+    InstrDef {
+        mnemonic: "WBINVD",
+        opcode: 0x09,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "WBINVD",
+    },
+    InstrDef {
+        mnemonic: "UD2",
+        opcode: 0x0B,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "UD2",
+    },
+    // Model-specific registers and identification — Spec: Intel SDM Vol. 2
+    // "WRMSR" (`0F 30`), "RDMSR" (`0F 32`), "CPUID" (`0F A2`).
+    InstrDef {
+        mnemonic: "WRMSR",
+        opcode: 0x30,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "WRMSR",
+    },
+    InstrDef {
+        mnemonic: "RDMSR",
+        opcode: 0x32,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "RDMSR",
+    },
+    InstrDef {
+        mnemonic: "CPUID",
+        opcode: 0xA2,
+        encoding: Encoding::None,
+        width: Width::OsZ,
+        sdm: "CPUID",
+    },
+    // `BSWAP r32` — Spec: Intel SDM Vol. 2 "BSWAP" (`0F C8`+rd). The register
+    // is encoded in the low three opcode bits; there is no ModR/M byte.
+    bswap(0xC8),
+    bswap(0xC9),
+    bswap(0xCA),
+    bswap(0xCB),
+    bswap(0xCC),
+    bswap(0xCD),
+    bswap(0xCE),
+    bswap(0xCF),
 ];
+
+/// Two-byte `BSWAP r32` entry (`0F C8`+rd).
+const fn bswap(opcode: u8) -> InstrDef {
+    InstrDef {
+        mnemonic: "BSWAP",
+        opcode,
+        encoding: Encoding::OpcodeReg,
+        width: Width::OsZ,
+        sdm: "BSWAP r32",
+    }
+}
+
+/// Two-byte near `Jcc rel16/rel32` entry (`0F 80`+cc cw/cd).
+const fn jcc_near(opcode: u8, mnemonic: &'static str) -> InstrDef {
+    InstrDef {
+        mnemonic,
+        opcode,
+        encoding: Encoding::Rel16,
+        width: Width::OsZ,
+        sdm: "Jcc rel16/rel32",
+    }
+}
+
+/// Two-byte `SETcc r/m8` entry (`0F 90`+cc /r).
+const fn setcc(opcode: u8, mnemonic: &'static str) -> InstrDef {
+    InstrDef {
+        mnemonic,
+        opcode,
+        encoding: Encoding::Modrm,
+        width: Width::W8,
+        sdm: "SETcc r/m8",
+    }
+}
 
 pub fn lookup_0f(opcode: u8) -> Option<&'static InstrDef> {
     M1_0F_SUBSET.iter().find(|d| d.opcode == opcode)
@@ -1417,5 +1717,33 @@ mod tests {
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
         assert!(lookup_0f(0x20).is_some(), "missing 0F 20 MOV r32,CRn");
         assert!(lookup_0f(0x22).is_some(), "missing 0F 22 MOV CRn,r32");
+    }
+
+    /// Intel SDM Vol. 2 "Jcc" / "SETcc" (opcode map 2): the whole `0F 80`–`0F 8F`
+    /// and `0F 90`–`0F 9F` condition ranges are present with the documented
+    /// mnemonic order, rel16/rel32 vs byte-destination encodings.
+    #[test]
+    fn two_byte_condition_ranges_are_complete() {
+        const JCC: [&str; 16] = [
+            "JO", "JNO", "JB", "JAE", "JE", "JNE", "JBE", "JA", "JS", "JNS", "JP", "JNP", "JL",
+            "JGE", "JLE", "JG",
+        ];
+        const SETCC: [&str; 16] = [
+            "SETO", "SETNO", "SETB", "SETAE", "SETE", "SETNE", "SETBE", "SETA", "SETS", "SETNS",
+            "SETP", "SETNP", "SETL", "SETGE", "SETLE", "SETG",
+        ];
+        for cc in 0u8..16 {
+            let jcc =
+                lookup_0f(0x80 | cc).unwrap_or_else(|| panic!("missing 0F {:02X}", 0x80 | cc));
+            assert_eq!(jcc.mnemonic, JCC[cc as usize]);
+            assert_eq!(jcc.encoding, Encoding::Rel16);
+            assert_eq!(jcc.width, Width::OsZ);
+
+            let set =
+                lookup_0f(0x90 | cc).unwrap_or_else(|| panic!("missing 0F {:02X}", 0x90 | cc));
+            assert_eq!(set.mnemonic, SETCC[cc as usize]);
+            assert_eq!(set.encoding, Encoding::Modrm);
+            assert_eq!(set.width, Width::W8);
+        }
     }
 }
