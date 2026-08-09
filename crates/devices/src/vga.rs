@@ -83,8 +83,10 @@
 //! - Byte R/W over the `VGA_TEXT_BASE`…`VGA_TEXT_END` alphanumeric window;
 //!   reset fills the first 80×25 cells with space + attribute `0x07`
 //! - Helpers for tests (`char_at` / `attr_at` / `put_char`)
-//! - Character generator and text-mode display fetch
-//!   ([`VgaText::render_frame`] → [`VgaFrame`] of DAC indices)
+//! - Character generator and text-mode display fetch, the chain-4 256-color
+//!   fetch (mode 13h), and the planar 16-color fetch (modes
+//!   `0Dh`/`0Eh`/`10h`/`12h`) ([`VgaText::render_frame`] → [`VgaFrame`] of DAC
+//!   indices)
 //! - CRTC index/data: latch index / store/read register file on the IOAS-selected
 //!   map (`0x3D4`/`0x3D5` color or `0x3B4`/`0x3B5` mono; shared file); cursor
 //!   registers `0x0A`/`0x0B`/`0x0E`/`0x0F` have store/readback plus helpers for
@@ -173,10 +175,14 @@
 //!
 //! # Unsupported (explicit)
 //!
-//! - Shift Register Interleave and 256-Color Shift Mode have no effect
-//! - The display fetch covers the alphanumeric (character generator) path
-//!   only. Planar 16-color pixel serialization has no renderer; see
-//!   [`VgaText::render_mode`], which reports
+//! - Shift Register Interleave selects the CGA-compatible 4-color
+//!   serialization, which has no renderer; it is only read to *exclude* a
+//!   programming from the planar 16-color fetch
+//! - The display fetch covers exactly three programmings: alphanumeric (the
+//!   character generator), chain-4 256-color (mode 13h) and planar 16-color
+//!   (modes `0Dh`/`0Eh`/`10h`/`12h`; see
+//!   `docs/vga-r4-planar16-renderer.md`). CGA-compatible modes `04h`–`06h`,
+//!   unchained "mode X", and every VBE mode report
 //!   [`VgaRenderMode::Unsupported`] rather than guessing. There is no VBE, no
 //!   host display, and no timing-accurate raster
 //! - No font is installed at reset, so a freshly reset device renders no
@@ -194,7 +200,7 @@
 //!   (Protect write-gate + Max Scan store/readback only; no scanline counters)
 //! - Misc Output clock-select / polarity side effects (RAM Enable bit1 enforced
 //!   on CPU text-plane helpers)
-//! - Planar graphics, VBE, host canvas rendering, dirty tracking
+//! - VBE, host canvas rendering, dirty tracking
 //! - Font ROM / host rendering of the hardware cursor glyph from CRTC start/end
 //!   scanlines (register state + offset helpers only)
 
@@ -1247,11 +1253,49 @@ pub const VGA_MODE13_WIDTH: usize = 320;
 /// Displayed height of the chain-4 256-color graphics fetch, in rows.
 pub const VGA_MODE13_HEIGHT: usize = 200;
 
+/// Graphics Mode (`0x05`) bit5 — Shift Register Interleave Mode (`SRI`).
+///
+/// Spec: FreeVGA Graphics Mode Register — "This bit allows the bit 3 and 2 to
+/// be used to select the plane pair"; IBM PS/2 Video Subsystems Figure 2-72
+/// "Shift Register Interleave Mode". It selects the CGA-compatible 4-color
+/// serialization, which is **not** the planar 16-color path, so this model
+/// requires it clear before it will claim a planar frame.
+pub const VGA_GC_MODE_SHIFT_INTERLEAVE: u8 = 0x20;
+const _: () = assert!(
+    VGA_GC_MODE_SHIFT_INTERLEAVE == 0x20 && VGA_GC_MODE_SHIFT256 == 0x40,
+    "Graphics Mode bit5 is SRI and bit6 is C256"
+);
+
+/// CRTC Horizontal Display Enable End (`0x01`), in character clocks minus one.
+///
+/// Spec: FreeVGA CRT Controller "End Horizontal Display" — "This field
+/// determines the number of displayed characters per scan line", programmed
+/// with the count minus one.
+pub const VGA_CRTC_HORIZONTAL_DISPLAY_END: u8 = 0x01;
+/// CRTC Vertical Display Enable End (`0x12`) — low 8 bits of the count minus
+/// one; bits 8 and 9 live in Overflow (`0x07`).
+///
+/// Spec: FreeVGA CRT Controller "Vertical Display Enable End Register", with
+/// [`VGA_CRTC_OVERFLOW_VDE_BIT8`] and [`VGA_CRTC_OVERFLOW_VDE_BIT9`].
+pub const VGA_CRTC_VERTICAL_DISPLAY_END: u8 = 0x12;
+const _: () = assert!(
+    VGA_CRTC_HORIZONTAL_DISPLAY_END == 0x01
+        && VGA_CRTC_VERTICAL_DISPLAY_END == 0x12
+        && (VGA_CRTC_VERTICAL_DISPLAY_END as usize) < VGA_CRTC_REG_COUNT
+);
+
+/// Dots one display byte contributes to a planar 16-color scan line.
+///
+/// Spec: IBM PS/2 Video Subsystems chapter 2 "Graphics Controller" — the four
+/// maps are serialized one bit at a time, so byte *b* of each map supplies 8
+/// consecutive pixels, most significant bit leftmost.
+pub const VGA_PLANAR16_DOTS_PER_BYTE: usize = 8;
+
 /// Display mode the renderer can currently produce.
 ///
-/// This model renders exactly two programmings and says so; it is not general
-/// VGA mode coverage. In particular there is **no** planar 16-color renderer
-/// (modes 0Dh/0Eh/10h/12h) and no VBE.
+/// This model renders exactly three programmings and says so; it is not
+/// general VGA mode coverage. In particular there is no CGA-compatible fetch,
+/// no unchained 256-color ("mode X") fetch, and no VBE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VgaRenderMode {
     /// Alphanumeric (character generator) fetch: codes from map 0, attributes
@@ -1260,6 +1304,11 @@ pub enum VgaRenderMode {
     /// Chain-4 256-color linear graphics — the mode-13h programming. Each
     /// display byte is one pixel and goes to the DAC through the PEL Mask.
     Graphics256Chain4,
+    /// Planar 16-color graphics — the BIOS mode `0Dh` / `0Eh` / `10h` / `12h`
+    /// programming. One bit position across maps 0–3 forms a 4-bit index that
+    /// goes to the DAC through Color Plane Enable, the ATC Internal Palette,
+    /// Color Select and the PEL Mask.
+    Graphics16Planar,
     /// Programming the renderer does not model. No frame is produced.
     Unsupported,
 }
@@ -2715,16 +2764,108 @@ impl VgaText {
             && self.gc_shift256()
     }
 
+    /// True when Graphics Mode Shift Register Interleave (`SRI`) is set.
+    ///
+    /// Spec: FreeVGA Graphics Mode Register; IBM Figure 2-72.
+    pub fn gc_shift_interleave(&self) -> bool {
+        self.gc_regs[usize::from(VGA_GC_MODE)] & VGA_GC_MODE_SHIFT_INTERLEAVE != 0
+    }
+
+    /// Color Plane Enable (ATC `0x12`) bits 3:0.
+    ///
+    /// Spec: FreeVGA Attribute Controller "Color Plane Enable Register" —
+    /// "Setting a bit to 0 will force the corresponding color plane to 0",
+    /// applied to the 4-bit index before the Internal Palette. The reset
+    /// default [`VGA_ATC_COLOR_PLANE_ENABLE_DEFAULT`] enables all four.
+    pub fn atc_color_plane_enable(&self) -> u8 {
+        self.atc_regs[usize::from(VGA_ATC_COLOR_PLANE_ENABLE)] & 0x0F
+    }
+
+    /// Displayed character clocks per scan line, from CRTC `0x01`.
+    ///
+    /// Spec: FreeVGA CRT Controller "End Horizontal Display" — the register
+    /// holds the count minus one.
+    pub fn crtc_horizontal_display_end(&self) -> u8 {
+        self.crtc_regs[usize::from(VGA_CRTC_HORIZONTAL_DISPLAY_END)]
+    }
+
+    /// 10-bit Vertical Display Enable End (CRTC `0x12` plus Overflow bits).
+    ///
+    /// Spec: FreeVGA CRT Controller "Vertical Display Enable End Register" and
+    /// the Overflow Register, which carries bits 8 and 9. The value is the
+    /// displayed scan-line count minus one.
+    pub fn crtc_vertical_display_end(&self) -> u16 {
+        let overflow = self.crtc_regs[usize::from(VGA_CRTC_OVERFLOW)];
+        let mut value = u16::from(self.crtc_regs[usize::from(VGA_CRTC_VERTICAL_DISPLAY_END)]);
+        if overflow & VGA_CRTC_OVERFLOW_VDE_BIT8 != 0 {
+            value |= 1 << 8;
+        }
+        if overflow & VGA_CRTC_OVERFLOW_VDE_BIT9 != 0 {
+            value |= 1 << 9;
+        }
+        value
+    }
+
+    /// True when Maximum Scan Line bit7 selects Scan Doubling.
+    ///
+    /// Spec: FreeVGA CRT Controller Maximum Scan Line Register `SD` — "When
+    /// this bit is set to 1, 200-scan-line video data is converted to
+    /// 400-scan-line output."
+    pub fn crtc_scan_doubling(&self) -> bool {
+        self.crtc_regs[usize::from(VGA_CRTC_MAX_SCAN_LINE)] & VGA_CRTC_MAX_SCAN_DOUBLING != 0
+    }
+
+    /// Scan lines the CRTC spends on one row of display memory.
+    ///
+    /// Spec: FreeVGA Maximum Scan Line — bits 4:0 hold the scan lines per row
+    /// minus one (the same field [`Self::text_cell_height`] reads as a
+    /// character height), and bit 7 Scan Doubling repeats each one.
+    pub fn crtc_scan_lines_per_row(&self) -> usize {
+        self.text_cell_height() * if self.crtc_scan_doubling() { 2 } else { 1 }
+    }
+
+    /// True when the register file carries the planar 16-color signature.
+    ///
+    /// This is the programming BIOS modes `0Dh`, `0Eh`, `10h` and `12h` share.
+    /// All seven conditions must hold, because each one that does not names a
+    /// *different* fetch this model does not implement:
+    ///
+    /// | Register | Field | Required | Excludes |
+    /// |---|---|---|---|
+    /// | GC Miscellaneous `06h` bit0 | Graphics/Alphanumeric | set | alphanumeric |
+    /// | ATC Mode Control `10h` bit0 | `ATGE` | set | alphanumeric |
+    /// | ATC Mode Control `10h` bit6 | `8BIT` | clear | mode 13h and "mode X" |
+    /// | GC Mode `05h` bit6 | `C256` | clear | mode 13h and "mode X" |
+    /// | GC Mode `05h` bit5 | `SRI` | clear | CGA 4-color modes `04h`/`05h` |
+    /// | Sequencer Memory Mode `04h` bit3 | Chain 4 | clear | mode 13h |
+    /// | GC Miscellaneous `06h` bit1 | Chain Odd/Even | clear | CGA modes `04h`–`06h` |
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-72 (Graphics Mode), Figure 2-74
+    /// (Miscellaneous), Figure 2-34 (Map Selection / Chain 4), Figure 2-79
+    /// (Attribute Mode Control); FreeVGA for the same registers.
+    pub fn is_planar16_programming(&self) -> bool {
+        self.gc_graphics_mode()
+            && self.atc_graphics_enabled()
+            && !self.atc_8bit_color()
+            && !self.gc_shift256()
+            && !self.gc_shift_interleave()
+            && !self.seq_chain4_enabled()
+            && !self.gc_chain_odd_even()
+    }
+
     /// Display fetch this model can produce with the current programming.
     ///
-    /// Two fetches exist: the alphanumeric character generator and the
-    /// chain-4 256-color linear fetch. Every other graphics programming —
-    /// planar 16-color modes included — reports
-    /// [`VgaRenderMode::Unsupported`] rather than rendering something that is
-    /// not what the hardware would show.
+    /// Three fetches exist: the alphanumeric character generator, the chain-4
+    /// 256-color linear fetch, and the planar 16-color fetch. Every other
+    /// graphics programming — CGA-compatible modes and unchained "mode X"
+    /// included — reports [`VgaRenderMode::Unsupported`] rather than rendering
+    /// something that is not what the hardware would show.
     pub fn render_mode(&self) -> VgaRenderMode {
         if self.is_mode13h_programming() {
             return VgaRenderMode::Graphics256Chain4;
+        }
+        if self.is_planar16_programming() {
+            return VgaRenderMode::Graphics16Planar;
         }
         if self.gc_graphics_mode() || self.atc_graphics_enabled() {
             return VgaRenderMode::Unsupported;
@@ -2742,6 +2883,7 @@ impl VgaText {
         match self.render_mode() {
             VgaRenderMode::Text => Some(self.render_text_frame(blink_off_half)),
             VgaRenderMode::Graphics256Chain4 => Some(self.render_graphics256_frame()),
+            VgaRenderMode::Graphics16Planar => Some(self.render_graphics16_frame()),
             VgaRenderMode::Unsupported => None,
         }
     }
@@ -2899,6 +3041,99 @@ impl VgaText {
             height,
             pixels,
             mode: VgaRenderMode::Graphics256Chain4,
+        }
+    }
+
+    /// Frame geometry of the planar 16-color fetch, in pixels.
+    ///
+    /// **Unlike the text and mode-13h frames, this one is derived from
+    /// registers rather than fixed.** No single fixed size can serve `0Dh`
+    /// (320×200), `0Eh` (640×200), `10h` (640×350) and `12h` (640×480), so the
+    /// geometry comes from the CRTC display-end registers:
+    ///
+    /// - width = `(End Horizontal Display + 1) * 8` dots. Spec: FreeVGA CRT
+    ///   Controller "End Horizontal Display" — the displayed character count
+    ///   minus one, at 8 dots per character clock in a graphics mode.
+    /// - height = displayed scan lines / [`Self::crtc_scan_lines_per_row`],
+    ///   where the scan-line count is `Vertical Display Enable End + 1` across
+    ///   CRTC `0x12` and the two Overflow bits. Spec: FreeVGA "Vertical Display
+    ///   Enable End Register" and Maximum Scan Line `SD`.
+    ///
+    /// Those two registers are read here purely as **geometry**; this model
+    /// still has no CRTC timing, no raster, and no pixel clock, so nothing else
+    /// about them is honored. A CRTC that has not been programmed yields a
+    /// degenerate 8×1 frame — the model does not invent a default resolution.
+    pub fn graphics16_frame_size(&self) -> (usize, usize) {
+        let width =
+            (usize::from(self.crtc_horizontal_display_end()) + 1) * VGA_PLANAR16_DOTS_PER_BYTE;
+        let scan_lines = usize::from(self.crtc_vertical_display_end()) + 1;
+        let height = (scan_lines / self.crtc_scan_lines_per_row()).max(1);
+        (width, height)
+    }
+
+    /// DAC index of one planar 16-color pixel.
+    ///
+    /// `byte_offset` is the display byte address shared by all four maps, and
+    /// `bit` is the dot within that byte, `0` leftmost.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems chapter 2 — the four maps are serialized
+    /// in parallel, so one bit position across maps 0–3 forms a 4-bit index
+    /// with map 0 supplying bit 0 and map 3 supplying bit 3, most significant
+    /// bit of each byte leftmost on screen. Spec: FreeVGA Attribute Controller
+    /// — Color Plane Enable forces disabled planes to zero, then the Internal
+    /// Palette, Mode Control `P54S` and Color Select compose the DAC index
+    /// ([`Self::atc_palette_dac_index`]) and the PEL Mask is applied
+    /// ([`Self::display_dac_index`]).
+    pub fn graphics16_pixel_dac_index(&self, byte_offset: usize, bit: usize) -> u8 {
+        let offset = byte_offset % self.plane_size_bytes();
+        let mask = 0x80u8 >> (bit % VGA_PLANAR16_DOTS_PER_BYTE);
+        let mut index = 0u8;
+        for plane in 0..VGA_PLANE_COUNT {
+            if self.planes[plane * VGA_PLANE_SIZE + offset] & mask != 0 {
+                index |= 1 << plane;
+            }
+        }
+        index &= self.atc_color_plane_enable();
+        self.display_dac_index(self.atc_palette_dac_index(index))
+    }
+
+    /// Render the planar 16-color display (BIOS modes `0Dh`/`0Eh`/`10h`/`12h`).
+    ///
+    /// Row *r* starts at CRTC address counter `StartAddress + r * Offset * 2`,
+    /// which the addressing multiplier turns into a display byte address
+    /// ([`Self::graphics_row_stride_bytes`]); pixel *x* of that row is bit
+    /// `x % 8` of byte `x / 8` along, taken across all four maps.
+    ///
+    /// Spec: FreeVGA CRT Controller Start Address and Offset; IBM PS/2 Video
+    /// Subsystems chapter 2 for the four-map serialization.
+    ///
+    /// **Model choices:** one output row per row of display memory, so Scan
+    /// Doubling and a non-zero Maximum Scan Line shrink the frame instead of
+    /// repeating rows (the same choice mode 13h makes); Horizontal PEL Panning,
+    /// Line Compare / split screen, Preset Row Scan, Screen Disable and the
+    /// overscan border are not applied; the word-mode Address Wrap rotation is
+    /// not modeled.
+    pub fn render_graphics16_frame(&self) -> VgaFrame {
+        let (width, height) = self.graphics16_frame_size();
+        let mut pixels = vec![0u8; width * height];
+        let start_byte = usize::from(self.text_start_address()) * self.crtc_address_multiplier();
+        let stride = self.graphics_row_stride_bytes();
+
+        for row in 0..height {
+            let row_byte = start_byte + row * stride;
+            for x in 0..width {
+                pixels[row * width + x] = self.graphics16_pixel_dac_index(
+                    row_byte + x / VGA_PLANAR16_DOTS_PER_BYTE,
+                    x % VGA_PLANAR16_DOTS_PER_BYTE,
+                );
+            }
+        }
+
+        VgaFrame {
+            width,
+            height,
+            pixels,
+            mode: VgaRenderMode::Graphics16Planar,
         }
     }
 
