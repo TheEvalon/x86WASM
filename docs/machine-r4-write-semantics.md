@@ -3,20 +3,26 @@
 What an i440FX/PIIX PC does with a memory write that nothing accepts, and why
 this model stopped raising `#GP` for one third of that set.
 
-## The measured defect
+## Read this first: the POST storm was a CPU bug, not this
 
-Round 3 left SeaBIOS POST spinning. From trace event 315 onward the run
-alternated 1:1 between `mem-fault wr addr=0xFFFF6E06` and `OUT 0x20, 0x20`
-(master PIC EOI), **37,060 times**, consuming the rest of a 2,000,000-step
-budget. `0xFFFF6E06` is `CS.base = 0xFFFF0000` plus `0x6E06` — a store into the
-top-of-4 GiB BIOS alias while firmware still executed from it.
+Round 3 recorded SeaBIOS POST spinning in a write-to-ROM `#GP` storm at
+`0xFFFF6E06` and named it the top blocker. **That storm was caused by
+`x86-interpreter`, not by the memory model.** Under `CS.D = 1` the `MOV`
+absolute-offset forms sized their offset from the presence of a `67H` prefix
+instead of from the effective address-size attribute, so a 32-bit POST store
+truncated to its low word and landed at `CS.base + offset16` — inside the ROM
+window. Intel SDM Vol. 2 "MOV": the address-size attribute of the instruction
+determines the size of the offset. See `docs/machine-r4-fseg-sweep.md` for the
+independent evidence chain that reached the same one-line defect from the
+`0xF0000000` sweep, and reverting that single line puts the storm back.
 
-The path was: `PhysMem::write_u8` returned `MemError::RomWrite`, `MachineBus`
-turned that into `ExecError::MemoryFault`, the interpreter classified it as
-`#GP` (vector 13), SeaBIOS's handler EOI'd and returned, and the same store
-retried forever.
+With the offset computed correctly, the store never targets ROM at all: a full
+run produces **zero** dropped-ROM-write events.
 
-The fault was the bug.
+So this slice is **not** a POST unblocker and must not be justified as one. It
+is kept because the model was internally inconsistent and the inconsistent half
+had no specification behind it — the argument below stands entirely on the
+specs, with no reference to what SeaBIOS does.
 
 ## What the specifications say
 
@@ -123,16 +129,26 @@ New: `mem::tests::every_dropped_write_case_completes_and_they_are_distinguishabl
 drives all three cases plus an accepted write in one place, which is the
 property this slice is actually about.
 
-## Measured effect on SeaBIOS POST
+## Measured effect, stated honestly
 
-Before (round 3 tip, `--post-trace`): 74,435 platform events, ending in 37,060
-`mem-fault` / `OUT 0x20,0x20` pairs.
+Two separate measurements, because they say different things.
 
-After: **319 platform events total**, of which the `0xFFFF6E06` store appears
-exactly once, as four `rom-write … dropped` byte events (one 32-bit store), and
-firmware continues. The `--post-probe` output is unchanged only because a
-second, unrelated blocker consumes the budget — see
-`docs/machine-r4-fseg-sweep.md`.
+**With the CPU defect still present**, this change collapses the storm: the
+traced run goes from 74,435 platform events ending in 37,060
+`mem-fault` / `OUT 0x20,0x20` pairs, to **319 events total**, with the
+`0xFFFF6E06` store appearing once as four `rom-write … dropped` byte events.
+That is real, and it is **symptom suppression, not a cure** — the store is
+still going to the wrong address, it just no longer traps. Reporting it as
+progress would have hidden a CPU bug behind a memory-model change, which is
+precisely what happened in round 3's write-up and is corrected here.
+
+**With the CPU defect fixed**, this change is invisible to SeaBIOS: the run
+produces no dropped-ROM-write events at all, because firmware never writes to
+the ROM window. The `--post-probe` output is identical with and without this
+slice.
+
+The right reading: this slice buys **model consistency and one diagnostic**, and
+zero POST progress.
 
 ## Not supported
 

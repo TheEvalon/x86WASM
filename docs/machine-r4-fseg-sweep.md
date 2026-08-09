@@ -130,6 +130,23 @@ a 64 KiB test BIOS that enters a flat `CS.D=1` ring-0 segment and runs
 `address_size_override_selects_moffs16_in_a_32_bit_code_segment` passes now and
 guards against a fix that merely inverts the condition.
 
+## The same defect explains the `0xFFFF6E06` `#GP` storm
+
+A sibling agent reached this identical one-line defect from the other end — the
+write-to-ROM storm round 3 named as the top POST blocker — and confirmed
+attribution by reverting just that line and watching the probe go straight back
+to 2,000,000 steps and the storm. Both symptoms are the same cause: a 32-bit
+store whose absolute offset truncated to its low word. In the f-segment case
+the truncated load returned zero and the guest dereferenced NULL; in the
+`0xFFFF6E06` case the truncated **store** landed at `CS.base + offset16`, inside
+the top-of-4 GiB ROM window, and the model faulted on it.
+
+Two independent evidence chains converging on one line is the strongest
+attribution available here. It also means the round-3 write-up's framing — "the
+suspect is the fault itself" — was wrong about the cause even though it was
+right that the fault semantics were inconsistent; see
+`docs/machine-r4-write-semantics.md`.
+
 ## Measured effect of the one-line fix (applied locally, not committed)
 
 With slice 1 plus that one line:
