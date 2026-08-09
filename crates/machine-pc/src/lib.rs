@@ -41,8 +41,8 @@ pub use post_spin::{
 };
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use step_clock::{
-    StepClock, StepTicks, CMOS_PERIODIC_HZ, DEFAULT_PIT_CLOCKS_PER_STEP,
-    PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
+    StepClock, StepTicks, ACPI_PM_CLOCKS_PER_PIT_CLOCK, ACPI_PM_TMR_MASK, CMOS_PERIODIC_HZ,
+    DEFAULT_PIT_CLOCKS_PER_STEP, PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
 };
 
 use devices::{
@@ -52,7 +52,8 @@ use devices::{
     E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED,
     FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD, PIC_MASTER_CMD,
     PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA,
-    PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PCI_PIIX_ACPI_PM_TMR, PORT_SYSTEM_CONTROL,
+    PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -348,9 +349,11 @@ impl Machine {
 
     /// Charge one retired instruction to the time source.
     ///
-    /// Spec: Intel 8254 (CLK-driven counter) and Motorola MC146818A (periodic
-    /// quantum + one-second update cycle), driven from the retired-instruction
-    /// count rather than host wall clock so a run is reproducible.
+    /// Spec: Intel 8254 (CLK-driven counter), Motorola MC146818A (periodic
+    /// quantum + one-second update cycle), and Intel 82371AB ACPI `PM_TMR`
+    /// (24-bit free-running counter at 3.579545 MHz), all driven from the
+    /// retired-instruction count rather than host wall clock so a run is
+    /// reproducible.
     fn advance_step_clock(&mut self) {
         let ticks = self.step_clock.charge_step();
         if ticks.is_empty() {
@@ -358,6 +361,8 @@ impl Machine {
         }
         if ticks.pit_clocks > 0 {
             self.tick_pit(ticks.pit_clocks);
+            // Spec: Intel 82371AB — PM_TMR runs at 3.579545 MHz = 3 × PIT CLK.
+            self.advance_acpi_pm_tmr(ticks.pit_clocks.saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK));
         }
         if ticks.cmos_periods > 0 {
             self.tick_cmos(ticks.cmos_periods);
@@ -365,6 +370,26 @@ impl Machine {
         for _ in 0..ticks.cmos_seconds {
             self.tick_cmos_second();
         }
+    }
+
+    /// Advance the PIIX ACPI power-management timer (PMBASE+`08h`).
+    ///
+    /// Spec: Intel 82371AB / ACPI — `PM_TMR` is a 24-bit free-running counter;
+    /// reads return bits 23:0. The PCI I/O stub only store/readbacks the
+    /// dword; the machine layer owns the freerun so SeaBIOS delays complete.
+    fn advance_acpi_pm_tmr(&mut self, ticks: u64) {
+        if ticks == 0 {
+            return;
+        }
+        let off = PCI_PIIX_ACPI_PM_TMR as usize;
+        let cur = u32::from_le_bytes([
+            self.pci.acpi_pm_io[off],
+            self.pci.acpi_pm_io[off + 1],
+            self.pci.acpi_pm_io[off + 2],
+            self.pci.acpi_pm_io[off + 3],
+        ]);
+        let next = cur.wrapping_add(ticks as u32) & ACPI_PM_TMR_MASK;
+        self.pci.acpi_pm_io[off..off + 4].copy_from_slice(&next.to_le_bytes());
     }
 
     /// Attach a raw 1.44MB floppy image to [`Self::fdc`].
