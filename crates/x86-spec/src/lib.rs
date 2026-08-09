@@ -1345,6 +1345,16 @@ pub const M1_SUBSET: &[InstrDef] = &[
 /// Two-byte opcode map entries (primary escape `0F`).
 /// Spec: Intel SDM Vol. 2 Chapter 2; opcode map 2.
 pub const M1_0F_SUBSET: &[InstrDef] = &[
+    // Group 6: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 00).
+    // Implemented: /1 STR, /3 LTR (32-bit available TSS). Unsupported here:
+    // /0 SLDT, /2 LLDT, /4 VERR, /5 VERW, and 16-bit TSS forms.
+    InstrDef {
+        mnemonic: "GRP6",
+        opcode: 0x00,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "STR/LTR",
+    },
     // Group 7: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 01).
     // Implemented: /0 SGDT, /1 SIDT, /2 LGDT, /3 LIDT, /4 SMSW, /6 LMSW,
     // /7 INVLPG (real-mode NOP; mod=11 #UD). /5 extensions unsupported.
@@ -1809,6 +1819,10 @@ mod tests {
         ] {
             assert!(lookup_primary(op).is_some(), "missing {op:#x}");
         }
+        assert!(
+            lookup_0f(0x00).is_some(),
+            "missing 0F 00 GRP6 STR/LTR"
+        );
         assert!(
             lookup_0f(0x01).is_some(),
             "missing 0F 01 GRP7 SGDT/SIDT/LGDT/LIDT"

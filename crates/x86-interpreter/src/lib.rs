@@ -138,6 +138,15 @@ pub trait Bus {
     fn read_system_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
         self.read_u8(addr)
     }
+
+    /// Write one byte of a GDT, LDT, IDT or TSS entry (supervisor access).
+    ///
+    /// Used when the processor itself updates a system descriptor — for
+    /// example marking a TSS busy on `LTR` (SDM Vol. 3 §§4.6.1, 7.2.2).
+    /// Default: an ordinary write.
+    fn write_system_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        self.write_u8(addr, val)
+    }
 }
 
 /// The interpreter's memory path with 32-bit paging in it.
@@ -525,6 +534,12 @@ impl Bus for PagedBus<'_> {
         let access = Self::system_access(AccessKind::Read);
         let phys = self.translate(addr, access)?;
         self.inner.read_u8(phys)
+    }
+
+    fn write_system_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        let access = Self::system_access(AccessKind::Write);
+        let phys = self.translate(addr, access)?;
+        self.inner.write_u8(phys, val)
     }
 
     fn commit_string_iteration(&mut self, cpu: &CpuState) {
@@ -4250,6 +4265,79 @@ fn real_mode_ud(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> 
     real_mode_exception(cpu, bus, 6)
 }
 
+/// Minimum inclusive limit of a 32-bit TSS (SDM Vol. 3 §7.2.1).
+const TSS32_MIN_LIMIT: u32 = 0x67;
+/// System-descriptor type: available 32-bit TSS (SDM Vol. 3 Table 3-2).
+const DESC_TYPE_TSS32_AVAILABLE: u8 = 0x9;
+/// System-descriptor type: busy 32-bit TSS (SDM Vol. 3 Table 3-2).
+const DESC_TYPE_TSS32_BUSY: u8 = 0xB;
+
+/// `LTR r/m16` — load TR from a present available 32-bit TSS descriptor.
+///
+/// Validates CPL, null/TI, type (`0x9`), present, and the §7.2.1 minimum limit,
+/// then marks the GDT descriptor busy (`0xB`) and caches base/limit/AR in TR.
+/// No task switch is performed.
+/// Spec: Intel SDM Vol. 2 "LTR"; Vol. 3 §§7.2–7.3.
+/// Unsupported here: 16-bit TSS (`type=1`), LDT-resident descriptors, hardware
+/// task switches.
+fn exec_ltr(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        // Real-address / virtual-8086 mode: invalid opcode.
+        return Err(arch_fault(6));
+    }
+    require_cpl0(cpu)?;
+    let selector = read_rm_u16(cpu, bus, insn)?;
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    if selector & 0x4 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Err(selector_fault(13, selector));
+    }
+    let addr = cpu.gdtr.base.wrapping_add(offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+
+    let access = descriptor[5];
+    let system = access & 0x10 == 0;
+    let type_field = access & 0x0F;
+    if !system || type_field != DESC_TYPE_TSS32_AVAILABLE {
+        return Err(selector_fault(13, selector));
+    }
+    if access & 0x80 == 0 {
+        return Err(selector_fault(11, selector));
+    }
+
+    let parsed = parse_segment_descriptor(descriptor);
+    if parsed.limit < TSS32_MIN_LIMIT {
+        return Err(selector_fault(13, selector));
+    }
+
+    // Mark busy in the GDT before committing TR (SDM Vol. 3 §7.2.2 / §7.3).
+    let busy_access = (access & 0xF0) | DESC_TYPE_TSS32_BUSY;
+    bus.write_system_u8(addr.wrapping_add(5), busy_access)
+        .map_err(|error| classify_mem_fault(error, false))?;
+
+    cpu.tr.load_descriptor_cache(selector, parsed.base, parsed.limit, {
+        let mut flags = parsed.flags;
+        flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
+        flags
+    });
+    Ok(())
+}
+
 /// Load/store GDTR/IDTR pseudo-descriptor `m16&32` (limit16 + base32).
 /// Spec: Intel SDM Vol. 2 "LGDT/SGDT" / "LIDT/SIDT"; Vol. 3 §2.4.1 / §2.4.3.
 ///
@@ -4314,6 +4402,29 @@ fn step_two_byte(
             note_control_register_write(cpu, bus, 0);
             set_current_ip(cpu, next_ip);
             Ok(())
+        }
+        0x00 => {
+            // Group 6 — Spec: Intel SDM Vol. 2 opcode map 2; "STR"/"LTR";
+            // Vol. 3 §§7.2–7.3. Unsupported here: SLDT/LLDT/VERR/VERW,
+            // 16-bit TSS descriptors, and any hardware task switch.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0x00))?;
+            match m.reg {
+                1 => {
+                    // STR r/m16 — store the visible TR selector. No privilege
+                    // check; valid in real-address mode as well (stores the
+                    // cached selector). Spec: SDM Vol. 2 "STR".
+                    write_rm_u16(cpu, bus, insn, cpu.tr.selector)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
+                3 => {
+                    // LTR r/m16 — load TR from a 32-bit available TSS.
+                    exec_ltr(cpu, bus, insn)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
+                _ => Err(ExecError::Unsupported(0x00)),
+            }
         }
         0x01 => {
             // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2;
