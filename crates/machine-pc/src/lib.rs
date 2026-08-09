@@ -14,6 +14,7 @@ mod mem;
 mod ports;
 mod post_code;
 mod post_probe;
+mod post_trace;
 mod step_clock;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
@@ -30,8 +31,10 @@ pub use ports::{
 pub use post_code::{PostCodePort, POST_CODE_HISTORY_LIMIT, POST_DIAG_PORT};
 pub use post_probe::{
     seabios_image_path, OpcodeSite, PostFailure, PostFailureKind, PostReport, PostStopReason,
-    DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV, SEABIOS_IMAGE_RELATIVE,
+    TracedPostReport, DEFAULT_POST_PROBE_STEPS, POST_OPCODE_WINDOW_LEN, SEABIOS_IMAGE_ENV,
+    SEABIOS_IMAGE_RELATIVE,
 };
+pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use step_clock::{
     StepClock, StepTicks, CMOS_PERIODIC_HZ, DEFAULT_PIT_CLOCKS_PER_STEP,
     PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
@@ -115,6 +118,13 @@ pub struct Machine {
     /// Instruction-count time source for the PIT / RTC (disabled by default).
     step_clock: StepClock,
     ports: PortBus,
+    /// 512-byte sectors of the image attached through [`Machine::attach_ide_image`].
+    ///
+    /// `IdePrimary` keeps the backing image private and exposes no capacity, so
+    /// the machine remembers what it handed over. That is what the CMOS
+    /// fixed-disk geometry is derived from; attaching straight to
+    /// [`Machine::ide`] bypasses it and leaves CMOS describing no disk.
+    ide_disk_sectors: Option<u64>,
 }
 
 impl Machine {
@@ -140,6 +150,7 @@ impl Machine {
             post_diag: PostCodePort::new(),
             step_clock: StepClock::disabled(),
             ports: PortBus::new(),
+            ide_disk_sectors: None,
         };
         machine.sync_firmware_configuration();
         machine
@@ -216,12 +227,82 @@ impl Machine {
     /// (attaching floppy media). Not called from [`Self::reset`]: the CMOS
     /// configuration bytes are battery backed and survive it, and re-deriving
     /// them would discard whatever POST wrote.
+    /// Cylinders / heads / sectors-per-track for the attached IDE image, or
+    /// `None` when nothing was attached through [`Self::attach_ide_image`].
+    ///
+    /// Spec: the heads and sectors-per-track match the obsolete CHS words the
+    /// IDE device already reports in IDENTIFY (word 3 = 16 heads, word 6 = 63
+    /// sectors), so a guest cannot read two different geometries for one disk.
+    /// Cylinders are the image's sector count divided by one cylinder's worth,
+    /// rounded down but never below one — a disk smaller than a cylinder is
+    /// still a disk, and zero cylinders would describe no storage at all.
+    ///
+    /// This is the physical geometry the CMOS parameter block describes, not an
+    /// INT 13h-translated one: nothing in this machine performs BIOS CHS
+    /// translation yet, so no 1024-cylinder cap is applied. The CMOS field is a
+    /// 16-bit pair, so an image larger than 65535 cylinders (about 31 GiB at
+    /// this geometry) saturates rather than wrapping.
+    pub fn ide_chs_geometry(&self) -> Option<(u16, u8, u8)> {
+        const HEADS: u64 = 16;
+        const SECTORS_PER_TRACK: u64 = 63;
+        let sectors = self.ide_disk_sectors?;
+        let cylinders = (sectors / (HEADS * SECTORS_PER_TRACK)).clamp(1, u64::from(u16::MAX));
+        Some((cylinders as u16, HEADS as u8, SECTORS_PER_TRACK as u8))
+    }
+
+    /// The `2Dh` configuration-options byte this machine can honestly claim.
+    ///
+    /// Spec: RBIL CMOS `2Dh` Table C0032 — bit 5 is the boot order, `0` = drive
+    /// C: then A:, `1` = drive A: then C:. Only that bit is set: there is no
+    /// Weitek coprocessor (bit 7), no cache (bits 3-2), no turbo switch (bit 0),
+    /// and no boot-speed control (bit 4), and floppy seek at boot (bit 6) is a
+    /// POST behavior no firmware here performs.
+    ///
+    /// The order follows the media: with a floppy attached and no fixed disk,
+    /// A: is the only bootable device. This byte is inert — nothing in this
+    /// machine reads it, and SeaBIOS does not either (it takes its boot order
+    /// from fw_cfg). It is filled in because it is inside the checksum range
+    /// and an AMI-style POST would read it.
+    pub fn boot_options_byte(&self) -> u8 {
+        let floppy_only = self.fdc.has_media() && self.ide_disk_sectors.is_none();
+        if floppy_only {
+            CmosRtc::BOOT_OPTION_FLOPPY_FIRST
+        } else {
+            0
+        }
+    }
+
     pub fn sync_firmware_configuration(&mut self) {
         let ram = self.mem.ram_len() as u64;
         self.cmos.set_memory_size(ram);
         self.cmos.set_equipment_byte(self.equipment_byte());
-        // Both `14h` and the memory-size pairs are inside `10h`-`2Dh`, so the
-        // checksum is stored last. Spec: RBIL CMOS `2Fh`.
+        // Spec: RBIL CMOS `10h` Table C0007/C0008 — this machine's FDC is a
+        // 1.44 MB drive, counted only when media is attached, for the same
+        // reason the equipment byte counts it only then.
+        let floppy = if self.fdc.has_media() {
+            CmosRtc::FLOPPY_TYPE_1440K
+        } else {
+            CmosRtc::FLOPPY_TYPE_NONE
+        };
+        self.cmos
+            .set_floppy_drive_types(floppy, CmosRtc::FLOPPY_TYPE_NONE);
+        // Spec: RBIL CMOS `12h` Table C0014 / `19h` Table C0020 / `1Bh`-`23h` —
+        // drive 0 is the primary master. Drive 1 stays absent: `12h` describes
+        // the two drives of one fixed-disk controller, and this machine has no
+        // primary-slave model — its second IDE image lives on the secondary
+        // channel, which this byte does not describe.
+        match self.ide_chs_geometry() {
+            Some((cylinders, heads, sectors)) => {
+                self.cmos
+                    .set_hard_disk_user_geometry(0, cylinders, heads, sectors);
+            }
+            None => self.cmos.set_hard_disk_absent(0),
+        }
+        self.cmos.set_hard_disk_absent(1);
+        self.cmos.set_boot_options(self.boot_options_byte());
+        // `14h`, `10h`, `12h`, `19h`-`2Ch`, `2Dh`, and the memory-size pairs are
+        // all inside `10h`-`2Dh`, so the checksum is stored last.
+        // Spec: RBIL CMOS `2Fh`.
         self.cmos.store_standard_checksum();
         self.fw_cfg.set_ram_size(ram);
         let entries = self.e820_entries();
@@ -283,6 +364,16 @@ impl Machine {
         let mut m = Self::new(ram_size);
         m.attach_floppy_image(image)?;
         Ok(m)
+    }
+
+    /// Record the capacity of an image handed to the primary IDE master.
+    ///
+    /// `IdePrimary` keeps its backing image private and exposes no capacity, so
+    /// [`Self::attach_ide_image`] tells the machine what it attached. This is
+    /// what [`Self::ide_chs_geometry`] and the CMOS fixed-disk bytes are
+    /// derived from.
+    fn record_ide_disk_capacity(&mut self, image_len: usize) {
+        self.ide_disk_sectors = Some((image_len / MBR_SECTOR_SIZE) as u64);
     }
 
     /// Load a 64 KiB (or smaller) ROM at `0xFFFF_0000` for the Intel reset vector.
@@ -999,8 +1090,82 @@ impl MachineBus<'_> {
         }
     }
 
-    /// Decode classic PC port ownership. Spec: `docs/machine-model-pc-v1.md`.
+    /// Describe a port access for the POST trace.
+    ///
+    /// PCI Mechanism #1 gets its own events because the raw `OUT 0xCF8` /
+    /// `IN 0xCFC` pair says nothing on its own: what a reader needs is the
+    /// bus/device/function/register the latch decoded to.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.2, Figure 3-2.
+    fn trace_port_event(
+        &self,
+        port: u16,
+        size: u8,
+        value: u32,
+        write: bool,
+    ) -> post_trace::PostTraceEvent {
+        use post_trace::PostTraceEvent;
+        match port {
+            0xCF8..=0xCFB => PostTraceEvent::PciConfigAddress {
+                write,
+                port,
+                size,
+                latched: self.pci.address,
+            },
+            0xCFC..=0xCFF => PostTraceEvent::PciConfigData {
+                write,
+                port,
+                size,
+                value,
+                enabled: self.pci.config_enabled(),
+                bus: self.pci.config_bus(),
+                device: self.pci.config_device(),
+                function: self.pci.config_function(),
+                register: self.pci.config_register(),
+            },
+            _ if write => PostTraceEvent::PortOut { port, size, value },
+            _ => PostTraceEvent::PortIn { port, size, value },
+        }
+    }
+
+    /// Decode classic PC port ownership, recording the access when the POST
+    /// trace is armed. Spec: `docs/machine-model-pc-v1.md`.
     fn port_read(&mut self, port: u16, size: u8) -> u32 {
+        let value = self.dispatch_port_read(port, size);
+        if self.ports.trace_enabled() {
+            let event = self.trace_port_event(port, size, value, false);
+            self.ports.record_trace(event);
+        }
+        value
+    }
+
+    fn port_write(&mut self, port: u16, size: u8, value: u32) {
+        // PAM programming is a state change, not an access: snapshot before the
+        // write so the trace can name the registers that actually moved.
+        let pam_before = (self.ports.trace_enabled() && PciConfig::owns_port(port))
+            .then(|| self.pci.pam_registers());
+
+        self.dispatch_port_write(port, size, value);
+
+        if self.ports.trace_enabled() {
+            let event = self.trace_port_event(port, size, value, true);
+            self.ports.record_trace(event);
+            if let Some(before) = pam_before {
+                let after = self.pci.pam_registers();
+                for (index, (old, new)) in before.into_iter().zip(after).enumerate() {
+                    if old != new {
+                        self.ports
+                            .record_trace(post_trace::PostTraceEvent::PamProgram {
+                                index: index as u8,
+                                value: new,
+                            });
+                    }
+                }
+            }
+        }
+    }
+
+    fn dispatch_port_read(&mut self, port: u16, size: u8) -> u32 {
         if IdePrimary::owns_port(port) {
             return self.ide.port_read(port, size);
         }
@@ -1047,7 +1212,7 @@ impl MachineBus<'_> {
         }
     }
 
-    fn port_write(&mut self, port: u16, size: u8, value: u32) {
+    fn dispatch_port_write(&mut self, port: u16, size: u8, value: u32) {
         if IdePrimary::owns_port(port) {
             self.ide.port_write(port, size, value);
             return;
@@ -1168,6 +1333,14 @@ impl Bus for MachineBus<'_> {
         };
         if VgaText::in_aperture(effective) {
             if let Some(b) = self.vga.mmio_read_u8(effective) {
+                if self.ports.trace_enabled() {
+                    self.ports
+                        .record_trace(post_trace::PostTraceEvent::VgaAperture {
+                            write: false,
+                            addr: effective,
+                            value: b,
+                        });
+                }
                 return Ok(b);
             }
         }
@@ -1175,9 +1348,13 @@ impl Bus for MachineBus<'_> {
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
             self.ports.record_unmapped_mmio(effective, false);
         }
-        self.mem
-            .read_u8(addr)
-            .map_err(|_| ExecError::MemoryFault(addr))
+        self.mem.read_u8(addr).map_err(|_| {
+            if self.ports.trace_enabled() {
+                self.ports
+                    .record_trace(post_trace::PostTraceEvent::MemoryFault { write: false, addr });
+            }
+            ExecError::MemoryFault(addr)
+        })
     }
 
     fn write_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
@@ -1189,14 +1366,26 @@ impl Bus for MachineBus<'_> {
             addr & !(1u64 << 20)
         };
         if VgaText::in_aperture(effective) && self.vga.mmio_write_u8(effective, val) {
+            if self.ports.trace_enabled() {
+                self.ports
+                    .record_trace(post_trace::PostTraceEvent::VgaAperture {
+                        write: true,
+                        addr: effective,
+                        value: val,
+                    });
+            }
             return Ok(());
         }
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
             self.ports.record_unmapped_mmio(effective, true);
         }
-        self.mem
-            .write_u8(addr, val)
-            .map_err(|_| ExecError::MemoryFault(addr))
+        self.mem.write_u8(addr, val).map_err(|_| {
+            if self.ports.trace_enabled() {
+                self.ports
+                    .record_trace(post_trace::PostTraceEvent::MemoryFault { write: true, addr });
+            }
+            ExecError::MemoryFault(addr)
+        })
     }
 
     fn port_in_u8(&mut self, port: u16) -> Result<u8, ExecError> {
@@ -2476,7 +2665,10 @@ mod tests {
         m.pit.port_write(PIT_CONTROL, 1, 0x36);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
         m.pit.port_write(PIT_CH0_DATA, 1, 0x10);
-        m.cmos.port_write(CMOS_INDEX, 1, 0x10);
+        // `0x40` is outside the battery-backed configuration area, so reset
+        // clears it. A byte inside `0Eh`-`2Fh` would survive by design — see
+        // `CmosRtc::is_battery_backed`.
+        m.cmos.port_write(CMOS_INDEX, 1, 0x40);
         m.cmos.port_write(CMOS_DATA, 1, 0xAB);
         m.kbd
             .port_write(I8042_STATUS_CMD, 1, u32::from(CMD_SELF_TEST));

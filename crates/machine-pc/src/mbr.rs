@@ -24,8 +24,16 @@ impl Machine {
     ///
     /// Wraps [`devices::IdePrimary::attach_image`]. Image should be a multiple
     /// of 512 bytes for ATA LBA semantics; short images are still attached.
+    ///
+    /// Also records the capacity and re-derives the firmware configuration, so
+    /// the CMOS fixed-disk bytes (`12h`, `19h`, `1Bh`-`23h`) describe the disk
+    /// that is actually there. Attaching straight to [`Machine::ide`] still
+    /// answers IDENTIFY but leaves CMOS reporting no fixed disk; this is the
+    /// supported path.
     pub fn attach_ide_image(&mut self, image: Vec<u8>) {
+        self.record_ide_disk_capacity(image.len());
         self.ide.attach_image(image);
+        self.sync_firmware_configuration();
     }
 
     /// Construct a machine with a primary IDE image already attached.

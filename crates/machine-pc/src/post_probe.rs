@@ -20,6 +20,7 @@ use x86_decode::DecodeError;
 use x86_interpreter::ExecError;
 
 use crate::ports::{UnclaimedPortAccess, UnmappedMmioAccess};
+use crate::post_trace::{PostTrace, PostTraceConfig};
 use crate::step_clock::StepClock;
 use crate::{Machine, MachineError};
 
@@ -368,6 +369,28 @@ impl fmt::Display for PostReport {
     }
 }
 
+/// A [`PostReport`] plus the optional event trace recorded alongside it.
+///
+/// `Display` prints the report exactly as [`PostReport`] does — the first lines
+/// are byte-identical, because tooling parses them — and then appends the trace
+/// as a clearly delimited section. With no trace armed it is indistinguishable
+/// from printing the report alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TracedPostReport {
+    pub report: PostReport,
+    pub trace: Option<PostTrace>,
+}
+
+impl fmt::Display for TracedPostReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.report)?;
+        if let Some(trace) = &self.trace {
+            write!(f, "\n{trace}")?;
+        }
+        Ok(())
+    }
+}
+
 impl Machine {
     /// Single-step the mapped firmware under `max_steps` and report first contact.
     ///
@@ -383,7 +406,34 @@ impl Machine {
     /// delay loop and the probe measures nothing. A host-configured clock is
     /// left exactly as it was set.
     pub fn probe_post(&mut self, max_steps: u64) -> PostReport {
+        self.probe_post_traced(max_steps, None).report
+    }
+
+    /// [`Self::probe_post`] plus a bounded trace of what firmware was doing.
+    ///
+    /// With `trace` set, the run records the most recent port I/O, PCI
+    /// configuration cycles, PAM programming, VGA aperture accesses, and memory
+    /// faults leading up to the stop (see [`crate::PostTrace`]). With `trace`
+    /// `None` this is exactly [`Self::probe_post`]: nothing is recorded, the run
+    /// pays one branch per access, and [`TracedPostReport::trace`] is `None`.
+    ///
+    /// The [`PostReport`] and its `Display` are identical either way — the
+    /// trace is additional output, never a change to the existing one.
+    pub fn probe_post_traced(
+        &mut self,
+        max_steps: u64,
+        trace: Option<PostTraceConfig>,
+    ) -> TracedPostReport {
+        let report = self.run_post_probe(max_steps, trace);
+        TracedPostReport {
+            report,
+            trace: self.ports.take_trace(),
+        }
+    }
+
+    fn run_post_probe(&mut self, max_steps: u64, trace: Option<PostTraceConfig>) -> PostReport {
         self.ports.clear_diagnostics();
+        self.ports.set_trace(trace);
         self.post_diag.reset();
         self.ports.set_probe(true);
         let host_clock = self.step_clock();

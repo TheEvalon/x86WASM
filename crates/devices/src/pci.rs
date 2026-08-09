@@ -542,6 +542,18 @@ impl PamRegion {
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
 
+/// Value an unclaimed I/O read returns, truncated to the access width.
+///
+/// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.2 footnote 15 — an
+/// access the bridge cannot translate completes "dropping the data on writes
+/// and returning all ones on reads". Widths this device never generates a
+/// cycle for read the same way, matching ISA open bus on the rest of the
+/// machine.
+const OPEN_BUS: u32 = 0xFFFF_FFFF;
+
+/// Bytes of I/O space the CONFIG_DATA register occupies (`0xCFC`–`0xCFF`).
+const CONFIG_DATA_WINDOW: usize = 4;
+
 /// Type-0 config header identity fields written at reset.
 struct PciHeaderId {
     vendor: u16,
@@ -591,6 +603,11 @@ pub struct PciConfig {
     /// Used to deassert IRQs that lose their last PIRQ route without touching
     /// unrelated PIC lines.
     pub pirq_pic_driven: u16,
+    /// Host policy: accept byte/word writes to `0xCF8`–`0xCFB` as CONFIG_ADDRESS
+    /// byte lanes instead of ignoring them (see
+    /// [`PciConfig::set_config_address_byte_lane_compat`]). Off by default,
+    /// which is what PCI 3.0 §3.2.2.3.2 requires.
+    address_byte_lane_compat: bool,
 }
 
 /// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
@@ -714,7 +731,43 @@ impl PciConfig {
             // Spec: Intel 82371SB — PIRQ# lines idle at reset; routes disabled (0x80).
             pirq_asserted: [false; 4],
             pirq_pic_driven: 0,
+            // Spec: PCI 3.0 §3.2.2.3.2 — non-dword accesses to CONFIG_ADDRESS
+            // have no effect. The compatibility policy is opt-in.
+            address_byte_lane_compat: false,
         }
+    }
+
+    /// CONFIG_ADDRESS bits a full-dword write can change.
+    ///
+    /// Spec: PCI Local Bus Specification Revision 3.0 §3.2.2.3.2, Figure 3-2 —
+    /// bit 31 Enable, bits 23:16 Bus Number, bits 15:11 Device Number, bits
+    /// 10:8 Function Number, bits 7:2 Register Number. "Bits 30 to 24 are
+    /// reserved, read-only, and must return 0's when read", and bits 1:0 are
+    /// likewise read-only zero.
+    pub const ADDRESS_WRITABLE_MASK: u32 = ADDR_ENABLE | 0x00FF_FF00 | 0x0000_00FC;
+
+    /// CONFIG_ADDRESS bits that are reserved / hardwired zero.
+    pub const ADDRESS_RESERVED_MASK: u32 = !Self::ADDRESS_WRITABLE_MASK;
+
+    /// Accept byte and word accesses to `0xCF8`–`0xCFB` as CONFIG_ADDRESS byte
+    /// lanes (default: off).
+    ///
+    /// **Model choice, not hardware behavior.** PCI 3.0 §3.2.2.3.2 is explicit:
+    /// "Any other types of accesses to this address (non-DWORD) have no effect
+    /// on CONFIG_ADDRESS and are executed as normal I/O transactions on the PCI
+    /// bus", and the Intel 440FX PMC documents CONFADD the same way. This
+    /// switch exists only for hosts that cannot yet issue a 32-bit `OUT` — the
+    /// interpreter's primary opcode map has no `EF` (`OUT DX, eAX`) form, so a
+    /// guest-code test has no other way to program the register. Turn it off
+    /// (or simply never turn it on) for anything claiming to model a real
+    /// platform.
+    pub fn set_config_address_byte_lane_compat(&mut self, enabled: bool) {
+        self.address_byte_lane_compat = enabled;
+    }
+
+    /// Whether the non-spec CONFIG_ADDRESS byte-lane policy is armed.
+    pub fn config_address_byte_lane_compat(&self) -> bool {
+        self.address_byte_lane_compat
     }
 
     fn init_host_bridge() -> [u8; 256] {
@@ -843,8 +896,15 @@ impl PciConfig {
         cfg[0x0E] = id.header_type;
     }
 
+    /// Return every guest-visible register to its power-on state.
+    ///
+    /// The CONFIG_ADDRESS byte-lane compatibility policy is host configuration
+    /// rather than guest state, so it survives, the same way
+    /// `Machine::set_step_clock` survives a machine reset.
     pub fn reset(&mut self) {
+        let compat = self.address_byte_lane_compat;
         *self = Self::new();
+        self.address_byte_lane_compat = compat;
     }
 
     /// PIRQRC byte for PIRQ `pirq` (0=A … 3=D) from ISA config `0x60`–`0x63`.
@@ -875,14 +935,17 @@ impl PciConfig {
     /// True when a CONFIG_DATA access at `port`/`size` overlaps PIRQRC `0x60`–`0x63`
     /// on the currently latched Type-1 address (PIIX ISA `00:01.0`).
     pub fn pirqrc_config_write_overlaps(&self, port: u16, size: u8) -> bool {
-        if !matches!(port, PCI_CONFIG_DATA..=0xCFF) || !self.enable() {
+        let Some(lane) = Self::config_data_lane(port, size) else {
+            return false;
+        };
+        if !self.config_enabled() {
             return false;
         }
-        if self.bus() != 0 || self.device() != 1 || self.function() != 0 {
+        if self.config_bus() != 0 || self.config_device() != 1 || self.config_function() != 0 {
             return false;
         }
-        let start = u16::from(self.reg_offset()) + (port - PCI_CONFIG_DATA);
-        let end = start.saturating_add(u16::from(size.max(1)));
+        let start = u16::from(self.config_register()) + lane as u16;
+        let end = start + u16::from(size);
         start < 0x64 && end > 0x60
     }
 
@@ -917,32 +980,60 @@ impl PciConfig {
         matches!(port, 0xCF8..=0xCFF | PIIX_ELCR_MASTER | PIIX_ELCR_SLAVE)
     }
 
-    fn enable(&self) -> bool {
+    /// CONFIG_ADDRESS Enable bit (bit 31): CONFIG_DATA accesses are translated
+    /// into configuration transactions only while it is set.
+    ///
+    /// Spec: PCI 3.0 §3.2.2.3.2, Figure 3-2.
+    pub fn config_enabled(&self) -> bool {
         self.address & ADDR_ENABLE != 0
     }
 
-    fn bus(&self) -> u8 {
+    /// Latched Bus Number (CONFIG_ADDRESS bits 23:16).
+    pub fn config_bus(&self) -> u8 {
         ((self.address >> 16) & 0xFF) as u8
     }
 
-    fn device(&self) -> u8 {
+    /// Latched Device Number (CONFIG_ADDRESS bits 15:11).
+    pub fn config_device(&self) -> u8 {
         ((self.address >> 11) & 0x1F) as u8
     }
 
-    fn function(&self) -> u8 {
+    /// Latched Function Number (CONFIG_ADDRESS bits 10:8).
+    pub fn config_function(&self) -> u8 {
         ((self.address >> 8) & 0x07) as u8
     }
 
-    /// Dword-aligned register number from bits 7:2 (byte offset 0–252).
-    fn reg_offset(&self) -> u8 {
+    /// Latched dword-aligned register number (bits 7:2 → byte offset 0–252).
+    pub fn config_register(&self) -> u8 {
         (self.address & 0xFC) as u8
     }
 
-    fn selected_cfg(&self) -> Option<&[u8; 256]> {
-        if self.bus() != 0 {
+    /// Byte lane an I/O access at `port`/`size` selects inside the dword
+    /// beginning at CONFIG_DATA, or `None` when it is not a configuration
+    /// cycle at all.
+    ///
+    /// Spec: PCI 3.0 §3.2.2.3.2 — "When a host bridge sees an I/O access that
+    /// falls inside the DWORD beginning at CONFIG_DATA address, it checks the
+    /// Enable bit ...", and "byte enables for the data transfers must be
+    /// directly copied from the processor bus". A single configuration
+    /// transaction addresses one dword and carries four byte enables, so an
+    /// access running past `0xCFF` cannot be expressed as one: it is an
+    /// ordinary I/O transaction instead, and in particular must never fold
+    /// into the *next* configuration register. Widths other than 1, 2, and 4
+    /// are not generated by `IN`/`OUT` (Intel SDM Vol. 2) and are refused.
+    fn config_data_lane(port: u16, size: u8) -> Option<usize> {
+        if !matches!(size, 1 | 2 | 4) {
             return None;
         }
-        match (self.device(), self.function()) {
+        let lane = usize::from(port.checked_sub(PCI_CONFIG_DATA)?);
+        (lane + usize::from(size) <= CONFIG_DATA_WINDOW).then_some(lane)
+    }
+
+    fn selected_cfg(&self) -> Option<&[u8; 256]> {
+        if self.config_bus() != 0 {
+            return None;
+        }
+        match (self.config_device(), self.config_function()) {
             (0, 0) => Some(&self.host_bridge),
             (1, 0) => Some(&self.piix_isa),
             (1, 1) => Some(&self.piix_ide),
@@ -953,10 +1044,10 @@ impl PciConfig {
     }
 
     fn selected_cfg_mut(&mut self) -> Option<&mut [u8; 256]> {
-        if self.bus() != 0 {
+        if self.config_bus() != 0 {
             return None;
         }
-        match (self.device(), self.function()) {
+        match (self.config_device(), self.config_function()) {
             (0, 0) => Some(&mut self.host_bridge),
             (1, 0) => Some(&mut self.piix_isa),
             (1, 1) => Some(&mut self.piix_ide),
@@ -966,81 +1057,100 @@ impl PciConfig {
         }
     }
 
+    /// CONFIG_ADDRESS (`0xCF8`–`0xCFB`) write.
+    ///
+    /// Spec: PCI 3.0 §3.2.2.3.2 — "Anytime a host bridge sees a full DWORD I/O
+    /// write from the host to CONFIG_ADDRESS, the bridge must latch the data
+    /// into its CONFIG_ADDRESS register ... Any other types of accesses to this
+    /// address (non-DWORD) have no effect on CONFIG_ADDRESS and are executed as
+    /// normal I/O transactions on the PCI bus." Reserved bits 30:24 and 1:0 are
+    /// read-only zero, so the latch never stores them.
     fn write_address(&mut self, size: u8, port: u16, value: u32) {
+        if size == 4 && port == PCI_CONFIG_ADDRESS {
+            self.address = value & Self::ADDRESS_WRITABLE_MASK;
+            return;
+        }
+        if !self.address_byte_lane_compat {
+            return;
+        }
+        // Documented model choice only — see
+        // [`Self::set_config_address_byte_lane_compat`].
         let shift = ((port - PCI_CONFIG_ADDRESS) as u32) * 8;
         match size {
-            4 if port == PCI_CONFIG_ADDRESS => {
-                // Spec: PCI Mechanism #1 — bits 1:0 of CONFIG_ADDRESS are hardwired 0.
-                self.address = value & !0x3;
-            }
             2 if port <= 0xCFA => {
                 let mask = 0xFFFFu32 << shift;
                 self.address = (self.address & !mask) | ((value as u16 as u32) << shift);
-                self.address &= !0x3;
             }
-            1 if port <= 0xCFB => {
+            1 => {
                 let mask = 0xFFu32 << shift;
                 self.address = (self.address & !mask) | ((value as u8 as u32) << shift);
-                self.address &= !0x3;
             }
-            _ => {}
+            _ => return,
         }
+        self.address &= Self::ADDRESS_WRITABLE_MASK;
     }
 
+    /// CONFIG_ADDRESS (`0xCF8`–`0xCFB`) read.
+    ///
+    /// Spec: PCI 3.0 §3.2.2.3.2 — "On full DWORD I/O reads to CONFIG_ADDRESS,
+    /// the bridge must return the data in CONFIG_ADDRESS"; any other access is
+    /// an ordinary I/O transaction, which nothing on this machine claims.
     fn read_address(&self, size: u8, port: u16) -> u32 {
-        let shift = ((port - PCI_CONFIG_ADDRESS) as u32) * 8;
-        match size {
-            4 if port == PCI_CONFIG_ADDRESS => self.address,
-            2 if port <= 0xCFA => (self.address >> shift) & 0xFFFF,
-            1 if port <= 0xCFB => (self.address >> shift) & 0xFF,
-            _ => 0xFFFFFFFF,
+        if size == 4 && port == PCI_CONFIG_ADDRESS {
+            return self.address;
         }
+        if self.address_byte_lane_compat {
+            let shift = ((port - PCI_CONFIG_ADDRESS) as u32) * 8;
+            match size {
+                2 if port <= 0xCFA => return (self.address >> shift) & 0xFFFF,
+                1 => return (self.address >> shift) & 0xFF,
+                _ => {}
+            }
+        }
+        OPEN_BUS
     }
 
-    /// Read CONFIG_DATA with port providing the byte offset within the latched dword.
+    /// Read CONFIG_DATA with the port selecting byte enables inside the latched
+    /// dword.
+    ///
+    /// Spec: PCI 3.0 §3.2.2.3.2 — the access must fall inside the dword
+    /// beginning at CONFIG_DATA and the Enable bit must be set; footnote 15 and
+    /// §3.2.2.3.4 make an unclaimed target return all ones (Master-Abort).
     fn read_data(&self, size: u8, port: u16) -> u32 {
-        // Documented choice: enable clear → open-bus `0xFFFFFFFF` on data reads.
-        if !self.enable() {
-            return 0xFFFFFFFF;
+        let Some(lane) = Self::config_data_lane(port, size) else {
+            return OPEN_BUS;
+        };
+        if !self.config_enabled() {
+            return OPEN_BUS;
         }
         let Some(cfg) = self.selected_cfg() else {
-            return 0xFFFFFFFF;
+            return OPEN_BUS;
         };
-        let base = self.reg_offset() as usize;
-        let lane = (port - PCI_CONFIG_DATA) as usize;
-        let off = base + lane;
-        match size {
-            1 => u32::from(cfg.get(off).copied().unwrap_or(0xFF)),
-            2 => {
-                let b0 = cfg.get(off).copied().unwrap_or(0xFF);
-                let b1 = cfg.get(off + 1).copied().unwrap_or(0xFF);
-                u32::from(u16::from_le_bytes([b0, b1]))
-            }
-            4 => {
-                let mut bytes = [0xFFu8; 4];
-                for (i, b) in bytes.iter_mut().enumerate() {
-                    if let Some(v) = cfg.get(off + i) {
-                        *b = *v;
-                    }
-                }
-                u32::from_le_bytes(bytes)
-            }
-            _ => 0xFFFFFFFF,
-        }
+        let off = self.config_register() as usize + lane;
+        let mut bytes = [0u8; 4];
+        bytes[..usize::from(size)].copy_from_slice(&cfg[off..off + usize::from(size)]);
+        u32::from_le_bytes(bytes)
     }
 
     fn write_data(&mut self, size: u8, port: u16, value: u32) {
-        if !self.enable() {
+        let Some(lane) = Self::config_data_lane(port, size) else {
+            return;
+        };
+        if !self.config_enabled() {
             return;
         }
-        let base = self.reg_offset() as usize;
-        let lane = (port - PCI_CONFIG_DATA) as usize;
+        let base = self.config_register() as usize;
         let off = base + lane;
-        let is_host_bridge = self.bus() == 0 && self.device() == 0 && self.function() == 0;
-        let is_piix_isa = self.bus() == 0 && self.device() == 1 && self.function() == 0;
-        let is_piix_ide = self.bus() == 0 && self.device() == 1 && self.function() == 1;
-        let is_piix_usb = self.bus() == 0 && self.device() == 1 && self.function() == 2;
-        let is_piix_acpi = self.bus() == 0 && self.device() == 1 && self.function() == 3;
+        let is_host_bridge =
+            self.config_bus() == 0 && self.config_device() == 0 && self.config_function() == 0;
+        let is_piix_isa =
+            self.config_bus() == 0 && self.config_device() == 1 && self.config_function() == 0;
+        let is_piix_ide =
+            self.config_bus() == 0 && self.config_device() == 1 && self.config_function() == 1;
+        let is_piix_usb =
+            self.config_bus() == 0 && self.config_device() == 1 && self.config_function() == 2;
+        let is_piix_acpi =
+            self.config_bus() == 0 && self.config_device() == 1 && self.config_function() == 3;
         // Spec: PCI Status RW1C needs pre-write value (write-1-to-clear).
         let old_status =
             if is_host_bridge || is_piix_isa || is_piix_ide || is_piix_usb || is_piix_acpi {
@@ -1056,31 +1166,14 @@ impl PciConfig {
         let Some(cfg) = self.selected_cfg_mut() else {
             return;
         };
-        match size {
-            1 => {
-                if off < 256 && !readonly(off) {
-                    cfg[off] = value as u8;
-                }
+        // `config_data_lane` bounded the access to one dword, and the register
+        // number is dword-aligned in 0x00-0xFC, so every byte enable lands
+        // inside the 256-byte register file.
+        for (i, byte) in value.to_le_bytes()[..usize::from(size)].iter().enumerate() {
+            let o = off + i;
+            if !readonly(o) {
+                cfg[o] = *byte;
             }
-            2 => {
-                let bytes = (value as u16).to_le_bytes();
-                for (i, b) in bytes.iter().enumerate() {
-                    let o = off + i;
-                    if o < 256 && !readonly(o) {
-                        cfg[o] = *b;
-                    }
-                }
-            }
-            4 => {
-                let bytes = value.to_le_bytes();
-                for (i, b) in bytes.iter().enumerate() {
-                    let o = off + i;
-                    if o < 256 && !readonly(o) {
-                        cfg[o] = *b;
-                    }
-                }
-            }
-            _ => {}
         }
         // Spec: PCI Local Bus — Command at 0x04. Host bridge stub keeps only
         // IO/MEM/BusMaster sticky; other Command bits hardwired 0 (no decode yet).
@@ -1285,14 +1378,17 @@ impl PciConfig {
     /// inside this crate, so a machine that owns physical memory uses this to
     /// know when to re-read [`Self::pam_registers`].
     pub fn pam_config_write_overlaps(&self, port: u16, size: u8) -> bool {
-        if !matches!(port, PCI_CONFIG_DATA..=0xCFF) || !self.enable() {
+        let Some(lane) = Self::config_data_lane(port, size) else {
+            return false;
+        };
+        if !self.config_enabled() {
             return false;
         }
-        if self.bus() != 0 || self.device() != 0 || self.function() != 0 {
+        if self.config_bus() != 0 || self.config_device() != 0 || self.config_function() != 0 {
             return false;
         }
-        let start = u16::from(self.reg_offset()) + (port - PCI_CONFIG_DATA);
-        let end = start.saturating_add(u16::from(size.max(1)));
+        let start = u16::from(self.config_register()) + lane as u16;
+        let end = start + u16::from(size);
         let pam_first = u16::from(PCI_PMC_PAM0_OFFSET);
         let pam_end = pam_first + PCI_PMC_PAM_COUNT as u16;
         start < pam_end && end > pam_first
@@ -1315,7 +1411,10 @@ impl PciConfig {
         }
     }
 
-    /// Build a Type 1 CONFIG_ADDRESS value for tests / callers.
+    /// Build a CONFIG_ADDRESS value for tests / callers.
+    ///
+    /// Spec: PCI 3.0 §3.2.2.3.2 Figure 3-2 field layout; reserved bits are left
+    /// zero, so the result is exactly what [`Self::read_address`] gives back.
     pub fn make_address(bus: u8, device: u8, function: u8, reg: u8, enable: bool) -> u32 {
         let mut a = (u32::from(bus) << 16)
             | (u32::from(device & 0x1F) << 11)
@@ -1324,7 +1423,7 @@ impl PciConfig {
         if enable {
             a |= ADDR_ENABLE;
         }
-        a
+        a & Self::ADDRESS_WRITABLE_MASK
     }
 
     fn piix_ide_command(&self) -> u16 {
@@ -2063,6 +2162,118 @@ mod tests {
             },
             0x1237_8086
         );
+    }
+
+    /// Spec: PCI 3.0 §3.2.2.3.2 Figure 3-2 — bits 30:24 and 1:0 are read-only
+    /// zero, so the writable mask is exactly Enable | Bus | Device | Function |
+    /// Register.
+    #[test]
+    fn config_address_writable_mask_matches_figure_3_2() {
+        assert_eq!(PciConfig::ADDRESS_WRITABLE_MASK, 0x80FF_FFFC);
+        assert_eq!(PciConfig::ADDRESS_RESERVED_MASK, 0x7F00_0003);
+        assert_eq!(
+            PciConfig::ADDRESS_WRITABLE_MASK & PciConfig::ADDRESS_RESERVED_MASK,
+            0
+        );
+    }
+
+    /// Model choice (**not** hardware): with the compatibility policy armed,
+    /// byte lanes at `0xCF8`–`0xCFB` assemble CONFIG_ADDRESS, because a guest
+    /// whose decoder has no `EF` (`OUT DX, eAX`) form cannot program it any
+    /// other way. Reserved bits stay zero either way.
+    #[test]
+    fn config_address_byte_lane_compat_policy_assembles_the_latch() {
+        let mut pci = PciConfig::new();
+        assert!(!pci.config_address_byte_lane_compat());
+        pci.set_config_address_byte_lane_compat(true);
+
+        let addr = PciConfig::make_address(0, 0, 0, 0x5C, true);
+        for (lane, byte) in addr.to_le_bytes().iter().enumerate() {
+            pci.port_write(PCI_CONFIG_ADDRESS + lane as u16, 1, u32::from(*byte));
+        }
+        assert_eq!(pci.port_read(PCI_CONFIG_ADDRESS, 4), addr);
+        assert_eq!(pci.port_read(0xCFB, 1) as u8, (addr >> 24) as u8);
+
+        // Reserved bits are still refused through the lanes.
+        pci.port_write(0xCFB, 1, 0xFF);
+        pci.port_write(PCI_CONFIG_ADDRESS, 1, 0xFF);
+        assert_eq!(
+            pci.port_read(PCI_CONFIG_ADDRESS, 4) & PciConfig::ADDRESS_RESERVED_MASK,
+            0
+        );
+
+        // Word lanes work the same; a word at 0xCFB would leave the register.
+        let other = PciConfig::make_address(0, 1, 1, 0x20, true);
+        pci.port_write(PCI_CONFIG_ADDRESS, 2, other & 0xFFFF);
+        pci.port_write(0xCFA, 2, other >> 16);
+        assert_eq!(pci.port_read(PCI_CONFIG_ADDRESS, 4), other);
+        pci.port_write(0xCFB, 2, 0x0000);
+        assert_eq!(pci.port_read(PCI_CONFIG_ADDRESS, 4), other);
+    }
+
+    /// The compatibility policy is host configuration, not guest state: a
+    /// device reset returns the latch to zero but leaves the policy armed.
+    #[test]
+    fn config_address_compat_policy_survives_reset() {
+        let mut pci = PciConfig::new();
+        pci.set_config_address_byte_lane_compat(true);
+        pci.port_write(PCI_CONFIG_ADDRESS, 1, 0x40);
+        assert_ne!(pci.address, 0);
+
+        pci.reset();
+
+        assert_eq!(pci.address, 0);
+        assert!(pci.config_address_byte_lane_compat());
+    }
+
+    /// Spec: PCI 3.0 §3.2.2.3.2 Figure 3-2 — the latch decodes to bus, device,
+    /// function, and dword-aligned register, which is what a host tracing
+    /// configuration cycles needs.
+    #[test]
+    fn config_address_decodes_to_bus_device_function_register() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0x12, 0x1E, 5, 0x5E, true),
+        );
+        assert!(pci.config_enabled());
+        assert_eq!(pci.config_bus(), 0x12);
+        assert_eq!(pci.config_device(), 0x1E);
+        assert_eq!(pci.config_function(), 5);
+        assert_eq!(pci.config_register(), 0x5C);
+
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, 0, false),
+        );
+        assert!(!pci.config_enabled());
+    }
+
+    /// A configuration write that leaves the CONFIG_DATA dword is not a
+    /// configuration cycle, so it must not make the machine layer re-read PAM
+    /// or PIRQRC either.
+    #[test]
+    fn straddling_writes_do_not_report_pam_or_pirqrc_overlap() {
+        let mut pci = PciConfig::new();
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 0, 0, PCI_PMC_PAM0_OFFSET, true),
+        );
+        assert!(pci.pam_config_write_overlaps(PCI_CONFIG_DATA, 4));
+        assert!(!pci.pam_config_write_overlaps(0xCFE, 4));
+        assert!(!pci.pam_config_write_overlaps(0xCFF, 2));
+
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_PIIX_ISA_PIRQRC_OFFSET, true),
+        );
+        assert!(pci.pirqrc_config_write_overlaps(PCI_CONFIG_DATA, 4));
+        assert!(!pci.pirqrc_config_write_overlaps(0xCFE, 4));
+        assert!(!pci.pirqrc_config_write_overlaps(0xCFF, 2));
     }
 
     #[test]

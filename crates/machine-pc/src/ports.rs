@@ -9,6 +9,8 @@
 
 use devices::PortDevice;
 
+use crate::post_trace::{PostTrace, PostTraceConfig, PostTraceEvent};
+
 /// Distinct `(port, direction, size)` records kept per probe run.
 pub const UNCLAIMED_PORT_LIMIT: usize = 64;
 /// Distinct `(page, direction)` records kept per probe run.
@@ -45,6 +47,8 @@ pub struct PortBus {
     unclaimed_overflow: bool,
     unmapped_mmio: Vec<UnmappedMmioAccess>,
     unmapped_mmio_overflow: bool,
+    /// Bounded event trace, armed only by [`crate::Machine::probe_post_traced`].
+    trace: Option<PostTrace>,
 }
 
 impl PortBus {
@@ -67,6 +71,29 @@ impl PortBus {
         self.unclaimed_overflow = false;
         self.unmapped_mmio.clear();
         self.unmapped_mmio_overflow = false;
+        self.trace = None;
+    }
+
+    /// Arm bounded event tracing for the next run.
+    pub fn set_trace(&mut self, config: Option<PostTraceConfig>) {
+        self.trace = config.map(PostTrace::new);
+    }
+
+    /// Whether event tracing is armed. Callers check this before building an
+    /// event, so an untraced run pays only a branch.
+    pub fn trace_enabled(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    pub fn record_trace(&mut self, event: PostTraceEvent) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.record(event);
+        }
+    }
+
+    /// Take the recorded trace, leaving tracing disarmed.
+    pub fn take_trace(&mut self) -> Option<PostTrace> {
+        self.trace.take()
     }
 
     pub fn unclaimed_ports(&self) -> &[UnclaimedPortAccess] {

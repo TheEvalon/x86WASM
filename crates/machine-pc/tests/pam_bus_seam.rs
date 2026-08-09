@@ -97,8 +97,15 @@ fn pci_and_phys_mem_agree_on_pam_region_ordering() {
 ///
 /// Written with four 8-bit `OUT DX, AL` stores because this build's primary
 /// opcode map has no `ED`/`EF` accumulator port I/O — only the byte forms
-/// `E4`/`E6`/`EC`/`EE` exist. `write_address` accepts byte lanes at
-/// `0xCF8`–`0xCFB`, which is what PCI Mechanism #1 specifies.
+/// `E4`/`E6`/`EC`/`EE` exist.
+///
+/// Real hardware does not accept this. PCI Local Bus Specification Revision 3.0
+/// §3.2.2.3.2 says non-dword accesses to CONFIG_ADDRESS "have no effect on
+/// CONFIG_ADDRESS and are executed as normal I/O transactions on the PCI bus",
+/// which is the emulator's default. The test therefore arms the documented
+/// compatibility policy (`set_config_address_byte_lane_compat`) explicitly, and
+/// this whole helper can be replaced with a single `OUT DX, EAX` once `EF`
+/// decodes.
 #[rustfmt::skip]
 fn config_address_for_host_bridge(reg: u8) -> Vec<u8> {
     let dword = reg & !0x03;
@@ -192,6 +199,9 @@ fn guest_programs_pam_through_mechanism_1_then_shadows_and_locks_the_bios() {
 
     let rom = bios_image_64k(&code);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("map BIOS image");
+    // See `config_address_for_host_bridge`: byte-lane CONFIG_ADDRESS programming
+    // is a documented model choice this guest needs until `EF` decodes.
+    m.pci.set_config_address_byte_lane_compat(true);
     m.reset();
 
     // Reset state: PAM0 is 0x00, so the BIOS area reads ROM and drops writes.
