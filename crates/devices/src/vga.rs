@@ -103,12 +103,22 @@
 //!   with mode-03h reset default `0x00`; Memory Mode `0x04` store/readback with
 //!   mode-03h reset default `0x02` (no timing/plane write-enable/font-map/
 //!   chain-4/odd-even/extended-memory side effects)
-//! - Graphics Controller index/data noop: latch index on `0x3CE`, store/read
+//! - Graphics Controller index/data: latch index on `0x3CE`, store/read
 //!   register file on `0x3CF` with mode-03h-class reset defaults; Graphics Mode
 //!   `0x05` store/readback with mode-03h reset default `0x10`; Miscellaneous
 //!   `0x06` store/readback with mode-03h reset default `0x0E`; Bit Mask `0x08`
-//!   store/readback with mode-03h reset default `0xFF` (no write-mode / read-mode
-//!   / map / bitmask side effects)
+//!   store/readback with mode-03h reset default `0xFF`
+//! - Sequencer Memory Mode / Map Mask plane address decode
+//!   ([`VgaText::plane_access`] / [`VgaText::plane_write_mask`] /
+//!   [`VgaText::plane_offset`]): Chain 4 (A1:A0 select the map), odd/even
+//!   (even → maps 0+2, odd → maps 1+3), planar, Extended Memory map size
+//! - Graphics Controller data path over [`VgaText::planes`]:
+//!   [`VgaText::gc_read_u8`] loads the four [`VgaText::gc_latches`] and applies
+//!   read mode 0 (Read Map Select, or A1:A0 in Chain 4) or read mode 1 (Color
+//!   Compare / Color Don't Care); [`VgaText::gc_write_u8`] applies write modes
+//!   0–3 with Set/Reset + Enable Set/Reset, Data Rotate + Function Select,
+//!   Bit Mask, and Map Mask plane write enables. This path is host-callable
+//!   only — `MachineBus` CPU MMIO still uses the legacy text buffer.
 //! - Attribute Controller noop: address/data flip-flop on `0x3C0`, data read on
 //!   `0x3C1`, flip-flop reset via Input Status #1 (active IOAS map); Mode Control
 //!   `0x10` store/readback with mode-03h reset default `0x0C` + host text attr
@@ -141,6 +151,15 @@
 //!
 //! # Unsupported (explicit)
 //!
+//! - The Graphics Controller data path is not wired to CPU MMIO: `read_u8` /
+//!   `write_u8` (used by `MachineBus`) still address the interleaved text
+//!   buffer directly, so guest writes do not flow through write modes, latches,
+//!   Map Mask, or the plane decode
+//! - Graphics Mode bit4 host odd/even *read* addressing does not steer read
+//!   mode 0 map selection (IBM Figure 2-71's odd/even note is ambiguous);
+//!   Shift Register Interleave and 256-Color Shift Mode have no effect
+//! - No display fetch from [`VgaText::planes`]: character generation, planar
+//!   pixel output, and Chain-4/doubleword display addressing are absent
 //! - ATC / Sequencer / GC timing, plane-enable / overscan display side effects,
 //!   map-mask, write-mode, read-map, or bitmask side effects on the text plane;
 //!   Internal Palette + Color Select attr→DAC composition is on host text
@@ -606,6 +625,23 @@ pub const VGA_GC_ENABLE_SET_RESET: u8 = 0x01;
 /// Spec: FreeVGA / IBM VGA alphanumeric mode 03h — Enable Set/Reset `0x00`
 /// (CPU data path). Store/readback only; no Enable Set/Reset side effects.
 pub const VGA_GC_ENABLE_SET_RESET_DEFAULT: u8 = 0x00;
+/// Graphics Controller Color Compare Register index.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-68 — bits 3:0 are the 4-bit color
+/// compared against the four maps when read mode 1 is selected.
+pub const VGA_GC_COLOR_COMPARE: u8 = 0x02;
+/// Graphics Controller Read Map Select Register index.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-71 — bits 1:0 select the map used
+/// for system read operations in read mode 0.
+pub const VGA_GC_READ_MAP_SELECT: u8 = 0x04;
+/// Read Map Select map field (bits 1:0).
+pub const VGA_GC_READ_MAP_SELECT_MASK: u8 = 0x03;
+/// Graphics Controller Color Don't Care Register index.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-76 — bit *n* set makes map *n*
+/// participate in the read-mode-1 color compare.
+pub const VGA_GC_COLOR_DONT_CARE: u8 = 0x07;
 /// Graphics Controller Data Rotate / Function Select Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x03`. Bits 2:0 =
@@ -619,6 +655,35 @@ pub const VGA_GC_DATA_ROTATE: u8 = 0x03;
 /// writes replace plane data without rotate or logical mix. Store/readback
 /// only; no rotate/function side effects on the text plane.
 pub const VGA_GC_DATA_ROTATE_DEFAULT: u8 = 0x00;
+/// Data Rotate bits 2:0 — Rotate Count (write mode 0 right rotate).
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-69 RC.
+pub const VGA_GC_ROTATE_COUNT_MASK: u8 = 0x07;
+/// Data Rotate bits 4:3 — Function Select field.
+///
+/// Spec: IBM PS/2 Video Subsystems Figure 2-70 Operation Select Bit
+/// Definitions: `00` unmodified, `01` AND, `10` OR, `11` XOR with latched data.
+pub const VGA_GC_FUNCTION_SELECT_MASK: u8 = 0x18;
+/// Function Select `00` — data unmodified.
+pub const VGA_GC_FUNCTION_REPLACE: u8 = 0x00;
+/// Function Select `01` — data ANDed with latched data.
+pub const VGA_GC_FUNCTION_AND: u8 = 0x08;
+/// Function Select `10` — data ORed with latched data.
+pub const VGA_GC_FUNCTION_OR: u8 = 0x10;
+/// Function Select `11` — data XORed with latched data.
+pub const VGA_GC_FUNCTION_XOR: u8 = 0x18;
+const _: () = assert!(
+    VGA_GC_FUNCTION_SELECT_MASK
+        == (VGA_GC_FUNCTION_REPLACE
+            | VGA_GC_FUNCTION_AND
+            | VGA_GC_FUNCTION_OR
+            | VGA_GC_FUNCTION_XOR)
+        && VGA_GC_ROTATE_COUNT_MASK == 0x07
+        && VGA_GC_COLOR_COMPARE == 0x02
+        && VGA_GC_READ_MAP_SELECT == 0x04
+        && VGA_GC_READ_MAP_SELECT_MASK == 0x03
+        && VGA_GC_COLOR_DONT_CARE == 0x07
+);
 /// Graphics Controller Graphics Mode Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x05`. Bits 1:0 = Write
@@ -633,6 +698,16 @@ pub const VGA_GC_MODE: u8 = 0x05;
 /// memory reads use odd/even addressing. Store/readback only; no write-mode /
 /// read-mode / shift side effects on the text plane.
 pub const VGA_GC_MODE_DEFAULT: u8 = 0x10;
+/// Graphics Mode bits 1:0 — Write Mode field.
+///
+/// Spec: IBM PS/2 Video Subsystems Figures 2-72 / 2-73.
+pub const VGA_GC_MODE_WRITE_MASK: u8 = 0x03;
+/// Graphics Mode bit3 — Read Mode (`0` = map read, `1` = color compare).
+pub const VGA_GC_MODE_READ: u8 = 0x08;
+const _: () = assert!(
+    VGA_GC_MODE_DEFAULT & VGA_GC_MODE_WRITE_MASK == 0
+        && VGA_GC_MODE_DEFAULT & VGA_GC_MODE_READ == 0
+);
 /// Graphics Controller Miscellaneous Register index.
 ///
 /// Spec: FreeVGA Graphics Registers / IBM VGA — index `0x06`. Bit0 = Graphics /
@@ -974,6 +1049,17 @@ pub struct VgaText {
     pub gc_index: u8,
     /// Graphics Controller register file (noop store/readback).
     pub gc_regs: [u8; VGA_GC_REG_COUNT],
+    /// Display memory maps: [`VGA_PLANE_COUNT`] × [`VGA_PLANE_SIZE`] bytes,
+    /// map-major (map `p` offset `o` at `p * VGA_PLANE_SIZE + o`).
+    ///
+    /// Reached through [`VgaText::gc_read_u8`] / [`VgaText::gc_write_u8`];
+    /// the legacy interleaved text buffer [`VgaText::mem`] stays separate.
+    pub planes: Vec<u8>,
+    /// Graphics Controller data latches, one per map.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems §2 "Graphics Controller" / OSDev VGA
+    /// Hardware "The Latches" — a system read loads all four.
+    pub gc_latches: [u8; VGA_PLANE_COUNT],
     /// Attribute Address register (bits 4:0 index, bit 5 PAS).
     pub atc_index: u8,
     /// Attribute Controller register file (noop store/readback).
@@ -1024,6 +1110,8 @@ impl VgaText {
             seq_regs: VGA_SEQ_DEFAULTS,
             gc_index: 0,
             gc_regs: VGA_GC_DEFAULTS,
+            planes: vec![0; VGA_PLANE_COUNT * VGA_PLANE_SIZE],
+            gc_latches: [0; VGA_PLANE_COUNT],
             atc_index: VGA_ATC_INDEX_DEFAULT,
             atc_regs: VGA_ATC_DEFAULTS,
             atc_flip_flop_data: false,
@@ -1077,6 +1165,8 @@ impl VgaText {
         self.seq_regs = VGA_SEQ_DEFAULTS;
         self.gc_index = 0;
         self.gc_regs = VGA_GC_DEFAULTS;
+        self.planes.fill(0);
+        self.gc_latches = [0; VGA_PLANE_COUNT];
         self.atc_index = VGA_ATC_INDEX_DEFAULT;
         self.atc_regs = VGA_ATC_DEFAULTS;
         self.atc_flip_flop_data = false;
@@ -1233,6 +1323,215 @@ impl VgaText {
     /// Per-map byte offset a CPU access to `addr` resolves to.
     pub fn plane_offset(&self, addr: u64) -> Option<usize> {
         self.plane_access(addr).map(|access| access.offset)
+    }
+
+    /// Read one byte of display memory directly (host/test helper, no GC path).
+    pub fn plane_byte(&self, plane: usize, offset: usize) -> Option<u8> {
+        if plane >= VGA_PLANE_COUNT || offset >= VGA_PLANE_SIZE {
+            return None;
+        }
+        Some(self.planes[plane * VGA_PLANE_SIZE + offset])
+    }
+
+    /// Write one byte of display memory directly (host/test helper, no GC path).
+    pub fn set_plane_byte(&mut self, plane: usize, offset: usize, value: u8) -> bool {
+        if plane >= VGA_PLANE_COUNT || offset >= VGA_PLANE_SIZE {
+            return false;
+        }
+        self.planes[plane * VGA_PLANE_SIZE + offset] = value;
+        true
+    }
+
+    /// Graphics Mode Write Mode field (bits 1:0). Spec: IBM Figure 2-72.
+    pub fn gc_write_mode(&self) -> u8 {
+        self.gc_regs[usize::from(VGA_GC_MODE)] & VGA_GC_MODE_WRITE_MASK
+    }
+
+    /// Graphics Mode Read Mode bit (bit3). Spec: IBM Figure 2-72.
+    pub fn gc_read_mode(&self) -> u8 {
+        u8::from(self.gc_regs[usize::from(VGA_GC_MODE)] & VGA_GC_MODE_READ != 0)
+    }
+
+    /// Data Rotate rotate count (bits 2:0). Spec: IBM Figure 2-69.
+    pub fn gc_rotate_count(&self) -> u32 {
+        u32::from(self.gc_regs[usize::from(VGA_GC_DATA_ROTATE)] & VGA_GC_ROTATE_COUNT_MASK)
+    }
+
+    /// Data Rotate Function Select (bits 4:3). Spec: IBM Figure 2-70.
+    pub fn gc_function_select(&self) -> u8 {
+        self.gc_regs[usize::from(VGA_GC_DATA_ROTATE)] & VGA_GC_FUNCTION_SELECT_MASK
+    }
+
+    /// Bit Mask register value. Spec: IBM Figure 2-77.
+    pub fn gc_bit_mask(&self) -> u8 {
+        self.gc_regs[usize::from(VGA_GC_BIT_MASK)]
+    }
+
+    /// Set/Reset map values (bits 3:0). Spec: IBM Figure 2-66.
+    pub fn gc_set_reset(&self) -> u8 {
+        self.gc_regs[usize::from(VGA_GC_SET_RESET)] & VGA_SEQ_MAP_MASK_PLANES
+    }
+
+    /// Enable Set/Reset map bits (bits 3:0). Spec: IBM Figure 2-67.
+    pub fn gc_enable_set_reset(&self) -> u8 {
+        self.gc_regs[usize::from(VGA_GC_ENABLE_SET_RESET)] & VGA_SEQ_MAP_MASK_PLANES
+    }
+
+    /// Read Map Select map number (bits 1:0). Spec: IBM Figure 2-71.
+    pub fn gc_read_map_select(&self) -> usize {
+        usize::from(self.gc_regs[usize::from(VGA_GC_READ_MAP_SELECT)] & VGA_GC_READ_MAP_SELECT_MASK)
+    }
+
+    /// Color Compare value (bits 3:0). Spec: IBM Figure 2-68.
+    pub fn gc_color_compare(&self) -> u8 {
+        self.gc_regs[usize::from(VGA_GC_COLOR_COMPARE)] & VGA_SEQ_MAP_MASK_PLANES
+    }
+
+    /// Color Don't Care participating maps (bits 3:0). Spec: IBM Figure 2-76.
+    pub fn gc_color_dont_care(&self) -> u8 {
+        self.gc_regs[usize::from(VGA_GC_COLOR_DONT_CARE)] & VGA_SEQ_MAP_MASK_PLANES
+    }
+
+    /// Expand one map bit to the 8-bit value written to that map.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-66 — "the set/reset bit, if
+    /// enabled, is written to all 8 bits within that map".
+    fn expand_map_bit(value: u8, plane: usize) -> u8 {
+        if value & (1 << plane) != 0 {
+            0xFF
+        } else {
+            0x00
+        }
+    }
+
+    /// Apply Function Select between write data and the latched map byte.
+    fn apply_function_select(&self, data: u8, latch: u8) -> u8 {
+        match self.gc_function_select() {
+            VGA_GC_FUNCTION_AND => data & latch,
+            VGA_GC_FUNCTION_OR => data | latch,
+            VGA_GC_FUNCTION_XOR => data ^ latch,
+            _ => data,
+        }
+    }
+
+    /// Blend an ALU result with the latched byte through a bit mask.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-77 — a clear mask bit keeps the
+    /// latched bit for that position.
+    fn blend_with_latch(result: u8, latch: u8, mask: u8) -> u8 {
+        (result & mask) | (latch & !mask)
+    }
+
+    /// Read display memory through the Graphics Controller read path.
+    ///
+    /// Loads all four latches from the addressed map offset, then returns the
+    /// read-mode result: read mode 0 returns the map named by Read Map Select
+    /// (or by A1:A0 while Chain 4 is set), read mode 1 returns the color
+    /// compare of the participating maps.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figures 2-68, 2-71, 2-72 (RM), 2-76;
+    /// OSDev VGA Hardware "The Latches". Returns `None` when Misc Output RAM
+    /// Enable is clear or the address is outside [`Self::display_window`].
+    pub fn gc_read_u8(&mut self, addr: u64) -> Option<u8> {
+        if !self.misc_ram_enable() {
+            return None;
+        }
+        let access = self.plane_access(addr)?;
+        for plane in 0..VGA_PLANE_COUNT {
+            self.gc_latches[plane] = self.planes[plane * VGA_PLANE_SIZE + access.offset];
+        }
+        if self.gc_read_mode() == 1 {
+            let compare = self.gc_color_compare();
+            let participating = self.gc_color_dont_care();
+            let mut result = 0u8;
+            for bit in 0..8 {
+                let mut matches = true;
+                for plane in 0..VGA_PLANE_COUNT {
+                    if participating & (1 << plane) == 0 {
+                        continue;
+                    }
+                    let map_bit = (self.gc_latches[plane] >> bit) & 1;
+                    let want = (compare >> plane) & 1;
+                    if map_bit != want {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    result |= 1 << bit;
+                }
+            }
+            return Some(result);
+        }
+        let plane = if access.addressing == VgaPlaneAddressing::Chain4 {
+            access.planes.trailing_zeros() as usize
+        } else {
+            self.gc_read_map_select()
+        };
+        Some(self.gc_latches[plane])
+    }
+
+    /// Write display memory through the Graphics Controller write path.
+    ///
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-73 Write Mode Definitions plus
+    /// Figures 2-66/2-67 (Set/Reset), 2-69/2-70 (rotate + Function Select),
+    /// 2-77 (Bit Mask) and Figure 2-29 (Map Mask); OSDev VGA Hardware
+    /// "Read/Write logic" for the per-step ordering.
+    ///
+    /// Returns `false` when Misc Output RAM Enable is clear or the address is
+    /// outside [`Self::display_window`].
+    pub fn gc_write_u8(&mut self, addr: u64, value: u8) -> bool {
+        if !self.misc_ram_enable() {
+            return false;
+        }
+        let Some(access) = self.plane_access(addr) else {
+            return false;
+        };
+        let mode = self.gc_write_mode();
+        let rotated = value.rotate_right(self.gc_rotate_count());
+        let bit_mask = self.gc_bit_mask();
+        let set_reset = self.gc_set_reset();
+        let enable_set_reset = self.gc_enable_set_reset();
+
+        let mut results = [0u8; VGA_PLANE_COUNT];
+        for (plane, slot) in results.iter_mut().enumerate() {
+            let latch = self.gc_latches[plane];
+            *slot = match mode {
+                // Write mode 0: rotated system data (or Set/Reset for enabled
+                // maps) through Function Select, then the Bit Mask.
+                0 => {
+                    let source = if enable_set_reset & (1 << plane) != 0 {
+                        Self::expand_map_bit(set_reset, plane)
+                    } else {
+                        rotated
+                    };
+                    let alu = self.apply_function_select(source, latch);
+                    Self::blend_with_latch(alu, latch, bit_mask)
+                }
+                // Write mode 1: the map receives the latch unchanged.
+                1 => latch,
+                // Write mode 2: map n filled with data bit n, then Function
+                // Select and the Bit Mask.
+                2 => {
+                    let source = Self::expand_map_bit(value, plane);
+                    let alu = self.apply_function_select(source, latch);
+                    Self::blend_with_latch(alu, latch, bit_mask)
+                }
+                // Write mode 3: Set/Reset value (Enable Set/Reset ignored)
+                // through a mask of rotated data ANDed with the Bit Mask.
+                _ => {
+                    let mask = rotated & bit_mask;
+                    Self::blend_with_latch(Self::expand_map_bit(set_reset, plane), latch, mask)
+                }
+            };
+        }
+
+        for (plane, result) in results.iter().enumerate() {
+            if access.write_planes & (1 << plane) != 0 {
+                self.planes[plane * VGA_PLANE_SIZE + access.offset] = *result;
+            }
+        }
+        true
     }
 
     /// True if this device owns the I/O port (CRTC + Sequencer + GC + ATC +
@@ -4940,6 +5239,59 @@ mod tests {
         assert_eq!(v.read_u8(VGA_TEXT_BASE), Some(b'A'));
         assert_eq!(v.char_at(0, 0), Some(b'A'));
         assert_eq!(v.attr_at(0, 0), Some(0x1F));
+    }
+
+    /// Program a Graphics Controller register (`0x3CE`/`0x3CF`).
+    fn set_gc_reg(v: &mut VgaText, index: u8, value: u8) {
+        v.port_write(VGA_GC_INDEX, 1, u32::from(index));
+        v.port_write(VGA_GC_DATA, 1, u32::from(value));
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figures 2-68 / 2-71 / 2-76 — Color
+    /// Compare, Read Map Select and Color Don't Care all reset to `0x00` in the
+    /// mode-03h-class register file.
+    #[test]
+    fn gc_read_path_registers_reset_to_mode03h_defaults() {
+        let v = VgaText::new();
+        assert_eq!(v.gc_color_compare(), 0x00);
+        assert_eq!(v.gc_read_map_select(), 0);
+        assert_eq!(v.gc_color_dont_care(), 0x00);
+        assert_eq!(v.gc_write_mode(), 0);
+        assert_eq!(v.gc_read_mode(), 0);
+        assert_eq!(v.gc_bit_mask(), VGA_GC_BIT_MASK_DEFAULT);
+        assert_eq!(v.gc_rotate_count(), 0);
+        assert_eq!(v.gc_function_select(), VGA_GC_FUNCTION_REPLACE);
+    }
+
+    /// Spec: IBM PS/2 Video Subsystems Figure 2-33 + Figure 2-29 — under the
+    /// mode-03h odd/even + Map Mask `0x03` programming the GC write path
+    /// reaches the character map on even addresses and the attribute map on odd
+    /// addresses, at one shared map offset.
+    #[test]
+    fn gc_write_odd_even_reaches_character_and_attribute_maps() {
+        let mut v = VgaText::new();
+        assert!(v.gc_write_u8(VGA_TEXT_BASE, b'Z'));
+        assert!(v.gc_write_u8(VGA_TEXT_BASE + 1, 0x1F));
+        assert_eq!(v.plane_byte(0, 0), Some(b'Z'));
+        assert_eq!(v.plane_byte(1, 0), Some(0x1F));
+        assert_eq!(v.plane_byte(2, 0), Some(0), "Map Mask 0x03 blocks map 2");
+        assert_eq!(v.plane_byte(3, 0), Some(0), "Map Mask 0x03 blocks map 3");
+
+        set_gc_reg(&mut v, VGA_GC_READ_MAP_SELECT, 1);
+        assert_eq!(v.gc_read_u8(VGA_TEXT_BASE), Some(0x1F));
+        assert_eq!(v.gc_latches, [b'Z', 0x1F, 0, 0]);
+    }
+
+    /// Direct map helpers reject out-of-range maps and offsets.
+    #[test]
+    fn plane_byte_helpers_bound_map_and_offset() {
+        let mut v = VgaText::new();
+        assert!(v.set_plane_byte(3, VGA_PLANE_SIZE - 1, 0x7E));
+        assert_eq!(v.plane_byte(3, VGA_PLANE_SIZE - 1), Some(0x7E));
+        assert!(!v.set_plane_byte(VGA_PLANE_COUNT, 0, 1));
+        assert!(!v.set_plane_byte(0, VGA_PLANE_SIZE, 1));
+        assert_eq!(v.plane_byte(VGA_PLANE_COUNT, 0), None);
+        assert_eq!(v.plane_byte(0, VGA_PLANE_SIZE), None);
     }
 
     /// Reset restores mode-03h Memory Mode / Map Mask, hence odd/even decode.

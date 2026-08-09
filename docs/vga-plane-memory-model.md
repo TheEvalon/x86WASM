@@ -42,6 +42,37 @@ the size, not what happens to a host access beyond the 64 KB configuration, so
 this model wraps the per-map offset within the enabled region
 (16 KiB per map when clear, 64 KiB when set).
 
+## Graphics Controller data path
+
+`VgaText::gc_read_u8` / `VgaText::gc_write_u8` operate on the four maps in
+`VgaText::planes` and on the four latches in `VgaText::gc_latches`.
+
+Reads always load all four latches from the addressed map offset (OSDev VGA
+Hardware, "The Latches"), then:
+
+- read mode 0 returns the map named by Read Map Select (Figure 2-71), or the map
+  named by A1:A0 when Chain 4 is set (Figure 2-72, RM description);
+- read mode 1 returns the color compare of the maps selected by Color Don't Care
+  (Figures 2-68 and 2-76).
+
+Writes follow Figure 2-73:
+
+| Write mode | Data source | Function Select | Bit Mask |
+|---|---|---|---|
+| 0 | rotated system data, or Set/Reset for maps enabled in Enable Set/Reset | applied | applied |
+| 1 | the latches | not applied | not applied |
+| 2 | data bit *n* expanded across map *n* | applied | applied |
+| 3 | Set/Reset value (Enable Set/Reset ignored) | not applied | rotated data AND Bit Mask forms the mask |
+
+The resulting bytes are stored only in maps selected by the address decode AND
+the Map Mask.
+
+Write mode 3 does not apply Function Select in this model. IBM Figure 2-73 says
+the function select operation is "performed on system data for modes 0, 2, and
+3", but in mode 3 the system data forms the bit mask rather than the written
+value, and the step-by-step description in OSDev VGA Hardware "Write mode 3"
+contains no ALU stage.
+
 ## Explicitly not modeled
 
 - QEMU's alternative Chain-4 offset (`addr >> 2`); this model follows the
@@ -50,3 +81,10 @@ this model wraps the per-map offset within the enabled region
   per OSDev does not). There is no renderer in this model at all.
 - Doubleword / word CRTC addressing (`Count by Two`, byte/word mode), which is
   what compensates for the odd/even offset form on the display side.
+- Routing CPU MMIO through the Graphics Controller data path. `VgaText::read_u8`
+  / `VgaText::write_u8`, which `MachineBus` calls, still address the legacy
+  interleaved text buffer.
+- Graphics Mode bit4 (host odd/even memory read addressing) as an input to read
+  mode 0 map selection, plus Shift Register Interleave and 256-Color Shift Mode.
+- Any display fetch from plane memory (character generator, planar pixel
+  serialization, attribute path).
