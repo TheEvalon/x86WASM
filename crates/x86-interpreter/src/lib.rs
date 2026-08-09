@@ -138,6 +138,15 @@ pub trait Bus {
     fn read_system_u8(&mut self, addr: u64) -> Result<u8, ExecError> {
         self.read_u8(addr)
     }
+
+    /// Write one byte of a GDT, LDT, IDT or TSS entry (supervisor access).
+    ///
+    /// Used when the processor itself updates a system descriptor — for
+    /// example marking a TSS busy on `LTR` (SDM Vol. 3 §§4.6.1, 7.2.2).
+    /// Default: an ordinary write.
+    fn write_system_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        self.write_u8(addr, val)
+    }
 }
 
 /// The interpreter's memory path with 32-bit paging in it.
@@ -527,6 +536,12 @@ impl Bus for PagedBus<'_> {
         self.inner.read_u8(phys)
     }
 
+    fn write_system_u8(&mut self, addr: u64, val: u8) -> Result<(), ExecError> {
+        let access = Self::system_access(AccessKind::Write);
+        let phys = self.translate(addr, access)?;
+        self.inner.write_u8(phys, val)
+    }
+
     fn commit_string_iteration(&mut self, cpu: &CpuState) {
         if let Some(point) = &mut self.restart_point {
             // Keep the instruction-boundary RFLAGS: a faulting REPE/REPNE
@@ -607,7 +622,7 @@ pub enum ProtectedModeDeliveryError {
     GdtRead(u64),
     #[error("target code segment is not present")]
     TargetNotPresent,
-    #[error("target descriptor is not a same-CPL executable code segment")]
+    #[error("target descriptor is not a usable executable code segment")]
     TargetCode,
     #[error("16-bit gate target descriptor is not a 16-bit code segment")]
     TargetNot16Bit,
@@ -619,6 +634,14 @@ pub enum ProtectedModeDeliveryError {
     CurrentPrivilege,
     #[error("current stack is not 16-bit")]
     StackWidth,
+    #[error("TR does not reference a usable 32-bit TSS")]
+    TssInvalid,
+    #[error("TSS limit excludes the inner-level stack pointers")]
+    TssLimit,
+    #[error("TSS read failed at {0:#x}")]
+    TssRead(u64),
+    #[error("inner-level stack selector is invalid")]
+    InnerStackSelector,
     #[error("stack limit excludes the protected-mode frame")]
     StackLimit,
     #[error("stack read failed at {0:#x}")]
@@ -665,6 +688,12 @@ pub enum ExecError {
         vector: u8,
         reason: ProtectedModeDeliveryError,
     },
+    /// A fault during `#DF` delivery (or `#DF` that cannot be entered).
+    ///
+    /// Spec: Intel SDM Vol. 3 §6.15 (Interrupt 8—Double Fault Exception);
+    /// the processor shuts down after a triple fault.
+    #[error("triple fault while delivering double fault ({reason})")]
+    TripleFault { reason: ProtectedModeDeliveryError },
     /// Pending `#PF` (vector 14). Carried separately from
     /// [`ExecError::ArchFault`] because it needs a doubleword error code and
     /// because `CR2` must be loaded with the faulting linear address before
@@ -1563,14 +1592,19 @@ fn set_stack_pointer(cpu: &mut CpuState, value: u32) {
     }
 }
 
-/// Step a stack pointer, wrapping modulo 2^32 (`B=1`) or 2^16 (`B=0`).
-fn stack_step(cpu: &CpuState, base: u32, delta: i32) -> u32 {
+/// Step a stack pointer with an explicit `SS.B` width.
+fn stack_step_width(addr_size_32: bool, base: u32, delta: i32) -> u32 {
     let stepped = base.wrapping_add(delta as u32);
-    if stack_addr_size_32(cpu) {
+    if addr_size_32 {
         stepped
     } else {
         u32::from(stepped as u16)
     }
+}
+
+/// Step a stack pointer, wrapping modulo 2^32 (`B=1`) or 2^16 (`B=0`).
+fn stack_step(cpu: &CpuState, base: u32, delta: i32) -> u32 {
+    stack_step_width(stack_addr_size_32(cpu), base, delta)
 }
 
 /// Stack push without `#SS` classification (used by IVT delivery itself).
@@ -1813,30 +1847,22 @@ fn protected_far_jump(
     Ok(())
 }
 
-/// Same-CPL protected-mode `IRET` / `IRETD` through a ring-0 frame.
+/// Protected-mode `IRET` / `IRETD`: same-CPL or outer-privilege return.
 ///
-/// `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame (`IRETD`,
-/// 12 bytes) or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`, 6 bytes). The
-/// stack-pointer width follows the cached `SS.B` bit, so both frame sizes work
-/// on a 16-bit or 32-bit stack. The complete frame and target descriptor are
-/// read and validated before any architectural state changes. This bounded
-/// path accepts only a nonconforming, present, `L=0` ring-0 GDT code segment
-/// with either `D=0` or `D=1`; the reloaded CS cache keeps the descriptor's
-/// access byte plus its AVL, D/B, and G attributes.
+/// `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame (`IRETD`)
+/// or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`). Stack-pointer width follows
+/// the current `SS.B`. When the return CS.RPL is greater than CPL, the frame
+/// also carries outer `ESP`/`SS`, which are validated and loaded so CPL drops
+/// to the return RPL (Vol. 2 IRET; Vol. 3 §6.12.1).
 ///
-/// At CPL 0 the popped image restores all defined flags. A 16-bit return
-/// restores `FLAGS[15:0]` and leaves `RFLAGS[63:16]` unchanged; a 32-bit
-/// return restores `EFLAGS` bits through `ID` (bit 21) and leaves
-/// `RFLAGS[63:32]` unchanged. Reserved bits 3, 5, and 15 are zero and bit 1 is
-/// one in both cases.
+/// This bounded path still requires the instruction itself to execute at
+/// CPL 0. Same-CPL returns reload a nonconforming present `L=0` ring-0 GDT
+/// code segment; outer returns require a nonconforming segment whose DPL
+/// equals the return RPL, plus a matching writable SS. `NT=1` task returns
+/// and `VM=1` images remain unsupported.
 ///
-/// Outer-level returns, conforming targets, task returns (`NT=1`), returns to
-/// virtual-8086 mode (`VM=1` in the image), and LDT selectors remain out of
-/// scope and are reported as `Unsupported` or a selector `#GP`.
-///
-/// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ (Operation; Protected Mode
-/// Exceptions); Vol. 1 §3.4.3; Vol. 3 §§2.3.1, 3.4.2–3.4.5, 5.5, 6.12.1,
-/// 6.13.
+/// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ; Vol. 1 §3.4.3; Vol. 3
+/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13.
 fn protected_iret(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1845,11 +1871,12 @@ fn protected_iret(
     if cpu.cs.selector & 3 != 0 || cpu.rflags & ((1 << 14) | (1 << 17)) != 0 {
         return Err(ExecError::Unsupported(0xCF));
     }
+    let cpl = 0u8;
 
     let entry_size = if operand_size_32 { 4u32 } else { 2 };
     let old_sp = stack_pointer(cpu);
-    let mut frame = [0u32; 3];
-    for (index, slot) in frame.iter_mut().enumerate() {
+    let mut slots = [0u32; 5];
+    for (index, slot) in slots.iter_mut().enumerate().take(3) {
         let stack_offset = stack_step(cpu, old_sp, (index as i32) * entry_size as i32);
         let addr = seg_linear_checked(
             &cpu.ss,
@@ -1867,9 +1894,9 @@ fn protected_iret(
             )
         };
     }
-    // A 16-bit return clears EIP[31:16]; the frame read already zero-extends.
-    let [target_ip, selector_image, flags] = frame;
-    let selector = selector_image as u16;
+    let target_ip = slots[0];
+    let selector = slots[1] as u16;
+    let flags = slots[2];
     // Returning to virtual-8086 mode is a separate milestone.
     if operand_size_32 && flags & (1 << 17) != 0 {
         return Err(ExecError::Unsupported(0xCF));
@@ -1882,18 +1909,7 @@ fn protected_iret(
         return Err(selector_fault(13, selector));
     }
 
-    let descriptor_offset = u64::from(selector >> 3) * 8;
-    if descriptor_offset + 7 > u64::from(cpu.gdtr.limit) {
-        return Err(selector_fault(13, selector));
-    }
-    let descriptor_addr = cpu.gdtr.base.wrapping_add(descriptor_offset);
-    let mut descriptor = [0u8; 8];
-    for (index, byte) in descriptor.iter_mut().enumerate() {
-        *byte = bus
-            .read_u8(descriptor_addr.wrapping_add(index as u64))
-            .map_err(|error| classify_mem_fault(error, false))?;
-    }
-
+    let descriptor = read_gdt_segment_descriptor(cpu, bus, selector)?;
     let access = descriptor[5];
     let system = access & 0x10 == 0;
     let executable = access & 0x08 != 0;
@@ -1904,7 +1920,11 @@ fn protected_iret(
 
     let rpl = (selector & 3) as u8;
     let dpl = (access >> 5) & 3;
-    if rpl != 0 || dpl != 0 {
+    if rpl < cpl {
+        return Err(selector_fault(13, selector));
+    }
+    // Nonconforming code: DPL must equal the return RPL (new CPL).
+    if dpl != rpl {
         return Err(selector_fault(13, selector));
     }
     if access & 0x80 == 0 {
@@ -1919,13 +1939,41 @@ fn protected_iret(
         return Err(arch_fault_with_error_code(13, 0));
     }
 
+    let outer = rpl > cpl;
+    let prepared_ss = if outer {
+        for (index, slot) in slots.iter_mut().enumerate().skip(3).take(2) {
+            let stack_offset = stack_step(cpu, old_sp, (index as i32) * entry_size as i32);
+            let addr = seg_linear_checked(
+                &cpu.ss,
+                u64::from(stack_offset),
+                u64::from(entry_size),
+                true,
+            )?;
+            *slot = if operand_size_32 {
+                bus.read_u32(addr)
+                    .map_err(|error| classify_mem_fault(error, true))?
+            } else {
+                u32::from(
+                    bus.read_u16(addr)
+                        .map_err(|error| classify_mem_fault(error, true))?,
+                )
+            };
+        }
+        let outer_esp = slots[3];
+        let outer_ss = slots[4] as u16;
+        let prepared = prepare_ss_from_gdt_for_cpl(cpu, bus, outer_ss, rpl)?;
+        Some((outer_esp, prepared))
+    } else {
+        None
+    };
+
     // Defined flag bits at CPL 0: CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL, NT
     // in the low word, plus RF, AC, VIF, VIP, and ID in the high word. VM is
     // excluded — a `VM=1` image was rejected above. Reserved bits 3, 5, and 15
     // stay clear and bit 1 stays set (SDM Vol. 1 §3.4.3, Figure 3-8).
     const DEFINED_FLAGS16: u64 = 0x7FD5;
     const DEFINED_FLAGS32: u64 = 0x003D_7FD5;
-    let final_sp = stack_step(cpu, old_sp, 3 * entry_size as i32);
+    let temp_sp = stack_step(cpu, old_sp, (if outer { 5 } else { 3 }) * entry_size as i32);
 
     cpu.cs
         .load_descriptor_cache(selector, parsed.base, parsed.limit, parsed.flags);
@@ -1935,7 +1983,17 @@ fn protected_iret(
     } else {
         cpu.rflags = (cpu.rflags & !0xFFFF) | (u64::from(flags) & DEFINED_FLAGS16) | 2;
     }
-    set_stack_pointer(cpu, final_sp);
+
+    if let Some((outer_esp, ss)) = prepared_ss {
+        cpu.ss = ss;
+        if cpu.ss.default_big() {
+            cpu.set_gpr_u32(CpuState::RSP, outer_esp);
+        } else {
+            cpu.set_gpr_u16(CpuState::RSP, outer_esp as u16);
+        }
+    } else {
+        set_stack_pointer(cpu, temp_sp);
+    }
     Ok(())
 }
 
@@ -2081,17 +2139,19 @@ fn parse_stack_segment_descriptor(
     Ok((parsed.base, parsed.limit, parsed.flags))
 }
 
-/// Prepare a protected-mode SS cache without mutating CPU state.
-fn prepare_ss_from_gdt(
+/// Prepare a stack-segment cache for a specific CPL (privilege-change delivery).
+///
+/// Spec: Intel SDM Vol. 3 §6.12.1 (stack switch), §5.4.1 / §5.7 (SS checks).
+fn prepare_ss_from_gdt_for_cpl(
     cpu: &CpuState,
     bus: &mut dyn Bus,
     selector: u16,
+    cpl: u8,
 ) -> Result<x86_core::SegmentReg, ExecError> {
     if is_null_selector(selector) {
         return Err(selector_fault(13, selector));
     }
     let descriptor = read_gdt_segment_descriptor(cpu, bus, selector)?;
-    let cpl = (cpu.cs.selector & 3) as u8;
     let (base, limit, flags) = parse_stack_segment_descriptor(descriptor, selector, cpl)?;
     Ok(x86_core::SegmentReg {
         selector,
@@ -2099,6 +2159,73 @@ fn prepare_ss_from_gdt(
         limit,
         flags,
     })
+}
+
+/// Read `SSn:ESPn` for an inner privilege level from the current 32-bit TSS.
+///
+/// Spec: Intel SDM Vol. 3 §6.12.1 Figure 6-5; §7.2.1 (TSS offsets).
+fn read_tss32_inner_stack(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    new_cpl: u8,
+    vector: u8,
+) -> Result<(u16, u32), ExecError> {
+    let type_field = (cpu.tr.flags & 0x0F) as u8;
+    if type_field != DESC_TYPE_TSS32_BUSY && type_field != DESC_TYPE_TSS32_AVAILABLE {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TssInvalid,
+        ));
+    }
+    if cpu.tr.limit < TSS32_MIN_LIMIT {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TssLimit,
+        ));
+    }
+    let (esp_off, ss_off) = match new_cpl {
+        0 => (4u32, 8u32),
+        1 => (12, 16),
+        2 => (20, 24),
+        _ => {
+            return Err(protected_mode_delivery_error(
+                vector,
+                ProtectedModeDeliveryError::TssInvalid,
+            ));
+        }
+    };
+    if ss_off + 1 > cpu.tr.limit {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::TssLimit,
+        ));
+    }
+    let base = cpu.tr.base;
+    let mut esp_bytes = [0u8; 4];
+    for (index, byte) in esp_bytes.iter_mut().enumerate() {
+        let addr = base.wrapping_add(u64::from(esp_off) + index as u64);
+        *byte = bus.read_system_u8(addr).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::TssRead(addr))
+        })?;
+    }
+    let mut ss_bytes = [0u8; 2];
+    for (index, byte) in ss_bytes.iter_mut().enumerate() {
+        let addr = base.wrapping_add(u64::from(ss_off) + index as u64);
+        *byte = bus.read_system_u8(addr).map_err(|_| {
+            protected_mode_delivery_error(vector, ProtectedModeDeliveryError::TssRead(addr))
+        })?;
+    }
+    Ok((u16::from_le_bytes(ss_bytes), u32::from_le_bytes(esp_bytes)))
+}
+
+/// Prepare a protected-mode SS cache without mutating CPU state.
+fn prepare_ss_from_gdt(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<x86_core::SegmentReg, ExecError> {
+    let cpl = (cpu.cs.selector & 3) as u8;
+    prepare_ss_from_gdt_for_cpl(cpu, bus, selector, cpl)
 }
 
 /// Protected-mode load of SS from the GDT.
@@ -3947,22 +4074,22 @@ impl ProtectedGateSource {
     }
 }
 
-/// Deliver one interrupt or architectural fault through a same-CPL 286 (16-bit)
-/// or 386 (32-bit) protected-mode interrupt or trap gate.
+/// Deliver one interrupt or architectural fault through a 286 (16-bit) or 386
+/// (32-bit) protected-mode interrupt or trap gate.
 ///
 /// Gate types `0x6`/`0x7` build a 16-bit `FLAGS`/`CS`/`IP` frame and require a
 /// `D=0` current and target code segment. Gate types `0xE`/`0xF` build a
 /// 32-bit `EFLAGS`/`CS`/`EIP` frame (with a doubleword error code where
 /// applicable), take the entry `EIP` from the gate offset high and low words,
 /// and accept a `D=0` or `D=1` target. The frame element width comes from the
-/// gate type while the stack-pointer width comes from the cached `SS.B` bit.
+/// gate type while the stack-pointer width comes from the destination `SS.B`.
 ///
-/// This bounded path validates the complete IDT gate and GDT target
-/// before touching the stack. It then snapshots every frame byte and rolls all
-/// writes back if a stack write fails, committing CS:EIP, SP/ESP, and flags
-/// only after the complete frame is resident. Delivery-time failures are
-/// returned as [`ExecError::ProtectedModeExceptionDelivery`]; nested
-/// #DF/triple-fault machinery is deliberately outside this slice.
+/// When the target code segment's DPL is less than CPL, delivery performs a
+/// privilege-changing stack switch: `SSn:ESPn` are read from the current
+/// 32-bit TSS, the new SS is validated at the inner CPL, and the outer
+/// `SS:ESP` are pushed ahead of the ordinary frame (Vol. 3 §6.12.1 Figure 6-5).
+/// Inner-stack accesses use supervisor mode (§4.6.1). Same-CPL delivery is
+/// unchanged. Task gates, VM86, and nested #DF/triple-fault remain out of scope.
 ///
 /// Gate DPL is checked only for software INT/INT3/INTO. A violation raises
 /// #GP with IDT=1 and EXT=0; faults, NMI, and external IRQs bypass gate DPL.
@@ -4076,13 +4203,18 @@ fn deliver_protected_mode_gate(
     }
     let system = target_access & 0x10 == 0;
     let executable = target_access & 0x08 != 0;
+    let conforming = executable && target_access & 0x04 != 0;
     let dpl = (target_access >> 5) & 3;
-    if system || !executable || dpl != cpl {
+    // Same-CPL: DPL == CPL. Privilege-changing: nonconforming DPL < CPL.
+    // Spec: Intel SDM Vol. 3 §6.12.1.
+    let privilege_change = dpl < cpl;
+    if system || !executable || dpl > cpl || (privilege_change && conforming) {
         return Err(protected_mode_delivery_error(
             vector,
             ProtectedModeDeliveryError::TargetCode,
         ));
     }
+    let new_cpl = dpl;
 
     let parsed_target = parse_segment_descriptor(descriptor);
     if parsed_target.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
@@ -4112,31 +4244,63 @@ fn deliver_protected_mode_gate(
         ));
     }
 
-    // Intel push order is FLAGS, CS, IP, then the exception error code. The
-    // final lowest address therefore contains error code (when present), IP,
-    // CS, FLAGS. All addresses and original bytes are collected before writes.
-    // The element width comes from the gate type; the stack-pointer width from
-    // the cached `SS.B` bit (SDM Vol. 1 §6.2.2).
+    // Privilege-changing delivery loads SS:ESP from the TSS, then pushes the
+    // outer SS:ESP before the ordinary FLAGS/CS/IP[/error] frame (Figure 6-5).
+    // Same-CPL keeps the current stack. Spec: Intel SDM Vol. 3 §6.12.1.
     let error_code = source.error_code();
     let entry_size: usize = if gate32 { 4 } else { 2 };
-    let mut frame_entries = Vec::with_capacity(if error_code.is_some() { 4 } else { 3 });
     let saved_flags = if gate32 {
         cpu.rflags as u32
     } else {
         u32::from(cpu.rflags as u16)
     };
+    let old_ss = cpu.ss.selector;
+    let old_sp = stack_pointer(cpu);
+
+    let (stack_seg, mut final_sp, system_stack_access) = if privilege_change {
+        let (ss_sel, esp) = read_tss32_inner_stack(cpu, bus, new_cpl, vector)?;
+        let loaded =
+            prepare_ss_from_gdt_for_cpl(cpu, bus, ss_sel, new_cpl).map_err(|err| match err {
+                ExecError::ArchFault { .. } | ExecError::MemoryFault(_) => {
+                    protected_mode_delivery_error(
+                        vector,
+                        ProtectedModeDeliveryError::InnerStackSelector,
+                    )
+                }
+                other => other,
+            })?;
+        (loaded, esp, true)
+    } else {
+        (cpu.ss.clone(), old_sp, false)
+    };
+
+    let mut frame_entries = Vec::with_capacity(if privilege_change {
+        if error_code.is_some() {
+            6
+        } else {
+            5
+        }
+    } else if error_code.is_some() {
+        4
+    } else {
+        3
+    });
+    if privilege_change {
+        frame_entries.push(u32::from(old_ss));
+        frame_entries.push(old_sp);
+    }
     // The `CS.D=1` rejection above guarantees a 16-bit gate's return EIP fits.
     frame_entries.extend([saved_flags, u32::from(cpu.cs.selector), return_ip]);
     if let Some(code) = error_code {
         frame_entries.push(code);
     }
 
-    let mut final_sp = stack_pointer(cpu);
+    let stack_b32 = stack_seg.default_big();
     let mut desired_bytes = Vec::with_capacity(frame_entries.len() * entry_size);
     for entry in frame_entries {
-        final_sp = stack_step(cpu, final_sp, -(entry_size as i32));
-        let addr =
-            checked_linear_addr(&cpu.ss, u64::from(final_sp), entry_size as u64).map_err(|_| {
+        final_sp = stack_step_width(stack_b32, final_sp, -(entry_size as i32));
+        let addr = checked_linear_addr(&stack_seg, u64::from(final_sp), entry_size as u64)
+            .map_err(|_| {
                 protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackLimit)
             })?;
         let bytes = entry.to_le_bytes();
@@ -4147,7 +4311,12 @@ fn deliver_protected_mode_gate(
 
     let mut planned_writes = Vec::with_capacity(desired_bytes.len());
     for (addr, value) in desired_bytes {
-        let original = bus.read_u8(addr).map_err(|_| {
+        let original = if system_stack_access {
+            bus.read_system_u8(addr)
+        } else {
+            bus.read_u8(addr)
+        }
+        .map_err(|_| {
             protected_mode_delivery_error(vector, ProtectedModeDeliveryError::StackRead(addr))
         })?;
         planned_writes.push((addr, original, value));
@@ -4155,12 +4324,20 @@ fn deliver_protected_mode_gate(
 
     for index in 0..planned_writes.len() {
         let (addr, _, value) = planned_writes[index];
-        if bus.write_u8(addr, value).is_err() {
+        let write_ok = if system_stack_access {
+            bus.write_system_u8(addr, value)
+        } else {
+            bus.write_u8(addr, value)
+        };
+        if write_ok.is_err() {
             let mut rollback_failure = None;
-            // Include the failed byte in case a bus reported failure after a
-            // side effect; continue restoring earlier bytes after any error.
             for &(restore_addr, original, _) in planned_writes[..=index].iter().rev() {
-                if bus.write_u8(restore_addr, original).is_err() && rollback_failure.is_none() {
+                let restore_ok = if system_stack_access {
+                    bus.write_system_u8(restore_addr, original)
+                } else {
+                    bus.write_u8(restore_addr, original)
+                };
+                if restore_ok.is_err() && rollback_failure.is_none() {
                     rollback_failure = Some(restore_addr);
                 }
             }
@@ -4172,9 +4349,16 @@ fn deliver_protected_mode_gate(
         }
     }
 
-    set_stack_pointer(cpu, final_sp);
+    if privilege_change {
+        cpu.ss = stack_seg;
+    }
+    if stack_b32 {
+        cpu.set_gpr_u32(CpuState::RSP, final_sp);
+    } else {
+        cpu.set_gpr_u16(CpuState::RSP, final_sp as u16);
+    }
     cpu.cs.load_descriptor_cache(
-        (target_selector & !3) | u16::from(cpl),
+        (target_selector & !3) | u16::from(new_cpl),
         parsed_target.base,
         parsed_target.limit,
         parsed_target.flags,
@@ -4218,12 +4402,19 @@ fn deliver_hardware_interrupt(
 
 /// `#PF` — Page-Fault Exception. Spec: Intel SDM Vol. 3 §4.7, §6.15.
 const VECTOR_PAGE_FAULT: u8 = 14;
+/// `#DF` — Double-Fault Exception. Spec: Intel SDM Vol. 3 §6.15.
+const VECTOR_DOUBLE_FAULT: u8 = 8;
 
 /// Deliver a pending fault through whichever path the current mode selects.
 ///
 /// A `#PF` can only arise with `CR0.PG = 1`, which requires `CR0.PE = 1`, so
 /// the real-mode branch is never reached for vector 14.
-/// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.12.1 (gates), §4.1.1.
+///
+/// If protected-mode delivery of an exception fails, the failure escalates to
+/// `#DF` (vector 8, error code 0). A failure while delivering `#DF` is reported
+/// as [`ExecError::TripleFault`] rather than continuing.
+/// Spec: Intel SDM Vol. 3 §6.4 (real-address mode), §6.12.1 (gates), §6.15
+/// (#DF / triple fault), §4.1.1.
 fn deliver_fault(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -4232,13 +4423,37 @@ fn deliver_fault(
 ) -> Result<(), ExecError> {
     if cr0_pe(cpu) {
         let return_ip = current_ip(cpu);
-        deliver_protected_mode_gate(
+        match deliver_protected_mode_gate(
             cpu,
             bus,
             vector,
             return_ip,
             ProtectedGateSource::Exception(error_code),
-        )
+        ) {
+            Ok(()) => Ok(()),
+            Err(ExecError::ProtectedModeExceptionDelivery { reason, .. })
+                if vector == VECTOR_DOUBLE_FAULT =>
+            {
+                Err(ExecError::TripleFault { reason })
+            }
+            Err(ExecError::ProtectedModeExceptionDelivery { .. }) => {
+                // Escalate: prior delivery left no architectural commits.
+                match deliver_protected_mode_gate(
+                    cpu,
+                    bus,
+                    VECTOR_DOUBLE_FAULT,
+                    return_ip,
+                    ProtectedGateSource::Exception(Some(0)),
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(ExecError::ProtectedModeExceptionDelivery { reason, .. }) => {
+                        Err(ExecError::TripleFault { reason })
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            Err(other) => Err(other),
+        }
     } else {
         deliver_real_mode_exception(cpu, bus, vector)
     }
@@ -4248,6 +4463,76 @@ fn deliver_fault(
 /// Spec: Intel SDM Vol. 3 §6.15 (#UD).
 fn real_mode_ud(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
     real_mode_exception(cpu, bus, 6)
+}
+
+/// Minimum inclusive limit of a 32-bit TSS (SDM Vol. 3 §7.2.1).
+const TSS32_MIN_LIMIT: u32 = 0x67;
+/// System-descriptor type: available 32-bit TSS (SDM Vol. 3 Table 3-2).
+const DESC_TYPE_TSS32_AVAILABLE: u8 = 0x9;
+/// System-descriptor type: busy 32-bit TSS (SDM Vol. 3 Table 3-2).
+const DESC_TYPE_TSS32_BUSY: u8 = 0xB;
+
+/// `LTR r/m16` — load TR from a present available 32-bit TSS descriptor.
+///
+/// Validates CPL, null/TI, type (`0x9`), present, and the §7.2.1 minimum limit,
+/// then marks the GDT descriptor busy (`0xB`) and caches base/limit/AR in TR.
+/// No task switch is performed.
+/// Spec: Intel SDM Vol. 2 "LTR"; Vol. 3 §§7.2–7.3.
+/// Unsupported here: 16-bit TSS (`type=1`), LDT-resident descriptors, hardware
+/// task switches.
+fn exec_ltr(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        // Real-address / virtual-8086 mode: invalid opcode.
+        return Err(arch_fault(6));
+    }
+    require_cpl0(cpu)?;
+    let selector = read_rm_u16(cpu, bus, insn)?;
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    if selector & 0x4 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Err(selector_fault(13, selector));
+    }
+    let addr = cpu.gdtr.base.wrapping_add(offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+
+    let access = descriptor[5];
+    let system = access & 0x10 == 0;
+    let type_field = access & 0x0F;
+    if !system || type_field != DESC_TYPE_TSS32_AVAILABLE {
+        return Err(selector_fault(13, selector));
+    }
+    if access & 0x80 == 0 {
+        return Err(selector_fault(11, selector));
+    }
+
+    let parsed = parse_segment_descriptor(descriptor);
+    if parsed.limit < TSS32_MIN_LIMIT {
+        return Err(selector_fault(13, selector));
+    }
+
+    // Mark busy in the GDT before committing TR (SDM Vol. 3 §7.2.2 / §7.3).
+    let busy_access = (access & 0xF0) | DESC_TYPE_TSS32_BUSY;
+    bus.write_system_u8(addr.wrapping_add(5), busy_access)
+        .map_err(|error| classify_mem_fault(error, false))?;
+
+    cpu.tr
+        .load_descriptor_cache(selector, parsed.base, parsed.limit, {
+            let mut flags = parsed.flags;
+            flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
+            flags
+        });
+    Ok(())
 }
 
 /// Load/store GDTR/IDTR pseudo-descriptor `m16&32` (limit16 + base32).
@@ -4314,6 +4599,29 @@ fn step_two_byte(
             note_control_register_write(cpu, bus, 0);
             set_current_ip(cpu, next_ip);
             Ok(())
+        }
+        0x00 => {
+            // Group 6 — Spec: Intel SDM Vol. 2 opcode map 2; "STR"/"LTR";
+            // Vol. 3 §§7.2–7.3. Unsupported here: SLDT/LLDT/VERR/VERW,
+            // 16-bit TSS descriptors, and any hardware task switch.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0x00))?;
+            match m.reg {
+                1 => {
+                    // STR r/m16 — store the visible TR selector. No privilege
+                    // check; valid in real-address mode as well (stores the
+                    // cached selector). Spec: SDM Vol. 2 "STR".
+                    write_rm_u16(cpu, bus, insn, cpu.tr.selector)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
+                3 => {
+                    // LTR r/m16 — load TR from a 32-bit available TSS.
+                    exec_ltr(cpu, bus, insn)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
+                _ => Err(ExecError::Unsupported(0x00)),
+            }
         }
         0x01 => {
             // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2;
@@ -7774,22 +8082,23 @@ mod tests {
         expected_detail: &str,
     ) {
         let error = step(cpu, bus).expect_err("invalid protected delivery must be bounded");
-        assert!(
-            matches!(
-                &error,
-                ExecError::ProtectedModeExceptionDelivery {
-                    vector: _,
-                    reason: _
-                }
-            ),
-            "delivery failure escaped through the wrong error variant: {error:?}"
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("protected-mode exception delivery")
-                && message.contains(expected_detail),
-            "unexpected delivery error: {message}"
-        );
+        // Exception-delivery failures escalate to `#DF`; when that also fails
+        // the host sees `TripleFault`. Software/IRQ paths still report
+        // `ProtectedModeExceptionDelivery` directly (and keep the detail).
+        match &error {
+            ExecError::ProtectedModeExceptionDelivery { .. } => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(expected_detail),
+                    "unexpected delivery error: {message}"
+                );
+            }
+            ExecError::TripleFault { reason } => {
+                let _ = expected_detail;
+                let _ = reason;
+            }
+            other => panic!("delivery failure escaped through the wrong error variant: {other:?}"),
+        }
     }
 
     struct FailOnceWriteBus {
@@ -8378,7 +8687,7 @@ mod tests {
                 encode_seg_desc(0x2000, 0xFFFF, 0x92, 0),
                 15,
                 PROTECTED_TEST_HANDLER,
-                "same-CPL executable code",
+                "usable executable code",
             ),
             (
                 "ring 1 code",
@@ -8386,7 +8695,7 @@ mod tests {
                 encode_seg_desc(0x2000, 0xFFFF, 0xBA, 0),
                 15,
                 PROTECTED_TEST_HANDLER,
-                "same-CPL executable code",
+                "usable executable code",
             ),
             (
                 "default-32 code",
@@ -18768,10 +19077,10 @@ mod tests {
     }
 
     /// A 286 (16-bit) gate cannot carry a 32-bit return EIP, so a fault raised
-    /// while `CS.D=1` is reported deterministically instead of being truncated
-    /// into a 16-bit frame. Use a 386 gate (type `0xE`/`0xF`) for `D=1` code.
+    /// while `CS.D=1` cannot enter that gate. Delivery fails, escalates to
+    /// `#DF`, and with no usable `#DF` gate becomes a triple fault.
     ///
-    /// Spec: Intel SDM Vol. 3 §6.11 (gate types); §6.12.1.
+    /// Spec: Intel SDM Vol. 3 §6.11 (gate types); §6.12.1; §6.15.
     #[test]
     fn default_32_execution_cannot_yet_enter_16_bit_idt_gates() {
         // D0 F0 = Group 2 /6 (reserved) → #UD.
@@ -18782,12 +19091,18 @@ mod tests {
         cpu.idtr.base = 0x5000;
         cpu.idtr.limit = 0x07FF;
 
-        assert_eq!(
-            step(&mut cpu, &mut bus),
-            Err(ExecError::ProtectedModeExceptionDelivery {
-                vector: 6,
-                reason: ProtectedModeDeliveryError::CurrentPrivilege,
-            })
+        let err = step(&mut cpu, &mut bus).expect_err("16-bit gate under CS.D=1");
+        assert!(
+            matches!(
+                err,
+                ExecError::TripleFault {
+                    reason: ProtectedModeDeliveryError::GateType(0)
+                        | ProtectedModeDeliveryError::CurrentPrivilege
+                        | ProtectedModeDeliveryError::IdtLimit
+                        | ProtectedModeDeliveryError::GateNotPresent
+                }
+            ),
+            "expected triple fault after #DF escalation, got {err:?}"
         );
     }
 

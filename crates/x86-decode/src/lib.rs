@@ -682,6 +682,18 @@ mod tests {
 
     #[test]
     fn decode_lgdt_sgdt_m16() {
+        // Spec: Intel SDM Vol. 2 STR/LTR — 0F 00 /1 and /3.
+        let str_ax = decode(&[0x0F, 0x00, 0xC8]).unwrap(); // STR AX
+        assert_eq!(str_ax.mnemonic, "GRP6");
+        assert!(str_ax.two_byte);
+        assert_eq!(str_ax.opcode, 0x00);
+        assert_eq!(str_ax.modrm.unwrap().reg, 1);
+        assert_eq!(str_ax.length, 3);
+
+        let ltr_ax = decode(&[0x0F, 0x00, 0xD8]).unwrap(); // LTR AX
+        assert_eq!(ltr_ax.modrm.unwrap().reg, 3);
+        assert_eq!(ltr_ax.length, 3);
+
         // Spec: Intel SDM Vol. 2 LGDT/SGDT — 0F 01 /2 and /0, memory form.
         let sgdt = decode(&[0x0F, 0x01, 0x06, 0x00, 0x20]).unwrap(); // SGDT [0x2000]
         assert_eq!(sgdt.mnemonic, "GRP7");
@@ -1135,9 +1147,11 @@ mod tests {
 
         // Truncated escape / unknown secondary.
         assert_eq!(decode(&[0x0F]), Err(DecodeError::Truncated));
+        // GRP6 (0F 00) needs a ModRM byte.
+        assert_eq!(decode(&[0x0F, 0x00]), Err(DecodeError::Truncated));
         assert!(matches!(
-            decode(&[0x0F, 0x00]),
-            Err(DecodeError::UnsupportedOpcode(0x00))
+            decode(&[0x0F, 0x04]),
+            Err(DecodeError::UnsupportedOpcode(0x04))
         ));
         // Primary AF remains SCASW (not two-byte).
         let d = decode(&[0xAF]).unwrap();
