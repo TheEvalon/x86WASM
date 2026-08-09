@@ -215,6 +215,64 @@ pub const EQUIP_MATH_COPROCESSOR: u8 = 1 << 1;
 /// Equipment bit 0 — "floppy drive installed".
 pub const EQUIP_FLOPPY_INSTALLED: u8 = 1 << 0;
 
+/// Floppy drive type byte (index `0x10`).
+///
+/// Spec: RBIL CMOS `10h` — IBM "FLOPPY DRIVE TYPE", Table C0007: bits 7-4 first
+/// floppy disk drive type, bits 3-0 second, encoded per Table C0008.
+pub const REG_FLOPPY_TYPE: u8 = 0x10;
+
+/// Hard disk data byte (index `0x12`).
+///
+/// Spec: RBIL CMOS `12h` — IBM "HARD DISK DATA", Table C0014: bits 7-4 first
+/// hard disk drive (`00` none, `01`-`0Eh` type 1-14, `0Fh` type 16-255 with the
+/// actual type in `19h`), bits 3-0 second (extension in `1Ah`).
+pub const REG_HARD_DISK_TYPE: u8 = 0x12;
+
+/// First extended hard disk drive type (index `0x19`).
+///
+/// Spec: RBIL CMOS `19h` — IBM "FIRST EXTENDED HARD DISK DRIVE TYPE",
+/// Table C0020: `00`-`0Fh` unused, `10h`-`FFh` extended type 16-255.
+pub const REG_HARD_DISK0_EXT_TYPE: u8 = 0x19;
+
+/// Second extended hard disk drive type (index `0x1A`).
+///
+/// Spec: RBIL CMOS `1Ah` — "SECOND EXTENDED HARD DISK DRIVE TYPE".
+pub const REG_HARD_DISK1_EXT_TYPE: u8 = 0x1A;
+
+/// First byte of the first drive's user-defined parameter block (index `0x1B`).
+///
+/// Spec: RBIL CMOS `1Bh`-`23h` — AMI "First Hard Disk (type 47) user defined":
+/// cylinders LSB, cylinders high byte, number of heads, WPC-low, WPC-high,
+/// control byte (Table C0025), landing zone low, landing zone high, sectors per
+/// track.
+pub const REG_HARD_DISK0_PARAMS: u8 = 0x1B;
+
+/// First byte of the second drive's user-defined parameter block (index `0x24`).
+///
+/// Spec: RBIL CMOS `24h`-`2Ch` — AMI "Second Hard Disk user defined", the same
+/// nine fields in the same order.
+pub const REG_HARD_DISK1_PARAMS: u8 = 0x24;
+
+/// Boot / configuration options byte (index `0x2D`).
+///
+/// Spec: RBIL CMOS `2Dh` — AMI Hi-Flex BIOS "CONFIGURATION OPTIONS",
+/// Table C0032: bit 7 Weitek installed, bit 6 floppy drive seek, bit 5 boot
+/// order (0 = drive C: then A:, 1 = drive A: then C:), bit 4 boot speed, bit 3
+/// external cache, bit 2 internal cache, bit 1 fast gate A20, bit 0 turbo
+/// switch. This is a vendor byte, not part of the original IBM PC/AT map.
+pub const REG_BOOT_OPTIONS: u8 = 0x2D;
+
+/// Bytes in one user-defined hard-disk parameter block.
+///
+/// Spec: RBIL CMOS `1Bh`-`23h` / `24h`-`2Ch`.
+const HARD_DISK_PARAM_BLOCK_LEN: u8 = 9;
+
+// The two parameter blocks are adjacent and end exactly where the boot-options
+// byte begins, which is why the checksum range stops at `2Dh`.
+const _: () = assert!(REG_HARD_DISK0_PARAMS + HARD_DISK_PARAM_BLOCK_LEN == REG_HARD_DISK1_PARAMS);
+const _: () = assert!(REG_HARD_DISK1_PARAMS + HARD_DISK_PARAM_BLOCK_LEN == REG_BOOT_OPTIONS);
+const _: () = assert!(REG_BOOT_OPTIONS == CMOS_CHECKSUM_LAST);
+
 /// Standard CMOS checksum, high byte (index `0x2E`).
 ///
 /// Spec: RBIL CMOS `2Eh`/`2Fh` — IBM "Standard CMOS Checksum, High/Low Byte";
@@ -650,6 +708,224 @@ impl CmosRtc {
             drives
         };
         ((capped - 1) << EQUIP_FLOPPY_COUNT_SHIFT) | EQUIP_FLOPPY_INSTALLED
+    }
+
+    /// Floppy drive type: no drive (Table C0008 `00h`).
+    pub const FLOPPY_TYPE_NONE: u8 = 0x00;
+    /// Floppy drive type: 360 KB 5.25" (Table C0008 `01h`).
+    pub const FLOPPY_TYPE_360K: u8 = 0x01;
+    /// Floppy drive type: 1.2 MB 5.25" (Table C0008 `02h`).
+    pub const FLOPPY_TYPE_1200K: u8 = 0x02;
+    /// Floppy drive type: 720 KB 3.5" (Table C0008 `03h`).
+    pub const FLOPPY_TYPE_720K: u8 = 0x03;
+    /// Floppy drive type: 1.44 MB 3.5" (Table C0008 `04h`).
+    pub const FLOPPY_TYPE_1440K: u8 = 0x04;
+    /// Floppy drive type: 2.88 MB 3.5" (Table C0008 `05h`).
+    pub const FLOPPY_TYPE_2880K: u8 = 0x05;
+
+    /// `12h` nibble value meaning "type 16-255, see the extension byte".
+    ///
+    /// Spec: RBIL CMOS `12h` Table C0014 — "0Fh Hard Disk Type 16-255 (actual
+    /// Hard Drive Type is in CMOS RAM 19h)".
+    pub const HARD_DISK_TYPE_EXTENDED: u8 = 0x0F;
+
+    /// Extended hard-disk type 47: parameters live in the CMOS parameter block.
+    ///
+    /// Spec: RBIL CMOS `19h` Table C0020 — "For most manufacturers the last
+    /// drive type (typically either 47d or 49d) is 'user defined' and
+    /// parameters are stored elsewhere in the CMOS"; RBIL CMOS `1Bh` names the
+    /// block "First Hard Disk (type 47) user defined".
+    pub const HARD_DISK_TYPE_USER_DEFINED: u8 = 47;
+
+    /// `2Dh` bit 5 — boot order: set = drive A: then C:, clear = C: then A:.
+    ///
+    /// Spec: RBIL CMOS `2Dh` Table C0032.
+    pub const BOOT_OPTION_FLOPPY_FIRST: u8 = 1 << 5;
+    /// `2Dh` bit 6 — floppy drive seek at boot ("turn off for fast boot").
+    pub const BOOT_OPTION_FLOPPY_SEEK: u8 = 1 << 6;
+
+    /// `20h`/`29h` control-byte bit 3 — "more than 8 heads".
+    ///
+    /// Spec: RBIL CMOS `20h` Table C0025 "AMI user-defined hard disk control
+    /// byte": bits 7-6 no retries, bit 5 bad sector map at last cylinder+1,
+    /// bit 4 unused, bit 3 more than 8 heads, bits 2-0 unused. (RBIL's note on
+    /// `29h` describes the same condition as producing `80h` instead; this
+    /// model follows the explicit bitfield table.)
+    const HARD_DISK_CONTROL_MANY_HEADS: u8 = 1 << 3;
+
+    /// Program the floppy drive type nibbles at `10h`.
+    ///
+    /// Spec: RBIL CMOS `10h` Table C0007 — bits 7-4 the first drive, bits 3-0
+    /// the second, each a Table C0008 type code. Values above `0Fh` cannot be
+    /// expressed and are refused (the byte is left unchanged for that nibble).
+    /// The byte is inside the `10h`-`2Dh` checksum range, so a host that also
+    /// maintains the checksum calls [`Self::store_standard_checksum`] after.
+    pub fn set_floppy_drive_types(&mut self, first: u8, second: u8) {
+        self.ram[REG_FLOPPY_TYPE as usize] = ((first & 0x0F) << 4) | (second & 0x0F);
+    }
+
+    /// Table C0008 type code for floppy drive `drive` (0 = A:, 1 = B:).
+    ///
+    /// Any other drive number returns [`Self::FLOPPY_TYPE_NONE`]: `10h`
+    /// describes exactly two drives.
+    pub fn floppy_drive_type(&self, drive: u8) -> u8 {
+        let byte = self.ram[REG_FLOPPY_TYPE as usize];
+        match drive {
+            0 => byte >> 4,
+            1 => byte & 0x0F,
+            _ => Self::FLOPPY_TYPE_NONE,
+        }
+    }
+
+    /// Index of the extension byte (`19h`/`1Ah`) for hard disk `drive`.
+    fn hard_disk_ext_index(drive: u8) -> Option<u8> {
+        match drive {
+            0 => Some(REG_HARD_DISK0_EXT_TYPE),
+            1 => Some(REG_HARD_DISK1_EXT_TYPE),
+            _ => None,
+        }
+    }
+
+    /// First index of the user-defined parameter block for hard disk `drive`.
+    fn hard_disk_param_index(drive: u8) -> Option<u8> {
+        match drive {
+            0 => Some(REG_HARD_DISK0_PARAMS),
+            1 => Some(REG_HARD_DISK1_PARAMS),
+            _ => None,
+        }
+    }
+
+    /// Write the `12h` nibble for `drive` without disturbing the other one.
+    fn set_hard_disk_nibble(&mut self, drive: u8, value: u8) {
+        let byte = &mut self.ram[REG_HARD_DISK_TYPE as usize];
+        match drive {
+            0 => *byte = (*byte & 0x0F) | ((value & 0x0F) << 4),
+            1 => *byte = (*byte & 0xF0) | (value & 0x0F),
+            _ => {}
+        }
+    }
+
+    /// Describe hard disk `drive` (0 or 1) as the user-defined type with this
+    /// geometry.
+    ///
+    /// Spec: RBIL CMOS `12h` Table C0014 (nibble `0Fh` escapes to the extension
+    /// byte), `19h`/`1Ah` Table C0020 (extended type; 47 is the conventional
+    /// "user defined" type), and `1Bh`-`23h` / `24h`-`2Ch` for the nine
+    /// parameter bytes.
+    ///
+    /// Write precompensation cylinder (`1Eh`/`1Fh`) is written as zero and the
+    /// landing zone (`21h`/`22h`) as the cylinder count. **Both are model
+    /// choices, not spec:** RBIL documents where the fields live but not what
+    /// an emulated device should put in them, and neither has any meaning for a
+    /// disk backed by a file — there is no MFM write channel to precompensate
+    /// and no head to park. The control byte follows Table C0025.
+    ///
+    /// Every byte written is inside the checksum range; the caller recomputes
+    /// [`Self::store_standard_checksum`].
+    pub fn set_hard_disk_user_geometry(
+        &mut self,
+        drive: u8,
+        cylinders: u16,
+        heads: u8,
+        sectors_per_track: u8,
+    ) {
+        let (Some(ext), Some(params)) = (
+            Self::hard_disk_ext_index(drive),
+            Self::hard_disk_param_index(drive),
+        ) else {
+            return;
+        };
+        self.set_hard_disk_nibble(drive, Self::HARD_DISK_TYPE_EXTENDED);
+        self.ram[ext as usize] = Self::HARD_DISK_TYPE_USER_DEFINED;
+
+        let control = if heads > 8 {
+            Self::HARD_DISK_CONTROL_MANY_HEADS
+        } else {
+            0
+        };
+        let [cyl_lo, cyl_hi] = cylinders.to_le_bytes();
+        let block = [
+            cyl_lo,            // 1Bh / 24h — cylinders, LSB
+            cyl_hi,            // 1Ch / 25h — cylinders, high byte
+            heads,             // 1Dh / 26h — number of heads
+            0x00,              // 1Eh / 27h — WPC low (model choice: none)
+            0x00,              // 1Fh / 28h — WPC high
+            control,           // 20h / 29h — control byte, Table C0025
+            cyl_lo,            // 21h / 2Ah — landing zone low (model choice)
+            cyl_hi,            // 22h / 2Bh — landing zone high
+            sectors_per_track, // 23h / 2Ch — sectors per track
+        ];
+        let base = params as usize;
+        self.ram[base..base + block.len()].copy_from_slice(&block);
+    }
+
+    /// Describe hard disk `drive` as absent, clearing its parameter block.
+    ///
+    /// Spec: RBIL CMOS `12h` Table C0014 — "00 No drive"; `19h` Table C0020 —
+    /// "00-0Fh unused (would not require extension)".
+    pub fn set_hard_disk_absent(&mut self, drive: u8) {
+        let (Some(ext), Some(params)) = (
+            Self::hard_disk_ext_index(drive),
+            Self::hard_disk_param_index(drive),
+        ) else {
+            return;
+        };
+        self.set_hard_disk_nibble(drive, 0);
+        self.ram[ext as usize] = 0;
+        let base = params as usize;
+        self.ram[base..base + usize::from(HARD_DISK_PARAM_BLOCK_LEN)].fill(0);
+    }
+
+    /// Effective drive type for hard disk `drive`: `0` when absent, the `12h`
+    /// nibble for types 1-14, or the extension byte when the nibble is `0Fh`.
+    ///
+    /// Spec: RBIL CMOS `12h` Table C0014 / `19h` Table C0020.
+    pub fn hard_disk_type(&self, drive: u8) -> u8 {
+        let Some(ext) = Self::hard_disk_ext_index(drive) else {
+            return 0;
+        };
+        let nibble = match drive {
+            0 => self.ram[REG_HARD_DISK_TYPE as usize] >> 4,
+            _ => self.ram[REG_HARD_DISK_TYPE as usize] & 0x0F,
+        };
+        if nibble == Self::HARD_DISK_TYPE_EXTENDED {
+            self.ram[ext as usize]
+        } else {
+            nibble
+        }
+    }
+
+    /// Cylinders / heads / sectors-per-track for a drive described by the
+    /// user-defined type, or `None` when the drive is absent or uses a
+    /// predefined type whose parameters live in the BIOS table instead.
+    pub fn hard_disk_geometry(&self, drive: u8) -> Option<(u16, u8, u8)> {
+        if self.hard_disk_type(drive) != Self::HARD_DISK_TYPE_USER_DEFINED {
+            return None;
+        }
+        let base = Self::hard_disk_param_index(drive)? as usize;
+        let cylinders = u16::from_le_bytes([self.ram[base], self.ram[base + 1]]);
+        Some((cylinders, self.ram[base + 2], self.ram[base + 8]))
+    }
+
+    /// Store the `2Dh` configuration-options byte.
+    ///
+    /// Spec: RBIL CMOS `2Dh` Table C0032. This is an AMI Hi-Flex vendor byte
+    /// rather than part of the IBM PC/AT map, and it is inert storage here: no
+    /// device or machine behavior reads it, and SeaBIOS does not either.
+    pub fn set_boot_options(&mut self, value: u8) {
+        self.ram[REG_BOOT_OPTIONS as usize] = value;
+    }
+
+    /// Current `2Dh` configuration-options byte.
+    pub fn boot_options(&self) -> u8 {
+        self.ram[REG_BOOT_OPTIONS as usize]
+    }
+
+    /// `2Dh` bit 5: boot order is "drive A: then C:".
+    ///
+    /// Spec: RBIL CMOS `2Dh` Table C0032 bit 5.
+    pub fn boot_floppy_first(&self) -> bool {
+        self.boot_options() & Self::BOOT_OPTION_FLOPPY_FIRST != 0
     }
 
     /// Byte-wise additive sum of CMOS `10h`–`2Dh`.
