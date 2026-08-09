@@ -108,7 +108,12 @@
 //!   parameters, no IRQ assert/clear; MSR RQM|DIO during result phase
 //! - Configure (`0x13`): command byte → three parameter bytes stored
 //!   (`configure_byte0`, `configure_eis_fifo_poll_thr`, `configure_pretrk`);
-//!   no result phase; no IRQ; MSR RQM (!DIO) during parameter phase.
+//!   no result phase; no IRQ; MSR RQM (!DIO) during parameter phase. EIS
+//!   (byte1 bit6) is enforced at runtime: a read/write command that carries a
+//!   C parameter (READ DATA, READ TRACK, READ DELETED DATA, VERIFY, SCAN,
+//!   WRITE DATA, WRITE DELETED DATA — not FORMAT TRACK) performs an implied
+//!   Seek that sets `pcn[unit] = C` before execution, with no Seek End latch
+//!   and no extra interrupt. See `docs/fdc-implied-seek.md`.
 //! - LOCK (`0x14` unlock / `0x94` lock): Spec Intel 82077AA §5.3.2 — LOCK is
 //!   command-byte bit7 (no parameter bytes); one result byte `LOCK<<4` with
 //!   MSR RQM|DIO; no IRQ. Soft DOR reset does **not** clear LOCK; when LOCK=0
@@ -276,11 +281,15 @@
 //! - Seek / Relative Seek step timing; Relative Seek ST0 EC when stepping out
 //!   beyond track 0 (PCN clamp only this slice); real DIR disk-change edge
 //!   timing (DSKCHG stub only)
-//! - Implied seek from Configure EIS; DMA TC early termination mid-transfer
-//!   (this stub completes R..=EOT then presents the full latch to DMA)
+//! - Implied-seek step timing, DSKCHG clearing from an implied seek, and
+//!   head-position gating of transfers (ST2 WC / BC are never reported — the
+//!   transfer still addresses by its own C parameter); DMA TC early termination
+//!   mid-transfer (this stub completes R..=EOT then presents the full latch to
+//!   DMA)
 //! - PERPENDICULAR Gap2/WGATE/VCO timing side effects on media commands
-//! - Configure bit side effects beyond LOCK soft-reset protection (FIFO enable,
-//!   implied seek, poll disable enforcement); DSR POWER DOWN/data-rate timing
+//! - Configure bit side effects beyond EIS implied seek and LOCK soft-reset
+//!   protection (FIFO enable, poll disable enforcement); DSR POWER DOWN /
+//!   data-rate timing
 
 use crate::PortDevice;
 
@@ -334,6 +343,12 @@ pub const FDC_DSR_SOFTWARE_RESET: u8 = 0x80;
 
 /// Configure byte1 EFIFO (1 = FIFO disabled / 8272-compatible). Spec: §5.2.7.
 const FDC_CONFIG_EFIFO: u8 = 0x20;
+/// Configure byte1 EIS — Enable Implied Seek (bit6).
+///
+/// Spec: Intel 82077AA §5.2.7 — "EIS — Enable Implied Seek. When set to '1',
+/// the 82077AA will perform a Seek operation before executing a Read or Write
+/// command." The Configure default is no implied seek.
+const FDC_CONFIG_EIS: u8 = 0x40;
 /// Configure byte1 FIFO threshold minus one. Spec: Intel 82077AA §5.2.7.
 const FDC_CONFIG_FIFOTHR_MASK: u8 = 0x0F;
 /// Fields protected by LOCK across DOR/DSR software reset. Spec: §5.3.2.
@@ -1488,6 +1503,8 @@ impl Fdc82077 {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let c = self.read_params[1];
+        // Spec: Intel 82077AA §5.2.7 — Configure EIS seeks to C first.
+        self.apply_implied_seek(head_unit, c);
         let h = self.read_params[2];
         let r = self.read_params[3];
         let n = self.read_params[4];
@@ -1602,6 +1619,8 @@ impl Fdc82077 {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let c = self.read_params[1];
+        // Spec: Intel 82077AA §5.2.7 — Configure EIS seeks to C first.
+        self.apply_implied_seek(head_unit, c);
         let h = self.read_params[2];
         let r = self.read_params[3];
         let n = self.read_params[4];
@@ -1683,6 +1702,8 @@ impl Fdc82077 {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let c = self.read_params[1];
+        // Spec: Intel 82077AA §5.2.7 — Configure EIS seeks to C first.
+        self.apply_implied_seek(head_unit, c);
         let h = self.read_params[2];
         let r = self.read_params[3];
         let n = self.read_params[4];
@@ -1750,6 +1771,8 @@ impl Fdc82077 {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let c = self.read_params[1];
+        // Spec: Intel 82077AA §5.2.7 — Configure EIS seeks to C first.
+        self.apply_implied_seek(head_unit, c);
         let h = self.read_params[2];
         let r = self.read_params[3];
         let n = self.read_params[4];
@@ -1986,6 +2009,8 @@ impl Fdc82077 {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let c = self.read_params[1];
+        // Spec: Intel 82077AA §5.2.7 — Configure EIS seeks to C first.
+        self.apply_implied_seek(head_unit, c);
         let h = self.read_params[2];
         let r = self.read_params[3];
         let n = self.read_params[4];
@@ -2099,6 +2124,8 @@ impl Fdc82077 {
         let unit = head_unit & 0x03;
         let head = (head_unit >> 2) & 0x01;
         let c = self.read_params[1];
+        // Spec: Intel 82077AA §5.2.7 — Configure EIS seeks to C first.
+        self.apply_implied_seek(head_unit, c);
         let h = self.read_params[2];
         let r = self.read_params[3];
         let n = self.read_params[4];
@@ -2233,6 +2260,32 @@ impl Fdc82077 {
     #[inline]
     fn is_format_track_command(cmd: u8) -> bool {
         cmd & FDC_CMD_OPCODE_MASK == (FDC_CMD_FORMAT_TRACK_MFM & FDC_CMD_OPCODE_MASK)
+    }
+
+    /// Perform the Configure EIS implied seek for a command that carries a
+    /// cylinder parameter.
+    ///
+    /// Spec: Intel 82077AA §5.2.7 — "EIS — Enable Implied Seek. When set to
+    /// '1', the 82077AA will perform a Seek operation before executing a Read
+    /// or Write command." A Seek leaves the selected unit's Present Cylinder
+    /// Number at the target (§5.2.8), which is what DUMPREG, Sense Drive Status
+    /// ST3 T0 and READ ID subsequently observe.
+    ///
+    /// The seek is mechanical and happens before the transfer is attempted, so
+    /// it applies even when the transfer then terminates abnormally. It is part
+    /// of the command: no separate Seek End ST0 latch is queued for Sense
+    /// Interrupt Status and no extra interrupt is generated. With EIS clear the
+    /// head does not move and the host stays responsible for an explicit
+    /// Seek / Sense Interrupt Status / READ ID sequence.
+    ///
+    /// Commands with a C parameter (Table 5-1): READ DATA, READ TRACK, READ
+    /// DELETED DATA, VERIFY, SCAN, WRITE DATA, WRITE DELETED DATA. FORMAT TRACK
+    /// has no C parameter and never implies a seek.
+    fn apply_implied_seek(&mut self, head_unit: u8, cylinder: u8) {
+        if self.configure_eis_fifo_poll_thr & FDC_CONFIG_EIS == 0 {
+            return;
+        }
+        self.pcn[usize::from(head_unit & 0x03)] = cylinder;
     }
 
     /// Begin READ ID parameter phase (1 byte HD|US). Spec: Intel 82077AA Table 5-1.
