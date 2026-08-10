@@ -1107,7 +1107,8 @@ impl Machine {
         self.cpu
             .set_gpr_u8(4 + CpuState::RDX, INT13_FLOPPY_MAX_HEAD);
         self.cpu.set_gpr_u8_low(CpuState::RDX, 1); // one floppy drive
-        self.cpu.set_gpr_u8_low(CpuState::RBX, INT13_FLOPPY_TYPE_1440); // BL
+        self.cpu
+            .set_gpr_u8_low(CpuState::RBX, INT13_FLOPPY_TYPE_1440); // BL
         self.cpu.set_al(0);
         self.cpu.set_ah(INT13_STATUS_OK);
         self.cpu.set_cf(false);
@@ -1919,10 +1920,7 @@ mod tests {
         assert_eq!(rba, 24);
         let load_seg = u16::from(m.mem.read_u8(0x500C).unwrap())
             | (u16::from(m.mem.read_u8(0x500D).unwrap()) << 8);
-        assert_eq!(
-            load_seg,
-            firmware_interface::EL_TORITO_DEFAULT_LOAD_SEGMENT
-        );
+        assert_eq!(load_seg, firmware_interface::EL_TORITO_DEFAULT_LOAD_SEGMENT);
         let sectors = u16::from(m.mem.read_u8(0x500E).unwrap())
             | (u16::from(m.mem.read_u8(0x500F).unwrap()) << 8);
         assert_eq!(sectors, 4);
