@@ -18,6 +18,7 @@
 //! QEMU fw_cfg I/O subset (0x510/0x511 traditional + 0x514 DMA read/skip/select).
 //! Classic LPT1/LPT2 parallel-port register-file stub (0x378–0x37A / 0x278–0x27A).
 //! Local APIC MMIO identity stub at 0xFEE00000 (ID/Version; no delivery).
+//! HPET MMIO capability stub at 0xFED00000 (CAPS/ID; counter stuck at 0).
 
 #![forbid(unsafe_code)]
 
@@ -26,6 +27,7 @@ mod cmos;
 mod dma;
 mod fdc;
 mod fw_cfg;
+mod hpet;
 mod i8042;
 mod ide;
 mod lapic;
@@ -89,6 +91,11 @@ pub use fw_cfg::{
     FW_CFG_SEL_WRITE, FW_CFG_SIGNATURE, FW_CFG_SIGNATURE_BYTES, FW_CFG_SYSTEM_STATES_SIZE,
     FW_CFG_SYSTEM_STATE_ENABLED, FW_CFG_TEST_FILE_BYTES, FW_CFG_TEST_FILE_NAME, FW_CFG_UUID,
     FW_CFG_UUID_SIZE, FW_CFG_VERSION, FW_CFG_VERSION_DMA,
+};
+pub use hpet::{
+    HpetMmio, HPET_CAPS_ID_VALUE, HPET_CFG_ENABLE, HPET_COUNTER_CLK_PERIOD_FS, HPET_DEFAULT_BASE,
+    HPET_NUM_TIM_CAP, HPET_REG_CAPS_ID, HPET_REG_CONFIG, HPET_REG_MAIN_COUNTER, HPET_REV_ID,
+    HPET_VENDOR_ID, HPET_WINDOW_SIZE,
 };
 pub use i8042::{
     CFG_AUX_CLOCK_DISABLE, CFG_INT1, CFG_INT12, CFG_KBD_CLOCK_DISABLE, CFG_TRANSLATE,
