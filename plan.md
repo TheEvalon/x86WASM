@@ -1322,7 +1322,10 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
-Status (2026-08-10, round-12 usb-timer lane `slice/r12-usb-timer` on base `01050d2`): **in progress -- R12 usb-timer lane.** UHCI QH horizontal depth 4 + USBSTS/USBINTR gating; LAPIC ICR presence/self-IPI stub; HPET FSB/MSI capability clear + IRQ-route honesty. See `docs/uhci-r12-*.md`, `docs/lapic-r12-icr.md`, `docs/hpet-r12-msi-irq.md`. **Not** UHCI→PIC, multi-APIC IPI, HPET MSI delivery; CPUID APIC stays clear.
+Status (2026-08-10, round-12 display-fw lane `slice/r12-display-fw` on base `01050d2`): **in progress -- R12 display-fw lane.** Host INT 10h AH=01h cursor type (BDA+CRTC), AH=09h/0Ah write char/attr, BDA columns/page/CRT-base/rows polish, VBE AX=4F00h controller-info deepen with Capabilities/VideoModePtr honesty and **no guest LFB**. See `docs/vga-r12-*.md`, `docs/firmware-r12-vbe-host-stub.md`. **Not** SeaVGABIOS VBE body; PhysBasePtr stays zero.
+
+Status (2026-08-10, round-12 usb-timer lane `slice/r12-usb-timer` on base `01050d2`): **in progress -- R12 usb-timer lane.** UHCI QH horizontal depth 4 + USBSTS/USBINTR gating; LAPIC ICR presence/self-IPI stub; HPET FSB/MSI capability clear + IRQ-route honesty. See `docs/uhci-r12-*.md`, `docs/lapic-r12-icr.md`, `docs/hpet-r12-msi-irq.md`. **Not** UHCI?PIC, multi-APIC IPI, HPET MSI delivery; CPUID APIC stays clear.
+
 
 Status (2026-08-10, round-11 parallel integration `merge/m2-r11-parallel-16` on base `b46e5f0`): **in progress -- eleventh parallel campaign merged.** Four agents landed 16 bounded slices: UHCI frame-list/PORTSC + LAPIC LVT + HPET wrap; BDA keyboard ring + APM INT15 AH=53 stub + port61 NMI + POST remeasure; INT13 AH=4A/4B + HD AH=08 + FreeDOS BDA seed + Linux header inspect; VM86 PUSH/POP Sreg + VIP/VIF-without-VME + INT3/ICEBP + opsize-32 far transfers. See `docs/m2-r11-parallel-integration.md`. **SeaBIOS POST still does not complete; every M2 exit criterion remains open.** Honesty that must survive: no real SMM; no guest LFB; no CR4.VME; FreeDOS/Linux stubs not prompt/shell; ADR-0008 table-loader absent; POST still `F000:C897`.
 
