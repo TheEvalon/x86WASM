@@ -7,6 +7,9 @@
 //! - §10.4.14 / §10.9 — Spurious Interrupt Vector Register @ `F0H`
 //! - §10.5.1 — LVT Timer @ `320H`
 //! - §10.5.4 — Timer ICR `380H`, CCR `390H`, DCR `3E0H`
+//! - §10.6 — Interrupt Command Register (ICR) @ `300H`/`310H` (R12 presence /
+//!   readback stub; single-CPU: Self shorthand may latch Fixed locally;
+//!   other destinations do not deliver)
 //! - §10.8.3 / §10.8.4 — IRR @ `200H`–`270H`, ISR @ `100H`–`170H` (32-bit
 //!   bitmaps; bit *N* = vector *N*)
 //! - §10.8.5 — EOI @ `B0H` clears the highest-priority ISR bit
@@ -21,11 +24,12 @@
 //! Priority (TPR/PPR) store/readback gates `take_interrupt` when the pending
 //! vector class is not strictly above PPR. Round-11: LVT Timer mask/vector/
 //! mode readback edge cases (mask at expiry, vector sampled at fire,
-//! reserved bits dropped). CPUID leaf 1 EDX bit 9 (`APIC`) stays clear —
+//! reserved bits dropped). Round-12: ICR low/high store/readback + optional
+//! Self Fixed IPI; CPUID leaf 1 EDX bit 9 (`APIC`) stays clear —
 //! presence ≠ advertised APIC.
 //! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`,
 //! `docs/lapic-r10-tmr.md`, `docs/lapic-r10-tpr-ppr.md`,
-//! `docs/lapic-r11-lvt-timer.md`.
+//! `docs/lapic-r11-lvt-timer.md`, `docs/lapic-r12-icr.md`.
 
 /// Default Local APIC physical base (SDM Vol. 3A §10.4.4).
 pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
@@ -63,6 +67,12 @@ pub const LAPIC_REG_SVR: u32 = 0xF0;
 /// LVT Timer Register offset (SDM §10.5.1).
 pub const LAPIC_REG_LVT_TIMER: u32 = 0x320;
 
+/// Interrupt Command Register low dword (SDM §10.6.1).
+pub const LAPIC_REG_ICR_LOW: u32 = 0x300;
+
+/// Interrupt Command Register high dword (destination field).
+pub const LAPIC_REG_ICR_HIGH: u32 = 0x310;
+
 /// Initial Count Register (timer) offset.
 pub const LAPIC_REG_TIMER_ICR: u32 = 0x380;
 
@@ -98,8 +108,53 @@ pub const LAPIC_LVT_TIMER_PERIODIC: u32 = 1 << 17;
 /// LVT vector field (bits 7:0).
 pub const LAPIC_LVT_VECTOR_MASK: u32 = 0xFF;
 
+/// ICR vector field (bits 7:0). Spec: SDM §10.6.1.
+pub const LAPIC_ICR_VECTOR_MASK: u32 = 0xFF;
+
+/// ICR Delivery Mode field (bits 10:8).
+pub const LAPIC_ICR_DELIVERY_MODE_MASK: u32 = 0x700;
+
+/// ICR Delivery Mode Fixed (`000`).
+pub const LAPIC_ICR_DELIVERY_FIXED: u32 = 0;
+
+/// ICR Destination Mode (bit 11).
+pub const LAPIC_ICR_DEST_MODE: u32 = 1 << 11;
+
+/// ICR Delivery Status (bit 12) — RO; this stub always reads Idle (0).
+pub const LAPIC_ICR_DELIVERY_STATUS: u32 = 1 << 12;
+
+/// ICR Level (bit 14).
+pub const LAPIC_ICR_LEVEL: u32 = 1 << 14;
+
+/// ICR Trigger Mode (bit 15).
+pub const LAPIC_ICR_TRIGGER: u32 = 1 << 15;
+
+/// ICR Destination Shorthand field (bits 19:18).
+pub const LAPIC_ICR_SHORTHAND_MASK: u32 = 0xC_0000;
+
+/// Destination Shorthand = Self (`01b`).
+pub const LAPIC_ICR_SHORTHAND_SELF: u32 = 0x4_0000;
+
+/// Destination Shorthand = All Including Self (`10b`).
+pub const LAPIC_ICR_SHORTHAND_ALL_INC: u32 = 0x8_0000;
+
+/// Destination Shorthand = All Excluding Self (`11b`).
+pub const LAPIC_ICR_SHORTHAND_ALL_EXC: u32 = 0xC_0000;
+
+/// Writable ICR low bits retained by this stub (Delivery Status is RO/zero).
+pub const LAPIC_ICR_LOW_WRITABLE: u32 = LAPIC_ICR_VECTOR_MASK
+    | LAPIC_ICR_DELIVERY_MODE_MASK
+    | LAPIC_ICR_DEST_MODE
+    | LAPIC_ICR_LEVEL
+    | LAPIC_ICR_TRIGGER
+    | LAPIC_ICR_SHORTHAND_MASK;
+
+/// ICR high destination field (bits 31:24).
+pub const LAPIC_ICR_DEST_FIELD_MASK: u32 = 0xFF00_0000;
+
 /// Local APIC MMIO: ID/Version + SVR + LVT Timer + timer ICR/CCR/DCR stub
-/// plus IRR/ISR/TMR bitmap readback for EOI / trigger-mode honesty.
+/// plus IRR/ISR/TMR bitmap readback for EOI / trigger-mode honesty and an
+/// Interrupt Command Register (ICR) presence/readback stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalApicMmio {
     base: u64,
@@ -119,6 +174,10 @@ pub struct LocalApicMmio {
     timer_dcr: u32,
     /// Accumulator of bus clocks toward one CCR decrement.
     divide_accum: u32,
+    /// Interrupt Command Register low (writable fields; Delivery Status RO 0).
+    icr_low: u32,
+    /// Interrupt Command Register high (destination bits 31:24).
+    icr_high: u32,
     /// Latched local interrupt vector awaiting [`Self::take_interrupt`].
     pending_vector: Option<u8>,
     /// In-service vector after accept (cleared by EOI). Mirrors highest ISR.
@@ -153,6 +212,8 @@ impl LocalApicMmio {
             timer_ccr: 0,
             timer_dcr: 0, // divide by 2
             divide_accum: 0,
+            icr_low: 0,
+            icr_high: 0,
             pending_vector: None,
             in_service: None,
             irr: [0; 8],
@@ -218,6 +279,16 @@ impl LocalApicMmio {
 
     pub fn timer_dcr(&self) -> u32 {
         self.timer_dcr
+    }
+
+    /// ICR low dword as last written (Delivery Status always reads 0 / Idle).
+    pub fn icr_low(&self) -> u32 {
+        self.icr_low & LAPIC_ICR_LOW_WRITABLE
+    }
+
+    /// ICR high dword (destination field bits 31:24).
+    pub fn icr_high(&self) -> u32 {
+        self.icr_high & LAPIC_ICR_DEST_FIELD_MASK
     }
 
     /// Read one IRR dword (index 0..=7 → offsets `200H`..`270H`).
@@ -289,6 +360,8 @@ impl LocalApicMmio {
             LAPIC_REG_EOI => 0,
             LAPIC_REG_SVR => self.svr,
             LAPIC_REG_LVT_TIMER => self.lvt_timer,
+            LAPIC_REG_ICR_LOW => self.icr_low(),
+            LAPIC_REG_ICR_HIGH => self.icr_high(),
             LAPIC_REG_TIMER_ICR => self.timer_icr,
             LAPIC_REG_TIMER_CCR => self.timer_ccr,
             LAPIC_REG_TIMER_DCR => self.timer_dcr & 0xB, // bits 3,1,0
@@ -418,6 +491,30 @@ impl LocalApicMmio {
         }
     }
 
+    /// Dispatch a just-written ICR command (single-CPU honesty).
+    ///
+    /// Spec: SDM §10.6.1 — writing ICR low issues the IPI. This single-CPU
+    /// stub only delivers when Destination Shorthand is Self (or All Including
+    /// Self) **and** Delivery Mode is Fixed: it latches the vector via
+    /// [`Self::inject_fixed`]. All Excluding Self, physical/logical destination
+    /// fields, INIT/SIPI/NMI/SMI, and multi-APIC delivery are no-ops
+    /// (presence/readback only). CPUID.APIC remains clear by policy.
+    fn try_dispatch_icr(&mut self) {
+        let shorthand = self.icr_low & LAPIC_ICR_SHORTHAND_MASK;
+        let delivery = self.icr_low & LAPIC_ICR_DELIVERY_MODE_MASK;
+        if delivery != LAPIC_ICR_DELIVERY_FIXED {
+            return;
+        }
+        match shorthand {
+            LAPIC_ICR_SHORTHAND_SELF | LAPIC_ICR_SHORTHAND_ALL_INC => {
+                let vector = (self.icr_low & LAPIC_ICR_VECTOR_MASK) as u8;
+                let _ = self.inject_fixed(vector);
+            }
+            // No shorthand / All Excluding Self / other: single-CPU → no delivery.
+            _ => {}
+        }
+    }
+
     /// Advance the local APIC timer by `bus_clocks` (host-driven).
     ///
     /// Returns `true` if this tick newly latched a local interrupt.
@@ -482,6 +579,17 @@ impl LocalApicMmio {
                 // junk bits are dropped so readback matches the stub mask.
                 self.lvt_timer =
                     value & (LAPIC_LVT_VECTOR_MASK | LAPIC_LVT_MASK | LAPIC_LVT_TIMER_PERIODIC);
+            }
+            LAPIC_REG_ICR_HIGH => {
+                // Spec: SDM §10.6.1 — destination field bits 31:24.
+                self.icr_high = value & LAPIC_ICR_DEST_FIELD_MASK;
+            }
+            LAPIC_REG_ICR_LOW => {
+                // Spec: SDM §10.6.1 — writing ICR low issues the IPI command.
+                // Delivery Status (bit 12) is RO and always Idle in this stub
+                // (command completes immediately with no pending queue).
+                self.icr_low = value & LAPIC_ICR_LOW_WRITABLE;
+                self.try_dispatch_icr();
             }
             LAPIC_REG_TIMER_ICR => {
                 self.timer_icr = value;
@@ -887,5 +995,82 @@ mod tests {
         assert_eq!(lapic.take_interrupt(), Some(0x42));
         // Periodic reload after fire.
         assert_eq!(lapic.timer_ccr(), 3);
+    }
+
+    /// Spec: SDM §10.6.1 — ICR high/low store/readback; Delivery Status RO Idle.
+    #[test]
+    fn icr_store_readback_drops_delivery_status() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_ICR_HIGH, 0xAB00_0000 | 0x00FF_FFFF);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_ICR_HIGH), 0xAB00_0000);
+        assert_eq!(lapic.icr_high(), 0xAB00_0000);
+
+        // Include Delivery Status bit 12 in the write — must not stick.
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_ICR_LOW,
+            0x20 | LAPIC_ICR_DELIVERY_STATUS | LAPIC_ICR_SHORTHAND_SELF,
+        );
+        let low = read_u32(&lapic, LAPIC_REG_ICR_LOW);
+        assert_eq!(low & LAPIC_ICR_DELIVERY_STATUS, 0, "Delivery Status RO Idle");
+        assert_eq!(low & LAPIC_ICR_VECTOR_MASK, 0x20);
+        assert_eq!(low & LAPIC_ICR_SHORTHAND_MASK, LAPIC_ICR_SHORTHAND_SELF);
+    }
+
+    /// Spec: SDM §10.6.1 — Self Fixed shorthand latches local vector (optional self-IPI).
+    #[test]
+    fn icr_self_fixed_latches_local_vector() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_ICR_LOW,
+            0x33 | LAPIC_ICR_DELIVERY_FIXED | LAPIC_ICR_SHORTHAND_SELF,
+        );
+        assert_eq!(lapic.pending_vector(), Some(0x33));
+        assert!(lapic.irr_bit(0x33));
+        assert_eq!(lapic.take_interrupt(), Some(0x33));
+    }
+
+    /// Spec: SDM §10.6.1 — no shorthand / All Excluding Self: single-CPU no delivery.
+    #[test]
+    fn icr_no_shorthand_and_all_excluding_self_no_delivery() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_ICR_HIGH, 0x0100_0000); // dest APIC ID 1
+        write_u32(&mut lapic, LAPIC_REG_ICR_LOW, 0x44); // Fixed, no shorthand
+        assert!(lapic.pending_vector().is_none());
+        assert!(!lapic.irr_bit(0x44));
+
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_ICR_LOW,
+            0x55 | LAPIC_ICR_SHORTHAND_ALL_EXC,
+        );
+        assert!(lapic.pending_vector().is_none());
+        assert!(!lapic.irr_bit(0x55));
+        // Command still stored for firmware probe.
+        assert_eq!(
+            read_u32(&lapic, LAPIC_REG_ICR_LOW) & LAPIC_ICR_VECTOR_MASK,
+            0x55
+        );
+    }
+
+    /// Spec: SDM §10.6.1 — non-Fixed delivery modes are presence-only (no latch).
+    #[test]
+    fn icr_nmi_delivery_mode_no_latch() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        // Delivery Mode NMI = 100b.
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_ICR_LOW,
+            0x20 | (0b100 << 8) | LAPIC_ICR_SHORTHAND_SELF,
+        );
+        assert!(lapic.pending_vector().is_none());
+        assert_eq!(
+            read_u32(&lapic, LAPIC_REG_ICR_LOW) & LAPIC_ICR_DELIVERY_MODE_MASK,
+            0b100 << 8
+        );
     }
 }
