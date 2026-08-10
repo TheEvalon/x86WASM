@@ -194,7 +194,7 @@ impl IoApicMmio {
                 let entry = (idx - IOAPIC_IND_REDTBL0) as usize;
                 if entry < self.redtbl.len() {
                     // Remote IRR is hardware-owned on low dwords (even indices).
-                    if entry % 2 == 0 {
+                    if entry.is_multiple_of(2) {
                         let remote = self.redtbl[entry] & IOAPIC_RTE_REMOTE_IRR;
                         self.redtbl[entry] = (value & !IOAPIC_RTE_REMOTE_IRR) | remote;
                     } else {

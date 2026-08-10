@@ -241,8 +241,8 @@ where
             }
         }
         UHCI_PID_OUT | UHCI_PID_SETUP => {
-            for i in 0..n {
-                device_buf[i] = mem_read(buffer.wrapping_add(i as u32));
+            for (i, slot) in device_buf.iter_mut().enumerate().take(n) {
+                *slot = mem_read(buffer.wrapping_add(i as u32));
             }
         }
         other => return Err(UhciTdError::UnsupportedPid(other)),
