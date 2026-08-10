@@ -207,12 +207,9 @@ impl<'a> PagedBus<'a> {
             inner,
             mmu,
             ctx,
-            cpl: if cr0_pe(cpu) {
-                (cpu.cs.selector & 3) as u8
-            } else {
-                // Real-address mode executes at CPL 0 (SDM Vol. 3 §5.5).
-                0
-            },
+            // Virtual-8086 mode forces CPL 3 regardless of CS[1:0]
+            // (SDM Vol. 3 §5.5, §20.1.1).
+            cpl: architectural_cpl(cpu),
             restart_point: None,
         }
     }
@@ -1757,6 +1754,136 @@ fn cr0_pe(cpu: &CpuState) -> bool {
     cpu.cr0 & 1 != 0
 }
 
+/// `EFLAGS.VM` — virtual-8086 mode (SDM Vol. 1 §3.4.3; Vol. 3 §20.1).
+const EFLAGS_VM: u64 = 1 << 17;
+/// `EFLAGS.NT` (nested task).
+const EFLAGS_NT: u64 = 1 << 14;
+
+fn eflags_vm(rflags: u64) -> bool {
+    rflags & EFLAGS_VM != 0
+}
+
+fn eflags_iopl(rflags: u64) -> u8 {
+    ((rflags >> 12) & 3) as u8
+}
+
+/// `#GP(0)` when `CLI`/`STI` lack sufficient IOPL privilege (no VME/PVI).
+///
+/// Real-address mode always succeeds. Protected mode (VM=0): require
+/// `IOPL ≥ CPL`. Virtual-8086 mode: require `IOPL = 3` (CPL is forced to 3).
+/// Spec: Intel SDM Vol. 2 "CLI"/"STI" Table 3-7; Vol. 3 §20.2.1.
+fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        return Ok(());
+    }
+    let cpl = architectural_cpl(cpu);
+    if eflags_iopl(cpu.rflags) >= cpl {
+        Ok(())
+    } else {
+        Err(arch_fault_with_error_code(13, 0))
+    }
+}
+
+/// Pop FLAGS/EFLAGS with IOPL/IF privilege masking.
+///
+/// VM86 without VME: `IOPL < 3` → `#GP(0)`. Otherwise load permitted bits;
+/// `VM`/`RF` are never taken from the image; RF is cleared; bit 1 stays set.
+/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2.
+fn popf_execute(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    operand_size_32: bool,
+) -> Result<(), ExecError> {
+    if cr0_pe(cpu) && eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    let image = if operand_size_32 {
+        u64::from(pop32(cpu, bus)?)
+    } else {
+        u64::from(pop16(cpu, bus)?)
+    };
+
+    let cpl = architectural_cpl(cpu);
+    let iopl = eflags_iopl(cpu.rflags);
+    let vm = eflags_vm(cpu.rflags);
+
+    // Bits always loadable from the image width (status/control except IF/IOPL).
+    // Low-word changeable: CF PF AF ZF SF TF DF OF NT (+ IF/IOPL conditionally).
+    const STATUS16: u64 = 0x08D5; // CF PF AF ZF SF TF DF OF (no IF/IOPL/NT yet)
+    const NT_BIT: u64 = 1 << 14;
+    const IF_BIT: u64 = 1 << 9;
+    const IOPL_BITS: u64 = 3 << 12;
+    // High dword changeable at CPL 0 (32-bit opsize): AC ID (VIF/VIP never from POPF).
+    const HIGH_CPL0: u64 = (1 << 18) | (1 << 21); // AC | ID
+
+    let mut change = STATUS16 | NT_BIT;
+    if operand_size_32 {
+        // RF is architecturally cleared after POPF; VM never loads from image.
+        if cpl == 0 && !vm {
+            change |= HIGH_CPL0;
+        } else if !vm {
+            // CPL > 0 protected: AC and ID still changeable on 32-bit POPF.
+            change |= HIGH_CPL0;
+        }
+        // VM86 IOPL=3: all non-reserved except IOPL/VIP/VIF/VM/RF — IF yes.
+        if vm {
+            change |= IF_BIT;
+        }
+    }
+
+    if !vm {
+        if cpl == 0 {
+            change |= IOPL_BITS | IF_BIT;
+        } else {
+            // IOPL never changes at CPL > 0.
+            if cpl <= iopl {
+                change |= IF_BIT;
+            }
+        }
+    } else {
+        // VM86 with IOPL=3: IF may change; IOPL may not.
+        change |= IF_BIT;
+    }
+
+    let mask = if operand_size_32 {
+        change
+    } else {
+        change & 0xFFFF
+    };
+
+    // Preserve bits outside the writable set, including VM/RF/VIP/VIF and
+    // upper RFLAGS. Clear RF after POPF (SDM Vol. 2 POPF note).
+    let preserve = !mask;
+    let mut new_flags = (cpu.rflags & preserve) | (image & mask) | 2;
+    new_flags &= !(1 << 16); // RF := 0
+                             // Keep VM sticky (never from image).
+    if vm {
+        new_flags |= EFLAGS_VM;
+    } else {
+        new_flags &= !EFLAGS_VM;
+    }
+    if operand_size_32 {
+        cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | (new_flags & 0xFFFF_FFFF);
+    } else {
+        cpu.rflags = (cpu.rflags & !0xFFFF) | (new_flags & 0xFFFF);
+    }
+    Ok(())
+}
+
+/// Architectural CPL: 0 in real-address mode, 3 while `EFLAGS.VM=1`, else CS.RPL.
+///
+/// Spec: Intel SDM Vol. 3 §5.5; §20.1.1 (VM86 forces CPL 3; CS[1:0] is not RPL).
+fn architectural_cpl(cpu: &CpuState) -> u8 {
+    if !cr0_pe(cpu) {
+        0
+    } else if eflags_vm(cpu.rflags) {
+        3
+    } else {
+        (cpu.cs.selector & 3) as u8
+    }
+}
+
 /// Null selector: index=0 and TI=0 (values 0000–0003). Spec: SDM Vol. 3 §3.4.2.
 fn is_null_selector(selector: u16) -> bool {
     selector & 0xFFFC == 0
@@ -2105,7 +2232,8 @@ fn call_gate_far_call(
     Ok(())
 }
 
-/// Protected-mode `IRET` / `IRETD`: nested-task return, same-CPL, or outer return.
+/// Protected-mode `IRET` / `IRETD`: nested-task return, same-CPL, outer return,
+/// or return to virtual-8086 mode.
 ///
 /// When `NT=1`, perform an IRET-form hardware task switch to the previous-task
 /// link (Vol. 3 §7.3) instead of popping a stack frame. `next_ip` is the EIP
@@ -2117,24 +2245,27 @@ fn call_gate_far_call(
 /// the frame also carries outer `ESP`/`SS`, which are validated and loaded so
 /// CPL drops to the return RPL (Vol. 2 IRET; Vol. 3 §6.12.1).
 ///
+/// When the 32-bit EFLAGS image has `VM=1` and the instruction runs at CPL 0,
+/// the processor returns to virtual-8086 mode from the 9-dword PL0 frame
+/// (EIP/CS/EFLAGS/ESP/SS/ES/DS/FS/GS) and forces CPL 3 (Vol. 2 IRET
+/// RETURN-TO-VIRTUAL-8086-MODE; Vol. 3 §20.2 Figure 20-4).
+///
 /// Non-nested returns still require the instruction itself to execute at CPL 0.
-/// `VM=1` (virtual-8086 IRET) remains unsupported.
+/// `IRET` while already in VM86 is handled by [`vm86_iret`].
 ///
 /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ; Vol. 1 §3.4.3; Vol. 3
-/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13, 7.3.
+/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13, 7.3, 20.2–20.3.
 fn protected_iret(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
     operand_size_32: bool,
     next_ip: u32,
 ) -> Result<(), ExecError> {
-    if cpu.rflags & (1 << 17) != 0 {
-        return Err(ExecError::Unsupported(0xCF));
-    }
-    if cpu.rflags & (1 << 14) != 0 {
+    debug_assert!(!eflags_vm(cpu.rflags), "VM86 IRET must use vm86_iret");
+    if cpu.rflags & EFLAGS_NT != 0 {
         return task_switch(cpu, bus, TaskSwitchCause::Iret, None, next_ip);
     }
-    if cpu.cs.selector & 3 != 0 {
+    if architectural_cpl(cpu) != 0 {
         return Err(ExecError::Unsupported(0xCF));
     }
     let cpl = 0u8;
@@ -2163,9 +2294,9 @@ fn protected_iret(
     let target_ip = slots[0];
     let selector = slots[1] as u16;
     let flags = slots[2];
-    // Returning to virtual-8086 mode is a separate milestone.
-    if operand_size_32 && flags & (1 << 17) != 0 {
-        return Err(ExecError::Unsupported(0xCF));
+    // CPL 0 + 32-bit operand size + VM in the image → VM86 enter.
+    if operand_size_32 && eflags_vm(u64::from(flags)) {
+        return return_to_virtual_8086_mode(cpu, bus, old_sp, target_ip, selector, flags);
     }
 
     if is_null_selector(selector) {
@@ -2235,8 +2366,8 @@ fn protected_iret(
 
     // Defined flag bits at CPL 0: CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL, NT
     // in the low word, plus RF, AC, VIF, VIP, and ID in the high word. VM is
-    // excluded — a `VM=1` image was rejected above. Reserved bits 3, 5, and 15
-    // stay clear and bit 1 stays set (SDM Vol. 1 §3.4.3, Figure 3-8).
+    // excluded — a `VM=1` image took the VM86 path above. Reserved bits 3, 5,
+    // and 15 stay clear and bit 1 stays set (SDM Vol. 1 §3.4.3, Figure 3-8).
     const DEFINED_FLAGS16: u64 = 0x7FD5;
     const DEFINED_FLAGS32: u64 = 0x003D_7FD5;
     let temp_sp = stack_step(cpu, old_sp, (if outer { 5 } else { 3 }) * entry_size as i32);
@@ -2259,6 +2390,118 @@ fn protected_iret(
         }
     } else {
         set_stack_pointer(cpu, temp_sp);
+    }
+    Ok(())
+}
+
+/// `IRETD` return to virtual-8086 mode from CPL 0 (9-dword PL0 frame).
+///
+/// Frame order at increasing addresses: EIP, CS, EFLAGS, ESP, SS, ES, DS, FS,
+/// GS. Segment registers are loaded with real-address bases (`selector << 4`).
+/// Architectural CPL becomes 3 via `EFLAGS.VM=1`.
+///
+/// Unsupported here: VME/PVI (`CR4` bits stay reserved/clear; CPUID does not
+/// advertise them); VM86 interrupt/exception delivery that builds this frame;
+/// 16-bit `IRET` enter (VM lives in EFLAGS[31:16]).
+///
+/// Spec: Intel SDM Vol. 2 "IRET/IRETD" RETURN-TO-VIRTUAL-8086-MODE; Vol. 3
+/// §§20.2–20.3 Figure 20-4; Vol. 3 §3.4.2 (real-mode base).
+fn return_to_virtual_8086_mode(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    old_sp: u32,
+    eip: u32,
+    cs_sel: u16,
+    eflags: u32,
+) -> Result<(), ExecError> {
+    // Slots 0..2 already validated by the caller; read ESP/SS/ES/DS/FS/GS.
+    let mut extra = [0u32; 6];
+    for (index, slot) in extra.iter_mut().enumerate() {
+        let stack_offset = stack_step(cpu, old_sp, ((index + 3) as i32) * 4);
+        let addr = seg_linear_checked(&cpu.ss, u64::from(stack_offset), 4, true)?;
+        *slot = bus
+            .read_u32(addr)
+            .map_err(|error| classify_mem_fault(error, true))?;
+    }
+    let new_esp = extra[0];
+    let new_ss = extra[1] as u16;
+    let new_es = extra[2] as u16;
+    let new_ds = extra[3] as u16;
+    let new_fs = extra[4] as u16;
+    let new_gs = extra[5] as u16;
+
+    // Real-mode-style CS limit is 64 KiB (Vol. 3 §3.4.2 / §20.1.3).
+    if eip > 0xFFFF {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    // Defined EFLAGS bits including VM (bit 17). Same mask as CPL-0 IRETD
+    // plus VM, which the non-VM86 path deliberately excludes.
+    const DEFINED_FLAGS32_WITH_VM: u64 = 0x003F_7FD5;
+
+    cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+    cpu.ss = x86_core::SegmentReg::real_mode(new_ss);
+    cpu.es = x86_core::SegmentReg::real_mode(new_es);
+    cpu.ds = x86_core::SegmentReg::real_mode(new_ds);
+    cpu.fs = x86_core::SegmentReg::real_mode(new_fs);
+    cpu.gs = x86_core::SegmentReg::real_mode(new_gs);
+    cpu.rip = u64::from(eip);
+    cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | (u64::from(eflags) & DEFINED_FLAGS32_WITH_VM) | 2;
+    // ESP image is a full dword; subsequent VM86 stack ops use SP when B=0.
+    cpu.set_gpr_u32(CpuState::RSP, new_esp);
+    Ok(())
+}
+
+/// `IRET`/`IRETD` while already in virtual-8086 mode.
+///
+/// Without VME: `IOPL < 3` → `#GP(0)`; `IOPL = 3` → real-mode-like pop that
+/// leaves `VM`/`IOPL`/`VIP`/`VIF` unchanged (Vol. 2 IRET
+/// RETURN-FROM-VIRTUAL-8086-MODE). Leaving VM86 entirely requires a privilege
+/// transition to CPL 0 (interrupt/task) then `IRETD` with `VM=0` in the image —
+/// interrupt delivery that builds the 9-dword frame remains unsupported.
+///
+/// Spec: Intel SDM Vol. 2 "IRET/IRETD"; Vol. 3 §20.2.3 / ch.20.
+fn vm86_iret(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    operand_size_32: bool,
+) -> Result<(), ExecError> {
+    if eflags_iopl(cpu.rflags) < 3 {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    // Preserve VM, IOPL, VIP, VIF across the flag load (Vol. 2 RETURN-FROM-VM86).
+    const STICKY_HIGH: u64 = EFLAGS_VM | (3 << 12) | (1 << 19) | (1 << 20);
+
+    if operand_size_32 {
+        let eip = pop32(cpu, bus)?;
+        let cs_raw = pop32(cpu, bus)?;
+        let flags = pop32(cpu, bus)?;
+        let cs_sel = cs_raw as u16;
+        if eip > 0xFFFF {
+            return Err(arch_fault_with_error_code(13, 0));
+        }
+        let sticky = cpu.rflags & STICKY_HIGH;
+        // Load defined bits except the sticky VM/IOPL/VIP/VIF set.
+        // RF (bit 16) is architecturally cleared after IRET (Vol. 2).
+        const DEFINED32_NO_RF: u64 = 0x003C_7FD5;
+        cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+        cpu.rip = u64::from(eip);
+        cpu.rflags = (cpu.rflags & !0xFFFF_FFFF)
+            | (u64::from(flags) & DEFINED32_NO_RF & !STICKY_HIGH)
+            | sticky
+            | 2;
+    } else {
+        let ip = pop16(cpu, bus)?;
+        let cs_sel = pop16(cpu, bus)?;
+        let flags = pop16(cpu, bus)?;
+        let sticky_iopl = cpu.rflags & (3 << 12);
+        cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+        cpu.set_ip16(ip);
+        // Low FLAGS without IOPL; IOPL sticky. VM lives in high word.
+        const DEFINED16_NO_IOPL: u64 = 0x4FD5; // excludes IOPL bits 13:12
+        cpu.rflags =
+            (cpu.rflags & !0xFFFF) | (u64::from(flags) & DEFINED16_NO_IOPL) | sticky_iopl | 2;
     }
     Ok(())
 }
@@ -4233,11 +4476,11 @@ fn write_msr(cpu: &mut CpuState, index: u32, value: u64) -> bool {
 
 /// `#GP(0)` unless the processor is at CPL 0.
 ///
-/// Real-address mode always runs at CPL 0, so only a `PE=1` non-zero `CS` RPL
-/// faults. Spec: Intel SDM Vol. 2 "INVD"/"WBINVD"/"RDMSR"/"WRMSR" (Protected
-/// Mode Exceptions); Vol. 3 §5.5.
+/// Real-address mode always runs at CPL 0. Virtual-8086 mode forces CPL 3, so
+/// it faults even when CS[1:0] looks like RPL 0. Spec: Intel SDM Vol. 2
+/// "INVD"/"WBINVD"/"RDMSR"/"WRMSR" (Protected Mode Exceptions); Vol. 3 §5.5.
 fn require_cpl0(cpu: &CpuState) -> Result<(), ExecError> {
-    if cr0_pe(cpu) && cpu.cs.selector & 3 != 0 {
+    if architectural_cpl(cpu) != 0 {
         return Err(arch_fault_with_error_code(13, 0));
     }
     Ok(())
@@ -6459,10 +6702,16 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0xFA => {
+            // CLI — Spec: Intel SDM Vol. 2 "CLI" Table 3-7; Vol. 3 §20.2.1.
+            // Unsupported: VME/PVI (`CR4` reserved; CPUID clear) → no VIF path.
+            require_iopl_for_cli_sti(cpu)?;
             cpu.set_interrupt_flag(false);
             set_current_ip(cpu, next_ip);
         }
         0xFB => {
+            // STI — Spec: Intel SDM Vol. 2 "STI" Table 3-8; Vol. 3 §20.2.1.
+            // Unsupported: VME/PVI VIF path; interrupt-shadow delay after STI.
+            require_iopl_for_cli_sti(cpu)?;
             cpu.set_interrupt_flag(true);
             set_current_ip(cpu, next_ip);
         }
@@ -6914,8 +7163,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0x9C => {
-            // PUSHF/PUSHFD — Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ"; Ch. 2 (66H).
-            // Real-address mode: push FLAGS (16) or EFLAGS (32). Unsupported: PUSHFQ.
+            // PUSHF/PUSHFD — Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ".
+            // VM86 without VME: IOPL < 3 → #GP(0) (Vol. 3 §20.2.2).
+            // Unsupported: PUSHFQ; VME VIP/VIF push masking.
+            if cr0_pe(cpu) && eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
+                return Err(arch_fault_with_error_code(13, 0));
+            }
             if opsz32(&insn) {
                 push32(cpu, bus, cpu.rflags as u32)?;
             } else {
@@ -6924,18 +7177,10 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0x9D => {
-            // POPF/POPFD — Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ"; Ch. 2 (66H).
-            // Real-address mode: VM and RF unaffected; reserved bit 1 stays set.
-            // Unsupported here: IOPL/VIP/VIF privilege masking (protected / V86); POPFQ.
-            if opsz32(&insn) {
-                let flags = pop32(cpu, bus)?;
-                let vm_rf = cpu.rflags & ((1 << 16) | (1 << 17));
-                cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | u64::from(flags) | 2;
-                cpu.rflags = (cpu.rflags & !((1 << 16) | (1 << 17))) | vm_rf;
-            } else {
-                let flags = pop16(cpu, bus)?;
-                cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
-            }
+            // POPF/POPFD — Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ"; Vol. 3
+            // §20.2.2. Privilege masks IOPL/IF; VM/RF never loaded from image.
+            // Unsupported: POPFQ; VME 16-bit POPF with IOPL<3.
+            popf_execute(cpu, bus, opsz32(&insn))?;
             set_current_ip(cpu, next_ip);
         }
         0x9E => {
@@ -6997,7 +7242,11 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // IRET/IRETD — Spec: Intel SDM Vol. 2 "IRET/IRETD/IRETQ".
             // The effective operand size selects the 6-byte or 12-byte frame.
             if cr0_pe(cpu) {
-                protected_iret(cpu, bus, opsz32(&insn), next_ip)?;
+                if eflags_vm(cpu.rflags) {
+                    vm86_iret(cpu, bus, opsz32(&insn))?;
+                } else {
+                    protected_iret(cpu, bus, opsz32(&insn), next_ip)?;
+                }
             } else {
                 // Preserve the existing real-address 16-bit stack-frame path.
                 // Real-address `IRETD` (`0x66 CF`, 12-byte frame) is not modeled.
@@ -15589,9 +15838,9 @@ mod tests {
 
     /// PUSHFD/POPFD round-trip in real-address mode (opsize 32).
     /// Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ", "POPF/POPFD/POPFQ"; Ch. 2 (66H).
-    /// VM and RF are unaffected by POPFD in real-address mode.
+    /// `VM` is unaffected by POPFD; `RF` is cleared after POPF (Vol. 2 POPF note).
     #[test]
-    fn pushfd_popfd_round_trip_preserves_vm_rf() {
+    fn pushfd_popfd_round_trip_preserves_vm_clears_rf() {
         let mut mem = vec![0u8; 0x10000];
         mem[0] = 0x66;
         mem[1] = 0x9C; // PUSHFD
@@ -15605,7 +15854,7 @@ mod tests {
         cpu.rip = 0;
         let sp0 = 0xFFFE_u16;
         cpu.set_gpr_u16(CpuState::RSP, sp0);
-        // CF+PF+AF+ZF+SF+IF+OF + synthetic VM/RF that must survive POPFD.
+        // CF+PF+AF+ZF+SF+IF+OF + synthetic VM/RF.
         cpu.rflags = 0x0002_0AD7 | (1 << 16) | (1 << 17);
         let flags_before = cpu.rflags;
         let mut bus = VecBus { mem, ports: vec![] };
@@ -15621,10 +15870,10 @@ mod tests {
         cpu.rflags = (1 << 16) | (1 << 17) | 2;
         step(&mut cpu, &mut bus).unwrap(); // POPFD
         assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
-        // Lower image restored (bit 1 forced); VM/RF unchanged from pre-POPFD.
+        // Lower image restored (bit 1 forced); VM sticky; RF cleared.
         assert_eq!(cpu.rflags & 0xFFFF, u64::from(flags_before as u16 | 2));
-        assert_ne!(cpu.rflags & (1 << 16), 0); // RF
-        assert_ne!(cpu.rflags & (1 << 17), 0); // VM
+        assert_eq!(cpu.rflags & (1 << 16), 0); // RF cleared
+        assert_ne!(cpu.rflags & (1 << 17), 0); // VM preserved
     }
 
     /// RET iw / RETF iw release stack bytes after the return frame.
@@ -21123,21 +21372,39 @@ mod tests {
         assert_eq!(cpu, before, "EIP past limit committed state");
     }
 
-    /// Returning to virtual-8086 mode (`VM=1` in the popped image) remains
-    /// outside this path and is reported rather than silently ignored.
-    /// Nested-task `NT=1` returns are covered by `cpu_r8_iret_nt`.
-    /// Spec: Intel SDM Vol. 2 "IRET/IRETD" (Operation); Vol. 3 §§6.12.1, 20.2.
+    /// Returning to virtual-8086 mode is covered by `cpu_r9_vm86_enter`.
+    /// A 3-dword frame with `VM=1` is incomplete (needs ESP/SS/ES/DS/FS/GS) and
+    /// must not silently ignore the VM bit. Spec: Intel SDM Vol. 2 "IRET/IRETD"
+    /// RETURN-TO-VIRTUAL-8086-MODE; Vol. 3 §20.2.
     #[test]
-    fn protected_iretd_rejects_vm86_return_image() {
+    fn protected_iretd_vm86_image_requires_nine_dword_frame() {
         let descriptor = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
-        let (mut cpu, mut bus) =
-            pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002 | (1 << 17), descriptor);
-        let before = cpu.clone();
-        assert_eq!(
-            step_inner(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xCF))
-        );
-        assert_eq!(cpu, before);
+        // Only three dwords are on the stack; slots 3..8 read as zero and would
+        // form a vacuous VM86 state — ensure ESP advances past a full 9-dword
+        // frame when VM is set (36 bytes), not the protected 3-dword path.
+        let (mut cpu, mut bus) = pm32_iretd_fixture(0x0100, 0x1000, 0x0002 | (1 << 17), descriptor);
+        // Extend the stack image with the remaining six dwords of a VM86 frame.
+        let frame = (PM32_TEST_ESP - 36) as usize;
+        let eip = 0x0100u32.to_le_bytes();
+        let cs = 0x1000u32.to_le_bytes();
+        let flags = (0x0002u32 | (1 << 17)).to_le_bytes();
+        bus.mem[frame..frame + 4].copy_from_slice(&eip);
+        bus.mem[frame + 4..frame + 8].copy_from_slice(&cs);
+        bus.mem[frame + 8..frame + 12].copy_from_slice(&flags);
+        for i in 0..6 {
+            bus.mem[frame + 12 + i * 4..frame + 16 + i * 4]
+                .copy_from_slice(&(0x2000u32 + i as u32 * 0x1000).to_le_bytes());
+        }
+        // SS/ESP for VM86: selector 0x2000, SP 0xFFFE (encoded in first extra dword).
+        bus.mem[frame + 12..frame + 16].copy_from_slice(&0xFFFEu32.to_le_bytes());
+        bus.mem[frame + 16..frame + 20].copy_from_slice(&0x2000u32.to_le_bytes());
+        cpu.set_gpr_u32(CpuState::RSP, PM32_TEST_ESP - 36);
+
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 17), 0);
+        assert_eq!(cpu.cs.selector, 0x1000);
+        assert_eq!(cpu.cs.base, 0x1000 << 4);
+        assert_eq!(cpu.rip, 0x0100);
     }
 
     /// A stack-limit fault during the 32-bit frame load leaves the CPU
