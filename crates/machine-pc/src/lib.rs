@@ -1048,6 +1048,21 @@ impl Machine {
         self.sync_com2_irq3();
     }
 
+    /// Consume an ACPI soft-off request latched by `PM1a_CNT` `SLP_EN` + S5 typ.
+    ///
+    /// Spec: ACPI PM1_CNT sleep enable; model docs/acpi-r8-pm1-sleep.md.
+    /// Same take pattern as 8042/`0x92` system-reset — host decides what to do.
+    pub fn take_acpi_power_off_request(&mut self) -> bool {
+        self.pci.take_acpi_power_off_request()
+    }
+
+    /// Consume a non-S5 ACPI sleep request (`SLP_TYP`), if any.
+    ///
+    /// Spec: ACPI PM1_CNT; no resume path in this tree (docs/acpi-r8-pm1-sleep.md).
+    pub fn take_acpi_sleep_request(&mut self) -> Option<u8> {
+        self.pci.take_acpi_sleep_request()
+    }
+
     /// Assert/deassert a software PIRQA–PIRQD line and sync through PIRQRC to DualPic.
     ///
     /// Spec: Intel 82371SB — PIRQ# → ISA IRQ selected by PIRQRC[A:D] when bit7

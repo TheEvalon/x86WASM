@@ -120,8 +120,9 @@
 //!   Advance via [`PciConfig::tick_acpi_pm`] (preferred machine hook: 3 PM
 //!   ticks per PIT step-clock) or by writing the same `acpi_pm_io` bytes. SCI
 //!   level is `(STS & EN)` while `SCI_EN` is set, reported via
-//!   [`PciConfig::acpi_sci_asserted`]; no PIC/APIC wire, SMI, GPE, or
-//!   sleep-state machine.
+//!   [`PciConfig::acpi_sci_asserted`]; no PIC/APIC wire, SMI, or GPE.
+//!   `PM1a_CNT` `SLP_EN` + `SLP_TYP` latches a host soft-off / sleep request
+//!   (docs/acpi-r8-pm1-sleep.md); there is still no S3 resume machine.
 //!
 //! - PIIX USB UHCI BAR0 I/O decode: when Command.IO is set and UHCI BAR0 has
 //!   I/O form (bit0), the 32-byte UHCI register block at `BAR0 & 0xFFE0` is a
@@ -171,8 +172,9 @@
 //!   stubs. Guest BMICOM.SSBM and ATA READ|WRITE DMA do not start transfers;
 //!   see `docs/pci-r4-bar-sizing-and-enumeration.md`.
 //! - USB host controller (UHCI frame list / ports / IRQ)
-//! - ACPI SCI delivery onto the interrupt controller / SMI / GPE / sleep-state
-//!   transitions (`SLP_EN`) / ACPI tables
+//! - ACPI SCI delivery onto the interrupt controller / SMI / GPE / ACPI tables
+//! - S1–S4 enter/exit and resume (SLP_EN only latches host soft-off / sleep
+//!   request; see docs/acpi-r8-pm1-sleep.md)
 //! - Capability lists, MSI, PCIe, hotplug
 //! - IDE BARs tied to `IdePrimary` ports (legacy fixed ports remain)
 //! - PAM *effect*: programming PAM0–PAM6 changes only this register file and
@@ -949,11 +951,25 @@ pub const ACPI_PM1_CNT_SCI_EN: u16 = 1 << 0;
 pub const ACPI_PM1_CNT_GBL_RLS: u16 = 1 << 2;
 /// PM1_CNT bits [12:10]: SLP_TYPx field.
 pub const ACPI_PM1_CNT_SLP_TYP_MASK: u16 = 0x1C00;
-/// PM1_CNT bit 13: SLP_EN (write-only trigger; ignored — no sleep machine).
+/// Shift of `SLP_TYPx` within `PM1_CNT`. Spec: ACPI fixed-hardware register layout.
+pub const ACPI_PM1_CNT_SLP_TYP_SHIFT: u32 = 10;
+/// PM1_CNT bit 13: SLP_EN (write-only trigger; does not latch in the register).
+///
+/// Spec: ACPI — writing 1 with `SLP_TYP` enters the requested sleep state.
+/// This stub latches a host soft-off / sleep request instead of suspending
+/// (docs/acpi-r8-pm1-sleep.md).
 pub const ACPI_PM1_CNT_SLP_EN: u16 = 1 << 13;
 /// Sticky PM1_CNT bits stored across writes (SCI_EN | BM_RLD | SLP_TYP).
 pub const ACPI_PM1_CNT_STICKY_MASK: u16 =
     ACPI_PM1_CNT_SCI_EN | (1 << 1) | ACPI_PM1_CNT_SLP_TYP_MASK;
+/// Platform `SLP_TYP` value this machine maps to ACPI S5 (soft-off).
+///
+/// Spec: ACPI — `SLP_TYP` encoding is platform-defined (normally FADT). Without
+/// ACPI tables this tree documents `0` as S5; see docs/acpi-r8-pm1-sleep.md.
+pub const ACPI_SLP_TYP_S5: u8 = 0;
+const _: () = assert!(ACPI_PM1_CNT_SLP_TYP_SHIFT == 10);
+const _: () = assert!(ACPI_PM1_CNT_SLP_TYP_MASK == 0x7 << ACPI_PM1_CNT_SLP_TYP_SHIFT);
+const _: () = assert!(ACPI_SLP_TYP_S5 == 0);
 
 /// Enable bit in CONFIG_ADDRESS (bit 31).
 const ADDR_ENABLE: u32 = 1 << 31;
@@ -1021,6 +1037,11 @@ pub struct PciConfig {
     /// Used to deassert IRQs that lose their last PIRQ route without touching
     /// unrelated PIC lines.
     pub pirq_pic_driven: u16,
+    /// Host latch: guest wrote `SLP_EN` with [`ACPI_SLP_TYP_S5`] (soft-off).
+    /// Spec: ACPI PM1_CNT sleep enable; model docs/acpi-r8-pm1-sleep.md.
+    acpi_power_off_pending: bool,
+    /// Host latch: guest wrote `SLP_EN` with a non-S5 `SLP_TYP` (no resume path).
+    acpi_sleep_typ: Option<u8>,
 }
 
 /// Mask ELCR bytes to PIIX writable bits (IRQ0/1/2/8/13 forced edge / clear).
@@ -1144,6 +1165,9 @@ impl PciConfig {
             // Spec: Intel 82371SB — PIRQ# lines idle at reset; routes disabled (0x80).
             pirq_asserted: [false; 4],
             pirq_pic_driven: 0,
+            // Spec: ACPI — no pending sleep/soft-off at power-on / reset.
+            acpi_power_off_pending: false,
+            acpi_sleep_typ: None,
         }
     }
 
@@ -2517,6 +2541,9 @@ impl PciConfig {
         // STS via assert_power_button / tick_acpi_pm. PM_TMR lives in
         // acpi_pm_io[+8] (24-bit) so machine step-clock freerun and
         // [`Self::tick_acpi_pm`] share one register file.
+        // Spec: ACPI PM1_CNT — SLP_EN is a write-only trigger; detect it before
+        // the sticky mask clears bit 13 (docs/acpi-r8-pm1-sleep.md).
+        let cnt_touched = off < 6 && off + bytes.len() > 4;
         if off < 2 {
             let old = self.acpi_pm1_sts();
             let mut written = 0u16;
@@ -2552,9 +2579,48 @@ impl PciConfig {
         let en = u16::from_le_bytes([self.acpi_pm_io[2], self.acpi_pm_io[3]])
             & ACPI_PM1_EN_WRITABLE_MASK;
         self.acpi_pm_io[2..4].copy_from_slice(&en.to_le_bytes());
-        let cnt =
-            u16::from_le_bytes([self.acpi_pm_io[4], self.acpi_pm_io[5]]) & ACPI_PM1_CNT_STICKY_MASK;
+        let raw_cnt = u16::from_le_bytes([self.acpi_pm_io[4], self.acpi_pm_io[5]]);
+        if cnt_touched && raw_cnt & ACPI_PM1_CNT_SLP_EN != 0 {
+            let typ = ((raw_cnt & ACPI_PM1_CNT_SLP_TYP_MASK) >> ACPI_PM1_CNT_SLP_TYP_SHIFT) as u8;
+            self.acpi_latch_sleep_enable(typ);
+        }
+        let cnt = raw_cnt & ACPI_PM1_CNT_STICKY_MASK;
         self.acpi_pm_io[4..6].copy_from_slice(&cnt.to_le_bytes());
+    }
+
+    /// Latch a host soft-off or sleep request from a `SLP_EN` write.
+    ///
+    /// Spec: ACPI PM1_CNT sleep enable; model docs/acpi-r8-pm1-sleep.md.
+    fn acpi_latch_sleep_enable(&mut self, typ: u8) {
+        if typ == ACPI_SLP_TYP_S5 {
+            self.acpi_power_off_pending = true;
+            self.acpi_sleep_typ = None;
+        } else {
+            self.acpi_sleep_typ = Some(typ);
+            self.acpi_power_off_pending = false;
+        }
+    }
+
+    /// True when the guest has requested soft-off via `SLP_EN` + [`ACPI_SLP_TYP_S5`].
+    pub fn acpi_power_off_pending(&self) -> bool {
+        self.acpi_power_off_pending
+    }
+
+    /// Consume the soft-off latch (same pattern as 8042/`0x92` system-reset).
+    pub fn take_acpi_power_off_request(&mut self) -> bool {
+        let pending = self.acpi_power_off_pending;
+        self.acpi_power_off_pending = false;
+        pending
+    }
+
+    /// Non-S5 sleep request (`SLP_TYP`), if any. No resume machine exists.
+    pub fn acpi_sleep_request(&self) -> Option<u8> {
+        self.acpi_sleep_typ
+    }
+
+    /// Consume the non-S5 sleep latch, returning the captured `SLP_TYP`.
+    pub fn take_acpi_sleep_request(&mut self) -> Option<u8> {
+        self.acpi_sleep_typ.take()
     }
 
     /// PM1a status word (`PMBASE + 0`).

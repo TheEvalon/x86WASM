@@ -18,7 +18,7 @@ power-button / SCI-enable stubs.
 |---|---|---|
 | PM1_STS | +0 | Write-1-to-clear for TMR/GBL/PWRBTN (and reserved clearable bits in the mask); guest writes cannot set STS. Host `acpi_assert_power_button` ORs PWRBTN_STS; timer MSB toggle ORs TMR_STS. |
 | PM1_EN | +2 | R/W (TMR/GBL/PWRBTN enables in this stub). Gates SCI with matching STS bits. |
-| PM1_CNT | +4 | Sticky SCI_EN / BM_RLD / SLP_TYP; SLP_EN write ignored (no sleep machine) |
+| PM1_CNT | +4 | Sticky SCI_EN / BM_RLD / SLP_TYP; SLP_EN write-only trigger latches host soft-off/sleep (R8 — docs/acpi-r8-pm1-sleep.md) |
 | PM_TMR | +8 | 24-bit counter in `PciConfig::acpi_pm_io[8..12]`; guest loads accepted; advanced by `tick_acpi_pm` |
 
 ```rust
@@ -60,4 +60,6 @@ Direct `acpi_pm_io` mutation remains coherent with guest I/O reads.
 
 ## Not implemented
 
-- SCI delivery onto PIC/APIC, SMI#, GPE0/1, sleep states, ACPI tables / FADT.
+- SCI delivery onto PIC/APIC, SMI#, GPE0/1, S1–S4 resume, ACPI tables / FADT.
+  Soft-off / sleep **request** latching from `SLP_EN` is Round 8
+  (`docs/acpi-r8-pm1-sleep.md`).
