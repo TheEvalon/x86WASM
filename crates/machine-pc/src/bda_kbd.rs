@@ -119,6 +119,40 @@ impl Machine {
         Ok(bda_kbd_count(head, tail))
     }
 
+    /// Peek the next BDA keystroke without removing it.
+    ///
+    /// Spec: IBM PC/AT — INT 16h AH=01h reads the word at the current head.
+    pub fn bda_kbd_peek(&self) -> Result<Option<(u8, u8)>, MachineError> {
+        let head = self.read_bda_kbd_ptr(BDA_KBD_HEAD)?;
+        let tail = self.read_bda_kbd_ptr(BDA_KBD_TAIL)?;
+        if head == tail {
+            return Ok(None);
+        }
+        let phys = BDA_PHYS_BASE + u64::from(head);
+        let ascii = self
+            .mem
+            .read_u8(phys)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        let scancode = self
+            .mem
+            .read_u8(phys + 1)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        Ok(Some((ascii, scancode)))
+    }
+
+    /// Dequeue one keystroke from the BDA ring (advance head).
+    ///
+    /// Spec: IBM PC/AT — INT 16h AH=00h removes the word at head and advances
+    /// the head pointer, wrapping at `003Eh`.
+    pub fn bda_kbd_dequeue(&mut self) -> Result<Option<(u8, u8)>, MachineError> {
+        let Some((ascii, scancode)) = self.bda_kbd_peek()? else {
+            return Ok(None);
+        };
+        let head = self.read_bda_kbd_ptr(BDA_KBD_HEAD)?;
+        self.write_bda_kbd_ptr(BDA_KBD_HEAD, advance_bda_kbd_off(head))?;
+        Ok(Some((ascii, scancode)))
+    }
+
     fn ensure_bda_kbd_ring(&mut self) -> Result<(), MachineError> {
         let head = self.read_bda_kbd_ptr(BDA_KBD_HEAD)?;
         let tail = self.read_bda_kbd_ptr(BDA_KBD_TAIL)?;
@@ -316,5 +350,17 @@ mod tests {
         enable_kbd_irq1(&mut m);
         assert!(m.kbd_inject_scancode_to_bda(0x1C).unwrap());
         assert_eq!(m.bda_kbd_len().unwrap(), 1);
+    }
+
+    /// Spec: IBM PC/AT INT 16h path — peek then dequeue advances head.
+    #[test]
+    fn bda_kbd_peek_and_dequeue() {
+        let mut m = Machine::new(64 * 1024);
+        assert!(m.bda_kbd_inject_key(b'A', 0x1E).unwrap());
+        assert_eq!(m.bda_kbd_peek().unwrap(), Some((b'A', 0x1E)));
+        assert_eq!(m.bda_kbd_len().unwrap(), 1);
+        assert_eq!(m.bda_kbd_dequeue().unwrap(), Some((b'A', 0x1E)));
+        assert_eq!(m.bda_kbd_len().unwrap(), 0);
+        assert_eq!(m.bda_kbd_dequeue().unwrap(), None);
     }
 }

@@ -1986,11 +1986,10 @@ mod tests {
         PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
         PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL,
         PORT61_ENABLE_PARITY, PORT61_GATE2, PORT61_OUT2, PORT61_PARITY_STATUS, PORT61_SPKR_DATA,
-        PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL,
-        PORT_SYSTEM_CONTROL_A, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
-        STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
-        VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
-        VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
+        PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A, REG_STATUS_A,
+        REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE,
+        STC_IRQF, STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
+        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -5143,13 +5142,14 @@ mod tests {
     #[test]
     fn inject_parity_nmi_requires_port61_enable() {
         let mut m = Machine::new(64 * 1024);
-        // CMOS index bit7 clear → NMI delivery allowed; port61 parity enable off.
-        m.cmos.write_index(0x00);
+        assert!(m.nmi_delivery_enabled());
+        // Parity enable off: status latches but no `#NMI`.
         assert!(!m.inject_parity_nmi());
         assert!(m.pit.port61_read() & PORT61_PARITY_STATUS != 0);
         assert!(!m.cpu.pending_nmi);
 
-        m.pit.port61_write(PORT61_ENABLE_PARITY | PORT61_PARITY_STATUS); // clear status, enable
+        m.pit
+            .port61_write(PORT61_ENABLE_PARITY | PORT61_PARITY_STATUS); // clear status, enable
         assert!(m.inject_parity_nmi());
         assert!(m.cpu.pending_nmi);
     }
