@@ -28,6 +28,12 @@ pub const EL_TORITO_KEY_55: u8 = 0x55;
 pub const EL_TORITO_KEY_AA: u8 = 0xAA;
 /// Initial/Default Entry boot indicator — bootable.
 pub const EL_TORITO_BOOTABLE: u8 = 0x88;
+/// Boot media type `00h` — no emulation. Spec: El Torito Figure 3.
+pub const EL_TORITO_MEDIA_NO_EMUL: u8 = 0x00;
+/// Default load segment when the catalog stores `0000h`. Spec: El Torito.
+pub const EL_TORITO_DEFAULT_LOAD_SEGMENT: u16 = 0x07C0;
+/// Physical address for [`EL_TORITO_DEFAULT_LOAD_SEGMENT`].
+pub const EL_TORITO_DEFAULT_LOAD_PHYS: u64 = (EL_TORITO_DEFAULT_LOAD_SEGMENT as u64) << 4;
 
 /// Platform ID `00h` — 80x86. Spec Validation Entry.
 pub const EL_TORITO_PLATFORM_X86: u8 = 0x00;
@@ -45,10 +51,33 @@ pub struct ElToritoInfo {
     pub bootable: bool,
     /// Boot media type from the Initial/Default Entry.
     pub media_type: u8,
+    /// Load segment from the Initial/Default Entry (`0000h` → use default).
+    pub load_segment: u16,
     /// Load RBA (absolute sector of the boot image).
     pub load_rba: u32,
     /// Sector count field (512-byte virtual sectors per El Torito).
     pub sector_count: u16,
+}
+
+impl ElToritoInfo {
+    /// Effective real-mode load segment (`0000h` resolves to [`EL_TORITO_DEFAULT_LOAD_SEGMENT`]).
+    pub fn effective_load_segment(&self) -> u16 {
+        if self.load_segment == 0 {
+            EL_TORITO_DEFAULT_LOAD_SEGMENT
+        } else {
+            self.load_segment
+        }
+    }
+
+    /// Physical load address = effective segment × 16.
+    pub fn load_phys(&self) -> u64 {
+        u64::from(self.effective_load_segment()) << 4
+    }
+
+    /// Bytes the BIOS would transfer (`sector_count` × 512).
+    pub fn load_byte_len(&self) -> Option<usize> {
+        usize::from(self.sector_count).checked_mul(512)
+    }
 }
 
 /// Errors from [`parse_el_torito`].
@@ -85,7 +114,7 @@ impl core::fmt::Display for ElToritoError {
 
 impl std::error::Error for ElToritoError {}
 
-fn sector<'a>(image: &'a [u8], lba: u32) -> Result<&'a [u8], ElToritoError> {
+fn sector(image: &[u8], lba: u32) -> Result<&[u8], ElToritoError> {
     let start = (lba as usize)
         .checked_mul(EL_TORITO_SECTOR_BYTES)
         .ok_or(ElToritoError::Truncated)?;
@@ -171,6 +200,7 @@ pub fn parse_el_torito(image: &[u8]) -> Result<ElToritoInfo, ElToritoError> {
     let default = &catalog[32..64];
     let bootable = default[0] == EL_TORITO_BOOTABLE;
     let media_type = default[1];
+    let load_segment = u16::from_le_bytes([default[2], default[3]]);
     let sector_count = u16::from_le_bytes([default[6], default[7]]);
     let load_rba = u32::from_le_bytes([default[8], default[9], default[10], default[11]]);
 
@@ -180,6 +210,7 @@ pub fn parse_el_torito(image: &[u8]) -> Result<ElToritoInfo, ElToritoError> {
         platform_id: validation[1],
         bootable,
         media_type,
+        load_segment,
         load_rba,
         sector_count,
     })
@@ -260,9 +291,13 @@ mod tests {
         assert_eq!(info.catalog_lba, 20);
         assert_eq!(info.platform_id, EL_TORITO_PLATFORM_X86);
         assert!(info.bootable);
-        assert_eq!(info.media_type, 0);
+        assert_eq!(info.media_type, EL_TORITO_MEDIA_NO_EMUL);
+        assert_eq!(info.load_segment, 0);
+        assert_eq!(info.effective_load_segment(), EL_TORITO_DEFAULT_LOAD_SEGMENT);
+        assert_eq!(info.load_phys(), EL_TORITO_DEFAULT_LOAD_PHYS);
         assert_eq!(info.load_rba, 24);
         assert_eq!(info.sector_count, 4);
+        assert_eq!(info.load_byte_len(), Some(2048));
     }
 
     #[test]
