@@ -12,6 +12,7 @@ mod eltorito_load;
 mod hello_rom;
 mod mbr;
 mod mem;
+mod option_rom_invoke;
 mod ports;
 mod post_code;
 mod post_probe;
@@ -22,6 +23,9 @@ mod xbcs;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
+pub use option_rom_invoke::{
+    OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET, OPTION_ROM_RESUME_PHYS,
+};
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
     PAM_FIELD_MASK, PAM_FIELD_RE, PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST,
@@ -111,6 +115,15 @@ pub enum MachineError {
     /// Sector count was zero or overflowed.
     #[error("El Torito sector count invalid")]
     ElToritoInvalidSectorCount,
+    /// Option-ROM base is not a valid legacy entry (`CS:IP` cannot be formed).
+    #[error("option ROM entry base is invalid")]
+    OptionRomEntryInvalid,
+    /// Declared option-ROM image bytes are not readable at the requested base.
+    #[error("option ROM is not mapped at the requested base")]
+    OptionRomNotMapped,
+    /// Real-mode stack could not accept the far-call return frame.
+    #[error("option ROM invoke stack fault")]
+    OptionRomStackFault,
 }
 
 /// Host override for fw_cfg `bootorder`, or the machine default when `Default`.
@@ -566,8 +579,9 @@ impl Machine {
 
     /// Map an expansion ROM at the conventional video-BIOS base `0xC0000`.
     ///
-    /// Wraps [`Self::map_option_rom`]. This tree ships no VGA BIOS image and
-    /// nothing executes the ROM; the mapping is what a scan can find.
+    /// Wraps [`Self::map_option_rom`]. Mapping alone does not execute the ROM;
+    /// use [`Self::invoke_option_rom_entry`] / [`Self::map_and_invoke_vga_option_rom`]
+    /// for a host-driven far call to offset 3.
     pub fn map_vga_option_rom(&mut self, data: &[u8]) -> Result<(), MachineError> {
         self.map_option_rom(firmware_interface::VGA_OPTION_ROM_BASE, data)
     }

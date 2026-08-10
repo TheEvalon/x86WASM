@@ -119,6 +119,35 @@ pub const OPTION_ROM_BLOCK_SIZE: usize = 512;
 /// Smallest header a size and checksum can be read from.
 pub const OPTION_ROM_HEADER_LEN: usize = 3;
 
+/// Byte offset of the initialization entry point inside an expansion ROM.
+///
+/// Spec: PCI Firmware Specification / BIOS Boot Specification — after the
+/// `55 AA` signature and the size byte, execution begins at offset 3. A BIOS
+/// far-calls that address; the ROM is expected to return with `RETF`.
+pub const OPTION_ROM_ENTRY_OFFSET: u64 = 3;
+
+/// Real-mode `CS:IP` for the expansion-ROM entry at `phys_base`.
+///
+/// Spec: BIOS Boot Specification / classic PC — the BIOS far-calls
+/// `CS = phys_base >> 4`, `IP = (phys_base & 0xF) + 3`. Bases on a 2 KiB
+/// boundary (required by [`prepare_option_rom`]) are paragraph-aligned, so
+/// `IP` is [`OPTION_ROM_ENTRY_OFFSET`].
+///
+/// Returns `None` when `phys_base` is not 2 KiB-aligned or the resulting
+/// selector would not fit in 16 bits (outside the legacy option-ROM region
+/// that this tree maps).
+pub fn option_rom_entry_cs_ip(phys_base: u64) -> Option<(u16, u16)> {
+    if !phys_base.is_multiple_of(OPTION_ROM_SCAN_STEP) {
+        return None;
+    }
+    if phys_base < OPTION_ROM_REGION_BASE || phys_base >= OPTION_ROM_REGION_END {
+        return None;
+    }
+    let cs = u16::try_from(phys_base >> 4).ok()?;
+    let ip = u16::try_from((phys_base & 0xF) + OPTION_ROM_ENTRY_OFFSET).ok()?;
+    Some((cs, ip))
+}
+
 /// Errors from [`prepare_option_rom`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OptionRomError {
@@ -279,6 +308,17 @@ mod tests {
         assert_eq!(image.data.len(), 4 * OPTION_ROM_BLOCK_SIZE);
         assert_eq!(image.data[0], 0x55);
         assert_eq!(image.data[1], 0xAA);
+    }
+
+    /// Spec: BIOS Boot Spec / PCI Firmware — entry at base+3 → `C000:0003`.
+    #[test]
+    fn option_rom_entry_cs_ip_for_vga_base() {
+        assert_eq!(
+            option_rom_entry_cs_ip(VGA_OPTION_ROM_BASE),
+            Some((0xC000, OPTION_ROM_ENTRY_OFFSET as u16))
+        );
+        assert_eq!(option_rom_entry_cs_ip(0x000C_0400), None);
+        assert_eq!(option_rom_entry_cs_ip(0x000B_F800), None);
     }
 
     /// Only the declared initialization size is mapped; trailing padding in the
