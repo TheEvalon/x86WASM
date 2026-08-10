@@ -31,8 +31,10 @@ classic Disk Address Packet — see `docs/storage-r8-int13-extensions.md`.
 ## Honesty / unsupported
 
 - **Not** a guest IVT BIOS body.
-- **AH=43h** extended write, removable locking (`CX` bit 1), EDD 2.0/3.0
-  device-path / DPI fields — unsupported / not advertised.
+- Removable locking (`CX` bit 1), EDD 2.0/3.0 device-path / DPI fields —
+  unsupported / not advertised.
+- **AH=43h** extended write is present on the R9 tip (see
+  `docs/storage-r9-int13-ext-write.md`); this R8 note originally deferred it.
 - Geometry is the fixed IDENTIFY obsolete 16/63 mapping, not translation modes.
 
 ## Spec

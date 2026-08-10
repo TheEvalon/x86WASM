@@ -355,8 +355,7 @@ impl Machine {
         self.cpu.set_ah(INT13_EXT_VERSION);
         self.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_OUT);
         // Packet access (AH=42h/43h) + EDD params (AH=48h). Removable locking out.
-        self.cpu
-            .set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
+        self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
         self.cpu.set_cf(false);
     }
 
@@ -1422,10 +1421,7 @@ mod tests {
         m.service_int13_hd();
         assert!(!cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
-        assert_eq!(
-            m.read_guest_u16(0x6000).unwrap(),
-            INT13_EDD_PARAMS_SIZE_MIN
-        );
+        assert_eq!(m.read_guest_u16(0x6000).unwrap(), INT13_EDD_PARAMS_SIZE_MIN);
         assert_eq!(
             m.read_guest_u16(0x6002).unwrap(),
             INT13_EDD_INFO_GEOMETRY_VALID
@@ -1449,10 +1445,7 @@ mod tests {
             u32::from(INT13_HD_SPT)
         );
         assert_eq!(m.read_guest_u64(0x6010).unwrap(), sectors as u64);
-        assert_eq!(
-            m.read_guest_u16(0x6018).unwrap(),
-            INT13_SECTOR_SIZE as u16
-        );
+        assert_eq!(m.read_guest_u16(0x6018).unwrap(), INT13_SECTOR_SIZE as u16);
     }
 
     /// Spec: AH=48h rejects short buffers and missing media.
