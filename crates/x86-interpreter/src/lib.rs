@@ -1869,17 +1869,22 @@ fn prepare_protected_far_cs(
     Ok(((selector & !3) | u16::from(cpl), parsed))
 }
 
-/// Protected-mode far `JMP` into a same-CPL GDT code segment.
+/// Protected-mode far `JMP` into a same-CPL GDT code segment, or a JMP-form
+/// hardware task switch to a 32-bit TSS / task gate.
 ///
-/// This bounded path accepts only nonconforming ring-0 code segments, with
-/// either `D=0` (16-bit) or `D=1` (default-32) execution; `L=1` remains out of
-/// scope. Spec: Intel SDM Vol. 2 JMP; Vol. 3 §§3.4.5, 5.8.1, 6.13.
+/// Code path: nonconforming ring-0 `L=0` GDT code (`D=0` or `D=1`).
+/// Task path: available 32-bit TSS or task gate (see [`task_switch_jmp`]).
+/// Spec: Intel SDM Vol. 2 JMP; Vol. 3 §§3.4.5, 5.8.1, 6.13, 7.2–7.3.
 fn protected_far_jump(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
     target_offset: u32,
     selector: u16,
+    next_ip: u32,
 ) -> Result<(), ExecError> {
+    if protected_far_is_task_target(cpu, bus, selector)? {
+        return task_switch_jmp(cpu, bus, selector, next_ip);
+    }
     let (sel, parsed) = prepare_protected_far_cs(cpu, bus, target_offset, selector)?;
     cpu.cs
         .load_descriptor_cache(sel, parsed.base, parsed.limit, parsed.flags);
@@ -1890,8 +1895,9 @@ fn protected_far_jump(
 /// Protected-mode far `CALL` into a same-CPL GDT code segment.
 ///
 /// Validates the target first, then pushes the return `CS`/`IP` (or `EIP`) link,
-/// then loads CS. Call gates, privilege changes, and LDT targets remain
-/// unsupported. Spec: Intel SDM Vol. 2 CALL; Vol. 3 §§5.8.1, 6.13.
+/// then loads CS. Call gates and privilege changes remain unsupported. Far
+/// `CALL` to a TSS or task gate (nested task) is explicitly unsupported here.
+/// Spec: Intel SDM Vol. 2 CALL; Vol. 3 §§5.8.1, 6.13, 7.3.
 fn protected_far_call(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1900,6 +1906,10 @@ fn protected_far_call(
     next_ip: u32,
     operand_size_32: bool,
 ) -> Result<(), ExecError> {
+    if protected_far_is_task_target(cpu, bus, selector)? {
+        // Nested-task CALL (NT=1 / back-link) is out of scope for this slice.
+        return Err(ExecError::Unsupported(0x9A));
+    }
     let (sel, parsed) = prepare_protected_far_cs(cpu, bus, target_offset, selector)?;
     let return_cs = cpu.cs.selector;
     if operand_size_32 {
@@ -4689,6 +4699,30 @@ const TSS32_MIN_LIMIT: u32 = 0x67;
 const DESC_TYPE_TSS32_AVAILABLE: u8 = 0x9;
 /// System-descriptor type: busy 32-bit TSS (SDM Vol. 3 Table 3-2).
 const DESC_TYPE_TSS32_BUSY: u8 = 0xB;
+/// System-descriptor type: task gate (SDM Vol. 3 Table 3-2).
+const DESC_TYPE_TASK_GATE: u8 = 0x5;
+/// System-descriptor type: LDT (SDM Vol. 3 Table 3-2).
+const DESC_TYPE_LDT: u8 = 0x2;
+
+/// 32-bit TSS field offsets (SDM Vol. 3 §7.2.1 Figure 7-2).
+const TSS32_OFF_CR3: u32 = 28;
+const TSS32_OFF_EIP: u32 = 32;
+const TSS32_OFF_EFLAGS: u32 = 36;
+const TSS32_OFF_EAX: u32 = 40;
+const TSS32_OFF_ECX: u32 = 44;
+const TSS32_OFF_EDX: u32 = 48;
+const TSS32_OFF_EBX: u32 = 52;
+const TSS32_OFF_ESP: u32 = 56;
+const TSS32_OFF_EBP: u32 = 60;
+const TSS32_OFF_ESI: u32 = 64;
+const TSS32_OFF_EDI: u32 = 68;
+const TSS32_OFF_ES: u32 = 72;
+const TSS32_OFF_CS: u32 = 76;
+const TSS32_OFF_SS: u32 = 80;
+const TSS32_OFF_DS: u32 = 84;
+const TSS32_OFF_FS: u32 = 88;
+const TSS32_OFF_GS: u32 = 92;
+const TSS32_OFF_LDTR: u32 = 96;
 
 /// `LTR r/m16` — load TR from a present available 32-bit TSS descriptor.
 ///
@@ -4750,6 +4784,393 @@ fn exec_ltr(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result
             flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
             flags
         });
+    Ok(())
+}
+
+fn tss32_read_u32(bus: &mut dyn Bus, base: u64, offset: u32) -> Result<u32, ExecError> {
+    let mut bytes = [0u8; 4];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(base.wrapping_add(u64::from(offset) + index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn tss32_write_u32(bus: &mut dyn Bus, base: u64, offset: u32, value: u32) -> Result<(), ExecError> {
+    for (index, byte) in value.to_le_bytes().iter().enumerate() {
+        bus.write_system_u8(
+            base.wrapping_add(u64::from(offset) + index as u64),
+            *byte,
+        )
+        .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(())
+}
+
+fn tss32_read_u16(bus: &mut dyn Bus, base: u64, offset: u32) -> Result<u16, ExecError> {
+    let mut bytes = [0u8; 2];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(base.wrapping_add(u64::from(offset) + index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn tss32_write_u16(bus: &mut dyn Bus, base: u64, offset: u32, value: u16) -> Result<(), ExecError> {
+    for (index, byte) in value.to_le_bytes().iter().enumerate() {
+        bus.write_system_u8(
+            base.wrapping_add(u64::from(offset) + index as u64),
+            *byte,
+        )
+        .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(())
+}
+
+fn gdt_descriptor_addr(cpu: &CpuState, selector: u16) -> Result<u64, ExecError> {
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    if selector & 0x4 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Err(selector_fault(13, selector));
+    }
+    Ok(cpu.gdtr.base.wrapping_add(offset))
+}
+
+fn read_gdt_raw_descriptor(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<[u8; 8], ExecError> {
+    let addr = gdt_descriptor_addr(cpu, selector)?;
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(descriptor)
+}
+
+fn write_gdt_access_byte(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+    access: u8,
+) -> Result<(), ExecError> {
+    let addr = gdt_descriptor_addr(cpu, selector)?;
+    bus.write_system_u8(addr.wrapping_add(5), access)
+        .map_err(|error| classify_mem_fault(error, false))
+}
+
+/// Whether a GDT selector is a task-switch target (TSS or task gate).
+///
+/// Used by far `JMP`/`CALL` to distinguish code-segment transfers from the
+/// bounded hardware task-switch path. Spec: Intel SDM Vol. 3 Table 3-2.
+fn protected_far_is_task_target(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<bool, ExecError> {
+    if is_null_selector(selector) || selector & 0x4 != 0 {
+        return Ok(false);
+    }
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Ok(false);
+    }
+    let access = bus
+        .read_system_u8(cpu.gdtr.base.wrapping_add(offset).wrapping_add(5))
+        .map_err(|error| classify_mem_fault(error, false))?;
+    if access & 0x10 != 0 {
+        return Ok(false);
+    }
+    Ok(matches!(
+        access & 0x0F,
+        DESC_TYPE_TASK_GATE | DESC_TYPE_TSS32_AVAILABLE | DESC_TYPE_TSS32_BUSY
+    ))
+}
+
+/// Resolve a far selector to an available 32-bit TSS (direct or via task gate).
+///
+/// Spec: Intel SDM Vol. 3 §7.3 / Figure 7-5 (privilege checks for JMP).
+fn resolve_jmp_task_tss_selector(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<(u16, [u8; 8]), ExecError> {
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let rpl = (selector & 3) as u8;
+    let desc = read_gdt_raw_descriptor(cpu, bus, selector)?;
+    let access = desc[5];
+    if access & 0x10 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+    let type_field = access & 0x0F;
+    let dpl = (access >> 5) & 3;
+    let present = access & 0x80 != 0;
+
+    let tss_selector = match type_field {
+        DESC_TYPE_TASK_GATE => {
+            // Gate: CPL ≤ DPL and RPL ≤ DPL.
+            if cpl > dpl || rpl > dpl {
+                return Err(selector_fault(13, selector));
+            }
+            if !present {
+                return Err(selector_fault(11, selector));
+            }
+            u16::from_le_bytes([desc[2], desc[3]])
+        }
+        DESC_TYPE_TSS32_AVAILABLE | DESC_TYPE_TSS32_BUSY => {
+            // Direct TSS: max(CPL, RPL) ≤ DPL.
+            if cpl > dpl || rpl > dpl {
+                return Err(selector_fault(13, selector));
+            }
+            if !present {
+                return Err(selector_fault(11, selector));
+            }
+            selector
+        }
+        _ => return Err(selector_fault(13, selector)),
+    };
+
+    if is_null_selector(tss_selector) || tss_selector & 0x4 != 0 {
+        return Err(selector_fault(13, tss_selector));
+    }
+    let tss_desc = read_gdt_raw_descriptor(cpu, bus, tss_selector)?;
+    let tss_access = tss_desc[5];
+    if tss_access & 0x10 != 0 || tss_access & 0x0F != DESC_TYPE_TSS32_AVAILABLE {
+        // Busy or wrong type → #GP(selector). Spec: Vol. 3 §7.3.
+        return Err(selector_fault(13, tss_selector));
+    }
+    if tss_access & 0x80 == 0 {
+        return Err(selector_fault(11, tss_selector));
+    }
+    let parsed = parse_segment_descriptor(tss_desc);
+    if parsed.limit < TSS32_MIN_LIMIT {
+        return Err(selector_fault(13, tss_selector));
+    }
+    Ok((tss_selector, tss_desc))
+}
+
+fn prepare_task_cs(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<x86_core::SegmentReg, ExecError> {
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    let desc = read_gdt_segment_descriptor(cpu, bus, selector)?;
+    let access = desc[5];
+    let s_bit = access & 0x10 != 0;
+    let executable = access & 0x08 != 0;
+    let conforming = executable && access & 0x04 != 0;
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    if !s_bit || !executable {
+        return Err(selector_fault(13, selector));
+    }
+    if conforming {
+        if dpl > rpl {
+            return Err(selector_fault(13, selector));
+        }
+    } else if dpl != rpl {
+        return Err(selector_fault(13, selector));
+    }
+    if access & 0x80 == 0 {
+        return Err(selector_fault(11, selector));
+    }
+    let parsed = parse_segment_descriptor(desc);
+    if parsed.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
+        return Err(selector_fault(13, selector));
+    }
+    Ok(x86_core::SegmentReg {
+        selector,
+        base: parsed.base,
+        limit: parsed.limit,
+        flags: parsed.flags,
+    })
+}
+
+fn prepare_task_data_sreg(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+    cpl: u8,
+) -> Result<x86_core::SegmentReg, ExecError> {
+    if is_null_selector(selector) {
+        return Ok(x86_core::SegmentReg {
+            selector,
+            base: 0,
+            limit: 0,
+            flags: 0,
+        });
+    }
+    let descriptor = read_gdt_segment_descriptor(cpu, bus, selector)?;
+    let (base, limit, flags) = parse_data_segment_descriptor(descriptor, selector, cpl)?;
+    Ok(x86_core::SegmentReg {
+        selector,
+        base,
+        limit,
+        flags,
+    })
+}
+
+fn prepare_task_ldtr(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<x86_core::SegmentReg, ExecError> {
+    if is_null_selector(selector) {
+        return Ok(x86_core::SegmentReg {
+            selector,
+            base: 0,
+            limit: 0,
+            flags: 0,
+        });
+    }
+    if selector & 0x4 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+    let desc = read_gdt_raw_descriptor(cpu, bus, selector)?;
+    let access = desc[5];
+    if access & 0x10 != 0 || access & 0x0F != DESC_TYPE_LDT {
+        return Err(selector_fault(13, selector));
+    }
+    if access & 0x80 == 0 {
+        return Err(selector_fault(11, selector));
+    }
+    let parsed = parse_segment_descriptor(desc);
+    Ok(x86_core::SegmentReg {
+        selector,
+        base: parsed.base,
+        limit: parsed.limit,
+        flags: parsed.flags,
+    })
+}
+
+/// Hardware task switch via far `JMP` to a 32-bit TSS or task gate.
+///
+/// Saves outgoing state into the current busy TSS, marks it available, loads
+/// the incoming available TSS, marks it busy, sets `CR0.TS`, and clears `NT`.
+/// Spec: Intel SDM Vol. 2 "JMP"; Vol. 3 §§7.2–7.3.
+///
+/// Unsupported here: nested-task `CALL`/`INT` switches, `EFLAGS.VM=1` targets,
+/// 16-bit TSS, IDT task-gate delivery, and LDT-resident TSS/gate descriptors.
+fn task_switch_jmp(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+    next_ip: u32,
+) -> Result<(), ExecError> {
+    let old_type = (cpu.tr.flags & 0x0F) as u8;
+    if old_type != DESC_TYPE_TSS32_BUSY || cpu.tr.limit < TSS32_MIN_LIMIT {
+        return Err(selector_fault(13, cpu.tr.selector));
+    }
+
+    let (new_sel, new_desc) = resolve_jmp_task_tss_selector(cpu, bus, selector)?;
+    let new_parsed = parse_segment_descriptor(new_desc);
+    let new_base = new_parsed.base;
+
+    // Reject VM86 targets before mutating either TSS. Spec: Vol. 3 §7.3;
+    // VM86 task entry is a later slice.
+    let new_eflags = tss32_read_u32(bus, new_base, TSS32_OFF_EFLAGS)?;
+    if new_eflags & (1 << 17) != 0 {
+        return Err(ExecError::Unsupported(0xEA));
+    }
+    let new_eip = tss32_read_u32(bus, new_base, TSS32_OFF_EIP)?;
+    let new_cr3 = tss32_read_u32(bus, new_base, TSS32_OFF_CR3)?;
+    let new_eax = tss32_read_u32(bus, new_base, TSS32_OFF_EAX)?;
+    let new_ecx = tss32_read_u32(bus, new_base, TSS32_OFF_ECX)?;
+    let new_edx = tss32_read_u32(bus, new_base, TSS32_OFF_EDX)?;
+    let new_ebx = tss32_read_u32(bus, new_base, TSS32_OFF_EBX)?;
+    let new_esp = tss32_read_u32(bus, new_base, TSS32_OFF_ESP)?;
+    let new_ebp = tss32_read_u32(bus, new_base, TSS32_OFF_EBP)?;
+    let new_esi = tss32_read_u32(bus, new_base, TSS32_OFF_ESI)?;
+    let new_edi = tss32_read_u32(bus, new_base, TSS32_OFF_EDI)?;
+    let new_es = tss32_read_u16(bus, new_base, TSS32_OFF_ES)?;
+    let new_cs_sel = tss32_read_u16(bus, new_base, TSS32_OFF_CS)?;
+    let new_ss_sel = tss32_read_u16(bus, new_base, TSS32_OFF_SS)?;
+    let new_ds = tss32_read_u16(bus, new_base, TSS32_OFF_DS)?;
+    let new_fs = tss32_read_u16(bus, new_base, TSS32_OFF_FS)?;
+    let new_gs = tss32_read_u16(bus, new_base, TSS32_OFF_GS)?;
+    let new_ldtr_sel = tss32_read_u16(bus, new_base, TSS32_OFF_LDTR)?;
+
+    // Validate incoming segments before committing the outgoing save.
+    let cs_loaded = prepare_task_cs(cpu, bus, new_cs_sel)?;
+    let new_cpl = (new_cs_sel & 3) as u8;
+    let ss_loaded = prepare_ss_from_gdt_for_cpl(cpu, bus, new_ss_sel, new_cpl)?;
+    let es_loaded = prepare_task_data_sreg(cpu, bus, new_es, new_cpl)?;
+    let ds_loaded = prepare_task_data_sreg(cpu, bus, new_ds, new_cpl)?;
+    let fs_loaded = prepare_task_data_sreg(cpu, bus, new_fs, new_cpl)?;
+    let gs_loaded = prepare_task_data_sreg(cpu, bus, new_gs, new_cpl)?;
+    let ldtr_loaded = prepare_task_ldtr(cpu, bus, new_ldtr_sel)?;
+    if new_eip > cs_loaded.limit {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    // Save outgoing architectural state into the current TSS.
+    let old_base = cpu.tr.base;
+    tss32_write_u32(bus, old_base, TSS32_OFF_EIP, next_ip)?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_EFLAGS, cpu.rflags as u32)?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_EAX, cpu.gpr_u32(CpuState::RAX))?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_ECX, cpu.gpr_u32(CpuState::RCX))?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_EDX, cpu.gpr_u32(CpuState::RDX))?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_EBX, cpu.gpr_u32(CpuState::RBX))?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_ESP, cpu.gpr_u32(CpuState::RSP))?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_EBP, cpu.gpr_u32(CpuState::RBP))?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_ESI, cpu.gpr_u32(CpuState::RSI))?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_EDI, cpu.gpr_u32(CpuState::RDI))?;
+    tss32_write_u16(bus, old_base, TSS32_OFF_ES, cpu.es.selector)?;
+    tss32_write_u16(bus, old_base, TSS32_OFF_CS, cpu.cs.selector)?;
+    tss32_write_u16(bus, old_base, TSS32_OFF_SS, cpu.ss.selector)?;
+    tss32_write_u16(bus, old_base, TSS32_OFF_DS, cpu.ds.selector)?;
+    tss32_write_u16(bus, old_base, TSS32_OFF_FS, cpu.fs.selector)?;
+    tss32_write_u16(bus, old_base, TSS32_OFF_GS, cpu.gs.selector)?;
+    tss32_write_u16(bus, old_base, TSS32_OFF_LDTR, cpu.ldtr.selector)?;
+    tss32_write_u32(bus, old_base, TSS32_OFF_CR3, cpu.cr3 as u32)?;
+
+    // JMP clears the busy bit on the outgoing TSS and does not set NT.
+    let old_access = ((cpu.tr.flags & 0xFF) as u8 & 0xF0) | DESC_TYPE_TSS32_AVAILABLE;
+    write_gdt_access_byte(cpu, bus, cpu.tr.selector, old_access)?;
+    let new_access = (new_desc[5] & 0xF0) | DESC_TYPE_TSS32_BUSY;
+    write_gdt_access_byte(cpu, bus, new_sel, new_access)?;
+
+    cpu.tr.load_descriptor_cache(new_sel, new_base, new_parsed.limit, {
+        let mut flags = new_parsed.flags;
+        flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
+        flags
+    });
+
+    cpu.cr3 = u64::from(new_cr3);
+    note_control_register_write(cpu, bus, 3);
+    cpu.rip = u64::from(new_eip);
+    // JMP clears NT in the loaded EFLAGS image. Spec: Vol. 3 §7.3.
+    cpu.rflags = u64::from(new_eflags & !(1 << 14));
+    cpu.set_gpr_u32(CpuState::RAX, new_eax);
+    cpu.set_gpr_u32(CpuState::RCX, new_ecx);
+    cpu.set_gpr_u32(CpuState::RDX, new_edx);
+    cpu.set_gpr_u32(CpuState::RBX, new_ebx);
+    cpu.set_gpr_u32(CpuState::RSP, new_esp);
+    cpu.set_gpr_u32(CpuState::RBP, new_ebp);
+    cpu.set_gpr_u32(CpuState::RSI, new_esi);
+    cpu.set_gpr_u32(CpuState::RDI, new_edi);
+    cpu.cs = cs_loaded;
+    cpu.ss = ss_loaded;
+    cpu.es = es_loaded;
+    cpu.ds = ds_loaded;
+    cpu.fs = fs_loaded;
+    cpu.gs = gs_loaded;
+    cpu.ldtr = ldtr_loaded;
+    cpu.cr0 |= 1u64 << 3; // CR0.TS
+    note_control_register_write(cpu, bus, 0);
     Ok(())
 }
 
@@ -5809,7 +6230,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             };
             let selector = insn.displacement as u16;
             if cr0_pe(cpu) {
-                protected_far_jump(cpu, bus, offset, selector)?;
+                protected_far_jump(cpu, bus, offset, selector, next_ip)?;
             } else {
                 // Real-address code fetch still uses IP16; ptr16:32 is truncated.
                 cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
@@ -6710,7 +7131,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                         (u32::from(offset), selector)
                     };
                     if cr0_pe(cpu) {
-                        protected_far_jump(cpu, bus, offset, selector)?;
+                        protected_far_jump(cpu, bus, offset, selector, next_ip)?;
                     } else {
                         cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
                         cpu.set_ip16(offset as u16);
