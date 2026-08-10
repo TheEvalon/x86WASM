@@ -542,6 +542,13 @@ pub fn decode_with_mode(bytes: &[u8], mode: DecodeMode) -> Result<DecodedInsn, D
                 Some(7) => "BTC",
                 _ => def.mnemonic,
             }
+        } else if opcode == 0xC7 {
+            // Group 9 (`0F C7`): /1 CMPXCHG8B m64. Other /r keep the placeholder.
+            // Spec: Intel SDM Vol. 2 "CMPXCHG8B/CMPXCHG16B"; opcode map Group 9.
+            match modrm.map(|m| m.reg) {
+                Some(1) => "CMPXCHG8B",
+                _ => def.mnemonic,
+            }
         } else {
             def.mnemonic
         }
@@ -2265,6 +2272,38 @@ mod tests {
         assert_eq!(d.length, 4);
 
         assert_eq!(decode(&[0x0F, 0xBA, 0xE0]), Err(DecodeError::Truncated));
+    }
+
+    /// Intel SDM Vol. 2 "CMPXCHG8B" / opcode map Group 9 (`0F C7`): `/1` names
+    /// the compare-exchange; other `/r` values keep the group placeholder.
+    #[test]
+    fn decode_group9_cmpxchg8b() {
+        // 0F C7 /1 m64 — CMPXCHG8B [0x4000]
+        let d = decode(&[0x0F, 0xC7, 0x0E, 0x00, 0x40]).unwrap();
+        assert!(d.two_byte);
+        assert_eq!(d.mnemonic, "CMPXCHG8B");
+        assert_eq!(d.opcode, 0xC7);
+        assert_eq!(d.modrm.unwrap().reg, 1);
+        assert_eq!(d.modrm.unwrap().mod_, 0);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.immediate, 0);
+        assert_eq!(d.length, 5);
+
+        // LOCK is architectural for the memory form; decode must accept it.
+        let d = decode(&[0xF0, 0x0F, 0xC7, 0x0E, 0x00, 0x40]).unwrap();
+        assert!(d.prefixes.lock);
+        assert_eq!(d.mnemonic, "CMPXCHG8B");
+        assert_eq!(d.length, 6);
+
+        // Register form still decodes; #UD is an interpreter concern.
+        let d = decode(&[0x0F, 0xC7, 0xC9]).unwrap(); // /1, mod=11, rm=CX
+        assert_eq!(d.mnemonic, "CMPXCHG8B");
+        assert_eq!(d.modrm.unwrap().mod_, 3);
+        assert_eq!(d.length, 3);
+
+        // /0 keeps the group mnemonic.
+        assert_eq!(decode(&[0x0F, 0xC7, 0x06, 0x00, 0x40]).unwrap().mnemonic, "GRP9");
+        assert_eq!(decode(&[0x0F, 0xC7]), Err(DecodeError::Truncated));
     }
 
     /// Intel SDM Vol. 2 "BSF"/"BSR"/"BSWAP"/"XADD"/"CMPXCHG": ModR/M forms with

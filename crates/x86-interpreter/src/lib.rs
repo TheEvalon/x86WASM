@@ -1563,6 +1563,46 @@ fn write_rm_u32(
     }
 }
 
+/// Read an 8-byte memory operand; register form is `#UD`.
+///
+/// Spec: Intel SDM Vol. 2 "CMPXCHG8B" — destination is memory only.
+fn read_mem_u64(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+) -> Result<u64, ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        return Err(arch_fault(6));
+    }
+    let (addr, _, uses_ss) = ea(cpu, insn, 8)?;
+    let lo = bus
+        .read_u32(addr)
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    let hi = bus
+        .read_u32(addr.wrapping_add(4))
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    Ok(u64::from(lo) | (u64::from(hi) << 32))
+}
+
+/// Write an 8-byte memory operand; register form is `#UD`.
+fn write_mem_u64(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    val: u64,
+) -> Result<(), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        return Err(arch_fault(6));
+    }
+    let (addr, _, uses_ss) = ea(cpu, insn, 8)?;
+    bus.write_u32(addr, val as u32)
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    bus.write_u32(addr.wrapping_add(4), (val >> 32) as u32)
+        .map_err(|e| classify_mem_fault(e, uses_ss))
+}
+
 /// Stack-address size selected by the cached `SS.B` bit.
 ///
 /// The `0x67` address-size prefix applies to memory operands, **not** to the
@@ -5214,6 +5254,39 @@ fn step_two_byte(
                 }
                 set_sub_flags_u16(cpu, accumulator, temp, accumulator.wrapping_sub(temp));
             }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xC7 => {
+            // Group 9 — Spec: Intel SDM Vol. 2 "CMPXCHG8B/CMPXCHG16B"; opcode
+            // map Group 9 (`0F C7`). Implemented: /1 CMPXCHG8B m64.
+            // `TEMP64 := DEST; IF EDX:EAX = TEMP64 THEN ZF := 1; DEST := ECX:EBX
+            // ELSE ZF := 0; EDX:EAX := TEMP64; DEST := TEMP64`. Only ZF is
+            // written. Register destination is `#UD`. LOCK may be decoded; this
+            // single-processor model does not enforce multi-processor atomicity.
+            // Unsupported here: other /r forms, CMPXCHG16B / REX.W, CPUID.CX8.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0xC7))?;
+            if m.reg != 1 {
+                return Err(ExecError::Unsupported(0xC7));
+            }
+            let temp = read_mem_u64(cpu, bus, insn)?;
+            let edx_eax = (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
+                | u64::from(cpu.gpr_u32(CpuState::RAX));
+            let equal = edx_eax == temp;
+            let new_dest = if equal {
+                (u64::from(cpu.gpr_u32(CpuState::RCX)) << 32)
+                    | u64::from(cpu.gpr_u32(CpuState::RBX))
+            } else {
+                temp
+            };
+            // Memory write commits before register/flag updates so a write
+            // fault leaves EDX:EAX and ZF unchanged (precise exceptions).
+            write_mem_u64(cpu, bus, insn, new_dest)?;
+            if !equal {
+                cpu.set_gpr_u32(CpuState::RAX, temp as u32);
+                cpu.set_gpr_u32(CpuState::RDX, (temp >> 32) as u32);
+            }
+            cpu.set_zf(equal);
             set_current_ip(cpu, next_ip);
             Ok(())
         }
@@ -21392,6 +21465,119 @@ mod tests {
         step(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x1234_5678);
         assert_ne!(cpu.rflags & (1 << 6), 0);
+    }
+
+    /// Intel SDM Vol. 2 "CMPXCHG8B": compare `EDX:EAX` with `m64`; on equal
+    /// set ZF and store `ECX:EBX`, else clear ZF, load `m64` into `EDX:EAX`, and
+    /// write the old value back. CF/PF/AF/SF/OF are unaffected. Register form
+    /// is `#UD`. LOCK may prefix the memory form.
+    #[test]
+    fn cmpxchg8b_equal_unequal_flags_lock_and_ud() {
+        // 0F C7 /1 [0x4000] — equal path.
+        let flags = 0x0002 | 1 | (1 << 2) | (1 << 4) | (1 << 7) | (1 << 11);
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.rflags = flags;
+            cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+            cpu.set_gpr_u32(CpuState::RDX, 0x3333_4444);
+            cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            cpu.set_gpr_u32(CpuState::RCX, 0xCCCC_DDDD);
+            mem[0x4000..0x4008].copy_from_slice(&0x3333_4444_1111_2222u64.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0xAAAA_BBBB);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0xCCCC_DDDD);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1111_2222, "accumulator unchanged");
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0x3333_4444);
+        assert_ne!(cpu.rflags & (1 << 6), 0, "ZF set on match");
+        assert_eq!(
+            cpu.rflags & !(1 << 6),
+            flags & !(1 << 6),
+            "only ZF may change"
+        );
+        assert_eq!(cpu.ip16(), 5);
+
+        // Unequal path: memory written back, EDX:EAX takes TEMP, ZF clear.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.rflags = flags | (1 << 6);
+            cpu.set_gpr_u32(CpuState::RAX, 0);
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+            cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            cpu.set_gpr_u32(CpuState::RCX, 0xCCCC_DDDD);
+            mem[0x4000..0x4008].copy_from_slice(&0xFEED_FACE_DEAD_BEEFu64.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0xDEAD_BEEF, "write-back");
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0xFEED_FACE);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xDEAD_BEEF);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0xFEED_FACE);
+        assert_eq!(cpu.rflags & (1 << 6), 0, "ZF clear on mismatch");
+        assert_eq!(cpu.rflags & !(1 << 6), flags & !(1 << 6));
+
+        // LOCK prefix is accepted on the memory form (no multi-processor atomicity).
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0xF0, 0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+                cpu.set_gpr_u32(CpuState::RAX, 1);
+                cpu.set_gpr_u32(CpuState::RDX, 2);
+                cpu.set_gpr_u32(CpuState::RBX, 3);
+                cpu.set_gpr_u32(CpuState::RCX, 4);
+                mem[0x4000..0x4008].copy_from_slice(&0x0000_0002_0000_0001u64.to_le_bytes());
+            });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 3);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 4);
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+
+        // Register form: 0F C7 /1 CX → #UD.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0xC9], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 1);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+        assert_eq!(cpu, before);
+
+        // Other Group 9 /r remain unimplemented.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x06, 0x00, 0x40], |_, _| {});
+        assert_eq!(
+            step_inner(&mut cpu, &mut bus),
+            Err(ExecError::Unsupported(0xC7))
+        );
+    }
+
+    /// Intel SDM Vol. 2 "CMPXCHG8B": a memory write fault after the compare
+    /// leaves EDX:EAX and flags unchanged; segment-limit faults on the 8-byte
+    /// span are `#GP`/`#SS` before any register update.
+    #[test]
+    fn cmpxchg8b_memory_faults_are_atomic() {
+        // Limit ends at 0x4003 so the 8-byte access at 0x4000 fails #GP.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.ds.limit = 0x4003;
+            cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+            cpu.set_gpr_u32(CpuState::RDX, 0x3333_4444);
+            cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            cpu.set_gpr_u32(CpuState::RCX, 0xCCCC_DDDD);
+            cpu.rflags = 0x0002 | (1 << 6);
+            mem[0x4000..0x4008].copy_from_slice(&0x3333_4444_1111_2222u64.to_le_bytes());
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0x1111_2222);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0x3333_4444);
+
+        // Protected mode: same equal/unequal ZF contract under PE=1.
+        // 0F C7 /1 [disp32] — ModR/M 0x0D = mod=00, reg=1, rm=5.
+        let (mut cpu, mut bus) =
+            pm32_fixture(&[0x0F, 0xC7, 0x0D, 0x00, 0x40, 0x00, 0x00], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RAX, 0x10);
+        cpu.set_gpr_u32(CpuState::RDX, 0x20);
+        cpu.set_gpr_u32(CpuState::RBX, 0x30);
+        cpu.set_gpr_u32(CpuState::RCX, 0x40);
+        bus.mem[0x4000..0x4008].copy_from_slice(&0x0000_0020_0000_0010u64.to_le_bytes());
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0x30);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0x40);
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
     }
 
     /// Intel SDM Vol. 2 "CPUID": leaf 0 reports the highest basic leaf in EAX

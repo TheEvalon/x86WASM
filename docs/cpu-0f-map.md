@@ -136,7 +136,9 @@ Not supported:
   extending the bit-string address.
 - `LOCK` is decoded but has no atomicity effect (single-processor model), and
   `LOCK` with a register destination does not raise `#UD`.
-- The REX.W 64-bit forms, `CMPXCHG8B`/`CMPXCHG16B`, and `TZCNT`/`LZCNT`.
+- The REX.W 64-bit forms, `CMPXCHG16B`, and `TZCNT`/`LZCNT`.
+  Round 6 adds `CMPXCHG8B m64` (`0F C7 /1`) without advertising `CPUID.CX8`;
+  see `docs/cpu-r6-cmpxchg8b.md`.
 
 ## Slice 4 — system and identification
 

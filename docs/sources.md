@@ -25,6 +25,7 @@ Authoritative references for implementation. Agents must cite these (or Intel SD
 - Intel SDM Vol. 2 "SHLD" (`0F A4`/`A5`) and "SHRD" (`0F AC`/`AD`) — double-precision shifts by `imm8` or `CL`, count masked to 5 bits outside 64-bit mode, count 0 leaves the flags untouched. The SDM leaves several cases undefined: a count greater than the operand size, and the `OF`/`AF` results. This tree resolves them as deterministic model choices rather than leaving them unspecified; the choices are recorded in `docs/cpu-r3-port-io-and-two-byte-extensions.md`
 - Intel SDM Vol. 1 §3.4.1.1 (general-purpose registers in 64-bit mode and the 32-bit operand zero-extension rule), §3.6 Table 3-4 (effective operand-size and address-size attributes from `D`, `66H` and `67H`), §6.2 (stack and stack-address size); Vol. 3 §3.4.5.1 (code- and data-segment descriptor types), §5.4.1 (code- and data-segment descriptor types governing segment loads), §6.8.3 (masking exceptions and interrupts)
 - Intel SDM Vol. 4 — Model-Specific Register listings. Cited for the shape of `RDMSR`/`WRMSR` only: this tree implements **no** MSR, so every MSR address raises `#GP(0)`
+- Intel SDM Vol. 2 "CMPXCHG8B/CMPXCHG16B" (`0F C7 /1`) — compare `EDX:EAX` with `m64`; equal → `ZF=1` and store `ECX:EBX`; unequal → `ZF=0`, load `m64` into `EDX:EAX`, write-back old value; register form `#UD`; only ZF affected. Round 6 implements the memory form without advertising `CPUID.CX8`
 - Intel processor datasheets relevant to Core 2 Conroe/Penryn CPUID presentation
 
 ## Platform and devices

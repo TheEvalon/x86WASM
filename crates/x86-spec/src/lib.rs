@@ -1662,6 +1662,16 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "XADD r/m,r",
     },
+    // Group 9: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F C7).
+    // Implemented: /1 CMPXCHG8B m64. Unsupported here: other /r forms,
+    // CMPXCHG16B (REX.W), and advertising CPUID.CX8 until the form is solid.
+    InstrDef {
+        mnemonic: "GRP9",
+        opcode: 0xC7,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "CMPXCHG8B m64",
+    },
     // Cache management and the reserved undefined opcode — Spec: Intel SDM
     // Vol. 2 "INVD" (`0F 08`), "WBINVD" (`0F 09`), "UD2" (`0F 0B`).
     InstrDef {
@@ -1827,6 +1837,7 @@ mod tests {
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
         assert!(lookup_0f(0x20).is_some(), "missing 0F 20 MOV r32,CRn");
         assert!(lookup_0f(0x22).is_some(), "missing 0F 22 MOV CRn,r32");
+        assert!(lookup_0f(0xC7).is_some(), "missing 0F C7 GRP9 CMPXCHG8B");
     }
 
     /// Intel SDM Vol. 2 "IN—Input from Port" / "OUT—Output to Port"; Appendix A
