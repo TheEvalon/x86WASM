@@ -357,7 +357,8 @@ mod tests {
         let vga = synthetic_option_rom(2); // 1 KiB → advances 2 KiB
         let second = synthetic_option_rom(2);
         let mut m = Machine::new(1024 * 1024);
-        m.map_option_rom(VGA_OPTION_ROM_BASE, &vga).expect("map VGA");
+        m.map_option_rom(VGA_OPTION_ROM_BASE, &vga)
+            .expect("map VGA");
         m.map_option_rom(0x000C_0800, &second).expect("map second");
 
         let hits = m.scan_option_rom_region();
