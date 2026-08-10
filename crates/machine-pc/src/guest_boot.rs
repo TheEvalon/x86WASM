@@ -168,6 +168,8 @@ pub enum GuestFirstFailureClass {
     UnclaimedIo { port: u16 },
     /// Probe stopped with unmapped MMIO as the only actionable signal.
     UnmappedMmio { page: u64 },
+    /// Host INT 13h probe returned CF set (disk service failure).
+    Int13Cf { ah: u8 },
 }
 
 impl GuestFirstFailureClass {
@@ -186,6 +188,26 @@ impl GuestFirstFailureClass {
             Self::MachineError => "machine-error",
             Self::UnclaimedIo { .. } => "unclaimed-io",
             Self::UnmappedMmio { .. } => "unmapped-mmio",
+            Self::Int13Cf { .. } => "int13-cf",
+        }
+    }
+
+    /// Coarse triage bucket matching R10 acceptance (decode/#UD, device, INT13 CF, hang).
+    pub fn bucket(&self) -> &'static str {
+        match self {
+            Self::UnsupportedOpcode { .. }
+            | Self::UnsupportedEncoding { .. }
+            | Self::TruncatedInstruction
+            | Self::InstructionTooLong => "decode-ud",
+            Self::ArchFault { vector } if *vector == 6 => "decode-ud",
+            Self::UnclaimedIo { .. } | Self::UnmappedMmio { .. } => "device",
+            Self::Int13Cf { .. } => "int13-cf",
+            Self::StepBudget => "hang",
+            Self::SyntheticHalt => "halted",
+            Self::ArchFault { .. }
+            | Self::ProtectedModeDelivery { .. }
+            | Self::MemoryFault { .. }
+            | Self::MachineError => "other",
         }
     }
 
@@ -195,7 +217,7 @@ impl GuestFirstFailureClass {
             Self::SyntheticHalt => {
                 "Synthetic fixture halted after banner — not FreeDOS/Linux progress"
             }
-            Self::StepBudget => "Step budget exhausted before a terminal halt/failure",
+            Self::StepBudget => "Step budget exhausted before a terminal halt/failure (hang location in report)",
             Self::UnsupportedOpcode { .. } => "First failure: unsupported opcode (CPU decode gap)",
             Self::UnsupportedEncoding { .. } => {
                 "First failure: unsupported encoding (CPU form gap)"
@@ -208,8 +230,9 @@ impl GuestFirstFailureClass {
                 "First failure: protected-mode exception delivery"
             }
             Self::MachineError => "First failure: machine/runtime error in probe",
-            Self::UnclaimedIo { .. } => "First actionable signal: unclaimed I/O port",
-            Self::UnmappedMmio { .. } => "First actionable signal: unmapped MMIO page",
+            Self::UnclaimedIo { .. } => "First actionable signal: unclaimed I/O port (device)",
+            Self::UnmappedMmio { .. } => "First actionable signal: unmapped MMIO page (device)",
+            Self::Int13Cf { .. } => "Host INT 13h probe returned CF (disk service failure)",
         }
     }
 }
@@ -235,6 +258,7 @@ impl std::fmt::Display for GuestFirstFailureClass {
             Self::MachineError => f.write_str("machine-error"),
             Self::UnclaimedIo { port } => write!(f, "unclaimed-io:0x{port:04X}"),
             Self::UnmappedMmio { page } => write!(f, "unmapped-mmio:{page:#x}"),
+            Self::Int13Cf { ah } => write!(f, "int13-cf:AH={ah:02X}"),
         }
     }
 }
@@ -481,7 +505,10 @@ pub fn synthetic_freedos_like_disk() -> Vec<u8> {
     img
 }
 
-/// Linux serial-path stub: MBR prints `LX` to COM1 then HLT (no kernel).
+/// Linux serial-path stub: MBR prints `LX\r\n` to COM1 then HLT (no kernel).
+///
+/// The CRLF is a tiny earlyprintk-shaped line ending for serial capture; it is
+/// **not** a Linux boot-protocol or earlyprintk driver claim.
 pub fn synthetic_linux_serial_stub_disk() -> Vec<u8> {
     let mut img = vec![0u8; 2 * crate::mbr::MBR_SECTOR_SIZE];
     let mut mbr = vec![0x90u8; crate::mbr::MBR_SECTOR_SIZE];
@@ -490,6 +517,10 @@ pub fn synthetic_linux_serial_stub_disk() -> Vec<u8> {
         0xB0, b'L', // mov al, 'L'
         0xEE, // out dx, al
         0xB0, b'X', // mov al, 'X'
+        0xEE, // out dx, al
+        0xB0, b'\r', // mov al, CR
+        0xEE, // out dx, al
+        0xB0, b'\n', // mov al, LF
         0xEE, // out dx, al
         0xF4, // hlt
     ];
@@ -766,16 +797,36 @@ mod tests {
         let mut m = Machine::new(64 * 1024);
         let report = m.measure_linux_serial_path(64).expect("linux-serial");
         assert_eq!(report.kind, GuestOsMeasureKind::LinuxSerialPath);
-        assert_eq!(report.measure.com1, "LX");
+        assert_eq!(report.measure.com1, "LX\r\n");
         assert_eq!(
             report.first_failure,
             GuestFirstFailureClass::SyntheticHalt
         );
         assert!(report.gaps.iter().any(|g| g.contains("bzImage")));
+        assert!(report.gaps.iter().any(|g| g.contains("boot protocol")));
         let text = report.to_string();
         assert!(text.contains("NOT Milestone 2 exit"));
         assert!(text.contains("linux-serial-path"));
         assert!(text.contains("first-failure=synthetic-halt"));
         assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
+    }
+
+    /// Linux serial path classifies unsupported opcode without claiming a shell.
+    #[test]
+    fn measure_linux_serial_path_classifies_first_failure() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_mbr_ud());
+        let report = m
+            .measure_linux_serial_path(64)
+            .expect("linux-serial failure");
+        assert!(matches!(
+            report.first_failure,
+            GuestFirstFailureClass::UnsupportedOpcode { .. }
+                | GuestFirstFailureClass::UnsupportedEncoding { .. }
+                | GuestFirstFailureClass::ArchFault { .. }
+        ));
+        assert!(report.gaps.iter().any(|g| g.contains("bzImage")));
+        let text = report.to_string();
+        assert!(text.contains("NOT Milestone 2 exit"));
+        assert!(!text.contains("Linux shell"));
     }
 }
