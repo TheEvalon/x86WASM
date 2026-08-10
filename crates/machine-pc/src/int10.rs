@@ -1,17 +1,20 @@
-//! Host INT 10h video stub (AH=00h/02h/03h/0Eh/0Fh).
+//! Host INT 10h video stub (AH=00h/01h/02h/03h/0Eh/0Fh).
 //!
 //! Bring-up path only: installs a real-mode IVT pointer and services selected
 //! functions via [`Machine::service_int10`]. Not a VGA BIOS and not VBE
 //! AX=4Fxxh.
 //!
 //! Spec: Ralf Brown's Interrupt List — INT 10h AH=00h "SET VIDEO MODE",
-//! AH=02h "SET CURSOR POSITION", AH=03h "GET CURSOR POSITION AND SIZE",
-//! AH=0Eh "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE"; IBM PC BIOS
-//! Data Area video fields at `0040:0049` / `0040:004A` / `0040:004C` /
-//! `0040:004E` / `0040:0050` / `0040:0060` / `0040:0062`.
+//! AH=01h "SET CURSOR TYPE", AH=02h "SET CURSOR POSITION", AH=03h "GET CURSOR
+//! POSITION AND SIZE", AH=0Eh "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO
+//! MODE"; IBM PC BIOS Data Area video fields at `0040:0049` / `0040:004A` /
+//! `0040:004C` / `0040:004E` / `0040:0050` / `0040:0060` / `0040:0062`.
 
 use crate::{Machine, MachineError};
-use devices::{VgaRenderMode, VGA_DEFAULT_ATTR, VGA_TEXT_COLS, VGA_TEXT_ROWS};
+use devices::{
+    PortDevice, VgaRenderMode, VGA_CRTC_CURSOR_END, VGA_CRTC_CURSOR_START, VGA_CRTC_DATA,
+    VGA_CRTC_INDEX, VGA_DEFAULT_ATTR, VGA_TEXT_COLS, VGA_TEXT_ROWS,
+};
 use x86_core::CpuState;
 
 /// INT 10h vector number. Spec: IBM PC IVT / RBIL.
@@ -19,6 +22,8 @@ pub const INT10_VECTOR: u8 = 0x10;
 
 /// AH=00h — SET VIDEO MODE. Spec: RBIL INT 10h AH=00h.
 pub const INT10_AH_SET_MODE: u8 = 0x00;
+/// AH=01h — SET CURSOR TYPE. Spec: RBIL INT 10h AH=01h.
+pub const INT10_AH_SET_CURSOR_TYPE: u8 = 0x01;
 /// AH=02h — SET CURSOR POSITION. Spec: RBIL INT 10h AH=02h.
 pub const INT10_AH_SET_CURSOR: u8 = 0x02;
 /// AH=03h — GET CURSOR POSITION AND SIZE. Spec: RBIL INT 10h AH=03h.
@@ -67,6 +72,7 @@ impl Machine {
     ///
     /// Supported:
     /// - AH=00h AL=03h / AL=13h — set video mode (text reset / mode 13h program)
+    /// - AH=01h — set cursor type (BDA `0040:0060` + CRTC Cursor Start/End)
     /// - AH=02h — set cursor position (page 0; BDA `0040:0050`)
     /// - AH=03h — get cursor position and size (page 0; BDA + CRTC scanlines)
     /// - AH=0Eh — teletype output in text mode (CR/LF/BS + printable)
@@ -76,6 +82,7 @@ impl Machine {
     pub fn service_int10(&mut self) {
         match self.cpu.ah() {
             INT10_AH_SET_MODE => self.int10_set_mode(self.cpu.al()),
+            INT10_AH_SET_CURSOR_TYPE => self.int10_set_cursor_type(),
             INT10_AH_SET_CURSOR => self.int10_set_cursor(),
             INT10_AH_GET_CURSOR => self.int10_get_cursor(),
             INT10_AH_TELETYPE => self.int10_teletype(self.cpu.al()),
@@ -127,6 +134,31 @@ impl Machine {
                 // Unsupported mode: leave hardware alone (honest subset).
             }
         }
+    }
+
+    /// AH=01h SET CURSOR TYPE. Spec: RBIL — CH=start scanline, CL=end scanline
+    /// (CH bit5 = cursor disable on VGA).
+    ///
+    /// Writes BDA `0040:0060` (CX layout: low=end, high=start) and programs
+    /// FreeVGA CRTC Cursor Start (`0x0A`) / Cursor End (`0x0B`).
+    fn int10_set_cursor_type(&mut self) {
+        let start = self.cpu.gpr_u8(4 + CpuState::RCX); // CH
+        let end = self.cpu.gpr_u8_low(CpuState::RCX); // CL
+        let _ = self.write_bda_cursor_type(start, end);
+        self.program_crtc_cursor_type(start, end);
+    }
+
+    /// Program CRTC Cursor Start/End to match AH=01h / BDA cursor type.
+    ///
+    /// Spec: FreeVGA CRT Controller — indices `0x0A` / `0x0B` (scanline mask
+    /// and disable bit preserved in the written byte).
+    fn program_crtc_cursor_type(&mut self, start: u8, end: u8) {
+        self.vga
+            .port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_START));
+        self.vga.port_write(VGA_CRTC_DATA, 1, u32::from(start));
+        self.vga
+            .port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_END));
+        self.vga.port_write(VGA_CRTC_DATA, 1, u32::from(end));
     }
 
     /// AH=02h SET CURSOR POSITION. Spec: RBIL — BH=page, DH=row, DL=col.
@@ -326,6 +358,13 @@ pub fn setup_int10_set_mode(cpu: &mut CpuState, mode: u8) {
     cpu.set_al(mode);
 }
 
+/// Load AH/CH/CL for SET CURSOR TYPE.
+pub fn setup_int10_set_cursor_type(cpu: &mut CpuState, start: u8, end: u8) {
+    cpu.set_ah(INT10_AH_SET_CURSOR_TYPE);
+    cpu.set_gpr_u8(4 + CpuState::RCX, start); // CH
+    cpu.set_gpr_u8_low(CpuState::RCX, end); // CL
+}
+
 /// Load AH/BH/DH/DL for SET CURSOR POSITION.
 pub fn setup_int10_set_cursor(cpu: &mut CpuState, page: u8, row: u8, col: u8) {
     cpu.set_ah(INT10_AH_SET_CURSOR);
@@ -433,6 +472,40 @@ mod tests {
         assert_eq!(m.vga.char_at(1, 0), Some(b'B'));
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0).unwrap(), 1);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn int10_ah01_sets_bda_and_crtc_cursor_type() {
+        // Spec: RBIL INT 10h AH=01h — CH=start, CL=end → BDA 0040:0060 + CRTC.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+
+        setup_int10_set_cursor_type(&mut m.cpu, 0x0A, 0x0B);
+        m.service_int10();
+
+        assert_eq!(m.read_bda_cursor_type(), Some((0x0A, 0x0B)));
+        assert_eq!(m.vga.crtc_cursor_start_scanline(), 0x0A);
+        assert_eq!(m.vga.crtc_cursor_end_scanline(), 0x0B);
+        assert!(!m.vga.crtc_cursor_disabled());
+
+        // AH=03h must observe the new type. Spec: RBIL AH=03h CH/CL.
+        setup_int10_get_cursor(&mut m.cpu, 0);
+        m.service_int10();
+        assert_eq!(m.cpu.gpr_u8(4 + CpuState::RCX), 0x0A); // CH
+        assert_eq!(m.cpu.gpr_u8_low(CpuState::RCX), 0x0B); // CL
+    }
+
+    #[test]
+    fn int10_ah01_cursor_disable_bit_reaches_crtc() {
+        // Spec: FreeVGA / IBM VGA — Cursor Start bit5 disables the cursor.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_cursor_type(&mut m.cpu, 0x20 | 0x06, 0x07);
+        m.service_int10();
+        assert!(m.vga.crtc_cursor_disabled());
+        assert_eq!(m.read_bda_cursor_type(), Some((0x26, 0x07)));
     }
 
     #[test]
@@ -568,7 +641,7 @@ mod tests {
     fn int10_unsupported_ah_is_noop() {
         let mut m = Machine::new(1024 * 1024);
         m.vga.put_char(0, 0, b'X', 0x07);
-        m.cpu.set_ah(0x01); // SET CURSOR TYPE — not implemented in this slice
+        m.cpu.set_ah(0x05); // SELECT ACTIVE DISPLAY PAGE — not in this stub
         m.cpu.set_al(0);
         m.service_int10();
         assert_eq!(m.vga.char_at(0, 0), Some(b'X'));
