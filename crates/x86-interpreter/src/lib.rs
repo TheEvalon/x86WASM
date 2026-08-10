@@ -1801,7 +1801,9 @@ fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
 ///
 /// VM86 without VME: `IOPL < 3` → `#GP(0)`. Otherwise load permitted bits;
 /// `VM`/`RF` are never taken from the image; RF is cleared; bit 1 stays set.
-/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2.
+/// `VIP`/`VIF` are **never** loaded from the image (VME is unsupported —
+/// CPUID.VME clear, `CR4.VME` reserved); they remain sticky.
+/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2 / Table 20-2 (VME=0).
 fn popf_execute(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -2471,8 +2473,10 @@ fn return_to_virtual_8086_mode(
 /// leaves `VM`/`IOPL`/`VIP`/`VIF` unchanged (Vol. 2 IRET
 /// RETURN-FROM-VIRTUAL-8086-MODE). Leaving VM86 entirely requires a privilege
 /// transition to CPL 0 (interrupt/task) then `IRETD` with `VM=0` in the image.
+/// Unsupported: VME redirect of IOPL-sensitive IRET; VIP∧VIF `#GP` is a VME
+/// feature and is **not** implemented here (CPUID.VME clear).
 ///
-/// Spec: Intel SDM Vol. 2 "IRET/IRETD"; Vol. 3 §20.2.3 / ch.20.
+/// Spec: Intel SDM Vol. 2 "IRET/IRETD"; Vol. 3 §20.2.3 / ch.20 / Table 20-2.
 fn vm86_iret(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
