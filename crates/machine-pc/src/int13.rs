@@ -72,10 +72,20 @@ pub const INT13_EXT_MAGIC_OUT: u16 = 0xAA55;
 pub const INT13_EXT_VERSION: u8 = 0x01;
 /// `CX` bit 0 — packet-structure device access supported (AH=42h/43h here).
 pub const INT13_EXT_CX_PACKET: u16 = 0x0001;
+/// `CX` bit 1 — removable drive locking/ejecting (AH=45h/46h/49h) — **unsupported**.
+pub const INT13_EXT_CX_LOCKING: u16 = 0x0002;
 /// `CX` bit 2 — Enhanced Disk Drive support (AH=48h subset here).
 pub const INT13_EXT_CX_EDD: u16 = 0x0004;
 /// Subset advertised by AH=41h: packet access + EDD params (not locking).
+///
+/// Honesty: bit0 historically covers AH=42h–44h/47h; this host implements
+/// AH=42h/43h (HD) or AH=42h (CD) only. AH=44h extended verify and AH=47h
+/// extended seek remain unsupported and return [`INT13_STATUS_INVALID`].
 pub const INT13_EXT_CX_SUPPORTED: u16 = INT13_EXT_CX_PACKET | INT13_EXT_CX_EDD;
+/// AH=44h — extended verify sectors (unsupported; packet bit does not imply it).
+pub const INT13_AH_EXT_VERIFY: u8 = 0x44;
+/// AH=47h — extended seek (unsupported).
+pub const INT13_AH_EXT_SEEK: u8 = 0x47;
 /// Minimum Disk Address Packet size (16 bytes).
 pub const INT13_DAP_SIZE_MIN: u8 = 0x10;
 /// Minimum AH=48h result buffer size (Phoenix EDD v1.x / RBIL).
@@ -433,6 +443,8 @@ impl Machine {
     }
 
     /// Spec: IBM/MS INT 13h Extensions AH=41h — `BX=55AAh` in, `BX=AA55h` out.
+    /// `CX` advertises only [`INT13_EXT_CX_SUPPORTED`] (packet + EDD); locking
+    /// bit1 stays clear. AH=44h/47h remain unsupported despite packet bit0.
     fn int13_hd_check_extensions(&mut self) {
         if self.cpu.gpr_u16(CpuState::RBX) != INT13_EXT_MAGIC_IN {
             self.int13_fail(INT13_STATUS_INVALID);
@@ -446,6 +458,10 @@ impl Machine {
         self.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_OUT);
         // Packet access (AH=42h/43h) + EDD params (AH=48h). Removable locking out.
         self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
+        debug_assert_eq!(
+            self.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING,
+            0
+        );
         self.cpu.set_cf(false);
     }
 
@@ -1771,6 +1787,39 @@ mod tests {
         );
     }
 
+    /// Spec: AH=41h CX bitmap honesty — only packet+EDD; locking bit clear.
+    /// Aligned with implemented AH=42h/43h/48h (not AH=44h/45h/46h/47h).
+    #[test]
+    fn int13_ah41_cx_bitmap_only_supported_bits() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        m.cpu.set_ah(INT13_AH_CHECK_EXTENSIONS);
+        m.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_IN);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13();
+        let cx = m.cpu.gpr_u16(CpuState::RCX);
+        assert!(!cf(&m.cpu));
+        assert_eq!(cx, INT13_EXT_CX_PACKET | INT13_EXT_CX_EDD);
+        assert_eq!(cx & INT13_EXT_CX_LOCKING, 0, "locking/eject bit must stay clear");
+        assert_eq!(cx & !INT13_EXT_CX_SUPPORTED, 0, "no undocumented CX bits");
+    }
+
+    /// Spec: packet bit does not imply AH=44h/47h — those remain invalid.
+    #[test]
+    fn int13_ah44_ah47_extensions_unsupported() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        m.cpu.set_ah(INT13_AH_EXT_VERIFY);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+
+        m.cpu.set_ah(INT13_AH_EXT_SEEK);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
     /// Spec: AH=41h requires BX=55AAh.
     #[test]
     fn int13_ah41_rejects_bad_magic() {
@@ -2243,6 +2292,18 @@ mod tests {
         assert_eq!(m.cpu.ah(), INT13_EXT_VERSION);
         assert_eq!(m.cpu.gpr_u16(CpuState::RBX), INT13_EXT_MAGIC_OUT);
         assert_eq!(m.cpu.gpr_u16(CpuState::RCX), INT13_EXT_CX_SUPPORTED);
+        assert_eq!(
+            m.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING,
+            0,
+            "CD AH=41h must not advertise locking"
+        );
+        // CD has AH=42h/48h but not AH=43h — packet bit still set for DAP read;
+        // extended write remains invalid on CD.
+        m.cpu.set_ah(INT13_AH_EXT_WRITE);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
+        m.service_int13_cd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
     }
 
     /// Spec: AH=42h CD DAP read — 2048-byte Mode-1 LBA from ATAPI medium.
