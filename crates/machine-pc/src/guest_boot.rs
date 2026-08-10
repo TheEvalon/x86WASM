@@ -1,22 +1,25 @@
-//! Guest disk boot measure harness v2/v3 (FreeDOS/Linux serial-path prep).
+//! Guest disk boot measure harness v2/v4 (FreeDOS/Linux serial-path prep).
 //!
 //! Loads a boot sector / El Torito / synthetic FreeDOS-like image, then reuses
 //! [`Machine::probe_post`] to record the **first** stop reason plus serial
-//! capture, optional VGA summary, and named checkpoints. This does **not**
-//! claim FreeDOS prompt, Linux userspace, or Milestone 2 boot success.
+//! capture, optional VGA summary, named checkpoints, and a structured
+//! first-failure class (decode/#UD, device, INT13 CF, hang location). This
+//! does **not** claim FreeDOS prompt, Linux userspace, or Milestone 2 boot
+//! success.
 //!
 //! Spec: IBM PC BIOS INT 19h handoff + El Torito 1.0 no-emul load + existing
 //! POST probe diagnostics (`docs/boot-r8-guest-measure-v2.md`,
-//! `docs/boot-r9-freedos-measure.md`).
+//! `docs/boot-r9-freedos-measure.md`, `docs/boot-r10-freedos-first-failure.md`,
+//! `docs/boot-r10-linux-serial-first-failure.md`).
 
-use crate::post_probe::{PostReport, PostStopReason};
+use crate::post_probe::{PostFailureKind, PostReport, PostStopReason};
 use crate::{Machine, MachineError};
 
 /// Harness schema version for CLI/report consumers (v2 checkpoints + serial).
 pub const GUEST_BOOT_MEASURE_VERSION: u32 = 2;
 
-/// FreeDOS-like / Linux-serial measure report schema (wraps v2 + honesty).
-pub const GUEST_OS_MEASURE_VERSION: u32 = 3;
+/// FreeDOS-like / Linux-serial measure report schema (v4 = first-failure class).
+pub const GUEST_OS_MEASURE_VERSION: u32 = 4;
 
 /// Which host boot helper to use before measuring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,7 +139,145 @@ pub enum GuestOsMeasureKind {
     LinuxSerialPath,
 }
 
-/// v3 OS-path measure: wraps v2 plus honesty / gap list.
+/// Structured first-stop / first-failure class for guest OS-path triage.
+///
+/// Derived from [`GuestBootMeasure::report`]; never claims OS boot success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuestFirstFailureClass {
+    /// Intentional synthetic `HLT` after banner (fixture complete; not an OS).
+    SyntheticHalt,
+    /// Instruction budget exhausted before halt/failure.
+    StepBudget,
+    /// Decode tables lack the primary opcode.
+    UnsupportedOpcode { opcode: u8 },
+    /// Encoding/form unimplemented.
+    UnsupportedEncoding { opcode: u8 },
+    /// Truncated fetch.
+    TruncatedInstruction,
+    /// SDM 15-byte limit exceeded.
+    InstructionTooLong,
+    /// Memory / bus fault.
+    MemoryFault { addr: u64 },
+    /// Architectural exception surfaced to the host.
+    ArchFault { vector: u8 },
+    /// Protected-mode delivery failed.
+    ProtectedModeDelivery { vector: u8 },
+    /// Machine-level setup/runtime error recorded by the probe.
+    MachineError,
+    /// Probe stopped with unclaimed I/O as the only actionable signal.
+    UnclaimedIo { port: u16 },
+    /// Probe stopped with unmapped MMIO as the only actionable signal.
+    UnmappedMmio { page: u64 },
+}
+
+impl GuestFirstFailureClass {
+    /// Stable triage tag for CLI/docs (ASCII kebab-case).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::SyntheticHalt => "synthetic-halt",
+            Self::StepBudget => "step-budget",
+            Self::UnsupportedOpcode { .. } => "unsupported-opcode",
+            Self::UnsupportedEncoding { .. } => "unsupported-encoding",
+            Self::TruncatedInstruction => "truncated-instruction",
+            Self::InstructionTooLong => "instruction-too-long",
+            Self::MemoryFault { .. } => "memory-fault",
+            Self::ArchFault { .. } => "arch-fault",
+            Self::ProtectedModeDelivery { .. } => "pm-delivery",
+            Self::MachineError => "machine-error",
+            Self::UnclaimedIo { .. } => "unclaimed-io",
+            Self::UnmappedMmio { .. } => "unmapped-mmio",
+        }
+    }
+
+    /// Gap string contributed by this class (appended to static path gaps).
+    pub fn gap_note(&self) -> &'static str {
+        match self {
+            Self::SyntheticHalt => {
+                "Synthetic fixture halted after banner — not FreeDOS/Linux progress"
+            }
+            Self::StepBudget => "Step budget exhausted before a terminal halt/failure",
+            Self::UnsupportedOpcode { .. } => "First failure: unsupported opcode (CPU decode gap)",
+            Self::UnsupportedEncoding { .. } => {
+                "First failure: unsupported encoding (CPU form gap)"
+            }
+            Self::TruncatedInstruction => "First failure: truncated instruction fetch",
+            Self::InstructionTooLong => "First failure: instruction too long",
+            Self::MemoryFault { .. } => "First failure: memory/bus fault",
+            Self::ArchFault { .. } => "First failure: architectural fault (exception delivery)",
+            Self::ProtectedModeDelivery { .. } => {
+                "First failure: protected-mode exception delivery"
+            }
+            Self::MachineError => "First failure: machine/runtime error in probe",
+            Self::UnclaimedIo { .. } => "First actionable signal: unclaimed I/O port",
+            Self::UnmappedMmio { .. } => "First actionable signal: unmapped MMIO page",
+        }
+    }
+}
+
+impl std::fmt::Display for GuestFirstFailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SyntheticHalt => f.write_str("synthetic-halt"),
+            Self::StepBudget => f.write_str("step-budget"),
+            Self::UnsupportedOpcode { opcode } => {
+                write!(f, "unsupported-opcode:0x{opcode:02X}")
+            }
+            Self::UnsupportedEncoding { opcode } => {
+                write!(f, "unsupported-encoding:0x{opcode:02X}")
+            }
+            Self::TruncatedInstruction => f.write_str("truncated-instruction"),
+            Self::InstructionTooLong => f.write_str("instruction-too-long"),
+            Self::MemoryFault { addr } => write!(f, "memory-fault:{addr:#x}"),
+            Self::ArchFault { vector } => write!(f, "arch-fault:vec={vector}"),
+            Self::ProtectedModeDelivery { vector } => {
+                write!(f, "pm-delivery:vec={vector}")
+            }
+            Self::MachineError => f.write_str("machine-error"),
+            Self::UnclaimedIo { port } => write!(f, "unclaimed-io:0x{port:04X}"),
+            Self::UnmappedMmio { page } => write!(f, "unmapped-mmio:{page:#x}"),
+        }
+    }
+}
+
+/// Classify the first stop / first failure from a v2 guest measure report.
+pub fn classify_guest_first_failure(report: &PostReport) -> GuestFirstFailureClass {
+    match &report.stop {
+        PostStopReason::Halted => GuestFirstFailureClass::SyntheticHalt,
+        PostStopReason::StepBudgetExhausted => {
+            if let Some(access) = report.unclaimed_ports.first() {
+                GuestFirstFailureClass::UnclaimedIo {
+                    port: access.port,
+                }
+            } else if let Some(access) = report.unmapped_mmio.first() {
+                GuestFirstFailureClass::UnmappedMmio {
+                    page: access.page,
+                }
+            } else {
+                GuestFirstFailureClass::StepBudget
+            }
+        }
+        PostStopReason::Failure(failure) => match &failure.kind {
+            PostFailureKind::UnsupportedOpcode(op) => GuestFirstFailureClass::UnsupportedOpcode {
+                opcode: *op,
+            },
+            PostFailureKind::UnsupportedEncoding(op) => {
+                GuestFirstFailureClass::UnsupportedEncoding { opcode: *op }
+            }
+            PostFailureKind::TruncatedInstruction => GuestFirstFailureClass::TruncatedInstruction,
+            PostFailureKind::InstructionTooLong => GuestFirstFailureClass::InstructionTooLong,
+            PostFailureKind::MemoryFault(addr) => GuestFirstFailureClass::MemoryFault { addr: *addr },
+            PostFailureKind::ArchFault { vector, .. } => {
+                GuestFirstFailureClass::ArchFault { vector: *vector }
+            }
+            PostFailureKind::ProtectedModeDelivery { vector, .. } => {
+                GuestFirstFailureClass::ProtectedModeDelivery { vector: *vector }
+            }
+            PostFailureKind::Machine(_) => GuestFirstFailureClass::MachineError,
+        },
+    }
+}
+
+/// v4 OS-path measure: wraps v2 plus honesty / first-failure class / gap list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestOsMeasure {
     /// Schema version ([`GUEST_OS_MEASURE_VERSION`]).
@@ -145,9 +286,11 @@ pub struct GuestOsMeasure {
     pub kind: GuestOsMeasureKind,
     /// Underlying v2 measure (serial/VGA/checkpoints/stop).
     pub measure: GuestBootMeasure,
+    /// Structured first-stop / first-failure class.
+    pub first_failure: GuestFirstFailureClass,
     /// Explicit non-claim sentence for reports/CLI.
     pub honesty: &'static str,
-    /// Remaining gaps toward a real guest (not M2 exit).
+    /// Remaining gaps toward a real guest (not M2 exit), including class note.
     pub gaps: Vec<&'static str>,
 }
 
@@ -159,8 +302,8 @@ impl std::fmt::Display for GuestOsMeasure {
         };
         writeln!(
             f,
-            "guest-os-measure-v{}: kind={} (NOT an OS boot / NOT Milestone 2 exit)",
-            self.version, kind
+            "guest-os-measure-v{}: kind={} first-failure={} (NOT an OS boot / NOT Milestone 2 exit)",
+            self.version, kind, self.first_failure
         )?;
         writeln!(f, "  honesty: {}", self.honesty)?;
         write!(f, "  gaps=[")?;
@@ -230,17 +373,21 @@ impl Machine {
             self.attach_ide_image(synthetic_freedos_like_disk());
         }
         let measure = self.measure_guest_boot(GuestBootMedia::IdePrefer, max_steps)?;
+        let first_failure = classify_guest_first_failure(&measure.report);
+        let mut gaps = vec![
+            "No FreeDOS image vendored; fixture is synthetic",
+            "Guest INT 13h still needs SeaBIOS (host subset is not an IVT body)",
+            "Incomplete firmware POST / devices / opcodes for real FreeDOS",
+            "No claim of COMMAND.COM or FreeDOS prompt",
+        ];
+        gaps.push(first_failure.gap_note());
         Ok(GuestOsMeasure {
             version: GUEST_OS_MEASURE_VERSION,
             kind: GuestOsMeasureKind::FreeDosLike,
             measure,
+            first_failure,
             honesty: "Synthetic FreeDOS-like MBR+payload only — does NOT claim a FreeDOS prompt or kernel.",
-            gaps: vec![
-                "No FreeDOS image vendored; fixture is synthetic",
-                "Guest INT 13h still needs SeaBIOS (host subset is not an IVT body)",
-                "Incomplete firmware POST / devices / opcodes for real FreeDOS",
-                "No claim of COMMAND.COM or FreeDOS prompt",
-            ],
+            gaps,
         })
     }
 
@@ -256,18 +403,22 @@ impl Machine {
             self.attach_ide_image(synthetic_linux_serial_stub_disk());
         }
         let measure = self.measure_guest_boot(GuestBootMedia::IdePrefer, max_steps)?;
+        let first_failure = classify_guest_first_failure(&measure.report);
+        let mut gaps = vec![
+            "No bzImage / vmlinux fixture vendored or loaded",
+            "No Linux boot protocol (real-mode setup, protected-mode jump)",
+            "No earlyprintk / 8250 console driver path through a real kernel",
+            "Missing SeaBIOS INT 13h guest path for disked bootloaders",
+            "Protected-mode / paging / CPUID gaps may still block real kernels",
+        ];
+        gaps.push(first_failure.gap_note());
         Ok(GuestOsMeasure {
             version: GUEST_OS_MEASURE_VERSION,
             kind: GuestOsMeasureKind::LinuxSerialPath,
             measure,
+            first_failure,
             honesty: "Synthetic serial-printing stub only — does NOT claim Linux boot, userspace, or Milestone 2 exit.",
-            gaps: vec![
-                "No bzImage / vmlinux fixture vendored or loaded",
-                "No Linux boot protocol (real-mode setup, protected-mode jump)",
-                "No earlyprintk / 8250 console driver path through a real kernel",
-                "Missing SeaBIOS INT 13h guest path for disked bootloaders",
-                "Protected-mode / paging / CPUID gaps may still block real kernels",
-            ],
+            gaps,
         })
     }
 }
@@ -567,13 +718,46 @@ mod tests {
             .checkpoints
             .contains(&GuestBootCheckpoint::VgaObserved));
         assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
+        assert_eq!(
+            report.first_failure,
+            GuestFirstFailureClass::SyntheticHalt
+        );
+        assert_eq!(report.first_failure.tag(), "synthetic-halt");
         let text = report.to_string();
         assert!(text.contains("NOT an OS boot"));
         assert!(text.contains("does NOT claim a FreeDOS prompt"));
         assert!(text.contains("freedos-like"));
+        assert!(text.contains("first-failure=synthetic-halt"));
         assert!(report.gaps.iter().any(|g| g.contains("prompt")));
+        assert!(report
+            .gaps
+            .iter()
+            .any(|g| g.contains("not FreeDOS/Linux progress")));
         // Payload marker exists on disk but is not a boot claim.
         assert!(m.ide.image[MBR_SECTOR_SIZE..].starts_with(b"FREEDOS-LIKE-PAYLOAD"));
+    }
+
+    /// FreeDOS-like first-failure class for an unimplemented opcode fixture.
+    #[test]
+    fn measure_freedos_like_classifies_unsupported_encoding() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_mbr_ud());
+        let report = m.measure_freedos_like(64).expect("freedos-like failure");
+        assert!(matches!(
+            report.first_failure,
+            GuestFirstFailureClass::UnsupportedOpcode { .. }
+                | GuestFirstFailureClass::UnsupportedEncoding { .. }
+                | GuestFirstFailureClass::ArchFault { .. }
+        ));
+        assert_eq!(report.first_failure.tag(), match &report.first_failure {
+            GuestFirstFailureClass::UnsupportedOpcode { .. } => "unsupported-opcode",
+            GuestFirstFailureClass::UnsupportedEncoding { .. } => "unsupported-encoding",
+            GuestFirstFailureClass::ArchFault { .. } => "arch-fault",
+            other => panic!("unexpected class {other}"),
+        });
+        assert!(report.gaps.iter().any(|g| g.contains("First failure")));
+        let text = report.to_string();
+        assert!(text.contains("NOT an OS boot"));
+        assert!(!text.contains("FreeDOS prompt reached"));
     }
 
     /// Linux serial-path harness: COM1 banner + documented gaps; not M2 exit.
@@ -583,10 +767,15 @@ mod tests {
         let report = m.measure_linux_serial_path(64).expect("linux-serial");
         assert_eq!(report.kind, GuestOsMeasureKind::LinuxSerialPath);
         assert_eq!(report.measure.com1, "LX");
+        assert_eq!(
+            report.first_failure,
+            GuestFirstFailureClass::SyntheticHalt
+        );
         assert!(report.gaps.iter().any(|g| g.contains("bzImage")));
         let text = report.to_string();
         assert!(text.contains("NOT Milestone 2 exit"));
         assert!(text.contains("linux-serial-path"));
+        assert!(text.contains("first-failure=synthetic-halt"));
         assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
     }
 }
