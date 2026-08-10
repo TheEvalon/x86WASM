@@ -17,8 +17,8 @@
 ## Unsupported (explicit)
 
 * Method-6 FLAGS image rewrite (`IOPL` forced to 3, `VIF→IF` on the pushed
-  word) — stub pushes the live FLAGS image.
-* VIF-based `CLI`/`STI`, VIP∧VIF `#GP`
+  word) — completed in Round-13 (`docs/cpu-r13-vme-soft-int-redirect-deepen.md`)
+* VIF-based `CLI`/`STI`, VIP∧VIF `#GP` — Round-13 slices 1–2
 * `CPUID.VME` (remains clear)
 * Hardware IRQ / exception redirection (bitmap is soft-int only)
 

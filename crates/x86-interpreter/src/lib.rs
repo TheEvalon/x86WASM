@@ -1832,10 +1832,10 @@ fn vme_soft_int_redirect_bit_set(
 }
 
 /// VME interrupt redirection: deliver `INT n` through the 8086 IVT at linear 0
-/// while remaining in virtual-8086 mode (Table 20-2 methods 5/6 class).
+/// while remaining in virtual-8086 mode (Table 20-2 methods 5/6).
 ///
-/// Bounded stub: pushes the live FLAGS image (does **not** rewrite IOPL=3 /
-/// VIF→IF for method 6), clears IF/TF, loads CS:IP from linear `vector*4`.
+/// Method 5 (`IOPL = 3`): push live FLAGS. Method 6 (`IOPL < 3`): push FLAGS
+/// with `IOPL := 3` and `IF ← VIF`, then clear `VIF` along with `IF`/`TF`.
 /// Spec: Intel SDM Vol. 3 §20.2.2 Table 20-2; Vol. 2 INT n.
 fn vm86_vme_redirect_soft_int(
     cpu: &mut CpuState,
@@ -1844,11 +1844,26 @@ fn vm86_vme_redirect_soft_int(
     return_ip: u32,
 ) -> Result<(), ExecError> {
     debug_assert!(eflags_vm(cpu.rflags));
-    let flags16 = cpu.rflags as u16;
+    let iopl = eflags_iopl(cpu.rflags);
+    let flags16 = if iopl < 3 {
+        // Method 6: IOPL=3 and IF←VIF in the pushed image.
+        let mut f = cpu.rflags as u16;
+        f = (f & !(3 << 12)) | (3 << 12);
+        f &= !(1 << 9);
+        if cpu.rflags & EFLAGS_VIF != 0 {
+            f |= 1 << 9;
+        }
+        f
+    } else {
+        cpu.rflags as u16
+    };
     push16(cpu, bus, flags16)?;
     push16(cpu, bus, cpu.cs.selector)?;
     push16(cpu, bus, return_ip as u16)?;
-    cpu.rflags &= !((1 << 9) | (1 << 8));
+    cpu.rflags &= !((1 << 9) | (1 << 8)); // IF|TF
+    if iopl < 3 {
+        cpu.rflags &= !EFLAGS_VIF;
+    }
     let entry = u64::from(vector) * 4;
     let offset = bus
         .read_u16(entry)
