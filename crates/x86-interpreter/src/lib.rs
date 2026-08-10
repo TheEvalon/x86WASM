@@ -2105,28 +2105,36 @@ fn call_gate_far_call(
     Ok(())
 }
 
-/// Protected-mode `IRET` / `IRETD`: same-CPL or outer-privilege return.
+/// Protected-mode `IRET` / `IRETD`: nested-task return, same-CPL, or outer return.
 ///
-/// `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame (`IRETD`)
-/// or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`). Stack-pointer width follows
-/// the current `SS.B`. When the return CS.RPL is greater than CPL, the frame
-/// also carries outer `ESP`/`SS`, which are validated and loaded so CPL drops
-/// to the return RPL (Vol. 2 IRET; Vol. 3 §6.12.1).
+/// When `NT=1`, perform an IRET-form hardware task switch to the previous-task
+/// link (Vol. 3 §7.3) instead of popping a stack frame. `next_ip` is the EIP
+/// saved into the outgoing TSS for that path.
 ///
-/// This bounded path still requires the instruction itself to execute at
-/// CPL 0. Same-CPL returns reload a nonconforming present `L=0` ring-0 GDT
-/// code segment; outer returns require a nonconforming segment whose DPL
-/// equals the return RPL, plus a matching writable SS. `NT=1` task returns
-/// and `VM=1` images remain unsupported.
+/// Otherwise `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame
+/// (`IRETD`) or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`). Stack-pointer
+/// width follows the current `SS.B`. When the return CS.RPL is greater than CPL,
+/// the frame also carries outer `ESP`/`SS`, which are validated and loaded so
+/// CPL drops to the return RPL (Vol. 2 IRET; Vol. 3 §6.12.1).
+///
+/// Non-nested returns still require the instruction itself to execute at CPL 0.
+/// `VM=1` (virtual-8086 IRET) remains unsupported.
 ///
 /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ; Vol. 1 §3.4.3; Vol. 3
-/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13.
+/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13, 7.3.
 fn protected_iret(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
     operand_size_32: bool,
+    next_ip: u32,
 ) -> Result<(), ExecError> {
-    if cpu.cs.selector & 3 != 0 || cpu.rflags & ((1 << 14) | (1 << 17)) != 0 {
+    if cpu.rflags & (1 << 17) != 0 {
+        return Err(ExecError::Unsupported(0xCF));
+    }
+    if cpu.rflags & (1 << 14) != 0 {
+        return task_switch(cpu, bus, TaskSwitchCause::Iret, None, next_ip);
+    }
+    if cpu.cs.selector & 3 != 0 {
         return Err(ExecError::Unsupported(0xCF));
     }
     let cpl = 0u8;
@@ -4969,8 +4977,6 @@ enum TaskSwitchCause {
     /// Far `CALL` — keep outgoing busy, set `NT`, write previous-task link.
     Call,
     /// `IRET` with `NT=1` — clear outgoing busy, clear `NT` (link from current TSS).
-    /// Wired by the Round-8 nested-task IRET slice.
-    #[allow(dead_code)]
     Iret,
 }
 
@@ -6991,7 +6997,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // IRET/IRETD — Spec: Intel SDM Vol. 2 "IRET/IRETD/IRETQ".
             // The effective operand size selects the 6-byte or 12-byte frame.
             if cr0_pe(cpu) {
-                protected_iret(cpu, bus, opsz32(&insn))?;
+                protected_iret(cpu, bus, opsz32(&insn), next_ip)?;
             } else {
                 // Preserve the existing real-address 16-bit stack-frame path.
                 // Real-address `IRETD` (`0x66 CF`, 12-byte frame) is not modeled.
@@ -21097,24 +21103,15 @@ mod tests {
         assert_eq!(cpu, before, "EIP past limit committed state");
     }
 
-    /// Returning to virtual-8086 mode (`VM=1` in the popped image) and nested
-    /// task returns (`NT=1`) are outside this bounded same-CPL slice and are
-    /// reported instead of being silently ignored.
+    /// Returning to virtual-8086 mode (`VM=1` in the popped image) remains
+    /// outside this path and is reported rather than silently ignored.
+    /// Nested-task `NT=1` returns are covered by `cpu_r8_iret_nt`.
     /// Spec: Intel SDM Vol. 2 "IRET/IRETD" (Operation); Vol. 3 §§6.12.1, 20.2.
     #[test]
-    fn protected_iretd_rejects_vm86_and_nested_task_returns() {
+    fn protected_iretd_rejects_vm86_return_image() {
         let descriptor = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
         let (mut cpu, mut bus) =
             pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002 | (1 << 17), descriptor);
-        let before = cpu.clone();
-        assert_eq!(
-            step_inner(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xCF))
-        );
-        assert_eq!(cpu, before);
-
-        let (mut cpu, mut bus) = pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002, descriptor);
-        cpu.rflags |= 1 << 14; // NT
         let before = cpu.clone();
         assert_eq!(
             step_inner(&mut cpu, &mut bus),
