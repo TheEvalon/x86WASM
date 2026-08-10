@@ -42,14 +42,15 @@ not constitute a SeaBIOS POST integration claim.
   into MIT/Apache Rust crates)
 - Manifest pin: firmware/manifests/seavgabios.json
 
-No SeaVGABIOS sources are embedded in crates/. The emulator does not scan or
-execute option ROMs; `emulator-cli --option-rom` maps an image for inspection
-only.
+No SeaVGABIOS sources are embedded in crates/. Option-ROM *mapping* is available
+via `Machine::map_vga_option_rom` / `emulator-cli --option-rom`; host-driven
+entry invoke is a separate machine helper (see `docs/firmware-r7-option-rom-invoke.md`
+when present). There is still no SeaBIOS-driven option-ROM scan or INT 10h.
 
-Status as of 2026-08-09: the build script has never been executed in this tree
-and no SeaVGABIOS binary exists here. The pin, the license notice, and the
-build configuration above are recorded ahead of the first build so that the
-provenance is settled before a binary appears.
+Status as of 2026-08-10 (R7 display/boot): pin, build script, LICENSE.notice, and
+this NOTICE entry remain the committed surface. A Windows in-session build was
+infeasible (no WSL bash / i386 toolchain); reproducible Linux/WSL2 steps are in
+`docs/firmware-r7-seavgabios-build.md`. No binary is committed (*.bin gitignored).
 
 ## OVMF / other firmware
 
