@@ -55,10 +55,10 @@ use devices::{
     FwCfgDmaOutcome, IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550,
     VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY,
     E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED,
-    FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD,
-    PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
-    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_BOOT_ORDER, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA,
+    I8042_STATUS_CMD, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
+    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -91,6 +91,15 @@ pub enum MachineError {
     /// Guest RAM must cover `0x7C00`..`0x7DFF` for the boot-sector copy.
     #[error("RAM too small for MBR at 0x7C00")]
     MbrRamTooSmall,
+}
+
+/// Host override for fw_cfg `bootorder`, or the machine default when `Default`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FwCfgBootOrderPolicy {
+    /// Publish [`devices::FW_CFG_DEFAULT_BOOT_ORDER`].
+    Default,
+    /// Host-supplied paths (empty removes the file).
+    Override(Vec<String>),
 }
 
 pub struct Machine {
@@ -148,6 +157,8 @@ pub struct Machine {
     /// fixed-disk geometry is derived from; attaching straight to
     /// [`Machine::ide`] bypasses it and leaves CMOS describing no disk.
     ide_disk_sectors: Option<u64>,
+    /// fw_cfg `bootorder` policy: machine default HDD/CD/floppy, or a host override.
+    fw_cfg_boot_order: FwCfgBootOrderPolicy,
 }
 
 impl Machine {
@@ -177,6 +188,7 @@ impl Machine {
             mmu: Mmu::new(),
             ports: PortBus::new(),
             ide_disk_sectors: None,
+            fw_cfg_boot_order: FwCfgBootOrderPolicy::Default,
         };
         machine
             .mem
@@ -336,13 +348,40 @@ impl Machine {
         self.fw_cfg.set_ram_size(ram);
         // Interface reference (ADR-0005): NB_CPUS / max-cpus / etc/max-cpus.
         // This machine has one execution context and no SMP, so the truthful
-        // count is 1. Host-settable items (UUID, nographic, bootorder,
-        // etc/system-states) stay absent until the host has a truthful value.
-        // `etc/table-loader` is never published: there are no ACPI tables to
-        // load (ADR-0008 / docs/fwcfg-r4-selectors.md).
+        // count is 1. Host-settable UUID / nographic / etc/system-states stay
+        // absent until the host has a truthful value. `bootorder` publishes the
+        // machine default (HDD → CD → floppy) unless overridden via
+        // [`Self::set_fw_cfg_boot_order`]. `etc/table-loader` is never
+        // published: there are no ACPI tables to load (ADR-0008 /
+        // docs/fwcfg-r4-selectors.md).
         self.fw_cfg.set_cpu_count(FW_CFG_DEFAULT_CPU_COUNT);
+        let boot_paths: Vec<String> = match &self.fw_cfg_boot_order {
+            FwCfgBootOrderPolicy::Default => FW_CFG_DEFAULT_BOOT_ORDER
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            FwCfgBootOrderPolicy::Override(entries) => entries.clone(),
+        };
+        let boot_refs: Vec<&str> = boot_paths.iter().map(String::as_str).collect();
+        self.fw_cfg.set_boot_order(&boot_refs);
         let entries = self.e820_entries();
         self.fw_cfg.set_e820_entries(&entries);
+    }
+
+    /// Publish a host-chosen fw_cfg `bootorder`, or remove it with an empty list.
+    ///
+    /// Survives subsequent [`Self::sync_firmware_configuration`] / reset until
+    /// [`Self::use_default_fw_cfg_boot_order`] restores the machine default.
+    pub fn set_fw_cfg_boot_order(&mut self, entries: &[&str]) {
+        self.fw_cfg_boot_order =
+            FwCfgBootOrderPolicy::Override(entries.iter().map(|s| (*s).to_string()).collect());
+        self.sync_firmware_configuration();
+    }
+
+    /// Restore the machine-default HDD → CD-ROM → floppy `bootorder`.
+    pub fn use_default_fw_cfg_boot_order(&mut self) {
+        self.fw_cfg_boot_order = FwCfgBootOrderPolicy::Default;
+        self.sync_firmware_configuration();
     }
 
     /// Current instruction-count time source configuration.

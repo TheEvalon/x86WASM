@@ -16,9 +16,7 @@
 //!
 //! [QEMU Firmware Configuration (fw_cfg) Device]: https://www.qemu.org/docs/master/specs/fw_cfg.html
 
-use devices::{
-    FwCfg, PortDevice, FW_CFG_DATA, FW_CFG_FILE_TABLE_LOADER, FW_CFG_SELECTOR,
-};
+use devices::{FwCfg, PortDevice, FW_CFG_DATA, FW_CFG_FILE_TABLE_LOADER, FW_CFG_SELECTOR};
 
 /// Interface reference (ADR-0005): system UUID, 16 bytes.
 const KEY_UUID: u16 = 0x0002;
@@ -190,7 +188,7 @@ fn system_states_is_absent_because_no_sleep_state_is_implemented() {
 /// `etc/table-loader` is the QEMU/SeaBIOS ACPI table-loader command stream.
 /// This tree builds no ACPI tables (no RSDP/XSDT/FADT), so the honest policy is
 /// to omit the file — never publish a zero-entry loader that would still claim
-/// the protocol. Spec / policy: ADR-0005, `docs/fwcfg-r4-selectors.md`.
+/// the protocol. Spec / policy: ADR-0008, ADR-0005, `docs/fwcfg-r4-selectors.md`.
 #[test]
 fn table_loader_is_omitted_and_name_lookup_fails_cleanly() {
     assert_eq!(FW_CFG_FILE_TABLE_LOADER, "etc/table-loader");
@@ -209,9 +207,9 @@ fn table_loader_is_omitted_and_name_lookup_fails_cleanly() {
     }
 
     // There is no setter: publishing would invent tables that do not exist.
-    // Replacing content under this name via the generic file API is still
-    // possible for host experiments, but the default device and machine sync
-    // paths must leave it absent (see machine-pc sync comment).
+    // Generic `add_file` remains available for host experiments; default and
+    // `Machine::sync_firmware_configuration` paths must leave it absent
+    // (ADR-0008).
 }
 
 /// Host configuration survives a device reset; only the guest-visible selector
