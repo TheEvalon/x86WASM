@@ -17,6 +17,7 @@
 //! FDC READ ID track scan and Configure EIS implied seek (1.44MB media only);
 //! QEMU fw_cfg I/O subset (0x510/0x511 traditional + 0x514 DMA read/skip/select).
 //! Classic LPT1/LPT2 parallel-port register-file stub (0x378–0x37A / 0x278–0x27A).
+//! Local APIC MMIO identity stub at 0xFEE00000 (ID/Version; no delivery).
 
 #![forbid(unsafe_code)]
 
@@ -27,6 +28,7 @@ mod fdc;
 mod fw_cfg;
 mod i8042;
 mod ide;
+mod lapic;
 mod lpt;
 mod pci;
 mod pic;
@@ -119,6 +121,10 @@ pub use ide::{
     IDE_SECONDARY_CTRL, IDE_SECONDARY_DATA, IDE_SECONDARY_DRIVE, IDE_SECONDARY_ERROR,
     IDE_SECONDARY_LBA_HI, IDE_SECONDARY_LBA_LO, IDE_SECONDARY_LBA_MID, IDE_SECONDARY_SECCOUNT,
     IDE_SECONDARY_STATUS,
+};
+pub use lapic::{
+    LocalApicMmio, LAPIC_DEFAULT_BASE, LAPIC_MAX_LVT_ENTRY, LAPIC_REG_ID, LAPIC_REG_VERSION,
+    LAPIC_VERSION_ID, LAPIC_VERSION_VALUE, LAPIC_WINDOW_SIZE,
 };
 pub use lpt::{
     ParallelPort, LPT1_BASE, LPT2_BASE, LPT_CONTROL, LPT_DATA, LPT_LAST_OFFSET, LPT_STATUS,
