@@ -145,8 +145,9 @@ fn nographic_is_absent_until_the_host_states_it() {
 }
 
 /// `bootorder` is a newline-separated, NUL-terminated list of firmware device
-/// paths. This machine states no boot policy, so the file is absent by default
-/// and an empty list removes it rather than publishing an empty policy.
+/// paths. The bare `FwCfg` device leaves it absent; an empty list removes it
+/// rather than publishing an empty policy. (A running `Machine` publishes
+/// `FW_CFG_DEFAULT_BOOT_ORDER` through sync — see machine-pc tests.)
 #[test]
 fn bootorder_is_absent_until_a_host_states_a_policy() {
     let mut cfg = FwCfg::new();
