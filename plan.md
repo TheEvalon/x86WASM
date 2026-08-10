@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-10, round-12 boot-guest lane `slice/r12-boot-guest` on base `01050d2`): **in progress -- R12 boot-guest lane.** INT 13h AH=04h VERIFY (HD+floppy), AH=41h CX bitmap honesty (packet+EDD only; AH=44/47 rejected), FreeDOS measure next-gap classify (v5: INT13/BDA/IVT/image), Linux bzImage early classify + real-mode setup load helper. See `docs/storage-r12-*.md`, `docs/boot-r12-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS; no POST C897 work in this lane.
+
 Status (2026-08-10, round-12 display-fw lane `slice/r12-display-fw` on base `01050d2`): **in progress -- R12 display-fw lane.** Host INT 10h AH=01h cursor type (BDA+CRTC), AH=09h/0Ah write char/attr, BDA columns/page/CRT-base/rows polish, VBE AX=4F00h controller-info deepen with Capabilities/VideoModePtr honesty and **no guest LFB**. See `docs/vga-r12-*.md`, `docs/firmware-r12-vbe-host-stub.md`. **Not** SeaVGABIOS VBE body; PhysBasePtr stays zero.
 
 Status (2026-08-10, round-12 usb-timer lane `slice/r12-usb-timer` on base `01050d2`): **in progress -- R12 usb-timer lane.** UHCI QH horizontal depth 4 + USBSTS/USBINTR gating; LAPIC ICR presence/self-IPI stub; HPET FSB/MSI capability clear + IRQ-route honesty. See `docs/uhci-r12-*.md`, `docs/lapic-r12-icr.md`, `docs/hpet-r12-msi-irq.md`. **Not** UHCI?PIC, multi-APIC IPI, HPET MSI delivery; CPUID APIC stays clear.

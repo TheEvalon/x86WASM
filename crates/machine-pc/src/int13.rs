@@ -1,5 +1,5 @@
-//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h/48h),
-//! floppy subset (AH=00/02/03/08/15, `DL=00h`), and CD/El Torito subset
+//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/04/08 + 41h/42h/43h/48h),
+//! floppy subset (AH=00/02/03/04/08/15, `DL=00h`), and CD/El Torito subset
 //! (AH=41h/42h/48h/4Ah/4Bh, `DL=E0h`).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
@@ -9,11 +9,11 @@
 //! **not** a guest IVT BIOS and not CHS translation modes.
 //!
 //! Spec: IBM PC BIOS INT 13h Disk Services (AH=00h reset, AH=02h read sectors,
-//! AH=03h write sectors, AH=08h get drive parameters, AH=15h get disk type);
-//! IBM/Microsoft INT 13h Extensions / RBIL (AH=41h check extensions, AH=42h
-//! extended read, AH=43h extended write, AH=48h extended drive parameters);
-//! El Torito 1.0 / RBIL AH=4Ah initiate emulation, AH=4Bh AL=00h terminate +
-//! status / AL=01h status-only (specification packet at `DS:SI`).
+//! AH=03h write sectors, AH=04h verify sectors, AH=08h get drive parameters,
+//! AH=15h get disk type); IBM/Microsoft INT 13h Extensions / RBIL (AH=41h check
+//! extensions, AH=42h extended read, AH=43h extended write, AH=48h extended drive
+//! parameters); El Torito 1.0 / RBIL AH=4Ah initiate emulation, AH=4Bh AL=00h
+//! terminate + status / AL=01h status-only (specification packet at `DS:SI`).
 //! ATA IDENTIFY obsolete geometry 16 heads / 63 sectors-per-track (matches
 //! `IdePrimary` IDENTIFY words 3/6). Floppy uses fixed 1.44MB geometry (80/2/18)
 //! via `Fdc82077::read_sector` / `Fdc82077::write_sector`. CD uses Mode-1
@@ -37,6 +37,8 @@ pub const INT13_AH_RESET: u8 = 0x00;
 pub const INT13_AH_READ: u8 = 0x02;
 /// AH=03h — write disk sectors from `ES:BX`.
 pub const INT13_AH_WRITE: u8 = 0x03;
+/// AH=04h — verify disk sectors (media reachable; no data transfer to `ES:BX`).
+pub const INT13_AH_VERIFY: u8 = 0x04;
 /// AH=08h — get drive parameters.
 pub const INT13_AH_GET_DRIVE_PARAMS: u8 = 0x08;
 /// AH=15h — get disk type / media sense (AT and later).
@@ -70,10 +72,20 @@ pub const INT13_EXT_MAGIC_OUT: u16 = 0xAA55;
 pub const INT13_EXT_VERSION: u8 = 0x01;
 /// `CX` bit 0 — packet-structure device access supported (AH=42h/43h here).
 pub const INT13_EXT_CX_PACKET: u16 = 0x0001;
+/// `CX` bit 1 — removable drive locking/ejecting (AH=45h/46h/49h) — **unsupported**.
+pub const INT13_EXT_CX_LOCKING: u16 = 0x0002;
 /// `CX` bit 2 — Enhanced Disk Drive support (AH=48h subset here).
 pub const INT13_EXT_CX_EDD: u16 = 0x0004;
 /// Subset advertised by AH=41h: packet access + EDD params (not locking).
+///
+/// Honesty: bit0 historically covers AH=42h–44h/47h; this host implements
+/// AH=42h/43h (HD) or AH=42h (CD) only. AH=44h extended verify and AH=47h
+/// extended seek remain unsupported and return [`INT13_STATUS_INVALID`].
 pub const INT13_EXT_CX_SUPPORTED: u16 = INT13_EXT_CX_PACKET | INT13_EXT_CX_EDD;
+/// AH=44h — extended verify sectors (unsupported; packet bit does not imply it).
+pub const INT13_AH_EXT_VERIFY: u8 = 0x44;
+/// AH=47h — extended seek (unsupported).
+pub const INT13_AH_EXT_SEEK: u8 = 0x47;
 /// Minimum Disk Address Packet size (16 bytes).
 pub const INT13_DAP_SIZE_MIN: u8 = 0x10;
 /// Minimum AH=48h result buffer size (Phoenix EDD v1.x / RBIL).
@@ -139,6 +151,7 @@ impl Machine {
             INT13_AH_RESET => self.int13_hd_reset(),
             INT13_AH_READ => self.int13_hd_read_from_regs(),
             INT13_AH_WRITE => self.int13_hd_write_from_regs(),
+            INT13_AH_VERIFY => self.int13_hd_verify_from_regs(),
             INT13_AH_GET_DRIVE_PARAMS => self.int13_hd_get_params(),
             INT13_AH_CHECK_EXTENSIONS => self.int13_hd_check_extensions(),
             INT13_AH_EXT_READ => self.int13_hd_ext_read_from_regs(),
@@ -273,14 +286,29 @@ impl Machine {
         Ok(count)
     }
 
-    fn int13_hd_chs_bounds(
+    /// Verify `count` sectors are present on primary IDE at packed INT 13h CHS.
+    ///
+    /// Spec: IBM BIOS / RBIL INT 13h AH=04h — same CHS packing as AH=02h; does
+    /// **not** transfer data to a guest buffer (`ES:BX` unused). Success means
+    /// the LBA range is within the attached image.
+    pub fn int13_hd_verify_chs(
         &self,
         cylinder: u16,
         head: u8,
         sector: u8,
         count: u8,
-        phys: u64,
-    ) -> Result<(usize, usize, u64), u8> {
+    ) -> Result<u8, u8> {
+        self.int13_hd_chs_media_bounds(cylinder, head, sector, count)?;
+        Ok(count)
+    }
+
+    fn int13_hd_chs_media_bounds(
+        &self,
+        cylinder: u16,
+        head: u8,
+        sector: u8,
+        count: u8,
+    ) -> Result<(usize, usize), u8> {
         if !self.ide.present || self.ide.image.is_empty() {
             return Err(INT13_STATUS_TIMEOUT);
         }
@@ -302,6 +330,18 @@ impl Machine {
 
         let byte_off = (start_lba as usize).saturating_mul(INT13_SECTOR_SIZE);
         let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
+        Ok((byte_off, bytes))
+    }
+
+    fn int13_hd_chs_bounds(
+        &self,
+        cylinder: u16,
+        head: u8,
+        sector: u8,
+        count: u8,
+        phys: u64,
+    ) -> Result<(usize, usize, u64), u8> {
+        let (byte_off, bytes) = self.int13_hd_chs_media_bounds(cylinder, head, sector, count)?;
         let end = phys.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
         if end > self.mem.ram_len() as u64 {
             return Err(INT13_STATUS_INVALID);
@@ -364,6 +404,22 @@ impl Machine {
         }
     }
 
+    /// Spec: IBM BIOS / RBIL INT 13h AH=04h — verify CHS range; `ES:BX` unused.
+    fn int13_hd_verify_from_regs(&mut self) {
+        let al = self.cpu.al();
+        let cx = self.cpu.gpr_u16(CpuState::RCX);
+        let dh = self.cpu.gpr_u8(4 + CpuState::RDX);
+        let (cylinder, sector) = unpack_cx(cx);
+
+        match self.int13_hd_verify_chs(cylinder, dh, sector, al) {
+            Ok(n) => self.int13_ok_al(n),
+            Err(status) => {
+                self.cpu.set_al(0);
+                self.int13_fail(status);
+            }
+        }
+    }
+
     fn int13_hd_get_params(&mut self) {
         // Spec: IBM BIOS INT 13h AH=08h — require attached fixed-disk media.
         // Present-but-empty IDE is treated like no media (CF + AH=80h).
@@ -387,6 +443,8 @@ impl Machine {
     }
 
     /// Spec: IBM/MS INT 13h Extensions AH=41h — `BX=55AAh` in, `BX=AA55h` out.
+    /// `CX` advertises only [`INT13_EXT_CX_SUPPORTED`] (packet + EDD); locking
+    /// bit1 stays clear. AH=44h/47h remain unsupported despite packet bit0.
     fn int13_hd_check_extensions(&mut self) {
         if self.cpu.gpr_u16(CpuState::RBX) != INT13_EXT_MAGIC_IN {
             self.int13_fail(INT13_STATUS_INVALID);
@@ -400,6 +458,7 @@ impl Machine {
         self.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_OUT);
         // Packet access (AH=42h/43h) + EDD params (AH=48h). Removable locking out.
         self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
+        debug_assert_eq!(self.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING, 0);
         self.cpu.set_cf(false);
     }
 
@@ -633,6 +692,18 @@ pub fn setup_int13_hd_write(
     cpu.es = x86_core::SegmentReg::real_mode(es);
 }
 
+/// Convenience: set up INT 13h AH=04h registers for a hard-disk verify.
+///
+/// Spec: RBIL INT 13h AH=04h — `ES:BX` is unused; harness still accepts them
+/// for register-shape parity with AH=02h.
+pub fn setup_int13_hd_verify(cpu: &mut CpuState, cylinder: u16, head: u8, sector: u8, count: u8) {
+    cpu.set_ah(INT13_AH_VERIFY);
+    cpu.set_al(count);
+    cpu.set_gpr_u16(CpuState::RCX, pack_cx(cylinder, sector));
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+    cpu.set_gpr_u8(4 + CpuState::RDX, head);
+}
+
 /// Write a classic 16-byte Disk Address Packet at `dap_phys` (DS=0 harness).
 fn write_dap(
     machine: &mut Machine,
@@ -741,11 +812,9 @@ impl Machine {
         Ok(())
     }
 
-    /// Host-side INT 13h floppy dispatch (`DL = 00h`) using current CPU registers.
-    ///
-    /// Supports AH=00h reset, AH=02h read, AH=03h write, AH=08h get-params, and
-    /// AH=15h get disk type against attached FDC 1.44MB media. Spec: IBM PC BIOS
-    /// INT 13h / RBIL floppy disk services; geometry matches
+    /// Supports AH=00h reset, AH=02h read, AH=03h write, AH=04h verify, AH=08h
+    /// get-params, and AH=15h get disk type against attached FDC 1.44MB media.
+    /// Spec: IBM PC BIOS INT 13h / RBIL floppy disk services; geometry matches
     /// [`FDC_1440_CYLINDERS`] / [`FDC_1440_HEADS`] /
     /// [`FDC_1440_SECTORS_PER_TRACK`]. Diskette parameter table (`ES:DI` on
     /// AH=08h) is out of scope.
@@ -759,6 +828,7 @@ impl Machine {
             INT13_AH_RESET => self.int13_floppy_reset(),
             INT13_AH_READ => self.int13_floppy_read_from_regs(),
             INT13_AH_WRITE => self.int13_floppy_write_from_regs(),
+            INT13_AH_VERIFY => self.int13_floppy_verify_from_regs(),
             INT13_AH_GET_DRIVE_PARAMS => self.int13_floppy_get_params(),
             INT13_AH_GET_DISK_TYPE => self.int13_floppy_get_disk_type(),
             _ => self.int13_fail(INT13_STATUS_INVALID),
@@ -1002,7 +1072,7 @@ impl Machine {
         count: u8,
         dest: u64,
     ) -> Result<u8, u8> {
-        self.int13_floppy_xfer(cylinder, head, sector, count, dest, false)
+        self.int13_floppy_xfer(cylinder, head, sector, count, FloppyXfer::Read { dest })
     }
 
     /// Write `count` floppy sectors from physical `src` starting at CHS.
@@ -1017,7 +1087,21 @@ impl Machine {
         count: u8,
         src: u64,
     ) -> Result<u8, u8> {
-        self.int13_floppy_xfer(cylinder, head, sector, count, src, true)
+        self.int13_floppy_xfer(cylinder, head, sector, count, FloppyXfer::Write { src })
+    }
+
+    /// Verify `count` floppy sectors are readable at CHS (no guest buffer write).
+    ///
+    /// Spec: IBM BIOS / RBIL INT 13h AH=04h floppy — walks the same CHS advance
+    /// as AH=02h via `Fdc82077::read_sector`; `ES:BX` unused.
+    pub fn int13_floppy_verify_chs(
+        &mut self,
+        cylinder: u8,
+        head: u8,
+        sector: u8,
+        count: u8,
+    ) -> Result<u8, u8> {
+        self.int13_floppy_xfer(cylinder, head, sector, count, FloppyXfer::Verify)
     }
 
     fn int13_floppy_xfer(
@@ -1026,13 +1110,12 @@ impl Machine {
         mut head: u8,
         mut sector: u8,
         count: u8,
-        mut phys: u64,
-        write: bool,
+        mode: FloppyXfer,
     ) -> Result<u8, u8> {
         if !self.fdc.has_media() {
             return Err(INT13_STATUS_TIMEOUT);
         }
-        if write && self.fdc.write_protected {
+        if matches!(mode, FloppyXfer::Write { .. }) && self.fdc.write_protected {
             return Err(INT13_STATUS_WRITE_PROTECTED);
         }
         if count == 0 || sector == 0 || head >= FDC_1440_HEADS {
@@ -1041,35 +1124,49 @@ impl Machine {
         if sector > FDC_1440_SECTORS_PER_TRACK || cylinder >= FDC_1440_CYLINDERS {
             return Err(INT13_STATUS_SECTOR_NOT_FOUND);
         }
-        let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
-        let end = phys.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
-        if end > self.mem.ram_len() as u64 {
-            return Err(INT13_STATUS_INVALID);
+        let mut phys = match mode {
+            FloppyXfer::Read { dest } => dest,
+            FloppyXfer::Write { src } => src,
+            FloppyXfer::Verify => 0,
+        };
+        if !matches!(mode, FloppyXfer::Verify) {
+            let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
+            let end = phys.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
+            if end > self.mem.ram_len() as u64 {
+                return Err(INT13_STATUS_INVALID);
+            }
         }
 
         for i in 0..count {
-            if write {
-                let mut sector_buf = [0u8; FDC_SECTOR_SIZE];
-                for (j, b) in sector_buf.iter_mut().enumerate() {
-                    *b = self
-                        .mem
-                        .read_u8(phys + j as u64)
-                        .map_err(|_| INT13_STATUS_INVALID)?;
+            match mode {
+                FloppyXfer::Write { .. } => {
+                    let mut sector_buf = [0u8; FDC_SECTOR_SIZE];
+                    for (j, b) in sector_buf.iter_mut().enumerate() {
+                        *b = self
+                            .mem
+                            .read_u8(phys + j as u64)
+                            .map_err(|_| INT13_STATUS_INVALID)?;
+                    }
+                    if !self.fdc.write_sector(cylinder, head, sector, &sector_buf) {
+                        return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+                    }
                 }
-                if !self.fdc.write_sector(cylinder, head, sector, &sector_buf) {
-                    return Err(INT13_STATUS_SECTOR_NOT_FOUND);
-                }
-            } else {
-                let Some(sector_buf) = self.fdc.read_sector(cylinder, head, sector) else {
-                    return Err(INT13_STATUS_SECTOR_NOT_FOUND);
-                };
-                for (j, b) in sector_buf.iter().enumerate() {
-                    self.mem
-                        .write_u8(phys + j as u64, *b)
-                        .map_err(|_| INT13_STATUS_INVALID)?;
+                FloppyXfer::Read { .. } | FloppyXfer::Verify => {
+                    let Some(sector_buf) = self.fdc.read_sector(cylinder, head, sector) else {
+                        return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+                    };
+                    if matches!(mode, FloppyXfer::Read { .. }) {
+                        for (j, b) in sector_buf.iter().enumerate() {
+                            self.mem
+                                .write_u8(phys + j as u64, *b)
+                                .map_err(|_| INT13_STATUS_INVALID)?;
+                        }
+                    }
                 }
             }
-            phys = phys.wrapping_add(INT13_SECTOR_SIZE as u64);
+            if !matches!(mode, FloppyXfer::Verify) {
+                phys = phys.wrapping_add(INT13_SECTOR_SIZE as u64);
+            }
             if i + 1 < count {
                 let Some((c, h, s)) = advance_floppy_chs(cylinder, head, sector) else {
                     return Err(INT13_STATUS_SECTOR_NOT_FOUND);
@@ -1132,6 +1229,26 @@ impl Machine {
         }
     }
 
+    /// Spec: IBM BIOS / RBIL INT 13h AH=04h floppy — verify; `ES:BX` unused.
+    fn int13_floppy_verify_from_regs(&mut self) {
+        let al = self.cpu.al();
+        let cx = self.cpu.gpr_u16(CpuState::RCX);
+        let dh = self.cpu.gpr_u8(4 + CpuState::RDX);
+        let (cylinder, sector) = unpack_cx(cx);
+        if cylinder > u16::from(u8::MAX) {
+            self.cpu.set_al(0);
+            self.int13_fail(INT13_STATUS_SECTOR_NOT_FOUND);
+            return;
+        }
+        match self.int13_floppy_verify_chs(cylinder as u8, dh, sector, al) {
+            Ok(n) => self.int13_ok_al(n),
+            Err(status) => {
+                self.cpu.set_al(0);
+                self.int13_fail(status);
+            }
+        }
+    }
+
     /// Spec: IBM BIOS / RBIL INT 13h AH=08h floppy — return 1.44MB max CHS and
     /// drive type `BL=04h`. No media → [`INT13_STATUS_TIMEOUT`]. `ES:DI` diskette
     /// parameter table is not filled (out of scope).
@@ -1167,6 +1284,13 @@ impl Machine {
         self.cpu.set_ah(INT13_DISK_TYPE_FLOPPY_CHANGE_LINE);
         self.cpu.set_cf(false);
     }
+}
+
+/// Floppy INT 13h transfer mode for the shared CHS walker.
+enum FloppyXfer {
+    Read { dest: u64 },
+    Write { src: u64 },
+    Verify,
 }
 
 /// Advance floppy CHS by one sector within 1.44MB geometry.
@@ -1224,6 +1348,21 @@ pub fn setup_int13_floppy_write(
     cpu.set_gpr_u8(4 + CpuState::RDX, head);
     cpu.set_gpr_u16(CpuState::RBX, bx);
     cpu.es = x86_core::SegmentReg::real_mode(es);
+}
+
+/// Convenience: set up INT 13h AH=04h registers for a floppy verify.
+pub fn setup_int13_floppy_verify(
+    cpu: &mut CpuState,
+    cylinder: u8,
+    head: u8,
+    sector: u8,
+    count: u8,
+) {
+    cpu.set_ah(INT13_AH_VERIFY);
+    cpu.set_al(count);
+    cpu.set_gpr_u16(CpuState::RCX, pack_cx(u16::from(cylinder), sector));
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
+    cpu.set_gpr_u8(4 + CpuState::RDX, head);
 }
 
 /// Convenience: set up INT 13h AH=08h registers for floppy get-params.
@@ -1391,6 +1530,37 @@ mod tests {
         m.service_int13_hd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    /// Spec: IBM BIOS / RBIL INT 13h AH=04h — verify in-range CHS without touching RAM.
+    #[test]
+    fn int13_ah04_verifies_hd_chs_without_buffer_write() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        // Poison a guest buffer; VERIFY must not write it.
+        m.mem.write_u8(0x7C00, 0xEE).unwrap();
+        setup_int13_hd_verify(&mut m.cpu, 0, 0, 1, 2);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu), "CF clear on verify success");
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x7C00).unwrap(), 0xEE);
+    }
+
+    /// Spec: AH=04h OOB / no-media → same CF/AH codes as AH=02h subset.
+    #[test]
+    fn int13_ah04_hd_rejects_oob_and_no_media() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        setup_int13_hd_verify(&mut m.cpu, 0, 0, 1, 8);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.cpu.al(), 0);
+
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_hd_verify(&mut bare.cpu, 0, 0, 1, 1);
+        bare.service_int13_hd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
     }
 
     /// Spec: non-HD drive number rejected (`DL != 80h`).
@@ -1621,6 +1791,43 @@ mod tests {
         );
     }
 
+    /// Spec: AH=41h CX bitmap honesty — only packet+EDD; locking bit clear.
+    /// Aligned with implemented AH=42h/43h/48h (not AH=44h/45h/46h/47h).
+    #[test]
+    fn int13_ah41_cx_bitmap_only_supported_bits() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        m.cpu.set_ah(INT13_AH_CHECK_EXTENSIONS);
+        m.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_IN);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13();
+        let cx = m.cpu.gpr_u16(CpuState::RCX);
+        assert!(!cf(&m.cpu));
+        assert_eq!(cx, INT13_EXT_CX_PACKET | INT13_EXT_CX_EDD);
+        assert_eq!(
+            cx & INT13_EXT_CX_LOCKING,
+            0,
+            "locking/eject bit must stay clear"
+        );
+        assert_eq!(cx & !INT13_EXT_CX_SUPPORTED, 0, "no undocumented CX bits");
+    }
+
+    /// Spec: packet bit does not imply AH=44h/47h — those remain invalid.
+    #[test]
+    fn int13_ah44_ah47_extensions_unsupported() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        m.cpu.set_ah(INT13_AH_EXT_VERIFY);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+
+        m.cpu.set_ah(INT13_AH_EXT_SEEK);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
     /// Spec: AH=41h requires BX=55AAh.
     #[test]
     fn int13_ah41_rejects_bad_magic() {
@@ -1781,6 +1988,19 @@ mod tests {
                 .unwrap(),
             0x2B
         );
+    }
+
+    /// Spec: IBM BIOS / RBIL INT 13h AH=04h floppy — verify without buffer write.
+    #[test]
+    fn int13_floppy_ah04_verifies_without_buffer_write() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        m.mem.write_u8(0x7C00, 0xDD).unwrap();
+        setup_int13_floppy_verify(&mut m.cpu, 0, 0, 1, 2);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x7C00).unwrap(), 0xDD);
     }
 
     /// Spec: floppy AH=03h writes ES:BX into FDC image at CHS.
@@ -2080,6 +2300,18 @@ mod tests {
         assert_eq!(m.cpu.ah(), INT13_EXT_VERSION);
         assert_eq!(m.cpu.gpr_u16(CpuState::RBX), INT13_EXT_MAGIC_OUT);
         assert_eq!(m.cpu.gpr_u16(CpuState::RCX), INT13_EXT_CX_SUPPORTED);
+        assert_eq!(
+            m.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING,
+            0,
+            "CD AH=41h must not advertise locking"
+        );
+        // CD has AH=42h/48h but not AH=43h — packet bit still set for DAP read;
+        // extended write remains invalid on CD.
+        m.cpu.set_ah(INT13_AH_EXT_WRITE);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
+        m.service_int13_cd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
     }
 
     /// Spec: AH=42h CD DAP read — 2048-byte Mode-1 LBA from ATAPI medium.

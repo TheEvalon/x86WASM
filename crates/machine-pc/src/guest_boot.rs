@@ -12,7 +12,9 @@
 //! `docs/boot-r9-freedos-measure.md`, `docs/boot-r10-freedos-first-failure.md`,
 //! `docs/boot-r10-linux-serial-first-failure.md`,
 //! `docs/boot-r11-freedos-bda-equipment.md`,
-//! `docs/boot-r11-linux-boot-protocol-inspect.md`).
+//! `docs/boot-r11-linux-boot-protocol-inspect.md`,
+//! `docs/boot-r12-freedos-next-gap.md`,
+//! `docs/boot-r12-linux-bzimage-early.md`).
 
 use crate::post_probe::{PostFailureKind, PostReport, PostStopReason};
 use crate::{Machine, MachineError};
@@ -20,8 +22,8 @@ use crate::{Machine, MachineError};
 /// Harness schema version for CLI/report consumers (v2 checkpoints + serial).
 pub const GUEST_BOOT_MEASURE_VERSION: u32 = 2;
 
-/// FreeDOS-like / Linux-serial measure report schema (v4 = first-failure class).
-pub const GUEST_OS_MEASURE_VERSION: u32 = 4;
+/// FreeDOS-like / Linux-serial measure report schema (v5 = next-gap class).
+pub const GUEST_OS_MEASURE_VERSION: u32 = 5;
 
 /// BDA equipment list word (`0040:0010`). Spec: RBIL memory map / IBM BIOS.
 pub const BDA_EQUIPMENT: u64 = 0x410;
@@ -184,6 +186,99 @@ pub enum GuestFirstFailureClass {
     UnmappedMmio { page: u64 },
     /// Host INT 13h probe returned CF set (disk service failure).
     Int13Cf { ah: u8 },
+}
+
+/// Next actionable gap after a FreeDOS-like measure (beyond the first-failure tag).
+///
+/// Used when the fixture already reached `synthetic-halt` (or to point back at
+/// `first_failure`). Does **not** claim a FreeDOS prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FreedosNextGap {
+    /// Host INT 13h AH=41h (or follow-on) returned CF — disk service gap.
+    HostInt13Cf { ah: u8 },
+    /// BDA equipment / HD-count fields disagree with attached media.
+    BdaDiskMismatch,
+    /// IVT vector `0x13` is null — guest cannot reach host INT 13h without SeaBIOS.
+    GuestInt13IvtMissing,
+    /// Fixture halted cleanly; next need is a real FreeDOS image + firmware POST.
+    RealImageAndFirmware,
+    /// Non-halt first failure already names the gap — see `first_failure`.
+    SeeFirstFailure,
+}
+
+impl FreedosNextGap {
+    /// Stable triage tag (ASCII kebab-case).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::HostInt13Cf { .. } => "host-int13-cf",
+            Self::BdaDiskMismatch => "bda-disk-mismatch",
+            Self::GuestInt13IvtMissing => "guest-int13-ivt-missing",
+            Self::RealImageAndFirmware => "real-image-and-firmware",
+            Self::SeeFirstFailure => "see-first-failure",
+        }
+    }
+
+    /// Host-note sentence for reports (static).
+    pub fn host_note(&self) -> &'static str {
+        match self {
+            Self::HostInt13Cf { .. } => {
+                "Next gap: host INT 13h probe CF — disk/extensions service failure"
+            }
+            Self::BdaDiskMismatch => {
+                "Next gap: BDA 0040:0010/0075 mismatch vs attached media"
+            }
+            Self::GuestInt13IvtMissing => {
+                "Next gap: IVT INT 13h null — need SeaBIOS (or install host stub); not FreeDOS prompt"
+            }
+            Self::RealImageAndFirmware => {
+                "Next gap: real FreeDOS image + SeaBIOS POST (fixture halt is not progress)"
+            }
+            Self::SeeFirstFailure => "Next gap: see first-failure class (non-halt stop)",
+        }
+    }
+}
+
+impl std::fmt::Display for FreedosNextGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+/// Read IVT far pointer for interrupt `vector` (offset then segment, little-endian).
+fn read_ivt_far(machine: &Machine, vector: u8) -> (u16, u16) {
+    let base = u64::from(vector) * 4;
+    let off = u16::from(machine.mem.read_u8(base).unwrap_or(0))
+        | (u16::from(machine.mem.read_u8(base + 1).unwrap_or(0)) << 8);
+    let seg = u16::from(machine.mem.read_u8(base + 2).unwrap_or(0))
+        | (u16::from(machine.mem.read_u8(base + 3).unwrap_or(0)) << 8);
+    (off, seg)
+}
+
+/// Classify the **next** FreeDOS-path gap after a measure (INT13 / BDA / IVT / image).
+///
+/// Spec: RBIL IVT + BDA disk fields; IBM INT 13h. Does not claim FreeDOS boot.
+pub fn classify_freedos_next_gap(
+    machine: &Machine,
+    first_failure: &GuestFirstFailureClass,
+    int13_probe: &Int13ProbeSnapshot,
+) -> FreedosNextGap {
+    if !matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
+        return FreedosNextGap::SeeFirstFailure;
+    }
+    if int13_probe.failed() {
+        return FreedosNextGap::HostInt13Cf { ah: int13_probe.ah };
+    }
+    let expect_hd = u8::from(machine.ide.present && !machine.ide.image.is_empty());
+    let bda_hd = machine.mem.read_u8(BDA_HD_COUNT).unwrap_or(0xFF);
+    let bda_equip = machine.mem.read_u8(BDA_EQUIPMENT).unwrap_or(0xFF);
+    if bda_hd != expect_hd || bda_equip != machine.equipment_byte() {
+        return FreedosNextGap::BdaDiskMismatch;
+    }
+    let (off, seg) = read_ivt_far(machine, 0x13);
+    if off == 0 && seg == 0 {
+        return FreedosNextGap::GuestInt13IvtMissing;
+    }
+    FreedosNextGap::RealImageAndFirmware
 }
 
 impl GuestFirstFailureClass {
@@ -362,7 +457,7 @@ impl Int13ProbeSnapshot {
     }
 }
 
-/// v4 OS-path measure: wraps v2 plus honesty / first-failure class / gap list.
+/// v5 OS-path measure: wraps v2 plus honesty / first-failure / next-gap / gap list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestOsMeasure {
     /// Schema version ([`GUEST_OS_MEASURE_VERSION`]).
@@ -379,6 +474,8 @@ pub struct GuestOsMeasure {
     pub failure_site: GuestFailureSite,
     /// Host INT 13h AH=41h probe after the guest stop.
     pub int13_probe: Int13ProbeSnapshot,
+    /// FreeDOS-path next-gap class (INT13 / BDA / IVT / real image). Always set.
+    pub next_gap: FreedosNextGap,
     /// Explicit non-claim sentence for reports/CLI.
     pub honesty: &'static str,
     /// Remaining gaps toward a real guest (not M2 exit), including class note.
@@ -395,8 +492,13 @@ impl std::fmt::Display for GuestOsMeasure {
         };
         writeln!(
             f,
-            "guest-os-measure-v{}: kind={} first-failure={} bucket={} site={} (NOT an OS boot / NOT Milestone 2 exit)",
-            self.version, kind, self.first_failure, self.failure_bucket, self.failure_site
+            "guest-os-measure-v{}: kind={} first-failure={} bucket={} site={} next-gap={} (NOT an OS boot / NOT Milestone 2 exit)",
+            self.version,
+            kind,
+            self.first_failure,
+            self.failure_bucket,
+            self.failure_site,
+            self.next_gap
         )?;
         writeln!(f, "  honesty: {}", self.honesty)?;
         writeln!(
@@ -543,6 +645,164 @@ pub fn synthetic_linux_boot_protocol_header(
     buf
 }
 
+/// Effective setup sector count per Linux boot protocol (`0` means 4).
+pub fn linux_setup_sect_count(setup_sects: u8) -> u8 {
+    if setup_sects == 0 {
+        4
+    } else {
+        setup_sects
+    }
+}
+
+/// Byte length of the real-mode blob: boot sector + setup sectors.
+pub fn linux_realmode_bytes(setup_sects: u8) -> usize {
+    (usize::from(linux_setup_sect_count(setup_sects)) + 1) * 512
+}
+
+/// Classic real-mode load base for the Linux setup blob (`0x90000`).
+///
+/// Spec: Linux `Documentation/x86/boot.rst` — real-mode kernel at `0x90000`.
+pub const LINUX_REALMODE_LOAD_ADDR: u64 = 0x9_0000;
+
+/// Next step after a successful early bzImage header/setup classify.
+///
+/// Does **not** claim a serial shell or full boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BzImageNextStep {
+    /// Protocol too old for the fields we inspect (`version` < 2.00).
+    UnsupportedOldProtocol { version: u16 },
+    /// Real-mode setup is loadable; next is execute setup (out of scope here).
+    RunRealModeSetup,
+    /// `LOADED_HIGH` set — next is load protected kernel / jump `code32_start`.
+    LoadHighProtectedKernel { code32_start: u32 },
+}
+
+impl BzImageNextStep {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::UnsupportedOldProtocol { .. } => "unsupported-old-protocol",
+            Self::RunRealModeSetup => "run-real-mode-setup",
+            Self::LoadHighProtectedKernel { .. } => "load-high-protected-kernel",
+        }
+    }
+}
+
+impl std::fmt::Display for BzImageNextStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+/// Early bzImage triage result (inspect + setup-size check; no kernel execution).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BzImageEarlyClass {
+    /// Header parse failed.
+    BadHeader(LinuxBootProtocolError),
+    /// Buffer shorter than real-mode setup blob implied by `setup_sects`.
+    IncompleteSetup {
+        setup_sects: u8,
+        have: usize,
+        need: usize,
+    },
+    /// Header + setup size OK — reports the next failure mode toward boot.
+    SetupLoadable {
+        setup_sects: u8,
+        version: u16,
+        loaded_high: bool,
+        code32_start: Option<u32>,
+        next: BzImageNextStep,
+    },
+}
+
+impl BzImageEarlyClass {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::BadHeader(_) => "bad-header",
+            Self::IncompleteSetup { .. } => "incomplete-setup",
+            Self::SetupLoadable { .. } => "setup-loadable",
+        }
+    }
+}
+
+impl std::fmt::Display for BzImageEarlyClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadHeader(e) => write!(f, "bad-header:{e}"),
+            Self::IncompleteSetup {
+                setup_sects,
+                have,
+                need,
+            } => write!(
+                f,
+                "incomplete-setup:sects={setup_sects} have={have} need={need}"
+            ),
+            Self::SetupLoadable { next, .. } => write!(f, "setup-loadable:next={next}"),
+        }
+    }
+}
+
+/// Classify a host bzImage (or synthetic header) far enough to name the next gap.
+///
+/// Loads nothing and executes nothing. Spec: Linux `Documentation/x86/boot.rst`.
+pub fn classify_bzimage_early(buf: &[u8]) -> BzImageEarlyClass {
+    let hdr = match inspect_linux_boot_protocol_header(buf) {
+        Ok(h) => h,
+        Err(e) => return BzImageEarlyClass::BadHeader(e),
+    };
+    let need = linux_realmode_bytes(hdr.setup_sects);
+    if buf.len() < need {
+        return BzImageEarlyClass::IncompleteSetup {
+            setup_sects: hdr.setup_sects,
+            have: buf.len(),
+            need,
+        };
+    }
+    let next = if hdr.version < 0x0200 {
+        BzImageNextStep::UnsupportedOldProtocol {
+            version: hdr.version,
+        }
+    } else if hdr.loaded_high() {
+        BzImageNextStep::LoadHighProtectedKernel {
+            code32_start: hdr.code32_start.unwrap_or(0x0010_0000),
+        }
+    } else {
+        BzImageNextStep::RunRealModeSetup
+    };
+    BzImageEarlyClass::SetupLoadable {
+        setup_sects: hdr.setup_sects,
+        version: hdr.version,
+        loaded_high: hdr.loaded_high(),
+        code32_start: hdr.code32_start,
+        next,
+    }
+}
+
+/// Error from [`Machine::load_bzimage_realmode_setup`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BzImageLoadError {
+    Classify(LinuxBootProtocolError),
+    IncompleteSetup { have: usize, need: usize },
+    RamTooSmall,
+}
+
+impl std::fmt::Display for BzImageLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Classify(e) => write!(f, "bzImage load: {e}"),
+            Self::IncompleteSetup { have, need } => {
+                write!(f, "bzImage load: incomplete setup have={have} need={need}")
+            }
+            Self::RamTooSmall => f.write_str("bzImage load: RAM too small"),
+        }
+    }
+}
+
+impl From<LinuxBootProtocolError> for BzImageLoadError {
+    fn from(value: LinuxBootProtocolError) -> Self {
+        Self::Classify(value)
+    }
+}
+
 impl Machine {
     /// Seed classic BDA diskette / equipment / HD-count fields from attached media.
     ///
@@ -642,6 +902,13 @@ impl Machine {
             eip: measure.report.stop_site.eip,
         };
         gaps.push(first_failure.gap_note());
+        let next_gap = if kind == GuestOsMeasureKind::FreeDosLike {
+            classify_freedos_next_gap(self, &first_failure, &int13_probe)
+        } else if matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
+            FreedosNextGap::RealImageAndFirmware
+        } else {
+            FreedosNextGap::SeeFirstFailure
+        };
         if matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
             host_notes.push(
                 "Synthetic-halt reached — next gap is real guest image / firmware POST, not fixture polish",
@@ -650,12 +917,15 @@ impl Machine {
                 host_notes.push(
                     "BDA 0040:0010/0075 seeded from host media; still not SeaBIOS equipment init",
                 );
+                host_notes.push(next_gap.host_note());
             }
             if kind == GuestOsMeasureKind::LinuxSerialPath {
                 host_notes.push(
-                    "Use inspect_linux_boot_protocol_header on a host bzImage; no kernel load here",
+                    "Use classify_bzimage_early / load_bzimage_realmode_setup on a host bzImage; no kernel exec here",
                 );
             }
+        } else if kind == GuestOsMeasureKind::FreeDosLike {
+            host_notes.push(next_gap.host_note());
         }
         GuestOsMeasure {
             version: GUEST_OS_MEASURE_VERSION,
@@ -665,6 +935,7 @@ impl Machine {
             failure_bucket,
             failure_site,
             int13_probe,
+            next_gap,
             honesty,
             gaps,
             host_notes,
@@ -704,7 +975,8 @@ impl Machine {
     /// Captures COM1 from a guest that prints a short banner then `HLT`. Does
     /// **not** load a bzImage, enter protected mode, or claim Linux boot / M2 exit.
     ///
-    /// For host-side bzImage triage use [`inspect_linux_boot_protocol_header`].
+    /// For host-side bzImage triage use [`inspect_linux_boot_protocol_header`] /
+    /// [`classify_bzimage_early`] / [`Self::load_bzimage_realmode_setup`].
     pub fn measure_linux_serial_path(
         &mut self,
         max_steps: u64,
@@ -723,10 +995,50 @@ impl Machine {
                 "No earlyprintk / 8250 console driver path through a real kernel",
                 "Missing SeaBIOS INT 13h guest path for disked bootloaders",
                 "Protected-mode / paging / CPUID gaps may still block real kernels",
-                "Header inspect helper available; does not execute setup code",
+                "Header inspect + classify_bzimage_early available; does not execute setup code",
             ],
             vec![],
         ))
+    }
+
+    /// Copy the real-mode portion of a host bzImage into guest RAM at `dest`.
+    ///
+    /// Copies `(setup_sects+1)×512` bytes (with `setup_sects==0` meaning 4) after
+    /// [`classify_bzimage_early`] succeeds with `SetupLoadable`. Default load
+    /// address is [`LINUX_REALMODE_LOAD_ADDR`] (`0x90000`).
+    ///
+    /// Does **not** arm `CS:IP`, enter protected mode, load the high kernel, or
+    /// claim a serial shell. Spec: Linux `Documentation/x86/boot.rst`.
+    pub fn load_bzimage_realmode_setup(
+        &mut self,
+        image: &[u8],
+        dest: u64,
+    ) -> Result<BzImageEarlyClass, BzImageLoadError> {
+        let class = classify_bzimage_early(image);
+        match &class {
+            BzImageEarlyClass::BadHeader(e) => return Err(BzImageLoadError::Classify(*e)),
+            BzImageEarlyClass::IncompleteSetup { have, need, .. } => {
+                return Err(BzImageLoadError::IncompleteSetup {
+                    have: *have,
+                    need: *need,
+                });
+            }
+            BzImageEarlyClass::SetupLoadable { setup_sects, .. } => {
+                let bytes = linux_realmode_bytes(*setup_sects);
+                let end = dest
+                    .checked_add(bytes as u64)
+                    .ok_or(BzImageLoadError::RamTooSmall)?;
+                if end > self.mem.ram_len() as u64 {
+                    return Err(BzImageLoadError::RamTooSmall);
+                }
+                for (i, b) in image[..bytes].iter().enumerate() {
+                    self.mem
+                        .write_u8(dest + i as u64, *b)
+                        .map_err(|_| BzImageLoadError::RamTooSmall)?;
+                }
+            }
+        }
+        Ok(class)
     }
 }
 
@@ -1034,11 +1346,14 @@ mod tests {
         assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
         assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
         assert_eq!(report.first_failure.tag(), "synthetic-halt");
+        assert_eq!(report.next_gap, FreedosNextGap::GuestInt13IvtMissing);
+        assert_eq!(report.next_gap.tag(), "guest-int13-ivt-missing");
         let text = report.to_string();
         assert!(text.contains("NOT an OS boot"));
         assert!(text.contains("does NOT claim a FreeDOS prompt"));
         assert!(text.contains("freedos-like"));
         assert!(text.contains("first-failure=synthetic-halt"));
+        assert!(text.contains("next-gap=guest-int13-ivt-missing"));
         assert!(report.gaps.iter().any(|g| g.contains("prompt")));
         assert!(report
             .gaps
@@ -1048,12 +1363,49 @@ mod tests {
             .host_notes
             .iter()
             .any(|n| n.contains("BDA 0040:0010/0075")));
+        assert!(report
+            .host_notes
+            .iter()
+            .any(|n| n.contains("IVT INT 13h null")));
         assert!(text.contains("host-notes="));
         // Payload marker exists on disk but is not a boot claim.
         assert!(m.ide.image[MBR_SECTOR_SIZE..].starts_with(b"FREEDOS-LIKE-PAYLOAD"));
         // BDA disk equipment seeded for the measure path.
         assert_eq!(m.mem.read_u8(BDA_HD_COUNT).unwrap(), 1);
         assert_eq!(m.mem.read_u8(BDA_EQUIPMENT).unwrap(), m.equipment_byte());
+    }
+
+    /// Next-gap: BDA mismatch wins over IVT-null when equipment bytes disagree.
+    #[test]
+    fn classify_freedos_next_gap_bda_mismatch() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_ide_image(synthetic_freedos_like_disk());
+        m.seed_bda_disk_equipment().unwrap();
+        // Corrupt HD count after seeding.
+        m.mem.write_u8(BDA_HD_COUNT, 0).unwrap();
+        let probe = Int13ProbeSnapshot {
+            dl: 0x80,
+            ah: 0x01,
+            cf: false,
+        };
+        let gap = classify_freedos_next_gap(&m, &GuestFirstFailureClass::SyntheticHalt, &probe);
+        assert_eq!(gap, FreedosNextGap::BdaDiskMismatch);
+    }
+
+    /// Next-gap: installed INT 13h IVT pointer advances past IVT-missing to image/firmware.
+    #[test]
+    fn classify_freedos_next_gap_with_ivt_pointer() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_ide_image(synthetic_freedos_like_disk());
+        m.seed_bda_disk_equipment().unwrap();
+        m.install_int13_ivt_pointer(0xF000, 0xE000).unwrap();
+        let probe = Int13ProbeSnapshot {
+            dl: 0x80,
+            ah: 0x01,
+            cf: false,
+        };
+        let gap = classify_freedos_next_gap(&m, &GuestFirstFailureClass::SyntheticHalt, &probe);
+        assert_eq!(gap, FreedosNextGap::RealImageAndFirmware);
     }
 
     /// BDA seed: floppy media flips equipment diskette bits; HD count tracks IDE.
@@ -1120,7 +1472,7 @@ mod tests {
         assert!(report
             .host_notes
             .iter()
-            .any(|n| n.contains("inspect_linux_boot_protocol_header")));
+            .any(|n| n.contains("classify_bzimage_early")));
         let text = report.to_string();
         assert!(text.contains("NOT Milestone 2 exit"));
         assert!(text.contains("linux-serial-path"));
@@ -1163,6 +1515,76 @@ mod tests {
             inspect_linux_boot_protocol_header(&bad_magic),
             Err(LinuxBootProtocolError::BadMagic)
         );
+    }
+
+    /// Spec: Linux boot.rst — early classify names next step (LOADED_HIGH → PM).
+    #[test]
+    fn classify_bzimage_early_loaded_high() {
+        let need = linux_realmode_bytes(4);
+        let mut buf = synthetic_linux_boot_protocol_header(4, 0x020F, 0x01, 0x0010_0000);
+        buf.resize(need, 0x90);
+        buf[0x200] = 0xAB; // marker inside setup
+        let class = classify_bzimage_early(&buf);
+        match class {
+            BzImageEarlyClass::SetupLoadable {
+                setup_sects,
+                loaded_high,
+                next,
+                ..
+            } => {
+                assert_eq!(setup_sects, 4);
+                assert!(loaded_high);
+                assert_eq!(
+                    next,
+                    BzImageNextStep::LoadHighProtectedKernel {
+                        code32_start: 0x0010_0000
+                    }
+                );
+            }
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    /// Spec: incomplete setup blob → IncompleteSetup (not a shell claim).
+    #[test]
+    fn classify_bzimage_early_incomplete_setup() {
+        let buf = synthetic_linux_boot_protocol_header(4, 0x0200, 0, 0);
+        assert!(buf.len() < linux_realmode_bytes(4));
+        match classify_bzimage_early(&buf) {
+            BzImageEarlyClass::IncompleteSetup {
+                setup_sects,
+                have,
+                need,
+            } => {
+                assert_eq!(setup_sects, 4);
+                assert_eq!(have, buf.len());
+                assert_eq!(need, linux_realmode_bytes(4));
+            }
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    /// Host load copies real-mode setup to 0x90000 without executing.
+    #[test]
+    fn load_bzimage_realmode_setup_to_90000() {
+        let need = linux_realmode_bytes(1);
+        let mut buf = synthetic_linux_boot_protocol_header(1, 0x0200, 0, 0);
+        buf.resize(need, 0);
+        buf[0] = 0xF4;
+        buf[512] = 0x5A;
+        let mut m = Machine::new(1024 * 1024);
+        let class = m
+            .load_bzimage_realmode_setup(&buf, LINUX_REALMODE_LOAD_ADDR)
+            .expect("load");
+        assert_eq!(class.tag(), "setup-loadable");
+        assert_eq!(m.mem.read_u8(LINUX_REALMODE_LOAD_ADDR).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(LINUX_REALMODE_LOAD_ADDR + 512).unwrap(), 0x5A);
+        match class {
+            BzImageEarlyClass::SetupLoadable { next, .. } => {
+                assert_eq!(next, BzImageNextStep::RunRealModeSetup);
+            }
+            other => panic!("unexpected {other}"),
+        }
     }
 
     /// Linux serial path classifies unsupported opcode without claiming a shell.
