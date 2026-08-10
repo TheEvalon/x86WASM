@@ -16,9 +16,7 @@
 //! `Fdc82077::write_sector`.
 
 use crate::{Machine, MachineError};
-use devices::{
-    FDC_1440_CYLINDERS, FDC_1440_HEADS, FDC_1440_SECTORS_PER_TRACK, FDC_SECTOR_SIZE,
-};
+use devices::{FDC_1440_CYLINDERS, FDC_1440_HEADS, FDC_1440_SECTORS_PER_TRACK, FDC_SECTOR_SIZE};
 use x86_core::CpuState;
 
 /// First floppy (`DL`).
@@ -1149,9 +1147,7 @@ mod tests {
         m.service_int13_hd();
         assert!(!cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
-        assert!(m.ide.image[..INT13_SECTOR_SIZE]
-            .iter()
-            .all(|&b| b == 0x5A));
+        assert!(m.ide.image[..INT13_SECTOR_SIZE].iter().all(|&b| b == 0x5A));
     }
 
     /// Spec: AH=43h then AH=42h round-trips the same LBA buffer.
@@ -1159,9 +1155,7 @@ mod tests {
     fn int13_ah43_then_ah42_round_trip() {
         let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
         for i in 0..INT13_SECTOR_SIZE {
-            m.mem
-                .write_u8(0xA000 + i as u64, (i & 0xFF) as u8)
-                .unwrap();
+            m.mem.write_u8(0xA000 + i as u64, (i & 0xFF) as u8).unwrap();
         }
         setup_int13_hd_ext_write(&mut m, 0x5500, 1, 1, 0x0000, 0xA000);
         m.service_int13_hd();
@@ -1171,10 +1165,7 @@ mod tests {
         m.service_int13_hd();
         assert!(!cf(&m.cpu));
         for i in 0..INT13_SECTOR_SIZE {
-            assert_eq!(
-                m.mem.read_u8(0xB000 + i as u64).unwrap(),
-                (i & 0xFF) as u8
-            );
+            assert_eq!(m.mem.read_u8(0xB000 + i as u64).unwrap(), (i & 0xFF) as u8);
         }
     }
 
@@ -1241,7 +1232,10 @@ mod tests {
         m.service_int13_floppy();
         assert!(!cf(&m.cpu));
         assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xF4);
-        assert_eq!(m.mem.read_u8(0x8000 + INT13_SECTOR_SIZE as u64).unwrap(), 0xB2);
+        assert_eq!(
+            m.mem.read_u8(0x8000 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0xB2
+        );
         assert_eq!(
             m.mem
                 .read_u8(0x8000 + INT13_SECTOR_SIZE as u64 + 1)
@@ -1269,9 +1263,7 @@ mod tests {
     fn int13_floppy_write_read_and_wp() {
         let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
         for i in 0..INT13_SECTOR_SIZE {
-            m.mem
-                .write_u8(0xA000 + i as u64, (i & 0xFF) as u8)
-                .unwrap();
+            m.mem.write_u8(0xA000 + i as u64, (i & 0xFF) as u8).unwrap();
         }
         setup_int13_floppy_write(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0xA000);
         m.service_int13();
@@ -1280,10 +1272,7 @@ mod tests {
         m.service_int13();
         assert!(!cf(&m.cpu));
         for i in 0..INT13_SECTOR_SIZE {
-            assert_eq!(
-                m.mem.read_u8(0xB000 + i as u64).unwrap(),
-                (i & 0xFF) as u8
-            );
+            assert_eq!(m.mem.read_u8(0xB000 + i as u64).unwrap(), (i & 0xFF) as u8);
         }
 
         m.fdc.set_write_protected(true);
