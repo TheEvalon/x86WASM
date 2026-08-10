@@ -4931,9 +4931,9 @@ impl ProtectedGateSource {
 /// unchanged.
 ///
 /// Virtual-8086 mode (`EFLAGS.VM=1`): architectural CPL is 3 (CS[1:0] is not
-/// RPL). A privilege-changing gate pushes the VM86 frame GS/FS/DS/ES + SS:SP
-/// + FLAGS + CS:IP — **dwords** for 386 gates (Figure 20-2) or **words** for
-/// 286 gates — then loads DS/ES/FS/GS with null selectors. Same-CPL delivery
+/// RPL). A privilege-changing gate pushes the VM86 frame (GS/FS/DS/ES, SS:SP,
+/// FLAGS, CS:IP) as **dwords** for 386 gates (Figure 20-2) or **words** for
+/// 286 gates, then loads DS/ES/FS/GS with null selectors. Same-CPL delivery
 /// from VM86 remains unsupported. Task gates, full VME (beyond the Round-12
 /// redirect stub), and nested #DF synthesis beyond the existing path remain
 /// out of scope.
