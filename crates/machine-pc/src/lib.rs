@@ -10,6 +10,7 @@
 
 mod eltorito_load;
 mod hello_rom;
+mod hpet_wire;
 mod mbr;
 mod mem;
 mod ports;
@@ -851,6 +852,15 @@ impl Machine {
     /// Drive PIC IRQ0 from the current PIT ch0 OUT level (level follow).
     pub fn sync_pit_irq0(&mut self) {
         self.pic.set_irq_line(0, self.pit.out_ch0());
+    }
+
+    /// Host-driven HPET main-counter advance (Timer 0 comparator stub).
+    ///
+    /// Spec: IA-PC HPET 1.0a — comparator match can set `T0_INT_STS` /
+    /// [`devices::HpetMmio::irq_line`]. Does **not** assert PIC or I/O APIC.
+    /// See `docs/hpet-r7-comparator-irq.md`.
+    pub fn advance_hpet(&mut self, delta: u64) -> bool {
+        hpet_wire::advance_hpet(&mut self.hpet, delta)
     }
 
     /// Advance CMOS/RTC by `periods` model quanta and sync IRQF → PIC IRQ8.
