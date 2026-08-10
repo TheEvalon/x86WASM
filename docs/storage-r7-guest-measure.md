@@ -2,7 +2,11 @@
 
 Milestone 2, round 7, storage/guest lane, slice 4.
 
-## Scope
+Superseded for report schema by **v2**: see `docs/boot-r8-guest-measure-v2.md`
+(checkpoints, serial capture, El Torito media). The R7 media helpers and CLI
+`--guest-measure` entry point remain.
+
+## Scope (historical)
 
 Measure the **first** stop after a host boot-sector handoff to `0x7C00`.
 Does **not** claim FreeDOS or Linux boot success.

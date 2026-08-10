@@ -28,7 +28,9 @@ mod vga_font;
 mod vga_frame;
 mod xbcs;
 
-pub use guest_boot::{GuestBootMeasure, GuestBootMedia};
+pub use guest_boot::{
+    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GUEST_BOOT_MEASURE_VERSION,
+};
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int13::{
     chs_to_lba, pack_cx, setup_int13_hd_ext_read, setup_int13_hd_read, setup_int13_hd_write,
