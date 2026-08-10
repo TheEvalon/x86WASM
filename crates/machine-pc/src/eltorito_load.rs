@@ -12,7 +12,8 @@ impl Machine {
     ///
     /// Spec: El Torito 1.0 — validate catalog via [`Self::inspect_atapi_el_torito`],
     /// require media type `00h`, copy bytes from `load_rba`, far-jump to the load
-    /// segment. Floppy/HDD emulation and INT 13h CD remain out of scope.
+    /// segment. Floppy/HDD emulation remain out of scope. Guest-callable host
+    /// INT 13h CD reads use [`Self::service_int13_cd`] (`DL=E0h`), not this helper.
     pub fn load_eltorito_to_7c00(&mut self) -> Result<(), MachineError> {
         let info = self.inspect_atapi_el_torito()?;
         if !info.bootable {
