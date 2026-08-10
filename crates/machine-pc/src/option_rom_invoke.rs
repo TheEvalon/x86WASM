@@ -397,4 +397,56 @@ mod tests {
         let mut m = Machine::new(1024 * 1024);
         assert_eq!(m.post_scan_invoke_option_roms_default(4).unwrap(), 0);
     }
+
+    /// Spec: BIOS Boot Spec — checksum must be zero mod 256; bad sum is skipped.
+    #[test]
+    fn post_scan_skips_bad_checksum() {
+        let mut bad = synthetic_option_rom(2);
+        let last = bad.len() - 1;
+        bad[last] = bad[last].wrapping_add(1); // break checksum
+        let mut m = Machine::new(1024 * 1024);
+        // Bypass prepare_option_rom by writing raw bytes into the window.
+        for (i, b) in bad.iter().enumerate() {
+            m.mem.write_u8(VGA_OPTION_ROM_BASE + i as u64, *b).unwrap();
+        }
+        assert!(
+            m.scan_option_rom_region().is_empty(),
+            "bad checksum must not be a scan hit"
+        );
+    }
+
+    /// Honesty: synthetic RETF option ROM is not SeaVGABIOS — BDA video + font
+    /// stay whatever the host INT 10h stub / bring-up font path set.
+    #[test]
+    fn option_rom_retf_preserves_bda_and_font() {
+        use crate::int10::{
+            setup_int10_set_cursor, setup_int10_set_mode, BDA_ACTIVE_PAGE, BDA_CURSOR_PAGE0,
+            BDA_VIDEO_COLS, BDA_VIDEO_MODE, BDA_VIDEO_PAGE_SIZE, INT10_MODE03_PAGE_SIZE,
+            INT10_MODE_03H_TEXT,
+        };
+
+        let rom = synthetic_option_rom(1);
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_cursor(&mut m.cpu, 0, 2, 9);
+        m.service_int10();
+        assert!(!m.vga.text_font_installed());
+
+        m.map_and_invoke_vga_option_rom(&rom)
+            .expect("map+invoke RETF ROM");
+        m.step().expect("RETF");
+
+        assert_eq!(m.mem.read_u8(BDA_VIDEO_MODE).unwrap(), INT10_MODE_03H_TEXT);
+        assert_eq!(m.mem.read_u8(BDA_VIDEO_COLS).unwrap(), 80);
+        assert_eq!(
+            u16::from(m.mem.read_u8(BDA_VIDEO_PAGE_SIZE).unwrap())
+                | (u16::from(m.mem.read_u8(BDA_VIDEO_PAGE_SIZE + 1).unwrap()) << 8),
+            INT10_MODE03_PAGE_SIZE
+        );
+        assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0).unwrap(), 9);
+        assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 1).unwrap(), 2);
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
+        assert!(!m.vga.text_font_installed());
+    }
 }

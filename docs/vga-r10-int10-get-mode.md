@@ -4,8 +4,8 @@ Milestone 2, Round 10, display-fw lane — slice 2.
 
 ## Goal
 
-Return the current BIOS video mode, column count, and active page from BDA /
-VGA-backed state via host INT 10h AH=0Fh.
+Return the current BIOS video mode, column count, and active page from BDA
+via host INT 10h AH=0Fh. This is the host stub, not SeaVGABIOS / VGA BIOS.
 
 ## API
 
@@ -15,7 +15,7 @@ VGA-backed state via host INT 10h AH=0Fh.
 | AH | low byte of `0040:004A` columns |
 | BH | `0040:0062` active page |
 
-After AH=00h AL=03h: AL=`03h`, AH=`50h` (80), BH=`00h`.  
+After AH=00h AL=03h: AL=`03h`, AH=`50h` (80), BH=`00h`.
 After AH=00h AL=13h: AL=`13h`, AH=`28h` (40), BH=`00h`.
 
 ## Spec refs
