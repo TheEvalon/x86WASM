@@ -25,14 +25,13 @@ mod xbcs;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
-pub use option_rom_invoke::{
-    OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET, OPTION_ROM_RESUME_PHYS,
-};
-pub use vga_frame::HostVgaFrame;
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
     PAM_FIELD_MASK, PAM_FIELD_RE, PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST,
     PAM_REGISTER_LAST, PAM_WINDOW_BASE, PAM_WINDOW_END,
+};
+pub use option_rom_invoke::{
+    OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET, OPTION_ROM_RESUME_PHYS,
 };
 pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
@@ -53,6 +52,7 @@ pub use step_clock::{
     StepClock, StepTicks, ACPI_PM_CLOCKS_PER_PIT_CLOCK, ACPI_PM_TMR_MASK, CMOS_PERIODIC_HZ,
     DEFAULT_PIT_CLOCKS_PER_STEP, PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
 };
+pub use vga_frame::HostVgaFrame;
 pub use xbcs::{
     Xbcs, XBCS_BIOS_WRITE_PROTECT_ENABLE, XBCS_CONFIG_OFFSET, XBCS_DEFAULT,
     XBCS_EXTENDED_BIOS_ENABLE, XBCS_LOWER_BIOS_ENABLE,

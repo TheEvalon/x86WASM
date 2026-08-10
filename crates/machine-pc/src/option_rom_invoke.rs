@@ -106,7 +106,9 @@ impl Machine {
         }
         let blocks = usize::from(header[2]);
         if blocks == 0 {
-            return Err(MachineError::OptionRom(firmware_interface::OptionRomError::ZeroSize));
+            return Err(MachineError::OptionRom(
+                firmware_interface::OptionRomError::ZeroSize,
+            ));
         }
         let len = blocks
             .checked_mul(OPTION_ROM_BLOCK_SIZE)
@@ -125,7 +127,8 @@ impl Machine {
         let sp = self.cpu.gpr_u16(CpuState::RSP);
         if sp < 4 {
             self.cpu.ss = SegmentReg::real_mode(0x0000);
-            self.cpu.set_gpr_u16(CpuState::RSP, OPTION_ROM_INVOKE_DEFAULT_SP);
+            self.cpu
+                .set_gpr_u16(CpuState::RSP, OPTION_ROM_INVOKE_DEFAULT_SP);
         }
     }
 
@@ -169,7 +172,7 @@ pub use firmware_interface::OPTION_ROM_ENTRY_OFFSET as OPTION_ROM_INVOKE_ENTRY_O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use firmware_interface::{OPTION_ROM_SIGNATURE, OPTION_ROM_BLOCK_SIZE as BLOCK};
+    use firmware_interface::{OPTION_ROM_BLOCK_SIZE as BLOCK, OPTION_ROM_SIGNATURE};
 
     fn synthetic_option_rom(blocks: u8) -> Vec<u8> {
         let mut rom = vec![0u8; usize::from(blocks) * BLOCK];

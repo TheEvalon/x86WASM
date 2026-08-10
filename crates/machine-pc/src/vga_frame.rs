@@ -94,9 +94,7 @@ mod tests {
     fn host_frame_text_mode_reports_font_and_rgba_size() {
         let mut m = Machine::new(64 * 1024);
         assert_eq!(
-            m.capture_vga_host_frame(false)
-                .unwrap()
-                .font_installed(),
+            m.capture_vga_host_frame(false).unwrap().font_installed(),
             Some(false)
         );
         assert!(m.install_vga_bringup_font());

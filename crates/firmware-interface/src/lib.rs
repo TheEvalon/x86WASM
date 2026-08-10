@@ -140,7 +140,7 @@ pub fn option_rom_entry_cs_ip(phys_base: u64) -> Option<(u16, u16)> {
     if !phys_base.is_multiple_of(OPTION_ROM_SCAN_STEP) {
         return None;
     }
-    if phys_base < OPTION_ROM_REGION_BASE || phys_base >= OPTION_ROM_REGION_END {
+    if !(OPTION_ROM_REGION_BASE..OPTION_ROM_REGION_END).contains(&phys_base) {
         return None;
     }
     let cs = u16::try_from(phys_base >> 4).ok()?;
