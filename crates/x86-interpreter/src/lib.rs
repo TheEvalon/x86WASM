@@ -1941,16 +1941,27 @@ fn protected_far_is_call_gate(
     bus: &mut dyn Bus,
     selector: u16,
 ) -> Result<bool, ExecError> {
-    if is_null_selector(selector) || selector & 0x4 != 0 {
+    if is_null_selector(selector) {
         return Ok(false);
     }
-    let offset = u64::from(selector >> 3) * 8;
-    if offset + 7 > u64::from(cpu.gdtr.limit) {
-        return Ok(false);
-    }
-    let access = bus
-        .read_system_u8(cpu.gdtr.base.wrapping_add(offset).wrapping_add(5))
-        .map_err(|error| classify_mem_fault(error, false))?;
+    let access = if selector & 0x4 != 0 {
+        if is_null_selector(cpu.ldtr.selector) {
+            return Ok(false);
+        }
+        let offset = u64::from(selector >> 3) * 8;
+        if offset + 7 > u64::from(cpu.ldtr.limit) {
+            return Ok(false);
+        }
+        bus.read_system_u8(cpu.ldtr.base.wrapping_add(offset).wrapping_add(5))
+            .map_err(|error| classify_mem_fault(error, false))?
+    } else {
+        let offset = u64::from(selector >> 3) * 8;
+        if offset + 7 > u64::from(cpu.gdtr.limit) {
+            return Ok(false);
+        }
+        bus.read_system_u8(cpu.gdtr.base.wrapping_add(offset).wrapping_add(5))
+            .map_err(|error| classify_mem_fault(error, false))?
+    };
     if access & 0x10 != 0 {
         return Ok(false);
     }
@@ -1987,7 +1998,7 @@ fn read_tss32_inner_stack_arch(
     Ok((ss, esp))
 }
 
-/// Far `CALL` through a 32-bit GDT call gate (param count must be 0).
+/// Far `CALL` through a 32-bit GDT or LDT call gate (param count must be 0).
 ///
 /// Spec: Intel SDM Vol. 2 "CALL"; Vol. 3 §5.8.2 Figures 5-8 / 5-9.
 fn call_gate_far_call(
@@ -1998,7 +2009,7 @@ fn call_gate_far_call(
 ) -> Result<(), ExecError> {
     let cpl = (cpu.cs.selector & 3) as u8;
     let rpl = (gate_selector & 3) as u8;
-    let gate = read_gdt_raw_descriptor(cpu, bus, gate_selector)?;
+    let gate = read_dt_raw_descriptor(cpu, bus, gate_selector)?;
     let gate_access = gate[5];
     let gate_type = gate_access & 0x0F;
     if gate_type == DESC_TYPE_CALL_GATE16 {
@@ -2022,6 +2033,7 @@ fn call_gate_far_call(
 
     let code_selector = u16::from_le_bytes([gate[2], gate[3]]);
     if is_null_selector(code_selector) || code_selector & 0x4 != 0 {
+        // Target code through LDT remains out of scope for this slice.
         return Err(selector_fault(13, code_selector));
     }
     let code_desc = read_gdt_segment_descriptor(cpu, bus, code_selector)?;
@@ -5022,6 +5034,42 @@ fn exec_ltr(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result
     Ok(())
 }
 
+/// `LLDT r/m16` — load LDTR from a present LDT system descriptor in the GDT.
+///
+/// Null clears the LDTR cache. Spec: Intel SDM Vol. 2 "LLDT"; Vol. 3 §§2.4.2,
+/// 3.5.1. Unsupported here: LDT-resident LDT descriptors (`TI=1` on the source).
+fn exec_lldt(cpu: &mut CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        return Err(arch_fault(6));
+    }
+    require_cpl0(cpu)?;
+    let selector = read_rm_u16(cpu, bus, insn)?;
+    if is_null_selector(selector) {
+        cpu.ldtr = x86_core::SegmentReg {
+            selector,
+            base: 0,
+            limit: 0,
+            flags: 0,
+        };
+        return Ok(());
+    }
+    if selector & 0x4 != 0 {
+        return Err(selector_fault(13, selector));
+    }
+    let desc = read_gdt_raw_descriptor(cpu, bus, selector)?;
+    let access = desc[5];
+    if access & 0x10 != 0 || access & 0x0F != DESC_TYPE_LDT {
+        return Err(selector_fault(13, selector));
+    }
+    if access & 0x80 == 0 {
+        return Err(selector_fault(11, selector));
+    }
+    let parsed = parse_segment_descriptor(desc);
+    cpu.ldtr
+        .load_descriptor_cache(selector, parsed.base, parsed.limit, parsed.flags);
+    Ok(())
+}
+
 fn tss32_read_u32(bus: &mut dyn Bus, base: u64, offset: u32) -> Result<u32, ExecError> {
     let mut bytes = [0u8; 4];
     for (index, byte) in bytes.iter_mut().enumerate() {
@@ -5084,6 +5132,39 @@ fn read_gdt_raw_descriptor(
     selector: u16,
 ) -> Result<[u8; 8], ExecError> {
     let addr = gdt_descriptor_addr(cpu, selector)?;
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(descriptor)
+}
+
+/// Read an 8-byte descriptor from the GDT (`TI=0`) or current LDT (`TI=1`).
+///
+/// Spec: Intel SDM Vol. 3 §§3.5.1–3.5.2. A null or unloaded LDTR with `TI=1`
+/// raises `#GP(selector)`.
+fn read_dt_raw_descriptor(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<[u8; 8], ExecError> {
+    if is_null_selector(selector) {
+        return Err(selector_fault(13, selector));
+    }
+    if selector & 0x4 == 0 {
+        return read_gdt_raw_descriptor(cpu, bus, selector);
+    }
+    // LDT path.
+    if is_null_selector(cpu.ldtr.selector) {
+        return Err(selector_fault(13, selector));
+    }
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.ldtr.limit) {
+        return Err(selector_fault(13, selector));
+    }
+    let addr = cpu.ldtr.base.wrapping_add(offset);
     let mut descriptor = [0u8; 8];
     for (index, byte) in descriptor.iter_mut().enumerate() {
         *byte = bus
@@ -5475,16 +5556,29 @@ fn step_two_byte(
             Ok(())
         }
         0x00 => {
-            // Group 6 — Spec: Intel SDM Vol. 2 opcode map 2; "STR"/"LTR"/
-            // "VERR"/"VERW"; Vol. 3 §§7.2–7.3. Unsupported here: SLDT/LLDT,
-            // 16-bit TSS descriptors, and nested-task CALL switches.
+            // Group 6 — Spec: Intel SDM Vol. 2 opcode map 2; "SLDT"/"STR"/
+            // "LLDT"/"LTR"/"VERR"/"VERW"; Vol. 3 §§2.4.2, 7.2–7.3.
+            // Unsupported here: 16-bit TSS descriptors and nested-task CALL.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x00))?;
             match m.reg {
+                0 => {
+                    // SLDT r/m16 — store the visible LDTR selector. Spec: SDM
+                    // Vol. 2 "SLDT". Valid in real-address mode as well.
+                    write_rm_u16(cpu, bus, insn, cpu.ldtr.selector)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
                 1 => {
                     // STR r/m16 — store the visible TR selector. No privilege
                     // check; valid in real-address mode as well (stores the
                     // cached selector). Spec: SDM Vol. 2 "STR".
                     write_rm_u16(cpu, bus, insn, cpu.tr.selector)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
+                2 => {
+                    // LLDT r/m16 — load LDTR from a GDT LDT descriptor.
+                    exec_lldt(cpu, bus, insn)?;
                     set_current_ip(cpu, next_ip);
                     Ok(())
                 }
