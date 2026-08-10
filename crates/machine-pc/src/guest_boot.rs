@@ -225,10 +225,7 @@ impl Machine {
     /// The fixture is a signed MBR that prints `FD` to COM1 and a VGA glyph,
     /// then `HLT`, plus a second-sector payload marker. It is **not** FreeDOS
     /// and must never be reported as a FreeDOS prompt.
-    pub fn measure_freedos_like(
-        &mut self,
-        max_steps: u64,
-    ) -> Result<GuestOsMeasure, MachineError> {
+    pub fn measure_freedos_like(&mut self, max_steps: u64) -> Result<GuestOsMeasure, MachineError> {
         if !self.ide.present || self.ide.image.is_empty() {
             self.attach_ide_image(synthetic_freedos_like_disk());
         }
@@ -569,10 +566,7 @@ mod tests {
             .measure
             .checkpoints
             .contains(&GuestBootCheckpoint::VgaObserved));
-        assert!(matches!(
-            report.measure.report.stop,
-            PostStopReason::Halted
-        ));
+        assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
         let text = report.to_string();
         assert!(text.contains("NOT an OS boot"));
         assert!(text.contains("does NOT claim a FreeDOS prompt"));
@@ -593,9 +587,6 @@ mod tests {
         let text = report.to_string();
         assert!(text.contains("NOT Milestone 2 exit"));
         assert!(text.contains("linux-serial-path"));
-        assert!(matches!(
-            report.measure.report.stop,
-            PostStopReason::Halted
-        ));
+        assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
     }
 }

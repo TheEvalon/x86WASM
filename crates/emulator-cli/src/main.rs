@@ -91,36 +91,6 @@ fn main() -> ExitCode {
         }
     }
 
-    if opts.guest_freedos_measure {
-        match run_freedos_measure(&mut machine, opts.max_steps) {
-            Ok(measure) => {
-                println!("{measure}");
-                print_diagnostics(&machine, option_rom_line, &opts);
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                print_diagnostics(&machine, option_rom_line, &opts);
-                return arg_exit_code(&e);
-            }
-        }
-    }
-
-    if opts.guest_linux_serial_measure {
-        match run_linux_serial_measure(&mut machine, opts.max_steps) {
-            Ok(measure) => {
-                println!("{measure}");
-                print_diagnostics(&machine, option_rom_line, &opts);
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                print_diagnostics(&machine, option_rom_line, &opts);
-                return arg_exit_code(&e);
-            }
-        }
-    }
-
     if opts.guest_measure {
         match run_guest_measure(&mut machine, guest_boot_media(&opts), opts.max_steps) {
             Ok(measure) => {
