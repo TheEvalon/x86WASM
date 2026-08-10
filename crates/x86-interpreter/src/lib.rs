@@ -2456,8 +2456,9 @@ fn return_to_virtual_8086_mode(
 ///
 /// Without VME: `IOPL < 3` → `#GP(0)`; `IOPL = 3` → real-mode-like pop that
 /// leaves `VM`/`IOPL`/`VIP`/`VIF` unchanged (Vol. 2 IRET
-/// RETURN-FROM-VIRTUAL-8086-MODE). Full monitor exit via interrupt delivery
-/// that reaches CPL 0 remains a later slice.
+/// RETURN-FROM-VIRTUAL-8086-MODE). Leaving VM86 entirely requires a privilege
+/// transition to CPL 0 (interrupt/task) then `IRETD` with `VM=0` in the image —
+/// interrupt delivery that builds the 9-dword frame remains unsupported.
 ///
 /// Spec: Intel SDM Vol. 2 "IRET/IRETD"; Vol. 3 §20.2.3 / ch.20.
 fn vm86_iret(
@@ -2465,10 +2466,45 @@ fn vm86_iret(
     bus: &mut dyn Bus,
     operand_size_32: bool,
 ) -> Result<(), ExecError> {
-    // Slice 4 fills this in; until then treat in-VM86 IRET as unsupported so
-    // accidental use cannot invent semantics.
-    let _ = (cpu, bus, operand_size_32);
-    Err(ExecError::Unsupported(0xCF))
+    if eflags_iopl(cpu.rflags) < 3 {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    // Preserve VM, IOPL, VIP, VIF across the flag load (Vol. 2 RETURN-FROM-VM86).
+    const STICKY_HIGH: u64 = EFLAGS_VM | (3 << 12) | (1 << 19) | (1 << 20);
+
+    if operand_size_32 {
+        let eip = pop32(cpu, bus)?;
+        let cs_raw = pop32(cpu, bus)?;
+        let flags = pop32(cpu, bus)?;
+        let cs_sel = cs_raw as u16;
+        if eip > 0xFFFF {
+            return Err(arch_fault_with_error_code(13, 0));
+        }
+        let sticky = cpu.rflags & STICKY_HIGH;
+        // Load defined bits except the sticky VM/IOPL/VIP/VIF set.
+        const DEFINED32: u64 = 0x003D_7FD5;
+        cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+        cpu.rip = u64::from(eip);
+        cpu.rflags = (cpu.rflags & !0xFFFF_FFFF)
+            | (u64::from(flags) & DEFINED32 & !STICKY_HIGH)
+            | sticky
+            | 2;
+    } else {
+        let ip = pop16(cpu, bus)?;
+        let cs_sel = pop16(cpu, bus)?;
+        let flags = pop16(cpu, bus)?;
+        let sticky_iopl = cpu.rflags & (3 << 12);
+        cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
+        cpu.set_ip16(ip);
+        // Low FLAGS without IOPL; IOPL sticky. VM lives in high word.
+        const DEFINED16_NO_IOPL: u64 = 0x4FD5; // excludes IOPL bits 13:12
+        cpu.rflags = (cpu.rflags & !0xFFFF)
+            | (u64::from(flags) & DEFINED16_NO_IOPL)
+            | sticky_iopl
+            | 2;
+    }
+    Ok(())
 }
 
 /// Read one complete GDT descriptor after common selector/table validation.
