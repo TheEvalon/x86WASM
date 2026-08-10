@@ -120,9 +120,7 @@ impl Machine {
             }
             0x08 => {
                 // BS — move left; do not erase (minimal TTY).
-                if col > 0 {
-                    col -= 1;
-                }
+                col = col.saturating_sub(1);
             }
             0x07 => {
                 // Bell — no speaker path in this stub.
