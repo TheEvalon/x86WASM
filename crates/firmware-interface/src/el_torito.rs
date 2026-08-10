@@ -293,7 +293,10 @@ mod tests {
         assert!(info.bootable);
         assert_eq!(info.media_type, EL_TORITO_MEDIA_NO_EMUL);
         assert_eq!(info.load_segment, 0);
-        assert_eq!(info.effective_load_segment(), EL_TORITO_DEFAULT_LOAD_SEGMENT);
+        assert_eq!(
+            info.effective_load_segment(),
+            EL_TORITO_DEFAULT_LOAD_SEGMENT
+        );
         assert_eq!(info.load_phys(), EL_TORITO_DEFAULT_LOAD_PHYS);
         assert_eq!(info.load_rba, 24);
         assert_eq!(info.sector_count, 4);
