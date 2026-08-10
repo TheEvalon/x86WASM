@@ -4930,11 +4930,12 @@ impl ProtectedGateSource {
 /// unchanged.
 ///
 /// Virtual-8086 mode (`EFLAGS.VM=1`): architectural CPL is 3 (CS[1:0] is not
-/// RPL). A privilege-changing 386 gate pushes the **9-dword** VM86 frame
-/// GS/FS/DS/ES + SS:ESP + EFLAGS(with VM) + CS:EIP (Vol. 3 §20.2 Figure 20-2),
-/// then loads DS/ES/FS/GS with null selectors. 16-bit gates and same-CPL
-/// delivery from VM86 remain unsupported. Task gates, VME/PVI, and nested
-/// #DF synthesis beyond the existing path remain out of scope.
+/// RPL). A privilege-changing gate pushes the VM86 frame GS/FS/DS/ES + SS:SP
+/// + FLAGS + CS:IP — **dwords** for 386 gates (Figure 20-2) or **words** for
+/// 286 gates — then loads DS/ES/FS/GS with null selectors. Same-CPL delivery
+/// from VM86 remains unsupported. Task gates, full VME (beyond the Round-12
+/// redirect stub), and nested #DF synthesis beyond the existing path remain
+/// out of scope.
 ///
 /// Gate DPL is checked only for software INT/INT3/INTO. A violation raises
 /// #GP with IDT=1 and EXT=0; faults, NMI, and external IRQs bypass gate DPL.
@@ -4990,22 +4991,15 @@ fn deliver_protected_mode_gate(
     // VM86 forces CPL=3; CS[1:0] is not RPL (Vol. 3 §§5.5, 20.1.1).
     let from_vm86 = eflags_vm(cpu.rflags);
     let cpl = architectural_cpl(cpu);
-    if from_vm86 && !gate32 {
-        // VM86 extended frame is dword-width (Figure 20-2); 286 gates unsupported.
-        return Err(protected_mode_delivery_error(
-            vector,
-            ProtectedModeDeliveryError::GateType(gate_access),
-        ));
-    }
     if cpu.cs.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
         return Err(protected_mode_delivery_error(
             vector,
             ProtectedModeDeliveryError::CurrentPrivilege,
         ));
     }
-    if !gate32 && cpu.cs.default_big() {
-        // A 16-bit frame cannot carry a 32-bit return EIP; report instead of
-        // silently truncating it.
+    // VM86 CS is real-mode style (D=0). A non-VM86 16-bit frame cannot carry a
+    // 32-bit return EIP from a D=1 current CS.
+    if !gate32 && !from_vm86 && cpu.cs.default_big() {
         return Err(protected_mode_delivery_error(
             vector,
             ProtectedModeDeliveryError::CurrentPrivilege,
