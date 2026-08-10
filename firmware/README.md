@@ -138,7 +138,10 @@ Before installing, the script checks the image is a well-formed option ROM:
 whole-image checksum of zero mod 256.
 
 **Windows:** the same constraints as SeaBIOS apply — use WSL2 or Linux CI. There
-is no CI workflow for this ROM yet.
+is no CI workflow for this ROM yet. R7 display/boot recorded reproducible
+Linux/WSL2 steps and the Windows infeasibility note in
+`docs/firmware-r7-seavgabios-build.md` (native Win32 / missing WSL bash cannot
+run this script).
 
 ## ROM mapping (emulator)
 

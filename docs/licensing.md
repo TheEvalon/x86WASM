@@ -50,8 +50,9 @@ Policy is the same as SeaBIOS: sources only under `firmware/seavgabios/.src/`
 (gitignored), never copied into `crates/**`, and the binary is gitignored until
 an explicit review allows committing it.
 
-**The build script has never been executed and no binary exists in this tree.**
-The pin and the notices are recorded ahead of the first build.
+**No `vgabios.bin` is committed.** R7 (2026-08-10) confirmed the Windows host
+cannot build in-session; use Linux/WSL2 per `docs/firmware-r7-seavgabios-build.md`.
+The pin and the notices remain the committed surface ahead of a CI/local Linux build.
 
 ## Provenance rules
 

@@ -14,12 +14,15 @@ mod ioapic_wire;
 mod lapic_wire;
 mod mbr;
 mod mem;
+mod option_rom_invoke;
 mod ports;
 mod post_code;
 mod post_probe;
 mod post_spin;
 mod post_trace;
 mod step_clock;
+mod vga_font;
+mod vga_frame;
 mod xbcs;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
@@ -28,6 +31,9 @@ pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
     PAM_FIELD_MASK, PAM_FIELD_RE, PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST,
     PAM_REGISTER_LAST, PAM_WINDOW_BASE, PAM_WINDOW_END,
+};
+pub use option_rom_invoke::{
+    OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET, OPTION_ROM_RESUME_PHYS,
 };
 pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
@@ -48,6 +54,7 @@ pub use step_clock::{
     StepClock, StepTicks, ACPI_PM_CLOCKS_PER_PIT_CLOCK, ACPI_PM_TMR_MASK, CMOS_PERIODIC_HZ,
     DEFAULT_PIT_CLOCKS_PER_STEP, PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
 };
+pub use vga_frame::HostVgaFrame;
 pub use xbcs::{
     Xbcs, XBCS_BIOS_WRITE_PROTECT_ENABLE, XBCS_CONFIG_OFFSET, XBCS_DEFAULT,
     XBCS_EXTENDED_BIOS_ENABLE, XBCS_LOWER_BIOS_ENABLE,
@@ -95,6 +102,15 @@ pub enum MachineError {
     /// Guest RAM must cover `0x7C00`..`0x7DFF` for the boot-sector copy.
     #[error("RAM too small for MBR at 0x7C00")]
     MbrRamTooSmall,
+    /// Option-ROM base is not a valid legacy entry (`CS:IP` cannot be formed).
+    #[error("option ROM entry base is invalid")]
+    OptionRomEntryInvalid,
+    /// Declared option-ROM image bytes are not readable at the requested base.
+    #[error("option ROM is not mapped at the requested base")]
+    OptionRomNotMapped,
+    /// Real-mode stack could not accept the far-call return frame.
+    #[error("option ROM invoke stack fault")]
+    OptionRomStackFault,
 }
 
 /// Host override for fw_cfg `bootorder`, or the machine default when `Default`.
@@ -550,8 +566,9 @@ impl Machine {
 
     /// Map an expansion ROM at the conventional video-BIOS base `0xC0000`.
     ///
-    /// Wraps [`Self::map_option_rom`]. This tree ships no VGA BIOS image and
-    /// nothing executes the ROM; the mapping is what a scan can find.
+    /// Wraps [`Self::map_option_rom`]. Mapping alone does not execute the ROM;
+    /// use [`Self::invoke_option_rom_entry`] / [`Self::map_and_invoke_vga_option_rom`]
+    /// for a host-driven far call to offset 3.
     pub fn map_vga_option_rom(&mut self, data: &[u8]) -> Result<(), MachineError> {
         self.map_option_rom(firmware_interface::VGA_OPTION_ROM_BASE, data)
     }

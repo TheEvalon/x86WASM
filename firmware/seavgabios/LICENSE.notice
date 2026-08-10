@@ -38,8 +38,9 @@ x86WASM project policy
   MIT/Apache Rust crates (firmware-interface, machine-pc, devices, …).
 - Do not commit vgabios.bin until licensing review explicitly allows it
   (*.bin under this tree is gitignored).
-- Building the ROM here does not imply the emulator scans or executes option
-  ROMs. `emulator-cli --option-rom` maps an image for inspection only.
+- Building the ROM here does not imply SeaBIOS POST. Mapping and host-driven
+  entry invoke are separate machine helpers; there is still no SeaBIOS option-
+  ROM scan or INT 10h. See docs/firmware-r7-seavgabios-build.md.
 
 See also: docs/licensing.md, docs/adr/0004-firmware-seabios-ovmf.md,
 third_party/NOTICE, firmware/README.md.
