@@ -3690,6 +3690,8 @@ const CPUID_VERSION_INFO: u32 = 0x0000_0600;
 const CPUID_FEATURE_PSE: u32 = 1 << 3;
 /// `CPUID.01H:EDX[5]` — `RDMSR`/`WRMSR`.
 const CPUID_FEATURE_MSR: u32 = 1 << 5;
+/// `CPUID.01H:EDX[8]` — `CMPXCHG8B` (`0F C7 /1` m64).
+const CPUID_FEATURE_CX8: u32 = 1 << 8;
 /// `CPUID.01H:EDX[13]` — global pages through `CR4.PGE` (SDM Vol. 3 §4.1.4,
 /// §4.10.2.4).
 const CPUID_FEATURE_PGE: u32 = 1 << 13;
@@ -3699,12 +3701,14 @@ const CPUID_FEATURE_CMOV: u32 = 1 << 15;
 
 /// `CPUID` leaf 1 `EDX` feature bits.
 ///
-/// Four features are implemented and therefore advertised:
+/// Five features are implemented and therefore advertised:
 ///
 /// * `PSE` — `CR4.PSE` and 4-MiB pages are implemented by the paging engine,
 ///   and §4.1.4 makes the CPUID bit the guest's licence to set `CR4.PSE`.
 /// * `MSR` — `RDMSR`/`WRMSR` decode, check privilege, and raise the
-///   architectural `#GP` for the MSR addresses they do not implement.
+///   architectural `#GP` for the MSR addresses they do not implement (except
+///   the bounded `IA32_APIC_BASE` presence path).
+/// * `CX8` — `CMPXCHG8B` (`0F C7 /1` m64) is implemented.
 /// * `PGE` — `CR4.PGE` and global-page TLB retention are implemented.
 /// * `CMOV` — the `0F 40`–`0F 4F` conditional moves are implemented. The
 ///   `FCMOVcc` half of this bit's definition needs an FPU, which `FPU`
@@ -3712,12 +3716,15 @@ const CPUID_FEATURE_CMOV: u32 = 1 << 15;
 ///
 /// Deliberately still clear: `PAE` (`EDX[6]`), `PAT` (`EDX[16]`) and `PSE-36`
 /// (`EDX[17]`) — the paging engine models none of them, and its default profile
-/// assumes exactly that. Everything else — `FPU`, `TSC`, `APIC`, `MTRR`, `CX8`,
+/// assumes exactly that. Everything else — `FPU`, `TSC`, `APIC`, `MTRR`,
 /// `MMX`, `SSE` — stays clear because none of those are implemented.
 /// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); Vol. 3 §4.1.4; `AGENTS.md`
 /// truthful-CPUID rule.
-const CPUID_FEATURES_EDX: u32 =
-    CPUID_FEATURE_PSE | CPUID_FEATURE_MSR | CPUID_FEATURE_PGE | CPUID_FEATURE_CMOV;
+const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_PSE
+    | CPUID_FEATURE_MSR
+    | CPUID_FEATURE_CX8
+    | CPUID_FEATURE_PGE
+    | CPUID_FEATURE_CMOV;
 
 /// `CPUID` leaf 1 `ECX` feature bits: none are implemented.
 const CPUID_FEATURES_ECX: u32 = 0;
@@ -3781,22 +3788,48 @@ fn cpuid_leaf(leaf: u32) -> CpuidResult {
     }
 }
 
+/// `IA32_APIC_BASE` MSR index. Spec: Intel SDM Vol. 4 MSR `1Bh`.
+const MSR_IA32_APIC_BASE: u32 = 0x1B;
+/// BSP flag. Spec: SDM Vol. 3 / Vol. 4 IA32_APIC_BASE bit 8.
+const IA32_APIC_BASE_BSP: u64 = 1 << 8;
+/// APIC global enable. Spec: SDM Vol. 3 / Vol. 4 IA32_APIC_BASE bit 10.
+const IA32_APIC_BASE_ENABLE: u64 = 1 << 10;
+/// x2APIC mode enable — unsupported here; writing 1 raises `#GP(0)`.
+const IA32_APIC_BASE_X2APIC: u64 = 1 << 11;
+/// Writable field mask: BSP | EN | base[35:12] (36-bit physical address model).
+/// Bits 0–7, 9, 11, and [63:36] are reserved for this tree.
+const IA32_APIC_BASE_WRITABLE: u64 =
+    IA32_APIC_BASE_BSP | IA32_APIC_BASE_ENABLE | 0x0000_000F_FFFF_F000;
+
 /// Read a model-specific register, or `None` when the address is reserved or
 /// unimplemented.
 ///
-/// No MSR is implemented in this slice. The emulator models no time-stamp
-/// counter, local APIC, MTRRs, `SYSENTER` state, or `EFER`, so there is nothing
-/// it could report truthfully; every address takes the architectural `#GP` path
-/// rather than returning a fabricated zero.
+/// Implemented: `IA32_APIC_BASE` (`0x1B`) only. Every other address takes the
+/// architectural `#GP` path rather than returning a fabricated zero.
 /// Spec: Intel SDM Vol. 2 "RDMSR"; Vol. 4 (MSR listings).
-fn read_msr(_index: u32) -> Option<u64> {
-    None
+fn read_msr(cpu: &CpuState, index: u32) -> Option<u64> {
+    match index {
+        MSR_IA32_APIC_BASE => Some(cpu.ia32_apic_base),
+        _ => None,
+    }
 }
 
 /// Write a model-specific register, returning `false` when the address is
-/// reserved or unimplemented. See [`read_msr`] — no MSR is implemented.
-fn write_msr(_index: u32, _value: u64) -> bool {
-    false
+/// reserved/unimplemented or the value sets a reserved bit (`#GP`).
+///
+/// Spec: Intel SDM Vol. 2 "WRMSR"; Vol. 3 / Vol. 4 IA32_APIC_BASE.
+fn write_msr(cpu: &mut CpuState, index: u32, value: u64) -> bool {
+    match index {
+        MSR_IA32_APIC_BASE => {
+            // x2APIC (bit 11) and any other non-writable bit → #GP(0).
+            if value & !IA32_APIC_BASE_WRITABLE != 0 {
+                return false;
+            }
+            cpu.ia32_apic_base = value;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `#GP(0)` unless the processor is at CPL 0.
@@ -5001,7 +5034,7 @@ fn step_two_byte(
             // instruction requires CPL 0.
             require_cpl0(cpu)?;
             let index = cpu.gpr_u32(CpuState::RCX);
-            let value = read_msr(index).ok_or_else(|| arch_fault_with_error_code(13, 0))?;
+            let value = read_msr(cpu, index).ok_or_else(|| arch_fault_with_error_code(13, 0))?;
             cpu.set_gpr_u32(CpuState::RAX, value as u32);
             cpu.set_gpr_u32(CpuState::RDX, (value >> 32) as u32);
             set_current_ip(cpu, next_ip);
@@ -5016,7 +5049,7 @@ fn step_two_byte(
             let index = cpu.gpr_u32(CpuState::RCX);
             let value = (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
                 | u64::from(cpu.gpr_u32(CpuState::RAX));
-            if !write_msr(index, value) {
+            if !write_msr(cpu, index, value) {
                 return Err(arch_fault_with_error_code(13, 0));
             }
             set_current_ip(cpu, next_ip);
@@ -5264,7 +5297,7 @@ fn step_two_byte(
             // ELSE ZF := 0; EDX:EAX := TEMP64; DEST := TEMP64`. Only ZF is
             // written. Register destination is `#UD`. LOCK may be decoded; this
             // single-processor model does not enforce multi-processor atomicity.
-            // Unsupported here: other /r forms, CMPXCHG16B / REX.W, CPUID.CX8.
+            // Unsupported here: other /r forms, CMPXCHG16B / REX.W.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0xC7))?;
             if m.reg != 1 {
                 return Err(ExecError::Unsupported(0xC7));
@@ -21624,10 +21657,11 @@ mod tests {
         let ecx = cpu.gpr_u32(CpuState::RCX);
         assert_eq!(
             edx,
-            (1 << 3) | (1 << 5) | (1 << 13) | (1 << 15),
-            "exactly PSE, MSR, PGE and CMOV"
+            (1 << 3) | (1 << 5) | (1 << 8) | (1 << 13) | (1 << 15),
+            "exactly PSE, MSR, CX8, PGE and CMOV"
         );
         assert_eq!(ecx, 0, "no ECX feature is implemented");
+        assert_ne!(edx & (1 << 8), 0, "CX8 tracks CMPXCHG8B");
 
         // Named guards for the features most likely to be assumed present.
         for (bit, name) in [
@@ -21636,7 +21670,6 @@ mod tests {
             (2, "DE"),
             (4, "TSC"),
             (6, "PAE"),
-            (8, "CX8"),
             (9, "APIC"),
             (11, "SEP"),
             (12, "MTRR"),
@@ -21702,15 +21735,13 @@ mod tests {
         }
     }
 
-    /// Intel SDM Vol. 2 "RDMSR"/"WRMSR": "Specifying a reserved or unimplemented
-    /// MSR address in ECX will also cause a general protection exception." This
-    /// slice implements no MSR, so every address faults rather than returning a
-    /// fabricated zero, and the CPU state is unchanged.
+    /// Intel SDM Vol. 2 "RDMSR"/"WRMSR": reserved or unimplemented MSR addresses
+    /// raise `#GP(0)`. `IA32_APIC_BASE` (`0x1B`) is implemented; everything else
+    /// in this list still faults with CPU state unchanged.
     #[test]
     fn rdmsr_wrmsr_fault_on_every_unimplemented_msr_address() {
         for index in [
             0x0000_0010u32, // IA32_TIME_STAMP_COUNTER
-            0x0000_001B,    // IA32_APIC_BASE
             0x0000_00FE,    // IA32_MTRRCAP
             0x0000_02FF,    // IA32_MTRR_DEF_TYPE
             0xC000_0080,    // IA32_EFER
@@ -21729,14 +21760,98 @@ mod tests {
         }
     }
 
+    /// Intel SDM Vol. 3 / Vol. 4 MSR `1Bh` (`IA32_APIC_BASE`): reset BSP=1,
+    /// enable=0, base=`0xFEE0_0000`; WRMSR/RDMSR round-trip the writable
+    /// fields; reserved bits (including x2APIC bit 11) raise `#GP(0)`.
+    #[test]
+    fn ia32_apic_base_msr_read_write_and_reserved_gp() {
+        // RDMSR of the reset value.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x32], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+            cpu.set_gpr_u32(CpuState::RDX, 0xCAFE_BABE);
+        });
+        assert_eq!(cpu.ia32_apic_base, x86_core::IA32_APIC_BASE_RESET);
+        step(&mut cpu, &mut bus).unwrap();
+        let value = (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
+            | u64::from(cpu.gpr_u32(CpuState::RAX));
+        assert_eq!(value, x86_core::IA32_APIC_BASE_RESET);
+        assert_eq!(value & IA32_APIC_BASE_BSP, IA32_APIC_BASE_BSP);
+        assert_eq!(value & IA32_APIC_BASE_ENABLE, 0);
+        assert_eq!(value & !0xFFF, 0xFEE0_0000);
+
+        // WRMSR: enable + relocate base, keep BSP.
+        let new_val = 0xFEC0_0000 | IA32_APIC_BASE_BSP | IA32_APIC_BASE_ENABLE;
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, new_val as u32);
+            cpu.set_gpr_u32(CpuState::RDX, (new_val >> 32) as u32);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ia32_apic_base, new_val);
+
+        // Round-trip RDMSR.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x32], |cpu, _| {
+            cpu.ia32_apic_base = new_val;
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        let readback = (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
+            | u64::from(cpu.gpr_u32(CpuState::RAX));
+        assert_eq!(readback, new_val);
+
+        // Reserved bit 0 → #GP(0), state unchanged.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, (x86_core::IA32_APIC_BASE_RESET as u32) | 1);
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // x2APIC bit 11 → #GP(0).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(
+                CpuState::RAX,
+                (x86_core::IA32_APIC_BASE_RESET as u32) | IA32_APIC_BASE_X2APIC as u32,
+            );
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // Bit above the 36-bit phys model (bit 36) → #GP(0).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, x86_core::IA32_APIC_BASE_RESET as u32);
+            cpu.set_gpr_u32(CpuState::RDX, 1 << 4); // bit 36 of the MSR
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // CPL 3 still faults before the MSR is considered.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x32], PM32_CODE, true);
+        cpu.cs.selector |= 3;
+        cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+    }
+
     /// Intel SDM Vol. 2 "RDMSR"/"WRMSR"/"INVD"/"WBINVD" (Protected Mode
     /// Exceptions): `#GP(0)` when the current privilege level is not 0.
     /// Real-address mode always runs at CPL 0.
     #[test]
     fn system_instructions_require_cpl0_in_protected_mode() {
         for opcode in [0x32u8, 0x30, 0x08, 0x09] {
-            // CPL 0: INVD/WBINVD retire; RDMSR/WRMSR still fault on the address.
+            // CPL 0: INVD/WBINVD retire; RDMSR/WRMSR of an unimplemented index
+            // still fault on the address (use TSC index so APIC_BASE is not hit).
             let (mut cpu, mut bus) = pm32_fixture(&[0x0F, opcode], PM32_CODE, true);
+            cpu.set_gpr_u32(CpuState::RCX, 0x10); // IA32_TIME_STAMP_COUNTER
             let result = step_inner(&mut cpu, &mut bus);
             if matches!(opcode, 0x08 | 0x09) {
                 result.unwrap();
