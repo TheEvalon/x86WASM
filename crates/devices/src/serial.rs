@@ -1,18 +1,22 @@
 //! COM1 (`0x3F8`), COM2 (`0x2F8`), and Bochs/QEMU-style debug port `0x402`.
 //!
-//! 16550 programming model is intentionally minimal (M1/M2 debug UART): writes
-//! to THR (when DLAB=0) and writes to `0x402` append bytes to a per-port sink.
-//! IER/IIR expose the transmitter-holding-register-empty interrupt as
-//! [`Serial16550::irq_line`]; the machine routes COM1 → IRQ4 and COM2 → IRQ3.
-//! There is no receive path, so received-data-available (IER bit0 / IIR `100b`)
-//! is never signalled.
+//! 16550 programming model (M1/M2 debug UART + bounded RX):
+//! - THR (DLAB=0) appends to a per-port TX sink.
+//! - Host [`Serial16550::push_rx`] feeds RBR; LSR.DR and IER.ERBFI / IIR RDA
+//!   (`100b`) drive [`Serial16550::irq_line`] with priority over THRE.
+//! - Machine routes COM1 → IRQ4 and COM2 → IRQ3.
+//!
 //! Spec: NS16550A / classic PC COM1–COM2 I/O map (THR/RBR/IER/IIR/LSR subset).
 
 use crate::PortDevice;
 
+const IER_RDA: u8 = 1 << 0;
 const IER_THRE: u8 = 1 << 1;
 const IIR_NO_INTERRUPT: u8 = 0x01;
 const IIR_THRE: u8 = 0x02;
+const IIR_RDA: u8 = 0x04;
+const LSR_DR: u8 = 1 << 0;
+const LSR_THRE_TEMT: u8 = 0x60;
 
 /// Bytes emitted by guest serial/debug writes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,6 +58,8 @@ pub struct Serial16550 {
     /// Divisor latch (when DLAB=1).
     pub divisor: u16,
     output: SerialOutput,
+    /// Single-byte receive holding register (no FIFO in this slice).
+    rx_data: Option<u8>,
     /// THRE interrupt latch (NS16550A IER/IIR/THR behavior).
     thre_interrupt_pending: bool,
 }
@@ -74,6 +80,7 @@ impl Serial16550 {
             scratch: 0,
             divisor: 1,
             output: SerialOutput::new(),
+            rx_data: None,
             // Reset leaves THR empty. IER reset keeps the external line low.
             thre_interrupt_pending: true,
         }
@@ -87,12 +94,32 @@ impl Serial16550 {
         &mut self.output
     }
 
-    /// Current device-level interrupt signal (THRE only).
+    /// Host injects one received byte into RBR (overwrites unread data).
     ///
-    /// Spec: NS16550A IER bit1 (ETBEI) gates the THRE interrupt. The host wires
-    /// this to ISA IRQ4 (COM1 base `0x3F8`) or IRQ3 (COM2 base `0x2F8`).
-    /// Received-data-available is not modeled — this UART has no receive path.
+    /// Spec: NS16550A receiver holding register — sets LSR.DR; with IER.ERBFI
+    /// asserted this raises the device IRQ line (IIR RDA `100b`).
+    pub fn push_rx(&mut self, byte: u8) {
+        self.rx_data = Some(byte);
+    }
+
+    /// True when RBR holds unread data (LSR.DR).
+    pub fn rx_pending(&self) -> bool {
+        self.rx_data.is_some()
+    }
+
+    /// Current device-level interrupt signal (RDA and/or THRE).
+    ///
+    /// Spec: NS16550A IER bit0 (ERBFI) gates received-data-available; bit1
+    /// (ETBEI) gates THRE. The host wires this to ISA IRQ4 (COM1) or IRQ3 (COM2).
     pub fn irq_line(&self) -> bool {
+        self.rda_irq_active() || self.thre_irq_active()
+    }
+
+    fn rda_irq_active(&self) -> bool {
+        self.ier & IER_RDA != 0 && self.rx_data.is_some()
+    }
+
+    fn thre_irq_active(&self) -> bool {
         self.ier & IER_THRE != 0 && self.thre_interrupt_pending
     }
 
@@ -104,13 +131,29 @@ impl Serial16550 {
         (self.base..self.base.saturating_add(8)).contains(&port)
     }
 
+    fn lsr(&self) -> u8 {
+        let mut v = LSR_THRE_TEMT;
+        if self.rx_data.is_some() {
+            v |= LSR_DR;
+        }
+        v
+    }
+
+    /// Spec: NS16550A IIR priority — RDA (`100b`) above THRE (`010b`).
+    /// Reading IIR clears only the THRE condition when THRE is reported.
     fn read_iir(&mut self) -> u8 {
-        if self.irq_line() {
+        if self.rda_irq_active() {
+            IIR_RDA
+        } else if self.thre_irq_active() {
             self.thre_interrupt_pending = false;
             IIR_THRE
         } else {
             IIR_NO_INTERRUPT
         }
+    }
+
+    fn read_rbr(&mut self) -> u8 {
+        self.rx_data.take().unwrap_or(0)
     }
 
     fn write_ier(&mut self, value: u8) {
@@ -141,12 +184,12 @@ impl PortDevice for Serial16550 {
         let v = match off {
             0 if self.dlab() => (self.divisor & 0xFF) as u8,
             1 if self.dlab() => (self.divisor >> 8) as u8,
-            0 => 0, // RHR empty
+            0 => self.read_rbr(),
             1 => self.ier,
             2 => self.read_iir(),
             3 => self.lcr,
             4 => self.mcr,
-            5 => 0x60, // LSR: THR empty + transmitter empty
+            5 => self.lsr(),
             6 => 0x10, // MSR: DSR
             7 => self.scratch,
             _ => 0xFF,
@@ -242,6 +285,7 @@ mod tests {
     fn lsr_reports_thr_empty() {
         let mut s = Serial16550::new(0x3F8);
         assert_eq!(s.port_read(0x3FD, 1) & 0x60, 0x60);
+        assert_eq!(s.port_read(0x3FD, 1) & u32::from(LSR_DR), 0);
     }
 
     /// Spec: NS16550A LSR offset +5 — THR empty (bit5) + transmitter empty (bit6).
@@ -251,6 +295,66 @@ mod tests {
         assert_eq!(s.port_read(0x2FD, 1) & 0x60, 0x60);
         // RBR empty (offset 0) — enough for polling OUT loops.
         assert_eq!(s.port_read(0x2F8, 1), 0);
+    }
+
+    /// Spec: NS16550A RBR / LSR.DR — host `push_rx` sets data ready; RBR read clears.
+    #[test]
+    fn push_rx_sets_lsr_dr_and_rbr() {
+        let mut s = Serial16550::new(0x3F8);
+        s.push_rx(b'R');
+        assert!(s.rx_pending());
+        assert_eq!(s.port_read(0x3FD, 1) & u32::from(LSR_DR), u32::from(LSR_DR));
+        assert_eq!(s.port_read(0x3F8, 1), u32::from(b'R'));
+        assert!(!s.rx_pending());
+        assert_eq!(s.port_read(0x3FD, 1) & u32::from(LSR_DR), 0);
+        assert_eq!(s.port_read(0x3F8, 1), 0);
+    }
+
+    /// Spec: NS16550A IER bit0 (ERBFI) + IIR RDA ID `100b`.
+    #[test]
+    fn rda_interrupt_ier_gating_and_iir() {
+        let mut s = Serial16550::new(0x3F8);
+        s.push_rx(b'A');
+        assert!(!s.irq_line());
+        assert_eq!(s.port_read(0x3FA, 1), u32::from(IIR_NO_INTERRUPT));
+
+        s.port_write(0x3F9, 1, u32::from(IER_RDA));
+        assert!(s.irq_line());
+        assert_eq!(s.port_read(0x3FA, 1), u32::from(IIR_RDA));
+        // Reading IIR does not clear RDA.
+        assert!(s.irq_line());
+        assert_eq!(s.port_read(0x3F8, 1), u32::from(b'A'));
+        assert!(!s.irq_line());
+        assert_eq!(s.port_read(0x3FA, 1), u32::from(IIR_NO_INTERRUPT));
+    }
+
+    /// Spec: NS16550A interrupt priority — RDA reported ahead of THRE.
+    #[test]
+    fn rda_has_priority_over_thre_in_iir() {
+        let mut s = Serial16550::new(0x3F8);
+        s.port_write(0x3F9, 1, u32::from(IER_RDA | IER_THRE));
+        assert!(s.irq_line());
+        assert_eq!(s.port_read(0x3FA, 1), u32::from(IIR_THRE)); // THRE only so far
+        s.push_rx(b'P');
+        assert_eq!(s.port_read(0x3FA, 1), u32::from(IIR_RDA));
+        let _ = s.port_read(0x3F8, 1);
+        // After RBR read, THRE may still be pending (cleared by prior IIR read).
+        // Re-enable THRE edge by disabling/enabling ETBEI.
+        s.port_write(0x3F9, 1, 0);
+        s.port_write(0x3F9, 1, u32::from(IER_THRE));
+        assert_eq!(s.port_read(0x3FA, 1), u32::from(IIR_THRE));
+    }
+
+    /// Spec: COM2 RX path is base-relative (same as COM1).
+    #[test]
+    fn com2_push_rx_rda_irq() {
+        let mut s = Serial16550::new(0x2F8);
+        s.push_rx(b'2');
+        s.port_write(0x2F9, 1, u32::from(IER_RDA));
+        assert!(s.irq_line());
+        assert_eq!(s.port_read(0x2FA, 1), u32::from(IIR_RDA));
+        assert_eq!(s.port_read(0x2F8, 1), u32::from(b'2'));
+        assert!(!s.irq_line());
     }
 
     /// Spec: NS16550A "Interrupt Enable Register" bit 1 and
@@ -263,21 +367,21 @@ mod tests {
         assert_eq!(s.port_read(0x3FA, 1), 0x01);
         assert!(!s.irq_line());
 
-        // Other IER sources remain inert in this TX-only subset.
-        s.port_write(0x3F9, 1, 0x0D);
-        assert_eq!(s.port_read(0x3F9, 1), 0x0D);
+        // ELSR/EDSSI without ERBFI/THRE remain inert when RX empty.
+        s.port_write(0x3F9, 1, 0x0C);
+        assert_eq!(s.port_read(0x3F9, 1), 0x0C);
         assert!(!s.irq_line());
         assert_eq!(s.port_read(0x3FA, 1), 0x01);
 
-        s.port_write(0x3F9, 1, 0x0F);
+        s.port_write(0x3F9, 1, 0x0E); // THRE + ELSR/EDSSI
         assert!(s.irq_line());
 
-        s.port_write(0x3F9, 1, 0x0D);
+        s.port_write(0x3F9, 1, 0x0C);
         assert!(!s.irq_line());
         assert_eq!(s.port_read(0x3FA, 1), 0x01);
 
         // Re-enabling THRE while LSR.THRE is set requests it again.
-        s.port_write(0x3F9, 1, 0x0F);
+        s.port_write(0x3F9, 1, 0x0E);
         assert!(s.irq_line());
     }
 
@@ -333,7 +437,7 @@ mod tests {
     }
 
     /// Spec: NS16550A register behavior is base-relative; COM1 and COM2 differ
-    /// only in base address (and external IRQ routing, which is out of scope).
+    /// only in base address (and external IRQ routing).
     #[test]
     fn com1_and_com2_thre_interrupt_behavior_matches() {
         assert_eq!(thre_interrupt_trace(0x3F8), thre_interrupt_trace(0x2F8));
