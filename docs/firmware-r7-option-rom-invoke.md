@@ -39,9 +39,10 @@ convenience plants `HLT` at physical `0x0500`.
 
 ## SeaBIOS interaction gaps (explicit)
 
-This slice does **not**:
+This R7 slice did **not**:
 
-- Scan `0xC0000`–`0xDFFFF` on 2 KiB steps (BIOS discovery loop).
+- Scan `0xC0000`–`0xDFFFF` on 2 KiB steps (BIOS discovery loop) — **added in R9**
+  (`docs/firmware-r9-option-rom-post-scan.md`).
 - Pass PCI BDF / location in `AX`/`BX`/`DX` as SeaBIOS/PCI firmware do.
 - Parse the PnP expansion header at offset `0x1A`, BEV/BCV, or runtime size.
 - Run SeaVGABIOS to completion or claim fonts / INT 10h / mode set.

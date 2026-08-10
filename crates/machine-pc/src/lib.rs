@@ -53,7 +53,8 @@ pub use mem::{
     PAM_REGISTER_LAST, PAM_WINDOW_BASE, PAM_WINDOW_END,
 };
 pub use option_rom_invoke::{
-    OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET, OPTION_ROM_RESUME_PHYS,
+    OptionRomScanHit, OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET,
+    OPTION_ROM_RESUME_PHYS,
 };
 pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
@@ -149,6 +150,9 @@ pub enum MachineError {
     /// Real-mode stack could not accept the far-call return frame.
     #[error("option ROM invoke stack fault")]
     OptionRomStackFault,
+    /// POST-style option-ROM invoke did not return to the resume CS:IP in budget.
+    #[error("option ROM scan invoke did not return to resume point")]
+    OptionRomScanDidNotReturn,
 }
 
 /// Host override for fw_cfg `bootorder`, or the machine default when `Default`.

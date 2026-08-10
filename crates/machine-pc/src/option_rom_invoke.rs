@@ -6,10 +6,13 @@
 //! Spec: PCI Firmware Specification / BIOS Boot Specification — PC-compatible
 //! expansion ROM header (`55 AA`, size, checksum); initialization entry at
 //! offset 3; classic BIOS far-calls `CS:IP = (base>>4):0003` and expects `RETF`.
+//! R9 adds a POST-style scan of `0xC0000`–`0xDFFFF` on 2 KiB steps
+//! (`docs/firmware-r9-option-rom-post-scan.md`).
 
 use crate::{Machine, MachineError};
 use firmware_interface::{
     option_rom_entry_cs_ip, prepare_option_rom, OPTION_ROM_BLOCK_SIZE, OPTION_ROM_HEADER_LEN,
+    OPTION_ROM_REGION_BASE, OPTION_ROM_REGION_END, OPTION_ROM_SCAN_STEP, OPTION_ROM_SIGNATURE,
     VGA_OPTION_ROM_BASE,
 };
 use x86_core::{CpuState, SegmentReg};
@@ -25,6 +28,27 @@ pub const OPTION_ROM_INVOKE_DEFAULT_SP: u16 = 0x7C00;
 /// physical `0x0500` (BIOS data area / DOS free RAM below EBDA conventions).
 pub const OPTION_ROM_RESUME_PHYS: u64 = 0x0500;
 
+/// One validated option ROM discovered by a legacy POST-style scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OptionRomScanHit {
+    /// Physical base on a 2 KiB boundary inside `0xC0000`–`0xDFFFF`.
+    pub phys_base: u64,
+    /// Initialization size in 512-byte blocks (header byte 2).
+    pub blocks: u8,
+}
+
+impl OptionRomScanHit {
+    /// Next scan address after this ROM (size rounded up to 2 KiB).
+    ///
+    /// Spec: classic BIOS option-ROM scan advances by the declared extent,
+    /// aligned up to the 2 KiB scan step.
+    pub fn next_scan_base(self) -> u64 {
+        let bytes = u64::from(self.blocks) * OPTION_ROM_BLOCK_SIZE as u64;
+        let aligned = bytes.div_ceil(OPTION_ROM_SCAN_STEP) * OPTION_ROM_SCAN_STEP;
+        self.phys_base.saturating_add(aligned)
+    }
+}
+
 impl Machine {
     /// Map a validated expansion ROM, then far-call its entry at offset 3.
     ///
@@ -32,6 +56,8 @@ impl Machine {
     /// `resume_cs` / `resume_ip` become the far-return target pushed for `RETF`.
     ///
     /// **Not** a SeaBIOS option-ROM scan, PnP BEV/BCV dispatch, or INT 10h.
+    /// For the scan loop see [`Self::scan_option_rom_region`] /
+    /// [`Self::post_scan_invoke_option_roms`].
     pub fn map_and_invoke_option_rom(
         &mut self,
         phys_base: u64,
@@ -57,6 +83,83 @@ impl Machine {
         )
     }
 
+    /// Discover valid expansion ROMs currently visible in the legacy scan window.
+    ///
+    /// Spec: BIOS Boot Specification / IBM PC — scan `0xC0000`–`0xDFFFF` on
+    /// 2 KiB steps for `55 AA`, verify size+checksum via [`prepare_option_rom`],
+    /// then advance by the declared size rounded up to 2 KiB.
+    ///
+    /// Does **not** execute entries; use [`Self::post_scan_invoke_option_roms`]
+    /// or [`Self::invoke_option_rom_entry`].
+    pub fn scan_option_rom_region(&self) -> Vec<OptionRomScanHit> {
+        let mut hits = Vec::new();
+        let mut base = OPTION_ROM_REGION_BASE;
+        while base < OPTION_ROM_REGION_END {
+            match self.try_read_option_rom_hit(base) {
+                Some(hit) => {
+                    let next = hit.next_scan_base();
+                    hits.push(hit);
+                    base = next.max(base + OPTION_ROM_SCAN_STEP);
+                }
+                None => base += OPTION_ROM_SCAN_STEP,
+            }
+        }
+        hits
+    }
+
+    /// POST-style: far-call every ROM found by [`Self::scan_option_rom_region`].
+    ///
+    /// For each hit: push `resume_cs:resume_ip`, set `CS:IP` to the entry, then
+    /// step the guest until it returns to that resume point (or
+    /// `steps_budget_per_rom` is exhausted). Plants `HLT` at the resume
+    /// physical when `resume_cs == 0` and `resume_ip` matches
+    /// [`OPTION_ROM_RESUME_PHYS`].
+    ///
+    /// Returns the number of ROMs successfully invoked and returned.
+    ///
+    /// Gaps vs SeaBIOS (documented): no PCI BDF in `AX`/`BX`/`DX`, no PnP
+    /// header / BEV/BCV, no claim that SeaVGABIOS installs fonts or INT 10h.
+    pub fn post_scan_invoke_option_roms(
+        &mut self,
+        resume_cs: u16,
+        resume_ip: u16,
+        steps_budget_per_rom: usize,
+    ) -> Result<usize, MachineError> {
+        if resume_cs == 0 && u64::from(resume_ip) == OPTION_ROM_RESUME_PHYS {
+            self.plant_option_rom_resume_hlt()?;
+        }
+        let hits = self.scan_option_rom_region();
+        let mut invoked = 0usize;
+        for hit in hits {
+            self.invoke_option_rom_entry(hit.phys_base, resume_cs, resume_ip)?;
+            let mut steps = 0usize;
+            while steps < steps_budget_per_rom {
+                if self.cpu.cs.selector == resume_cs && self.cpu.ip16() == resume_ip {
+                    break;
+                }
+                self.step()?;
+                steps += 1;
+            }
+            if self.cpu.cs.selector != resume_cs || self.cpu.ip16() != resume_ip {
+                return Err(MachineError::OptionRomScanDidNotReturn);
+            }
+            invoked += 1;
+        }
+        Ok(invoked)
+    }
+
+    /// Convenience: scan + invoke with the default `0000:0500` `HLT` resume.
+    pub fn post_scan_invoke_option_roms_default(
+        &mut self,
+        steps_budget_per_rom: usize,
+    ) -> Result<usize, MachineError> {
+        self.post_scan_invoke_option_roms(
+            0x0000,
+            OPTION_ROM_RESUME_PHYS as u16,
+            steps_budget_per_rom,
+        )
+    }
+
     /// Far-call the expansion ROM already mapped at `phys_base`.
     ///
     /// Spec: BIOS Boot Specification — initialization entry at offset 3;
@@ -70,10 +173,11 @@ impl Machine {
     /// 4. Set `CS:IP` to [`option_rom_entry_cs_ip`].
     ///
     /// Gaps vs SeaBIOS (documented, not implemented here):
-    /// - No `0xC0000`–`0xDFFFF` scan loop or 2 KiB step discovery.
     /// - No `AX`/`BX`/`DX` PCI location / BDF convention for the call.
     /// - No PnP expansion header (`0x1A`), BEV/BCV, or runtime-size shrink.
     /// - No claim that SeaVGABIOS completes or installs fonts/INT 10h.
+    ///
+    /// Region discovery is [`Self::scan_option_rom_region`].
     pub fn invoke_option_rom_entry(
         &mut self,
         phys_base: u64,
@@ -93,6 +197,18 @@ impl Machine {
         self.cpu.set_ip16(entry_ip);
         self.cpu.halted = false;
         Ok(())
+    }
+
+    fn try_read_option_rom_hit(&self, phys_base: u64) -> Option<OptionRomScanHit> {
+        let b0 = self.mem.read_u8(phys_base).ok()?;
+        let b1 = self.mem.read_u8(phys_base + 1).ok()?;
+        if b0 != OPTION_ROM_SIGNATURE[0] || b1 != OPTION_ROM_SIGNATURE[1] {
+            return None;
+        }
+        let image = self.read_mapped_option_rom(phys_base).ok()?;
+        prepare_option_rom(phys_base, &image).ok()?;
+        let blocks = image.get(2).copied().unwrap_or(0);
+        Some(OptionRomScanHit { phys_base, blocks })
     }
 
     /// Read the declared initialization extent from guest physical memory.
@@ -233,5 +349,51 @@ mod tests {
         m.step().expect("RETF");
         assert_eq!(m.cpu.ip16(), 0x0600);
         assert_eq!(m.mem.read_u8(0x0600).unwrap(), 0x90);
+    }
+
+    /// Spec: BIOS Boot Spec — scan `C0000`–`DFFFF` on 2 KiB; invoke each entry.
+    #[test]
+    fn post_scan_finds_and_invokes_vga_and_second_rom() {
+        let vga = synthetic_option_rom(2); // 1 KiB → advances 2 KiB
+        let second = synthetic_option_rom(2);
+        let mut m = Machine::new(1024 * 1024);
+        m.map_option_rom(VGA_OPTION_ROM_BASE, &vga).expect("map VGA");
+        m.map_option_rom(0x000C_0800, &second).expect("map second");
+
+        let hits = m.scan_option_rom_region();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].phys_base, VGA_OPTION_ROM_BASE);
+        assert_eq!(hits[1].phys_base, 0x000C_0800);
+
+        let n = m
+            .post_scan_invoke_option_roms_default(16)
+            .expect("POST scan invoke");
+        assert_eq!(n, 2);
+        assert_eq!(m.cpu.cs.selector, 0x0000);
+        assert_eq!(m.cpu.ip16(), OPTION_ROM_RESUME_PHYS as u16);
+    }
+
+    #[test]
+    fn post_scan_skips_bad_signature_holes() {
+        let rom = synthetic_option_rom(4); // 2 KiB
+        let mut m = Machine::new(1024 * 1024);
+        m.map_option_rom(0x000C_1000, &rom).expect("map");
+        let hits = m.scan_option_rom_region();
+        assert_eq!(
+            hits,
+            [OptionRomScanHit {
+                phys_base: 0x000C_1000,
+                blocks: 4,
+            }]
+        );
+        assert_eq!(hits[0].next_scan_base(), 0x000C_1800);
+    }
+
+    #[test]
+    fn empty_region_scan_returns_zero() {
+        let m = Machine::new(1024 * 1024);
+        assert!(m.scan_option_rom_region().is_empty());
+        let mut m = Machine::new(1024 * 1024);
+        assert_eq!(m.post_scan_invoke_option_roms_default(4).unwrap(), 0);
     }
 }
