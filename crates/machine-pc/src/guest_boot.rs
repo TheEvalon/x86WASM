@@ -266,8 +266,14 @@ impl std::fmt::Display for GuestFirstFailureClass {
 }
 
 /// Classify the first stop / first failure from a v2 guest measure report.
-pub fn classify_guest_first_failure(report: &PostReport) -> GuestFirstFailureClass {
-    match &report.stop {
+///
+/// When `int13_probe` reports CF on an otherwise soft stop (halt/budget),
+/// surface [`GuestFirstFailureClass::Int13Cf`]. Hard decode/device failures win.
+pub fn classify_guest_first_failure(
+    report: &PostReport,
+    int13_probe: Option<&Int13ProbeSnapshot>,
+) -> GuestFirstFailureClass {
+    let class = match &report.stop {
         PostStopReason::Halted => GuestFirstFailureClass::SyntheticHalt,
         PostStopReason::StepBudgetExhausted => {
             if let Some(access) = report.unclaimed_ports.first() {
@@ -298,6 +304,47 @@ pub fn classify_guest_first_failure(report: &PostReport) -> GuestFirstFailureCla
             }
             PostFailureKind::Machine(_) => GuestFirstFailureClass::MachineError,
         },
+    };
+    if matches!(
+        class,
+        GuestFirstFailureClass::SyntheticHalt | GuestFirstFailureClass::StepBudget
+    ) {
+        if let Some(probe) = int13_probe {
+            if probe.cf {
+                return GuestFirstFailureClass::Int13Cf { ah: probe.ah };
+            }
+        }
+    }
+    class
+}
+
+/// Guest stop location (`CS:EIP`) for hang / first-failure triage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestFailureSite {
+    /// `CS` selector at stop.
+    pub cs: u16,
+    /// `EIP` at stop.
+    pub eip: u32,
+}
+
+impl std::fmt::Display for GuestFailureSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04X}:{:08X}", self.cs, self.eip)
+    }
+}
+
+/// Snapshot of a host INT 13h register probe (AH/CF/DL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Int13ProbeSnapshot {
+    pub dl: u8,
+    pub ah: u8,
+    pub cf: bool,
+}
+
+impl Int13ProbeSnapshot {
+    /// True when the host INT 13h probe returned CF set.
+    pub fn failed(&self) -> bool {
+        self.cf
     }
 }
 
@@ -832,8 +879,11 @@ mod tests {
             }
         );
         assert!(report.gaps.iter().any(|g| g.contains("First failure")));
+        assert_eq!(report.failure_bucket, "decode-ud");
+        assert_eq!(report.failure_site.eip, 0x7C00);
         let text = report.to_string();
         assert!(text.contains("NOT an OS boot"));
+        assert!(text.contains("bucket=decode-ud"));
         assert!(!text.contains("FreeDOS prompt reached"));
     }
 
@@ -851,6 +901,9 @@ mod tests {
         assert!(text.contains("NOT Milestone 2 exit"));
         assert!(text.contains("linux-serial-path"));
         assert!(text.contains("first-failure=synthetic-halt"));
+        assert!(text.contains("bucket=halted"));
+        assert_eq!(report.failure_bucket, "halted");
+        assert!(!report.int13_probe.failed());
         assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
     }
 
@@ -867,9 +920,71 @@ mod tests {
                 | GuestFirstFailureClass::UnsupportedEncoding { .. }
                 | GuestFirstFailureClass::ArchFault { .. }
         ));
+        assert_eq!(report.failure_bucket, "decode-ud");
+        assert_eq!(report.failure_site.eip, 0x7C00);
         assert!(report.gaps.iter().any(|g| g.contains("bzImage")));
         let text = report.to_string();
         assert!(text.contains("NOT Milestone 2 exit"));
+        assert!(text.contains("bucket=decode-ud"));
         assert!(!text.contains("Linux shell"));
+    }
+
+    /// FreeDOS-like hang: tiny step budget classifies hang location.
+    #[test]
+    fn measure_freedos_like_classifies_hang_location() {
+        // Infinite jmp $-2 at 7C00 — budget exhausts before HLT.
+        let mut sector = vec![0x90u8; MBR_SECTOR_SIZE];
+        sector[0] = 0xEB;
+        sector[1] = 0xFE; // jmp $
+        sector[510] = MBR_SIGNATURE_LO;
+        sector[511] = MBR_SIGNATURE_HI;
+        let mut m = Machine::with_ide(64 * 1024, sector);
+        let report = m.measure_freedos_like(8).expect("hang measure");
+        assert_eq!(report.first_failure, GuestFirstFailureClass::StepBudget);
+        assert_eq!(report.failure_bucket, "hang");
+        assert_eq!(report.failure_site.cs, 0);
+        assert_eq!(report.failure_site.eip, 0x7C00);
+        let text = report.to_string();
+        assert!(text.contains("bucket=hang"));
+        assert!(text.contains("site=0000:00007C00"));
+        assert!(text.contains("NOT an OS boot"));
+    }
+
+    /// INT13 CF class when host AH=41h probe fails (no HD media).
+    #[test]
+    fn classify_int13_cf_from_probe_snapshot() {
+        let mut bare = Machine::new(64 * 1024);
+        // Attach a HLT MBR via floppy path? For IdePrefer measure needs IDE.
+        // Unit-test classifier directly with a halted report + failed INT13 probe.
+        let mut m = Machine::with_ide(64 * 1024, synthetic_mbr_hlt());
+        let measure = m
+            .measure_guest_boot(GuestBootMedia::IdePrefer, 16)
+            .expect("hlt");
+        let probe = Int13ProbeSnapshot {
+            dl: 0x80,
+            ah: 0x80,
+            cf: true,
+        };
+        let class = classify_guest_first_failure(&measure.report, Some(&probe));
+        assert_eq!(class, GuestFirstFailureClass::Int13Cf { ah: 0x80 });
+        assert_eq!(class.bucket(), "int13-cf");
+        // Bare machine probe should CF.
+        let snap = bare.probe_int13_hd_extensions_status();
+        assert!(snap.failed());
+    }
+
+    /// Linux serial hang location uses the same bucket vocabulary.
+    #[test]
+    fn measure_linux_serial_path_classifies_hang() {
+        let mut sector = vec![0x90u8; MBR_SECTOR_SIZE];
+        sector[0] = 0xEB;
+        sector[1] = 0xFE;
+        sector[510] = MBR_SIGNATURE_LO;
+        sector[511] = MBR_SIGNATURE_HI;
+        let mut m = Machine::with_ide(64 * 1024, sector);
+        let report = m.measure_linux_serial_path(4).expect("linux hang");
+        assert_eq!(report.failure_bucket, "hang");
+        assert_eq!(report.first_failure, GuestFirstFailureClass::StepBudget);
+        assert!(report.to_string().contains("NOT Milestone 2 exit"));
     }
 }

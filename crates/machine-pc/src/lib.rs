@@ -32,8 +32,9 @@ mod xbcs;
 
 pub use guest_boot::{
     classify_guest_first_failure, synthetic_freedos_like_disk, synthetic_linux_serial_stub_disk,
-    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GuestFirstFailureClass, GuestOsMeasure,
-    GuestOsMeasureKind, GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION,
+    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GuestFailureSite,
+    GuestFirstFailureClass, GuestOsMeasure, GuestOsMeasureKind, Int13ProbeSnapshot,
+    GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION,
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int10::{
