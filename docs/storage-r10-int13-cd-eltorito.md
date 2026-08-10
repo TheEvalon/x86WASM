@@ -12,10 +12,14 @@ ATAPI Mode-1 medium (`DL = E0h`):
 | `41h` | Check extensions (`BX=55AAh` → `BX=AA55h`, packet+EDD bits) |
 | `42h` | Extended read via Disk Address Packet — **2048-byte** Mode-1 LBAs |
 | `48h` | Extended get drive parameters (sector size `2048`, linear geometry) |
-| `4Bh` / `AL=00h` | El Torito get disk-emulation status (19-byte specification packet) |
+| `4Bh` | El Torito status / terminate (see R11 for AL semantics) |
 
 Complements host `Machine::load_eltorito_to_7c00` (boot-image handoff) with a
 guest-callable **host** INT 13h CD path for reading the ISO after attach.
+
+**Superseded AL note:** R10 treated `AH=4Bh AL=00h` as get-status. R11 aligns
+with El Torito/RBIL (`AL=00h` terminate, `AL=01h` status-only) —
+`docs/storage-r11-int13-cd-terminate.md`.
 
 ## API
 
@@ -30,9 +34,8 @@ guest-callable **host** INT 13h CD path for reading the ISO after attach.
 
 - **Not** SeaBIOS and **not** a guest IVT BIOS body.
 - AH=42h `count` is Mode-1 **2048-byte** blocks (not 512).
-- AH=4Bh `AL=01h` terminate-emulation — rejected (`AH=01h` / CF).
 - Floppy/HDD El Torito emulation media types (`01h`–`04h`) — out.
-- AH=43h CD write, AH=4A/4C/4D — out.
+- AH=43h CD write, AH=4C/4D — out (AH=4Ah initiate rejected in R11).
 - Does **not** claim Milestone 2 CD boot exit.
 
 ## Spec

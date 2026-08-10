@@ -10,7 +10,9 @@
 //! Spec: IBM PC BIOS INT 19h handoff + El Torito 1.0 no-emul load + existing
 //! POST probe diagnostics (`docs/boot-r8-guest-measure-v2.md`,
 //! `docs/boot-r9-freedos-measure.md`, `docs/boot-r10-freedos-first-failure.md`,
-//! `docs/boot-r10-linux-serial-first-failure.md`).
+//! `docs/boot-r10-linux-serial-first-failure.md`,
+//! `docs/boot-r11-freedos-bda-equipment.md`,
+//! `docs/boot-r11-linux-boot-protocol-inspect.md`).
 
 use crate::post_probe::{PostFailureKind, PostReport, PostStopReason};
 use crate::{Machine, MachineError};
@@ -20,6 +22,18 @@ pub const GUEST_BOOT_MEASURE_VERSION: u32 = 2;
 
 /// FreeDOS-like / Linux-serial measure report schema (v4 = first-failure class).
 pub const GUEST_OS_MEASURE_VERSION: u32 = 4;
+
+/// BDA equipment list word (`0040:0010`). Spec: RBIL memory map / IBM BIOS.
+pub const BDA_EQUIPMENT: u64 = 0x410;
+/// BDA number of hard disk drives (`0040:0075`). Spec: RBIL memory map.
+pub const BDA_HD_COUNT: u64 = 0x475;
+
+/// Linux real-mode boot-protocol magic at offset `0x202` (`Documentation/x86/boot.rst`).
+pub const LINUX_BOOT_HEADER_MAGIC: [u8; 4] = *b"HdrS";
+/// Classic boot-sector signature at offset `0x1FE`.
+pub const LINUX_BOOT_FLAG_AA55: u16 = 0xAA55;
+/// Minimum buffer length to reach `loadflags` (`0x211`).
+pub const LINUX_BOOT_HEADER_MIN_LEN: usize = 0x212;
 
 /// Which host boot helper to use before measuring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,6 +383,8 @@ pub struct GuestOsMeasure {
     pub honesty: &'static str,
     /// Remaining gaps toward a real guest (not M2 exit), including class note.
     pub gaps: Vec<&'static str>,
+    /// Optional host-image / BDA notes when the fixture already halted cleanly.
+    pub host_notes: Vec<&'static str>,
 }
 
 impl std::fmt::Display for GuestOsMeasure {
@@ -398,11 +414,159 @@ impl std::fmt::Display for GuestOsMeasure {
             f.write_str(g)?;
         }
         writeln!(f, "]")?;
+        if !self.host_notes.is_empty() {
+            write!(f, "  host-notes=[")?;
+            for (i, n) in self.host_notes.iter().enumerate() {
+                if i != 0 {
+                    f.write_str("; ")?;
+                }
+                f.write_str(n)?;
+            }
+            writeln!(f, "]")?;
+        }
         write!(f, "{}", self.measure)
     }
 }
 
+/// Error from [`inspect_linux_boot_protocol_header`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinuxBootProtocolError {
+    /// Buffer shorter than [`LINUX_BOOT_HEADER_MIN_LEN`].
+    Truncated,
+    /// Offset `0x1FE` is not `0xAA55`.
+    BadBootFlag,
+    /// Offset `0x202` is not `HdrS`.
+    BadMagic,
+}
+
+impl std::fmt::Display for LinuxBootProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("linux-boot-protocol: truncated"),
+            Self::BadBootFlag => f.write_str("linux-boot-protocol: bad boot_flag"),
+            Self::BadMagic => f.write_str("linux-boot-protocol: bad HdrS magic"),
+        }
+    }
+}
+
+/// Minimal real-mode Linux boot-protocol header fields (inspect-only).
+///
+/// Spec: Linux `Documentation/x86/boot.rst` (boot protocol ≥ 2.00). This does
+/// **not** load a bzImage, enter protected mode, or claim a kernel boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinuxBootProtocolHeader {
+    /// Offset `0x1F1` — sectors of setup code (0 means 4).
+    pub setup_sects: u8,
+    /// Offset `0x1F2` — `root_flags` (readonly root).
+    pub root_flags: u16,
+    /// Offset `0x1F4` — `syssize` (16-byte paragraphs; protocol-dependent).
+    pub syssize: u32,
+    /// Offset `0x1FE` — must be [`LINUX_BOOT_FLAG_AA55`].
+    pub boot_flag: u16,
+    /// Offset `0x202` — must be [`LINUX_BOOT_HEADER_MAGIC`].
+    pub header_magic: [u8; 4],
+    /// Offset `0x206` — boot protocol version (`0x0200` = 2.00).
+    pub version: u16,
+    /// Offset `0x211` — `loadflags` (bit0 LOADED_HIGH, etc.).
+    pub loadflags: u8,
+    /// Offset `0x214` — 32-bit kernel entry (`code32_start`), if buffer long enough.
+    pub code32_start: Option<u32>,
+}
+
+impl LinuxBootProtocolHeader {
+    /// True when `loadflags` bit 0 (`LOADED_HIGH`) is set.
+    pub fn loaded_high(&self) -> bool {
+        self.loadflags & 0x01 != 0
+    }
+}
+
+/// Inspect a Linux real-mode boot-protocol header in `buf` (bzImage-shaped).
+///
+/// Does **not** vendor or execute a kernel. Spec: Linux boot protocol
+/// (`Documentation/x86/boot.rst`) — fields at fixed offsets from image start.
+pub fn inspect_linux_boot_protocol_header(
+    buf: &[u8],
+) -> Result<LinuxBootProtocolHeader, LinuxBootProtocolError> {
+    if buf.len() < LINUX_BOOT_HEADER_MIN_LEN {
+        return Err(LinuxBootProtocolError::Truncated);
+    }
+    let boot_flag = u16::from_le_bytes([buf[0x1FE], buf[0x1FF]]);
+    if boot_flag != LINUX_BOOT_FLAG_AA55 {
+        return Err(LinuxBootProtocolError::BadBootFlag);
+    }
+    let header_magic = [buf[0x202], buf[0x203], buf[0x204], buf[0x205]];
+    if header_magic != LINUX_BOOT_HEADER_MAGIC {
+        return Err(LinuxBootProtocolError::BadMagic);
+    }
+    let setup_sects = buf[0x1F1];
+    let root_flags = u16::from_le_bytes([buf[0x1F2], buf[0x1F3]]);
+    let syssize = u32::from_le_bytes([buf[0x1F4], buf[0x1F5], buf[0x1F6], buf[0x1F7]]);
+    let version = u16::from_le_bytes([buf[0x206], buf[0x207]]);
+    let loadflags = buf[0x211];
+    let code32_start = if buf.len() >= 0x218 {
+        Some(u32::from_le_bytes([
+            buf[0x214], buf[0x215], buf[0x216], buf[0x217],
+        ]))
+    } else {
+        None
+    };
+    Ok(LinuxBootProtocolHeader {
+        setup_sects,
+        root_flags,
+        syssize,
+        boot_flag,
+        header_magic,
+        version,
+        loadflags,
+        code32_start,
+    })
+}
+
+/// Build a minimal synthetic Linux boot-protocol header buffer for harnesses.
+///
+/// Not a bzImage — only the inspectable header fields used by tests/docs.
+pub fn synthetic_linux_boot_protocol_header(
+    setup_sects: u8,
+    version: u16,
+    loadflags: u8,
+    code32_start: u32,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 0x220];
+    buf[0x1F1] = setup_sects;
+    buf[0x1FE] = (LINUX_BOOT_FLAG_AA55 & 0xFF) as u8;
+    buf[0x1FF] = (LINUX_BOOT_FLAG_AA55 >> 8) as u8;
+    buf[0x202..0x206].copy_from_slice(&LINUX_BOOT_HEADER_MAGIC);
+    buf[0x206] = (version & 0xFF) as u8;
+    buf[0x207] = (version >> 8) as u8;
+    buf[0x211] = loadflags;
+    buf[0x214..0x218].copy_from_slice(&code32_start.to_le_bytes());
+    buf
+}
+
 impl Machine {
+    /// Seed classic BDA diskette / equipment / HD-count fields from attached media.
+    ///
+    /// Writes:
+    /// - [`BDA_EQUIPMENT`] (`0040:0010`) low byte = [`Self::equipment_byte`]
+    /// - [`BDA_HD_COUNT`] (`0040:0075`) = 1 when IDE image present, else 0
+    ///
+    /// Spec: RBIL BIOS Data Area — equipment list + HD count. Host helper only;
+    /// does not claim SeaBIOS POST filled the BDA.
+    pub fn seed_bda_disk_equipment(&mut self) -> Result<(), MachineError> {
+        let equip = self.equipment_byte();
+        self.mem
+            .write_u8(BDA_EQUIPMENT, equip)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        self.mem
+            .write_u8(BDA_EQUIPMENT + 1, 0)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        let hd = u8::from(self.ide.present && !self.ide.image.is_empty());
+        self.mem
+            .write_u8(BDA_HD_COUNT, hd)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        Ok(())
+    }
+
     /// Load boot image per `media`, then [`Self::probe_post`] under `max_steps`.
     ///
     /// Returns [`MachineError`] only for media/signature/RAM problems before
@@ -468,6 +632,7 @@ impl Machine {
         measure: GuestBootMeasure,
         honesty: &'static str,
         mut gaps: Vec<&'static str>,
+        mut host_notes: Vec<&'static str>,
     ) -> GuestOsMeasure {
         let int13_probe = self.probe_int13_hd_extensions_status();
         let first_failure = classify_guest_first_failure(&measure.report, Some(&int13_probe));
@@ -477,6 +642,21 @@ impl Machine {
             eip: measure.report.stop_site.eip,
         };
         gaps.push(first_failure.gap_note());
+        if matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
+            host_notes.push(
+                "Synthetic-halt reached — next gap is real guest image / firmware POST, not fixture polish",
+            );
+            if kind == GuestOsMeasureKind::FreeDosLike {
+                host_notes.push(
+                    "BDA 0040:0010/0075 seeded from host media; still not SeaBIOS equipment init",
+                );
+            }
+            if kind == GuestOsMeasureKind::LinuxSerialPath {
+                host_notes.push(
+                    "Use inspect_linux_boot_protocol_header on a host bzImage; no kernel load here",
+                );
+            }
+        }
         GuestOsMeasure {
             version: GUEST_OS_MEASURE_VERSION,
             kind,
@@ -487,6 +667,7 @@ impl Machine {
             int13_probe,
             honesty,
             gaps,
+            host_notes,
         }
     }
 
@@ -495,10 +676,14 @@ impl Machine {
     /// The fixture is a signed MBR that prints `FD` to COM1 and a VGA glyph,
     /// then `HLT`, plus a second-sector payload marker. It is **not** FreeDOS
     /// and must never be reported as a FreeDOS prompt.
+    ///
+    /// Before probing, seeds BDA equipment / HD count from attached media
+    /// ([`Self::seed_bda_disk_equipment`]).
     pub fn measure_freedos_like(&mut self, max_steps: u64) -> Result<GuestOsMeasure, MachineError> {
         if !self.ide.present || self.ide.image.is_empty() {
             self.attach_ide_image(synthetic_freedos_like_disk());
         }
+        self.seed_bda_disk_equipment()?;
         let measure = self.measure_guest_boot(GuestBootMedia::IdePrefer, max_steps)?;
         Ok(self.finish_os_measure(
             GuestOsMeasureKind::FreeDosLike,
@@ -510,6 +695,7 @@ impl Machine {
                 "Incomplete firmware POST / devices / opcodes for real FreeDOS",
                 "No claim of COMMAND.COM or FreeDOS prompt",
             ],
+            vec![],
         ))
     }
 
@@ -517,6 +703,8 @@ impl Machine {
     ///
     /// Captures COM1 from a guest that prints a short banner then `HLT`. Does
     /// **not** load a bzImage, enter protected mode, or claim Linux boot / M2 exit.
+    ///
+    /// For host-side bzImage triage use [`inspect_linux_boot_protocol_header`].
     pub fn measure_linux_serial_path(
         &mut self,
         max_steps: u64,
@@ -535,7 +723,9 @@ impl Machine {
                 "No earlyprintk / 8250 console driver path through a real kernel",
                 "Missing SeaBIOS INT 13h guest path for disked bootloaders",
                 "Protected-mode / paging / CPUID gaps may still block real kernels",
+                "Header inspect helper available; does not execute setup code",
             ],
+            vec![],
         ))
     }
 }
@@ -854,8 +1044,38 @@ mod tests {
             .gaps
             .iter()
             .any(|g| g.contains("not FreeDOS/Linux progress")));
+        assert!(report
+            .host_notes
+            .iter()
+            .any(|n| n.contains("BDA 0040:0010/0075")));
+        assert!(text.contains("host-notes="));
         // Payload marker exists on disk but is not a boot claim.
         assert!(m.ide.image[MBR_SECTOR_SIZE..].starts_with(b"FREEDOS-LIKE-PAYLOAD"));
+        // BDA disk equipment seeded for the measure path.
+        assert_eq!(m.mem.read_u8(BDA_HD_COUNT).unwrap(), 1);
+        assert_eq!(m.mem.read_u8(BDA_EQUIPMENT).unwrap(), m.equipment_byte());
+    }
+
+    /// BDA seed: floppy media flips equipment diskette bits; HD count tracks IDE.
+    #[test]
+    fn seed_bda_disk_equipment_tracks_media() {
+        let mut bare = Machine::new(64 * 1024);
+        bare.seed_bda_disk_equipment().unwrap();
+        assert_eq!(bare.mem.read_u8(BDA_HD_COUNT).unwrap(), 0);
+        assert_eq!(
+            bare.mem.read_u8(BDA_EQUIPMENT).unwrap() & 0x01,
+            0,
+            "no floppy bit without media"
+        );
+
+        let mut floppy = vec![0u8; FDC_1440_IMAGE_SIZE];
+        floppy[..MBR_SECTOR_SIZE].copy_from_slice(&synthetic_mbr_hlt());
+        let mut m = Machine::with_floppy(64 * 1024, floppy).expect("floppy");
+        m.attach_ide_image(synthetic_mbr_hlt());
+        m.seed_bda_disk_equipment().unwrap();
+        assert_eq!(m.mem.read_u8(BDA_HD_COUNT).unwrap(), 1);
+        assert_eq!(m.mem.read_u8(BDA_EQUIPMENT).unwrap(), m.equipment_byte());
+        assert_ne!(m.mem.read_u8(BDA_EQUIPMENT).unwrap() & 0x01, 0);
     }
 
     /// FreeDOS-like first-failure class for an unimplemented opcode fixture.
@@ -897,6 +1117,10 @@ mod tests {
         assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
         assert!(report.gaps.iter().any(|g| g.contains("bzImage")));
         assert!(report.gaps.iter().any(|g| g.contains("boot protocol")));
+        assert!(report
+            .host_notes
+            .iter()
+            .any(|n| n.contains("inspect_linux_boot_protocol_header")));
         let text = report.to_string();
         assert!(text.contains("NOT Milestone 2 exit"));
         assert!(text.contains("linux-serial-path"));
@@ -905,6 +1129,40 @@ mod tests {
         assert_eq!(report.failure_bucket, "halted");
         assert!(!report.int13_probe.failed());
         assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
+    }
+
+    /// Linux boot-protocol header inspect: HdrS + version + loadflags (no bzImage).
+    #[test]
+    fn inspect_linux_boot_protocol_header_accepts_synthetic() {
+        let buf = synthetic_linux_boot_protocol_header(4, 0x020F, 0x01, 0x0010_0000);
+        let hdr = inspect_linux_boot_protocol_header(&buf).expect("header");
+        assert_eq!(hdr.setup_sects, 4);
+        assert_eq!(hdr.boot_flag, LINUX_BOOT_FLAG_AA55);
+        assert_eq!(hdr.header_magic, LINUX_BOOT_HEADER_MAGIC);
+        assert_eq!(hdr.version, 0x020F);
+        assert!(hdr.loaded_high());
+        assert_eq!(hdr.code32_start, Some(0x0010_0000));
+    }
+
+    /// Linux boot-protocol inspect rejects truncated / bad magic / bad AA55.
+    #[test]
+    fn inspect_linux_boot_protocol_header_rejects_bad() {
+        assert_eq!(
+            inspect_linux_boot_protocol_header(&[0u8; 16]),
+            Err(LinuxBootProtocolError::Truncated)
+        );
+        let mut bad_flag = synthetic_linux_boot_protocol_header(1, 0x0200, 0, 0);
+        bad_flag[0x1FE] = 0;
+        assert_eq!(
+            inspect_linux_boot_protocol_header(&bad_flag),
+            Err(LinuxBootProtocolError::BadBootFlag)
+        );
+        let mut bad_magic = synthetic_linux_boot_protocol_header(1, 0x0200, 0, 0);
+        bad_magic[0x202] = b'X';
+        assert_eq!(
+            inspect_linux_boot_protocol_header(&bad_magic),
+            Err(LinuxBootProtocolError::BadMagic)
+        );
     }
 
     /// Linux serial path classifies unsupported opcode without claiming a shell.

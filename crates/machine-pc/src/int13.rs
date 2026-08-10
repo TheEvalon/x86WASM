@@ -1,6 +1,6 @@
 //! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h/48h),
 //! floppy subset (AH=00/02/03/08/15, `DL=00h`), and CD/El Torito subset
-//! (AH=41h/42h/48h/4Bh, `DL=E0h`).
+//! (AH=41h/42h/48h/4Ah/4Bh, `DL=E0h`).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
 //! applies classic INT 13h register conventions against the primary IDE image,
@@ -12,7 +12,8 @@
 //! AH=03h write sectors, AH=08h get drive parameters, AH=15h get disk type);
 //! IBM/Microsoft INT 13h Extensions / RBIL (AH=41h check extensions, AH=42h
 //! extended read, AH=43h extended write, AH=48h extended drive parameters);
-//! El Torito 1.0 / RBIL AH=4Bh AL=00h bootable CD-ROM status packet.
+//! El Torito 1.0 / RBIL AH=4Ah initiate emulation, AH=4Bh AL=00h terminate +
+//! status / AL=01h status-only (specification packet at `DS:SI`).
 //! ATA IDENTIFY obsolete geometry 16 heads / 63 sectors-per-track (matches
 //! `IdePrimary` IDENTIFY words 3/6). Floppy uses fixed 1.44MB geometry (80/2/18)
 //! via `Fdc82077::read_sector` / `Fdc82077::write_sector`. CD uses Mode-1
@@ -48,10 +49,16 @@ pub const INT13_AH_EXT_READ: u8 = 0x42;
 pub const INT13_AH_EXT_WRITE: u8 = 0x43;
 /// AH=48h — extended get drive parameters.
 pub const INT13_AH_EXT_GET_PARAMS: u8 = 0x48;
-/// AH=4Bh — bootable CD-ROM (El Torito) get status / terminate emulation.
+/// AH=4Ah — El Torito initiate disk emulation (unsupported stub here).
+pub const INT13_AH_CDROM_INITIATE: u8 = 0x4A;
+/// AH=4Bh — bootable CD-ROM (El Torito) terminate / get status.
 pub const INT13_AH_CDROM_EMULATION: u8 = 0x4B;
-/// AH=4Bh AL=00h — get status (fill specification packet at `DS:SI`).
-pub const INT13_CD_AL_GET_STATUS: u8 = 0x00;
+/// AH=4Bh AL=00h — terminate disk emulation and return status (El Torito / RBIL).
+pub const INT13_CD_AL_TERMINATE: u8 = 0x00;
+/// AH=4Bh AL=01h — get status only, do not terminate (El Torito / RBIL).
+pub const INT13_CD_AL_GET_STATUS: u8 = 0x01;
+/// `DL=7Fh` — terminate / address all active CD emulations (El Torito).
+pub const INT13_DRIVE_CD_ALL: u8 = 0x7F;
 /// El Torito / RBIL specification packet size (`13h` = 19 bytes).
 pub const INT13_CD_SPEC_PACKET_SIZE: u8 = 0x13;
 
@@ -358,12 +365,15 @@ impl Machine {
     }
 
     fn int13_hd_get_params(&mut self) {
-        if !self.ide.present {
+        // Spec: IBM BIOS INT 13h AH=08h — require attached fixed-disk media.
+        // Present-but-empty IDE is treated like no media (CF + AH=80h).
+        if !self.ide.present || self.ide.image.is_empty() {
             self.int13_fail(INT13_STATUS_TIMEOUT);
             return;
         }
         // AH=08h: CX = max cylinder/sector packed; DH = max head; DL = drive count.
         // AL unused (cleared); BL = 00h for hard disks (floppy type N/A).
+        // Geometry derives from image size at fixed 16 heads / 63 spt.
         let (max_cyl, heads, spt, _total) = self.int13_hd_geometry();
         self.cpu
             .set_gpr_u16(CpuState::RCX, pack_cx(max_cyl, spt as u8));
@@ -755,32 +765,43 @@ impl Machine {
         }
     }
 
-    /// Route INT 13h by `DL`: floppy `00h`, hard disk `80h`, or CD `E0h`.
+    /// Route INT 13h by `DL`: floppy `00h`, hard disk `80h`, CD `E0h`, or
+    /// El Torito `7Fh` (AH=4Bh all-emulations) → CD service.
     pub fn service_int13(&mut self) {
-        match self.cpu.gpr_u8_low(CpuState::RDX) {
+        let dl = self.cpu.gpr_u8_low(CpuState::RDX);
+        match dl {
             INT13_DRIVE_FD0 => self.service_int13_floppy(),
             INT13_DRIVE_HD0 => self.service_int13_hd(),
             INT13_DRIVE_CD0 => self.service_int13_cd(),
+            INT13_DRIVE_CD_ALL if self.cpu.ah() == INT13_AH_CDROM_EMULATION => {
+                self.service_int13_cd()
+            }
             _ => self.int13_fail(INT13_STATUS_INVALID),
         }
     }
 
-    /// Host-side INT 13h CD/El Torito dispatch (`DL = E0h`).
+    /// Host-side INT 13h CD/El Torito dispatch (`DL = E0h` or `7Fh` for AH=4Bh).
     ///
-    /// Supports AH=41h/42h/48h against the ATAPI Mode-1 medium (2048-byte LBAs)
-    /// and AH=4Bh AL=00h get-status (specification packet at `DS:SI`). Spec:
-    /// IBM/MS INT 13h Extensions + El Torito 1.0 / RBIL AH=4Bh. Not SeaBIOS;
-    /// terminate-emulation (`AL=01h`) and floppy/HDD emulation media remain out.
+    /// Supports AH=41h/42h/48h against the ATAPI Mode-1 medium (2048-byte LBAs),
+    /// AH=4Bh AL=00h terminate + status / AL=01h status-only (specification packet
+    /// at `DS:SI`), and AH=4Ah initiate (honest unsupported). Spec: IBM/MS INT 13h
+    /// Extensions + El Torito 1.0 §§6.1–6.2 / RBIL AH=4Ah/4Bh. Not SeaBIOS;
+    /// floppy/HDD emulation media remain out.
     pub fn service_int13_cd(&mut self) {
+        let ah = self.cpu.ah();
         let dl = self.cpu.gpr_u8_low(CpuState::RDX);
-        if dl != INT13_DRIVE_CD0 {
+        // AH=4Bh may use DL=7Fh (all emulations); other CD functions need E0h.
+        let dl_ok =
+            dl == INT13_DRIVE_CD0 || (ah == INT13_AH_CDROM_EMULATION && dl == INT13_DRIVE_CD_ALL);
+        if !dl_ok {
             self.int13_fail(INT13_STATUS_INVALID);
             return;
         }
-        match self.cpu.ah() {
+        match ah {
             INT13_AH_CHECK_EXTENSIONS => self.int13_cd_check_extensions(),
             INT13_AH_EXT_READ => self.int13_cd_ext_read_from_regs(),
             INT13_AH_EXT_GET_PARAMS => self.int13_cd_ext_get_params(),
+            INT13_AH_CDROM_INITIATE => self.int13_cd_initiate_from_regs(),
             INT13_AH_CDROM_EMULATION => self.int13_cd_emulation_from_regs(),
             _ => self.int13_fail(INT13_STATUS_INVALID),
         }
@@ -899,11 +920,25 @@ impl Machine {
         self.cpu.set_cf(false);
     }
 
-    /// Spec: El Torito / RBIL INT 13h AH=4Bh — AL=00h fills a 19-byte
-    /// specification packet at `DS:SI` from the attached ATAPI El Torito catalog.
+    /// Spec: El Torito 1.0 §6.1 / RBIL INT 13h AH=4Ah — initiate disk emulation.
+    ///
+    /// Floppy/HDD emulation is out of scope; this host path only exposes no-emul
+    /// CD (`DL=E0h`) via AH=42h/48h/4Bh. Always fails with [`INT13_STATUS_INVALID`].
+    fn int13_cd_initiate_from_regs(&mut self) {
+        let _ = self.cpu.al(); // AL=00h expected; any AL rejected equally.
+        self.int13_fail(INT13_STATUS_INVALID);
+    }
+
+    /// Spec: El Torito 1.0 §6.2 / RBIL INT 13h AH=4Bh —
+    /// - `AL=00h` terminate disk emulation and fill the specification packet
+    /// - `AL=01h` fill the specification packet only (do not terminate)
+    ///
+    /// This host path never enters floppy/HDD emulation, so terminate is a
+    /// **no-op** that still returns the no-emul CD status packet (CF clear).
+    /// `DL=7Fh` (all emulations) is accepted the same way.
     fn int13_cd_emulation_from_regs(&mut self) {
-        if self.cpu.al() != INT13_CD_AL_GET_STATUS {
-            // AL=01h terminate-emulation and other subfunctions are out of scope.
+        let al = self.cpu.al();
+        if al != INT13_CD_AL_TERMINATE && al != INT13_CD_AL_GET_STATUS {
             self.int13_fail(INT13_STATUS_INVALID);
             return;
         }
@@ -911,19 +946,26 @@ impl Machine {
             self.int13_fail(INT13_STATUS_TIMEOUT);
             return;
         }
+        if self.int13_cd_fill_spec_packet().is_err() {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        // Terminate (AL=00h): no emulation state to clear for no-emul CD.
+        self.cpu.set_ah(INT13_STATUS_OK);
+        self.cpu.set_cf(false);
+    }
+
+    /// Fill the 19-byte El Torito specification packet at `DS:SI`.
+    fn int13_cd_fill_spec_packet(&mut self) -> Result<(), u8> {
         let info = match self.inspect_atapi_el_torito() {
             Ok(info) if info.bootable => info,
-            _ => {
-                self.int13_fail(INT13_STATUS_INVALID);
-                return;
-            }
+            _ => return Err(INT13_STATUS_INVALID),
         };
         let si = self.cpu.gpr_u16(CpuState::RSI);
         let pkt = self.cpu.ds.base.wrapping_add(u64::from(si));
         let end = pkt.wrapping_add(u64::from(INT13_CD_SPEC_PACKET_SIZE));
         if end > self.mem.ram_len() as u64 {
-            self.int13_fail(INT13_STATUS_INVALID);
-            return;
+            return Err(INT13_STATUS_INVALID);
         }
         // El Torito specification packet (19 bytes). CHS fields stay 0 for no-emul.
         let mut buf = [0u8; INT13_CD_SPEC_PACKET_SIZE as usize];
@@ -941,13 +983,11 @@ impl Machine {
         buf[14..16].copy_from_slice(&info.sector_count.to_le_bytes());
         // offsets 16..18: cylinder/sector/head remain 0 for media type 00h
         for (i, b) in buf.iter().enumerate() {
-            if self.mem.write_u8(pkt + i as u64, *b).is_err() {
-                self.int13_fail(INT13_STATUS_INVALID);
-                return;
-            }
+            self.mem
+                .write_u8(pkt + i as u64, *b)
+                .map_err(|_| INT13_STATUS_INVALID)?;
         }
-        self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_cf(false);
+        Ok(())
     }
 
     /// Read `count` floppy sectors starting at CHS into physical `dest`.
@@ -1200,10 +1240,28 @@ pub fn setup_int13_floppy_get_disk_type(cpu: &mut CpuState) {
     cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
 }
 
-/// Convenience: set up INT 13h AH=4Bh AL=00h CD get-status (`DS:SI` packet).
+/// Convenience: set up INT 13h AH=4Bh AL=01h CD get-status (`DS:SI` packet).
 pub fn setup_int13_cd_get_status(cpu: &mut CpuState, ds: u16, si: u16) {
     cpu.set_ah(INT13_AH_CDROM_EMULATION);
     cpu.set_al(INT13_CD_AL_GET_STATUS);
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
+    cpu.set_gpr_u16(CpuState::RSI, si);
+    cpu.ds = x86_core::SegmentReg::real_mode(ds);
+}
+
+/// Convenience: set up INT 13h AH=4Bh AL=00h terminate + status (`DS:SI` packet).
+pub fn setup_int13_cd_terminate(cpu: &mut CpuState, ds: u16, si: u16) {
+    cpu.set_ah(INT13_AH_CDROM_EMULATION);
+    cpu.set_al(INT13_CD_AL_TERMINATE);
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
+    cpu.set_gpr_u16(CpuState::RSI, si);
+    cpu.ds = x86_core::SegmentReg::real_mode(ds);
+}
+
+/// Convenience: set up INT 13h AH=4Ah initiate disk emulation (expected to fail).
+pub fn setup_int13_cd_initiate(cpu: &mut CpuState, ds: u16, si: u16) {
+    cpu.set_ah(INT13_AH_CDROM_INITIATE);
+    cpu.set_al(0x00);
     cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
     cpu.set_gpr_u16(CpuState::RSI, si);
     cpu.ds = x86_core::SegmentReg::real_mode(ds);
@@ -1357,7 +1415,7 @@ mod tests {
         assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
     }
 
-    /// Spec: AH=08h returns fixed 16-head / 63-spt geometry.
+    /// Spec: AH=08h returns fixed 16-head / 63-spt geometry from image size.
     #[test]
     fn int13_ah08_returns_geometry() {
         let mut m = Machine::with_ide(64 * 1024, synthetic_disk(16 * 63 * 2));
@@ -1372,6 +1430,49 @@ mod tests {
         assert_eq!(m.cpu.gpr_u8_low(CpuState::RDX), 1);
         assert_eq!(m.cpu.al(), 0);
         assert_eq!(m.cpu.gpr_u8_low(CpuState::RBX), 0);
+    }
+
+    /// Spec: AH=08h without attached HD media → CF + AH=80h (timeout/not ready).
+    #[test]
+    fn int13_ah08_no_media_sets_timeout() {
+        let mut bare = Machine::new(64 * 1024);
+        bare.cpu.set_ah(INT13_AH_GET_DRIVE_PARAMS);
+        bare.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        bare.service_int13_hd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+
+        // Present IDE with empty image is also "no media".
+        let mut empty = Machine::with_ide(64 * 1024, Vec::new());
+        empty.cpu.set_ah(INT13_AH_GET_DRIVE_PARAMS);
+        empty.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        empty.service_int13();
+        assert!(cf(&empty.cpu));
+        assert_eq!(empty.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    /// Spec: AH=08h max cylinder tracks image size at 16×63 SPT.
+    #[test]
+    fn int13_ah08_geometry_from_image_size() {
+        // One full cylinder → max cylinder index 0.
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(16 * 63));
+        m.cpu.set_ah(INT13_AH_GET_DRIVE_PARAMS);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        let (cyl, spt) = unpack_cx(m.cpu.gpr_u16(CpuState::RCX));
+        assert_eq!(cyl, 0);
+        assert_eq!(spt, INT13_HD_SPT as u8);
+        assert_eq!(m.cpu.gpr_u8(4 + CpuState::RDX), (INT13_HD_HEADS - 1) as u8);
+
+        // Three cylinders of sectors → max cylinder index 2.
+        let mut m2 = Machine::with_ide(64 * 1024, synthetic_disk(16 * 63 * 3));
+        m2.cpu.set_ah(INT13_AH_GET_DRIVE_PARAMS);
+        m2.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m2.service_int13_hd();
+        assert!(!cf(&m2.cpu));
+        let (cyl2, _) = unpack_cx(m2.cpu.gpr_u16(CpuState::RCX));
+        assert_eq!(cyl2, 2);
     }
 
     /// Spec: unsupported AH → invalid function.
@@ -1898,7 +1999,7 @@ mod tests {
         img
     }
 
-    /// Spec: El Torito / RBIL INT 13h AH=4Bh AL=00h — fill CD status packet.
+    /// Spec: El Torito / RBIL INT 13h AH=4Bh AL=01h — fill CD status packet.
     #[test]
     fn int13_cd_ah4b_get_status_packet() {
         let mut m = Machine::new(64 * 1024);
@@ -1926,9 +2027,28 @@ mod tests {
         assert_eq!(sectors, 4);
     }
 
-    /// Spec: AH=4Bh with no ATAPI medium → timeout; terminate AL rejected.
+    /// Spec: El Torito / RBIL INT 13h AH=4Bh AL=00h — terminate (no-op) + status.
     #[test]
-    fn int13_cd_ah4b_errors() {
+    fn int13_cd_ah4b_terminate_fills_status_packet() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        setup_int13_cd_terminate(&mut m.cpu, 0x0000, 0x5100);
+        m.service_int13();
+        assert!(!cf(&m.cpu), "terminate no-op succeeds for no-emul CD");
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(0x5100).unwrap(), INT13_CD_SPEC_PACKET_SIZE);
+        assert_eq!(m.mem.read_u8(0x5102).unwrap(), INT13_DRIVE_CD0);
+        // DL=7Fh (all) also accepted.
+        setup_int13_cd_terminate(&mut m.cpu, 0x0000, 0x5200);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD_ALL);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(0x5200).unwrap(), INT13_CD_SPEC_PACKET_SIZE);
+    }
+
+    /// Spec: AH=4Ah initiate unsupported; AH=4Bh no medium → timeout; bad AL.
+    #[test]
+    fn int13_cd_ah4a_ah4b_errors() {
         let mut bare = Machine::new(64 * 1024);
         setup_int13_cd_get_status(&mut bare.cpu, 0x0000, 0x5000);
         bare.service_int13_cd();
@@ -1937,8 +2057,13 @@ mod tests {
 
         let mut m = Machine::new(64 * 1024);
         m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        setup_int13_cd_initiate(&mut m.cpu, 0x0000, 0x5000);
+        m.service_int13_cd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+
         setup_int13_cd_get_status(&mut m.cpu, 0x0000, 0x5000);
-        m.cpu.set_al(0x01); // terminate-emulation — unsupported
+        m.cpu.set_al(0x02); // unknown subfunction
         m.service_int13_cd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);

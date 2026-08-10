@@ -37,10 +37,12 @@ pub use bda_kbd::{
     BDA_KBD_TAIL, BDA_PHYS_BASE,
 };
 pub use guest_boot::{
-    classify_guest_first_failure, synthetic_freedos_like_disk, synthetic_linux_serial_stub_disk,
-    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GuestFailureSite,
-    GuestFirstFailureClass, GuestOsMeasure, GuestOsMeasureKind, Int13ProbeSnapshot,
-    GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION,
+    classify_guest_first_failure, inspect_linux_boot_protocol_header, synthetic_freedos_like_disk,
+    synthetic_linux_boot_protocol_header, synthetic_linux_serial_stub_disk, GuestBootCheckpoint,
+    GuestBootMeasure, GuestBootMedia, GuestFailureSite, GuestFirstFailureClass, GuestOsMeasure,
+    GuestOsMeasureKind, Int13ProbeSnapshot, LinuxBootProtocolError, LinuxBootProtocolHeader,
+    BDA_EQUIPMENT, BDA_HD_COUNT, GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION,
+    LINUX_BOOT_FLAG_AA55, LINUX_BOOT_HEADER_MAGIC, LINUX_BOOT_HEADER_MIN_LEN,
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int10::{
@@ -53,20 +55,21 @@ pub use int10::{
 };
 pub use int13::{
     chs_to_lba, pack_cx, setup_int13_cd_check_extensions, setup_int13_cd_ext_get_params,
-    setup_int13_cd_ext_read, setup_int13_cd_get_status, setup_int13_floppy_get_disk_type,
-    setup_int13_floppy_get_params, setup_int13_floppy_read, setup_int13_floppy_write,
-    setup_int13_hd_ext_get_params, setup_int13_hd_ext_read, setup_int13_hd_ext_write,
-    setup_int13_hd_read, setup_int13_hd_write, unpack_cx, INT13_AH_CDROM_EMULATION,
-    INT13_AH_CHECK_EXTENSIONS, INT13_AH_EXT_GET_PARAMS, INT13_AH_EXT_READ, INT13_AH_EXT_WRITE,
-    INT13_AH_GET_DISK_TYPE, INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ, INT13_AH_RESET,
-    INT13_AH_WRITE, INT13_CD_AL_GET_STATUS, INT13_CD_SECTOR_SIZE, INT13_CD_SPEC_PACKET_SIZE,
+    setup_int13_cd_ext_read, setup_int13_cd_get_status, setup_int13_cd_initiate,
+    setup_int13_cd_terminate, setup_int13_floppy_get_disk_type, setup_int13_floppy_get_params,
+    setup_int13_floppy_read, setup_int13_floppy_write, setup_int13_hd_ext_get_params,
+    setup_int13_hd_ext_read, setup_int13_hd_ext_write, setup_int13_hd_read, setup_int13_hd_write,
+    unpack_cx, INT13_AH_CDROM_EMULATION, INT13_AH_CDROM_INITIATE, INT13_AH_CHECK_EXTENSIONS,
+    INT13_AH_EXT_GET_PARAMS, INT13_AH_EXT_READ, INT13_AH_EXT_WRITE, INT13_AH_GET_DISK_TYPE,
+    INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ, INT13_AH_RESET, INT13_AH_WRITE,
+    INT13_CD_AL_GET_STATUS, INT13_CD_AL_TERMINATE, INT13_CD_SECTOR_SIZE, INT13_CD_SPEC_PACKET_SIZE,
     INT13_DAP_SIZE_MIN, INT13_DISK_TYPE_FLOPPY, INT13_DISK_TYPE_FLOPPY_CHANGE_LINE,
-    INT13_DISK_TYPE_HARD, INT13_DISK_TYPE_NONE, INT13_DRIVE_CD0, INT13_DRIVE_FD0, INT13_DRIVE_HD0,
-    INT13_EDD_INFO_GEOMETRY_VALID, INT13_EDD_PARAMS_SIZE_MIN, INT13_EXT_CX_EDD,
-    INT13_EXT_CX_PACKET, INT13_EXT_CX_SUPPORTED, INT13_EXT_MAGIC_IN, INT13_EXT_MAGIC_OUT,
-    INT13_EXT_VERSION, INT13_FLOPPY_MAX_CYLINDER, INT13_FLOPPY_MAX_HEAD, INT13_FLOPPY_SPT,
-    INT13_FLOPPY_TYPE_1440, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE, INT13_STATUS_INVALID,
-    INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
+    INT13_DISK_TYPE_HARD, INT13_DISK_TYPE_NONE, INT13_DRIVE_CD0, INT13_DRIVE_CD_ALL,
+    INT13_DRIVE_FD0, INT13_DRIVE_HD0, INT13_EDD_INFO_GEOMETRY_VALID, INT13_EDD_PARAMS_SIZE_MIN,
+    INT13_EXT_CX_EDD, INT13_EXT_CX_PACKET, INT13_EXT_CX_SUPPORTED, INT13_EXT_MAGIC_IN,
+    INT13_EXT_MAGIC_OUT, INT13_EXT_VERSION, INT13_FLOPPY_MAX_CYLINDER, INT13_FLOPPY_MAX_HEAD,
+    INT13_FLOPPY_SPT, INT13_FLOPPY_TYPE_1440, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE,
+    INT13_STATUS_INVALID, INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
     INT13_STATUS_WRITE_PROTECTED,
 };
 pub use int15_apm::{
