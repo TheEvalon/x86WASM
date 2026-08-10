@@ -10,7 +10,7 @@
 //! POSITION", AH=0Ah "WRITE CHARACTER ONLY AT CURSOR POSITION", AH=0Eh
 //! "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE"; IBM PC BIOS Data Area
 //! video fields at `0040:0049` / `0040:004A` / `0040:004C` / `0040:004E` /
-//! `0040:0050` / `0040:0060` / `0040:0062`.
+//! `0040:0050`–`005F` / `0040:0060` / `0040:0062` / `0040:0063` / `0040:0084`.
 
 use crate::{Machine, MachineError};
 use devices::{
@@ -59,6 +59,10 @@ pub const BDA_CURSOR_PAGE0: u64 = 0x450;
 pub const BDA_CURSOR_TYPE: u64 = 0x460;
 /// BDA active display page (`0040:0062`). Spec: RBIL memory map.
 pub const BDA_ACTIVE_PAGE: u64 = 0x462;
+/// BDA CRT controller base port (`0040:0063`). Spec: RBIL — color VGA `03D4h`.
+pub const BDA_CRT_CTRL_BASE: u64 = 0x463;
+/// BDA rows on screen minus one (`0040:0084`). Spec: RBIL — mode 03h → `18h`.
+pub const BDA_VIDEO_ROWS_MINUS_1: u64 = 0x484;
 
 /// Mode-03h default cursor start scanline (IBM VGA underline-ish). Spec: RBIL /
 /// classic BIOS mode 03h cursor type `0607h`.
@@ -69,6 +73,10 @@ pub const INT10_MODE03_CURSOR_END: u8 = 0x07;
 pub const INT10_MODE03_PAGE_SIZE: u16 = 0x1000;
 /// Mode-13h BDA page size. Spec: classic BIOS mode-13h BDA `0040:004C` (`FA00h`).
 pub const INT10_MODE13_PAGE_SIZE: u16 = 0xFA00;
+/// Color VGA CRTC index port written to BDA `0040:0063`. Spec: IBM VGA / RBIL.
+pub const INT10_CRT_BASE_COLOR: u16 = 0x3D4;
+/// Mode-03h / mode-13h BDA rows-minus-one (`25 - 1`). Spec: RBIL `0040:0084`.
+pub const INT10_MODE03_ROWS_MINUS_1: u8 = (VGA_TEXT_ROWS as u8).saturating_sub(1);
 
 /// Bound CX repeat count for AH=09h/0Ah so a pathological count cannot walk
 /// forever. One full 80×25 page is enough for host bring-up.
@@ -135,14 +143,20 @@ impl Machine {
         match mode {
             INT10_MODE_03H_TEXT => {
                 self.vga.reset();
-                self.write_bda_video(mode, VGA_TEXT_COLS as u16, INT10_MODE03_PAGE_SIZE, 0, 0);
+                self.write_bda_video(
+                    mode,
+                    VGA_TEXT_COLS as u16,
+                    INT10_MODE03_PAGE_SIZE,
+                    INT10_MODE03_ROWS_MINUS_1,
+                );
                 let _ =
                     self.write_bda_cursor_type(INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END);
+                self.program_crtc_cursor_type(INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END);
             }
             INT10_MODE_13H_GRAPHICS => {
                 self.vga.program_bios_mode13h();
                 // Mode 13h is 40 columns in the classic BDA sense (320/8).
-                self.write_bda_video(mode, 40, INT10_MODE13_PAGE_SIZE, 0, 0);
+                self.write_bda_video(mode, 40, INT10_MODE13_PAGE_SIZE, INT10_MODE03_ROWS_MINUS_1);
             }
             _ => {
                 // Unsupported mode: leave hardware alone (honest subset).
@@ -330,19 +344,28 @@ impl Machine {
         let _ = self.write_bda_cursor(row, col);
     }
 
-    /// Write the core BDA video fields kept coherent with AH=00/02/03/0F.
+    /// Write the core BDA video fields kept coherent with AH=00/01/02/03/09/0A/0F.
     ///
     /// Spec: RBIL BIOS Data Area — mode `0040:0049`, columns `0040:004A`,
-    /// page size `0040:004C`, page start `0040:004E`, cursor `0040:0050`,
-    /// active page `0040:0062`.
-    fn write_bda_video(&mut self, mode: u8, cols: u16, page_size: u16, row: u8, col: u8) {
+    /// page size `0040:004C`, page start `0040:004E`, cursor pages
+    /// `0040:0050`–`005F`, cursor type `0040:0060`, active page `0040:0062`,
+    /// CRT base `0040:0063`, rows-minus-one `0040:0084`.
+    fn write_bda_video(&mut self, mode: u8, cols: u16, page_size: u16, rows_minus_1: u8) {
         let _ = self.mem.write_u8(BDA_VIDEO_MODE, mode);
         let _ = self.mem.write_u8(BDA_VIDEO_COLS, (cols & 0xFF) as u8);
         let _ = self.mem.write_u8(BDA_VIDEO_COLS + 1, (cols >> 8) as u8);
         let _ = self.write_bda_u16(BDA_VIDEO_PAGE_SIZE, page_size);
         let _ = self.write_bda_u16(BDA_VIDEO_PAGE_START, 0);
         let _ = self.mem.write_u8(BDA_ACTIVE_PAGE, 0);
-        let _ = self.write_bda_cursor(row, col);
+        let _ = self.write_bda_u16(BDA_CRT_CTRL_BASE, INT10_CRT_BASE_COLOR);
+        let _ = self.mem.write_u8(BDA_VIDEO_ROWS_MINUS_1, rows_minus_1);
+        // Spec: RBIL — eight page cursor words at 0040:0050; stub keeps page 0
+        // active and zeros the rest so stale guests do not see garbage.
+        for page in 0u8..8 {
+            let base = BDA_CURSOR_PAGE0 + u64::from(page) * 2;
+            let _ = self.mem.write_u8(base, 0);
+            let _ = self.mem.write_u8(base + 1, 0);
+        }
     }
 
     fn write_bda_u16(&mut self, phys: u64, val: u16) -> Result<(), MachineError> {
@@ -680,9 +703,19 @@ mod tests {
         assert_eq!(m.read_bda_page_start(), Some(0));
         assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
         assert_eq!(
+            m.read_bda_u16(BDA_CRT_CTRL_BASE),
+            Some(INT10_CRT_BASE_COLOR)
+        );
+        assert_eq!(
+            m.mem.read_u8(BDA_VIDEO_ROWS_MINUS_1).unwrap(),
+            INT10_MODE03_ROWS_MINUS_1
+        );
+        assert_eq!(
             m.read_bda_cursor_type(),
             Some((INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END))
         );
+        assert_eq!(m.vga.crtc_cursor_start_scanline(), INT10_MODE03_CURSOR_START);
+        assert_eq!(m.vga.crtc_cursor_end_scanline(), INT10_MODE03_CURSOR_END);
 
         setup_int10_set_cursor(&mut m.cpu, 0, 3, 7);
         m.service_int10();
@@ -706,6 +739,56 @@ mod tests {
         assert_eq!(m.read_bda_page_start(), Some(0));
         assert_eq!(m.read_bda_cols(), Some(40));
         assert_eq!(m.read_bda_cursor(), Some((0, 0)));
+        assert_eq!(
+            m.read_bda_u16(BDA_CRT_CTRL_BASE),
+            Some(INT10_CRT_BASE_COLOR)
+        );
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
+    }
+
+    #[test]
+    fn int10_bda_columns_page_survive_write_char_and_cursor_type() {
+        // Spec: RBIL — AH=01h/09h must not clobber columns or active page.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_cursor(&mut m.cpu, 0, 1, 2);
+        m.service_int10();
+
+        setup_int10_set_cursor_type(&mut m.cpu, 0x0C, 0x0D);
+        m.service_int10();
+        setup_int10_write_char_attr(&mut m.cpu, b'Q', 0, 0x07, 1);
+        m.service_int10();
+
+        assert_eq!(m.read_bda_cols(), Some(VGA_TEXT_COLS as u16));
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
+        assert_eq!(m.read_bda_page_size(), Some(INT10_MODE03_PAGE_SIZE));
+        assert_eq!(m.read_bda_page_start(), Some(0));
+        assert_eq!(
+            m.read_bda_u16(BDA_CRT_CTRL_BASE),
+            Some(INT10_CRT_BASE_COLOR)
+        );
+        assert_eq!(
+            m.mem.read_u8(BDA_VIDEO_ROWS_MINUS_1).unwrap(),
+            INT10_MODE03_ROWS_MINUS_1
+        );
+        assert_eq!(m.read_bda_cursor(), Some((1, 2)));
+        assert_eq!(m.vga.char_at(1, 2), Some(b'Q'));
+    }
+
+    #[test]
+    fn int10_bda_clears_all_page_cursors_on_mode_set() {
+        let mut m = Machine::new(1024 * 1024);
+        // Poison page-1 cursor word, then mode-set must clear all eight.
+        let _ = m.mem.write_u8(BDA_CURSOR_PAGE0 + 2, 0x55);
+        let _ = m.mem.write_u8(BDA_CURSOR_PAGE0 + 3, 0xAA);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        for page in 0u8..8 {
+            let base = BDA_CURSOR_PAGE0 + u64::from(page) * 2;
+            assert_eq!(m.mem.read_u8(base).unwrap(), 0, "page {page} col");
+            assert_eq!(m.mem.read_u8(base + 1).unwrap(), 0, "page {page} row");
+        }
     }
 
     #[test]
