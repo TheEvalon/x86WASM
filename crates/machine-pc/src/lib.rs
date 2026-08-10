@@ -339,7 +339,7 @@ impl Machine {
         // count is 1. Host-settable items (UUID, nographic, bootorder,
         // etc/system-states) stay absent until the host has a truthful value.
         // `etc/table-loader` is never published: there are no ACPI tables to
-        // load (docs/fwcfg-r4-selectors.md).
+        // load (ADR-0008 / docs/fwcfg-r4-selectors.md).
         self.fw_cfg.set_cpu_count(FW_CFG_DEFAULT_CPU_COUNT);
         let entries = self.e820_entries();
         self.fw_cfg.set_e820_entries(&entries);
@@ -3663,17 +3663,18 @@ mod tests {
             .unwrap();
             bus.port_out_u16(PCI_CONFIG_DATA, PCI_COMMAND_IO).unwrap();
 
+            // PM1_STS is W1C: a guest write of 0x0101 against clear STS leaves 0.
             bus.port_out_u16(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 0x0101)
-                .unwrap();
-            bus.port_out_u16(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 0x0001)
-                .unwrap();
-            bus.port_out_u32(0xB000 + u16::from(PCI_PIIX_ACPI_PM_TMR), 0x0012_3456)
                 .unwrap();
             assert_eq!(
                 bus.port_in_u16(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT))
                     .unwrap(),
-                0x0101
+                0
             );
+            bus.port_out_u16(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT), 0x0001)
+                .unwrap();
+            bus.port_out_u32(0xB000 + u16::from(PCI_PIIX_ACPI_PM_TMR), 0x0012_3456)
+                .unwrap();
             assert_eq!(
                 bus.port_in_u16(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT))
                     .unwrap(),

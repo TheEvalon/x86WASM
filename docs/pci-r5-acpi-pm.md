@@ -16,8 +16,8 @@ power-button / SCI-enable stubs.
 
 | Register | Offset | Behaviour |
 |---|---|---|
-| PM1_STS | +0 | Store/readback; host `acpi_assert_power_button` ORs PWRBTN_STS; timer MSB toggle ORs TMR_STS. Full write-1-to-clear deferred (MachineBus decode test still programs STS by store). |
-| PM1_EN | +2 | R/W (TMR/GBL/PWRBTN enables in this stub) |
+| PM1_STS | +0 | Write-1-to-clear for TMR/GBL/PWRBTN (and reserved clearable bits in the mask); guest writes cannot set STS. Host `acpi_assert_power_button` ORs PWRBTN_STS; timer MSB toggle ORs TMR_STS. |
+| PM1_EN | +2 | R/W (TMR/GBL/PWRBTN enables in this stub). Gates SCI with matching STS bits. |
 | PM1_CNT | +4 | Sticky SCI_EN / BM_RLD / SLP_TYP; SLP_EN write ignored (no sleep machine) |
 | PM_TMR | +8 | 24-bit counter in `PciConfig::acpi_pm_io[8..12]`; guest loads accepted; advanced by `tick_acpi_pm` |
 

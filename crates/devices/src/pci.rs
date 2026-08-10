@@ -115,11 +115,12 @@
 //!   command engine and no secondary-channel engine.
 //! - PIIX ACPI PM I/O decode: when Command.IO is set and PMBASE has I/O form
 //!   (bit0), the 64-byte PM register block at `PMBASE & 0xFFC0` implements a
-//!   bounded ACPI PM subset — `PM1a_STS`/`PM1a_EN`/`PM1a_CNT` stubs and a
-//!   24-bit `PM_TMR` in `acpi_pm_io[+8]` at 3.579545 MHz. Advance via
-//!   [`PciConfig::tick_acpi_pm`] (preferred machine hook: 3 PM ticks per PIT
-//!   step-clock) or by writing the same `acpi_pm_io` bytes. SCI is reported
-//!   via [`PciConfig::acpi_sci_asserted`]; no PIC/APIC wire, SMI, GPE, or
+//!   bounded ACPI PM subset — `PM1a_STS` (write-1-to-clear) / `PM1a_EN` /
+//!   `PM1a_CNT` stubs and a 24-bit `PM_TMR` in `acpi_pm_io[+8]` at 3.579545 MHz.
+//!   Advance via [`PciConfig::tick_acpi_pm`] (preferred machine hook: 3 PM
+//!   ticks per PIT step-clock) or by writing the same `acpi_pm_io` bytes. SCI
+//!   level is `(STS & EN)` while `SCI_EN` is set, reported via
+//!   [`PciConfig::acpi_sci_asserted`]; no PIC/APIC wire, SMI, GPE, or
 //!   sleep-state machine.
 //!
 //! - PIIX USB UHCI BAR0 I/O decode: when Command.IO is set and UHCI BAR0 has
@@ -2501,16 +2502,33 @@ impl PciConfig {
     }
 
     fn acpi_pm_write_bytes(&mut self, off: usize, bytes: &[u8]) {
-        // Spec: ACPI fixed hardware — PM1_EN is R/W; PM1_CNT stores sticky
-        // control bits. PM1_STS remains store/readback (hardware events OR bits
-        // via assert_power_button / tick_acpi_pm); full W1C is deferred so the
-        // existing MachineBus decode test keeps working. PM_TMR lives in
+        // Spec: ACPI fixed hardware — PM1_STS is write-1-to-clear for the
+        // implemented status bits (TMR/GBL/PWRBTN/…); writes cannot set STS.
+        // PM1_EN is R/W; PM1_CNT stores sticky control bits. Hardware events OR
+        // STS via assert_power_button / tick_acpi_pm. PM_TMR lives in
         // acpi_pm_io[+8] (24-bit) so machine step-clock freerun and
         // [`Self::tick_acpi_pm`] share one register file.
+        if off < 2 {
+            let old = self.acpi_pm1_sts();
+            let mut written = 0u16;
+            for (i, b) in bytes.iter().enumerate() {
+                let abs = off + i;
+                if abs >= 2 {
+                    break;
+                }
+                written |= u16::from(*b) << (8 * abs);
+            }
+            let new = old & !(written & ACPI_PM1_STS_WRITE_CLEAR_MASK);
+            self.acpi_pm_io[0..2].copy_from_slice(&new.to_le_bytes());
+        }
         for (i, b) in bytes.iter().enumerate() {
             let abs = off + i;
             if abs >= PCI_PIIX_ACPI_PM_IO_SIZE as usize {
                 break;
+            }
+            // STS handled above; do not store guest data into those bytes.
+            if abs < 2 {
+                continue;
             }
             self.acpi_pm_io[abs] = *b;
         }
@@ -4853,11 +4871,12 @@ mod tests {
         assert!(pci.acpi_pm_owns_port(0xB03F));
         assert!(!pci.acpi_pm_owns_port(0xB040));
 
-        // PM1_STS store/readback (hardware events also OR bits).
+        // PM1_STS is write-1-to-clear: guest writes cannot set status bits.
         pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2, 0x0101);
         assert_eq!(
             pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2) as u16,
-            0x0101
+            0,
+            "PM1_STS write cannot set bits"
         );
         // EN keeps TMR|GBL|PWRBTN only.
         pci.port_write(
