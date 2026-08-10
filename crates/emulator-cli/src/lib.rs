@@ -1639,6 +1639,6 @@ mod tests {
         let text = report.to_string();
         assert!(text.contains("linux-serial-path"));
         assert!(text.contains("NOT Milestone 2 exit"));
-        assert_eq!(report.measure.com1, "LX");
+        assert_eq!(report.measure.com1, "LX\r\n");
     }
 }
