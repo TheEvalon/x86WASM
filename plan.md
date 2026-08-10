@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-10, round-12 boot-guest lane `slice/r12-boot-guest` on base `01050d2`): **in progress -- R12 boot-guest lane.** INT 13h AH=04h VERIFY (HD+floppy), AH=41h CX bitmap honesty (packet+EDD only; AH=44/47 rejected), FreeDOS measure next-gap classify (v5: INT13/BDA/IVT/image), Linux bzImage early classify + real-mode setup load helper. See `docs/storage-r12-*.md`, `docs/boot-r12-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS; no POST C897 work in this lane.
+
 Status (2026-08-10, round-11 parallel integration `merge/m2-r11-parallel-16` on base `b46e5f0`): **in progress -- eleventh parallel campaign merged.** Four agents landed 16 bounded slices: UHCI frame-list/PORTSC + LAPIC LVT + HPET wrap; BDA keyboard ring + APM INT15 AH=53 stub + port61 NMI + POST remeasure; INT13 AH=4A/4B + HD AH=08 + FreeDOS BDA seed + Linux header inspect; VM86 PUSH/POP Sreg + VIP/VIF-without-VME + INT3/ICEBP + opsize-32 far transfers. See `docs/m2-r11-parallel-integration.md`. **SeaBIOS POST still does not complete; every M2 exit criterion remains open.** Honesty that must survive: no real SMM; no guest LFB; no CR4.VME; FreeDOS/Linux stubs not prompt/shell; ADR-0008 table-loader absent; POST still `F000:C897`.
 
 Status (2026-08-10, round-11 boot-guest lane `slice/r11-boot-guest` on base `b46e5f0`): **in progress -- R11 boot-guest lane.** INT 13h AH=4Ah/4Bh El Torito terminate+status (AL corrected to El Torito/RBIL), HD AH=08h media-required CHS deepen, FreeDOS measure BDA equipment seed + host-notes on synthetic-halt, Linux boot-protocol header inspect helper. See `docs/storage-r11-*.md`, `docs/boot-r11-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS.

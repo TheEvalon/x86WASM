@@ -458,10 +458,7 @@ impl Machine {
         self.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_OUT);
         // Packet access (AH=42h/43h) + EDD params (AH=48h). Removable locking out.
         self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
-        debug_assert_eq!(
-            self.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING,
-            0
-        );
+        debug_assert_eq!(self.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING, 0);
         self.cpu.set_cf(false);
     }
 
@@ -699,13 +696,7 @@ pub fn setup_int13_hd_write(
 ///
 /// Spec: RBIL INT 13h AH=04h — `ES:BX` is unused; harness still accepts them
 /// for register-shape parity with AH=02h.
-pub fn setup_int13_hd_verify(
-    cpu: &mut CpuState,
-    cylinder: u16,
-    head: u8,
-    sector: u8,
-    count: u8,
-) {
+pub fn setup_int13_hd_verify(cpu: &mut CpuState, cylinder: u16, head: u8, sector: u8, count: u8) {
     cpu.set_ah(INT13_AH_VERIFY);
     cpu.set_al(count);
     cpu.set_gpr_u16(CpuState::RCX, pack_cx(cylinder, sector));
@@ -1799,7 +1790,11 @@ mod tests {
         let cx = m.cpu.gpr_u16(CpuState::RCX);
         assert!(!cf(&m.cpu));
         assert_eq!(cx, INT13_EXT_CX_PACKET | INT13_EXT_CX_EDD);
-        assert_eq!(cx & INT13_EXT_CX_LOCKING, 0, "locking/eject bit must stay clear");
+        assert_eq!(
+            cx & INT13_EXT_CX_LOCKING,
+            0,
+            "locking/eject bit must stay clear"
+        );
         assert_eq!(cx & !INT13_EXT_CX_SUPPORTED, 0, "no undocumented CX bits");
     }
 
