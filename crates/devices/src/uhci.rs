@@ -1,14 +1,15 @@
 //! UHCI schedule + PORTSC stub (Intel UHCI / PIIX3 USB).
 //!
 //! Spec: Universal Host Controller Interface (UHCI) Design Guide, Revision 1.1;
-//! Intel 82371SB (PIIX3) USB function. Frame list → (optional QH + one horizontal
-//! hop) → TD transfer via host memory callbacks; PORTSC CCS/PED/PR for firmware
-//! probe. No real USB device stack, no isochronous bandwidth accounting, no
-//! full multi-QH reclaim walks.
+//! Intel 82371SB (PIIX3) USB function. Frame list → (optional QH + bounded
+//! horizontal chain) → TD transfer via host memory callbacks; PORTSC CCS/PED/PR
+//! for firmware probe. No real USB device stack, no isochronous bandwidth
+//! accounting, no full multi-QH reclaim walks.
 //!
 //! PCI config / BAR0 I/O decode remain in [`crate::pci::PciConfig`]; this module
 //! owns schedule + PORTSC bit semantics. See `docs/uhci-r8-one-td.md`,
-//! `docs/uhci-r11-frame-list-walk.md`, `docs/uhci-r11-portsc.md`.
+//! `docs/uhci-r11-frame-list-walk.md`, `docs/uhci-r11-portsc.md`,
+//! `docs/uhci-r12-qh-horizontal.md`.
 
 use crate::pci::{
     PCI_PIIX_USB_UHCI_FLBASEADD, PCI_PIIX_USB_UHCI_FRNUM, PCI_PIIX_USB_UHCI_IO_SIZE,
@@ -61,8 +62,19 @@ pub const UHCI_TD_MAX_TRANSFER: usize = 1280;
 /// Soft cap on frames walked by [`run_n_frames`] (1024-slot frame list).
 pub const UHCI_MAX_FRAMES_WALK: u32 = 1024;
 
-/// Soft cap on QH horizontal hops per frame (R11 stub depth).
-pub const UHCI_MAX_QH_HORIZONTAL: u32 = 1;
+/// Soft cap on QH horizontal hops per frame (R12: deeper than R11's single hop).
+///
+/// Spec: UHCI 1.1 §3.3 — horizontal link may chain queue heads. This stub
+/// follows the starting QH plus up to this many additional horizontal QH hops
+/// (so at most `1 + UHCI_MAX_QH_HORIZONTAL` QHs / element TDs per frame).
+/// Deeper chains return [`UhciTdError::QueueHeadHorizontalUnsupported`].
+/// Isochronous TD schedules are not special-cased: a frame-list TD link still
+/// executes as an ordinary Active TD; bandwidth reclamation / iso reclaim is
+/// explicitly unsupported.
+pub const UHCI_MAX_QH_HORIZONTAL: u32 = 4;
+
+/// Max TD addresses collected per frame (`1` start + horizontal hops).
+pub const UHCI_MAX_FRAME_TDS: usize = 1 + UHCI_MAX_QH_HORIZONTAL as usize;
 
 /// PORTSC Current Connect Status (UHCI 1.1 §2.1.7 bit 0) — RO from guest.
 pub const UHCI_PORTSC_CCS: u16 = 1 << 0;
@@ -215,17 +227,18 @@ fn resolve_td_addr<R: FnMut(u32) -> u8>(mem_read: &mut R, link: u32) -> Result<u
     Ok(element & !0xF)
 }
 
-/// Collect up to `1 + UHCI_MAX_QH_HORIZONTAL` TD addresses from a frame link.
+/// Collect up to [`UHCI_MAX_FRAME_TDS`] TD addresses from a frame link.
 ///
 /// Spec: UHCI 1.1 §3.3 — QH horizontal link may chain queue heads. This stub
-/// follows the element TD of the first QH, then at most one horizontal QH hop
-/// (its element TD). Deeper horizontal chains return
+/// follows the element TD of the first QH, then up to
+/// [`UHCI_MAX_QH_HORIZONTAL`] additional horizontal QH hops (each element TD).
+/// Deeper horizontal chains return
 /// [`UhciTdError::QueueHeadHorizontalUnsupported`]. Isochronous / bandwidth
-/// reclaim are not modeled.
+/// reclaim are not modeled (frame-list TDs still execute as ordinary TDs).
 fn collect_frame_td_addrs<R: FnMut(u32) -> u8>(
     mem_read: &mut R,
     link: u32,
-    out: &mut [u32; 2],
+    out: &mut [u32; UHCI_MAX_FRAME_TDS],
 ) -> Result<usize, UhciTdError> {
     if link & UHCI_LINK_TERMINATE != 0 {
         return Err(UhciTdError::NothingToDo);
@@ -399,11 +412,12 @@ where
 ///
 /// Spec: UHCI 1.1 §§3.1 / 3.3 — each 1 ms frame selects
 /// `FLBASEADD[(FRNUM & 0x3FF)]`; this stub processes that link (TD or QH with
-/// at most one horizontal hop), executes active TDs, then advances FRNUM.
-/// Empty / inactive frames count as scanned but are not errors.
+/// up to [`UHCI_MAX_QH_HORIZONTAL`] horizontal hops), executes active TDs, then
+/// advances FRNUM. Empty / inactive frames count as scanned but are not errors.
 ///
-/// Unsupported (explicit): isochronous TDs, bandwidth reclamation, full QH
-/// breadth-first reclaim, multi-packet TD vertical chains.
+/// Unsupported (explicit): isochronous bandwidth reclamation, full QH
+/// breadth-first reclaim, multi-packet TD vertical chains, depth >
+/// [`UHCI_MAX_QH_HORIZONTAL`].
 pub fn run_n_frames<R, W>(
     regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
     bus_master: bool,
@@ -437,7 +451,7 @@ where
         let frame_entry_addr = flbase.wrapping_add(frnum.wrapping_mul(4));
         let link = read_phys_u32(&mut mem_read, frame_entry_addr);
 
-        let mut td_addrs = [0u32; 2];
+        let mut td_addrs = [0u32; UHCI_MAX_FRAME_TDS];
         match collect_frame_td_addrs(&mut mem_read, link, &mut td_addrs) {
             Ok(n) => {
                 for &td_addr in td_addrs.iter().take(n) {
@@ -947,25 +961,113 @@ mod tests {
         assert_eq!(mem.get(buf1), 0x22);
     }
 
-    /// Spec: UHCI 1.1 §3.3 — second horizontal QH hop is unsupported.
+    /// Spec: UHCI 1.1 §3.3 — R12 allows up to [`UHCI_MAX_QH_HORIZONTAL`] hops.
     #[test]
-    fn qh_horizontal_depth_two_unsupported() {
+    fn qh_horizontal_depth_four_executes_all_tds() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0006_0000u32;
+        // Five QHs: start + 4 horizontal hops (MAX=4).
+        let qhs: [u32; 5] = [
+            0x0006_0100,
+            0x0006_0120,
+            0x0006_0140,
+            0x0006_0160,
+            0x0006_0180,
+        ];
+        let tds: [u32; 5] = [
+            0x0006_0200,
+            0x0006_0220,
+            0x0006_0240,
+            0x0006_0260,
+            0x0006_0280,
+        ];
+        let bufs: [u32; 5] = [
+            0x0006_0300,
+            0x0006_0310,
+            0x0006_0320,
+            0x0006_0330,
+            0x0006_0340,
+        ];
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, qhs[0] | UHCI_LINK_QH);
+        for i in 0..5 {
+            if i + 1 < 5 {
+                mem.write_u32(qhs[i], qhs[i + 1] | UHCI_LINK_QH);
+            } else {
+                mem.write_u32(qhs[i], UHCI_LINK_TERMINATE);
+            }
+            mem.write_u32(qhs[i] + 4, tds[i]);
+            mem.write_u32(tds[i], UHCI_LINK_TERMINATE);
+            mem.write_u32(tds[i] + 4, UHCI_TD_ACTIVE);
+            mem.write_u32(
+                tds[i] + 8,
+                u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+            );
+            mem.write_u32(tds[i] + 12, bufs[i]);
+        }
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+
+        let mut device = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4];
+        let summary = run_n_frames(
+            &mut pci.uhci_io,
+            true,
+            1,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("QH horizontal depth 4");
+        assert_eq!(summary.tds_completed, 5);
+        assert_eq!(UHCI_MAX_QH_HORIZONTAL, 4);
+        for (i, &buf) in bufs.iter().enumerate() {
+            assert_eq!(mem.get(buf), 0xA0 + i as u8);
+        }
+    }
+
+    /// Spec: UHCI 1.1 §3.3 — hop beyond [`UHCI_MAX_QH_HORIZONTAL`] is unsupported.
+    #[test]
+    fn qh_horizontal_depth_five_unsupported() {
         let mut pci = PciConfig::new();
         let bar = 0xD000u16;
         enable_uhci_io(&mut pci, bar);
         let flbase = 0x0005_0000u32;
-        let qh0 = 0x0005_0100u32;
-        let qh1 = 0x0005_0120u32;
-        let qh2 = 0x0005_0140u32;
+        // Six QHs → five hops > MAX=4.
+        let qhs: [u32; 6] = [
+            0x0005_0100,
+            0x0005_0120,
+            0x0005_0140,
+            0x0005_0160,
+            0x0005_0180,
+            0x0005_01A0,
+        ];
         let td = 0x0005_0200u32;
         let mem = FakeMem::new();
-        mem.write_u32(flbase, qh0 | UHCI_LINK_QH);
-        mem.write_u32(qh0, qh1 | UHCI_LINK_QH);
-        mem.write_u32(qh0 + 4, UHCI_LINK_TERMINATE);
-        mem.write_u32(qh1, qh2 | UHCI_LINK_QH);
-        mem.write_u32(qh1 + 4, td);
-        mem.write_u32(qh2, UHCI_LINK_TERMINATE);
-        mem.write_u32(qh2 + 4, UHCI_LINK_TERMINATE);
+        mem.write_u32(flbase, qhs[0] | UHCI_LINK_QH);
+        for i in 0..6 {
+            if i + 1 < 6 {
+                mem.write_u32(qhs[i], qhs[i + 1] | UHCI_LINK_QH);
+            } else {
+                mem.write_u32(qhs[i], UHCI_LINK_TERMINATE);
+            }
+            // Only the second QH has an active TD so walk does not early-exit
+            // before hitting the depth cap on the fifth hop.
+            if i == 1 {
+                mem.write_u32(qhs[i] + 4, td);
+            } else {
+                mem.write_u32(qhs[i] + 4, UHCI_LINK_TERMINATE);
+            }
+        }
         mem.write_u32(td, UHCI_LINK_TERMINATE);
         mem.write_u32(td + 4, UHCI_TD_ACTIVE);
         mem.write_u32(
