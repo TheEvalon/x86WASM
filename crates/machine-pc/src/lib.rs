@@ -37,12 +37,13 @@ pub use bda_kbd::{
     BDA_KBD_TAIL, BDA_PHYS_BASE,
 };
 pub use guest_boot::{
-    classify_guest_first_failure, inspect_linux_boot_protocol_header, synthetic_freedos_like_disk,
-    synthetic_linux_boot_protocol_header, synthetic_linux_serial_stub_disk, GuestBootCheckpoint,
-    GuestBootMeasure, GuestBootMedia, GuestFailureSite, GuestFirstFailureClass, GuestOsMeasure,
-    GuestOsMeasureKind, Int13ProbeSnapshot, LinuxBootProtocolError, LinuxBootProtocolHeader,
-    BDA_EQUIPMENT, BDA_HD_COUNT, GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION,
-    LINUX_BOOT_FLAG_AA55, LINUX_BOOT_HEADER_MAGIC, LINUX_BOOT_HEADER_MIN_LEN,
+    classify_freedos_next_gap, classify_guest_first_failure, inspect_linux_boot_protocol_header,
+    synthetic_freedos_like_disk, synthetic_linux_boot_protocol_header,
+    synthetic_linux_serial_stub_disk, FreedosNextGap, GuestBootCheckpoint, GuestBootMeasure,
+    GuestBootMedia, GuestFailureSite, GuestFirstFailureClass, GuestOsMeasure, GuestOsMeasureKind,
+    Int13ProbeSnapshot, LinuxBootProtocolError, LinuxBootProtocolHeader, BDA_EQUIPMENT,
+    BDA_HD_COUNT, GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION, LINUX_BOOT_FLAG_AA55,
+    LINUX_BOOT_HEADER_MAGIC, LINUX_BOOT_HEADER_MIN_LEN,
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int10::{

@@ -20,8 +20,8 @@ use crate::{Machine, MachineError};
 /// Harness schema version for CLI/report consumers (v2 checkpoints + serial).
 pub const GUEST_BOOT_MEASURE_VERSION: u32 = 2;
 
-/// FreeDOS-like / Linux-serial measure report schema (v4 = first-failure class).
-pub const GUEST_OS_MEASURE_VERSION: u32 = 4;
+/// FreeDOS-like / Linux-serial measure report schema (v5 = next-gap class).
+pub const GUEST_OS_MEASURE_VERSION: u32 = 5;
 
 /// BDA equipment list word (`0040:0010`). Spec: RBIL memory map / IBM BIOS.
 pub const BDA_EQUIPMENT: u64 = 0x410;
@@ -184,6 +184,101 @@ pub enum GuestFirstFailureClass {
     UnmappedMmio { page: u64 },
     /// Host INT 13h probe returned CF set (disk service failure).
     Int13Cf { ah: u8 },
+}
+
+/// Next actionable gap after a FreeDOS-like measure (beyond the first-failure tag).
+///
+/// Used when the fixture already reached `synthetic-halt` (or to point back at
+/// `first_failure`). Does **not** claim a FreeDOS prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FreedosNextGap {
+    /// Host INT 13h AH=41h (or follow-on) returned CF — disk service gap.
+    HostInt13Cf { ah: u8 },
+    /// BDA equipment / HD-count fields disagree with attached media.
+    BdaDiskMismatch,
+    /// IVT vector `0x13` is null — guest cannot reach host INT 13h without SeaBIOS.
+    GuestInt13IvtMissing,
+    /// Fixture halted cleanly; next need is a real FreeDOS image + firmware POST.
+    RealImageAndFirmware,
+    /// Non-halt first failure already names the gap — see `first_failure`.
+    SeeFirstFailure,
+}
+
+impl FreedosNextGap {
+    /// Stable triage tag (ASCII kebab-case).
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::HostInt13Cf { .. } => "host-int13-cf",
+            Self::BdaDiskMismatch => "bda-disk-mismatch",
+            Self::GuestInt13IvtMissing => "guest-int13-ivt-missing",
+            Self::RealImageAndFirmware => "real-image-and-firmware",
+            Self::SeeFirstFailure => "see-first-failure",
+        }
+    }
+
+    /// Host-note sentence for reports (static).
+    pub fn host_note(&self) -> &'static str {
+        match self {
+            Self::HostInt13Cf { .. } => {
+                "Next gap: host INT 13h probe CF — disk/extensions service failure"
+            }
+            Self::BdaDiskMismatch => {
+                "Next gap: BDA 0040:0010/0075 mismatch vs attached media"
+            }
+            Self::GuestInt13IvtMissing => {
+                "Next gap: IVT INT 13h null — need SeaBIOS (or install host stub); not FreeDOS prompt"
+            }
+            Self::RealImageAndFirmware => {
+                "Next gap: real FreeDOS image + SeaBIOS POST (fixture halt is not progress)"
+            }
+            Self::SeeFirstFailure => "Next gap: see first-failure class (non-halt stop)",
+        }
+    }
+}
+
+impl std::fmt::Display for FreedosNextGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+/// Read IVT far pointer for interrupt `vector` (offset then segment, little-endian).
+fn read_ivt_far(machine: &Machine, vector: u8) -> (u16, u16) {
+    let base = u64::from(vector) * 4;
+    let off = u16::from(machine.mem.read_u8(base).unwrap_or(0))
+        | (u16::from(machine.mem.read_u8(base + 1).unwrap_or(0)) << 8);
+    let seg = u16::from(machine.mem.read_u8(base + 2).unwrap_or(0))
+        | (u16::from(machine.mem.read_u8(base + 3).unwrap_or(0)) << 8);
+    (off, seg)
+}
+
+/// Classify the **next** FreeDOS-path gap after a measure (INT13 / BDA / IVT / image).
+///
+/// Spec: RBIL IVT + BDA disk fields; IBM INT 13h. Does not claim FreeDOS boot.
+pub fn classify_freedos_next_gap(
+    machine: &Machine,
+    first_failure: &GuestFirstFailureClass,
+    int13_probe: &Int13ProbeSnapshot,
+) -> FreedosNextGap {
+    if !matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
+        return FreedosNextGap::SeeFirstFailure;
+    }
+    if int13_probe.failed() {
+        return FreedosNextGap::HostInt13Cf {
+            ah: int13_probe.ah,
+        };
+    }
+    let expect_hd = u8::from(machine.ide.present && !machine.ide.image.is_empty());
+    let bda_hd = machine.mem.read_u8(BDA_HD_COUNT).unwrap_or(0xFF);
+    let bda_equip = machine.mem.read_u8(BDA_EQUIPMENT).unwrap_or(0xFF);
+    if bda_hd != expect_hd || bda_equip != machine.equipment_byte() {
+        return FreedosNextGap::BdaDiskMismatch;
+    }
+    let (off, seg) = read_ivt_far(machine, 0x13);
+    if off == 0 && seg == 0 {
+        return FreedosNextGap::GuestInt13IvtMissing;
+    }
+    FreedosNextGap::RealImageAndFirmware
 }
 
 impl GuestFirstFailureClass {
@@ -362,7 +457,7 @@ impl Int13ProbeSnapshot {
     }
 }
 
-/// v4 OS-path measure: wraps v2 plus honesty / first-failure class / gap list.
+/// v5 OS-path measure: wraps v2 plus honesty / first-failure / next-gap / gap list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestOsMeasure {
     /// Schema version ([`GUEST_OS_MEASURE_VERSION`]).
@@ -379,6 +474,8 @@ pub struct GuestOsMeasure {
     pub failure_site: GuestFailureSite,
     /// Host INT 13h AH=41h probe after the guest stop.
     pub int13_probe: Int13ProbeSnapshot,
+    /// FreeDOS-path next-gap class (INT13 / BDA / IVT / real image). Always set.
+    pub next_gap: FreedosNextGap,
     /// Explicit non-claim sentence for reports/CLI.
     pub honesty: &'static str,
     /// Remaining gaps toward a real guest (not M2 exit), including class note.
@@ -395,8 +492,13 @@ impl std::fmt::Display for GuestOsMeasure {
         };
         writeln!(
             f,
-            "guest-os-measure-v{}: kind={} first-failure={} bucket={} site={} (NOT an OS boot / NOT Milestone 2 exit)",
-            self.version, kind, self.first_failure, self.failure_bucket, self.failure_site
+            "guest-os-measure-v{}: kind={} first-failure={} bucket={} site={} next-gap={} (NOT an OS boot / NOT Milestone 2 exit)",
+            self.version,
+            kind,
+            self.first_failure,
+            self.failure_bucket,
+            self.failure_site,
+            self.next_gap
         )?;
         writeln!(f, "  honesty: {}", self.honesty)?;
         writeln!(
@@ -642,6 +744,13 @@ impl Machine {
             eip: measure.report.stop_site.eip,
         };
         gaps.push(first_failure.gap_note());
+        let next_gap = if kind == GuestOsMeasureKind::FreeDosLike {
+            classify_freedos_next_gap(self, &first_failure, &int13_probe)
+        } else if matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
+            FreedosNextGap::RealImageAndFirmware
+        } else {
+            FreedosNextGap::SeeFirstFailure
+        };
         if matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
             host_notes.push(
                 "Synthetic-halt reached — next gap is real guest image / firmware POST, not fixture polish",
@@ -650,12 +759,15 @@ impl Machine {
                 host_notes.push(
                     "BDA 0040:0010/0075 seeded from host media; still not SeaBIOS equipment init",
                 );
+                host_notes.push(next_gap.host_note());
             }
             if kind == GuestOsMeasureKind::LinuxSerialPath {
                 host_notes.push(
                     "Use inspect_linux_boot_protocol_header on a host bzImage; no kernel load here",
                 );
             }
+        } else if kind == GuestOsMeasureKind::FreeDosLike {
+            host_notes.push(next_gap.host_note());
         }
         GuestOsMeasure {
             version: GUEST_OS_MEASURE_VERSION,
@@ -665,6 +777,7 @@ impl Machine {
             failure_bucket,
             failure_site,
             int13_probe,
+            next_gap,
             honesty,
             gaps,
             host_notes,
@@ -1034,11 +1147,14 @@ mod tests {
         assert!(matches!(report.measure.report.stop, PostStopReason::Halted));
         assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
         assert_eq!(report.first_failure.tag(), "synthetic-halt");
+        assert_eq!(report.next_gap, FreedosNextGap::GuestInt13IvtMissing);
+        assert_eq!(report.next_gap.tag(), "guest-int13-ivt-missing");
         let text = report.to_string();
         assert!(text.contains("NOT an OS boot"));
         assert!(text.contains("does NOT claim a FreeDOS prompt"));
         assert!(text.contains("freedos-like"));
         assert!(text.contains("first-failure=synthetic-halt"));
+        assert!(text.contains("next-gap=guest-int13-ivt-missing"));
         assert!(report.gaps.iter().any(|g| g.contains("prompt")));
         assert!(report
             .gaps
@@ -1048,12 +1164,49 @@ mod tests {
             .host_notes
             .iter()
             .any(|n| n.contains("BDA 0040:0010/0075")));
+        assert!(report
+            .host_notes
+            .iter()
+            .any(|n| n.contains("IVT INT 13h null")));
         assert!(text.contains("host-notes="));
         // Payload marker exists on disk but is not a boot claim.
         assert!(m.ide.image[MBR_SECTOR_SIZE..].starts_with(b"FREEDOS-LIKE-PAYLOAD"));
         // BDA disk equipment seeded for the measure path.
         assert_eq!(m.mem.read_u8(BDA_HD_COUNT).unwrap(), 1);
         assert_eq!(m.mem.read_u8(BDA_EQUIPMENT).unwrap(), m.equipment_byte());
+    }
+
+    /// Next-gap: BDA mismatch wins over IVT-null when equipment bytes disagree.
+    #[test]
+    fn classify_freedos_next_gap_bda_mismatch() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_ide_image(synthetic_freedos_like_disk());
+        m.seed_bda_disk_equipment().unwrap();
+        // Corrupt HD count after seeding.
+        m.mem.write_u8(BDA_HD_COUNT, 0).unwrap();
+        let probe = Int13ProbeSnapshot {
+            dl: 0x80,
+            ah: 0x01,
+            cf: false,
+        };
+        let gap = classify_freedos_next_gap(&m, &GuestFirstFailureClass::SyntheticHalt, &probe);
+        assert_eq!(gap, FreedosNextGap::BdaDiskMismatch);
+    }
+
+    /// Next-gap: installed INT 13h IVT pointer advances past IVT-missing to image/firmware.
+    #[test]
+    fn classify_freedos_next_gap_with_ivt_pointer() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_ide_image(synthetic_freedos_like_disk());
+        m.seed_bda_disk_equipment().unwrap();
+        m.install_int13_ivt_pointer(0xF000, 0xE000).unwrap();
+        let probe = Int13ProbeSnapshot {
+            dl: 0x80,
+            ah: 0x01,
+            cf: false,
+        };
+        let gap = classify_freedos_next_gap(&m, &GuestFirstFailureClass::SyntheticHalt, &probe);
+        assert_eq!(gap, FreedosNextGap::RealImageAndFirmware);
     }
 
     /// BDA seed: floppy media flips equipment diskette bits; HD count tracks IDE.
