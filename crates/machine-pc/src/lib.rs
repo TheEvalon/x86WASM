@@ -889,6 +889,13 @@ impl Machine {
         ioapic_wire::assert_ioapic_gsi(&mut self.ioapic, &mut self.lapic, gsi, high)
     }
 
+    /// Local APIC EOI + I/O APIC Remote IRR clear for the retired vector.
+    ///
+    /// Spec: SDM §10.8.5 / 82093AA Remote IRR. See `docs/ioapic-r8-eoi.md`.
+    pub fn eoi_lapic_ioapic(&mut self) -> Option<u8> {
+        ioapic_wire::eoi_lapic_and_ioapic(&mut self.ioapic, &mut self.lapic)
+    }
+
     /// Advance CMOS/RTC by `periods` model quanta and sync IRQF → PIC IRQ8.
     ///
     /// Spec: MC146818 IRQ pin; IBM PC AT → 8259A slave IR0 (ISA IRQ8).

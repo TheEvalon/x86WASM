@@ -7,11 +7,16 @@
 //! - §10.4.14 / §10.9 — Spurious Interrupt Vector Register @ `F0H`
 //! - §10.5.1 — LVT Timer @ `320H`
 //! - §10.5.4 — Timer ICR `380H`, CCR `390H`, DCR `3E0H`
+//! - §10.8.3 / §10.8.4 — IRR @ `200H`–`270H`, ISR @ `100H`–`170H` (32-bit
+//!   bitmaps; bit *N* = vector *N*)
+//! - §10.8.5 — EOI @ `B0H` clears the highest-priority ISR bit
 //!
 //! Round-7: software-enabled APIC + programmed one-shot/periodic timer can
 //! latch a **local** interrupt vector via [`LocalApicMmio::take_interrupt`].
-//! CPUID leaf 1 EDX bit 9 (`APIC`) stays clear — presence ≠ advertised APIC.
-//! See `docs/lapic-r7-timer-lvt.md`.
+//! Round-8: IRR/ISR dword readback + EOI clears the matching ISR bit (and
+//! clears the single in-service tracker). CPUID leaf 1 EDX bit 9 (`APIC`)
+//! stays clear — presence ≠ advertised APIC.
+//! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`.
 
 /// Default Local APIC physical base (SDM Vol. 3A §10.4.4).
 pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
@@ -27,6 +32,12 @@ pub const LAPIC_REG_VERSION: u32 = 0x30;
 
 /// End Of Interrupt Register offset.
 pub const LAPIC_REG_EOI: u32 = 0xB0;
+
+/// In-Service Register base (8×32-bit; vector bitmaps). Spec: SDM §10.8.4.
+pub const LAPIC_REG_ISR_BASE: u32 = 0x100;
+
+/// Interrupt Request Register base (8×32-bit). Spec: SDM §10.8.3.
+pub const LAPIC_REG_IRR_BASE: u32 = 0x200;
 
 /// Spurious Interrupt Vector Register offset (SDM §10.9).
 pub const LAPIC_REG_SVR: u32 = 0xF0;
@@ -69,7 +80,8 @@ pub const LAPIC_LVT_TIMER_PERIODIC: u32 = 1 << 17;
 /// LVT vector field (bits 7:0).
 pub const LAPIC_LVT_VECTOR_MASK: u32 = 0xFF;
 
-/// Local APIC MMIO: ID/Version + SVR + LVT Timer + timer ICR/CCR/DCR stub.
+/// Local APIC MMIO: ID/Version + SVR + LVT Timer + timer ICR/CCR/DCR stub
+/// plus IRR/ISR bitmap readback for EOI honesty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalApicMmio {
     base: u64,
@@ -89,8 +101,12 @@ pub struct LocalApicMmio {
     divide_accum: u32,
     /// Latched local interrupt vector awaiting [`Self::take_interrupt`].
     pending_vector: Option<u8>,
-    /// In-service vector after accept (cleared by EOI).
+    /// In-service vector after accept (cleared by EOI). Mirrors highest ISR.
     in_service: Option<u8>,
+    /// Interrupt Request Register — 256 bits as eight little-endian dwords.
+    irr: [u32; 8],
+    /// In-Service Register — 256 bits as eight little-endian dwords.
+    isr: [u32; 8],
     /// Scratch for byte-lane assembly of dword writes.
     dword_scratch: [u8; 4],
 }
@@ -116,6 +132,8 @@ impl LocalApicMmio {
             divide_accum: 0,
             pending_vector: None,
             in_service: None,
+            irr: [0; 8],
+            isr: [0; 8],
             dword_scratch: [0; 4],
         }
     }
@@ -151,6 +169,26 @@ impl LocalApicMmio {
 
     pub fn timer_dcr(&self) -> u32 {
         self.timer_dcr
+    }
+
+    /// Read one IRR dword (index 0..=7 → offsets `200H`..`270H`).
+    pub fn irr_dword(&self, index: usize) -> Option<u32> {
+        self.irr.get(index).copied()
+    }
+
+    /// Read one ISR dword (index 0..=7 → offsets `100H`..`170H`).
+    pub fn isr_dword(&self, index: usize) -> Option<u32> {
+        self.isr.get(index).copied()
+    }
+
+    /// True if vector bit is set in IRR.
+    pub fn irr_bit(&self, vector: u8) -> bool {
+        bitmap_get(&self.irr, vector)
+    }
+
+    /// True if vector bit is set in ISR.
+    pub fn isr_bit(&self, vector: u8) -> bool {
+        bitmap_get(&self.isr, vector)
     }
 
     /// Software enable from SVR bit 8.
@@ -191,6 +229,14 @@ impl LocalApicMmio {
             LAPIC_REG_TIMER_ICR => self.timer_icr,
             LAPIC_REG_TIMER_CCR => self.timer_ccr,
             LAPIC_REG_TIMER_DCR => self.timer_dcr & 0xB, // bits 3,1,0
+            o if (LAPIC_REG_ISR_BASE..LAPIC_REG_ISR_BASE + 0x80).contains(&o) && o & 0xF == 0 => {
+                let idx = ((o - LAPIC_REG_ISR_BASE) / 0x10) as usize;
+                self.isr.get(idx).copied().unwrap_or(0)
+            }
+            o if (LAPIC_REG_IRR_BASE..LAPIC_REG_IRR_BASE + 0x80).contains(&o) && o & 0xF == 0 => {
+                let idx = ((o - LAPIC_REG_IRR_BASE) / 0x10) as usize;
+                self.irr.get(idx).copied().unwrap_or(0)
+            }
             _ => 0,
         }
     }
@@ -205,14 +251,36 @@ impl LocalApicMmio {
         self.pending_vector
     }
 
-    /// Accept the latched local interrupt (moves to in-service).
+    /// Accept the latched local interrupt (IRR → ISR).
     ///
-    /// Spec: SDM §10.8.3 — accepting an interrupt loads ISR; EOI later clears.
-    /// This stub does not inject into the CPU interpreter — hosts must deliver.
+    /// Spec: SDM §10.8.3–§10.8.4 — accepting an interrupt clears the IRR bit
+    /// and sets the ISR bit; EOI later clears ISR. This stub does not inject
+    /// into the CPU interpreter — hosts must deliver.
     pub fn take_interrupt(&mut self) -> Option<u8> {
         let vec = self.pending_vector.take()?;
+        bitmap_clear(&mut self.irr, vec);
+        bitmap_set(&mut self.isr, vec);
         self.in_service = Some(vec);
         Some(vec)
+    }
+
+    /// Peek the current in-service vector (set by [`Self::take_interrupt`]).
+    pub fn in_service_vector(&self) -> Option<u8> {
+        self.in_service
+    }
+
+    /// Software EOI helper — same as writing the EOI register.
+    ///
+    /// Returns the vector whose ISR bit was cleared, if any.
+    pub fn eoi(&mut self) -> Option<u8> {
+        let vec = self
+            .in_service
+            .take()
+            .or_else(|| highest_set_bit(&self.isr));
+        if let Some(v) = vec {
+            bitmap_clear(&mut self.isr, v);
+        }
+        vec
     }
 
     /// Latch a Fixed-mode vector from the I/O APIC (software-enable gated).
@@ -226,6 +294,7 @@ impl LocalApicMmio {
         if self.pending_vector.is_some() {
             return false;
         }
+        bitmap_set(&mut self.irr, vector);
         self.pending_vector = Some(vector);
         true
     }
@@ -241,6 +310,7 @@ impl LocalApicMmio {
         // Soft-priority floor: vectors 0..=15 are reserved; still latch for
         // honesty when software programmed them (tests may use ≥0x20).
         if self.pending_vector.is_none() {
+            bitmap_set(&mut self.irr, vector);
             self.pending_vector = Some(vector);
         }
     }
@@ -287,8 +357,10 @@ impl LocalApicMmio {
                 self.apic_id = ((value >> 24) & 0xFF) as u8;
             }
             LAPIC_REG_EOI => {
-                // Spec: SDM §10.8.5 — write to EOI signals end of interrupt.
-                self.in_service = None;
+                // Spec: SDM §10.8.5 — write to EOI clears the highest-priority
+                // ISR bit. This stub clears the tracked in-service vector's
+                // ISR bit (single outstanding interrupt model).
+                let _ = self.eoi();
             }
             LAPIC_REG_SVR => {
                 // Retain vector + software enable; other SVR bits dropped.
@@ -339,6 +411,36 @@ impl LocalApicMmio {
         self.write_dword(dword_off, u32::from_le_bytes(self.dword_scratch));
         true
     }
+}
+
+fn bitmap_get(bits: &[u32; 8], vector: u8) -> bool {
+    let idx = (vector / 32) as usize;
+    let bit = vector % 32;
+    bits[idx] & (1u32 << bit) != 0
+}
+
+fn bitmap_set(bits: &mut [u32; 8], vector: u8) {
+    let idx = (vector / 32) as usize;
+    let bit = vector % 32;
+    bits[idx] |= 1u32 << bit;
+}
+
+fn bitmap_clear(bits: &mut [u32; 8], vector: u8) {
+    let idx = (vector / 32) as usize;
+    let bit = vector % 32;
+    bits[idx] &= !(1u32 << bit);
+}
+
+/// Highest set vector bit in an 8-dword APIC bitmap, or `None`.
+fn highest_set_bit(bits: &[u32; 8]) -> Option<u8> {
+    for idx in (0..8).rev() {
+        let word = bits[idx];
+        if word != 0 {
+            let bit = 31 - word.leading_zeros();
+            return Some((idx as u8) * 32 + bit as u8);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -476,5 +578,48 @@ mod tests {
         write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 1);
         assert!(!lapic.tick_timer(1));
         assert!(!lapic.interrupt_pending());
+    }
+
+    /// Spec: SDM §10.8.3–§10.8.5 — IRR set on latch, ISR on accept, EOI clears ISR.
+    #[test]
+    fn irr_isr_readback_and_eoi_clears_isr_bit() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        assert!(lapic.inject_fixed(0x55));
+        assert!(lapic.irr_bit(0x55));
+        // IRR dword index 2 covers vectors 64..=95; bit 21 = 0x55.
+        assert_eq!(read_u32(&lapic, LAPIC_REG_IRR_BASE + 0x20), 1 << 21);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_ISR_BASE + 0x20), 0);
+
+        assert_eq!(lapic.take_interrupt(), Some(0x55));
+        assert!(!lapic.irr_bit(0x55));
+        assert!(lapic.isr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_IRR_BASE + 0x20), 0);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_ISR_BASE + 0x20), 1 << 21);
+
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        assert!(!lapic.isr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_ISR_BASE + 0x20), 0);
+        // ISR/IRR are read-only; writes are claimed but ignored.
+        assert!(lapic.mmio_write_u8(LAPIC_DEFAULT_BASE + u64::from(LAPIC_REG_ISR_BASE), 0xFF));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_ISR_BASE), 0);
+    }
+
+    /// Spec: SDM §10.5 / §10.8 — timer fire sets IRR; accept moves to ISR.
+    #[test]
+    fn timer_path_sets_irr_then_isr() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011);
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 1);
+        assert!(lapic.tick_timer(1));
+        assert!(lapic.irr_bit(0x40));
+        assert!(!lapic.isr_bit(0x40));
+        assert_eq!(lapic.take_interrupt(), Some(0x40));
+        assert!(!lapic.irr_bit(0x40));
+        assert!(lapic.isr_bit(0x40));
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        assert!(!lapic.isr_bit(0x40));
     }
 }

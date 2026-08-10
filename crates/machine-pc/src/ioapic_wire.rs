@@ -1,8 +1,8 @@
-//! Host helpers for Round-7 I/O APIC RTE → Local APIC Fixed delivery.
+//! Host helpers for I/O APIC RTE → Local APIC Fixed delivery + EOI.
 //!
 //! Coordinates with DualPic only by **not** mirroring: ISA device IRQs still
 //! use `DualPic`; IOAPIC GSI pins are a separate path. See
-//! `docs/ioapic-r7-rte-irq.md`.
+//! `docs/ioapic-r7-rte-irq.md`, `docs/ioapic-r8-eoi.md`.
 
 use devices::{IoApicDelivery, IoApicMmio, LocalApicMmio};
 
@@ -11,6 +11,7 @@ use devices::{IoApicDelivery, IoApicMmio, LocalApicMmio};
 ///
 /// Returns the delivery descriptor when the RTE produced one (even if the
 /// Local APIC dropped it due to software-disable or a busy pending slot).
+/// Level-triggered Fixed deliveries set Remote IRR inside [`IoApicMmio::assert_pin`].
 pub fn assert_ioapic_gsi(
     ioapic: &mut IoApicMmio,
     lapic: &mut LocalApicMmio,
@@ -22,4 +23,15 @@ pub fn assert_ioapic_gsi(
         let _ = lapic.inject_fixed(delivery.vector);
     }
     Some(delivery)
+}
+
+/// Local APIC EOI plus I/O APIC Remote IRR clear for the retired vector.
+///
+/// Spec: SDM §10.8.5 + 82093AA Remote IRR — level Fixed interrupts need an EOI
+/// broadcast so the I/O APIC can re-arm. This stub clears Remote IRR entries
+/// matching the vector that left ISR.
+pub fn eoi_lapic_and_ioapic(ioapic: &mut IoApicMmio, lapic: &mut LocalApicMmio) -> Option<u8> {
+    let vec = lapic.eoi()?;
+    ioapic.eoi(vec);
+    Some(vec)
 }
