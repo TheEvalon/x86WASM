@@ -52,6 +52,11 @@ this NOTICE entry remain the committed surface. A Windows in-session build was
 infeasible (no WSL bash / i386 toolchain); reproducible Linux/WSL2 steps are in
 `docs/firmware-r7-seavgabios-build.md`. No binary is committed (*.bin gitignored).
 
+R9 (2026-08-10): Linux/WSL smoke helper
+`firmware/build-scripts/smoke-seavgabios-linux.sh` (`--preflight` / `--build`)
+and `docs/firmware-r9-seavgabios-linux-smoke.md`. Still no sources in crates/;
+still no committed `vgabios.bin`.
+
 ## OVMF / other firmware
 
 OVMF and other firmware blobs are not yet added. When they are, record license,

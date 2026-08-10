@@ -23,6 +23,8 @@ Third-party firmware binaries live here, separate from the emulator core (see pl
 | `ovmf/OVMF_VARS_TEMPLATE.fd` | OVMF vars template (later) |
 | `build-scripts/build-seabios.sh` | Fetch + build SeaBIOS into `seabios/` |
 | `build-scripts/build-seavgabios.sh` | Fetch + build SeaVGABIOS into `seavgabios/` |
+| `build-scripts/smoke-seavgabios-linux.sh` | Linux/WSL smoke (`--preflight` / `--build`) |
+| `build-scripts/check-option-rom.py` | Validate `55 AA` + size + checksum |
 
 Do not commit binary blobs unless licensing review is complete. `*.bin` under SeaBIOS/SeaVGABIOS and `*.fd` under OVMF are gitignored.
 
@@ -141,7 +143,10 @@ whole-image checksum of zero mod 256.
 is no CI workflow for this ROM yet. R7 display/boot recorded reproducible
 Linux/WSL2 steps and the Windows infeasibility note in
 `docs/firmware-r7-seavgabios-build.md` (native Win32 / missing WSL bash cannot
-run this script).
+run this script). R9 smoke:
+`./firmware/build-scripts/smoke-seavgabios-linux.sh --preflight` (synthetic
+header check) or `--build` on Linux/WSL — see
+`docs/firmware-r9-seavgabios-linux-smoke.md`.
 
 ## ROM mapping (emulator)
 
