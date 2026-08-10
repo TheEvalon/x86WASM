@@ -70,8 +70,18 @@ fn acpi_pm_timer_msb_sets_tmr_sts() {
     // Advance just past bit 23.
     pci.tick_acpi_pm(1 << 23);
     assert_eq!(pci.acpi_pm1_sts() & ACPI_PM1_STS_TMR, ACPI_PM1_STS_TMR);
-    // Clear by store (full W1C deferred).
+    // Spec: ACPI PM1_STS — write-1-to-clear; write-0 leaves bits alone.
     pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2, 0);
+    assert_eq!(
+        pci.acpi_pm1_sts() & ACPI_PM1_STS_TMR,
+        ACPI_PM1_STS_TMR,
+        "write-0 must not clear TMR_STS"
+    );
+    pci.port_write(
+        0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT),
+        2,
+        u32::from(ACPI_PM1_STS_TMR),
+    );
     assert_eq!(pci.acpi_pm1_sts() & ACPI_PM1_STS_TMR, 0);
 }
 
@@ -101,8 +111,13 @@ fn acpi_power_button_and_sci_en_stub() {
     );
     assert!(pci.acpi_sci_asserted());
 
-    // Clear PWRBTN_STS → SCI drops.
-    pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2, 0);
+    // Write-1-to-clear PWRBTN_STS → SCI drops.
+    pci.port_write(
+        0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT),
+        2,
+        u32::from(ACPI_PM1_STS_PWRBTN),
+    );
+    assert_eq!(pci.acpi_pm1_sts() & ACPI_PM1_STS_PWRBTN, 0);
     assert!(!pci.acpi_sci_asserted());
 }
 
@@ -123,6 +138,53 @@ fn acpi_sci_from_timer_overflow_when_enabled() {
     assert!(!pci.acpi_sci_asserted());
     pci.tick_acpi_pm(1 << 23);
     assert!(pci.acpi_sci_asserted());
+}
+
+/// Spec: ACPI §4.8.1 — SCI = SCI_EN && (PM1_STS & PM1_EN) for SCI-capable bits.
+/// TMR_STS alone does not assert SCI while TMR_EN is clear; enabling then
+/// write-1-clearing STS drops the level.
+#[test]
+fn acpi_pm1a_en_gates_tmr_sci_and_w1c_drops_it() {
+    let mut pci = PciConfig::new();
+    enable_pm_io(&mut pci, 0xB000);
+    pci.port_write(
+        0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_CNT),
+        2,
+        u32::from(ACPI_PM1_CNT_SCI_EN),
+    );
+
+    pci.tick_acpi_pm(1 << 23);
+    assert_eq!(pci.acpi_pm1_sts() & ACPI_PM1_STS_TMR, ACPI_PM1_STS_TMR);
+    // STS set, EN clear → no SCI.
+    assert_eq!(pci.acpi_pm1_en() & ACPI_PM1_EN_TMR, 0);
+    assert!(!pci.acpi_sci_asserted());
+
+    // Both STS and EN set → SCI high.
+    pci.port_write(
+        0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2,
+        2,
+        u32::from(ACPI_PM1_EN_TMR),
+    );
+    assert!(pci.acpi_sci_asserted());
+
+    // Clearing EN while STS remains set also drops SCI.
+    pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2, 2, 0);
+    assert!(!pci.acpi_sci_asserted());
+    pci.port_write(
+        0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT) + 2,
+        2,
+        u32::from(ACPI_PM1_EN_TMR),
+    );
+    assert!(pci.acpi_sci_asserted());
+
+    // Write-1-to-clear STS drops SCI; write-0 would have left it asserted.
+    pci.port_write(
+        0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT),
+        2,
+        u32::from(ACPI_PM1_STS_TMR),
+    );
+    assert_eq!(pci.acpi_pm1_sts() & ACPI_PM1_STS_TMR, 0);
+    assert!(!pci.acpi_sci_asserted());
 }
 
 #[test]

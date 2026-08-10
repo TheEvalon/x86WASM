@@ -63,15 +63,21 @@ These are now read-only:
 `0x3C` Interrupt Line stays read/write: §6.2.4 makes it the byte POST fills in
 with the routed IRQ, and nothing reads it back here.
 
-### Known overstatement
+### Qualified Prog IF advertising
 
-`00:01.1`'s programming interface byte is `0x80`, the bus-master IDE bit. The
-BMIDE register block and the bounded PRD walkers exist, but no ATA command
-starts a DMA transfer, so that bit claims more than the tree delivers. It is
-inherited from round 2 and left in place deliberately — firmware that keys on
-the PIIX3 device ID would find a master-incapable PIIX3 stranger than a
-master-capable one — but it is an overstatement, not a truthful advertisement,
-and it is written down here rather than left to be discovered.
+`00:01.1`'s programming interface byte is `PCI_PROG_IF_IDE_BUS_MASTER`
+(`0x80`), the bus-master IDE bit. That matches what this tree actually exposes:
+
+- the BMIDE I/O BAR (BMIBA) decode when Command.IO is set;
+- host-called primary-channel PRD walkers (`start_bm_read` / `start_bm_write`);
+- Command.BusMaster as the gate for those host helpers.
+
+It does **not** claim a complete ATA DMA engine: a guest write to BMICOM.SSBM is
+ordinary register store/readback and does not start a transfer, and no ATA
+READ DMA / WRITE DMA command arms the BMIDE block. Clearing the Prog IF bit
+would make a PIIX3 device ID look master-incapable, which is a stranger lie for
+firmware that keys on `8086:7010`. The gap is therefore documented here and in
+`docs/pci-bmide-prd-directions.md` rather than hidden behind a cleared bit.
 
 ## The sizing protocol
 

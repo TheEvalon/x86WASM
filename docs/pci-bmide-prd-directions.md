@@ -39,6 +39,8 @@ latch BMISTA.Error when the walk fails. Shared bounds:
 
 - Any ATA command engine. Neither direction is started by an ATA READ DMA /
   WRITE DMA command or by a guest write to BMICOM.SSBM; both are host-called.
+  PCI Prog IF `0x80` (`PCI_PROG_IF_IDE_BUS_MASTER`) advertises the BMIDE BAR +
+  these host stubs only — see `docs/pci-r4-bar-sizing-and-enumeration.md`.
 - The secondary channel. BMIDTP at BMIBA+`0x0C` remains store/readback only.
 - BMIDE interrupt reporting (BMISTA bit2) and the PRD-exhausted / device-done
   interaction that drives it.

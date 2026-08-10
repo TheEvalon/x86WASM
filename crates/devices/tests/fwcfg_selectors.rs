@@ -16,7 +16,7 @@
 //!
 //! [QEMU Firmware Configuration (fw_cfg) Device]: https://www.qemu.org/docs/master/specs/fw_cfg.html
 
-use devices::{FwCfg, PortDevice, FW_CFG_DATA, FW_CFG_SELECTOR};
+use devices::{FwCfg, PortDevice, FW_CFG_DATA, FW_CFG_FILE_TABLE_LOADER, FW_CFG_SELECTOR};
 
 /// Interface reference (ADR-0005): system UUID, 16 bytes.
 const KEY_UUID: u16 = 0x0002;
@@ -29,7 +29,6 @@ const KEY_MAX_CPUS: u16 = 0x000F;
 
 const FILE_MAX_CPUS: &str = "etc/max-cpus";
 const FILE_SYSTEM_STATES: &str = "etc/system-states";
-const FILE_TABLE_LOADER: &str = "etc/table-loader";
 const FILE_BOOTORDER: &str = "bootorder";
 
 fn select(cfg: &mut FwCfg, selector: u16) {
@@ -146,8 +145,9 @@ fn nographic_is_absent_until_the_host_states_it() {
 }
 
 /// `bootorder` is a newline-separated, NUL-terminated list of firmware device
-/// paths. This machine states no boot policy, so the file is absent by default
-/// and an empty list removes it rather than publishing an empty policy.
+/// paths. The bare `FwCfg` device leaves it absent; an empty list removes it
+/// rather than publishing an empty policy. (A running `Machine` publishes
+/// `FW_CFG_DEFAULT_BOOT_ORDER` through sync — see machine-pc tests.)
 #[test]
 fn bootorder_is_absent_until_a_host_states_a_policy() {
     let mut cfg = FwCfg::new();
@@ -186,14 +186,31 @@ fn system_states_is_absent_because_no_sleep_state_is_implemented() {
     );
 }
 
-/// `etc/table-loader` is the ACPI table build script. This tree builds no ACPI
-/// tables, so there is nothing to load and the file is not implemented at all —
-/// not even as a host-settable blob, because there is no honest content for it.
+/// `etc/table-loader` is the QEMU/SeaBIOS ACPI table-loader command stream.
+/// This tree builds no ACPI tables (no RSDP/XSDT/FADT), so the honest policy is
+/// to omit the file — never publish a zero-entry loader that would still claim
+/// the protocol. Spec / policy: ADR-0008, ADR-0005, `docs/fwcfg-r4-selectors.md`.
 #[test]
-fn table_loader_is_not_implemented() {
+fn table_loader_is_omitted_and_name_lookup_fails_cleanly() {
+    assert_eq!(FW_CFG_FILE_TABLE_LOADER, "etc/table-loader");
     let cfg = FwCfg::new();
-    assert_eq!(cfg.file_selector(FILE_TABLE_LOADER), None);
-    assert!(!cfg.file_names().contains(&FILE_TABLE_LOADER));
+
+    // Host name lookup fails cleanly.
+    assert_eq!(cfg.file_selector(FW_CFG_FILE_TABLE_LOADER), None);
+    assert!(!cfg.file_names().contains(&FW_CFG_FILE_TABLE_LOADER));
+
+    // The file directory does not advertise the name either.
+    for name in cfg.file_names() {
+        assert_ne!(
+            name, FW_CFG_FILE_TABLE_LOADER,
+            "directory must not list etc/table-loader"
+        );
+    }
+
+    // There is no setter: publishing would invent tables that do not exist.
+    // Generic `add_file` remains available for host experiments; default and
+    // `Machine::sync_firmware_configuration` paths must leave it absent
+    // (ADR-0008).
 }
 
 /// Host configuration survives a device reset; only the guest-visible selector

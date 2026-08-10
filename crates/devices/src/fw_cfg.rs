@@ -47,11 +47,19 @@
 //!   [`FW_CFG_FILE_SYSTEM_STATES`]. Each describes a machine fact this device
 //!   cannot state on its own, so it stays absent until a host supplies it.
 //!
+//! # Deliberately absent: `etc/table-loader`
+//!
+//! [`FW_CFG_FILE_TABLE_LOADER`] is the QEMU/SeaBIOS ACPI table-loader script
+//! (command stream: allocate / add-pointer / checksum / write-pointer entries
+//! that place RSDP/XSDT/FADT and friends). Policy: **ADR-0008** (interface
+//! reference ADR-0005 + `docs/fwcfg-r4-selectors.md`). This tree builds **no**
+//! ACPI tables, so the honest policy is to **omit** the file entirely — never
+//! publish an empty zero-entry blob, which would still claim the loader
+//! protocol while listing nothing to load. [`FwCfg::file_selector`] returns
+//! `None`; machine `sync_firmware_configuration` never invents it.
+//!
 //! # Still not implemented
 //!
-//! - `etc/table-loader`. It is the ACPI table build script, and this tree
-//!   builds no ACPI tables, so there is nothing to load — not even a
-//!   host-settable blob, because no honest content exists for it.
 //! - Every other numeric key. Absent items read as the specification's "past
 //!   the end of the item" answer of `0x00` rather than a fabricated value.
 //! - Item writeability (selector bit 14 / DMA control bit 4).
@@ -131,9 +139,30 @@ pub const FW_CFG_SYSTEM_STATE_ENABLED: u8 = 0x80;
 /// Firmware file carrying the boot order as newline-separated device paths.
 ///
 /// Interface reference (ADR-0005): the file name and the NUL-terminated,
-/// newline-separated encoding. **Absent by default** — this machine states no
-/// boot policy. See [`FwCfg::set_boot_order`].
+/// newline-separated encoding. The bare device leaves it **absent**; the
+/// machine model publishes [`FW_CFG_DEFAULT_BOOT_ORDER`] through sync unless
+/// the host overrides it. See [`FwCfg::set_boot_order`].
 pub const FW_CFG_FILE_BOOTORDER: &str = "bootorder";
+/// Machine-default `bootorder` paths (HDD → CD-ROM → floppy) for SeaBIOS.
+///
+/// Interface reference (ADR-0005): newline-separated OpenFirmware-style device
+/// paths under the classic pc-i440fx topology (`ide@1,1` = PIIX IDE at
+/// `00:01.1`; secondary master is typically the ATAPI CD; ISA FDC at `03f0`).
+/// [`FwCfg::new`] still leaves the file absent; machine
+/// `sync_firmware_configuration` publishes this list unless the host overrides
+/// it (see [`FwCfg::set_boot_order`]).
+pub const FW_CFG_DEFAULT_BOOT_ORDER: &[&str] = &[
+    "/pci@i0cf8/ide@1,1/drive@0/disk@0",
+    "/pci@i0cf8/ide@1,1/drive@2/disk@0",
+    "/pci@i0cf8/isa@1/fdc@03f0/floppy@0",
+];
+/// Named firmware file for the ACPI table-loader script — **never published**.
+///
+/// Policy: ADR-0008. Interface reference (ADR-0005): QEMU/SeaBIOS
+/// `etc/table-loader` is a command stream that installs ACPI tables from fw_cfg
+/// blobs. This machine has no ACPI tables, so the name stays absent (see module
+/// docs / `docs/fwcfg-r4-selectors.md`).
+pub const FW_CFG_FILE_TABLE_LOADER: &str = "etc/table-loader";
 
 /// CPU count this device reports when the host states nothing else.
 ///

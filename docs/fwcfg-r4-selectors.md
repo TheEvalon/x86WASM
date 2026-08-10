@@ -50,20 +50,42 @@ it is absent until a host supplies it.
 |---|---|---|
 | `0x0002` UUID | `set_system_uuid` / `clear_system_uuid` | 16 raw bytes |
 | `0x0004` nographic | `set_nographic` | LE16, 1 = no graphics adapter |
-| `bootorder` | `set_boot_order` | newline-separated paths, trailing newline, NUL-terminated |
+| `bootorder` | `set_boot_order` / machine sync | newline-separated paths, trailing newline, NUL-terminated |
 | `etc/system-states` | `set_system_states` | 6 bytes indexed by S-state; bit 7 supported, bits 6:4 `SLP_TYP` |
 
 `etc/system-states` deserves its own sentence: this tree implements no ACPI
-power-state machine at all — the PIIX PM I/O block is a noop store/readback —
-so publishing a states blob would advertise a surface that does not exist.
+power-state machine at all — sleep-state transitions are out of scope — so
+publishing a states blob would advertise a surface that does not exist.
 `set_boot_order(&[])` removes the file rather than publishing an empty policy,
 for the same reason `set_e820_entries(&[])` removes `etc/e820`.
 
+### Machine-default `bootorder`
+
+The bare `FwCfg` device still leaves `bootorder` absent. A running
+`Machine::sync_firmware_configuration` publishes `FW_CFG_DEFAULT_BOOT_ORDER`:
+
+1. `/pci@i0cf8/ide@1,1/drive@0/disk@0` — primary master HDD
+2. `/pci@i0cf8/ide@1,1/drive@2/disk@0` — secondary master (ATAPI CD-ROM slot)
+3. `/pci@i0cf8/isa@1/fdc@03f0/floppy@0` — ISA floppy
+
+Host override: `Machine::set_fw_cfg_boot_order` (empty removes the file) survives
+sync/reset until `use_default_fw_cfg_boot_order`.
+
+## Deliberately absent: `etc/table-loader`
+
+Policy authority: **ADR-0008** (accepted 2026-08-10).
+
+| File | Policy | Why |
+|---|---|---|
+| `etc/table-loader` (`FW_CFG_FILE_TABLE_LOADER`) | **Omitted forever** until real ACPI tables exist — never present in the file directory | The QEMU/SeaBIOS table-loader blob is a command stream (allocate / add-pointer / add-checksum / write-pointer) that installs ACPI tables from other fw_cfg files. This tree has no RSDP/XSDT/FADT (or any other ACPI table). Publishing a zero-entry loader would still advertise the loader protocol while listing nothing honest to load; inventing RSDP/FADT would lie about fixed hardware. Omitting the name is the truthful answer. |
+
+Name lookup (`FwCfg::file_selector("etc/table-loader")`) returns `None`. A guest
+that never saw the name in the directory has no selector to read; probing an
+unknown selector still yields the specification's `0x00`.
+`Machine::sync_firmware_configuration` must not invent the file.
+
 ## Not implemented
 
-- `etc/table-loader`. It is the ACPI table build script, and this tree builds no
-  ACPI tables, so there is nothing to load — not even as a host-settable blob,
-  because no honest content exists for it.
 - Every other numeric key. Absent items read `0x00`.
 - Item writeability: selector bit 14 and DMA control bit 4 (write) are rejected
   with the spec's error bit rather than modelled.
@@ -71,7 +93,8 @@ for the same reason `set_e820_entries(&[])` removes `etc/e820`.
 ## Wiring status
 
 `FwCfg::new()` and `Machine::sync_firmware_configuration` both publish the
-CPU-count views (`NB_CPUS` / `max-cpus` / `etc/max-cpus` = 1), so a running
-machine answers them. The host-settable items (UUID, nographic, bootorder,
-`etc/system-states`) remain absent until the host supplies a truthful value —
-nothing in `crates/machine-pc` invents one.
+CPU-count views (`NB_CPUS` / `max-cpus` / `etc/max-cpus` = 1). Sync also
+publishes the machine-default `bootorder` (HDD → CD → floppy) unless the host
+has overridden it. UUID, nographic, and `etc/system-states` remain absent until
+the host supplies a truthful value. **`etc/table-loader` stays absent through
+sync** (ADR-0008).

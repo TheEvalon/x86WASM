@@ -115,11 +115,12 @@
 //!   command engine and no secondary-channel engine.
 //! - PIIX ACPI PM I/O decode: when Command.IO is set and PMBASE has I/O form
 //!   (bit0), the 64-byte PM register block at `PMBASE & 0xFFC0` implements a
-//!   bounded ACPI PM subset — `PM1a_STS`/`PM1a_EN`/`PM1a_CNT` stubs and a
-//!   24-bit `PM_TMR` in `acpi_pm_io[+8]` at 3.579545 MHz. Advance via
-//!   [`PciConfig::tick_acpi_pm`] (preferred machine hook: 3 PM ticks per PIT
-//!   step-clock) or by writing the same `acpi_pm_io` bytes. SCI is reported
-//!   via [`PciConfig::acpi_sci_asserted`]; no PIC/APIC wire, SMI, GPE, or
+//!   bounded ACPI PM subset — `PM1a_STS` (write-1-to-clear) / `PM1a_EN` /
+//!   `PM1a_CNT` stubs and a 24-bit `PM_TMR` in `acpi_pm_io[+8]` at 3.579545 MHz.
+//!   Advance via [`PciConfig::tick_acpi_pm`] (preferred machine hook: 3 PM
+//!   ticks per PIT step-clock) or by writing the same `acpi_pm_io` bytes. SCI
+//!   level is `(STS & EN)` while `SCI_EN` is set, reported via
+//!   [`PciConfig::acpi_sci_asserted`]; no PIC/APIC wire, SMI, GPE, or
 //!   sleep-state machine.
 //!
 //! - PIIX USB UHCI BAR0 I/O decode: when Command.IO is set and UHCI BAR0 has
@@ -165,11 +166,10 @@
 //! - Subsystem identification: Subsystem Vendor ID / Subsystem ID are read-only
 //!   zero, so a guest cannot tell this machine apart by subsystem.
 //! - BIST: read-only zero; no built-in self test exists on any function.
-//! - PIIX IDE programming interface `0x80` advertises the bus-master IDE bit.
-//!   The BMIDE register block and the bounded PRD walkers exist, but there is
-//!   still no ATA-command-driven DMA engine behind them, so that bit is an
-//!   **overstatement inherited from round 2** and is recorded here rather than
-//!   quietly changed under firmware that keys on the PIIX3 device ID.
+//! - PIIX IDE programming interface [`PCI_PROG_IF_IDE_BUS_MASTER`] (`0x80`)
+//!   advertises the bus-master IDE bit to match the BMIDE BAR + host PRD
+//!   stubs. Guest BMICOM.SSBM and ATA READ|WRITE DMA do not start transfers;
+//!   see `docs/pci-r4-bar-sizing-and-enumeration.md`.
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI SCI delivery onto the interrupt controller / SMI / GPE / sleep-state
 //!   transitions (`SLP_EN`) / ACPI tables
@@ -377,6 +377,15 @@ pub const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
 pub const PCI_SUBCLASS_USB: u8 = 0x03;
 /// UHCI programming interface (PCI class code prog IF).
 pub const PCI_PROG_IF_UHCI: u8 = 0x00;
+/// PIIX IDE programming interface: bus-master IDE capable (PCI class code bit 7).
+///
+/// Spec: PCI Local Bus — mass-storage / IDE Prog IF bit 7 advertises a bus-master
+/// IDE programming interface. This tree keeps `0x80` because the BMIDE I/O BAR
+/// and host-called PRD walkers exist (`start_bm_read` / `start_bm_write`). It does
+/// **not** mean a guest write to BMICOM.SSBM or an ATA READ/WRITE DMA command
+/// starts a transfer — see `docs/pci-r4-bar-sizing-and-enumeration.md` and
+/// `docs/pci-bmide-prd-directions.md`.
+pub const PCI_PROG_IF_IDE_BUS_MASTER: u8 = 0x80;
 /// Header type multi-function bit.
 pub const PCI_HEADER_MULTIFUNCTION: u8 = 0x80;
 /// Offset of Base Address Register 0 in a Type 0 configuration header.
@@ -1202,8 +1211,9 @@ impl PciConfig {
 
     fn init_piix_ide() -> [u8; 256] {
         let mut cfg = [0u8; 256];
-        // Spec: PCI class mass-storage / IDE (0x0101); prog IF 0x80 = bus master
-        // IDE capable bit advertised by classic PIIX; DMA engine still unsupported.
+        // Spec: PCI class mass-storage / IDE (0x0101); prog IF bit 7 =
+        // [`PCI_PROG_IF_IDE_BUS_MASTER`]. Qualified: BMIDE BAR + host PRD stubs
+        // exist; guest SSBM / ATA DMA commands do not start transfers.
         // Public PIIX3 IDE function ID 8086:7010.
         Self::write_id(
             &mut cfg,
@@ -1211,7 +1221,7 @@ impl PciConfig {
                 vendor: PCI_VENDOR_INTEL,
                 device: PCI_DEVICE_PIIX3_IDE,
                 revision: 0x00,
-                prog_if: 0x80,
+                prog_if: PCI_PROG_IF_IDE_BUS_MASTER,
                 subclass: PCI_SUBCLASS_IDE,
                 class: PCI_CLASS_STORAGE,
                 header_type: 0x00,
@@ -2501,16 +2511,33 @@ impl PciConfig {
     }
 
     fn acpi_pm_write_bytes(&mut self, off: usize, bytes: &[u8]) {
-        // Spec: ACPI fixed hardware — PM1_EN is R/W; PM1_CNT stores sticky
-        // control bits. PM1_STS remains store/readback (hardware events OR bits
-        // via assert_power_button / tick_acpi_pm); full W1C is deferred so the
-        // existing MachineBus decode test keeps working. PM_TMR lives in
+        // Spec: ACPI fixed hardware — PM1_STS is write-1-to-clear for the
+        // implemented status bits (TMR/GBL/PWRBTN/…); writes cannot set STS.
+        // PM1_EN is R/W; PM1_CNT stores sticky control bits. Hardware events OR
+        // STS via assert_power_button / tick_acpi_pm. PM_TMR lives in
         // acpi_pm_io[+8] (24-bit) so machine step-clock freerun and
         // [`Self::tick_acpi_pm`] share one register file.
+        if off < 2 {
+            let old = self.acpi_pm1_sts();
+            let mut written = 0u16;
+            for (i, b) in bytes.iter().enumerate() {
+                let abs = off + i;
+                if abs >= 2 {
+                    break;
+                }
+                written |= u16::from(*b) << (8 * abs);
+            }
+            let new = old & !(written & ACPI_PM1_STS_WRITE_CLEAR_MASK);
+            self.acpi_pm_io[0..2].copy_from_slice(&new.to_le_bytes());
+        }
         for (i, b) in bytes.iter().enumerate() {
             let abs = off + i;
             if abs >= PCI_PIIX_ACPI_PM_IO_SIZE as usize {
                 break;
+            }
+            // STS handled above; do not store guest data into those bytes.
+            if abs < 2 {
+                continue;
             }
             self.acpi_pm_io[abs] = *b;
         }
@@ -3150,7 +3177,7 @@ mod tests {
         let class_dword = pci.port_read(PCI_CONFIG_DATA, 4);
         assert_eq!((class_dword >> 24) as u8, PCI_CLASS_STORAGE);
         assert_eq!((class_dword >> 16) as u8, PCI_SUBCLASS_IDE);
-        assert_eq!((class_dword >> 8) as u8, 0x80); // prog IF bus-master capable bit
+        assert_eq!((class_dword >> 8) as u8, PCI_PROG_IF_IDE_BUS_MASTER);
     }
 
     /// Spec: Intel 82371SB — PIIX IDE BMIBA at PCI config `0x20` is an I/O BAR
@@ -4853,11 +4880,12 @@ mod tests {
         assert!(pci.acpi_pm_owns_port(0xB03F));
         assert!(!pci.acpi_pm_owns_port(0xB040));
 
-        // PM1_STS store/readback (hardware events also OR bits).
+        // PM1_STS is write-1-to-clear: guest writes cannot set status bits.
         pci.port_write(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2, 0x0101);
         assert_eq!(
             pci.port_read(0xB000 + u16::from(PCI_PIIX_ACPI_PM1A_EVT), 2) as u16,
-            0x0101
+            0,
+            "PM1_STS write cannot set bits"
         );
         // EN keeps TMR|GBL|PWRBTN only.
         pci.port_write(
