@@ -174,7 +174,7 @@ fn iretd_vm86_frame_reads_are_atomic() {
     let eflags = 0x0002 | (1 << 17);
     let (mut cpu, mut bus) = vm86_enter_fixture(eflags);
     // Only the first five dwords fit; sixth pop must `#SS(0)`.
-    cpu.ss.limit = (KERNEL_ESP - 36 + 19) as u32;
+    cpu.ss.limit = KERNEL_ESP - 36 + 19;
 
     let err = step(&mut cpu, &mut bus).expect_err("truncated VM86 frame");
     assert!(

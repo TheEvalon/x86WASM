@@ -1847,7 +1847,7 @@ fn popf_execute(
     }
 
     let mask = if operand_size_32 {
-        change | 0 // full low 32 via change bits only
+        change
     } else {
         change & 0xFFFF
     };
