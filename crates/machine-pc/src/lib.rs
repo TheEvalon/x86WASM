@@ -19,6 +19,7 @@ mod post_probe;
 mod post_spin;
 mod post_trace;
 mod step_clock;
+mod vga_font;
 mod xbcs;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};

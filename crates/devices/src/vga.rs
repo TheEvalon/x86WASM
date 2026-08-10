@@ -190,8 +190,10 @@
 //!   `docs/vga-r4-font-provenance.md` records the licensing reasoning. The
 //!   state is reported rather than left ambiguous —
 //!   [`VgaText::text_font_installed`], [`VgaText::font_bank_is_blank`], and
-//!   [`VgaFrame::font_installed`] on every alphanumeric frame — and
-//!   [`VgaText::install_font_bank`] lets a host supply its own
+//!   [`VgaFrame::font_installed`] on every alphanumeric frame —
+//!   [`VgaText::install_font_bank`] lets a host supply licensed glyphs, and
+//!   [`VgaText::install_bringup_font`] installs a procedural marker font for
+//!   host bring-up (`docs/vga-r7-font-install.md`) that is **not** IBM/CP437
 //! - ATC / Sequencer / GC timing, plane-enable / overscan display side effects,
 //!   map-mask, write-mode, read-map, or bitmask side effects on the text plane;
 //!   Internal Palette + Color Select attr→DAC composition is on host text
@@ -1169,6 +1171,41 @@ const _: () = assert!(VGA_FONT_BANK_BYTES == 0x2000);
 /// Spec: FreeVGA Fonts — "Fonts are either 8 or 9 pixels wide and can be from 1
 /// to 32 pixels high."
 pub const VGA_FONT_MAX_SCAN_LINES: usize = VGA_FONT_GLYPH_BYTES;
+
+/// Glyph height used by [`vga_bringup_font_glyphs`] / [`VgaText::install_bringup_font`].
+///
+/// Mode-03h character cells commonly use 16 scan lines (IBM VGA / FreeVGA text
+/// operation with Maximum Scan Line `0Fh`). This is the host bring-up height,
+/// not a claim that CRTC timing is derived here.
+pub const VGA_BRINGUP_FONT_HEIGHT: usize = 16;
+
+/// Length of the packed bring-up glyph buffer (`256 * VGA_BRINGUP_FONT_HEIGHT`).
+pub const VGA_BRINGUP_FONT_BYTES: usize = 256 * VGA_BRINGUP_FONT_HEIGHT;
+
+/// Procedural host bring-up font for map 2 — **not** IBM / CP437 glyphs.
+///
+/// Layout matches FreeVGA Fonts (256 codes × height bytes, top scan line first)
+/// as consumed by [`VgaText::install_font_bank`]. Space (`0x20`) is blank so the
+/// default text buffer stays visually empty; every other code gets a boxed
+/// marker whose second scan line equals the code byte (identity check for
+/// tests). Licensing: generated in-tree; no third-party font bytes
+/// (`docs/vga-r7-font-install.md`, `docs/vga-r4-font-provenance.md`).
+pub fn vga_bringup_font_glyphs() -> [u8; VGA_BRINGUP_FONT_BYTES] {
+    let mut glyphs = [0u8; VGA_BRINGUP_FONT_BYTES];
+    for code in 0u16..256 {
+        if code == u16::from(b' ') {
+            continue;
+        }
+        let base = usize::from(code) * VGA_BRINGUP_FONT_HEIGHT;
+        glyphs[base] = 0x7E; // top
+        glyphs[base + 1] = code as u8; // identity marker
+        for row in 2..VGA_BRINGUP_FONT_HEIGHT - 1 {
+            glyphs[base + row] = 0x42; // sides
+        }
+        glyphs[base + VGA_BRINGUP_FONT_HEIGHT - 1] = 0x7E; // bottom
+    }
+    glyphs
+}
 
 /// Sequencer Character Map Select bits that form Character Set A Select
 /// (bit 5 is field bit 2, bits 3:2 are field bits 1:0).
@@ -2848,6 +2885,17 @@ impl VgaText {
             self.planes[dst + glyph_height..dst + VGA_FONT_GLYPH_BYTES].fill(0);
         }
         true
+    }
+
+    /// Install the procedural host bring-up font into bank `0000h`.
+    ///
+    /// Spec path: FreeVGA Fonts / IBM PS/2 Video Subsystems — glyphs live in
+    /// map 2 at `code * 32` within an 8 KiB bank. This does **not** model a
+    /// hardware character ROM or SeaVGABIOS `INT 10h` load; it flips
+    /// [`Self::text_font_installed`] / [`VgaFrame::font_installed`] so text
+    /// mode is honest for host bring-up. See `docs/vga-r7-font-install.md`.
+    pub fn install_bringup_font(&mut self) -> bool {
+        self.install_font_bank(0, VGA_BRINGUP_FONT_HEIGHT, &vga_bringup_font_glyphs())
     }
 
     /// True when Attribute Mode Control Line Graphics Enable is set.
