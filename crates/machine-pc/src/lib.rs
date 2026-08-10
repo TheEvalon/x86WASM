@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod eltorito_load;
 mod hello_rom;
 mod mbr;
 mod mem;
@@ -91,6 +92,24 @@ pub enum MachineError {
     /// Guest RAM must cover `0x7C00`..`0x7DFF` for the boot-sector copy.
     #[error("RAM too small for MBR at 0x7C00")]
     MbrRamTooSmall,
+    /// El Torito catalog parse failed for [`Machine::load_eltorito_to_7c00`].
+    #[error(transparent)]
+    ElTorito(#[from] firmware_interface::ElToritoError),
+    /// Default entry is not bootable (`88h`).
+    #[error("El Torito default entry is not bootable")]
+    ElToritoNotBootable,
+    /// Only no-emulation media type `00h` is loaded in this slice.
+    #[error("El Torito media type not supported (no-emulation only)")]
+    ElToritoUnsupportedMedia,
+    /// Boot image extent is outside the attached CD image.
+    #[error("El Torito boot image out of range")]
+    ElToritoBootImageOob,
+    /// Guest RAM too small for the El Torito load address + sector count.
+    #[error("RAM too small for El Torito boot image")]
+    ElToritoRamTooSmall,
+    /// Sector count was zero or overflowed.
+    #[error("El Torito sector count invalid")]
+    ElToritoInvalidSectorCount,
 }
 
 pub struct Machine {
@@ -538,9 +557,9 @@ impl Machine {
     /// Attach a raw CD-ROM image (2048-byte Mode-1 blocks) as ATAPI Device 0.
     ///
     /// Wraps [`IdePrimary::attach_atapi_cdrom_image`]. Does not claim a CMOS
-    /// fixed-disk geometry (`ide_disk_sectors` stays unset). Full INT 13h CD
-    /// boot remains deferred; host-side El Torito validation is available via
-    /// [`Self::inspect_atapi_el_torito`].
+    /// fixed-disk geometry (`ide_disk_sectors` stays unset). Host-side El Torito
+    /// parse/handoff: [`Self::inspect_atapi_el_torito`] /
+    /// [`Self::load_eltorito_to_7c00`]. INT 13h CD boot remains deferred.
     pub fn attach_atapi_cdrom_image(&mut self, image: Vec<u8>) {
         self.ide.attach_atapi_cdrom_image(image);
     }
