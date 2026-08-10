@@ -2315,7 +2315,10 @@ mod tests {
         assert_eq!(d.length, 3);
 
         // /0 keeps the group mnemonic.
-        assert_eq!(decode(&[0x0F, 0xC7, 0x06, 0x00, 0x40]).unwrap().mnemonic, "GRP9");
+        assert_eq!(
+            decode(&[0x0F, 0xC7, 0x06, 0x00, 0x40]).unwrap().mnemonic,
+            "GRP9"
+        );
         assert_eq!(decode(&[0x0F, 0xC7]), Err(DecodeError::Truncated));
     }
 
