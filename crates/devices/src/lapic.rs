@@ -10,13 +10,16 @@
 //! - §10.8.3 / §10.8.4 — IRR @ `200H`–`270H`, ISR @ `100H`–`170H` (32-bit
 //!   bitmaps; bit *N* = vector *N*)
 //! - §10.8.5 — EOI @ `B0H` clears the highest-priority ISR bit
+//! - §10.8.6 — TMR @ `180H`–`1F0H` (level vs edge for accepted vectors)
 //!
 //! Round-7: software-enabled APIC + programmed one-shot/periodic timer can
 //! latch a **local** interrupt vector via [`LocalApicMmio::take_interrupt`].
 //! Round-8: IRR/ISR dword readback + EOI clears the matching ISR bit (and
-//! clears the single in-service tracker). CPUID leaf 1 EDX bit 9 (`APIC`)
-//! stays clear — presence ≠ advertised APIC.
-//! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`.
+//! clears the single in-service tracker). Round-10: Trigger Mode Register
+//! (TMR) tracks edge vs level on Fixed accept into IRR. CPUID leaf 1 EDX
+//! bit 9 (`APIC`) stays clear — presence ≠ advertised APIC.
+//! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`,
+//! `docs/lapic-r10-tmr.md`.
 
 /// Default Local APIC physical base (SDM Vol. 3A §10.4.4).
 pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
@@ -38,6 +41,9 @@ pub const LAPIC_REG_ISR_BASE: u32 = 0x100;
 
 /// Interrupt Request Register base (8×32-bit). Spec: SDM §10.8.3.
 pub const LAPIC_REG_IRR_BASE: u32 = 0x200;
+
+/// Trigger Mode Register base (8×32-bit). Spec: SDM §10.8.6.
+pub const LAPIC_REG_TMR_BASE: u32 = 0x180;
 
 /// Spurious Interrupt Vector Register offset (SDM §10.9).
 pub const LAPIC_REG_SVR: u32 = 0xF0;
@@ -81,7 +87,7 @@ pub const LAPIC_LVT_TIMER_PERIODIC: u32 = 1 << 17;
 pub const LAPIC_LVT_VECTOR_MASK: u32 = 0xFF;
 
 /// Local APIC MMIO: ID/Version + SVR + LVT Timer + timer ICR/CCR/DCR stub
-/// plus IRR/ISR bitmap readback for EOI honesty.
+/// plus IRR/ISR/TMR bitmap readback for EOI / trigger-mode honesty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalApicMmio {
     base: u64,
@@ -107,6 +113,8 @@ pub struct LocalApicMmio {
     irr: [u32; 8],
     /// In-Service Register — 256 bits as eight little-endian dwords.
     isr: [u32; 8],
+    /// Trigger Mode Register — bit set = level, clear = edge (SDM §10.8.6).
+    tmr: [u32; 8],
     /// Scratch for byte-lane assembly of dword writes.
     dword_scratch: [u8; 4],
 }
@@ -134,6 +142,7 @@ impl LocalApicMmio {
             in_service: None,
             irr: [0; 8],
             isr: [0; 8],
+            tmr: [0; 8],
             dword_scratch: [0; 4],
         }
     }
@@ -191,6 +200,18 @@ impl LocalApicMmio {
         bitmap_get(&self.isr, vector)
     }
 
+    /// Read one TMR dword (index 0..=7 → offsets `180H`..`1F0H`).
+    pub fn tmr_dword(&self, index: usize) -> Option<u32> {
+        self.tmr.get(index).copied()
+    }
+
+    /// True if TMR bit is set (level-triggered accept for that vector).
+    ///
+    /// Spec: SDM §10.8.6 — bit set = level; clear = edge.
+    pub fn tmr_bit(&self, vector: u8) -> bool {
+        bitmap_get(&self.tmr, vector)
+    }
+
     /// Software enable from SVR bit 8.
     pub fn software_enabled(&self) -> bool {
         self.svr & LAPIC_SVR_SW_ENABLE != 0
@@ -232,6 +253,10 @@ impl LocalApicMmio {
             o if (LAPIC_REG_ISR_BASE..LAPIC_REG_ISR_BASE + 0x80).contains(&o) && o & 0xF == 0 => {
                 let idx = ((o - LAPIC_REG_ISR_BASE) / 0x10) as usize;
                 self.isr.get(idx).copied().unwrap_or(0)
+            }
+            o if (LAPIC_REG_TMR_BASE..LAPIC_REG_TMR_BASE + 0x80).contains(&o) && o & 0xF == 0 => {
+                let idx = ((o - LAPIC_REG_TMR_BASE) / 0x10) as usize;
+                self.tmr.get(idx).copied().unwrap_or(0)
             }
             o if (LAPIC_REG_IRR_BASE..LAPIC_REG_IRR_BASE + 0x80).contains(&o) && o & 0xF == 0 => {
                 let idx = ((o - LAPIC_REG_IRR_BASE) / 0x10) as usize;
@@ -285,9 +310,20 @@ impl LocalApicMmio {
 
     /// Latch a Fixed-mode vector from the I/O APIC (software-enable gated).
     ///
+    /// Edge-triggered accept (clears TMR bit). Prefer
+    /// [`Self::inject_fixed_trigger`] when the RTE trigger mode is known.
+    ///
     /// Spec: SDM §10.8 / 82093AA Fixed delivery. Returns `true` when newly
     /// latched. Does not overwrite an already-pending vector.
     pub fn inject_fixed(&mut self, vector: u8) -> bool {
+        self.inject_fixed_trigger(vector, false)
+    }
+
+    /// Latch a Fixed-mode vector and record TMR for the trigger mode.
+    ///
+    /// Spec: SDM §10.8.6 — on acceptance into IRR, TMR bit is set for level
+    /// and cleared for edge. Returns `true` when newly latched.
+    pub fn inject_fixed_trigger(&mut self, vector: u8, level: bool) -> bool {
         if !self.software_enabled() {
             return false;
         }
@@ -295,6 +331,11 @@ impl LocalApicMmio {
             return false;
         }
         bitmap_set(&mut self.irr, vector);
+        if level {
+            bitmap_set(&mut self.tmr, vector);
+        } else {
+            bitmap_clear(&mut self.tmr, vector);
+        }
         self.pending_vector = Some(vector);
         true
     }
@@ -309,8 +350,10 @@ impl LocalApicMmio {
         let vector = (self.lvt_timer & LAPIC_LVT_VECTOR_MASK) as u8;
         // Soft-priority floor: vectors 0..=15 are reserved; still latch for
         // honesty when software programmed them (tests may use ≥0x20).
+        // Local APIC timer is edge-triggered (SDM §10.5.1) → clear TMR.
         if self.pending_vector.is_none() {
             bitmap_set(&mut self.irr, vector);
+            bitmap_clear(&mut self.tmr, vector);
             self.pending_vector = Some(vector);
         }
     }
@@ -621,5 +664,42 @@ mod tests {
         assert!(lapic.isr_bit(0x40));
         write_u32(&mut lapic, LAPIC_REG_EOI, 0);
         assert!(!lapic.isr_bit(0x40));
+    }
+
+    /// Spec: SDM Vol. 3A §10.8.6 — TMR set on level accept into IRR, clear on
+    /// edge; EOI does not invent or clear TMR bits; MMIO writes are ignored.
+    #[test]
+    fn tmr_tracks_edge_vs_level_accept_eoi_unchanged() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+
+        // Edge Fixed: TMR bit clear.
+        assert!(lapic.inject_fixed_trigger(0x55, false));
+        assert!(!lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 0);
+        assert_eq!(lapic.take_interrupt(), Some(0x55));
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        assert!(!lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 0);
+
+        // Level Fixed: TMR bit set (dword index 2, bit 21 = vector 0x55).
+        assert!(lapic.inject_fixed_trigger(0x55, true));
+        assert!(lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 1 << 21);
+        assert_eq!(lapic.take_interrupt(), Some(0x55));
+        // Still set after accept into ISR.
+        assert!(lapic.tmr_bit(0x55));
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        // EOI must not invent or clear TMR.
+        assert!(lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 1 << 21);
+
+        // Software writes to TMR are claimed and ignored.
+        write_u32(&mut lapic, LAPIC_REG_TMR_BASE + 0x20, 0);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 1 << 21);
+
+        // Re-accept as edge clears the prior level bit.
+        assert!(lapic.inject_fixed_trigger(0x55, false));
+        assert!(!lapic.tmr_bit(0x55));
     }
 }
