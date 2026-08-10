@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod eltorito_load;
 mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
@@ -113,6 +114,24 @@ pub enum MachineError {
     /// Guest RAM must cover `0x7C00`..`0x7DFF` for the boot-sector copy.
     #[error("RAM too small for MBR at 0x7C00")]
     MbrRamTooSmall,
+    /// El Torito catalog parse failed for [`Machine::load_eltorito_to_7c00`].
+    #[error(transparent)]
+    ElTorito(#[from] firmware_interface::ElToritoError),
+    /// Default entry is not bootable (`88h`).
+    #[error("El Torito default entry is not bootable")]
+    ElToritoNotBootable,
+    /// Only no-emulation media type `00h` is loaded in this slice.
+    #[error("El Torito media type not supported (no-emulation only)")]
+    ElToritoUnsupportedMedia,
+    /// Boot image extent is outside the attached CD image.
+    #[error("El Torito boot image out of range")]
+    ElToritoBootImageOob,
+    /// Guest RAM too small for the El Torito load address + sector count.
+    #[error("RAM too small for El Torito boot image")]
+    ElToritoRamTooSmall,
+    /// Sector count was zero or overflowed.
+    #[error("El Torito sector count invalid")]
+    ElToritoInvalidSectorCount,
     /// Option-ROM base is not a valid legacy entry (`CS:IP` cannot be formed).
     #[error("option ROM entry base is invalid")]
     OptionRomEntryInvalid,
@@ -627,8 +646,8 @@ impl Machine {
     ///
     /// Wraps [`IdePrimary::attach_atapi_cdrom_image`]. Does not claim a CMOS
     /// fixed-disk geometry (`ide_disk_sectors` stays unset). Host-side El Torito
-    /// inspection: [`Self::inspect_atapi_el_torito`]. INT 13h CD boot remains
-    /// deferred.
+    /// parse/handoff: [`Self::inspect_atapi_el_torito`] /
+    /// [`Self::load_eltorito_to_7c00`]. INT 13h CD boot remains deferred.
     pub fn attach_atapi_cdrom_image(&mut self, image: Vec<u8>) {
         self.ide.attach_atapi_cdrom_image(image);
     }
@@ -636,7 +655,7 @@ impl Machine {
     /// Parse El Torito from the attached ATAPI CD-ROM image (host-side only).
     ///
     /// Spec: El Torito 1.0 — Boot Record + Validation Entry (`55h`/`AAh`) +
-    /// Initial/Default Entry. Does not load or execute a boot image.
+    /// Initial/Default Entry. Load/execute uses [`Self::load_eltorito_to_7c00`].
     pub fn inspect_atapi_el_torito(
         &self,
     ) -> Result<firmware_interface::ElToritoInfo, firmware_interface::ElToritoError> {

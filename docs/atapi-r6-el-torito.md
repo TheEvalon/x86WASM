@@ -1,8 +1,8 @@
-# El Torito host-side detection
+# El Torito host-side detection and no-emul handoff
 
-Milestone 2, round 6, slice 4. CD boot remains an open Milestone 2 exit item;
-this slice adds **host-side** validation of an attached ATAPI/ISO image without
-INT 13h CD emulation or executing a boot image.
+Milestone 2, round 6 (inspect) + round 8 (load restore). CD boot remains an
+open Milestone 2 exit item; this documents **host-side** catalog validation and
+a bounded no-emulation load to the load segment (default phys `0x7C00`).
 
 ## Approved sources used here
 
@@ -19,10 +19,12 @@ INT 13h CD emulation or executing a boot image.
 | `firmware_interface::parse_el_torito` | Pure parser over a raw 2048-byte-sector image |
 | `IdePrimary::atapi_medium_image` | Borrow attached CD bytes for host helpers |
 | `Machine::inspect_atapi_el_torito` | Parse the primary ATAPI medium |
+| `Machine::load_eltorito_to_7c00` | No-emul image copy + `CS:IP` handoff |
 
 ## Still unsupported
 
-- INT 13h CD emulation / booting the load RBA
+- INT 13h CD emulation / guest CD BIOS services
+- Floppy/HDD emulation media types
 - Multi-section catalogs / EFI platform `EFh` section headers (platform ID is
   reported; section walking is not)
-- SeaVGABIOS option-ROM execution (map path already exists from earlier rounds)
+- SeaBIOS CD boot path
