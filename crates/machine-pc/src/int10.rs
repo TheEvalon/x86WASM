@@ -298,16 +298,19 @@ impl Machine {
         Some(u16::from(lo) | (u16::from(hi) << 8))
     }
 
+    #[cfg(test)]
     fn read_bda_u16(&self, phys: u64) -> Option<u16> {
         let lo = self.read_bda_u8(phys)?;
         let hi = self.read_bda_u8(phys + 1)?;
         Some(u16::from(lo) | (u16::from(hi) << 8))
     }
 
+    #[cfg(test)]
     fn read_bda_page_size(&self) -> Option<u16> {
         self.read_bda_u16(BDA_VIDEO_PAGE_SIZE)
     }
 
+    #[cfg(test)]
     fn read_bda_page_start(&self) -> Option<u16> {
         self.read_bda_u16(BDA_VIDEO_PAGE_START)
     }
