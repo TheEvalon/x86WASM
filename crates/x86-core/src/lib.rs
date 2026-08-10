@@ -7,9 +7,9 @@
 
 /// `IA32_APIC_BASE` (MSR `0x1B`) reset value used by this tree.
 ///
-/// BSP (bit 8) = 1, APIC global enable (bit 10) = 0, base = `0xFEE0_0000`.
-/// Enable stays clear until Local APIC MMIO is real; the CPU only stores the
-/// MSR. Spec: Intel SDM Vol. 3 / Vol. 4 MSR `1Bh`.
+/// BSP (bit 8) = 1, APIC Global Enable EN (bit 11) = 0, EXTD (bit 10) = 0,
+/// base = `0xFEE0_0000`. Enable stays clear until Local APIC MMIO is real; the
+/// CPU only stores the MSR. Spec: Intel SDM Vol. 3 §10.4.4 / Vol. 4 MSR `1Bh`.
 pub const IA32_APIC_BASE_RESET: u64 = 0xFEE0_0100;
 
 /// Serde default for [`CpuState::ia32_apic_base`] (snapshot version-compat).
@@ -165,9 +165,10 @@ pub struct CpuState {
     pub efer: u64,
     /// `IA32_APIC_BASE` (MSR `0x1B`) — BSP, global enable, and APIC base field.
     ///
-    /// Reset: BSP=1, enable=0, base=`0xFEE0_0000` (`0xFEE0_0100`). Enable stays
-    /// clear until a real Local APIC exists; this MSR only stores/readbacks CPU
-    /// state (no MMIO side effect). Spec: Intel SDM Vol. 3 / Vol. 4 MSR `1Bh`.
+    /// Reset: BSP=1, EN (bit 11)=0, EXTD (bit 10)=0, base=`0xFEE0_0000`
+    /// (`0xFEE0_0100`). Enable stays clear until a real Local APIC exists; this
+    /// MSR only stores/readbacks CPU state (no MMIO side effect).
+    /// Spec: Intel SDM Vol. 3 §10.4.4 / Vol. 4 MSR `1Bh`.
     #[cfg_attr(feature = "serde", serde(default = "default_ia32_apic_base"))]
     pub ia32_apic_base: u64,
     pub halted: bool,
@@ -565,7 +566,8 @@ mod tests {
         assert_eq!(cpu.cr0, 0x6000_0010);
         assert_eq!(cpu.ia32_apic_base, IA32_APIC_BASE_RESET);
         assert_eq!(cpu.ia32_apic_base & (1 << 8), 1 << 8, "BSP set");
-        assert_eq!(cpu.ia32_apic_base & (1 << 10), 0, "APIC enable clear");
+        assert_eq!(cpu.ia32_apic_base & (1 << 10), 0, "EXTD clear");
+        assert_eq!(cpu.ia32_apic_base & (1 << 11), 0, "EN clear");
         assert_eq!(cpu.ia32_apic_base & !0xFFF, 0xFEE0_0000);
         assert!(!cpu.halted);
     }

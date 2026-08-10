@@ -11,15 +11,18 @@ MMIO enable side effect (device ownership is elsewhere).
 |---|---|---|
 | Base `[35:12]` | `0xFEE0_0000` | Architectural default APIC physical base |
 | BSP (bit 8) | `1` | Single-processor / BSP firmware expectation |
-| Enable (bit 10) | `0` | Prefer clear until LAPIC MMIO is fully real |
-| x2APIC (bit 11) | reserved `0` | Unsupported → `#GP(0)` if written `1` |
+| EXTD (bit 10) | reserved `0` | x2APIC unsupported → `#GP(0)` if written `1` |
+| EN (bit 11) | `0` | Prefer clear until LAPIC MMIO is fully real |
 
 Reset constant: `IA32_APIC_BASE_RESET = 0xFEE0_0100` in `x86-core`.
 
+Bit layout follows Intel SDM Vol. 3 §10.4.4 / x2APIC spec: **EN = bit 11**,
+**EXTD = bit 10**.
+
 ## Writable mask
 
-`BSP | EN | base[35:12]`. Any other bit (including bit 11 and `[63:36]`) on
-`WRMSR` raises `#GP(0)` with state unchanged.
+Software may write `EN | base[35:12]`. BSP is preserved from the prior value
+(changing it → `#GP(0)`). EXTD and other reserved bits → `#GP(0)`.
 
 ## Honesty
 
@@ -29,4 +32,4 @@ Reset constant: `IA32_APIC_BASE_RESET = 0xFEE0_0100` in `x86-core`.
 
 ## Spec
 
-Intel SDM Vol. 2 "RDMSR"/"WRMSR"; Vol. 3 Local APIC / IA32_APIC_BASE; Vol. 4 MSR `1Bh`.
+Intel SDM Vol. 2 "RDMSR"/"WRMSR"; Vol. 3 §10.4.4; Vol. 4 MSR `1Bh`.
