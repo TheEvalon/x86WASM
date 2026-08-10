@@ -16,7 +16,9 @@
 //!
 //! [QEMU Firmware Configuration (fw_cfg) Device]: https://www.qemu.org/docs/master/specs/fw_cfg.html
 
-use devices::{FwCfg, PortDevice, FW_CFG_DATA, FW_CFG_SELECTOR};
+use devices::{
+    FwCfg, PortDevice, FW_CFG_DATA, FW_CFG_FILE_TABLE_LOADER, FW_CFG_SELECTOR,
+};
 
 /// Interface reference (ADR-0005): system UUID, 16 bytes.
 const KEY_UUID: u16 = 0x0002;
@@ -29,7 +31,6 @@ const KEY_MAX_CPUS: u16 = 0x000F;
 
 const FILE_MAX_CPUS: &str = "etc/max-cpus";
 const FILE_SYSTEM_STATES: &str = "etc/system-states";
-const FILE_TABLE_LOADER: &str = "etc/table-loader";
 const FILE_BOOTORDER: &str = "bootorder";
 
 fn select(cfg: &mut FwCfg, selector: u16) {
@@ -186,14 +187,31 @@ fn system_states_is_absent_because_no_sleep_state_is_implemented() {
     );
 }
 
-/// `etc/table-loader` is the ACPI table build script. This tree builds no ACPI
-/// tables, so there is nothing to load and the file is not implemented at all —
-/// not even as a host-settable blob, because there is no honest content for it.
+/// `etc/table-loader` is the QEMU/SeaBIOS ACPI table-loader command stream.
+/// This tree builds no ACPI tables (no RSDP/XSDT/FADT), so the honest policy is
+/// to omit the file — never publish a zero-entry loader that would still claim
+/// the protocol. Spec / policy: ADR-0005, `docs/fwcfg-r4-selectors.md`.
 #[test]
-fn table_loader_is_not_implemented() {
+fn table_loader_is_omitted_and_name_lookup_fails_cleanly() {
+    assert_eq!(FW_CFG_FILE_TABLE_LOADER, "etc/table-loader");
     let cfg = FwCfg::new();
-    assert_eq!(cfg.file_selector(FILE_TABLE_LOADER), None);
-    assert!(!cfg.file_names().contains(&FILE_TABLE_LOADER));
+
+    // Host name lookup fails cleanly.
+    assert_eq!(cfg.file_selector(FW_CFG_FILE_TABLE_LOADER), None);
+    assert!(!cfg.file_names().contains(&FW_CFG_FILE_TABLE_LOADER));
+
+    // The file directory does not advertise the name either.
+    for name in cfg.file_names() {
+        assert_ne!(
+            name, FW_CFG_FILE_TABLE_LOADER,
+            "directory must not list etc/table-loader"
+        );
+    }
+
+    // There is no setter: publishing would invent tables that do not exist.
+    // Replacing content under this name via the generic file API is still
+    // possible for host experiments, but the default device and machine sync
+    // paths must leave it absent (see machine-pc sync comment).
 }
 
 /// Host configuration survives a device reset; only the guest-visible selector

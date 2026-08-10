@@ -47,11 +47,19 @@
 //!   [`FW_CFG_FILE_SYSTEM_STATES`]. Each describes a machine fact this device
 //!   cannot state on its own, so it stays absent until a host supplies it.
 //!
+//! # Deliberately absent: `etc/table-loader`
+//!
+//! [`FW_CFG_FILE_TABLE_LOADER`] is the QEMU/SeaBIOS ACPI table-loader script
+//! (command stream: allocate / add-pointer / checksum / write-pointer entries
+//! that place RSDP/XSDT/FADT and friends). Interface reference: ADR-0005 and
+//! `docs/fwcfg-r4-selectors.md`. This tree builds **no** ACPI tables, so the
+//! honest policy is to **omit** the file entirely — never publish an empty
+//! zero-entry blob, which would still claim the loader protocol while listing
+//! nothing to load. [`FwCfg::file_selector`] returns `None`; machine
+//! `sync_firmware_configuration` never invents it.
+//!
 //! # Still not implemented
 //!
-//! - `etc/table-loader`. It is the ACPI table build script, and this tree
-//!   builds no ACPI tables, so there is nothing to load — not even a
-//!   host-settable blob, because no honest content exists for it.
 //! - Every other numeric key. Absent items read as the specification's "past
 //!   the end of the item" answer of `0x00` rather than a fabricated value.
 //! - Item writeability (selector bit 14 / DMA control bit 4).
@@ -134,6 +142,12 @@ pub const FW_CFG_SYSTEM_STATE_ENABLED: u8 = 0x80;
 /// newline-separated encoding. **Absent by default** — this machine states no
 /// boot policy. See [`FwCfg::set_boot_order`].
 pub const FW_CFG_FILE_BOOTORDER: &str = "bootorder";
+/// Named firmware file for the ACPI table-loader script — **never published**.
+///
+/// Interface reference (ADR-0005): QEMU/SeaBIOS `etc/table-loader` is a command
+/// stream that installs ACPI tables from fw_cfg blobs. This machine has no ACPI
+/// tables, so the name stays absent (see module docs / `docs/fwcfg-r4-selectors.md`).
+pub const FW_CFG_FILE_TABLE_LOADER: &str = "etc/table-loader";
 
 /// CPU count this device reports when the host states nothing else.
 ///

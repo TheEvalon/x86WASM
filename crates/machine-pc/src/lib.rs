@@ -338,6 +338,8 @@ impl Machine {
         // This machine has one execution context and no SMP, so the truthful
         // count is 1. Host-settable items (UUID, nographic, bootorder,
         // etc/system-states) stay absent until the host has a truthful value.
+        // `etc/table-loader` is never published: there are no ACPI tables to
+        // load (docs/fwcfg-r4-selectors.md).
         self.fw_cfg.set_cpu_count(FW_CFG_DEFAULT_CPU_COUNT);
         let entries = self.e820_entries();
         self.fw_cfg.set_e820_entries(&entries);

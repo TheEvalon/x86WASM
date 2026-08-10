@@ -59,11 +59,19 @@ so publishing a states blob would advertise a surface that does not exist.
 `set_boot_order(&[])` removes the file rather than publishing an empty policy,
 for the same reason `set_e820_entries(&[])` removes `etc/e820`.
 
+## Deliberately absent: `etc/table-loader`
+
+| File | Policy | Why |
+|---|---|---|
+| `etc/table-loader` (`FW_CFG_FILE_TABLE_LOADER`) | **Omitted** — never present in the file directory | The QEMU/SeaBIOS table-loader blob is a command stream (allocate / add-pointer / add-checksum / write-pointer) that installs ACPI tables from other fw_cfg files. This tree has no RSDP/XSDT/FADT (or any other ACPI table). Publishing a zero-entry loader would still advertise the loader protocol while listing nothing honest to load; omitting the name is the truthful answer. |
+
+Name lookup (`FwCfg::file_selector("etc/table-loader")`) returns `None`. A guest
+that never saw the name in the directory has no selector to read; probing an
+unknown selector still yields the specification's `0x00`.
+`Machine::sync_firmware_configuration` must not invent the file.
+
 ## Not implemented
 
-- `etc/table-loader`. It is the ACPI table build script, and this tree builds no
-  ACPI tables, so there is nothing to load — not even as a host-settable blob,
-  because no honest content exists for it.
 - Every other numeric key. Absent items read `0x00`.
 - Item writeability: selector bit 14 and DMA control bit 4 (write) are rejected
   with the spec's error bit rather than modelled.
@@ -74,4 +82,5 @@ for the same reason `set_e820_entries(&[])` removes `etc/e820`.
 CPU-count views (`NB_CPUS` / `max-cpus` / `etc/max-cpus` = 1), so a running
 machine answers them. The host-settable items (UUID, nographic, bootorder,
 `etc/system-states`) remain absent until the host supplies a truthful value —
-nothing in `crates/machine-pc` invents one.
+nothing in `crates/machine-pc` invents one, and **`etc/table-loader` stays
+absent through sync**.
