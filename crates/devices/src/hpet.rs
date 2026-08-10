@@ -16,8 +16,11 @@
 //! GSI (default IRQ2) from [`HpetMmio::irq_line`] / [`HpetMmio::ioapic_gsi`].
 //! Round-11: 32-bit main-counter wrap crossing is tested; level IRQ still
 //! asserted after EOI is re-driven onto the I/O APIC GSI (host wire).
+//! Round-12: MSI/FSB capability stays **clear** (no false FSB_INT_DEL_CAP /
+//! FSB_EN); IRQ route tests deepen advertised-vs-default GSI honesty.
 //! See `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`,
-//! `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`.
+//! `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`,
+//! `docs/hpet-r12-msi-irq.md`.
 
 /// Classic HPET MMIO base (PC firmware convention / ACPI GAS address).
 pub const HPET_DEFAULT_BASE: u64 = 0xFED0_0000;
@@ -61,6 +64,18 @@ pub const HPET_TN_PER_INT_CAP: u64 = 1 << 4;
 /// Timer n Value Set (`Tn_VAL_SET_CNF`) — bit 6 (W1; not retained).
 pub const HPET_TN_VAL_SET: u64 = 1 << 6;
 
+/// Timer n FSB Interrupt Enable (`Tn_FSB_EN_CNF`) — bit 14.
+///
+/// Spec: HPET 1.0a — only meaningful when `Tn_FSB_INT_DEL_CAP` is set. This
+/// stub keeps FSB/MSI capability **clear**, so writes to this bit are dropped.
+pub const HPET_TN_FSB_EN: u64 = 1 << 14;
+
+/// Timer n FSB Interrupt Delivery Capable (`Tn_FSB_INT_DEL_CAP`) — bit 15 (RO).
+///
+/// Honesty: always clear — this tree does not implement FSB/MSI message
+/// delivery. Software must use I/O APIC routing via `Tn_INT_ROUTE_CNF`.
+pub const HPET_TN_FSB_INT_DEL_CAP: u64 = 0;
+
 /// Timer n Interrupt Route field (`Tn_INT_ROUTE_CNF`) — bits 13:9.
 pub const HPET_TN_INT_ROUTE_SHIFT: u32 = 9;
 
@@ -76,6 +91,12 @@ pub const HPET_NUM_TIM_CAP: u8 = 0;
 /// `COUNT_SIZE_CAP` clear — main counter treated as 32-bit capable in CAPS.
 pub const HPET_COUNT_SIZE_CAP: u64 = 0;
 
+/// LegacyReplacement Route Capable (`LEG_RT_CAP`) — CAPS bit 15.
+///
+/// Honesty: clear — this stub does not implement legacy 8254/RTC replacement
+/// routing (HPET 1.0a §2.3.1).
+pub const HPET_LEG_RT_CAP: u64 = 0;
+
 /// Vendor ID (CAPS bits 31:16) — Intel PCI vendor for a PC-compatible stub.
 pub const HPET_VENDOR_ID: u16 = 0x8086;
 
@@ -90,6 +111,7 @@ pub const HPET_COUNTER_CLK_PERIOD_FS: u32 = 69_841_279;
 pub const HPET_CAPS_ID_VALUE: u64 = (HPET_REV_ID as u64)
     | ((HPET_NUM_TIM_CAP as u64) << 8)
     | HPET_COUNT_SIZE_CAP
+    | HPET_LEG_RT_CAP
     | ((HPET_VENDOR_ID as u64) << 16)
     | ((HPET_COUNTER_CLK_PERIOD_FS as u64) << 32);
 
@@ -105,7 +127,12 @@ pub const HPET_T0_INT_ROUTE_CAP: u32 = 1 << 2;
 pub const HPET_DEFAULT_IOAPIC_GSI: u8 = 2;
 
 /// RO capability bits always present in Timer 0 config.
-pub const HPET_T0_CONFIG_CAPS: u64 = HPET_TN_PER_INT_CAP | ((HPET_T0_INT_ROUTE_CAP as u64) << 32);
+///
+/// Includes `PER_INT_CAP` + `INT_ROUTE_CAP=IRQ2`. Explicitly **excludes**
+/// `Tn_FSB_INT_DEL_CAP` ([`HPET_TN_FSB_INT_DEL_CAP`] = 0) so MSI/FSB is not
+/// falsely advertised.
+pub const HPET_T0_CONFIG_CAPS: u64 =
+    HPET_TN_PER_INT_CAP | HPET_TN_FSB_INT_DEL_CAP | ((HPET_T0_INT_ROUTE_CAP as u64) << 32);
 
 /// Writable Timer 0 config bits retained by this stub.
 const HPET_T0_CONFIG_WRITABLE: u64 =
@@ -354,6 +381,9 @@ impl HpetMmio {
             if !route_ok {
                 retained &= !HPET_TN_INT_ROUTE_MASK;
             }
+            // Spec: HPET 1.0a — Tn_FSB_EN_CNF is meaningless while
+            // Tn_FSB_INT_DEL_CAP is clear; drop the bit so it never sticks.
+            retained &= !HPET_TN_FSB_EN;
             // Spec: HPET 1.0a — Tn_VAL_SET_CNF is W1 and not retained; it arms
             // the next comparator write to load the periodic accumulator.
             if raw & HPET_TN_VAL_SET != 0 {
@@ -664,5 +694,76 @@ mod tests {
         assert!(hpet.advance_main_counter(0x20)); // crosses 0xFFFFFFF8 then wraps
         assert_eq!(hpet.main_counter(), 0x10);
         assert_eq!(hpet.intr_status() & 1, 1);
+    }
+
+    /// Spec: HPET 1.0a — `Tn_FSB_INT_DEL_CAP` clear; FSB_EN / LEG_RT not claimed.
+    #[test]
+    fn fsb_msi_capability_clear_and_fsb_en_dropped() {
+        let mut hpet = HpetMmio::new();
+        let cfg = hpet.t0_config();
+        assert_eq!(cfg & (1 << 15), HPET_TN_FSB_INT_DEL_CAP);
+        assert_eq!(HPET_TN_FSB_INT_DEL_CAP, 0);
+        assert_eq!(HPET_CAPS_ID_VALUE & (1 << 15), HPET_LEG_RT_CAP);
+        assert_eq!(HPET_LEG_RT_CAP, 0);
+
+        // Attempt to set FSB_EN + junk route IRQ5 (not in INT_ROUTE_CAP).
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | HPET_TN_FSB_EN | (5 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        assert_eq!(
+            hpet.t0_config() & HPET_TN_FSB_EN,
+            0,
+            "FSB_EN must not stick"
+        );
+        assert_eq!(hpet.t0_int_route(), 0, "unadvertised IRQ5 must not stick");
+        assert_eq!(hpet.ioapic_gsi(), HPET_DEFAULT_IOAPIC_GSI);
+    }
+
+    /// Spec: HPET 1.0a — only IRQ2 is advertised; route+GSI deepen vs R11 wrap.
+    #[test]
+    fn irq_route_only_advertised_gsi2_sticks() {
+        let mut hpet = HpetMmio::new();
+        assert_eq!(HPET_T0_INT_ROUTE_CAP, 1 << 2);
+        assert_eq!(hpet.ioapic_gsi(), 2);
+
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | (2 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        assert_eq!(hpet.t0_int_route(), 2);
+        assert_eq!(hpet.ioapic_gsi(), 2);
+
+        // IRQ0 / IRQ3 are not in CAP — force default GSI 2 and clear route field.
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | (3 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        assert_eq!(hpet.t0_int_route(), 0);
+        assert_eq!(hpet.ioapic_gsi(), HPET_DEFAULT_IOAPIC_GSI);
+
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | (0 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        assert_eq!(hpet.t0_int_route(), 0);
+        assert_eq!(hpet.ioapic_gsi(), 2);
+
+        // After programming IRQ2, fire still asserts irq_line (route honesty
+        // does not break the R7/R10/R11 IRQ path).
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | HPET_TN_INT_TYPE | (2 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 5);
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        assert!(hpet.advance_main_counter(5));
+        assert!(hpet.irq_line());
+        assert_eq!(hpet.ioapic_gsi(), 2);
     }
 }

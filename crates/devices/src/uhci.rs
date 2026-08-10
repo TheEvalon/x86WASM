@@ -1,29 +1,68 @@
 //! UHCI schedule + PORTSC stub (Intel UHCI / PIIX3 USB).
 //!
 //! Spec: Universal Host Controller Interface (UHCI) Design Guide, Revision 1.1;
-//! Intel 82371SB (PIIX3) USB function. Frame list → (optional QH + one horizontal
-//! hop) → TD transfer via host memory callbacks; PORTSC CCS/PED/PR for firmware
-//! probe. No real USB device stack, no isochronous bandwidth accounting, no
-//! full multi-QH reclaim walks.
+//! Intel 82371SB (PIIX3) USB function. Frame list → (optional QH + bounded
+//! horizontal chain) → TD transfer via host memory callbacks; PORTSC CCS/PED/PR
+//! for firmware probe. No real USB device stack, no isochronous bandwidth
+//! accounting, no full multi-QH reclaim walks.
 //!
 //! PCI config / BAR0 I/O decode remain in [`crate::pci::PciConfig`]; this module
 //! owns schedule + PORTSC bit semantics. See `docs/uhci-r8-one-td.md`,
-//! `docs/uhci-r11-frame-list-walk.md`, `docs/uhci-r11-portsc.md`.
+//! `docs/uhci-r11-frame-list-walk.md`, `docs/uhci-r11-portsc.md`,
+//! `docs/uhci-r12-qh-horizontal.md`, `docs/uhci-r12-usbsts-usbintr.md`.
 
 use crate::pci::{
     PCI_PIIX_USB_UHCI_FLBASEADD, PCI_PIIX_USB_UHCI_FRNUM, PCI_PIIX_USB_UHCI_IO_SIZE,
     PCI_PIIX_USB_UHCI_PORTSC1, PCI_PIIX_USB_UHCI_PORTSC2, PCI_PIIX_USB_UHCI_USBCMD,
-    PCI_PIIX_USB_UHCI_USBSTS,
+    PCI_PIIX_USB_UHCI_USBINTR, PCI_PIIX_USB_UHCI_USBSTS,
 };
 
 /// USBCMD Run/Stop bit (UHCI 1.1 §2.1.1 bit 0).
 pub const UHCI_USBCMD_RS: u16 = 1 << 0;
 
+/// USBCMD Global Suspend (UHCI 1.1 §2.1.1 bit 3) — required for Resume Detect.
+pub const UHCI_USBCMD_GSUSPEND: u16 = 1 << 3;
+
 /// USBSTS USB Interrupt (UHCI 1.1 §2.1.2 bit 0) — set on IOC completion.
 pub const UHCI_USBSTS_USBINT: u16 = 1 << 0;
 
+/// USBSTS USB Error Interrupt (UHCI 1.1 §2.1.2 bit 1).
+pub const UHCI_USBSTS_USBERRINT: u16 = 1 << 1;
+
+/// USBSTS Resume Detect (UHCI 1.1 §2.1.2 bit 2).
+pub const UHCI_USBSTS_RD: u16 = 1 << 2;
+
+/// USBSTS Host System Error (UHCI 1.1 §2.1.2 bit 3).
+pub const UHCI_USBSTS_HSE: u16 = 1 << 3;
+
+/// USBSTS HC Process Error (UHCI 1.1 §2.1.2 bit 4) — fatal; not maskable.
+pub const UHCI_USBSTS_HCPE: u16 = 1 << 4;
+
 /// USBSTS HCHalted (UHCI 1.1 §2.1.2 bit 5) — sticky while RS clear (stub).
 pub const UHCI_USBSTS_HCHALTED: u16 = 1 << 5;
+
+/// USBSTS bits cleared by writing 1 (R/WC). Spec: UHCI 1.1 §2.1.2.
+pub const UHCI_USBSTS_RWC_MASK: u16 = UHCI_USBSTS_USBINT
+    | UHCI_USBSTS_USBERRINT
+    | UHCI_USBSTS_RD
+    | UHCI_USBSTS_HSE
+    | UHCI_USBSTS_HCPE;
+
+/// USBINTR Timeout/CRC Interrupt Enable (UHCI 1.1 §2.1.3 bit 0) — gates USBERRINT.
+pub const UHCI_USBINTR_CRC: u16 = 1 << 0;
+
+/// USBINTR Resume Interrupt Enable (bit 1).
+pub const UHCI_USBINTR_RESUME: u16 = 1 << 1;
+
+/// USBINTR Interrupt On Complete Enable (bit 2) — gates USBINT from IOC.
+pub const UHCI_USBINTR_IOC: u16 = 1 << 2;
+
+/// USBINTR Short Packet Interrupt Enable (bit 3).
+pub const UHCI_USBINTR_SPI: u16 = 1 << 3;
+
+/// Guest-writable USBINTR bits (15:4 reserved → hardwired 0).
+pub const UHCI_USBINTR_WRITABLE: u16 =
+    UHCI_USBINTR_CRC | UHCI_USBINTR_RESUME | UHCI_USBINTR_IOC | UHCI_USBINTR_SPI;
 
 /// Frame-list / QH / TD link Terminate bit.
 pub const UHCI_LINK_TERMINATE: u32 = 1 << 0;
@@ -61,8 +100,19 @@ pub const UHCI_TD_MAX_TRANSFER: usize = 1280;
 /// Soft cap on frames walked by [`run_n_frames`] (1024-slot frame list).
 pub const UHCI_MAX_FRAMES_WALK: u32 = 1024;
 
-/// Soft cap on QH horizontal hops per frame (R11 stub depth).
-pub const UHCI_MAX_QH_HORIZONTAL: u32 = 1;
+/// Soft cap on QH horizontal hops per frame (R12: deeper than R11's single hop).
+///
+/// Spec: UHCI 1.1 §3.3 — horizontal link may chain queue heads. This stub
+/// follows the starting QH plus up to this many additional horizontal QH hops
+/// (so at most `1 + UHCI_MAX_QH_HORIZONTAL` QHs / element TDs per frame).
+/// Deeper chains return [`UhciTdError::QueueHeadHorizontalUnsupported`].
+/// Isochronous TD schedules are not special-cased: a frame-list TD link still
+/// executes as an ordinary Active TD; bandwidth reclamation / iso reclaim is
+/// explicitly unsupported.
+pub const UHCI_MAX_QH_HORIZONTAL: u32 = 4;
+
+/// Max TD addresses collected per frame (`1` start + horizontal hops).
+pub const UHCI_MAX_FRAME_TDS: usize = 1 + UHCI_MAX_QH_HORIZONTAL as usize;
 
 /// PORTSC Current Connect Status (UHCI 1.1 §2.1.7 bit 0) — RO from guest.
 pub const UHCI_PORTSC_CCS: u16 = 1 << 0;
@@ -215,17 +265,18 @@ fn resolve_td_addr<R: FnMut(u32) -> u8>(mem_read: &mut R, link: u32) -> Result<u
     Ok(element & !0xF)
 }
 
-/// Collect up to `1 + UHCI_MAX_QH_HORIZONTAL` TD addresses from a frame link.
+/// Collect up to [`UHCI_MAX_FRAME_TDS`] TD addresses from a frame link.
 ///
 /// Spec: UHCI 1.1 §3.3 — QH horizontal link may chain queue heads. This stub
-/// follows the element TD of the first QH, then at most one horizontal QH hop
-/// (its element TD). Deeper horizontal chains return
+/// follows the element TD of the first QH, then up to
+/// [`UHCI_MAX_QH_HORIZONTAL`] additional horizontal QH hops (each element TD).
+/// Deeper horizontal chains return
 /// [`UhciTdError::QueueHeadHorizontalUnsupported`]. Isochronous / bandwidth
-/// reclaim are not modeled.
+/// reclaim are not modeled (frame-list TDs still execute as ordinary TDs).
 fn collect_frame_td_addrs<R: FnMut(u32) -> u8>(
     mem_read: &mut R,
     link: u32,
-    out: &mut [u32; 2],
+    out: &mut [u32; UHCI_MAX_FRAME_TDS],
 ) -> Result<usize, UhciTdError> {
     if link & UHCI_LINK_TERMINATE != 0 {
         return Err(UhciTdError::NothingToDo);
@@ -358,6 +409,96 @@ fn bump_frnum(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
     set_reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM, frnum);
 }
 
+/// Read USBSTS with HCHalted overlay when USBCMD.RS is clear.
+///
+/// Spec: UHCI 1.1 §2.1.2 — HCHalted is set by the HC after it stops; this stub
+/// reflects Run/Stop rather than a separate halt latch.
+pub fn usbsts_read(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> u16 {
+    let mut sts =
+        reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) & (UHCI_USBSTS_RWC_MASK | UHCI_USBSTS_HCHALTED);
+    if reg_u16(regs, PCI_PIIX_USB_UHCI_USBCMD) & UHCI_USBCMD_RS == 0 {
+        sts |= UHCI_USBSTS_HCHALTED;
+    } else {
+        sts &= !UHCI_USBSTS_HCHALTED;
+    }
+    sts
+}
+
+/// Write USBSTS: R/WC clear for interrupt/error bits; HCHalted is not stored.
+///
+/// Spec: UHCI 1.1 §2.1.2 — software clears a bit by writing 1.
+pub fn usbsts_write_w1c(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize], value: u16) {
+    let cur = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS);
+    let cleared = cur & !(value & UHCI_USBSTS_RWC_MASK);
+    set_reg_u16(
+        regs,
+        PCI_PIIX_USB_UHCI_USBSTS,
+        cleared & UHCI_USBSTS_RWC_MASK,
+    );
+}
+
+/// Read USBINTR (bits 3:0 only).
+pub fn usbintr_read(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> u16 {
+    reg_u16(regs, PCI_PIIX_USB_UHCI_USBINTR) & UHCI_USBINTR_WRITABLE
+}
+
+/// Write USBINTR; reserved bits 15:4 hardwired 0.
+pub fn usbintr_write(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize], value: u16) {
+    set_reg_u16(
+        regs,
+        PCI_PIIX_USB_UHCI_USBINTR,
+        value & UHCI_USBINTR_WRITABLE,
+    );
+}
+
+/// Host/device IRQ line from USBSTS ∩ USBINTR (plus unmaskable HCPE).
+///
+/// Spec: UHCI 1.1 §2.1.3 — disabled sources still appear in USBSTS for polling;
+/// this helper reports whether the HC would raise an interrupt to the host.
+/// Does **not** wire DualPic / PIRQ (explicit).
+pub fn uhci_interrupt_pending(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> bool {
+    let sts = usbsts_read(regs);
+    let en = usbintr_read(regs);
+    if sts & UHCI_USBSTS_HCPE != 0 {
+        return true;
+    }
+    if sts & UHCI_USBSTS_USBINT != 0 && en & UHCI_USBINTR_IOC != 0 {
+        return true;
+    }
+    if sts & UHCI_USBSTS_USBERRINT != 0 && en & UHCI_USBINTR_CRC != 0 {
+        return true;
+    }
+    if sts & UHCI_USBSTS_RD != 0 && en & UHCI_USBINTR_RESUME != 0 {
+        return true;
+    }
+    // Short-packet completions latch USBINT; SPI enable alone is not modeled
+    // as a separate status bit in this stub.
+    let _ = UHCI_USBINTR_SPI;
+    false
+}
+
+/// Host helper: latch USBERRINT (transaction-error stub).
+///
+/// Spec: UHCI 1.1 §2.1.2 bit 1. No real CRC/timeout engine — hosts call this
+/// to exercise status / USBINTR gating.
+pub fn latch_usb_error(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
+    let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_USBERRINT;
+    set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
+}
+
+/// Host helper: latch Resume Detect when USBCMD.GSuspend is set.
+///
+/// Spec: UHCI 1.1 §2.1.2 bit 2 — only valid in global suspend. Returns `false`
+/// if GSuspend is clear (no latch).
+pub fn latch_resume_detect(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> bool {
+    if reg_u16(regs, PCI_PIIX_USB_UHCI_USBCMD) & UHCI_USBCMD_GSUSPEND == 0 {
+        return false;
+    }
+    let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_RD;
+    set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
+    true
+}
+
 /// Walk **one** UHCI transfer descriptor from the current frame-list slot.
 ///
 /// Spec: UHCI 1.1 §§2.1 / 3.1–3.2 — with USBCMD.RS set, read
@@ -399,11 +540,12 @@ where
 ///
 /// Spec: UHCI 1.1 §§3.1 / 3.3 — each 1 ms frame selects
 /// `FLBASEADD[(FRNUM & 0x3FF)]`; this stub processes that link (TD or QH with
-/// at most one horizontal hop), executes active TDs, then advances FRNUM.
-/// Empty / inactive frames count as scanned but are not errors.
+/// up to [`UHCI_MAX_QH_HORIZONTAL`] horizontal hops), executes active TDs, then
+/// advances FRNUM. Empty / inactive frames count as scanned but are not errors.
 ///
-/// Unsupported (explicit): isochronous TDs, bandwidth reclamation, full QH
-/// breadth-first reclaim, multi-packet TD vertical chains.
+/// Unsupported (explicit): isochronous bandwidth reclamation, full QH
+/// breadth-first reclaim, multi-packet TD vertical chains, depth >
+/// [`UHCI_MAX_QH_HORIZONTAL`].
 pub fn run_n_frames<R, W>(
     regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
     bus_master: bool,
@@ -437,7 +579,7 @@ where
         let frame_entry_addr = flbase.wrapping_add(frnum.wrapping_mul(4));
         let link = read_phys_u32(&mut mem_read, frame_entry_addr);
 
-        let mut td_addrs = [0u32; 2];
+        let mut td_addrs = [0u32; UHCI_MAX_FRAME_TDS];
         match collect_frame_td_addrs(&mut mem_read, link, &mut td_addrs) {
             Ok(n) => {
                 for &td_addr in td_addrs.iter().take(n) {
@@ -947,25 +1089,113 @@ mod tests {
         assert_eq!(mem.get(buf1), 0x22);
     }
 
-    /// Spec: UHCI 1.1 §3.3 — second horizontal QH hop is unsupported.
+    /// Spec: UHCI 1.1 §3.3 — R12 allows up to [`UHCI_MAX_QH_HORIZONTAL`] hops.
     #[test]
-    fn qh_horizontal_depth_two_unsupported() {
+    fn qh_horizontal_depth_four_executes_all_tds() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0006_0000u32;
+        // Five QHs: start + 4 horizontal hops (MAX=4).
+        let qhs: [u32; 5] = [
+            0x0006_0100,
+            0x0006_0120,
+            0x0006_0140,
+            0x0006_0160,
+            0x0006_0180,
+        ];
+        let tds: [u32; 5] = [
+            0x0006_0200,
+            0x0006_0220,
+            0x0006_0240,
+            0x0006_0260,
+            0x0006_0280,
+        ];
+        let bufs: [u32; 5] = [
+            0x0006_0300,
+            0x0006_0310,
+            0x0006_0320,
+            0x0006_0330,
+            0x0006_0340,
+        ];
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, qhs[0] | UHCI_LINK_QH);
+        for i in 0..5 {
+            if i + 1 < 5 {
+                mem.write_u32(qhs[i], qhs[i + 1] | UHCI_LINK_QH);
+            } else {
+                mem.write_u32(qhs[i], UHCI_LINK_TERMINATE);
+            }
+            mem.write_u32(qhs[i] + 4, tds[i]);
+            mem.write_u32(tds[i], UHCI_LINK_TERMINATE);
+            mem.write_u32(tds[i] + 4, UHCI_TD_ACTIVE);
+            mem.write_u32(
+                tds[i] + 8,
+                u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+            );
+            mem.write_u32(tds[i] + 12, bufs[i]);
+        }
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+
+        let mut device = [0xA0, 0xA1, 0xA2, 0xA3, 0xA4];
+        let summary = run_n_frames(
+            &mut pci.uhci_io,
+            true,
+            1,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("QH horizontal depth 4");
+        assert_eq!(summary.tds_completed, 5);
+        assert_eq!(UHCI_MAX_QH_HORIZONTAL, 4);
+        for (i, &buf) in bufs.iter().enumerate() {
+            assert_eq!(mem.get(buf), 0xA0 + i as u8);
+        }
+    }
+
+    /// Spec: UHCI 1.1 §3.3 — hop beyond [`UHCI_MAX_QH_HORIZONTAL`] is unsupported.
+    #[test]
+    fn qh_horizontal_depth_five_unsupported() {
         let mut pci = PciConfig::new();
         let bar = 0xD000u16;
         enable_uhci_io(&mut pci, bar);
         let flbase = 0x0005_0000u32;
-        let qh0 = 0x0005_0100u32;
-        let qh1 = 0x0005_0120u32;
-        let qh2 = 0x0005_0140u32;
+        // Six QHs → five hops > MAX=4.
+        let qhs: [u32; 6] = [
+            0x0005_0100,
+            0x0005_0120,
+            0x0005_0140,
+            0x0005_0160,
+            0x0005_0180,
+            0x0005_01A0,
+        ];
         let td = 0x0005_0200u32;
         let mem = FakeMem::new();
-        mem.write_u32(flbase, qh0 | UHCI_LINK_QH);
-        mem.write_u32(qh0, qh1 | UHCI_LINK_QH);
-        mem.write_u32(qh0 + 4, UHCI_LINK_TERMINATE);
-        mem.write_u32(qh1, qh2 | UHCI_LINK_QH);
-        mem.write_u32(qh1 + 4, td);
-        mem.write_u32(qh2, UHCI_LINK_TERMINATE);
-        mem.write_u32(qh2 + 4, UHCI_LINK_TERMINATE);
+        mem.write_u32(flbase, qhs[0] | UHCI_LINK_QH);
+        for i in 0..6 {
+            if i + 1 < 6 {
+                mem.write_u32(qhs[i], qhs[i + 1] | UHCI_LINK_QH);
+            } else {
+                mem.write_u32(qhs[i], UHCI_LINK_TERMINATE);
+            }
+            // Only the second QH has an active TD so walk does not early-exit
+            // before hitting the depth cap on the fifth hop.
+            if i == 1 {
+                mem.write_u32(qhs[i] + 4, td);
+            } else {
+                mem.write_u32(qhs[i] + 4, UHCI_LINK_TERMINATE);
+            }
+        }
         mem.write_u32(td, UHCI_LINK_TERMINATE);
         mem.write_u32(td + 4, UHCI_TD_ACTIVE);
         mem.write_u32(
@@ -1032,5 +1262,105 @@ mod tests {
         assert_eq!(v & UHCI_PORTSC_PED, 0);
         assert_ne!(v & UHCI_PORTSC_CSC, 0);
         assert_ne!(v & UHCI_PORTSC_PEDC, 0);
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2/§2.1.3 — IOC latches USBINT; USBINTR.IOC gates host IRQ.
+    #[test]
+    fn usbsts_usbint_gated_by_usbintr_ioc() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0007_0000u32;
+        let td = 0x0007_1000u32;
+        let buf = 0x0007_2000u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, td);
+        mem.write_u32(td, UHCI_LINK_TERMINATE);
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE | UHCI_TD_IOC);
+        mem.write_u32(
+            td + 8,
+            u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(td + 12, buf);
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+        // USBINTR.IOC clear — status still latches, host IRQ not pending.
+        usbintr_write(&mut pci.uhci_io, 0);
+
+        let mut device = [0x55];
+        let xfer = run_one_td(
+            &mut pci.uhci_io,
+            true,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("IOC TD");
+        assert!(xfer.usbint);
+        assert_ne!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBINT, 0);
+        assert!(!uhci_interrupt_pending(&pci.uhci_io));
+
+        usbintr_write(&mut pci.uhci_io, UHCI_USBINTR_IOC);
+        assert!(uhci_interrupt_pending(&pci.uhci_io));
+
+        usbsts_write_w1c(&mut pci.uhci_io, UHCI_USBSTS_USBINT);
+        assert_eq!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBINT, 0);
+        assert!(!uhci_interrupt_pending(&pci.uhci_io));
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2/§2.1.3 — USBERRINT gated by Timeout/CRC enable.
+    #[test]
+    fn usbsts_usberrint_gated_by_crc_enable() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        latch_usb_error(&mut regs);
+        assert_ne!(usbsts_read(&regs) & UHCI_USBSTS_USBERRINT, 0);
+        assert!(!uhci_interrupt_pending(&regs));
+        usbintr_write(&mut regs, UHCI_USBINTR_CRC);
+        assert!(uhci_interrupt_pending(&regs));
+        usbsts_write_w1c(&mut regs, UHCI_USBSTS_USBERRINT);
+        assert_eq!(usbsts_read(&regs) & UHCI_USBSTS_USBERRINT, 0);
+        assert!(!uhci_interrupt_pending(&regs));
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2 — Resume Detect only while Global Suspend.
+    #[test]
+    fn usbsts_resume_detect_requires_gsuspend() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        assert!(!latch_resume_detect(&mut regs));
+        assert_eq!(usbsts_read(&regs) & UHCI_USBSTS_RD, 0);
+
+        set_reg_u16(&mut regs, PCI_PIIX_USB_UHCI_USBCMD, UHCI_USBCMD_GSUSPEND);
+        assert!(latch_resume_detect(&mut regs));
+        usbintr_write(&mut regs, UHCI_USBINTR_RESUME);
+        assert!(uhci_interrupt_pending(&regs));
+        usbsts_write_w1c(&mut regs, UHCI_USBSTS_RD);
+        assert!(!uhci_interrupt_pending(&regs));
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2 — HCPE is unmaskable.
+    #[test]
+    fn usbsts_hcpe_unmaskable() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        let sts = reg_u16(&regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_HCPE;
+        set_reg_u16(&mut regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
+        usbintr_write(&mut regs, 0);
+        assert!(uhci_interrupt_pending(&regs));
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2 — HCHalted overlays when RS clear.
+    #[test]
+    fn usbsts_hchalted_when_rs_clear() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        assert_ne!(usbsts_read(&regs) & UHCI_USBSTS_HCHALTED, 0);
+        set_reg_u16(&mut regs, PCI_PIIX_USB_UHCI_USBCMD, UHCI_USBCMD_RS);
+        assert_eq!(usbsts_read(&regs) & UHCI_USBSTS_HCHALTED, 0);
     }
 }

@@ -4400,11 +4400,15 @@ mod tests {
             .unwrap();
             bus.port_out_u16(PCI_CONFIG_DATA, PCI_COMMAND_IO).unwrap();
 
-            bus.port_out_u16(0xD000, 0x0001).unwrap(); // USBCMD
-            bus.port_out_u16(0xD002, 0x0020).unwrap(); // USBSTS
+            bus.port_out_u16(0xD000, 0x0001).unwrap(); // USBCMD.RS
+                                                       // Spec: UHCI 1.1 §2.1.2 — USBSTS is R/WC; writing 0x0020 with no
+                                                       // latched status bits is a no-op (HCHalted overlays from RS, not store).
+            bus.port_out_u16(0xD002, 0x0020).unwrap();
+            bus.port_out_u16(0xD004, 0x000F).unwrap(); // USBINTR
             bus.port_out_u32(0xD008, 0x1000_2000).unwrap(); // FLBASEADD
             assert_eq!(bus.port_in_u16(0xD000).unwrap(), 0x0001);
-            assert_eq!(bus.port_in_u16(0xD002).unwrap(), 0x0020);
+            assert_eq!(bus.port_in_u16(0xD002).unwrap(), 0x0000); // RS set → not halted
+            assert_eq!(bus.port_in_u16(0xD004).unwrap(), 0x000F);
             assert_eq!(bus.port_in_u32(0xD008).unwrap(), 0x1000_2000);
 
             // Clear IO → decode off (generic port sink, not UHCI readback).

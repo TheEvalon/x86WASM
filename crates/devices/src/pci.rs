@@ -2787,6 +2787,25 @@ impl PciConfig {
             return 0xFFFFFFFF;
         };
         let off = (port - base) as usize;
+        // Spec: UHCI 1.1 §2.1.2 — HCHalted overlays when RS clear.
+        if off == usize::from(PCI_PIIX_USB_UHCI_USBSTS) {
+            let sts = crate::uhci::usbsts_read(&self.uhci_io);
+            return match size {
+                1 => u32::from(sts as u8),
+                2 => u32::from(sts),
+                4 => u32::from(sts),
+                _ => 0xFFFFFFFF,
+            };
+        }
+        if off == usize::from(PCI_PIIX_USB_UHCI_USBINTR) {
+            let en = crate::uhci::usbintr_read(&self.uhci_io);
+            return match size {
+                1 => u32::from(en as u8),
+                2 => u32::from(en),
+                4 => u32::from(en),
+                _ => 0xFFFFFFFF,
+            };
+        }
         match size {
             1 => u32::from(self.uhci_io.get(off).copied().unwrap_or(0xFF)),
             2 => {
@@ -2812,6 +2831,25 @@ impl PciConfig {
             return;
         };
         let off = (port - base) as usize;
+        // Spec: UHCI 1.1 §2.1.2 — USBSTS is R/WC for interrupt/error bits.
+        if off == usize::from(PCI_PIIX_USB_UHCI_USBSTS) && (size == 2 || size == 1) {
+            let cur = crate::uhci::usbsts_read(&self.uhci_io);
+            let write_val = match size {
+                1 => (cur & 0xFF00) | u16::from(value as u8),
+                _ => value as u16,
+            };
+            crate::uhci::usbsts_write_w1c(&mut self.uhci_io, write_val);
+            return;
+        }
+        if off == usize::from(PCI_PIIX_USB_UHCI_USBINTR) && (size == 2 || size == 1) {
+            let cur = crate::uhci::usbintr_read(&self.uhci_io);
+            let write_val = match size {
+                1 => (cur & 0xFF00) | u16::from(value as u8),
+                _ => value as u16,
+            };
+            crate::uhci::usbintr_write(&mut self.uhci_io, write_val);
+            return;
+        }
         match size {
             1 => {
                 if let Some(slot) = self.uhci_io.get_mut(off) {
@@ -5333,9 +5371,15 @@ mod tests {
         assert!(pci.uhci_owns_port(0xD01F));
         assert!(!pci.uhci_owns_port(0xD020));
 
-        // Spec: UHCI I/O — USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC.
+        // Spec: UHCI I/O — USBCMD/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC store;
+        // USBSTS is R/WC (write-1-to-clear), not a sticky store.
         pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBCMD), 2, 0x0001);
-        pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBSTS), 2, 0x0020);
+        crate::uhci::latch_usb_error(&mut pci.uhci_io);
+        pci.port_write(
+            0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBSTS),
+            2,
+            u32::from(crate::uhci::UHCI_USBSTS_USBERRINT),
+        );
         pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBINTR), 2, 0x000F);
         pci.port_write(0xD000 + u16::from(PCI_PIIX_USB_UHCI_FRNUM), 2, 0x03FF);
         pci.port_write(
@@ -5351,9 +5395,10 @@ mod tests {
             pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBCMD), 2) as u16,
             0x0001
         );
+        // RS set → HCHalted clear; USBERRINT cleared by the W1C write above.
         assert_eq!(
             pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBSTS), 2) as u16,
-            0x0020
+            0x0000
         );
         assert_eq!(
             pci.port_read(0xD000 + u16::from(PCI_PIIX_USB_UHCI_USBINTR), 2) as u16,
