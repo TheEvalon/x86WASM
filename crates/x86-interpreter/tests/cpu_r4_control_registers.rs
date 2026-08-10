@@ -52,14 +52,16 @@ fn mov_cr4_round_trips_pse_and_pge() {
     assert_eq!(cpu.gpr_u32(CpuState::RBX), 0x90);
 }
 
-/// Every `CR4` bit outside `PSE`/`PGE` is reserved here, so writing 1 to one
-/// raises `#GP(0)` and leaves `CR4` alone. `CR4.PAE` matters most: refusing it
-/// is what stops a guest selecting the paging mode the engine reports as
-/// unsupported. Spec: SDM Vol. 2 MOV CRn (#GP on reserved CR4 bit); Vol. 3
-/// §4.1.4.
+/// Every `CR4` bit outside `VME`/`PSE`/`PGE` is reserved here, so writing 1 to
+/// one raises `#GP(0)` and leaves `CR4` alone. `CR4.VME` is writable for the
+/// Round-12 redirect stub without `CPUID.VME` (see `cpu_r12_cr4_vme_honesty`).
+/// `CR4.PAE` matters most among the reserved bits: refusing it stops a guest
+/// selecting the paging mode the engine reports as unsupported.
+/// Spec: SDM Vol. 2 MOV CRn (#GP on reserved CR4 bit); Vol. 3 §4.1.4 / §2.5.
 #[test]
 fn mov_cr4_reserved_bits_raise_gp_and_commit_nothing() {
-    for reserved in [1u32 << 0, 1 << 5, 1 << 8, 1 << 18] {
+    // bit0 VME is implemented (sticky); probe PVI, PAE, PCE, OSXSAVE.
+    for reserved in [1u32 << 1, 1 << 5, 1 << 8, 1 << 18] {
         let mut bus = RamBus::new(0x10000);
         let mut cpu = real_mode_cpu(0x1000, 0xFFFE);
         install_ivt(&mut bus, &mut cpu, 13, 0x0000, 0x0900);
