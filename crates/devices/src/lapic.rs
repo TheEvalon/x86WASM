@@ -10,13 +10,19 @@
 //! - §10.8.3 / §10.8.4 — IRR @ `200H`–`270H`, ISR @ `100H`–`170H` (32-bit
 //!   bitmaps; bit *N* = vector *N*)
 //! - §10.8.5 — EOI @ `B0H` clears the highest-priority ISR bit
+//! - §10.8.6 — TMR @ `180H`–`1F0H` (level vs edge for accepted vectors)
+//! - §10.8.3.1 / §10.8.3.2 — TPR @ `80H`, PPR @ `A0H` (firmware probe stub)
 //!
 //! Round-7: software-enabled APIC + programmed one-shot/periodic timer can
 //! latch a **local** interrupt vector via [`LocalApicMmio::take_interrupt`].
 //! Round-8: IRR/ISR dword readback + EOI clears the matching ISR bit (and
-//! clears the single in-service tracker). CPUID leaf 1 EDX bit 9 (`APIC`)
+//! clears the single in-service tracker). Round-10: Trigger Mode Register
+//! (TMR) tracks edge vs level on Fixed accept into IRR; Task/Processor
+//! Priority (TPR/PPR) store/readback gates `take_interrupt` when the pending
+//! vector class is not strictly above PPR. CPUID leaf 1 EDX bit 9 (`APIC`)
 //! stays clear — presence ≠ advertised APIC.
-//! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`.
+//! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`,
+//! `docs/lapic-r10-tmr.md`, `docs/lapic-r10-tpr-ppr.md`.
 
 /// Default Local APIC physical base (SDM Vol. 3A §10.4.4).
 pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
@@ -33,11 +39,20 @@ pub const LAPIC_REG_VERSION: u32 = 0x30;
 /// End Of Interrupt Register offset.
 pub const LAPIC_REG_EOI: u32 = 0xB0;
 
+/// Task Priority Register offset. Spec: SDM §10.8.3.1.
+pub const LAPIC_REG_TPR: u32 = 0x80;
+
+/// Processor Priority Register offset (RO). Spec: SDM §10.8.3.2.
+pub const LAPIC_REG_PPR: u32 = 0xA0;
+
 /// In-Service Register base (8×32-bit; vector bitmaps). Spec: SDM §10.8.4.
 pub const LAPIC_REG_ISR_BASE: u32 = 0x100;
 
 /// Interrupt Request Register base (8×32-bit). Spec: SDM §10.8.3.
 pub const LAPIC_REG_IRR_BASE: u32 = 0x200;
+
+/// Trigger Mode Register base (8×32-bit). Spec: SDM §10.8.6.
+pub const LAPIC_REG_TMR_BASE: u32 = 0x180;
 
 /// Spurious Interrupt Vector Register offset (SDM §10.9).
 pub const LAPIC_REG_SVR: u32 = 0xF0;
@@ -81,7 +96,7 @@ pub const LAPIC_LVT_TIMER_PERIODIC: u32 = 1 << 17;
 pub const LAPIC_LVT_VECTOR_MASK: u32 = 0xFF;
 
 /// Local APIC MMIO: ID/Version + SVR + LVT Timer + timer ICR/CCR/DCR stub
-/// plus IRR/ISR bitmap readback for EOI honesty.
+/// plus IRR/ISR/TMR bitmap readback for EOI / trigger-mode honesty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalApicMmio {
     base: u64,
@@ -89,6 +104,8 @@ pub struct LocalApicMmio {
     apic_id: u8,
     /// Spurious Interrupt Vector Register.
     svr: u32,
+    /// Task Priority Register (bits 7:0). Spec: SDM §10.8.3.1.
+    tpr: u32,
     /// LVT Timer register.
     lvt_timer: u32,
     /// Timer initial count.
@@ -107,6 +124,8 @@ pub struct LocalApicMmio {
     irr: [u32; 8],
     /// In-Service Register — 256 bits as eight little-endian dwords.
     isr: [u32; 8],
+    /// Trigger Mode Register — bit set = level, clear = edge (SDM §10.8.6).
+    tmr: [u32; 8],
     /// Scratch for byte-lane assembly of dword writes.
     dword_scratch: [u8; 4],
 }
@@ -124,6 +143,7 @@ impl LocalApicMmio {
             apic_id: 0,
             // Spec: SDM §10.4.7.11 — SVR reset: vector often `0xFF`, enable clear.
             svr: 0xFF,
+            tpr: 0,
             // LVT Timer reset: masked.
             lvt_timer: LAPIC_LVT_MASK,
             timer_icr: 0,
@@ -134,6 +154,7 @@ impl LocalApicMmio {
             in_service: None,
             irr: [0; 8],
             isr: [0; 8],
+            tmr: [0; 8],
             dword_scratch: [0; 4],
         }
     }
@@ -153,6 +174,31 @@ impl LocalApicMmio {
 
     pub fn svr(&self) -> u32 {
         self.svr
+    }
+
+    /// Task Priority Register value (bits 7:0).
+    pub fn tpr(&self) -> u32 {
+        self.tpr & 0xFF
+    }
+
+    /// Processor Priority Register (RO). Spec: SDM §10.8.3.2.
+    ///
+    /// `PPR = TPR` when TPR class ≥ highest ISR class; otherwise
+    /// `PPR = (ISRV class << 4)` with subclass 0.
+    pub fn ppr(&self) -> u32 {
+        let tpr = self.tpr & 0xFF;
+        let tpr_class = (tpr >> 4) & 0xF;
+        match highest_set_bit(&self.isr) {
+            Some(isrv) => {
+                let isr_class = u32::from(isrv >> 4);
+                if tpr_class >= isr_class {
+                    tpr
+                } else {
+                    isr_class << 4
+                }
+            }
+            None => tpr,
+        }
     }
 
     pub fn lvt_timer(&self) -> u32 {
@@ -191,6 +237,18 @@ impl LocalApicMmio {
         bitmap_get(&self.isr, vector)
     }
 
+    /// Read one TMR dword (index 0..=7 → offsets `180H`..`1F0H`).
+    pub fn tmr_dword(&self, index: usize) -> Option<u32> {
+        self.tmr.get(index).copied()
+    }
+
+    /// True if TMR bit is set (level-triggered accept for that vector).
+    ///
+    /// Spec: SDM §10.8.6 — bit set = level; clear = edge.
+    pub fn tmr_bit(&self, vector: u8) -> bool {
+        bitmap_get(&self.tmr, vector)
+    }
+
     /// Software enable from SVR bit 8.
     pub fn software_enabled(&self) -> bool {
         self.svr & LAPIC_SVR_SW_ENABLE != 0
@@ -223,6 +281,8 @@ impl LocalApicMmio {
         match off {
             LAPIC_REG_ID => self.id_value(),
             LAPIC_REG_VERSION => LAPIC_VERSION_VALUE,
+            LAPIC_REG_TPR => self.tpr & 0xFF,
+            LAPIC_REG_PPR => self.ppr(),
             LAPIC_REG_EOI => 0,
             LAPIC_REG_SVR => self.svr,
             LAPIC_REG_LVT_TIMER => self.lvt_timer,
@@ -233,6 +293,10 @@ impl LocalApicMmio {
                 let idx = ((o - LAPIC_REG_ISR_BASE) / 0x10) as usize;
                 self.isr.get(idx).copied().unwrap_or(0)
             }
+            o if (LAPIC_REG_TMR_BASE..LAPIC_REG_TMR_BASE + 0x80).contains(&o) && o & 0xF == 0 => {
+                let idx = ((o - LAPIC_REG_TMR_BASE) / 0x10) as usize;
+                self.tmr.get(idx).copied().unwrap_or(0)
+            }
             o if (LAPIC_REG_IRR_BASE..LAPIC_REG_IRR_BASE + 0x80).contains(&o) && o & 0xF == 0 => {
                 let idx = ((o - LAPIC_REG_IRR_BASE) / 0x10) as usize;
                 self.irr.get(idx).copied().unwrap_or(0)
@@ -242,26 +306,44 @@ impl LocalApicMmio {
     }
 
     /// True if a local interrupt is latched and awaiting accept.
+    ///
+    /// Spec: SDM §10.8.3.1 — pending Fixed vectors with priority class ≤ PPR
+    /// class are inhibited (remain latched / in IRR).
     pub fn interrupt_pending(&self) -> bool {
-        self.pending_vector.is_some()
+        match self.pending_vector {
+            Some(v) => self.vector_above_ppr(v),
+            None => false,
+        }
     }
 
-    /// Peek the latched local vector, if any.
+    /// Peek the latched local vector, if any (even when TPR-inhibited).
     pub fn pending_vector(&self) -> Option<u8> {
         self.pending_vector
     }
 
-    /// Accept the latched local interrupt (IRR → ISR).
+    /// Accept the latched local interrupt (IRR → ISR) when above PPR.
     ///
     /// Spec: SDM §10.8.3–§10.8.4 — accepting an interrupt clears the IRR bit
     /// and sets the ISR bit; EOI later clears ISR. This stub does not inject
-    /// into the CPU interpreter — hosts must deliver.
+    /// into the CPU interpreter — hosts must deliver. Returns `None` when
+    /// TPR/PPR inhibits the pending vector (latch retained).
     pub fn take_interrupt(&mut self) -> Option<u8> {
+        let vec = self.pending_vector?;
+        if !self.vector_above_ppr(vec) {
+            return None;
+        }
         let vec = self.pending_vector.take()?;
         bitmap_clear(&mut self.irr, vec);
         bitmap_set(&mut self.isr, vec);
         self.in_service = Some(vec);
         Some(vec)
+    }
+
+    /// Priority class of `vector` is strictly above current PPR class.
+    fn vector_above_ppr(&self, vector: u8) -> bool {
+        let vec_class = u32::from(vector >> 4);
+        let ppr_class = (self.ppr() >> 4) & 0xF;
+        vec_class > ppr_class
     }
 
     /// Peek the current in-service vector (set by [`Self::take_interrupt`]).
@@ -285,9 +367,20 @@ impl LocalApicMmio {
 
     /// Latch a Fixed-mode vector from the I/O APIC (software-enable gated).
     ///
+    /// Edge-triggered accept (clears TMR bit). Prefer
+    /// [`Self::inject_fixed_trigger`] when the RTE trigger mode is known.
+    ///
     /// Spec: SDM §10.8 / 82093AA Fixed delivery. Returns `true` when newly
     /// latched. Does not overwrite an already-pending vector.
     pub fn inject_fixed(&mut self, vector: u8) -> bool {
+        self.inject_fixed_trigger(vector, false)
+    }
+
+    /// Latch a Fixed-mode vector and record TMR for the trigger mode.
+    ///
+    /// Spec: SDM §10.8.6 — on acceptance into IRR, TMR bit is set for level
+    /// and cleared for edge. Returns `true` when newly latched.
+    pub fn inject_fixed_trigger(&mut self, vector: u8, level: bool) -> bool {
         if !self.software_enabled() {
             return false;
         }
@@ -295,6 +388,11 @@ impl LocalApicMmio {
             return false;
         }
         bitmap_set(&mut self.irr, vector);
+        if level {
+            bitmap_set(&mut self.tmr, vector);
+        } else {
+            bitmap_clear(&mut self.tmr, vector);
+        }
         self.pending_vector = Some(vector);
         true
     }
@@ -309,8 +407,10 @@ impl LocalApicMmio {
         let vector = (self.lvt_timer & LAPIC_LVT_VECTOR_MASK) as u8;
         // Soft-priority floor: vectors 0..=15 are reserved; still latch for
         // honesty when software programmed them (tests may use ≥0x20).
+        // Local APIC timer is edge-triggered (SDM §10.5.1) → clear TMR.
         if self.pending_vector.is_none() {
             bitmap_set(&mut self.irr, vector);
+            bitmap_clear(&mut self.tmr, vector);
             self.pending_vector = Some(vector);
         }
     }
@@ -355,6 +455,13 @@ impl LocalApicMmio {
         match off {
             LAPIC_REG_ID => {
                 self.apic_id = ((value >> 24) & 0xFF) as u8;
+            }
+            LAPIC_REG_TPR => {
+                // Spec: SDM §10.8.3.1 — bits 7:0 are the task priority.
+                self.tpr = value & 0xFF;
+            }
+            LAPIC_REG_PPR => {
+                // RO — claimed, ignored.
             }
             LAPIC_REG_EOI => {
                 // Spec: SDM §10.8.5 — write to EOI clears the highest-priority
@@ -621,5 +728,77 @@ mod tests {
         assert!(lapic.isr_bit(0x40));
         write_u32(&mut lapic, LAPIC_REG_EOI, 0);
         assert!(!lapic.isr_bit(0x40));
+    }
+
+    /// Spec: SDM Vol. 3A §10.8.6 — TMR set on level accept into IRR, clear on
+    /// edge; EOI does not invent or clear TMR bits; MMIO writes are ignored.
+    #[test]
+    fn tmr_tracks_edge_vs_level_accept_eoi_unchanged() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+
+        // Edge Fixed: TMR bit clear.
+        assert!(lapic.inject_fixed_trigger(0x55, false));
+        assert!(!lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 0);
+        assert_eq!(lapic.take_interrupt(), Some(0x55));
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        assert!(!lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 0);
+
+        // Level Fixed: TMR bit set (dword index 2, bit 21 = vector 0x55).
+        assert!(lapic.inject_fixed_trigger(0x55, true));
+        assert!(lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 1 << 21);
+        assert_eq!(lapic.take_interrupt(), Some(0x55));
+        // Still set after accept into ISR.
+        assert!(lapic.tmr_bit(0x55));
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        // EOI must not invent or clear TMR.
+        assert!(lapic.tmr_bit(0x55));
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 1 << 21);
+
+        // Software writes to TMR are claimed and ignored.
+        write_u32(&mut lapic, LAPIC_REG_TMR_BASE + 0x20, 0);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TMR_BASE + 0x20), 1 << 21);
+
+        // Re-accept as edge clears the prior level bit.
+        assert!(lapic.inject_fixed_trigger(0x55, false));
+        assert!(!lapic.tmr_bit(0x55));
+    }
+
+    /// Spec: SDM §10.8.3.1 / §10.8.3.2 — TPR store/readback; PPR follows TPR
+    /// when no ISR; pending Fixed below/equal PPR class is inhibited.
+    #[test]
+    fn tpr_ppr_store_readback_and_masks_pending() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_TPR, 0x41);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_TPR), 0x41);
+        assert_eq!(lapic.tpr(), 0x41);
+        // No ISR → PPR mirrors TPR.
+        assert_eq!(read_u32(&lapic, LAPIC_REG_PPR), 0x41);
+        assert_eq!(lapic.ppr(), 0x41);
+        // PPR writes are ignored.
+        write_u32(&mut lapic, LAPIC_REG_PPR, 0x00);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_PPR), 0x41);
+
+        // Vector 0x20 class 2 ≤ TPR class 4 → inhibited.
+        assert!(lapic.inject_fixed(0x20));
+        assert!(lapic.irr_bit(0x20));
+        assert_eq!(lapic.pending_vector(), Some(0x20));
+        assert!(!lapic.interrupt_pending());
+        assert!(lapic.take_interrupt().is_none());
+        assert!(lapic.irr_bit(0x20));
+
+        // Lower TPR so class 2 > class 1 → accept.
+        write_u32(&mut lapic, LAPIC_REG_TPR, 0x10);
+        assert!(lapic.interrupt_pending());
+        assert_eq!(lapic.take_interrupt(), Some(0x20));
+        assert!(lapic.isr_bit(0x20));
+        // With ISR class 2 and TPR class 1 → PPR = ISRV class << 4.
+        assert_eq!(lapic.ppr(), 0x20);
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        assert_eq!(lapic.ppr(), 0x10);
     }
 }

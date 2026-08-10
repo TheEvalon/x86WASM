@@ -926,13 +926,35 @@ impl Machine {
         self.pic.set_irq_line(0, self.pit.out_ch0());
     }
 
-    /// Host-driven HPET main-counter advance (Timer 0 comparator stub).
+    // -------------------------------------------------------------------------
+    // R10 timers-apic ownership: HPET → IOAPIC / LAPIC delivery helpers.
+    // Do not expand this region into PCI/VGA/IDE or interpreter paths.
+    // -------------------------------------------------------------------------
+
+    /// Host-driven HPET main-counter advance with Timer 0 → I/O APIC GSI wire.
     ///
     /// Spec: IA-PC HPET 1.0a — comparator match can set `T0_INT_STS` /
-    /// [`devices::HpetMmio::irq_line`]. Does **not** assert PIC or I/O APIC.
-    /// See `docs/hpet-r7-comparator-irq.md`.
+    /// [`devices::HpetMmio::irq_line`]; host mirrors that line onto I/O APIC
+    /// GSI [`devices::HPET_DEFAULT_IOAPIC_GSI`] (IRQ2) unless a capable
+    /// `Tn_INT_ROUTE_CNF` is programmed. Does **not** assert DualPic / legacy
+    /// replacement. See `docs/hpet-r10-ioapic-wire.md`.
     pub fn advance_hpet(&mut self, delta: u64) -> bool {
-        hpet_wire::advance_hpet(&mut self.hpet, delta)
+        hpet_wire::advance_hpet(&mut self.hpet, &mut self.ioapic, &mut self.lapic, delta)
+    }
+
+    /// Advance HPET and return any Fixed I/O APIC delivery produced this step.
+    ///
+    /// Same counter advance as [`Self::advance_hpet`]; exposes the RTE result.
+    pub fn advance_hpet_ioapic(&mut self, delta: u64) -> Option<devices::IoApicDelivery> {
+        hpet_wire::advance_hpet_ioapic(&mut self.hpet, &mut self.ioapic, &mut self.lapic, delta)
+    }
+
+    /// Mirror current HPET Timer 0 `irq_line` onto the resolved I/O APIC GSI.
+    ///
+    /// Call after guest MMIO that may clear `T0_INT_STS` / disable the timer
+    /// when not going through [`Self::advance_hpet`].
+    pub fn sync_hpet_irq_to_ioapic(&mut self) -> Option<devices::IoApicDelivery> {
+        hpet_wire::sync_hpet_irq_to_ioapic(&self.hpet, &mut self.ioapic, &mut self.lapic)
     }
 
     /// Host-driven Local APIC timer tick (ICR/CCR/DCR + LVT Timer stub).
@@ -945,9 +967,10 @@ impl Machine {
     }
 
     /// Assert an I/O APIC GSI pin; Fixed RTE deliveries matching this LAPIC ID
-    /// latch via [`devices::LocalApicMmio::inject_fixed`].
+    /// latch via [`devices::LocalApicMmio::inject_fixed_trigger`] (TMR-aware).
     ///
     /// Spec: Intel 82093AA redirection table. Does **not** mirror onto DualPic.
+    /// Non-Fixed modes are unsupported — see `docs/ioapic-r10-delivery-mode.md`.
     /// See `docs/ioapic-r7-rte-irq.md`.
     pub fn assert_ioapic_gsi(&mut self, gsi: u8, high: bool) -> Option<devices::IoApicDelivery> {
         ioapic_wire::assert_ioapic_gsi(&mut self.ioapic, &mut self.lapic, gsi, high)
@@ -959,6 +982,10 @@ impl Machine {
     pub fn eoi_lapic_ioapic(&mut self) -> Option<u8> {
         ioapic_wire::eoi_lapic_and_ioapic(&mut self.ioapic, &mut self.lapic)
     }
+
+    // -------------------------------------------------------------------------
+    // End R10 timers-apic ownership region.
+    // -------------------------------------------------------------------------
 
     /// Advance CMOS/RTC by `periods` model quanta and sync IRQF → PIC IRQ8.
     ///

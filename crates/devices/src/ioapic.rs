@@ -9,10 +9,13 @@
 //! Round-7: unmasked RTE entries can deliver a Fixed-mode vector to a
 //! guest-visible path via [`IoApicMmio::assert_pin`] → [`IoApicDelivery`].
 //! Round-8: level-triggered Fixed deliveries set Remote IRR (RTE bit 14) and
-//! suppress re-issue until [`IoApicMmio::eoi`] for that vector. Machine wiring
-//! latches the vector on the Local APIC when the destination APIC ID matches.
-//! DualPic / ExtINT virtual-wire is **not** auto-mirrored.
-//! See `docs/ioapic-r7-rte-irq.md`, `docs/ioapic-r8-eoi.md`.
+//! suppress re-issue until [`IoApicMmio::eoi`] for that vector. Round-10:
+//! non-Fixed delivery modes (SMI/NMI/ExtINT/LowestPriority/INIT) are stored for
+//! probe honesty but do not deliver; see [`IoApicMmio::take_unsupported_delivery`].
+//! Machine wiring latches the vector on the Local APIC when the destination
+//! APIC ID matches. DualPic / ExtINT virtual-wire is **not** auto-mirrored.
+//! See `docs/ioapic-r7-rte-irq.md`, `docs/ioapic-r8-eoi.md`,
+//! `docs/ioapic-r10-delivery-mode.md`.
 
 /// Classic I/O APIC physical base (PC AT / ACPI MADT convention).
 pub const IOAPIC_DEFAULT_BASE: u64 = 0xFEC0_0000;
@@ -63,6 +66,39 @@ pub const IOAPIC_RTE_DELIVERY_MASK: u32 = 0x7 << IOAPIC_RTE_DELIVERY_SHIFT;
 /// Fixed delivery mode.
 pub const IOAPIC_DELIVERY_FIXED: u32 = 0;
 
+/// Lowest Priority delivery mode (unsupported in this stub).
+pub const IOAPIC_DELIVERY_LOWEST: u32 = 1;
+
+/// SMI delivery mode (unsupported in this stub).
+pub const IOAPIC_DELIVERY_SMI: u32 = 2;
+
+/// NMI delivery mode (unsupported in this stub).
+pub const IOAPIC_DELIVERY_NMI: u32 = 4;
+
+/// INIT delivery mode (unsupported in this stub).
+pub const IOAPIC_DELIVERY_INIT: u32 = 5;
+
+/// ExtINT delivery mode (unsupported in this stub).
+pub const IOAPIC_DELIVERY_EXTINT: u32 = 7;
+
+/// True when `mode` is Fixed (the only delivery mode this stub implements).
+pub fn ioapic_delivery_mode_supported(mode: u32) -> bool {
+    mode == IOAPIC_DELIVERY_FIXED
+}
+
+/// Human-readable name for a known 82093AA delivery mode, if recognized.
+pub fn ioapic_delivery_mode_name(mode: u32) -> Option<&'static str> {
+    match mode {
+        IOAPIC_DELIVERY_FIXED => Some("Fixed"),
+        IOAPIC_DELIVERY_LOWEST => Some("LowestPriority"),
+        IOAPIC_DELIVERY_SMI => Some("SMI"),
+        IOAPIC_DELIVERY_NMI => Some("NMI"),
+        IOAPIC_DELIVERY_INIT => Some("INIT"),
+        IOAPIC_DELIVERY_EXTINT => Some("ExtINT"),
+        _ => None,
+    }
+}
+
 /// RTE low: interrupt mask (bit 16).
 pub const IOAPIC_RTE_MASK: u32 = 1 << 16;
 
@@ -88,6 +124,15 @@ pub struct IoApicDelivery {
     pub dest_apic_id: u8,
 }
 
+/// Recorded when an unmasked non-Fixed RTE would have fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoApicUnsupportedDelivery {
+    /// GSI / input pin that asserted.
+    pub gsi: u8,
+    /// Delivery mode field (bits 10:8 of RTE low).
+    pub mode: u32,
+}
+
 /// I/O APIC MMIO with redirection-table store/readback + pin delivery stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IoApicMmio {
@@ -100,6 +145,8 @@ pub struct IoApicMmio {
     redtbl: [u32; IOAPIC_REDIRECTION_COUNT * 2],
     /// Latched pin levels (for edge/level semantics).
     pin_level: [bool; IOAPIC_REDIRECTION_COUNT],
+    /// Last unmasked non-Fixed assert (honesty probe); cleared by take.
+    unsupported_delivery: Option<IoApicUnsupportedDelivery>,
     /// Scratch for assembling IOWIN dword writes.
     iowin_scratch: [u8; 4],
 }
@@ -123,6 +170,7 @@ impl IoApicMmio {
             apic_id: 0,
             redtbl,
             pin_level: [false; IOAPIC_REDIRECTION_COUNT],
+            unsupported_delivery: None,
             iowin_scratch: [0; 4],
         }
     }
@@ -206,15 +254,21 @@ impl IoApicMmio {
         }
     }
 
-    fn try_deliver(&self, gsi: u8) -> Option<IoApicDelivery> {
+    fn try_deliver(&mut self, gsi: u8) -> Option<IoApicDelivery> {
         let low = self.redtbl_low(gsi)?;
         let high = self.redtbl_high(gsi)?;
         if low & IOAPIC_RTE_MASK != 0 {
             return None;
         }
         let delivery = (low & IOAPIC_RTE_DELIVERY_MASK) >> IOAPIC_RTE_DELIVERY_SHIFT;
-        if delivery != IOAPIC_DELIVERY_FIXED {
-            // ExtINT / NMI / SMI / LowestPrio not modeled in this stub.
+        if !ioapic_delivery_mode_supported(delivery) {
+            // Spec: 82093AA defines SMI/NMI/INIT/ExtINT/LowestPriority; this
+            // stub stores the RTE for probe honesty but does not invent an
+            // APIC bus / dual-PIC ExtINT path. Record for hosts/tests.
+            self.unsupported_delivery = Some(IoApicUnsupportedDelivery {
+                gsi,
+                mode: delivery,
+            });
             return None;
         }
         Some(IoApicDelivery {
@@ -229,7 +283,9 @@ impl IoApicMmio {
     /// Spec: 82093AA — edge triggers on rising edge; level delivers while high
     /// and unmasked, but Remote IRR suppresses further level issues until EOI.
     /// Returns a Fixed delivery when the RTE accepts the event. Level Fixed
-    /// success sets Remote IRR. Does **not** talk to DualPic.
+    /// success sets Remote IRR. Non-Fixed modes latch
+    /// [`Self::take_unsupported_delivery`] and return `None`. Does **not**
+    /// talk to DualPic.
     pub fn assert_pin(&mut self, gsi: u8, high: bool) -> Option<IoApicDelivery> {
         let idx = gsi as usize;
         if idx >= IOAPIC_REDIRECTION_COUNT {
@@ -252,6 +308,22 @@ impl IoApicMmio {
             self.redtbl[idx * 2] |= IOAPIC_RTE_REMOTE_IRR;
         }
         Some(delivery)
+    }
+
+    /// Peek the last unmasked non-Fixed assert, if any.
+    pub fn unsupported_delivery(&self) -> Option<IoApicUnsupportedDelivery> {
+        self.unsupported_delivery
+    }
+
+    /// Take (clear) the last unmasked non-Fixed assert record.
+    pub fn take_unsupported_delivery(&mut self) -> Option<IoApicUnsupportedDelivery> {
+        self.unsupported_delivery.take()
+    }
+
+    /// Delivery mode field from RTE low for `gsi` (bits 10:8).
+    pub fn delivery_mode(&self, gsi: u8) -> Option<u32> {
+        self.redtbl_low(gsi)
+            .map(|low| (low & IOAPIC_RTE_DELIVERY_MASK) >> IOAPIC_RTE_DELIVERY_SHIFT)
     }
 
     /// Clear Remote IRR on every level-triggered RTE matching `vector`.
@@ -453,5 +525,41 @@ mod tests {
         assert!(!io.remote_irr(5));
         io.eoi(0x30);
         assert!(!io.remote_irr(5));
+    }
+
+    /// Spec: 82093AA delivery modes — non-Fixed (SMI/NMI/ExtINT/Lowest/INIT)
+    /// store/readback but do not deliver; Fixed continues to work.
+    #[test]
+    fn non_fixed_delivery_modes_unsupported_fixed_still_works() {
+        let mut io = IoApicMmio::new();
+        let modes = [
+            IOAPIC_DELIVERY_LOWEST,
+            IOAPIC_DELIVERY_SMI,
+            IOAPIC_DELIVERY_NMI,
+            IOAPIC_DELIVERY_INIT,
+            IOAPIC_DELIVERY_EXTINT,
+        ];
+        for (i, mode) in modes.iter().enumerate() {
+            let gsi = i as u8;
+            let low = (mode << IOAPIC_RTE_DELIVERY_SHIFT) | 0x50;
+            write_rte(&mut io, gsi, low, 0);
+            assert_eq!(io.delivery_mode(gsi), Some(*mode));
+            assert!(!ioapic_delivery_mode_supported(*mode));
+            assert!(ioapic_delivery_mode_name(*mode).is_some());
+            assert!(io.assert_pin(gsi, true).is_none());
+            assert_eq!(
+                io.take_unsupported_delivery(),
+                Some(IoApicUnsupportedDelivery { gsi, mode: *mode })
+            );
+            // No Remote IRR for non-Fixed.
+            assert!(!io.remote_irr(gsi));
+        }
+
+        // Fixed still delivers on another pin.
+        write_rte(&mut io, 10, 0x0000_0060, 0x0300_0000);
+        let d = io.assert_pin(10, true).expect("Fixed delivery");
+        assert_eq!(d.vector, 0x60);
+        assert_eq!(d.dest_apic_id, 3);
+        assert!(io.unsupported_delivery().is_none());
     }
 }
