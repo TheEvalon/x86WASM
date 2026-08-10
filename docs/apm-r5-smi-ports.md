@@ -40,8 +40,9 @@ via the APM control port, poll until the SMI handler clears status.
 - APMC_EN / SMI_EN / GLBCTL gating is not checked; every APM_CNT write
   stub-completes.
 - APM BIOS 1.2 power-state functions beyond this handshake are out of scope.
-- Later SeaBIOS `call32_smm` paths that `OUT 0xB2` then `HLT` waiting for a
-  real SMI still need SMM (recorded when the probe reaches them).
+- Round 9 adds a halt-wake stub for `OUT 0xB2` then `HLT` so the probe cannot
+  wedge, but `call32_smm` still needs real SMM to trampoline EIP — see
+  `docs/apm-r9-smi-handshake.md`.
 
 ## Tests
 

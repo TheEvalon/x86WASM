@@ -822,7 +822,19 @@ impl Machine {
         self.advance_step_clock();
         // Spec: OSDev I8042 / A20 Line — system-reset after OUT (CPU not in bus view).
         let _ = self.service_8042_pulse_reset();
+        // Spec: Intel SDM Vol. 2 `HLT` — SMI resumes a halt. APM_CNT stub may
+        // clear halt without entering SMM (see `docs/apm-r9-smi-handshake.md`).
+        let _ = self.service_apm_smi_halt_wake();
         Ok(())
+    }
+
+    /// If APM_CNT latched a pending SMI stub and the CPU is halted, resume.
+    ///
+    /// Spec: Intel SDM Vol. 2 `HLT` — SMI is a wake event. This path only clears
+    /// `halted`; it does **not** enter SMM, relocate SMBASE, or rewrite EIP.
+    /// See `docs/apm-r9-smi-handshake.md`.
+    pub fn service_apm_smi_halt_wake(&mut self) -> bool {
+        self.apm.service_halt_wake(&mut self.cpu.halted)
     }
 
     pub fn run(&mut self, max_steps: u64) -> Result<u64, MachineError> {
