@@ -1,11 +1,12 @@
-//! Host helpers for HPET Timer 0 → I/O APIC GSI delivery (R10).
+//! Host helpers for HPET Timer 0 → I/O APIC GSI delivery (R10/R11).
 //!
 //! Kept out of the `Machine` monolith so parallel lanes can merge without
 //! rewriting MMIO dispatch. Legacy PIC replacement and FSB/MSI remain out of
-//! scope — see `docs/hpet-r10-ioapic-wire.md`.
+//! scope — see `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`.
 //!
-//! Ownership (R10 timers-apic): this module + thin `Machine::advance_hpet` /
-//! `Machine::sync_hpet_irq_to_ioapic` / `Machine::advance_hpet_ioapic` wrappers.
+//! Ownership (R10/R11 usb-timer): this module + thin `Machine::advance_hpet` /
+//! `Machine::sync_hpet_irq_to_ioapic` / `Machine::advance_hpet_ioapic` /
+//! `Machine::eoi_lapic_ioapic` (HPET level re-sync) wrappers.
 
 use devices::{HpetMmio, IoApicDelivery, IoApicMmio, LocalApicMmio};
 
@@ -51,4 +52,19 @@ pub fn advance_hpet_ioapic(
 ) -> Option<IoApicDelivery> {
     let _ = hpet.advance_main_counter(delta);
     sync_hpet_irq_to_ioapic(hpet, ioapic, lapic)
+}
+
+/// Local APIC EOI + I/O APIC Remote IRR clear, then re-drive HPET level IRQ.
+///
+/// Spec: 82093AA — after EOI clears Remote IRR, a still-asserted level pin
+/// must be allowed to re-deliver. When HPET `Tn_INT_STS` remains set (level
+/// mode, status not yet W1C), [`sync_hpet_irq_to_ioapic`] re-asserts the GSI.
+pub fn eoi_lapic_ioapic_resync_hpet(
+    hpet: &HpetMmio,
+    ioapic: &mut IoApicMmio,
+    lapic: &mut LocalApicMmio,
+) -> Option<(u8, Option<IoApicDelivery>)> {
+    let vec = ioapic_wire::eoi_lapic_and_ioapic(ioapic, lapic)?;
+    let redlivery = sync_hpet_irq_to_ioapic(hpet, ioapic, lapic);
+    Some((vec, redlivery))
 }
