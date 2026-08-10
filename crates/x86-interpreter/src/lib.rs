@@ -4505,20 +4505,27 @@ fn require_cpl0(cpu: &CpuState) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// The `CR4` bits a guest may set, derived from the `CPUID` bits that advertise
-/// them so the two cannot drift apart.
+/// `CR4.VME` — Virtual-8086 Mode Extensions enable, bit 0 (SDM Vol. 3 §2.5).
+///
+/// Writable for the Round-12 soft-int redirect-bitmap stub. **`CPUID.01H:EDX.VME`
+/// stays clear** until VIF/VIP and the rest of Table 20-2 ship (`AGENTS.md`
+/// truthful-CPUID). Architecturally §4.1.4 would couple the CR4 bit to CPUID;
+/// we deliberately allow the sticky CR4 bit without advertising the feature.
+const CR4_VME: u64 = 1 << 0;
+
+/// The `CR4` bits a guest may set.
 ///
 /// SDM Vol. 3 §4.1.4 makes each paging feature's `CR4` bit conditional on its
 /// `CPUID` bit ("`CR4.PSE` … can be set only if `CPUID.01H:EDX.PSE [bit 3]` is
 /// 1"), and Vol. 2 "MOV—Move to/from Control Registers" raises `#GP(0)` on a
-/// write of 1 to a reserved `CR4` bit. Every bit outside this mask — `VME`,
-/// `PVI`, `TSD`, `DE`, `PAE`, `MCE`, `PCE`, `OSFXSR`, `OSXMMEXCPT`, `UMIP`,
-/// `SMEP`, `SMAP`, `PKE`, and the rest — is unimplemented here, so it is
-/// reserved and refused rather than silently stored. In particular `CR4.PAE`
-/// is refused, which keeps a guest from selecting the PAE paging mode the
-/// engine reports as unsupported.
+/// write of 1 to a reserved `CR4` bit. `CR4.VME` is an honesty exception: it is
+/// writable for the bounded VME redirect stub while `CPUID.VME` remains clear.
+/// Every other unimplemented bit — `PVI`, `TSD`, `DE`, `PAE`, `MCE`, `PCE`,
+/// `OSFXSR`, `OSXMMEXCPT`, `UMIP`, `SMEP`, `SMAP`, `PKE`, and the rest — is
+/// reserved and refused. In particular `CR4.PAE` is refused, which keeps a
+/// guest from selecting the PAE paging mode the engine reports as unsupported.
 const fn cr4_reserved_mask() -> u64 {
-    let mut implemented = 0u64;
+    let mut implemented = CR4_VME;
     if CPUID_FEATURES_EDX & CPUID_FEATURE_PSE != 0 {
         implemented |= x86_mmu::paging::CR4_PSE;
     }
