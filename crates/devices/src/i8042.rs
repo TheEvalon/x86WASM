@@ -361,6 +361,13 @@ const HOST_AUX_QUEUE_CAP: usize = 16;
 /// (Get ID needs ACK + 2 ID bytes; Reset needs ACK + BAT).
 const KBD_RESP_QUEUE_CAP: usize = 8;
 
+/// Capacity of the pending keyboard scancode inject queue (device → host).
+///
+/// Spec: IBM PC/AT 8042 — the hardware output buffer is one byte; extra
+/// device bytes wait until the host reads `0x60`. This bounded queue models
+/// that backlog for make/break inject (not command ACK streams).
+pub const KBD_SCAN_QUEUE_CAP: usize = 16;
+
 /// Capacity of the pending controller → host response queue
 /// (diagnostic dump `0xAC` returns [`DIAG_DUMP_LEN`] bytes).
 const CTRL_RESP_QUEUE_CAP: usize = DIAG_DUMP_LEN;
@@ -548,6 +555,10 @@ pub struct I8042 {
     /// (and an enabled keyboard clock) before presentation on keyboard OBF.
     kbd_resp: [u8; KBD_RESP_QUEUE_CAP],
     kbd_resp_len: u8,
+    /// Pending keyboard scancode inject bytes waiting for an empty output buffer
+    /// (behind command responses). Drained by [`Self::take_output`].
+    kbd_scan: [u8; KBD_SCAN_QUEUE_CAP],
+    kbd_scan_len: u8,
     /// Pending controller → host response bytes (e.g. diagnostic dump `0xAC`)
     /// waiting for an empty output buffer. Presented via [`Self::push_output`]
     /// (normal OBF, not AUX; not gated by keyboard/aux clock disable; does not
@@ -603,6 +614,8 @@ impl I8042 {
             kbd_pending_param: KbdPendingParam::None,
             kbd_resp: [0; KBD_RESP_QUEUE_CAP],
             kbd_resp_len: 0,
+            kbd_scan: [0; KBD_SCAN_QUEUE_CAP],
+            kbd_scan_len: 0,
             ctrl_resp: [0; CTRL_RESP_QUEUE_CAP],
             ctrl_resp_len: 0,
             kbd_last_byte: 0,
@@ -633,6 +646,8 @@ impl I8042 {
         self.reset_kbd_defaults();
         self.kbd_resp = [0; KBD_RESP_QUEUE_CAP];
         self.kbd_resp_len = 0;
+        self.kbd_scan = [0; KBD_SCAN_QUEUE_CAP];
+        self.kbd_scan_len = 0;
         self.ctrl_resp = [0; CTRL_RESP_QUEUE_CAP];
         self.ctrl_resp_len = 0;
         self.translate_pending_break = false;
@@ -797,7 +812,9 @@ impl I8042 {
     /// Spec: OSDev I8042 / IBM PC AT — when the first-port clock is disabled
     /// (config bit4), the keyboard interface ignores device traffic. When
     /// enabled, a byte is placed in the output buffer (OBF) and may raise IRQ1
-    /// if config INT1 is set.
+    /// if config INT1 is set. If OBF is already full, the byte is queued in the
+    /// bounded scancode backlog ([`KBD_SCAN_QUEUE_CAP`]) and presented on the
+    /// next `0x60` read; returns false when the queue is full (byte dropped).
     ///
     /// Translation (config bit6): when set, the byte is treated as Scan Code
     /// Set 2 from the device and remapped to Scan Code Set 1 for the host
@@ -809,8 +826,9 @@ impl I8042 {
     ///
     /// Returns true if IRQ1 had a rising edge (same as [`Self::place_output`]).
     /// Returns false when the clock is disabled, when scanning is disabled
-    /// (`0xF5`), or when a translate-mode `0xF0` break prefix is consumed
-    /// without presenting a host byte.
+    /// (`0xF5`), when a translate-mode `0xF0` break prefix is consumed without
+    /// presenting a host byte, when the byte was queued behind a full OBF, or
+    /// when the scancode queue rejected the byte.
     pub fn inject_scancode(&mut self, make_code: u8) -> bool {
         if self.keyboard_clock_disabled() || !self.kbd_scanning {
             return false;
@@ -822,8 +840,50 @@ impl I8042 {
             Some(make_code)
         };
         match host_byte {
-            Some(b) => self.place_output(b),
+            Some(b) => {
+                if self.output.is_none() && self.kbd_scan_len == 0 {
+                    return self.place_output(b);
+                }
+                if (self.kbd_scan_len as usize) >= KBD_SCAN_QUEUE_CAP {
+                    return false;
+                }
+                self.kbd_scan[self.kbd_scan_len as usize] = b;
+                self.kbd_scan_len = self.kbd_scan_len.saturating_add(1);
+                if self.output.is_none() {
+                    let prev = self.irq1_line();
+                    self.flush_kbd_scan_queue();
+                    return !prev && self.irq1_line();
+                }
+                false
+            }
             None => false,
+        }
+    }
+
+    /// Bytes waiting in the scancode inject backlog (not counting the OBF byte).
+    pub fn kbd_scan_queue_len(&self) -> usize {
+        self.kbd_scan_len as usize
+    }
+
+    fn pop_kbd_scan(&mut self) -> Option<u8> {
+        if self.kbd_scan_len == 0 {
+            return None;
+        }
+        let b = self.kbd_scan[0];
+        let n = self.kbd_scan_len as usize;
+        self.kbd_scan.copy_within(1..n, 0);
+        self.kbd_scan_len -= 1;
+        Some(b)
+    }
+
+    /// Present the next queued scancode inject byte when OBF is empty and the
+    /// keyboard clock is enabled (after command-response queues).
+    fn flush_kbd_scan_queue(&mut self) {
+        if self.output.is_some() || self.keyboard_clock_disabled() {
+            return;
+        }
+        if let Some(b) = self.pop_kbd_scan() {
+            self.present_kbd_byte(b);
         }
     }
 
@@ -1016,12 +1076,14 @@ impl I8042 {
     }
 
     /// Pop the output buffer, clearing OBF and AUX OBF (`0x60` read), then
-    /// present the next queued controller, keyboard, or mouse response byte if any.
+    /// present the next queued controller, keyboard, scancode, or mouse
+    /// response byte if any.
     fn take_output(&mut self) -> Option<u8> {
         let v = self.output.take();
         self.output_from_aux = false;
         self.flush_ctrl_response_queue();
         self.flush_kbd_response_queue();
+        self.flush_kbd_scan_queue();
         self.flush_aux_response_queue();
         v
     }
@@ -2388,6 +2450,28 @@ mod tests {
         assert_ne!(k.status() & STATUS_OBF, 0);
         assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E); // Set 1 'A'
         assert!(!k.irq1_line());
+        assert_eq!(k.status() & STATUS_OBF, 0);
+    }
+
+    /// Spec: IBM PC/AT 8042 — one-byte OBF; further injects wait until `0x60` read.
+    #[test]
+    fn inject_scancode_queues_behind_full_obf() {
+        let mut k = I8042::new();
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_ENABLE_KBD));
+        k.port_write(I8042_STATUS_CMD, 1, u32::from(CMD_WRITE_CONFIG));
+        // Translate off: raw Set 1 bytes for a clear FIFO check.
+        k.port_write(I8042_DATA, 1, 0x00);
+        assert!(!k.inject_scancode(0x1E)); // OBF 'A'
+        assert_eq!(k.kbd_scan_queue_len(), 0);
+        assert!(!k.inject_scancode(0x30)); // queue 'B'
+        assert_eq!(k.kbd_scan_queue_len(), 1);
+        assert!(!k.inject_scancode(0x2E)); // queue 'C'
+        assert_eq!(k.kbd_scan_queue_len(), 2);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x1E);
+        assert_eq!(k.kbd_scan_queue_len(), 1);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x30);
+        assert_eq!(k.kbd_scan_queue_len(), 0);
+        assert_eq!(k.port_read(I8042_DATA, 1) as u8, 0x2E);
         assert_eq!(k.status() & STATUS_OBF, 0);
     }
 

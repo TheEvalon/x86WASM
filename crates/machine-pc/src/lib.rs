@@ -13,6 +13,7 @@ mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
 mod int13;
+mod int16;
 mod ioapic_wire;
 mod lapic_wire;
 mod mbr;
@@ -39,6 +40,9 @@ pub use int13::{
     INT13_DRIVE_HD0, INT13_EXT_CX_PACKET, INT13_EXT_MAGIC_IN, INT13_EXT_MAGIC_OUT,
     INT13_EXT_VERSION, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE, INT13_STATUS_INVALID,
     INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
+};
+pub use int16::{
+    Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_GET_KEYSTROKE, INT16_BUFFER_CAP,
 };
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::{
@@ -221,6 +225,8 @@ pub struct Machine {
     ide_disk_sectors: Option<u64>,
     /// fw_cfg `bootorder` policy: machine default HDD/CD/floppy, or a host override.
     fw_cfg_boot_order: FwCfgBootOrderPolicy,
+    /// Host INT 16h typeahead buffer (AH=00/01 stub; not the BDA ring).
+    int16_buf: Vec<crate::int16::Int16Key>,
 }
 
 impl Machine {
@@ -256,6 +262,7 @@ impl Machine {
             ports: PortBus::new(),
             ide_disk_sectors: None,
             fw_cfg_boot_order: FwCfgBootOrderPolicy::Default,
+            int16_buf: Vec::new(),
         };
         machine
             .mem
@@ -710,6 +717,7 @@ impl Machine {
         self.fdc.reset();
         self.fw_cfg.reset();
         self.post_diag.reset();
+        self.int16_buf.clear();
         // Configuration survives reset (like the fw_cfg host configuration);
         // only partial timer quanta are dropped.
         self.step_clock.reset_accumulators();
