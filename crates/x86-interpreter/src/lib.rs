@@ -2938,11 +2938,12 @@ fn write_sreg(
     selector: u16,
 ) -> Result<(), ExecError> {
     // Caller must reject MOV CS and reserved Sreg encodings (#UD) before calling.
-    // PE=0: sticky unreal real-mode base (SDM Vol. 3 §3.4.2–§3.4.3).
-    // PE=1: DS/ES/FS/GS/SS load from GDT (SS requires writable data; null → #GP).
+    // PE=0 or VM86: sticky unreal / real-address base (SDM Vol. 3 §3.4.2–§3.4.3,
+    // §20.1.1). PE=1 and VM=0: DS/ES/FS/GS/SS load from GDT.
+    let use_gdt = cr0_pe(cpu) && !eflags_vm(cpu.rflags);
     match sreg {
-        0 | 3 | 4 | 5 if cr0_pe(cpu) => load_data_sreg_from_gdt(cpu, bus, sreg, selector),
-        2 if cr0_pe(cpu) => load_ss_from_gdt(cpu, bus, selector),
+        0 | 3 | 4 | 5 if use_gdt => load_data_sreg_from_gdt(cpu, bus, sreg, selector),
+        2 if use_gdt => load_ss_from_gdt(cpu, bus, selector),
         0 => {
             cpu.es.load_real_mode_selector(selector);
             Ok(())
@@ -3021,9 +3022,11 @@ fn pop_sreg(
 
 /// Validate a selector for ES/SS/DS/FS/GS without mutating CPU state.
 ///
-/// Returns `None` in real-address mode, where the load is the sticky-unreal
-/// `selector << 4` base update with no descriptor to read.
-/// Spec: Intel SDM Vol. 3 §§3.4.2, 3.5.1, 5.4.1.
+/// Returns `None` in real-address mode **and** virtual-8086 mode, where the
+/// load is the sticky-unreal / real-address `selector << 4` base update with
+/// no descriptor to read (Vol. 3 §20.1.1). Protected mode (`PE=1`, `VM=0`)
+/// reads the GDT.
+/// Spec: Intel SDM Vol. 3 §§3.4.2, 3.5.1, 5.4.1, 20.1.1.
 fn prepare_sreg_load(
     cpu: &CpuState,
     bus: &mut dyn Bus,
@@ -3031,7 +3034,7 @@ fn prepare_sreg_load(
     selector: u16,
 ) -> Result<Option<x86_core::SegmentReg>, ExecError> {
     debug_assert!(matches!(sreg, 0 | 2 | 3 | 4 | 5));
-    if !cr0_pe(cpu) {
+    if !cr0_pe(cpu) || eflags_vm(cpu.rflags) {
         return Ok(None);
     }
     Ok(Some(if sreg == 2 {
@@ -7007,9 +7010,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
+            // Protected (`PE=1`, `VM=0`) uses GDT; real-address / VM86 use
+            // `selector << 4` (Vol. 3 §20.1.1).
+            let use_gdt = cr0_pe(cpu) && !eflags_vm(cpu.rflags);
             if opsz32(&insn) {
                 let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
-                let protected_es = if cr0_pe(cpu) {
+                let protected_es = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
@@ -7023,7 +7029,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 }
             } else {
                 let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
-                let protected_es = if cr0_pe(cpu) {
+                let protected_es = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
@@ -7043,15 +7049,16 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // In protected mode, validate/load DS through the shared DS/ES
             // descriptor path only after the complete pointer is readable.
             // Spec: Intel SDM Vol. 2 "LDS" (Operation, Protected Mode
-            // Exceptions); Vol. 3 §§3.4.2–3.4.5, 5.3–5.6.
+            // Exceptions); Vol. 3 §§3.4.2–3.4.5, 5.3–5.6, 20.1.1.
             // Register form (mod=11) → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
+            let use_gdt = cr0_pe(cpu) && !eflags_vm(cpu.rflags);
             if opsz32(&insn) {
                 let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
-                let protected_ds = if cr0_pe(cpu) {
+                let protected_ds = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
@@ -7065,7 +7072,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 }
             } else {
                 let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
-                let protected_ds = if cr0_pe(cpu) {
+                let protected_ds = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
