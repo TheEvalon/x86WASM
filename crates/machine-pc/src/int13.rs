@@ -1,20 +1,28 @@
-//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h).
+//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h)
+//! and floppy subset (AH=00/02/03, `DL=00h`).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
-//! applies classic INT 13h register conventions against the primary IDE image,
-//! mirroring [`crate::mbr::Machine::load_mbr_to_7c00`]'s host-side media path.
-//! This is **not** a guest IVT BIOS, not CHS translation modes, and not floppy
-//! INT 13h (see [`crate::mbr`] for floppy → `0x7C00` handoff).
+//! applies classic INT 13h register conventions against the primary IDE image
+//! or attached FDC media, mirroring [`crate::mbr::Machine::load_mbr_to_7c00`]'s
+//! host-side media path. This is **not** a guest IVT BIOS and not CHS
+//! translation modes.
 //!
 //! Spec: IBM PC BIOS INT 13h Disk Services (AH=00h reset, AH=02h read sectors,
 //! AH=03h write sectors, AH=08h get drive parameters); IBM/Microsoft INT 13h
 //! Extensions / RBIL (AH=41h check extensions, AH=42h extended read, AH=43h
 //! extended write). ATA IDENTIFY obsolete geometry 16 heads / 63
-//! sectors-per-track (matches `IdePrimary` IDENTIFY words 3/6).
+//! sectors-per-track (matches `IdePrimary` IDENTIFY words 3/6). Floppy uses
+//! fixed 1.44MB geometry (80/2/18) via `Fdc82077::read_sector` /
+//! `Fdc82077::write_sector`.
 
 use crate::{Machine, MachineError};
+use devices::{
+    FDC_1440_CYLINDERS, FDC_1440_HEADS, FDC_1440_SECTORS_PER_TRACK, FDC_SECTOR_SIZE,
+};
 use x86_core::CpuState;
 
+/// First floppy (`DL`).
+pub const INT13_DRIVE_FD0: u8 = 0x00;
 /// First hard disk (IBM BIOS `DL`).
 pub const INT13_DRIVE_HD0: u8 = 0x80;
 
@@ -48,9 +56,11 @@ pub const INT13_DAP_SIZE_MIN: u8 = 0x10;
 pub const INT13_STATUS_OK: u8 = 0x00;
 /// Invalid command / unsupported function / bad drive.
 pub const INT13_STATUS_INVALID: u8 = 0x01;
+/// Write protected (floppy media WP pin).
+pub const INT13_STATUS_WRITE_PROTECTED: u8 = 0x03;
 /// Sector not found / address beyond media.
 pub const INT13_STATUS_SECTOR_NOT_FOUND: u8 = 0x04;
-/// Drive not ready (no attached IDE image).
+/// Drive not ready (no attached IDE / floppy image).
 pub const INT13_STATUS_TIMEOUT: u8 = 0x80;
 
 /// Heads matching IDE IDENTIFY obsolete word 3.
@@ -582,12 +592,241 @@ impl Machine {
             .map_err(|_| MachineError::MbrRamTooSmall)?;
         Ok(())
     }
+
+    /// Host-side INT 13h floppy dispatch (`DL = 00h`) using current CPU registers.
+    ///
+    /// Supports AH=00h reset, AH=02h read, AH=03h write against attached FDC
+    /// 1.44MB media. Spec: IBM PC BIOS INT 13h floppy disk services; geometry
+    /// matches [`FDC_1440_CYLINDERS`] / [`FDC_1440_HEADS`] /
+    /// [`FDC_1440_SECTORS_PER_TRACK`].
+    pub fn service_int13_floppy(&mut self) {
+        let dl = self.cpu.gpr_u8_low(CpuState::RDX);
+        if dl != INT13_DRIVE_FD0 {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        match self.cpu.ah() {
+            INT13_AH_RESET => self.int13_floppy_reset(),
+            INT13_AH_READ => self.int13_floppy_read_from_regs(),
+            INT13_AH_WRITE => self.int13_floppy_write_from_regs(),
+            _ => self.int13_fail(INT13_STATUS_INVALID),
+        }
+    }
+
+    /// Route INT 13h by `DL`: floppy `00h` or hard disk `80h`.
+    pub fn service_int13(&mut self) {
+        match self.cpu.gpr_u8_low(CpuState::RDX) {
+            INT13_DRIVE_FD0 => self.service_int13_floppy(),
+            INT13_DRIVE_HD0 => self.service_int13_hd(),
+            _ => self.int13_fail(INT13_STATUS_INVALID),
+        }
+    }
+
+    /// Read `count` floppy sectors starting at CHS into physical `dest`.
+    ///
+    /// Spec: IBM BIOS INT 13h AH=02h floppy — consecutive sectors advance
+    /// sector → head → cylinder within 1.44MB geometry.
+    pub fn int13_floppy_read_chs_to_phys(
+        &mut self,
+        cylinder: u8,
+        head: u8,
+        sector: u8,
+        count: u8,
+        dest: u64,
+    ) -> Result<u8, u8> {
+        self.int13_floppy_xfer(cylinder, head, sector, count, dest, false)
+    }
+
+    /// Write `count` floppy sectors from physical `src` starting at CHS.
+    ///
+    /// Spec: IBM BIOS INT 13h AH=03h floppy — same CHS advance as AH=02h.
+    /// Media write-protect → [`INT13_STATUS_WRITE_PROTECTED`].
+    pub fn int13_floppy_write_chs_from_phys(
+        &mut self,
+        cylinder: u8,
+        head: u8,
+        sector: u8,
+        count: u8,
+        src: u64,
+    ) -> Result<u8, u8> {
+        self.int13_floppy_xfer(cylinder, head, sector, count, src, true)
+    }
+
+    fn int13_floppy_xfer(
+        &mut self,
+        mut cylinder: u8,
+        mut head: u8,
+        mut sector: u8,
+        count: u8,
+        mut phys: u64,
+        write: bool,
+    ) -> Result<u8, u8> {
+        if !self.fdc.has_media() {
+            return Err(INT13_STATUS_TIMEOUT);
+        }
+        if write && self.fdc.write_protected {
+            return Err(INT13_STATUS_WRITE_PROTECTED);
+        }
+        if count == 0 || sector == 0 || head >= FDC_1440_HEADS {
+            return Err(INT13_STATUS_INVALID);
+        }
+        if sector > FDC_1440_SECTORS_PER_TRACK || cylinder >= FDC_1440_CYLINDERS {
+            return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+        }
+        let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
+        let end = phys.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
+        if end > self.mem.ram_len() as u64 {
+            return Err(INT13_STATUS_INVALID);
+        }
+
+        for i in 0..count {
+            if write {
+                let mut sector_buf = [0u8; FDC_SECTOR_SIZE];
+                for (j, b) in sector_buf.iter_mut().enumerate() {
+                    *b = self
+                        .mem
+                        .read_u8(phys + j as u64)
+                        .map_err(|_| INT13_STATUS_INVALID)?;
+                }
+                if !self.fdc.write_sector(cylinder, head, sector, &sector_buf) {
+                    return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+                }
+            } else {
+                let Some(sector_buf) = self.fdc.read_sector(cylinder, head, sector) else {
+                    return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+                };
+                for (j, b) in sector_buf.iter().enumerate() {
+                    self.mem
+                        .write_u8(phys + j as u64, *b)
+                        .map_err(|_| INT13_STATUS_INVALID)?;
+                }
+            }
+            phys = phys.wrapping_add(INT13_SECTOR_SIZE as u64);
+            if i + 1 < count {
+                let Some((c, h, s)) = advance_floppy_chs(cylinder, head, sector) else {
+                    return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+                };
+                cylinder = c;
+                head = h;
+                sector = s;
+            }
+        }
+        Ok(count)
+    }
+
+    fn int13_floppy_reset(&mut self) {
+        if !self.fdc.has_media() {
+            self.int13_fail(INT13_STATUS_TIMEOUT);
+            return;
+        }
+        self.int13_ok_al(0);
+    }
+
+    fn int13_floppy_read_from_regs(&mut self) {
+        let al = self.cpu.al();
+        let cx = self.cpu.gpr_u16(CpuState::RCX);
+        let dh = self.cpu.gpr_u8(4 + CpuState::RDX);
+        let bx = self.cpu.gpr_u16(CpuState::RBX);
+        let (cylinder, sector) = unpack_cx(cx);
+        let dest = self.cpu.es.base.wrapping_add(u64::from(bx));
+        if cylinder > u16::from(u8::MAX) {
+            self.cpu.set_al(0);
+            self.int13_fail(INT13_STATUS_SECTOR_NOT_FOUND);
+            return;
+        }
+        match self.int13_floppy_read_chs_to_phys(cylinder as u8, dh, sector, al, dest) {
+            Ok(n) => self.int13_ok_al(n),
+            Err(status) => {
+                self.cpu.set_al(0);
+                self.int13_fail(status);
+            }
+        }
+    }
+
+    fn int13_floppy_write_from_regs(&mut self) {
+        let al = self.cpu.al();
+        let cx = self.cpu.gpr_u16(CpuState::RCX);
+        let dh = self.cpu.gpr_u8(4 + CpuState::RDX);
+        let bx = self.cpu.gpr_u16(CpuState::RBX);
+        let (cylinder, sector) = unpack_cx(cx);
+        let src = self.cpu.es.base.wrapping_add(u64::from(bx));
+        if cylinder > u16::from(u8::MAX) {
+            self.cpu.set_al(0);
+            self.int13_fail(INT13_STATUS_SECTOR_NOT_FOUND);
+            return;
+        }
+        match self.int13_floppy_write_chs_from_phys(cylinder as u8, dh, sector, al, src) {
+            Ok(n) => self.int13_ok_al(n),
+            Err(status) => {
+                self.cpu.set_al(0);
+                self.int13_fail(status);
+            }
+        }
+    }
+}
+
+/// Advance floppy CHS by one sector within 1.44MB geometry.
+fn advance_floppy_chs(cylinder: u8, head: u8, sector: u8) -> Option<(u8, u8, u8)> {
+    let mut sector = sector.checked_add(1)?;
+    let mut head = head;
+    let mut cylinder = cylinder;
+    if sector > FDC_1440_SECTORS_PER_TRACK {
+        sector = 1;
+        head = head.checked_add(1)?;
+        if head >= FDC_1440_HEADS {
+            head = 0;
+            cylinder = cylinder.checked_add(1)?;
+            if cylinder >= FDC_1440_CYLINDERS {
+                return None;
+            }
+        }
+    }
+    Some((cylinder, head, sector))
+}
+
+/// Convenience: set up INT 13h AH=02h registers for a floppy read.
+pub fn setup_int13_floppy_read(
+    cpu: &mut CpuState,
+    cylinder: u8,
+    head: u8,
+    sector: u8,
+    count: u8,
+    es: u16,
+    bx: u16,
+) {
+    cpu.set_ah(INT13_AH_READ);
+    cpu.set_al(count);
+    cpu.set_gpr_u16(CpuState::RCX, pack_cx(u16::from(cylinder), sector));
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
+    cpu.set_gpr_u8(4 + CpuState::RDX, head);
+    cpu.set_gpr_u16(CpuState::RBX, bx);
+    cpu.es = x86_core::SegmentReg::real_mode(es);
+}
+
+/// Convenience: set up INT 13h AH=03h registers for a floppy write.
+pub fn setup_int13_floppy_write(
+    cpu: &mut CpuState,
+    cylinder: u8,
+    head: u8,
+    sector: u8,
+    count: u8,
+    es: u16,
+    bx: u16,
+) {
+    cpu.set_ah(INT13_AH_WRITE);
+    cpu.set_al(count);
+    cpu.set_gpr_u16(CpuState::RCX, pack_cx(u16::from(cylinder), sector));
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
+    cpu.set_gpr_u8(4 + CpuState::RDX, head);
+    cpu.set_gpr_u16(CpuState::RBX, bx);
+    cpu.es = x86_core::SegmentReg::real_mode(es);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
+    use devices::FDC_1440_IMAGE_SIZE;
 
     fn synthetic_disk(sectors: usize) -> Vec<u8> {
         let mut img = vec![0u8; sectors * INT13_SECTOR_SIZE];
@@ -968,5 +1207,106 @@ mod tests {
         bare.service_int13_hd();
         assert!(cf(&bare.cpu));
         assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    fn synthetic_floppy_boot() -> Vec<u8> {
+        let mut img = vec![0u8; FDC_1440_IMAGE_SIZE];
+        img[0] = 0xF4;
+        img[510] = MBR_SIGNATURE_LO;
+        img[511] = MBR_SIGNATURE_HI;
+        // Sector 2 (CHS 0,0,2) marker
+        img[INT13_SECTOR_SIZE] = 0xB2;
+        img[INT13_SECTOR_SIZE + 1] = 0x2B;
+        img
+    }
+
+    /// Spec: IBM BIOS INT 13h floppy AH=02h — CHS (0,0,1) via FDC media.
+    #[test]
+    fn int13_floppy_ah02_reads_boot_sector() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        setup_int13_floppy_read(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.al(), 1);
+        assert_eq!(m.mem.read_u8(MBR_PHYS_ADDR).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(MBR_PHYS_ADDR + 510).unwrap(), 0x55);
+    }
+
+    /// Spec: multi-sector floppy AH=02h advances consecutive CHS.
+    #[test]
+    fn int13_floppy_ah02_reads_two_sectors() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        setup_int13_floppy_read(&mut m.cpu, 0, 0, 1, 2, 0x0000, 0x8000);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(0x8000 + INT13_SECTOR_SIZE as u64).unwrap(), 0xB2);
+        assert_eq!(
+            m.mem
+                .read_u8(0x8000 + INT13_SECTOR_SIZE as u64 + 1)
+                .unwrap(),
+            0x2B
+        );
+    }
+
+    /// Spec: floppy AH=03h writes ES:BX into FDC image at CHS.
+    #[test]
+    fn int13_floppy_ah03_writes_sector() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        for i in 0..INT13_SECTOR_SIZE {
+            m.mem.write_u8(0x9000 + i as u64, 0x3C).unwrap();
+        }
+        setup_int13_floppy_write(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x9000);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        let sector = m.fdc.read_sector(0, 0, 1).expect("sector");
+        assert!(sector.iter().all(|&b| b == 0x3C));
+    }
+
+    /// Spec: floppy AH=03h then AH=02h round-trip; WP → AH=03h.
+    #[test]
+    fn int13_floppy_write_read_and_wp() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        for i in 0..INT13_SECTOR_SIZE {
+            m.mem
+                .write_u8(0xA000 + i as u64, (i & 0xFF) as u8)
+                .unwrap();
+        }
+        setup_int13_floppy_write(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0xA000);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        setup_int13_floppy_read(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0xB000);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        for i in 0..INT13_SECTOR_SIZE {
+            assert_eq!(
+                m.mem.read_u8(0xB000 + i as u64).unwrap(),
+                (i & 0xFF) as u8
+            );
+        }
+
+        m.fdc.set_write_protected(true);
+        setup_int13_floppy_write(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0xA000);
+        m.service_int13_floppy();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_WRITE_PROTECTED);
+    }
+
+    /// Spec: no floppy media → timeout; HD DL rejected by floppy service.
+    #[test]
+    fn int13_floppy_errors() {
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_floppy_read(&mut bare.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        bare.service_int13_floppy();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        setup_int13_floppy_read(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_floppy();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
     }
 }
