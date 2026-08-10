@@ -31,7 +31,9 @@ mod vga_frame;
 mod xbcs;
 
 pub use guest_boot::{
-    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GUEST_BOOT_MEASURE_VERSION,
+    synthetic_freedos_like_disk, synthetic_linux_serial_stub_disk, GuestBootCheckpoint,
+    GuestBootMeasure, GuestBootMedia, GuestOsMeasure, GuestOsMeasureKind,
+    GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION,
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int10::{
@@ -40,12 +42,14 @@ pub use int10::{
     INT10_MODE_13H_GRAPHICS, INT10_VECTOR,
 };
 pub use int13::{
-    chs_to_lba, pack_cx, setup_int13_hd_ext_read, setup_int13_hd_read, setup_int13_hd_write,
+    chs_to_lba, pack_cx, setup_int13_floppy_read, setup_int13_floppy_write,
+    setup_int13_hd_ext_read, setup_int13_hd_ext_write, setup_int13_hd_read, setup_int13_hd_write,
     unpack_cx, INT13_AH_CHECK_EXTENSIONS, INT13_AH_EXT_READ, INT13_AH_EXT_WRITE,
     INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ, INT13_AH_RESET, INT13_AH_WRITE, INT13_DAP_SIZE_MIN,
-    INT13_DRIVE_HD0, INT13_EXT_CX_PACKET, INT13_EXT_MAGIC_IN, INT13_EXT_MAGIC_OUT,
+    INT13_DRIVE_FD0, INT13_DRIVE_HD0, INT13_EXT_CX_PACKET, INT13_EXT_MAGIC_IN, INT13_EXT_MAGIC_OUT,
     INT13_EXT_VERSION, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE, INT13_STATUS_INVALID,
     INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
+    INT13_STATUS_WRITE_PROTECTED,
 };
 pub use int16::{Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_GET_KEYSTROKE, INT16_BUFFER_CAP};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};

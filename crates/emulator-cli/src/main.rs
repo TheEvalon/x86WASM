@@ -1,9 +1,9 @@
 //! Native CLI: run a ROM/BIOS (default: built-in HELLO ROM) until HLT.
 
 use emulator_cli::{
-    build_machine, guest_boot_media, parse_args, run_guest_measure, run_machine,
-    run_post_probe_options, usage, vga_frame_report, vga_text_dump, BuiltMachine, CliError,
-    Options, ParsedArgs,
+    build_machine, guest_boot_media, parse_args, run_freedos_measure, run_guest_measure,
+    run_linux_serial_measure, run_machine, run_post_probe_options, usage, vga_frame_report,
+    vga_text_dump, BuiltMachine, CliError, Options, ParsedArgs,
 };
 use machine_pc::Machine;
 use std::env;
@@ -61,6 +61,36 @@ fn main() -> ExitCode {
     };
     let option_rom_line = option_rom.map(|info| info.to_string());
 
+    if opts.guest_freedos_measure {
+        match run_freedos_measure(&mut machine, opts.max_steps) {
+            Ok(measure) => {
+                println!("{measure}");
+                print_diagnostics(&machine, option_rom_line, &opts);
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                print_diagnostics(&machine, option_rom_line, &opts);
+                return arg_exit_code(&e);
+            }
+        }
+    }
+
+    if opts.guest_linux_serial_measure {
+        match run_linux_serial_measure(&mut machine, opts.max_steps) {
+            Ok(measure) => {
+                println!("{measure}");
+                print_diagnostics(&machine, option_rom_line, &opts);
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                print_diagnostics(&machine, option_rom_line, &opts);
+                return arg_exit_code(&e);
+            }
+        }
+    }
+
     if opts.guest_measure {
         match run_guest_measure(&mut machine, guest_boot_media(&opts), opts.max_steps) {
             Ok(measure) => {
@@ -100,9 +130,8 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("{e}");
-            // Still show what reached the screen; that is the point of the flag.
             print_diagnostics(&machine, option_rom_line, &opts);
-            ExitCode::FAILURE
+            arg_exit_code(&e)
         }
     }
 }

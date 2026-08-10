@@ -19,6 +19,7 @@ IBM PC BIOS INT 19h floppy boot path / OSDev Boot Sequence.
 
 ## Still unsupported
 
-- Guest INT 13h floppy (`DL=00h`)
-- Multi-sector floppy loader / BPB parse
+- Guest INT 13h floppy AH=08h / format / extensions (AH=02/03 host path is R9 —
+  see `docs/storage-r9-int13-floppy.md`)
+- Multi-sector floppy loader / BPB parse beyond INT 13h AH=02h
 - Boot-order policy beyond these two host helpers

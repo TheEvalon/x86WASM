@@ -25,13 +25,14 @@ Drive `DL = 80h` only. Packet form: size ≥ `10h`, real-mode `seg:off` buffer,
 ## Honesty / unsupported
 
 - **Not** a guest IVT BIOS body (SeaBIOS still required for real `INT 13h`).
-- **AH=43h** extended write — returns `AH=01h` / CF set (documented unsupported).
+- **AH=43h** extended write — implemented in round 9; see
+  `docs/storage-r9-int13-ext-write.md`.
 - **AH=47h/48h**, removable locking (`CX` bit1), EDD (`CX` bit2) — unsupported.
 - Flat 64-bit transfer buffer (`FFFF:FFFF` + packet size ≥ `18h`) — rejected.
 - Floppy / CD INT 13h extensions — out of scope.
 
-`CX` advertises packet access bit 0 only so callers can discover AH=42h; that
-does **not** imply AH=43h write is present.
+`CX` advertises packet access bit 0 so callers can discover packet I/O
+(AH=42h; AH=43h added in R9).
 
 ## Spec
 
