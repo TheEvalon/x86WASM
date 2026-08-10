@@ -16,6 +16,7 @@
 //! 82077AA FDC port stub (0x3F0–0x3F5/0x3F7; Specify/Recalibrate/Seek/Sense Int; IRQ6);
 //! FDC READ ID track scan and Configure EIS implied seek (1.44MB media only);
 //! QEMU fw_cfg I/O subset (0x510/0x511 traditional + 0x514 DMA read/skip/select).
+//! Classic LPT1/LPT2 parallel-port register-file stub (0x378–0x37A / 0x278–0x27A).
 
 #![forbid(unsafe_code)]
 
@@ -26,6 +27,7 @@ mod fdc;
 mod fw_cfg;
 mod i8042;
 mod ide;
+mod lpt;
 mod pci;
 mod pic;
 mod pit;
@@ -117,6 +119,10 @@ pub use ide::{
     IDE_SECONDARY_CTRL, IDE_SECONDARY_DATA, IDE_SECONDARY_DRIVE, IDE_SECONDARY_ERROR,
     IDE_SECONDARY_LBA_HI, IDE_SECONDARY_LBA_LO, IDE_SECONDARY_LBA_MID, IDE_SECONDARY_SECCOUNT,
     IDE_SECONDARY_STATUS,
+};
+pub use lpt::{
+    ParallelPort, LPT1_BASE, LPT2_BASE, LPT_CONTROL, LPT_DATA, LPT_LAST_OFFSET, LPT_STATUS,
+    LPT_STATUS_BUSY_N, LPT_STATUS_NO_PRINTER,
 };
 pub use pci::{
     decode_bmide_prd, pirqrc_routed_irq, sanitize_piix_elcr, BmidePrdEntry, BmidePrdError,

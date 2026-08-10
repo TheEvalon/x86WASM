@@ -52,13 +52,13 @@ pub use xbcs::{
 
 use devices::{
     ApmSmi, CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
-    FwCfgDmaOutcome, IdePrimary, IdeSecondary, PciConfig, Pit8254, Port92, PortDevice, Serial16550,
-    VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY,
-    E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED,
-    FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD,
-    PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
-    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    FwCfgDmaOutcome, IdePrimary, IdeSecondary, ParallelPort, PciConfig, Pit8254, Port92,
+    PortDevice, Serial16550, VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX,
+    E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED,
+    EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA,
+    I8042_STATUS_CMD, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
+    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -113,6 +113,10 @@ pub struct Machine {
     pub port92: Port92,
     /// APM/SMI command+status (`0xB2`/`0xB3`) with SMM-completion stub.
     pub apm: ApmSmi,
+    /// LPT1 parallel port (`0x378`–`0x37A`) — data/status/control stub.
+    pub lpt1: ParallelPort,
+    /// LPT2 parallel port (`0x278`–`0x27A`) — data/status/control stub.
+    pub lpt2: ParallelPort,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
     /// VGA color text plane at 0xB8000 + CRTC/Seq/GC/ATC/DAC/Misc stubs.
@@ -164,6 +168,8 @@ impl Machine {
             kbd: I8042::new(),
             port92: Port92::new(),
             apm: ApmSmi::new(),
+            lpt1: ParallelPort::lpt1(),
+            lpt2: ParallelPort::lpt2(),
             dma: Dma8237::new(),
             vga: VgaText::new(),
             pci: PciConfig::new(),
@@ -576,6 +582,8 @@ impl Machine {
         self.kbd.reset();
         self.port92.reset();
         self.apm.reset();
+        self.lpt1.reset();
+        self.lpt2.reset();
         self.dma.reset();
         self.vga.reset();
         self.pci.reset();
@@ -637,6 +645,8 @@ impl Machine {
             kbd: &mut self.kbd,
             port92: &mut self.port92,
             apm: &mut self.apm,
+            lpt1: &mut self.lpt1,
+            lpt2: &mut self.lpt2,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
@@ -671,6 +681,8 @@ impl Machine {
                 kbd: &mut self.kbd,
                 port92: &mut self.port92,
                 apm: &mut self.apm,
+                lpt1: &mut self.lpt1,
+                lpt2: &mut self.lpt2,
                 dma: &mut self.dma,
                 vga: &mut self.vga,
                 pci: &mut self.pci,
@@ -858,6 +870,8 @@ impl Machine {
             kbd: &mut self.kbd,
             port92: &mut self.port92,
             apm: &mut self.apm,
+            lpt1: &mut self.lpt1,
+            lpt2: &mut self.lpt2,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
@@ -1054,6 +1068,8 @@ struct MachineBus<'a> {
     kbd: &'a mut I8042,
     port92: &'a mut Port92,
     apm: &'a mut ApmSmi,
+    lpt1: &'a mut ParallelPort,
+    lpt2: &'a mut ParallelPort,
     dma: &'a mut Dma8237,
     vga: &'a mut VgaText,
     pci: &'a mut PciConfig,
@@ -1322,6 +1338,12 @@ impl MachineBus<'_> {
         if self.vga.owns_port(port) {
             return self.vga.port_read(port, size);
         }
+        if self.lpt1.owns_port(port) {
+            return self.lpt1.port_read(port, size);
+        }
+        if self.lpt2.owns_port(port) {
+            return self.lpt2.port_read(port, size);
+        }
         match port {
             PIC_MASTER_CMD | PIC_MASTER_DATA | PIC_SLAVE_CMD | PIC_SLAVE_DATA => {
                 self.pic.port_read(port, size)
@@ -1421,6 +1443,14 @@ impl MachineBus<'_> {
         }
         if self.vga.owns_port(port) {
             self.vga.port_write(port, size, value);
+            return;
+        }
+        if self.lpt1.owns_port(port) {
+            self.lpt1.port_write(port, size, value);
+            return;
+        }
+        if self.lpt2.owns_port(port) {
+            self.lpt2.port_write(port, size, value);
             return;
         }
         match port {
@@ -1615,7 +1645,7 @@ mod tests {
         FW_CFG_DMA_ADDR_LOW, FW_CFG_DMA_CTL_ERROR, FW_CFG_DMA_CTL_READ, FW_CFG_DMA_CTL_SELECT,
         FW_CFG_DMA_CTL_WRITE, FW_CFG_DMA_SIGNATURE, FW_CFG_ID, FW_CFG_RAM_SIZE, FW_CFG_SELECTOR,
         FW_CFG_SIGNATURE, FW_CFG_SIGNATURE_BYTES, FW_CFG_VERSION, FW_CFG_VERSION_DMA, I8042,
-        I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
+        I8042_DATA, I8042_STATUS_CMD, LPT_STATUS_NO_PRINTER, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
         PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
         PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
         PORT61_OUT2, PORT61_SPKR_DATA, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL,
@@ -2641,6 +2671,29 @@ mod tests {
         assert!(!m.pit.channel0().count_loaded);
     }
 
+    /// Spec: IBM PC / OSDev Parallel Port — LPT1/LPT2 DATA/STATUS/CONTROL claimed;
+    /// `0x3E9`/`0x2E9` are not classic LPT and stay open-bus.
+    #[test]
+    fn machine_bus_lpt1_lpt2_claimed_probe_sites_open_bus() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(0x378, 0xA5).unwrap();
+            assert_eq!(bus.port_in_u8(0x378).unwrap(), 0xA5);
+            assert_eq!(bus.port_in_u8(0x379).unwrap(), LPT_STATUS_NO_PRINTER);
+            bus.port_out_u8(0x37A, 0x0C).unwrap();
+            assert_eq!(bus.port_in_u8(0x37A).unwrap(), 0x0C);
+
+            bus.port_out_u8(0x278, 0x5A).unwrap();
+            assert_eq!(bus.port_in_u8(0x278).unwrap(), 0x5A);
+            assert_eq!(bus.port_in_u8(0x279).unwrap(), LPT_STATUS_NO_PRINTER);
+
+            // Documented open-bus: not LPT DATA/STATUS/CONTROL.
+            assert_eq!(bus.port_in_u8(0x3E9).unwrap(), 0xFF);
+            assert_eq!(bus.port_in_u8(0x2E9).unwrap(), 0xFF);
+        }
+    }
+
     /// Spec: IBM PC/AT Technical Reference — port `0x80` is the manufacturing
     /// diagnostic (POST checkpoint) port. Writes latch a code for a POST card;
     /// the system board defines no read data, so reads stay ISA open bus.
@@ -2855,6 +2908,8 @@ mod tests {
         assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.port92, Port92::new());
         assert_eq!(m.apm, ApmSmi::new());
+        assert_eq!(m.lpt1, ParallelPort::lpt1());
+        assert_eq!(m.lpt2, ParallelPort::lpt2());
         assert_eq!(m.pci, PciConfig::new());
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
