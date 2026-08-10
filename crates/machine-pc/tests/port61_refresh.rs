@@ -1,6 +1,4 @@
-use devices::{
-    PortDevice, PIT_CH1_DATA, PIT_CONTROL, PORT61_REFRESH_TOGGLE, PORT_SYSTEM_CONTROL,
-};
+use devices::{PortDevice, PIT_CH1_DATA, PIT_CONTROL, PORT61_REFRESH_TOGGLE, PORT_SYSTEM_CONTROL};
 use machine_pc::Machine;
 use x86_core::{CpuState, SegmentReg};
 

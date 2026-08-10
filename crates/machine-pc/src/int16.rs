@@ -68,6 +68,7 @@ impl Machine {
     ///   ZF (host stub does **not** busy-wait — callers must push first).
     /// - AH=01h: if empty set ZF and leave `AX`; if ready clear ZF, load `AX`,
     ///   leave the key in the buffer.
+    ///
     /// Other AH values leave registers unchanged and set ZF.
     ///
     /// Guest `INT 16h` still needs a real IVT handler (SeaBIOS) or an explicit
