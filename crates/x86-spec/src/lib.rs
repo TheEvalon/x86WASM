@@ -1346,14 +1346,14 @@ pub const M1_SUBSET: &[InstrDef] = &[
 /// Spec: Intel SDM Vol. 2 Chapter 2; opcode map 2.
 pub const M1_0F_SUBSET: &[InstrDef] = &[
     // Group 6: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 00).
-    // Implemented: /1 STR, /3 LTR (32-bit available TSS). Unsupported here:
-    // /0 SLDT, /2 LLDT, /4 VERR, /5 VERW, and 16-bit TSS forms.
+    // Implemented: /1 STR, /3 LTR (32-bit available TSS), /4 VERR, /5 VERW.
+    // Unsupported here: /0 SLDT, /2 LLDT, and 16-bit TSS forms.
     InstrDef {
         mnemonic: "GRP6",
         opcode: 0x00,
         encoding: Encoding::Modrm,
         width: Width::OsZ,
-        sdm: "STR/LTR",
+        sdm: "STR/LTR/VERR/VERW",
     },
     // Group 7: ModRM.reg selects op (SDM Vol. 2 opcode map 2 — 0F 01).
     // Implemented: /0 SGDT, /1 SIDT, /2 LGDT, /3 LIDT, /4 SMSW, /6 LMSW,

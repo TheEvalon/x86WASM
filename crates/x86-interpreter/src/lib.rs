@@ -2398,6 +2398,62 @@ fn exec_lar_lsl(
     Ok(())
 }
 
+/// Soft check for `VERR` / `VERW` (SDM Vol. 2).
+///
+/// `VERR`: present readable data or readable code, with the ordinary segment
+/// privilege check (conforming code skips DPL). `VERW`: present writable data
+/// only (`max(CPL,RPL) ≤ DPL`). System segments and execute-only code clear ZF.
+fn verr_verw_usable(access: u8, selector: u16, cpl: u8, for_write: bool) -> bool {
+    if access & 0x80 == 0 {
+        return false;
+    }
+    let s_bit = access & 0x10 != 0;
+    if !s_bit {
+        return false;
+    }
+    let executable = access & 0x08 != 0;
+    let conforming = executable && access & 0x04 != 0;
+    let readable = !executable || access & 0x02 != 0;
+    let writable = !executable && access & 0x02 != 0;
+    if for_write {
+        if !writable {
+            return false;
+        }
+    } else if !readable {
+        return false;
+    }
+    if conforming && !for_write {
+        return true;
+    }
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    cpl <= dpl && rpl <= dpl
+}
+
+/// Execute `VERR` or `VERW`. Real-address mode → `#UD`.
+///
+/// Sets `ZF` only; does not load the segment. Spec: Intel SDM Vol. 2
+/// "VERR"/"VERW". Unsupported here: LDT resolution (TI=1 clears ZF).
+fn exec_verr_verw(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    for_write: bool,
+) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        return Err(arch_fault(6));
+    }
+    let _m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    let selector = read_rm_u16(cpu, bus, insn)?;
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let ok = match try_read_gdt_descriptor_for_lar_lsl(cpu, bus, selector)? {
+        Some(desc) if verr_verw_usable(desc[5], selector, cpl, for_write) => true,
+        _ => false,
+    };
+    cpu.set_zf(ok);
+    Ok(())
+}
+
 /// Validate a DS/ES/FS/GS descriptor and return cached base/limit/AR.
 ///
 /// Data and readable code are accepted. Data and nonconforming code require
@@ -5419,9 +5475,9 @@ fn step_two_byte(
             Ok(())
         }
         0x00 => {
-            // Group 6 — Spec: Intel SDM Vol. 2 opcode map 2; "STR"/"LTR";
-            // Vol. 3 §§7.2–7.3. Unsupported here: SLDT/LLDT/VERR/VERW,
-            // 16-bit TSS descriptors, and any hardware task switch.
+            // Group 6 — Spec: Intel SDM Vol. 2 opcode map 2; "STR"/"LTR"/
+            // "VERR"/"VERW"; Vol. 3 §§7.2–7.3. Unsupported here: SLDT/LLDT,
+            // 16-bit TSS descriptors, and nested-task CALL switches.
             let m = insn.modrm.ok_or(ExecError::Unsupported(0x00))?;
             match m.reg {
                 1 => {
@@ -5435,6 +5491,18 @@ fn step_two_byte(
                 3 => {
                     // LTR r/m16 — load TR from a 32-bit available TSS.
                     exec_ltr(cpu, bus, insn)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
+                4 => {
+                    // VERR r/m16 — Spec: Intel SDM Vol. 2 "VERR".
+                    exec_verr_verw(cpu, bus, insn, false)?;
+                    set_current_ip(cpu, next_ip);
+                    Ok(())
+                }
+                5 => {
+                    // VERW r/m16 — Spec: Intel SDM Vol. 2 "VERW".
+                    exec_verr_verw(cpu, bus, insn, true)?;
                     set_current_ip(cpu, next_ip);
                     Ok(())
                 }
