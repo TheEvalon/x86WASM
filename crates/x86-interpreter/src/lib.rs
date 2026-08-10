@@ -6930,20 +6930,19 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xEA => {
             // JMP far ptr16:16 / ptr16:32.
-            // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H); Vol. 3 §5.8.1.
-            // Protected mode is bounded to ptr16:16 targeting a same-level
-            // nonconforming D=0 GDT code segment. Gates/tasks and ptr16:32 are
-            // separate slices.
+            // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
+            // Protected mode (VM=0) is bounded to GDT code / task targets.
+            // Virtual-8086 mode: real-address-like CS:IP reload; stay VM=1.
             let offset = if opsz32(&insn) {
                 insn.immediate as u32
             } else {
                 u32::from(insn.immediate as u16)
             };
             let selector = insn.displacement as u16;
-            if cr0_pe(cpu) {
+            if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                 protected_far_jump(cpu, bus, offset, selector, next_ip)?;
             } else {
-                // Real-address code fetch still uses IP16; ptr16:32 is truncated.
+                // Real-address / VM86: code fetch still uses IP16; ptr16:32 truncated.
                 cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
                 cpu.set_ip16(offset as u16);
             }
@@ -7841,9 +7840,10 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                             .map_err(|e| classify_mem_fault(e, uses_ss))?;
                         (u32::from(offset), selector)
                     };
-                    if cr0_pe(cpu) {
+                    if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                         protected_far_jump(cpu, bus, offset, selector, next_ip)?;
                     } else {
+                        // Real-address / VM86 (Vol. 3 §20.1): stay in current mode.
                         cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
                         cpu.set_ip16(offset as u16);
                     }
