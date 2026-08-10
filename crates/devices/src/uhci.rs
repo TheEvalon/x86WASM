@@ -1,16 +1,19 @@
-//! UHCI one-TD schedule stub (Intel UHCI / PIIX3 USB).
+//! UHCI schedule + PORTSC stub (Intel UHCI / PIIX3 USB).
 //!
 //! Spec: Universal Host Controller Interface (UHCI) Design Guide, Revision 1.1;
-//! Intel 82371SB (PIIX3) USB function. Frame list → (optional QH) → one TD
-//! transfer via host memory callbacks. No real USB device stack, no multi-TD
-//! queue walk, no isochronous bandwidth accounting.
+//! Intel 82371SB (PIIX3) USB function. Frame list → (optional QH + one horizontal
+//! hop) → TD transfer via host memory callbacks; PORTSC CCS/PED/PR for firmware
+//! probe. No real USB device stack, no isochronous bandwidth accounting, no
+//! full multi-QH reclaim walks.
 //!
 //! PCI config / BAR0 I/O decode remain in [`crate::pci::PciConfig`]; this module
-//! owns schedule semantics only. See `docs/uhci-r8-one-td.md`.
+//! owns schedule + PORTSC bit semantics. See `docs/uhci-r8-one-td.md`,
+//! `docs/uhci-r11-frame-list-walk.md`, `docs/uhci-r11-portsc.md`.
 
 use crate::pci::{
     PCI_PIIX_USB_UHCI_FLBASEADD, PCI_PIIX_USB_UHCI_FRNUM, PCI_PIIX_USB_UHCI_IO_SIZE,
-    PCI_PIIX_USB_UHCI_USBCMD, PCI_PIIX_USB_UHCI_USBSTS,
+    PCI_PIIX_USB_UHCI_PORTSC1, PCI_PIIX_USB_UHCI_PORTSC2, PCI_PIIX_USB_UHCI_USBCMD,
+    PCI_PIIX_USB_UHCI_USBSTS,
 };
 
 /// USBCMD Run/Stop bit (UHCI 1.1 §2.1.1 bit 0).
@@ -55,6 +58,36 @@ pub const UHCI_TD_ACTLEN_MASK: u32 = 0x7FF;
 /// Soft cap on bytes moved by one stub TD (safety; UHCI max packet is 1280).
 pub const UHCI_TD_MAX_TRANSFER: usize = 1280;
 
+/// Soft cap on frames walked by [`run_n_frames`] (1024-slot frame list).
+pub const UHCI_MAX_FRAMES_WALK: u32 = 1024;
+
+/// Soft cap on QH horizontal hops per frame (R11 stub depth).
+pub const UHCI_MAX_QH_HORIZONTAL: u32 = 1;
+
+/// PORTSC Current Connect Status (UHCI 1.1 §2.1.7 bit 0) — RO from guest.
+pub const UHCI_PORTSC_CCS: u16 = 1 << 0;
+
+/// PORTSC Connect Status Change (bit 1) — R/WC.
+pub const UHCI_PORTSC_CSC: u16 = 1 << 1;
+
+/// PORTSC Port Enabled/Disabled (bit 2).
+pub const UHCI_PORTSC_PED: u16 = 1 << 2;
+
+/// PORTSC Port Enable/Disable Change (bit 3) — R/WC.
+pub const UHCI_PORTSC_PEDC: u16 = 1 << 3;
+
+/// PORTSC Low Speed Device Attached (bit 8) — RO from guest.
+pub const UHCI_PORTSC_LS: u16 = 1 << 8;
+
+/// PORTSC reserved bit 10 — always reads as 1 (UHCI 1.1 §2.1.7).
+pub const UHCI_PORTSC_RESERVED1: u16 = 1 << 10;
+
+/// PORTSC Port Reset (bit 12).
+pub const UHCI_PORTSC_PR: u16 = 1 << 12;
+
+/// Guest-writable PORTSC bits retained by this stub (excluding R/WC one-shots).
+const UHCI_PORTSC_WRITABLE: u16 = UHCI_PORTSC_PED | UHCI_PORTSC_PR;
+
 /// Result of a successful one-TD walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UhciTdTransfer {
@@ -68,7 +101,20 @@ pub struct UhciTdTransfer {
     pub usbint: bool,
 }
 
-/// Errors from [`run_one_td`].
+/// Summary of a multi-frame / QH-horizontal schedule walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UhciFrameWalkSummary {
+    /// Frame-list slots examined (FRNUM advanced this many times).
+    pub frames_scanned: u32,
+    /// Transfer descriptors successfully completed.
+    pub tds_completed: u32,
+    /// Bytes copied across all completed TDs.
+    pub bytes_copied: usize,
+    /// Whether USBSTS.USBINT is set after the walk.
+    pub usbint: bool,
+}
+
+/// Errors from [`run_one_td`] / [`run_n_frames`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UhciTdError {
     /// PCI Command.BusMaster clear — schedule must not DMA.
@@ -79,6 +125,8 @@ pub enum UhciTdError {
     NothingToDo,
     /// Frame list pointed at a QH whose element link is another QH (not walked).
     QueueHeadDepthUnsupported,
+    /// Horizontal QH chain exceeded [`UHCI_MAX_QH_HORIZONTAL`].
+    QueueHeadHorizontalUnsupported,
     /// Token PID is not IN/OUT/SETUP.
     UnsupportedPid(u8),
     /// Empty host/device buffer supplied for a data-bearing transfer.
@@ -88,6 +136,10 @@ pub enum UhciTdError {
         phys_addr: u32,
         bytes_requested: usize,
     },
+    /// `max_frames` was zero or exceeded [`UHCI_MAX_FRAMES_WALK`].
+    InvalidFrameCount,
+    /// PORTSC port index not 0 or 1.
+    InvalidPortIndex,
 }
 
 /// Read a little-endian `u16` from the UHCI I/O register file.
@@ -143,7 +195,7 @@ fn encode_actlen(bytes: usize) -> u32 {
     }
 }
 
-/// Resolve the first TD address from a frame-list link (one optional QH hop).
+/// Resolve the first TD address from a frame-list / QH element link.
 fn resolve_td_addr<R: FnMut(u32) -> u8>(mem_read: &mut R, link: u32) -> Result<u32, UhciTdError> {
     if link & UHCI_LINK_TERMINATE != 0 {
         return Err(UhciTdError::NothingToDo);
@@ -163,46 +215,81 @@ fn resolve_td_addr<R: FnMut(u32) -> u8>(mem_read: &mut R, link: u32) -> Result<u
     Ok(element & !0xF)
 }
 
-/// Walk **one** UHCI transfer descriptor from the current frame-list slot.
+/// Collect up to `1 + UHCI_MAX_QH_HORIZONTAL` TD addresses from a frame link.
 ///
-/// Spec: UHCI 1.1 §§2.1 / 3.1–3.2 — with USBCMD.RS set, read
-/// `FLBASEADD + (FRNUM & 0x3FF) × 4`, follow one optional QH element link to a
-/// TD, and if Active perform a single IN (device→guest) or OUT/SETUP
-/// (guest→device) copy via callbacks. Clears Active, writes Actual Length,
-/// and latches USBSTS.USBINT when IOC was set.
-///
-/// `regs` is the 32-byte BAR0 I/O file owned by [`crate::pci::PciConfig`].
-/// Requires PCI Bus Master Enable (checked by the caller / wrapper).
-pub fn run_one_td<R, W>(
+/// Spec: UHCI 1.1 §3.3 — QH horizontal link may chain queue heads. This stub
+/// follows the element TD of the first QH, then at most one horizontal QH hop
+/// (its element TD). Deeper horizontal chains return
+/// [`UhciTdError::QueueHeadHorizontalUnsupported`]. Isochronous / bandwidth
+/// reclaim are not modeled.
+fn collect_frame_td_addrs<R: FnMut(u32) -> u8>(
+    mem_read: &mut R,
+    link: u32,
+    out: &mut [u32; 2],
+) -> Result<usize, UhciTdError> {
+    if link & UHCI_LINK_TERMINATE != 0 {
+        return Err(UhciTdError::NothingToDo);
+    }
+    let mut count = 0usize;
+    if link & UHCI_LINK_QH == 0 {
+        out[0] = link & !0xF;
+        return Ok(1);
+    }
+
+    let mut qh = link & !0xF;
+    let mut horizontal_hops = 0u32;
+    loop {
+        let element = read_phys_u32(mem_read, qh.wrapping_add(4));
+        if element & UHCI_LINK_TERMINATE == 0 {
+            if element & UHCI_LINK_QH != 0 {
+                return Err(UhciTdError::QueueHeadDepthUnsupported);
+            }
+            if count < out.len() {
+                out[count] = element & !0xF;
+                count += 1;
+            }
+        }
+        let horizontal = read_phys_u32(mem_read, qh);
+        if horizontal & UHCI_LINK_TERMINATE != 0 {
+            break;
+        }
+        if horizontal & UHCI_LINK_QH == 0 {
+            // Horizontal TD: treat as one more transfer target.
+            if count < out.len() {
+                out[count] = horizontal & !0xF;
+                count += 1;
+            }
+            break;
+        }
+        if horizontal_hops >= UHCI_MAX_QH_HORIZONTAL {
+            return Err(UhciTdError::QueueHeadHorizontalUnsupported);
+        }
+        horizontal_hops += 1;
+        qh = horizontal & !0xF;
+    }
+    if count == 0 {
+        Err(UhciTdError::NothingToDo)
+    } else {
+        Ok(count)
+    }
+}
+
+fn execute_td_at<R, W>(
     regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
-    bus_master: bool,
     device_buf: &mut [u8],
-    mut mem_read: R,
-    mut mem_write: W,
+    mem_read: &mut R,
+    mem_write: &mut W,
+    td_addr: u32,
 ) -> Result<UhciTdTransfer, UhciTdError>
 where
     R: FnMut(u32) -> u8,
     W: FnMut(u32, u8),
 {
-    if !bus_master {
-        return Err(UhciTdError::BusMasterDisabled);
-    }
-    let usbcmd = reg_u16(regs, PCI_PIIX_USB_UHCI_USBCMD);
-    if usbcmd & UHCI_USBCMD_RS == 0 {
-        return Err(UhciTdError::NotRunning);
-    }
-
-    let flbase = reg_u32(regs, PCI_PIIX_USB_UHCI_FLBASEADD) & !0xFFF;
-    let frnum = (reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM) & 0x3FF) as u32;
-    let frame_entry_addr = flbase.wrapping_add(frnum.wrapping_mul(4));
-    let link = read_phys_u32(&mut mem_read, frame_entry_addr);
-    let td_addr = resolve_td_addr(&mut mem_read, link)?;
-
-    let link_ptr = read_phys_u32(&mut mem_read, td_addr);
-    let mut status = read_phys_u32(&mut mem_read, td_addr.wrapping_add(4));
-    let token = read_phys_u32(&mut mem_read, td_addr.wrapping_add(8));
-    let buffer = read_phys_u32(&mut mem_read, td_addr.wrapping_add(12));
-    let _ = link_ptr; // one-TD stub does not follow TD link
+    let link_ptr = read_phys_u32(mem_read, td_addr);
+    let mut status = read_phys_u32(mem_read, td_addr.wrapping_add(4));
+    let token = read_phys_u32(mem_read, td_addr.wrapping_add(8));
+    let buffer = read_phys_u32(mem_read, td_addr.wrapping_add(12));
+    let _ = link_ptr; // TD vertical link not followed in this stub
 
     if status & UHCI_TD_ACTIVE == 0 {
         return Err(UhciTdError::NothingToDo);
@@ -211,9 +298,8 @@ where
     let pid = (token & UHCI_TD_PID_MASK) as u8;
     let max_len = uhci_len_field(token >> UHCI_TD_MAXLEN_SHIFT).min(UHCI_TD_MAX_TRANSFER);
     if max_len == 0 {
-        // Zero-length handshake still completes the TD.
         status = (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK) | encode_actlen(0);
-        write_phys_u32(&mut mem_write, td_addr.wrapping_add(4), status);
+        write_phys_u32(mem_write, td_addr.wrapping_add(4), status);
         let usbint = status_was_ioc_and_latch(regs, status);
         return Ok(UhciTdTransfer {
             td_addr,
@@ -250,7 +336,7 @@ where
 
     let ioc = status & UHCI_TD_IOC != 0;
     status = (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK) | encode_actlen(n);
-    write_phys_u32(&mut mem_write, td_addr.wrapping_add(4), status);
+    write_phys_u32(mem_write, td_addr.wrapping_add(4), status);
     let usbint = if ioc {
         let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_USBINT;
         set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
@@ -263,6 +349,125 @@ where
         td_addr,
         pid,
         bytes_copied: n,
+        usbint,
+    })
+}
+
+fn bump_frnum(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
+    let frnum = (reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM).wrapping_add(1)) & 0x3FF;
+    set_reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM, frnum);
+}
+
+/// Walk **one** UHCI transfer descriptor from the current frame-list slot.
+///
+/// Spec: UHCI 1.1 §§2.1 / 3.1–3.2 — with USBCMD.RS set, read
+/// `FLBASEADD + (FRNUM & 0x3FF) × 4`, follow one optional QH element link to a
+/// TD, and if Active perform a single IN (device→guest) or OUT/SETUP
+/// (guest→device) copy via callbacks. Clears Active, writes Actual Length,
+/// and latches USBSTS.USBINT when IOC was set. Does **not** advance FRNUM.
+///
+/// `regs` is the 32-byte BAR0 I/O file owned by [`crate::pci::PciConfig`].
+/// Requires PCI Bus Master Enable (checked by the caller / wrapper).
+pub fn run_one_td<R, W>(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    bus_master: bool,
+    device_buf: &mut [u8],
+    mut mem_read: R,
+    mut mem_write: W,
+) -> Result<UhciTdTransfer, UhciTdError>
+where
+    R: FnMut(u32) -> u8,
+    W: FnMut(u32, u8),
+{
+    if !bus_master {
+        return Err(UhciTdError::BusMasterDisabled);
+    }
+    let usbcmd = reg_u16(regs, PCI_PIIX_USB_UHCI_USBCMD);
+    if usbcmd & UHCI_USBCMD_RS == 0 {
+        return Err(UhciTdError::NotRunning);
+    }
+
+    let flbase = reg_u32(regs, PCI_PIIX_USB_UHCI_FLBASEADD) & !0xFFF;
+    let frnum = (reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM) & 0x3FF) as u32;
+    let frame_entry_addr = flbase.wrapping_add(frnum.wrapping_mul(4));
+    let link = read_phys_u32(&mut mem_read, frame_entry_addr);
+    let td_addr = resolve_td_addr(&mut mem_read, link)?;
+    execute_td_at(regs, device_buf, &mut mem_read, &mut mem_write, td_addr)
+}
+
+/// Walk up to `max_frames` frame-list slots starting at FRNUM.
+///
+/// Spec: UHCI 1.1 §§3.1 / 3.3 — each 1 ms frame selects
+/// `FLBASEADD[(FRNUM & 0x3FF)]`; this stub processes that link (TD or QH with
+/// at most one horizontal hop), executes active TDs, then advances FRNUM.
+/// Empty / inactive frames count as scanned but are not errors.
+///
+/// Unsupported (explicit): isochronous TDs, bandwidth reclamation, full QH
+/// breadth-first reclaim, multi-packet TD vertical chains.
+pub fn run_n_frames<R, W>(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    bus_master: bool,
+    max_frames: u32,
+    device_buf: &mut [u8],
+    mut mem_read: R,
+    mut mem_write: W,
+) -> Result<UhciFrameWalkSummary, UhciTdError>
+where
+    R: FnMut(u32) -> u8,
+    W: FnMut(u32, u8),
+{
+    if max_frames == 0 || max_frames > UHCI_MAX_FRAMES_WALK {
+        return Err(UhciTdError::InvalidFrameCount);
+    }
+    if !bus_master {
+        return Err(UhciTdError::BusMasterDisabled);
+    }
+    let usbcmd = reg_u16(regs, PCI_PIIX_USB_UHCI_USBCMD);
+    if usbcmd & UHCI_USBCMD_RS == 0 {
+        return Err(UhciTdError::NotRunning);
+    }
+
+    let flbase = reg_u32(regs, PCI_PIIX_USB_UHCI_FLBASEADD) & !0xFFF;
+    let mut tds_completed = 0u32;
+    let mut bytes_copied = 0usize;
+    let mut buf_offset = 0usize;
+
+    for _ in 0..max_frames {
+        let frnum = (reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM) & 0x3FF) as u32;
+        let frame_entry_addr = flbase.wrapping_add(frnum.wrapping_mul(4));
+        let link = read_phys_u32(&mut mem_read, frame_entry_addr);
+
+        let mut td_addrs = [0u32; 2];
+        match collect_frame_td_addrs(&mut mem_read, link, &mut td_addrs) {
+            Ok(n) => {
+                for &td_addr in td_addrs.iter().take(n) {
+                    let slice = if buf_offset < device_buf.len() {
+                        &mut device_buf[buf_offset..]
+                    } else {
+                        &mut []
+                    };
+                    match execute_td_at(regs, slice, &mut mem_read, &mut mem_write, td_addr) {
+                        Ok(xfer) => {
+                            tds_completed += 1;
+                            bytes_copied += xfer.bytes_copied;
+                            buf_offset = buf_offset.saturating_add(xfer.bytes_copied);
+                        }
+                        Err(UhciTdError::NothingToDo) | Err(UhciTdError::EmptyBuffer) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Err(UhciTdError::NothingToDo) => {}
+            Err(e) => return Err(e),
+        }
+        bump_frnum(regs);
+    }
+
+    let usbint = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) & UHCI_USBSTS_USBINT != 0;
+    Ok(UhciFrameWalkSummary {
+        frames_scanned: max_frames,
+        tds_completed,
+        bytes_copied,
         usbint,
     })
 }
@@ -282,12 +487,115 @@ fn status_was_ioc_and_latch(
     }
 }
 
+fn portsc_offset(port_index: u8) -> Result<u8, UhciTdError> {
+    match port_index {
+        0 => Ok(PCI_PIIX_USB_UHCI_PORTSC1),
+        1 => Ok(PCI_PIIX_USB_UHCI_PORTSC2),
+        _ => Err(UhciTdError::InvalidPortIndex),
+    }
+}
+
+/// Read PORTSCn with RO overlays (UHCI 1.1 §2.1.7 — bit 10 always 1).
+pub fn portsc_read(
+    regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    port_index: u8,
+) -> Result<u16, UhciTdError> {
+    let off = portsc_offset(port_index)?;
+    Ok(reg_u16(regs, off) | UHCI_PORTSC_RESERVED1)
+}
+
+/// Guest PORTSC write: R/WC CSC/PEDC, retain PED/PR, preserve RO CCS/LS.
+///
+/// Spec: UHCI 1.1 §2.1.7 — firmware probe typically pulses PR then enables PED
+/// when CCS is set. Ending reset (PR 1→0) while CCS is set auto-sets PED and
+/// PEDC so a connect is enabled after reset.
+pub fn portsc_write(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    port_index: u8,
+    value: u16,
+) -> Result<u16, UhciTdError> {
+    let off = portsc_offset(port_index)?;
+    let old = reg_u16(regs, off);
+    let ro = old & (UHCI_PORTSC_CCS | UHCI_PORTSC_LS);
+    let mut next = ro;
+    next |= value & UHCI_PORTSC_WRITABLE;
+    // R/WC: write-1 clears CSC / PEDC.
+    let mut csc = old & UHCI_PORTSC_CSC;
+    let mut pedc = old & UHCI_PORTSC_PEDC;
+    if value & UHCI_PORTSC_CSC != 0 {
+        csc = 0;
+    }
+    if value & UHCI_PORTSC_PEDC != 0 {
+        pedc = 0;
+    }
+    // Reset end (PR 1→0) with device present → enable port.
+    let pr_was = old & UHCI_PORTSC_PR != 0;
+    let pr_now = next & UHCI_PORTSC_PR != 0;
+    if pr_was && !pr_now && ro & UHCI_PORTSC_CCS != 0 && next & UHCI_PORTSC_PED == 0 {
+        next |= UHCI_PORTSC_PED;
+        pedc = UHCI_PORTSC_PEDC;
+    }
+    // Software PED clear while connected latches PEDC.
+    if old & UHCI_PORTSC_PED != 0 && next & UHCI_PORTSC_PED == 0 {
+        pedc = UHCI_PORTSC_PEDC;
+    }
+    next |= csc | pedc | UHCI_PORTSC_RESERVED1;
+    set_reg_u16(regs, off, next);
+    Ok(next)
+}
+
+/// Host: attach a device on PORTSCn — sets CCS (+ optional LS) and CSC.
+///
+/// Spec: UHCI 1.1 §2.1.7 — CCS is RO to software; the HC updates it on connect.
+pub fn portsc_attach_device(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    port_index: u8,
+    low_speed: bool,
+) -> Result<u16, UhciTdError> {
+    let off = portsc_offset(port_index)?;
+    let mut v = reg_u16(regs, off);
+    let was = v & UHCI_PORTSC_CCS != 0;
+    v |= UHCI_PORTSC_CCS | UHCI_PORTSC_RESERVED1;
+    if low_speed {
+        v |= UHCI_PORTSC_LS;
+    } else {
+        v &= !UHCI_PORTSC_LS;
+    }
+    if !was {
+        v |= UHCI_PORTSC_CSC;
+    }
+    set_reg_u16(regs, off, v);
+    Ok(v | UHCI_PORTSC_RESERVED1)
+}
+
+/// Host: detach device — clears CCS/LS/PED, sets CSC (+ PEDC if was enabled).
+pub fn portsc_detach_device(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    port_index: u8,
+) -> Result<u16, UhciTdError> {
+    let off = portsc_offset(port_index)?;
+    let mut v = reg_u16(regs, off);
+    let was_ccs = v & UHCI_PORTSC_CCS != 0;
+    let was_ped = v & UHCI_PORTSC_PED != 0;
+    v &= !(UHCI_PORTSC_CCS | UHCI_PORTSC_LS | UHCI_PORTSC_PED | UHCI_PORTSC_PR);
+    if was_ccs {
+        v |= UHCI_PORTSC_CSC;
+    }
+    if was_ped {
+        v |= UHCI_PORTSC_PEDC;
+    }
+    v |= UHCI_PORTSC_RESERVED1;
+    set_reg_u16(regs, off, v);
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pci::{
         PciConfig, PCI_COMMAND_BUS_MASTER, PCI_COMMAND_IO, PCI_COMMAND_OFFSET,
-        PCI_DEVICE_PIIX3_USB, PCI_PIIX_USB_BAR0_OFFSET, PCI_PIIX_USB_UHCI_USBCMD,
+        PCI_DEVICE_PIIX3_USB, PCI_PIIX_USB_BAR0_OFFSET, PCI_PIIX_USB_UHCI_FLBASEADD,
+        PCI_PIIX_USB_UHCI_FRNUM, PCI_PIIX_USB_UHCI_IO_SIZE, PCI_PIIX_USB_UHCI_USBCMD,
         PCI_PIIX_USB_UHCI_USBSTS,
     };
     use crate::PortDevice;
@@ -518,5 +826,211 @@ mod tests {
         // After reset BAR decode is off and register file is zero.
         assert_eq!(pci.uhci_io_base(), None);
         assert!(pci.uhci_io.iter().all(|&b| b == 0));
+    }
+
+    /// Spec: UHCI 1.1 §3.1 — walk N frame-list slots and advance FRNUM.
+    #[test]
+    fn n_frames_walks_two_slots_and_advances_frnum() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0003_0000u32;
+        let td0 = 0x0003_1000u32;
+        let td1 = 0x0003_1100u32;
+        let buf0 = 0x0003_2000u32;
+        let buf1 = 0x0003_2100u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, td0);
+        mem.write_u32(flbase + 4, td1);
+        for (td, buf, pid_byte) in [(td0, buf0, 0xAAu8), (td1, buf1, 0xBBu8)] {
+            mem.write_u32(td, UHCI_LINK_TERMINATE);
+            mem.write_u32(td + 4, UHCI_TD_ACTIVE);
+            let token = u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT);
+            mem.write_u32(td + 8, token);
+            mem.write_u32(td + 12, buf);
+            let _ = pid_byte;
+        }
+        // maxlen=1 for each
+        mem.write_u32(
+            td0 + 8,
+            u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(
+            td1 + 8,
+            u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FRNUM, 2, 0);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+
+        let mut device = [0xAA, 0xBB];
+        let bus_master = true;
+        let summary = run_n_frames(
+            &mut pci.uhci_io,
+            bus_master,
+            2,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("2-frame walk");
+        assert_eq!(summary.frames_scanned, 2);
+        assert_eq!(summary.tds_completed, 2);
+        assert_eq!(summary.bytes_copied, 2);
+        assert_eq!(mem.get(buf0), 0xAA);
+        assert_eq!(mem.get(buf1), 0xBB);
+        assert_eq!(
+            read_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FRNUM, 2) as u16 & 0x3FF,
+            2
+        );
+    }
+
+    /// Spec: UHCI 1.1 §3.3 — one QH horizontal hop to a second element TD.
+    #[test]
+    fn qh_horizontal_hop_executes_second_td() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0004_0000u32;
+        let qh0 = 0x0004_0100u32;
+        let qh1 = 0x0004_0120u32;
+        let td0 = 0x0004_0200u32;
+        let td1 = 0x0004_0220u32;
+        let buf0 = 0x0004_0300u32;
+        let buf1 = 0x0004_0310u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, qh0 | UHCI_LINK_QH);
+        mem.write_u32(qh0, qh1 | UHCI_LINK_QH); // horizontal → QH1
+        mem.write_u32(qh0 + 4, td0);
+        mem.write_u32(qh1, UHCI_LINK_TERMINATE);
+        mem.write_u32(qh1 + 4, td1);
+        for (td, buf) in [(td0, buf0), (td1, buf1)] {
+            mem.write_u32(td, UHCI_LINK_TERMINATE);
+            mem.write_u32(td + 4, UHCI_TD_ACTIVE);
+            mem.write_u32(
+                td + 8,
+                u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+            );
+            mem.write_u32(td + 12, buf);
+        }
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+
+        let mut device = [0x11, 0x22];
+        let summary = run_n_frames(
+            &mut pci.uhci_io,
+            true,
+            1,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("QH horizontal");
+        assert_eq!(summary.tds_completed, 2);
+        assert_eq!(mem.get(buf0), 0x11);
+        assert_eq!(mem.get(buf1), 0x22);
+    }
+
+    /// Spec: UHCI 1.1 §3.3 — second horizontal QH hop is unsupported.
+    #[test]
+    fn qh_horizontal_depth_two_unsupported() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+        let flbase = 0x0005_0000u32;
+        let qh0 = 0x0005_0100u32;
+        let qh1 = 0x0005_0120u32;
+        let qh2 = 0x0005_0140u32;
+        let td = 0x0005_0200u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, qh0 | UHCI_LINK_QH);
+        mem.write_u32(qh0, qh1 | UHCI_LINK_QH);
+        mem.write_u32(qh0 + 4, UHCI_LINK_TERMINATE);
+        mem.write_u32(qh1, qh2 | UHCI_LINK_QH);
+        mem.write_u32(qh1 + 4, td);
+        mem.write_u32(qh2, UHCI_LINK_TERMINATE);
+        mem.write_u32(qh2 + 4, UHCI_LINK_TERMINATE);
+        mem.write_u32(td, UHCI_LINK_TERMINATE);
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE);
+        mem.write_u32(
+            td + 8,
+            u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(td + 12, 0x0005_0300);
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+        let mut device = [0u8; 1];
+        assert_eq!(
+            run_n_frames(
+                &mut pci.uhci_io,
+                true,
+                1,
+                &mut device,
+                |a| mem.get(a),
+                |a, v| mem.set(a, v),
+            ),
+            Err(UhciTdError::QueueHeadHorizontalUnsupported)
+        );
+    }
+
+    /// Spec: UHCI 1.1 §2.1.7 — CCS/PED/PR enough for firmware connect+reset probe.
+    #[test]
+    fn portsc_attach_reset_enables_ped() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        let v = portsc_attach_device(&mut regs, 0, false).unwrap();
+        assert_ne!(v & UHCI_PORTSC_CCS, 0);
+        assert_ne!(v & UHCI_PORTSC_CSC, 0);
+        assert_ne!(v & UHCI_PORTSC_RESERVED1, 0);
+        assert_eq!(v & UHCI_PORTSC_PED, 0);
+
+        // Pulse PR.
+        let _ = portsc_write(&mut regs, 0, UHCI_PORTSC_PR | UHCI_PORTSC_CSC).unwrap();
+        let mid = portsc_read(&regs, 0).unwrap();
+        assert_ne!(mid & UHCI_PORTSC_PR, 0);
+        assert_eq!(mid & UHCI_PORTSC_CSC, 0); // W1C
+
+        // End reset → PED + PEDC.
+        let end = portsc_write(&mut regs, 0, 0).unwrap();
+        assert_eq!(end & UHCI_PORTSC_PR, 0);
+        assert_ne!(end & UHCI_PORTSC_PED, 0);
+        assert_ne!(end & UHCI_PORTSC_PEDC, 0);
+        assert_ne!(end & UHCI_PORTSC_CCS, 0);
+    }
+
+    #[test]
+    fn portsc_detach_clears_ccs_and_ped() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        portsc_attach_device(&mut regs, 1, true).unwrap();
+        portsc_write(&mut regs, 1, UHCI_PORTSC_PR).unwrap();
+        portsc_write(&mut regs, 1, 0).unwrap(); // end reset → PED
+        let v = portsc_detach_device(&mut regs, 1).unwrap();
+        assert_eq!(v & UHCI_PORTSC_CCS, 0);
+        assert_eq!(v & UHCI_PORTSC_LS, 0);
+        assert_eq!(v & UHCI_PORTSC_PED, 0);
+        assert_ne!(v & UHCI_PORTSC_CSC, 0);
+        assert_ne!(v & UHCI_PORTSC_PEDC, 0);
     }
 }
