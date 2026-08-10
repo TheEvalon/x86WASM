@@ -1,10 +1,10 @@
 //! Round-10 slice 4: software `INT n` / `INT3` / `INTO` from VM86 + IOPL.
 //!
-//! Without VME: `INT n` and `INTO` require `IOPL = 3` else `#GP(0)`.
-//! `INT3` is not IOPL-sensitive. Successful forms use the VM86→CPL0 9-dword
-//! frame from slice 1.
+//! Without VME: `INT n` requires `IOPL = 3` else `#GP(0)`. `INT3` and `INTO`
+//! are **not** IOPL-sensitive (Vol. 2 INT n Virtual-8086 Mode Exceptions;
+//! 80386 PRM). Successful forms use the VM86→CPL0 9-dword frame from slice 1.
 //!
-//! Spec: Intel SDM Vol. 3 §20.2.2 / Table 20-1; Vol. 2 INT n/INT3/INTO;
+//! Spec: Intel SDM Vol. 3 §20.2.2 / Table 20-2 (VME=0); Vol. 2 INT n/INT3/INTO;
 //! Vol. 3 §§20.2–20.3 (delivery frame).
 
 use x86_core::CpuState;
@@ -120,9 +120,18 @@ fn install_tables(bus: &mut RamBus) {
         &encode_idt_gate32(HANDLER_INT, SEL_KCODE, 0xEE),
     );
     // INT3 / INTO / #GP
-    bus.write_bytes(IDT + 3 * 8, &encode_idt_gate32(HANDLER_INT, SEL_KCODE, 0xEE));
-    bus.write_bytes(IDT + 4 * 8, &encode_idt_gate32(HANDLER_INT, SEL_KCODE, 0xEE));
-    bus.write_bytes(IDT + 13 * 8, &encode_idt_gate32(HANDLER_GP, SEL_KCODE, 0x8E));
+    bus.write_bytes(
+        IDT + 3 * 8,
+        &encode_idt_gate32(HANDLER_INT, SEL_KCODE, 0xEE),
+    );
+    bus.write_bytes(
+        IDT + 4 * 8,
+        &encode_idt_gate32(HANDLER_INT, SEL_KCODE, 0xEE),
+    );
+    bus.write_bytes(
+        IDT + 13 * 8,
+        &encode_idt_gate32(HANDLER_GP, SEL_KCODE, 0x8E),
+    );
 }
 
 fn enter_vm86(guest: &[u8], iopl: u8) -> (CpuState, RamBus) {
@@ -229,18 +238,33 @@ fn vm86_int3_ignores_iopl_and_delivers() {
     assert_eq!(cpu.gpr_u32(CpuState::RSP), KERNEL_ESP0 - 36);
 }
 
-/// VM86 + IOPL=0 + OF=1: `INTO` → `#GP(0)`.
+/// `INTO` with OF=1 is **not** IOPL-sensitive; delivers #OF at IOPL=0.
 #[test]
-fn vm86_into_with_iopl_below_3_raises_gp0() {
+fn vm86_into_overflow_delivers_despite_iopl0() {
     let (mut cpu, mut bus) = enter_vm86(&[0xCE], 0);
     cpu.rflags |= 1 << 11; // OF
+    let saved = cpu.rflags as u32;
 
     step(&mut cpu, &mut bus).unwrap();
 
-    assert_eq!(cpu.rip, u64::from(HANDLER_GP));
+    assert_eq!(cpu.rip, u64::from(HANDLER_INT));
+    assert_eq!(cpu.rflags & (1 << 17), 0);
     let esp = cpu.gpr_u32(CpuState::RSP);
-    assert_eq!(bus.peek_u32(esp as usize), 0);
-    assert_eq!(bus.peek_u32((esp + 4) as usize), u32::from(VM86_IP));
+    assert_eq!(esp, KERNEL_ESP0 - 36);
+    assert_eq!(bus.peek_u32(esp as usize), u32::from(VM86_IP) + 1);
+    assert_eq!(bus.peek_u32((esp + 8) as usize), saved);
+}
+
+/// Untaken `INTO` (OF=0) advances IP and stays in VM86.
+#[test]
+fn vm86_into_no_overflow_falls_through() {
+    let (mut cpu, mut bus) = enter_vm86(&[0xCE, 0xF4], 0);
+    cpu.rflags &= !(1 << 11);
+
+    step(&mut cpu, &mut bus).unwrap();
+
+    assert_ne!(cpu.rflags & (1 << 17), 0);
+    assert_eq!(cpu.rip, u64::from(VM86_IP) + 1);
 }
 
 /// VM86 + IOPL=3 + OF=1: `INTO` delivers #OF through the VM86 frame.

@@ -216,9 +216,17 @@ fn vm86_int3_pushes_nine_dword_frame_and_nullifies_data_sregs() {
     // Low→high: EIP, CS, EFLAGS, ESP, SS, ES, DS, FS, GS (Vol. 3 Figure 20-2).
     let esp = cpu.gpr_u32(CpuState::RSP);
     assert_eq!(esp, KERNEL_ESP0 - 36, "9 dwords");
-    assert_eq!(bus.peek_u32(esp as usize), u32::from(VM86_IP) + 1, "return EIP");
+    assert_eq!(
+        bus.peek_u32(esp as usize),
+        u32::from(VM86_IP) + 1,
+        "return EIP"
+    );
     assert_eq!(bus.peek_u32((esp + 4) as usize), u32::from(VM86_CS));
-    assert_eq!(bus.peek_u32((esp + 8) as usize), saved_flags, "EFLAGS with VM");
+    assert_eq!(
+        bus.peek_u32((esp + 8) as usize),
+        saved_flags,
+        "EFLAGS with VM"
+    );
     assert_eq!(bus.peek_u32((esp + 12) as usize), u32::from(VM86_SP));
     assert_eq!(bus.peek_u32((esp + 16) as usize), u32::from(VM86_SS));
     assert_eq!(bus.peek_u32((esp + 20) as usize), u32::from(VM86_ES));
