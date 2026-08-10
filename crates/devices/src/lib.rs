@@ -220,13 +220,16 @@ pub use pit::{
 pub use port92::{Port92, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL_A};
 pub use serial::{DebugConsole, Serial16550, SerialOutput};
 pub use uhci::{
-    portsc_attach_device, portsc_detach_device, portsc_read, portsc_write, run_n_frames,
-    run_one_td, UhciFrameWalkSummary, UhciTdError, UhciTdTransfer, UHCI_LINK_QH,
+    latch_resume_detect, latch_usb_error, portsc_attach_device, portsc_detach_device, portsc_read,
+    portsc_write, run_n_frames, run_one_td, uhci_interrupt_pending, usbintr_read, usbintr_write,
+    usbsts_read, usbsts_write_w1c, UhciFrameWalkSummary, UhciTdError, UhciTdTransfer, UHCI_LINK_QH,
     UHCI_LINK_TERMINATE, UHCI_MAX_FRAMES_WALK, UHCI_MAX_FRAME_TDS, UHCI_MAX_QH_HORIZONTAL,
-    UHCI_PID_IN, UHCI_PID_OUT,
-    UHCI_PID_SETUP, UHCI_PORTSC_CCS, UHCI_PORTSC_CSC, UHCI_PORTSC_LS, UHCI_PORTSC_PED,
-    UHCI_PORTSC_PEDC, UHCI_PORTSC_PR, UHCI_PORTSC_RESERVED1, UHCI_TD_ACTIVE, UHCI_TD_IOC,
-    UHCI_TD_MAX_TRANSFER, UHCI_USBCMD_RS, UHCI_USBSTS_HCHALTED, UHCI_USBSTS_USBINT,
+    UHCI_PID_IN, UHCI_PID_OUT, UHCI_PID_SETUP, UHCI_PORTSC_CCS, UHCI_PORTSC_CSC, UHCI_PORTSC_LS,
+    UHCI_PORTSC_PED, UHCI_PORTSC_PEDC, UHCI_PORTSC_PR, UHCI_PORTSC_RESERVED1, UHCI_TD_ACTIVE,
+    UHCI_TD_IOC, UHCI_TD_MAX_TRANSFER, UHCI_USBCMD_GSUSPEND, UHCI_USBCMD_RS, UHCI_USBINTR_CRC,
+    UHCI_USBINTR_IOC, UHCI_USBINTR_RESUME, UHCI_USBINTR_SPI, UHCI_USBINTR_WRITABLE,
+    UHCI_USBSTS_HCPE, UHCI_USBSTS_HCHALTED, UHCI_USBSTS_HSE, UHCI_USBSTS_RD, UHCI_USBSTS_RWC_MASK,
+    UHCI_USBSTS_USBERRINT, UHCI_USBSTS_USBINT,
 };
 pub use vga::{
     vga_bringup_font_glyphs, vga_dac_default_ram, VgaFrame, VgaPlaneAccess, VgaPlaneAddressing,
