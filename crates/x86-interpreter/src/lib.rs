@@ -1898,8 +1898,9 @@ fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
 ///
 /// VM86 without VME: `IOPL < 3` → `#GP(0)`. Otherwise load permitted bits;
 /// `VM`/`RF` are never taken from the image; RF is cleared; bit 1 stays set.
-/// `VIP`/`VIF` are **never** loaded from the image (VME is unsupported —
-/// CPUID.VME clear, `CR4.VME` reserved); they remain sticky.
+/// `VIP`/`VIF` are **never** loaded from the image without full VME VIF support
+/// (`CPUID.VME` clear); they remain sticky even when `CR4.VME` is set for the
+/// soft-int redirect stub.
 /// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2 / Table 20-2 (VME=0).
 fn popf_execute(
     cpu: &mut CpuState,
@@ -7402,10 +7403,11 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xCE => {
             // INTO — if OF=1, #OF (vector 4) trap; else fall through.
             // Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1";
-            // Vol. 3 §§6.12.1, 6.15 (#OF — trap), 20.2.2.
-            // INTO is not IOPL-sensitive in VM86 (unlike INT n).
+            // Vol. 3 §§6.12.1, 6.15 (#OF — trap), 20.2.2 Table 20-2.
+            // INTO is not IOPL-sensitive and is **not** governed by the VME
+            // interrupt-redirection bitmap (those apply only to INT n / 0xCD).
             // Saved IP is the following instruction (trap class).
-            // Unsupported here: 64-bit mode (#UD); VME redirect.
+            // Unsupported here: 64-bit mode (#UD).
             if cpu.rflags & (1 << 11) != 0 {
                 deliver_software_interrupt(cpu, bus, 4, next_ip)?;
             } else {
