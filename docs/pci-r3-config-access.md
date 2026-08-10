@@ -34,7 +34,7 @@ The four sentences the implementation turns on:
 | Access | Behavior |
 |---|---|
 | 32-bit at `0xCF8` | Latches `value & 0x80FF_FFFC`; reads return the latch |
-| 32-bit at `0xCF9`/`0xCFA`/`0xCFB` | Not CONFIG_ADDRESS. Ordinary I/O: read all ones, write dropped |
+| 32-bit at `0xCF9`/`0xCFA`/`0xCFB` | Not CONFIG_ADDRESS. Ordinary I/O: read all ones, write dropped (except byte/word at `0xCF9` claimed by `devices::Cf9Reset` — see `docs/post-c897-cf9-diagnosis.md`) |
 | 8/16-bit anywhere in `0xCF8`–`0xCFB` | Ordinary I/O: read all ones, write dropped |
 
 Reserved bits 30:24 and 1:0 are never stored, so a read-back is byte-identical
