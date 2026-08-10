@@ -121,14 +121,8 @@ fn install_tables(bus: &mut RamBus) {
     bus.poke_u16(TSS + 8, SEL_KDATA);
 
     // Vector 3 (#BP / INT3) and 4 (#OF / INTO) — DPL=3 interrupt gates.
-    bus.write_bytes(
-        IDT + 3 * 8,
-        &encode_idt_gate32(HANDLER_BP, SEL_KCODE, 0xEE),
-    );
-    bus.write_bytes(
-        IDT + 4 * 8,
-        &encode_idt_gate32(HANDLER_OF, SEL_KCODE, 0xEE),
-    );
+    bus.write_bytes(IDT + 3 * 8, &encode_idt_gate32(HANDLER_BP, SEL_KCODE, 0xEE));
+    bus.write_bytes(IDT + 4 * 8, &encode_idt_gate32(HANDLER_OF, SEL_KCODE, 0xEE));
 }
 
 fn enter_vm86(guest: &[u8], iopl: u8) -> (CpuState, RamBus) {
@@ -230,10 +224,7 @@ fn vm86_icebp_f1_remains_unsupported() {
 
     let err = step(&mut cpu, &mut bus).expect_err("ICEBP must stay unsupported");
     assert!(
-        matches!(
-            err,
-            ExecError::Decode(DecodeError::UnsupportedOpcode(0xF1))
-        ),
+        matches!(err, ExecError::Decode(DecodeError::UnsupportedOpcode(0xF1))),
         "got {err:?}"
     );
     assert_eq!(cpu.rip, rip_before, "IP must not advance");

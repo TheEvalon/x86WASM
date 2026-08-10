@@ -153,10 +153,7 @@ fn vm86_push_ds_writes_selector_stays_vm() {
     assert_ne!(cpu.rflags & (1 << 17), 0);
     assert_eq!(cpu.gpr_u16(CpuState::RSP), VM86_SP - 2);
     let sp_base = (u32::from(VM86_SS) << 4) as usize;
-    assert_eq!(
-        bus.peek_u16(sp_base + (VM86_SP as usize - 2)),
-        VM86_DS
-    );
+    assert_eq!(bus.peek_u16(sp_base + (VM86_SP as usize - 2)), VM86_DS);
 }
 
 /// `PUSH ES` / `PUSH SS` / `PUSH CS` likewise stay in VM86.

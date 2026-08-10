@@ -157,9 +157,7 @@ fn enter_vm86(guest: &[u8]) -> (CpuState, RamBus) {
 #[test]
 fn vm86_opsize32_far_jmp_direct_stays_vm() {
     // 66 EA 00 02 00 00 00 18 — JMP 1800:00000200 (high half of offset ignored)
-    let (mut cpu, mut bus) = enter_vm86(&[
-        0x66, 0xEA, 0x00, 0x02, 0x00, 0x00, 0x00, 0x18,
-    ]);
+    let (mut cpu, mut bus) = enter_vm86(&[0x66, 0xEA, 0x00, 0x02, 0x00, 0x00, 0x00, 0x18]);
     let target = (u32::from(TARGET_CS) << 4) + u32::from(TARGET_IP);
     bus.mem[target as usize] = 0xF4;
 
@@ -175,9 +173,7 @@ fn vm86_opsize32_far_jmp_direct_stays_vm() {
 #[test]
 fn vm86_opsize32_far_jmp_truncates_high_offset() {
     // Offset 0x0001_0200 → IP = 0x0200 after truncate.
-    let (mut cpu, mut bus) = enter_vm86(&[
-        0x66, 0xEA, 0x00, 0x02, 0x01, 0x00, 0x00, 0x18,
-    ]);
+    let (mut cpu, mut bus) = enter_vm86(&[0x66, 0xEA, 0x00, 0x02, 0x01, 0x00, 0x00, 0x18]);
     let target = (u32::from(TARGET_CS) << 4) + u32::from(TARGET_IP);
     bus.mem[target as usize] = 0xF4;
 
@@ -209,9 +205,7 @@ fn vm86_opsize32_far_jmp_indirect_m16_32_stays_vm() {
 #[test]
 fn vm86_opsize32_far_call_pushes_eip32_cs_stays_vm() {
     // 66 9A 00 02 00 00 00 18 — CALL 1800:00000200
-    let (mut cpu, mut bus) = enter_vm86(&[
-        0x66, 0x9A, 0x00, 0x02, 0x00, 0x00, 0x00, 0x18,
-    ]);
+    let (mut cpu, mut bus) = enter_vm86(&[0x66, 0x9A, 0x00, 0x02, 0x00, 0x00, 0x00, 0x18]);
     let target = (u32::from(TARGET_CS) << 4) + u32::from(TARGET_IP);
     bus.mem[target as usize] = 0xF4;
 
@@ -252,9 +246,7 @@ fn vm86_opsize32_retf_restores_cs_ip_stays_vm() {
 /// Opsize-32 far CALL then RETF round-trip while VM=1.
 #[test]
 fn vm86_opsize32_far_call_retf_round_trip() {
-    let (mut cpu, mut bus) = enter_vm86(&[
-        0x66, 0x9A, 0x00, 0x02, 0x00, 0x00, 0x00, 0x18, 0xF4,
-    ]);
+    let (mut cpu, mut bus) = enter_vm86(&[0x66, 0x9A, 0x00, 0x02, 0x00, 0x00, 0x00, 0x18, 0xF4]);
     let target = (u32::from(TARGET_CS) << 4) + u32::from(TARGET_IP);
     bus.mem[target as usize] = 0x66;
     bus.mem[target as usize + 1] = 0xCB;

@@ -245,5 +245,9 @@ fn vm86_cli_with_vip_vif_clears_if_not_vif() {
     step(&mut cpu, &mut bus).unwrap();
 
     assert!(!cpu.interrupt_flag());
-    assert_eq!(cpu.rflags & VIP_VIF, VIP_VIF, "CLI must not clear VIF without VME");
+    assert_eq!(
+        cpu.rflags & VIP_VIF,
+        VIP_VIF,
+        "CLI must not clear VIF without VME"
+    );
 }
