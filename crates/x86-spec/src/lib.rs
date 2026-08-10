@@ -1365,6 +1365,23 @@ pub const M1_0F_SUBSET: &[InstrDef] = &[
         width: Width::OsZ,
         sdm: "SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG",
     },
+    // LAR / LSL — Spec: Intel SDM Vol. 2 "LAR" (`0F 02`), "LSL" (`0F 03`).
+    // Protected mode only; real-address mode → #UD. Source selector is always
+    // 16-bit (r/m16); destination follows the operand-size attribute.
+    InstrDef {
+        mnemonic: "LAR",
+        opcode: 0x02,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LAR r,r/m16",
+    },
+    InstrDef {
+        mnemonic: "LSL",
+        opcode: 0x03,
+        encoding: Encoding::Modrm,
+        width: Width::OsZ,
+        sdm: "LSL r,r/m16",
+    },
     // CLTS — Spec: Intel SDM Vol. 2 "CLTS—Clear Task-Switched Flag in CR0"
     // (opcode map 2 — 0F 06). No ModR/M. Clears CR0.TS (bit 3) only.
     InstrDef {
@@ -1834,6 +1851,8 @@ mod tests {
             lookup_0f(0x01).is_some(),
             "missing 0F 01 GRP7 SGDT/SIDT/LGDT/LIDT"
         );
+        assert!(lookup_0f(0x02).is_some(), "missing 0F 02 LAR");
+        assert!(lookup_0f(0x03).is_some(), "missing 0F 03 LSL");
         assert!(lookup_0f(0xAF).is_some(), "missing 0F AF IMUL");
         assert!(lookup_0f(0x20).is_some(), "missing 0F 20 MOV r32,CRn");
         assert!(lookup_0f(0x22).is_some(), "missing 0F 22 MOV CRn,r32");

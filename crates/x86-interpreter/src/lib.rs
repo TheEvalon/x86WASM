@@ -3790,16 +3790,16 @@ fn cpuid_leaf(leaf: u32) -> CpuidResult {
 
 /// `IA32_APIC_BASE` MSR index. Spec: Intel SDM Vol. 4 MSR `1Bh`.
 const MSR_IA32_APIC_BASE: u32 = 0x1B;
-/// BSP flag. Spec: SDM Vol. 3 / Vol. 4 IA32_APIC_BASE bit 8.
+/// BSP flag (bit 8). Spec: SDM Vol. 3 §10.4.4.
 const IA32_APIC_BASE_BSP: u64 = 1 << 8;
-/// APIC global enable. Spec: SDM Vol. 3 / Vol. 4 IA32_APIC_BASE bit 10.
-const IA32_APIC_BASE_ENABLE: u64 = 1 << 10;
-/// x2APIC mode enable — unsupported here; writing 1 raises `#GP(0)`.
-const IA32_APIC_BASE_X2APIC: u64 = 1 << 11;
-/// Writable field mask: BSP | EN | base[35:12] (36-bit physical address model).
-/// Bits 0–7, 9, 11, and [63:36] are reserved for this tree.
-const IA32_APIC_BASE_WRITABLE: u64 =
-    IA32_APIC_BASE_BSP | IA32_APIC_BASE_ENABLE | 0x0000_000F_FFFF_F000;
+/// Enable x2APIC mode (bit 10 / EXTD) — unsupported; writing 1 raises `#GP(0)`.
+const IA32_APIC_BASE_X2APIC: u64 = 1 << 10;
+/// APIC Global Enable (bit 11 / EN). Spec: SDM Vol. 3 §10.4.4.
+const IA32_APIC_BASE_ENABLE: u64 = 1 << 11;
+/// Fields software may write: EN | base[35:12] (36-bit physical address model).
+/// BSP is read-only and forced from the prior value; bits 0–7, 9, 10 (x2APIC),
+/// and [63:36] are reserved for this tree.
+const IA32_APIC_BASE_SOFTWARE_WRITABLE: u64 = IA32_APIC_BASE_ENABLE | 0x0000_000F_FFFF_F000;
 
 /// Read a model-specific register, or `None` when the address is reserved or
 /// unimplemented.
@@ -3817,15 +3817,20 @@ fn read_msr(cpu: &CpuState, index: u32) -> Option<u64> {
 /// Write a model-specific register, returning `false` when the address is
 /// reserved/unimplemented or the value sets a reserved bit (`#GP`).
 ///
-/// Spec: Intel SDM Vol. 2 "WRMSR"; Vol. 3 / Vol. 4 IA32_APIC_BASE.
+/// Spec: Intel SDM Vol. 2 "WRMSR"; Vol. 3 §10.4.4 / Vol. 4 IA32_APIC_BASE.
 fn write_msr(cpu: &mut CpuState, index: u32, value: u64) -> bool {
     match index {
         MSR_IA32_APIC_BASE => {
-            // x2APIC (bit 11) and any other non-writable bit → #GP(0).
-            if value & !IA32_APIC_BASE_WRITABLE != 0 {
+            // x2APIC (bit 10) and any other non-software-writable bit → #GP(0).
+            // BSP (bit 8) is read-only: a write that changes it is also `#GP`.
+            let prior_bsp = cpu.ia32_apic_base & IA32_APIC_BASE_BSP;
+            if value & !IA32_APIC_BASE_SOFTWARE_WRITABLE & !IA32_APIC_BASE_BSP != 0 {
                 return false;
             }
-            cpu.ia32_apic_base = value;
+            if value & IA32_APIC_BASE_BSP != prior_bsp {
+                return false;
+            }
+            cpu.ia32_apic_base = (value & IA32_APIC_BASE_SOFTWARE_WRITABLE) | prior_bsp;
             true
         }
         _ => false,
@@ -21760,9 +21765,10 @@ mod tests {
         }
     }
 
-    /// Intel SDM Vol. 3 / Vol. 4 MSR `1Bh` (`IA32_APIC_BASE`): reset BSP=1,
-    /// enable=0, base=`0xFEE0_0000`; WRMSR/RDMSR round-trip the writable
-    /// fields; reserved bits (including x2APIC bit 11) raise `#GP(0)`.
+    /// Intel SDM Vol. 3 §10.4.4 / Vol. 4 MSR `1Bh` (`IA32_APIC_BASE`): reset
+    /// BSP=1, EN=0 (bit 11), EXTD=0 (bit 10), base=`0xFEE0_0000`; WRMSR/RDMSR
+    /// round-trip EN and the base; reserved bits (including x2APIC bit 10) and
+    /// BSP changes raise `#GP(0)`.
     #[test]
     fn ia32_apic_base_msr_read_write_and_reserved_gp() {
         // RDMSR of the reset value.
@@ -21778,6 +21784,7 @@ mod tests {
         assert_eq!(value, x86_core::IA32_APIC_BASE_RESET);
         assert_eq!(value & IA32_APIC_BASE_BSP, IA32_APIC_BASE_BSP);
         assert_eq!(value & IA32_APIC_BASE_ENABLE, 0);
+        assert_eq!(value & IA32_APIC_BASE_X2APIC, 0);
         assert_eq!(value & !0xFFF, 0xFEE0_0000);
 
         // WRMSR: enable + relocate base, keep BSP.
@@ -21810,13 +21817,23 @@ mod tests {
         assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
         assert_eq!(cpu, before);
 
-        // x2APIC bit 11 → #GP(0).
+        // x2APIC EXTD bit 10 → #GP(0).
         let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
             cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
             cpu.set_gpr_u32(
                 CpuState::RAX,
                 (x86_core::IA32_APIC_BASE_RESET as u32) | IA32_APIC_BASE_X2APIC as u32,
             );
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // Clearing BSP (read-only) → #GP(0).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, 0xFEE0_0000); // BSP cleared
             cpu.set_gpr_u32(CpuState::RDX, 0);
         });
         let before = cpu.clone();
