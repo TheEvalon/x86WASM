@@ -1933,36 +1933,49 @@ fn cli_sti_execute(cpu: &mut CpuState, set: bool) -> Result<(), ExecError> {
 
 /// Pop FLAGS/EFLAGS with IOPL/IF privilege masking.
 ///
-/// VM86 without VME: `IOPL < 3` → `#GP(0)`. Otherwise load permitted bits;
-/// `VM`/`RF` are never taken from the image; RF is cleared; bit 1 stays set.
-/// `VIP`/`VIF` are **never** loaded from the image without full VME VIF support
-/// (`CPUID.VME` clear); they remain sticky even when `CR4.VME` is set for the
-/// soft-int redirect stub.
-/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2 / Table 20-2 (VME=0).
+/// VM86 without VME: `IOPL < 3` → `#GP(0)`. With `CR4.VME=1` and `IOPL < 3`
+/// (Table 20-2 method 4): load status flags; image `IF` updates `VIF` (not
+/// `IF`); `IOPL`/`VM`/`VIP`/`VIF`-from-image stay sticky; enabling `VIF` while
+/// `VIP=1` → `#GP(0)`. With VME and `IOPL = 3`: ordinary `IF` load; VIP∧IF
+/// `#GP` on enable. `CPUID.VME` stays clear.
+/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §§20.2–20.3 Table 20-2.
 fn popf_execute(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
     operand_size_32: bool,
 ) -> Result<(), ExecError> {
-    if cr0_pe(cpu) && eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
+    let vm = eflags_vm(cpu.rflags);
+    let vme = cr4_vme(cpu);
+    let iopl = eflags_iopl(cpu.rflags);
+    let vme_vif_path = cr0_pe(cpu) && vm && vme && iopl < 3;
+
+    if cr0_pe(cpu) && vm && iopl < 3 && !vme {
         return Err(arch_fault_with_error_code(13, 0));
     }
 
-    let image = if operand_size_32 {
-        u64::from(pop32(cpu, bus)?)
+    // Peek image before commit so VIP∧VIF/IF `#GP` leaves SP unchanged.
+    let (image, next_sp) = if operand_size_32 {
+        let (v, sp) = peek_pop32(cpu, bus)?;
+        (u64::from(v), sp)
     } else {
-        u64::from(pop16(cpu, bus)?)
+        let (v, sp) = peek_pop16(cpu, bus)?;
+        (u64::from(v), sp)
     };
 
+    const IF_BIT: u64 = 1 << 9;
+    if cr0_pe(cpu) && vm && vme && cpu.rflags & EFLAGS_VIP != 0 && image & IF_BIT != 0 {
+        // Enabling VIF (method 4) or IF (IOPL=3) while VIP=1.
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    set_stack_pointer(cpu, next_sp);
+
     let cpl = architectural_cpl(cpu);
-    let iopl = eflags_iopl(cpu.rflags);
-    let vm = eflags_vm(cpu.rflags);
 
     // Bits always loadable from the image width (status/control except IF/IOPL).
     // Low-word changeable: CF PF AF ZF SF TF DF OF NT (+ IF/IOPL conditionally).
     const STATUS16: u64 = 0x08D5; // CF PF AF ZF SF TF DF OF (no IF/IOPL/NT yet)
     const NT_BIT: u64 = 1 << 14;
-    const IF_BIT: u64 = 1 << 9;
     const IOPL_BITS: u64 = 3 << 12;
     // High dword changeable at CPL 0 (32-bit opsize): AC ID (VIF/VIP never from POPF).
     const HIGH_CPL0: u64 = (1 << 18) | (1 << 21); // AC | ID
@@ -1976,8 +1989,8 @@ fn popf_execute(
             // CPL > 0 protected: AC and ID still changeable on 32-bit POPF.
             change |= HIGH_CPL0;
         }
-        // VM86 IOPL=3: all non-reserved except IOPL/VIP/VIF/VM/RF — IF yes.
-        if vm {
+        // VM86: IF may change when not on the VIF remapping path.
+        if vm && !vme_vif_path {
             change |= IF_BIT;
         }
     }
@@ -1991,10 +2004,11 @@ fn popf_execute(
                 change |= IF_BIT;
             }
         }
-    } else {
-        // VM86 with IOPL=3: IF may change; IOPL may not.
+    } else if !vme_vif_path {
+        // VM86 with IOPL=3 (or VME IOPL=3): IF may change; IOPL may not.
         change |= IF_BIT;
     }
+    // vme_vif_path: IF not in change mask — applied to VIF below.
 
     let mask = if operand_size_32 {
         change
@@ -2013,12 +2027,56 @@ fn popf_execute(
     } else {
         new_flags &= !EFLAGS_VM;
     }
+
+    if vme_vif_path {
+        // Image IF → VIF; architectural IF unchanged; VIP sticky.
+        if image & IF_BIT != 0 {
+            new_flags |= EFLAGS_VIF;
+        } else {
+            new_flags &= !EFLAGS_VIF;
+        }
+        // Keep live IF (not from image on this path).
+        if cpu.rflags & IF_BIT != 0 {
+            new_flags |= IF_BIT;
+        } else {
+            new_flags &= !IF_BIT;
+        }
+    }
+
     if operand_size_32 {
         cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | (new_flags & 0xFFFF_FFFF);
     } else {
         cpu.rflags = (cpu.rflags & !0xFFFF) | (new_flags & 0xFFFF);
+        // VIF lives in the high word — apply after 16-bit merge.
+        if vme_vif_path {
+            if image & IF_BIT != 0 {
+                cpu.rflags |= EFLAGS_VIF;
+            } else {
+                cpu.rflags &= !EFLAGS_VIF;
+            }
+        }
     }
     Ok(())
+}
+
+/// Build the FLAGS/EFLAGS image for `PUSHF`/`PUSHFD`.
+///
+/// VME method 4 (`VM=1`, `CR4.VME=1`, `IOPL < 3`): report `IOPL=3` and
+/// `IF ← VIF` in the pushed image. Spec: Intel SDM Vol. 3 Table 20-2.
+fn pushf_image(cpu: &CpuState, operand_size_32: bool) -> u32 {
+    let mut image = cpu.rflags as u32;
+    if eflags_vm(cpu.rflags) && cr4_vme(cpu) && eflags_iopl(cpu.rflags) < 3 {
+        image = (image & !(3 << 12)) | (3 << 12); // IOPL := 3
+        image &= !(1 << 9);
+        if cpu.rflags & EFLAGS_VIF != 0 {
+            image |= 1 << 9; // IF ← VIF
+        }
+    }
+    if operand_size_32 {
+        image
+    } else {
+        image & 0xFFFF
+    }
 }
 
 /// Architectural CPL: 0 in real-address mode, 3 while `EFLAGS.VM=1`, else CS.RPL.
@@ -7370,23 +7428,27 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0x9C => {
-            // PUSHF/PUSHFD — Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ".
-            // VM86 without VME: IOPL < 3 → #GP(0) (Vol. 3 §20.2.2).
-            // Unsupported: PUSHFQ; VME VIP/VIF push masking.
-            if cr0_pe(cpu) && eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
+            // PUSHF/PUSHFD — Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ";
+            // Vol. 3 §§20.2–20.3 Table 20-2 (VME method 4: IF←VIF, IOPL=3).
+            // Unsupported: PUSHFQ; PVI.
+            let vm = eflags_vm(cpu.rflags);
+            let vme = cr4_vme(cpu);
+            let iopl = eflags_iopl(cpu.rflags);
+            if cr0_pe(cpu) && vm && iopl < 3 && !vme {
                 return Err(arch_fault_with_error_code(13, 0));
             }
+            let image = pushf_image(cpu, opsz32(&insn));
             if opsz32(&insn) {
-                push32(cpu, bus, cpu.rflags as u32)?;
+                push32(cpu, bus, image)?;
             } else {
-                push16(cpu, bus, cpu.rflags as u16)?;
+                push16(cpu, bus, image as u16)?;
             }
             set_current_ip(cpu, next_ip);
         }
         0x9D => {
             // POPF/POPFD — Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ"; Vol. 3
-            // §20.2.2. Privilege masks IOPL/IF; VM/RF never loaded from image.
-            // Unsupported: POPFQ; VME 16-bit POPF with IOPL<3.
+            // §§20.2–20.3 Table 20-2 (VME method 4: IF→VIF; VIP∧VIF #GP).
+            // Unsupported: POPFQ; PVI.
             popf_execute(cpu, bus, opsz32(&insn))?;
             set_current_ip(cpu, next_ip);
         }
