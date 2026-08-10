@@ -72,3 +72,36 @@ fn machine_ioapic_rte_delivers_to_matching_lapic() {
     assert_eq!(m.pic.master.irr, 0);
     assert_eq!(m.pic.slave.irr, 0);
 }
+
+/// Spec: 82093AA Remote IRR — level Fixed suppresses until LAPIC+IOAPIC EOI.
+#[test]
+fn machine_level_remote_irr_cleared_by_eoi_helper() {
+    use devices::{IOAPIC_RTE_LEVEL, IOAPIC_RTE_REMOTE_IRR};
+    let mut m = Machine::new(64 * 1024);
+    write_lapic_u32(&mut m, LAPIC_REG_ID, 0);
+    write_lapic_u32(&mut m, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+
+    assert!(m
+        .ioapic
+        .mmio_write_u8(IOAPIC_DEFAULT_BASE, IOAPIC_IND_REDTBL0));
+    write_ioapic_u32(&mut m, IOAPIC_IOWIN, IOAPIC_RTE_LEVEL | 0x42);
+    assert!(m
+        .ioapic
+        .mmio_write_u8(IOAPIC_DEFAULT_BASE, IOAPIC_IND_REDTBL0 + 1));
+    write_ioapic_u32(&mut m, IOAPIC_IOWIN, 0); // dest APIC ID 0
+
+    assert!(m.assert_ioapic_gsi(0, true).is_some());
+    assert!(m.ioapic.remote_irr(0));
+    assert_eq!(m.lapic.take_interrupt(), Some(0x42));
+    // Suppressed while Remote IRR set.
+    assert!(m.assert_ioapic_gsi(0, true).is_none());
+
+    assert_eq!(m.eoi_lapic_ioapic(), Some(0x42));
+    assert!(!m.ioapic.remote_irr(0));
+    // Pin still high → new delivery + Remote IRR.
+    assert!(m.assert_ioapic_gsi(0, true).is_some());
+    assert_eq!(
+        m.ioapic.redtbl_low(0).unwrap() & IOAPIC_RTE_REMOTE_IRR,
+        IOAPIC_RTE_REMOTE_IRR
+    );
+}

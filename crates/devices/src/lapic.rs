@@ -264,6 +264,22 @@ impl LocalApicMmio {
         Some(vec)
     }
 
+    /// Peek the current in-service vector (set by [`Self::take_interrupt`]).
+    pub fn in_service_vector(&self) -> Option<u8> {
+        self.in_service
+    }
+
+    /// Software EOI helper — same as writing the EOI register.
+    ///
+    /// Returns the vector whose ISR bit was cleared, if any.
+    pub fn eoi(&mut self) -> Option<u8> {
+        let vec = self.in_service.take().or_else(|| highest_set_bit(&self.isr));
+        if let Some(v) = vec {
+            bitmap_clear(&mut self.isr, v);
+        }
+        vec
+    }
+
     /// Latch a Fixed-mode vector from the I/O APIC (software-enable gated).
     ///
     /// Spec: SDM §10.8 / 82093AA Fixed delivery. Returns `true` when newly
@@ -341,12 +357,7 @@ impl LocalApicMmio {
                 // Spec: SDM §10.8.5 — write to EOI clears the highest-priority
                 // ISR bit. This stub clears the tracked in-service vector's
                 // ISR bit (single outstanding interrupt model).
-                if let Some(vec) = self.in_service.take() {
-                    bitmap_clear(&mut self.isr, vec);
-                } else if let Some(vec) = highest_set_bit(&self.isr) {
-                    // Defensive: clear highest ISR bit if tracker drifted.
-                    bitmap_clear(&mut self.isr, vec);
-                }
+                let _ = self.eoi();
             }
             LAPIC_REG_SVR => {
                 // Retain vector + software enable; other SVR bits dropped.

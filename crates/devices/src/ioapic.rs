@@ -8,9 +8,11 @@
 //!
 //! Round-7: unmasked RTE entries can deliver a Fixed-mode vector to a
 //! guest-visible path via [`IoApicMmio::assert_pin`] → [`IoApicDelivery`].
-//! Machine wiring latches that vector on the Local APIC when the destination
-//! APIC ID matches. DualPic / ExtINT virtual-wire is **not** auto-mirrored.
-//! See `docs/ioapic-r7-rte-irq.md`.
+//! Round-8: level-triggered Fixed deliveries set Remote IRR (RTE bit 14) and
+//! suppress re-issue until [`IoApicMmio::eoi`] for that vector. Machine wiring
+//! latches the vector on the Local APIC when the destination APIC ID matches.
+//! DualPic / ExtINT virtual-wire is **not** auto-mirrored.
+//! See `docs/ioapic-r7-rte-irq.md`, `docs/ioapic-r8-eoi.md`.
 
 /// Classic I/O APIC physical base (PC AT / ACPI MADT convention).
 pub const IOAPIC_DEFAULT_BASE: u64 = 0xFEC0_0000;
@@ -66,6 +68,10 @@ pub const IOAPIC_RTE_MASK: u32 = 1 << 16;
 
 /// RTE low: trigger mode (bit 15): 0 = edge, 1 = level.
 pub const IOAPIC_RTE_LEVEL: u32 = 1 << 15;
+
+/// RTE low: Remote IRR (bit 14, RO for software). Spec: 82093AA — set when a
+/// level-triggered Fixed interrupt is delivered; cleared by EOI for that vector.
+pub const IOAPIC_RTE_REMOTE_IRR: u32 = 1 << 14;
 
 /// RTE high: destination APIC ID in bits 63:56 of the 64-bit RTE
 /// (bits 31:24 of the high dword) for physical destination mode.
@@ -187,7 +193,13 @@ impl IoApicMmio {
             idx if idx >= IOAPIC_IND_REDTBL0 => {
                 let entry = (idx - IOAPIC_IND_REDTBL0) as usize;
                 if entry < self.redtbl.len() {
-                    self.redtbl[entry] = value;
+                    // Remote IRR is hardware-owned on low dwords (even indices).
+                    if entry % 2 == 0 {
+                        let remote = self.redtbl[entry] & IOAPIC_RTE_REMOTE_IRR;
+                        self.redtbl[entry] = (value & !IOAPIC_RTE_REMOTE_IRR) | remote;
+                    } else {
+                        self.redtbl[entry] = value;
+                    }
                 }
             }
             _ => {}
@@ -215,8 +227,9 @@ impl IoApicMmio {
     /// Drive I/O APIC input pin `gsi`.
     ///
     /// Spec: 82093AA — edge triggers on rising edge; level delivers while high
-    /// and unmasked. Returns a Fixed delivery when the RTE accepts the event.
-    /// Does **not** talk to DualPic; machine wiring may latch the Local APIC.
+    /// and unmasked, but Remote IRR suppresses further level issues until EOI.
+    /// Returns a Fixed delivery when the RTE accepts the event. Level Fixed
+    /// success sets Remote IRR. Does **not** talk to DualPic.
     pub fn assert_pin(&mut self, gsi: u8, high: bool) -> Option<IoApicDelivery> {
         let idx = gsi as usize;
         if idx >= IOAPIC_REDIRECTION_COUNT {
@@ -226,12 +239,43 @@ impl IoApicMmio {
         self.pin_level[idx] = high;
         let low = self.redtbl[idx * 2];
         let level_trig = low & IOAPIC_RTE_LEVEL != 0;
-        let should_try = if level_trig { high } else { !prev && high };
-        if should_try {
-            self.try_deliver(gsi)
+        let should_try = if level_trig {
+            high && low & IOAPIC_RTE_REMOTE_IRR == 0
         } else {
-            None
+            !prev && high
+        };
+        if !should_try {
+            return None;
         }
+        let delivery = self.try_deliver(gsi)?;
+        if level_trig {
+            self.redtbl[idx * 2] |= IOAPIC_RTE_REMOTE_IRR;
+        }
+        Some(delivery)
+    }
+
+    /// Clear Remote IRR on every level-triggered RTE matching `vector`.
+    ///
+    /// Spec: 82093AA — EOI for a level interrupt clears Remote IRR; the pin may
+    /// then re-deliver if still asserted and unmasked. Edge RTEs are untouched.
+    pub fn eoi(&mut self, vector: u8) {
+        for gsi in 0..IOAPIC_REDIRECTION_COUNT {
+            let low = self.redtbl[gsi * 2];
+            if low & IOAPIC_RTE_LEVEL == 0 {
+                continue;
+            }
+            if (low & IOAPIC_RTE_VECTOR_MASK) as u8 != vector {
+                continue;
+            }
+            self.redtbl[gsi * 2] &= !IOAPIC_RTE_REMOTE_IRR;
+        }
+    }
+
+    /// True when Remote IRR is set on redirection entry `gsi`.
+    pub fn remote_irr(&self, gsi: u8) -> bool {
+        self.redtbl_low(gsi)
+            .map(|low| low & IOAPIC_RTE_REMOTE_IRR != 0)
+            .unwrap_or(false)
     }
 
     /// Byte read within the claimed window, or `None` if unclaimed.
@@ -376,16 +420,38 @@ mod tests {
         assert!(io.assert_pin(5, true).is_none());
     }
 
-    /// Spec: 82093AA — level RTE delivers while pin is high and unmasked.
+    /// Spec: 82093AA — level RTE delivers while pin is high and unmasked;
+    /// Remote IRR suppresses re-issue until EOI.
     #[test]
-    fn level_rte_delivers_while_high() {
+    fn level_rte_sets_remote_irr_until_eoi() {
         let mut io = IoApicMmio::new();
         write_rte(&mut io, 3, IOAPIC_RTE_LEVEL | 0x41, 0x0200_0000);
         let d = io.assert_pin(3, true).expect("level delivery");
         assert_eq!(d.vector, 0x41);
         assert_eq!(d.dest_apic_id, 2);
-        // Still high → another try (stub re-evaluates; no remote-IRR suppress).
+        assert!(io.remote_irr(3));
+        // Still high → suppressed by Remote IRR.
+        assert!(io.assert_pin(3, true).is_none());
+        // Software cannot clear Remote IRR via RTE write.
+        write_rte(&mut io, 3, IOAPIC_RTE_LEVEL | 0x41, 0x0200_0000);
+        assert!(io.remote_irr(3));
+        // EOI for vector clears Remote IRR; pin still high → re-delivers.
+        io.eoi(0x41);
+        assert!(!io.remote_irr(3));
         assert!(io.assert_pin(3, true).is_some());
+        assert!(io.remote_irr(3));
+        io.eoi(0x41);
+        assert!(!io.remote_irr(3));
         assert!(io.assert_pin(3, false).is_none());
+    }
+
+    #[test]
+    fn edge_rte_never_sets_remote_irr() {
+        let mut io = IoApicMmio::new();
+        write_rte(&mut io, 5, 0x0000_0030, 0x0100_0000);
+        assert!(io.assert_pin(5, true).is_some());
+        assert!(!io.remote_irr(5));
+        io.eoi(0x30);
+        assert!(!io.remote_irr(5));
     }
 }
