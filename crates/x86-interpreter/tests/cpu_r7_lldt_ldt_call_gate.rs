@@ -120,10 +120,7 @@ fn install_tables(bus: &mut RamBus) {
     bus.write_bytes(GDT + 24, &encode_seg_desc(TSS as u32, 0x67, 0x8B, 0));
     bus.write_bytes(GDT + 32, &encode_seg_desc(LDT as u32, 15, 0x82, 0)); // LDT type=2
 
-    bus.write_bytes(
-        LDT,
-        &encode_call_gate32(GATE_TARGET, SEL_KCODE, 0x8C, 0),
-    );
+    bus.write_bytes(LDT, &encode_call_gate32(GATE_TARGET, SEL_KCODE, 0x8C, 0));
 
     bus.poke_u32(TSS + 4, 0x9000);
     bus.poke_u16(TSS + 8, SEL_KDATA);

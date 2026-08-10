@@ -122,7 +122,7 @@ fn install_tables(bus: &mut RamBus) {
     bus.write_bytes(GDT + 24, &encode_seg_desc(TSS as u32, 0x67, 0x8B, 0)); // busy TSS
     bus.write_bytes(GDT + 32, &encode_seg_desc(0, 0xF_FFFF, 0xFA, 0xC0)); // ucode
     bus.write_bytes(GDT + 40, &encode_seg_desc(0, 0xF_FFFF, 0xF3, 0xC0)); // udata
-    // Same-CPL call gate DPL=0 → kernel code
+                                                                          // Same-CPL call gate DPL=0 → kernel code
     bus.write_bytes(
         GDT + 48,
         &encode_call_gate32(GATE_TARGET, SEL_KCODE, 0x8C, 0),

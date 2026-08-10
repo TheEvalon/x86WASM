@@ -106,14 +106,8 @@ fn install_gdt(bus: &mut RamBus) {
     bus.write_bytes(GDT, &[0u8; 8]);
     bus.write_bytes(GDT + 8, &encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0)); // code D=1
     bus.write_bytes(GDT + 16, &encode_seg_desc(0, 0xF_FFFF, 0x93, 0xC0)); // data B=1
-    bus.write_bytes(
-        GDT + 24,
-        &encode_seg_desc(OLD_TSS as u32, 0x67, 0x8B, 0),
-    ); // busy old TSS
-    bus.write_bytes(
-        GDT + 32,
-        &encode_seg_desc(NEW_TSS as u32, 0x67, 0x89, 0),
-    ); // available new TSS
+    bus.write_bytes(GDT + 24, &encode_seg_desc(OLD_TSS as u32, 0x67, 0x8B, 0)); // busy old TSS
+    bus.write_bytes(GDT + 32, &encode_seg_desc(NEW_TSS as u32, 0x67, 0x89, 0)); // available new TSS
     bus.write_bytes(GDT + 40, &encode_task_gate(SEL_NEW_TSS, 0x85)); // P|DPL0|type5
 }
 

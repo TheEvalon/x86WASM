@@ -2046,16 +2046,9 @@ fn call_gate_far_call(
         return Err(selector_fault(13, code_selector));
     }
     // Destination must be more privileged or same: DPL ≤ CPL.
-    // Nonconforming privilege change requires DPL < CPL; conforming never
+    // Nonconforming with DPL < CPL switches privilege; conforming never
     // changes CPL. Spec: Vol. 3 §5.8.2.
     if code_dpl > cpl {
-        return Err(selector_fault(13, code_selector));
-    }
-    if !conforming && code_dpl < cpl {
-        // privilege change — allowed
-    } else if !conforming && code_dpl != cpl {
-        return Err(selector_fault(13, code_selector));
-    } else if conforming && code_dpl > cpl {
         return Err(selector_fault(13, code_selector));
     }
     if code_access & 0x80 == 0 {
@@ -2084,12 +2077,7 @@ fn call_gate_far_call(
         let ss_loaded = prepare_ss_from_gdt_for_cpl(cpu, bus, ss_sel, new_cpl)?;
         // Privilege-changing CALL frame (Vol. 3 Figure 5-9), low→high:
         // EIP, CS, ESP, SS. Writes are supervisor accesses (§4.6.1).
-        let frame = [
-            next_ip,
-            u32::from(return_cs),
-            old_esp,
-            u32::from(old_ss),
-        ];
+        let frame = [next_ip, u32::from(return_cs), old_esp, u32::from(old_ss)];
         let stack_b32 = ss_loaded.default_big();
         for &value in frame.iter().rev() {
             sp = if stack_b32 {
@@ -2458,10 +2446,10 @@ fn exec_verr_verw(
     let _m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
     let selector = read_rm_u16(cpu, bus, insn)?;
     let cpl = (cpu.cs.selector & 3) as u8;
-    let ok = match try_read_gdt_descriptor_for_lar_lsl(cpu, bus, selector)? {
-        Some(desc) if verr_verw_usable(desc[5], selector, cpl, for_write) => true,
-        _ => false,
-    };
+    let ok = matches!(
+        try_read_gdt_descriptor_for_lar_lsl(cpu, bus, selector)?,
+        Some(desc) if verr_verw_usable(desc[5], selector, cpl, for_write)
+    );
     cpu.set_zf(ok);
     Ok(())
 }
@@ -5082,11 +5070,8 @@ fn tss32_read_u32(bus: &mut dyn Bus, base: u64, offset: u32) -> Result<u32, Exec
 
 fn tss32_write_u32(bus: &mut dyn Bus, base: u64, offset: u32, value: u32) -> Result<(), ExecError> {
     for (index, byte) in value.to_le_bytes().iter().enumerate() {
-        bus.write_system_u8(
-            base.wrapping_add(u64::from(offset) + index as u64),
-            *byte,
-        )
-        .map_err(|error| classify_mem_fault(error, false))?;
+        bus.write_system_u8(base.wrapping_add(u64::from(offset) + index as u64), *byte)
+            .map_err(|error| classify_mem_fault(error, false))?;
     }
     Ok(())
 }
@@ -5103,11 +5088,8 @@ fn tss32_read_u16(bus: &mut dyn Bus, base: u64, offset: u32) -> Result<u16, Exec
 
 fn tss32_write_u16(bus: &mut dyn Bus, base: u64, offset: u32, value: u16) -> Result<(), ExecError> {
     for (index, byte) in value.to_le_bytes().iter().enumerate() {
-        bus.write_system_u8(
-            base.wrapping_add(u64::from(offset) + index as u64),
-            *byte,
-        )
-        .map_err(|error| classify_mem_fault(error, false))?;
+        bus.write_system_u8(base.wrapping_add(u64::from(offset) + index as u64), *byte)
+            .map_err(|error| classify_mem_fault(error, false))?;
     }
     Ok(())
 }
@@ -5459,11 +5441,12 @@ fn task_switch_jmp(
     let new_access = (new_desc[5] & 0xF0) | DESC_TYPE_TSS32_BUSY;
     write_gdt_access_byte(cpu, bus, new_sel, new_access)?;
 
-    cpu.tr.load_descriptor_cache(new_sel, new_base, new_parsed.limit, {
-        let mut flags = new_parsed.flags;
-        flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
-        flags
-    });
+    cpu.tr
+        .load_descriptor_cache(new_sel, new_base, new_parsed.limit, {
+            let mut flags = new_parsed.flags;
+            flags = (flags & !0x0F) | u16::from(DESC_TYPE_TSS32_BUSY);
+            flags
+        });
 
     cpu.cr3 = u64::from(new_cr3);
     note_control_register_write(cpu, bus, 3);
