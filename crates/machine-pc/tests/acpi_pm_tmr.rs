@@ -1,8 +1,10 @@
-//! ACPI PM_TMR advances with the instruction-count step clock.
+//! ACPI PM_TMR advances with the instruction-count step clock and every
+//! [`Machine::tick_pit`] quantum.
 //!
 //! Spec: Intel 82371AB (PIIX4) — `PM_TMR` at PMBASE+`08h` is a 24-bit
 //! free-running counter at 3.579545 MHz (three times the 8254 input clock).
 //! SeaBIOS busy-waits on `IN` of that dword; a stuck-at-zero stub never exits.
+//! See `docs/platform-r9-pm-tmr.md`.
 
 use devices::{
     PciConfig, PortDevice, PCI_COMMAND_IO, PCI_COMMAND_OFFSET, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
@@ -63,4 +65,29 @@ fn pm_tmr_wraps_at_24_bits() {
     m.set_step_clock(StepClock::enabled_default());
     m.step().expect("step"); // +3 → wraps to 1
     assert_eq!(read_pm_tmr(&m), 1);
+}
+
+/// Spec: Intel 82371AB — every PIT quantum freeruns PM_TMR, including host
+/// [`Machine::tick_pit`] without an armed step clock.
+#[test]
+fn tick_pit_alone_freeruns_pm_tmr() {
+    let mut m = Machine::new(64 * 1024);
+    program_pmbase(&mut m);
+    assert!(!m.step_clock().enabled);
+    assert_eq!(read_pm_tmr(&m), 0);
+    m.tick_pit(7);
+    assert_eq!(read_pm_tmr(&m), 21, "7 PIT clocks × 3 PM ticks");
+    m.tick_pit(1);
+    assert_eq!(read_pm_tmr(&m), 24);
+}
+
+/// Spec: step-clock path must not double-charge PM_TMR (single authority via
+/// [`Machine::tick_pit`]).
+#[test]
+fn step_clock_does_not_double_charge_pm_tmr() {
+    let mut m = Machine::new(64 * 1024);
+    program_pmbase(&mut m);
+    m.set_step_clock(StepClock::with_pit_clocks_per_step(5));
+    m.step().expect("step");
+    assert_eq!(read_pm_tmr(&m), 15, "5×3 only once per step");
 }

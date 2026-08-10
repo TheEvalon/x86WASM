@@ -472,25 +472,17 @@ impl Machine {
     ///
     /// Spec: Intel 8254 (CLK-driven counter), Motorola MC146818A (periodic
     /// quantum + one-second update cycle), and Intel 82371AB ACPI `PM_TMR`
-    /// (24-bit free-running counter at 3.579545 MHz), all driven from the
-    /// retired-instruction count rather than host wall clock so a run is
-    /// reproducible.
+    /// (24-bit free-running counter at 3.579545 MHz via [`Self::tick_pit`]),
+    /// all driven from the retired-instruction count rather than host wall
+    /// clock so a run is reproducible.
     fn advance_step_clock(&mut self) {
         let ticks = self.step_clock.charge_step();
         if ticks.is_empty() {
             return;
         }
         if ticks.pit_clocks > 0 {
+            // Spec: Intel 82371AB — PM_TMR freeruns at 3× PIT via [`Self::tick_pit`].
             self.tick_pit(ticks.pit_clocks);
-            // Spec: Intel 82371AB — PM_TMR runs at 3.579545 MHz = 3 × PIT CLK.
-            // Authority lives in `PciConfig::acpi_pm_io[+8]`; prefer
-            // [`PciConfig::tick_acpi_pm`] so MSB toggle can set TMR_STS.
-            let pm = ticks
-                .pit_clocks
-                .saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK);
-            if pm > 0 {
-                self.pci.tick_acpi_pm(pm.min(u64::from(u32::MAX)) as u32);
-            }
         }
         if ticks.cmos_periods > 0 {
             self.tick_cmos(ticks.cmos_periods);
@@ -864,9 +856,11 @@ impl Machine {
     }
 
     /// Advance PIT channel 0 (and ch2 speaker timer) by `clocks` model ticks
-    /// and sync ch0 OUT → PIC IRQ0.
+    /// and sync ch0 OUT → PIC IRQ0. Also freeruns ACPI `PM_TMR` at 3× PIT.
     ///
-    /// Spec: Intel 8254 ch0 OUT; Intel 8259A edge IR (low→high latches IRR).
+    /// Spec: Intel 8254 ch0 OUT; Intel 8259A edge IR (low→high latches IRR);
+    /// Intel 82371AB — `PM_TMR` at 3.579545 MHz = 3 × PIT CLK into
+    /// `PciConfig::acpi_pm_io[+8]` via [`PciConfig::tick_acpi_pm`].
     /// Guest wall-clock rate is **not** host-real-time — callers choose the quantum.
     ///
     /// When `tick_ch0` reports a rising OUT edge, IR0 is pulsed (deassert then
@@ -875,6 +869,12 @@ impl Machine {
     pub fn tick_pit(&mut self, clocks: u64) {
         let rising = self.pit.tick_ch0(clocks);
         let _ = self.pit.tick_ch2(clocks);
+        // Spec: Intel 82371AB / ACPI — one PM_TMR clock path (3× PIT) for every
+        // machine PIT quantum, including step-clock and host `tick_pit` calls.
+        let pm = clocks.saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK);
+        if pm > 0 {
+            self.pci.tick_acpi_pm(pm.min(u64::from(u32::MAX)) as u32);
+        }
         if rising {
             self.pic.set_irq_line(0, false);
             self.pic.set_irq_line(0, true);
