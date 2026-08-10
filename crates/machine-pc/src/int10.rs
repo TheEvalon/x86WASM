@@ -7,8 +7,8 @@
 //! Spec: Ralf Brown's Interrupt List — INT 10h AH=00h "SET VIDEO MODE",
 //! AH=02h "SET CURSOR POSITION", AH=03h "GET CURSOR POSITION AND SIZE",
 //! AH=0Eh "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE"; IBM PC BIOS
-//! Data Area video fields at `0040:0049` / `0040:004A` / `0040:0050` /
-//! `0040:0060` / `0040:0062`.
+//! Data Area video fields at `0040:0049` / `0040:004A` / `0040:004C` /
+//! `0040:004E` / `0040:0050` / `0040:0060` / `0040:0062`.
 
 use crate::{Machine, MachineError};
 use devices::{VgaRenderMode, VGA_DEFAULT_ATTR, VGA_TEXT_COLS, VGA_TEXT_ROWS};
@@ -37,6 +37,10 @@ pub const INT10_MODE_13H_GRAPHICS: u8 = 0x13;
 pub const BDA_VIDEO_MODE: u64 = 0x449;
 /// BDA screen columns (`0040:004A`). Spec: RBIL memory map.
 pub const BDA_VIDEO_COLS: u64 = 0x44A;
+/// BDA video page / regen buffer size in bytes (`0040:004C`). Spec: RBIL.
+pub const BDA_VIDEO_PAGE_SIZE: u64 = 0x44C;
+/// BDA current page start offset (`0040:004E`). Spec: RBIL — stub keeps `0000h`.
+pub const BDA_VIDEO_PAGE_START: u64 = 0x44E;
 /// BDA cursor position for display page 0 (`0040:0050`): low=col, high=row.
 pub const BDA_CURSOR_PAGE0: u64 = 0x450;
 /// BDA cursor type (`0040:0060`): low=end scanline, high=start scanline (CX form).
@@ -50,6 +54,10 @@ pub const BDA_ACTIVE_PAGE: u64 = 0x462;
 pub const INT10_MODE03_CURSOR_START: u8 = 0x06;
 /// Mode-03h default cursor end scanline.
 pub const INT10_MODE03_CURSOR_END: u8 = 0x07;
+/// Mode-03h BDA page size (4 KiB regen). Spec: classic IBM BIOS BDA `0040:004C`.
+pub const INT10_MODE03_PAGE_SIZE: u16 = 0x1000;
+/// Mode-13h BDA page size. Spec: classic BIOS mode-13h BDA `0040:004C` (`FA00h`).
+pub const INT10_MODE13_PAGE_SIZE: u16 = 0xFA00;
 
 /// Default teletype attribute in text mode (light grey on black).
 const INT10_TTY_ATTR: u8 = VGA_DEFAULT_ATTR;
@@ -62,7 +70,7 @@ impl Machine {
     /// - AH=02h — set cursor position (page 0; BDA `0040:0050`)
     /// - AH=03h — get cursor position and size (page 0; BDA + CRTC scanlines)
     /// - AH=0Eh — teletype output in text mode (CR/LF/BS + printable)
-    /// - AH=0Fh — get current video mode (AL/AH/BH from BDA)
+    /// - AH=0Fh — get current video mode / columns / page from BDA
     ///
     /// Unsupported AH values leave CPU/VGA unchanged. Spec: RBIL INT 10h subset.
     pub fn service_int10(&mut self) {
@@ -106,7 +114,7 @@ impl Machine {
         match mode {
             INT10_MODE_03H_TEXT => {
                 self.vga.reset();
-                self.write_bda_video(mode, VGA_TEXT_COLS as u16, 0, 0);
+                self.write_bda_video(mode, VGA_TEXT_COLS as u16, INT10_MODE03_PAGE_SIZE, 0, 0);
                 let _ = self.write_bda_cursor_type(
                     INT10_MODE03_CURSOR_START,
                     INT10_MODE03_CURSOR_END,
@@ -115,7 +123,7 @@ impl Machine {
             INT10_MODE_13H_GRAPHICS => {
                 self.vga.program_bios_mode13h();
                 // Mode 13h is 40 columns in the classic BDA sense (320/8).
-                self.write_bda_video(mode, 40, 0, 0);
+                self.write_bda_video(mode, 40, INT10_MODE13_PAGE_SIZE, 0, 0);
             }
             _ => {
                 // Unsupported mode: leave hardware alone (honest subset).
@@ -150,14 +158,12 @@ impl Machine {
             return;
         }
         let (row, col) = self.read_bda_cursor().unwrap_or((0, 0));
-        let (start, end) = self
-            .read_bda_cursor_type()
-            .unwrap_or_else(|| {
-                (
-                    self.vga.crtc_cursor_start_scanline(),
-                    self.vga.crtc_cursor_end_scanline(),
-                )
-            });
+        let (start, end) = self.read_bda_cursor_type().unwrap_or_else(|| {
+            (
+                self.vga.crtc_cursor_start_scanline(),
+                self.vga.crtc_cursor_end_scanline(),
+            )
+        });
         self.cpu.set_gpr_u8(4 + CpuState::RDX, row); // DH
         self.cpu.set_gpr_u8_low(CpuState::RDX, col); // DL
         self.cpu.set_gpr_u8(4 + CpuState::RCX, start); // CH
@@ -165,6 +171,8 @@ impl Machine {
     }
 
     /// AH=0Fh GET CURRENT VIDEO MODE. Spec: RBIL — AL=mode, AH=columns, BH=page.
+    ///
+    /// Reads BDA `0040:0049` / `0040:004A` / `0040:0062` (host stub state).
     fn int10_get_mode(&mut self) {
         let mode = self
             .read_bda_u8(BDA_VIDEO_MODE)
@@ -228,12 +236,29 @@ impl Machine {
         let _ = self.write_bda_cursor(row, col);
     }
 
-    fn write_bda_video(&mut self, mode: u8, cols: u16, row: u8, col: u8) {
+    /// Write the core BDA video fields kept coherent with AH=00/02/03/0F.
+    ///
+    /// Spec: RBIL BIOS Data Area — mode `0040:0049`, columns `0040:004A`,
+    /// page size `0040:004C`, page start `0040:004E`, cursor `0040:0050`,
+    /// active page `0040:0062`.
+    fn write_bda_video(&mut self, mode: u8, cols: u16, page_size: u16, row: u8, col: u8) {
         let _ = self.mem.write_u8(BDA_VIDEO_MODE, mode);
         let _ = self.mem.write_u8(BDA_VIDEO_COLS, (cols & 0xFF) as u8);
         let _ = self.mem.write_u8(BDA_VIDEO_COLS + 1, (cols >> 8) as u8);
+        let _ = self.write_bda_u16(BDA_VIDEO_PAGE_SIZE, page_size);
+        let _ = self.write_bda_u16(BDA_VIDEO_PAGE_START, 0);
         let _ = self.mem.write_u8(BDA_ACTIVE_PAGE, 0);
         let _ = self.write_bda_cursor(row, col);
+    }
+
+    fn write_bda_u16(&mut self, phys: u64, val: u16) -> Result<(), MachineError> {
+        self.mem
+            .write_u8(phys, (val & 0xFF) as u8)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        self.mem
+            .write_u8(phys + 1, (val >> 8) as u8)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        Ok(())
     }
 
     fn write_bda_cursor(&mut self, row: u8, col: u8) -> Result<(), MachineError> {
@@ -273,6 +298,20 @@ impl Machine {
         let lo = self.read_bda_u8(BDA_VIDEO_COLS)?;
         let hi = self.read_bda_u8(BDA_VIDEO_COLS + 1)?;
         Some(u16::from(lo) | (u16::from(hi) << 8))
+    }
+
+    fn read_bda_u16(&self, phys: u64) -> Option<u16> {
+        let lo = self.read_bda_u8(phys)?;
+        let hi = self.read_bda_u8(phys + 1)?;
+        Some(u16::from(lo) | (u16::from(hi) << 8))
+    }
+
+    fn read_bda_page_size(&self) -> Option<u16> {
+        self.read_bda_u16(BDA_VIDEO_PAGE_SIZE)
+    }
+
+    fn read_bda_page_start(&self) -> Option<u16> {
+        self.read_bda_u16(BDA_VIDEO_PAGE_START)
     }
 
     fn read_bda_u8(&self, phys: u64) -> Option<u8> {
@@ -331,6 +370,13 @@ mod tests {
         assert_eq!(m.mem.read_u8(BDA_VIDEO_COLS).unwrap(), VGA_TEXT_COLS as u8);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0).unwrap(), 0);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 1).unwrap(), 0);
+        assert_eq!(m.read_bda_u16(BDA_VIDEO_PAGE_SIZE), Some(INT10_MODE03_PAGE_SIZE));
+        assert_eq!(m.read_bda_u16(BDA_VIDEO_PAGE_START), Some(0));
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
+        assert_eq!(
+            m.read_bda_cursor_type(),
+            Some((INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END))
+        );
     }
 
     #[test]
@@ -344,6 +390,8 @@ mod tests {
             m.mem.read_u8(BDA_VIDEO_MODE).unwrap(),
             INT10_MODE_13H_GRAPHICS
         );
+        assert_eq!(m.read_bda_page_size(), Some(INT10_MODE13_PAGE_SIZE));
+        assert_eq!(m.read_bda_u16(BDA_VIDEO_PAGE_START), Some(0));
     }
 
     #[test]
@@ -458,6 +506,48 @@ mod tests {
         assert_eq!(m.cpu.al(), INT10_MODE_13H_GRAPHICS);
         assert_eq!(m.cpu.ah(), 40);
         assert_eq!(m.cpu.gpr_u8(4 + CpuState::RBX), 0);
+    }
+
+    #[test]
+    fn int10_bda_video_fields_coherent_after_mode_cursor_get() {
+        // Spec: RBIL BDA video map — mode/cols/page size/cursor type/page stay
+        // coherent across AH=00h / AH=02h / AH=03h / AH=0Fh.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+
+        assert_eq!(m.mem.read_u8(BDA_VIDEO_MODE).unwrap(), INT10_MODE_03H_TEXT);
+        assert_eq!(m.read_bda_cols(), Some(VGA_TEXT_COLS as u16));
+        assert_eq!(m.read_bda_page_size(), Some(INT10_MODE03_PAGE_SIZE));
+        assert_eq!(m.read_bda_page_start(), Some(0));
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
+        assert_eq!(
+            m.read_bda_cursor_type(),
+            Some((INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END))
+        );
+
+        setup_int10_set_cursor(&mut m.cpu, 0, 3, 7);
+        m.service_int10();
+        setup_int10_get_cursor(&mut m.cpu, 0);
+        m.service_int10();
+        assert_eq!(m.cpu.gpr_u8(4 + CpuState::RDX), 3);
+        assert_eq!(m.cpu.gpr_u8_low(CpuState::RDX), 7);
+
+        setup_int10_get_mode(&mut m.cpu);
+        m.service_int10();
+        assert_eq!(m.cpu.al(), INT10_MODE_03H_TEXT);
+        assert_eq!(m.cpu.ah(), VGA_TEXT_COLS as u8);
+        // Cursor position must survive AH=0Fh (does not rewrite BDA).
+        assert_eq!(m.read_bda_cursor(), Some((3, 7)));
+        assert_eq!(m.read_bda_page_size(), Some(INT10_MODE03_PAGE_SIZE));
+        assert_eq!(m.read_bda_page_start(), Some(0));
+
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_13H_GRAPHICS);
+        m.service_int10();
+        assert_eq!(m.read_bda_page_size(), Some(INT10_MODE13_PAGE_SIZE));
+        assert_eq!(m.read_bda_page_start(), Some(0));
+        assert_eq!(m.read_bda_cols(), Some(40));
+        assert_eq!(m.read_bda_cursor(), Some((0, 0)));
     }
 
     #[test]
