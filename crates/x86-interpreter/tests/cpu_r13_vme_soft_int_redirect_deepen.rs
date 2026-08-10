@@ -131,10 +131,7 @@ fn install_tables(bus: &mut RamBus) {
     for b in 0..32 {
         bus.mem[REDIRECT_MAP + b] = 0xFF;
     }
-    bus.write_bytes(
-        IDT + 0x00 * 8,
-        &encode_idt_gate32(HANDLER_IDT, SEL_KCODE, 0xEE),
-    );
+    bus.write_bytes(IDT, &encode_idt_gate32(HANDLER_IDT, SEL_KCODE, 0xEE));
     bus.write_bytes(
         IDT + 0x07 * 8,
         &encode_idt_gate32(HANDLER_IDT, SEL_KCODE, 0xEE),

@@ -5,6 +5,7 @@
 //!   `IF ← VIF`.
 //! * `POPF`/`POPFD` succeed; image `IF` updates `VIF` (not `IF`); `VIP`/`VIF`
 //!   high bits stay sticky; enabling `VIF` while `VIP=1` → `#GP(0)`.
+//!
 //! With `IOPL = 3` under VME: ordinary `IF` load; `VIP∧IF` on enable → `#GP`.
 //! Without VME: R9/R11 contracts unchanged. `CPUID.VME` stays clear.
 //!
