@@ -44,16 +44,7 @@ is_linux_or_wsl() {
   esac
 }
 
-preflight() {
-  log "preflight SeaVGABIOS smoke (root=${ROOT})"
-  [[ -f "${SCRIPT_DIR}/build-seavgabios.sh" ]] || die "missing build-seavgabios.sh"
-  [[ -f "${SCRIPT_DIR}/check-option-rom.py" ]] || die "missing check-option-rom.py"
-  [[ -f "${ROOT}/firmware/manifests/seavgabios.json" ]] || die "missing seavgabios.json pin"
-  [[ -f "${ROOT}/firmware/seavgabios/LICENSE.notice" ]] || die "missing LICENSE.notice"
-  [[ -f "${ROOT}/docs/firmware-r7-seavgabios-build.md" ]] || die "missing R7 build doc"
-  [[ -f "${ROOT}/docs/firmware-r9-seavgabios-linux-smoke.md" ]] || die "missing R9 smoke doc"
-
-  # Prefer PYTHON override (Git Bash on Windows often has a Store stub for python3).
+resolve_python() {
   local py="${PYTHON:-}"
   if [[ -z "${py}" ]]; then
     if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
@@ -64,7 +55,25 @@ preflight() {
       die "python3/python required for check-option-rom.py (set PYTHON=...)"
     fi
   fi
-  command -v "${py}" >/dev/null 2>&1 || [[ -x "${py}" ]] || die "PYTHON interpreter not found: ${py}"
+  if ! command -v "${py}" >/dev/null 2>&1 && [[ ! -x "${py}" ]]; then
+    die "PYTHON interpreter not found: ${py}"
+  fi
+  # Reject Windows Store stubs that print an install banner and exit non-zero.
+  "${py}" -c 'import sys' >/dev/null 2>&1 || die "PYTHON is not a working interpreter: ${py}"
+  printf '%s' "${py}"
+}
+
+preflight() {
+  log "preflight SeaVGABIOS smoke (root=${ROOT})"
+  [[ -f "${SCRIPT_DIR}/build-seavgabios.sh" ]] || die "missing build-seavgabios.sh"
+  [[ -f "${SCRIPT_DIR}/check-option-rom.py" ]] || die "missing check-option-rom.py"
+  [[ -f "${ROOT}/firmware/manifests/seavgabios.json" ]] || die "missing seavgabios.json pin"
+  [[ -f "${ROOT}/firmware/seavgabios/LICENSE.notice" ]] || die "missing LICENSE.notice"
+  [[ -f "${ROOT}/docs/firmware-r7-seavgabios-build.md" ]] || die "missing R7 build doc"
+  [[ -f "${ROOT}/docs/firmware-r9-seavgabios-linux-smoke.md" ]] || die "missing R9 smoke doc"
+
+  local py
+  py="$(resolve_python)"
 
   # Synthetic 512-byte option ROM: 55 AA, size=1, RETF at offset 3, checksum 0.
   local tmp
@@ -102,12 +111,15 @@ run_build() {
     fi
     return 0
   fi
+  local py
+  py="$(resolve_python)"
+  export PYTHON="${py}"
   log "running build-seavgabios.sh"
   chmod +x "${SCRIPT_DIR}/build-seavgabios.sh"
   "${SCRIPT_DIR}/build-seavgabios.sh"
   [[ -f "${ROOT}/firmware/seavgabios/vgabios.bin" ]] \
     || die "expected firmware/seavgabios/vgabios.bin after build"
-  python3 "${SCRIPT_DIR}/check-option-rom.py" \
+  "${py}" "${SCRIPT_DIR}/check-option-rom.py" \
     "${ROOT}/firmware/seavgabios/vgabios.bin"
   log "build smoke ok"
 }
