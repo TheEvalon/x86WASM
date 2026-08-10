@@ -29,7 +29,9 @@ mod vga_frame;
 mod xbcs;
 
 pub use guest_boot::{
-    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GUEST_BOOT_MEASURE_VERSION,
+    synthetic_freedos_like_disk, synthetic_linux_serial_stub_disk, GuestBootCheckpoint,
+    GuestBootMeasure, GuestBootMedia, GuestOsMeasure, GuestOsMeasureKind,
+    GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION,
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int13::{

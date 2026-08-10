@@ -2,6 +2,10 @@
 
 Milestone 2, round 8, boot-guest lane, slice 4.
 
+Superseded for OS-path honesty reports by **v3 FreeDOS-like / Linux-serial**:
+see `docs/boot-r9-freedos-measure.md` and `docs/boot-r9-linux-serial-measure.md`.
+The R8 v2 checkpoints/serial schema remains the inner measure.
+
 ## Scope
 
 Extend the R7 measure-first harness toward a FreeDOS/Linux **serial-path**

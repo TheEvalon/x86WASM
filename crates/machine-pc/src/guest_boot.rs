@@ -1,17 +1,22 @@
-//! Guest disk boot measure harness v2 (FreeDOS/Linux serial-path prep).
+//! Guest disk boot measure harness v2/v3 (FreeDOS/Linux serial-path prep).
 //!
-//! Loads a boot sector / El Torito image, then reuses [`Machine::probe_post`] to
-//! record the **first** stop reason plus serial capture and named checkpoints.
-//! This does **not** claim FreeDOS, Linux, or Milestone 2 boot success.
+//! Loads a boot sector / El Torito / synthetic FreeDOS-like image, then reuses
+//! [`Machine::probe_post`] to record the **first** stop reason plus serial
+//! capture, optional VGA summary, and named checkpoints. This does **not**
+//! claim FreeDOS prompt, Linux userspace, or Milestone 2 boot success.
 //!
 //! Spec: IBM PC BIOS INT 19h handoff + El Torito 1.0 no-emul load + existing
-//! POST probe diagnostics (`docs/boot-r8-guest-measure-v2.md`).
+//! POST probe diagnostics (`docs/boot-r8-guest-measure-v2.md`,
+//! `docs/boot-r9-freedos-measure.md`).
 
 use crate::post_probe::{PostReport, PostStopReason};
 use crate::{Machine, MachineError};
 
-/// Harness schema version for CLI/report consumers.
+/// Harness schema version for CLI/report consumers (v2 checkpoints + serial).
 pub const GUEST_BOOT_MEASURE_VERSION: u32 = 2;
+
+/// FreeDOS-like / Linux-serial measure report schema (wraps v2 + honesty).
+pub const GUEST_OS_MEASURE_VERSION: u32 = 3;
 
 /// Which host boot helper to use before measuring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +40,8 @@ pub enum GuestBootCheckpoint {
     ProbeStarted,
     /// At least one COM1 or debug-console byte was observed at stop.
     SerialObserved,
+    /// At least one printable VGA text cell observed at stop.
+    VgaObserved,
     /// Probe recorded a terminal stop reason.
     StopRecorded,
 }
@@ -52,6 +59,8 @@ pub struct GuestBootMeasure {
     pub com1: String,
     /// Port `0x402` debug console bytes at stop.
     pub debug: String,
+    /// Compact VGA text summary (non-blank rows only); empty if blank.
+    pub vga_summary: String,
     /// Probe report (first failure / halt / budget). **Not** a success claim.
     pub report: PostReport,
 }
@@ -60,6 +69,11 @@ impl GuestBootMeasure {
     /// True when any serial/debug byte was captured (does not imply boot success).
     pub fn serial_captured(&self) -> bool {
         !self.com1.is_empty() || !self.debug.is_empty()
+    }
+
+    /// True when VGA text had any printable non-space glyph.
+    pub fn vga_captured(&self) -> bool {
+        !self.vga_summary.is_empty()
     }
 
     /// Human-readable stop class for FreeDOS/Linux bring-up triage.
@@ -95,6 +109,7 @@ impl std::fmt::Display for GuestBootMeasure {
                 GuestBootCheckpoint::CsIpArmed => "cs-ip-armed",
                 GuestBootCheckpoint::ProbeStarted => "probe-started",
                 GuestBootCheckpoint::SerialObserved => "serial-observed",
+                GuestBootCheckpoint::VgaObserved => "vga-observed",
                 GuestBootCheckpoint::StopRecorded => "stop-recorded",
             })?;
         }
@@ -105,7 +120,58 @@ impl std::fmt::Display for GuestBootMeasure {
             self.com1.as_str(),
             self.debug.as_str()
         )?;
+        if !self.vga_summary.is_empty() {
+            writeln!(f, "  vga: {}", self.vga_summary)?;
+        }
         write!(f, "{}", self.report)
+    }
+}
+
+/// Which synthetic / path-specific OS measure was requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestOsMeasureKind {
+    /// In-tree FreeDOS-*like* MBR+payload fixture (not FreeDOS).
+    FreeDosLike,
+    /// Serial-path stub toward 32-bit Linux console (not a kernel boot).
+    LinuxSerialPath,
+}
+
+/// v3 OS-path measure: wraps v2 plus honesty / gap list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestOsMeasure {
+    /// Schema version ([`GUEST_OS_MEASURE_VERSION`]).
+    pub version: u32,
+    /// Path kind.
+    pub kind: GuestOsMeasureKind,
+    /// Underlying v2 measure (serial/VGA/checkpoints/stop).
+    pub measure: GuestBootMeasure,
+    /// Explicit non-claim sentence for reports/CLI.
+    pub honesty: &'static str,
+    /// Remaining gaps toward a real guest (not M2 exit).
+    pub gaps: Vec<&'static str>,
+}
+
+impl std::fmt::Display for GuestOsMeasure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.kind {
+            GuestOsMeasureKind::FreeDosLike => "freedos-like",
+            GuestOsMeasureKind::LinuxSerialPath => "linux-serial-path",
+        };
+        writeln!(
+            f,
+            "guest-os-measure-v{}: kind={} (NOT an OS boot / NOT Milestone 2 exit)",
+            self.version, kind
+        )?;
+        writeln!(f, "  honesty: {}", self.honesty)?;
+        write!(f, "  gaps=[")?;
+        for (i, g) in self.gaps.iter().enumerate() {
+            if i != 0 {
+                f.write_str("; ")?;
+            }
+            f.write_str(g)?;
+        }
+        writeln!(f, "]")?;
+        write!(f, "{}", self.measure)
     }
 }
 
@@ -115,7 +181,8 @@ impl Machine {
     /// Returns [`MachineError`] only for media/signature/RAM problems before
     /// execution starts. Execution stops are always captured inside the report.
     ///
-    /// v2 also records checkpoints and copies COM1/debug serial at the stop.
+    /// v2 also records checkpoints and copies COM1/debug serial at the stop;
+    /// R9 adds a compact VGA text summary when printable glyphs exist.
     pub fn measure_guest_boot(
         &mut self,
         media: GuestBootMedia,
@@ -137,6 +204,10 @@ impl Machine {
         if !com1.is_empty() || !debug.is_empty() {
             checkpoints.push(GuestBootCheckpoint::SerialObserved);
         }
+        let vga_summary = vga_text_summary(self);
+        if !vga_summary.is_empty() {
+            checkpoints.push(GuestBootCheckpoint::VgaObserved);
+        }
         checkpoints.push(GuestBootCheckpoint::StopRecorded);
         Ok(GuestBootMeasure {
             version: GUEST_BOOT_MEASURE_VERSION,
@@ -144,9 +215,144 @@ impl Machine {
             checkpoints,
             com1,
             debug,
+            vga_summary,
             report,
         })
     }
+
+    /// Attach the in-tree FreeDOS-*like* IDE fixture (if no IDE yet) and measure.
+    ///
+    /// The fixture is a signed MBR that prints `FD` to COM1 and a VGA glyph,
+    /// then `HLT`, plus a second-sector payload marker. It is **not** FreeDOS
+    /// and must never be reported as a FreeDOS prompt.
+    pub fn measure_freedos_like(
+        &mut self,
+        max_steps: u64,
+    ) -> Result<GuestOsMeasure, MachineError> {
+        if !self.ide.present || self.ide.image.is_empty() {
+            self.attach_ide_image(synthetic_freedos_like_disk());
+        }
+        let measure = self.measure_guest_boot(GuestBootMedia::IdePrefer, max_steps)?;
+        Ok(GuestOsMeasure {
+            version: GUEST_OS_MEASURE_VERSION,
+            kind: GuestOsMeasureKind::FreeDosLike,
+            measure,
+            honesty: "Synthetic FreeDOS-like MBR+payload only — does NOT claim a FreeDOS prompt or kernel.",
+            gaps: vec![
+                "No FreeDOS image vendored; fixture is synthetic",
+                "Guest INT 13h still needs SeaBIOS (host subset is not an IVT body)",
+                "Incomplete firmware POST / devices / opcodes for real FreeDOS",
+                "No claim of COMMAND.COM or FreeDOS prompt",
+            ],
+        })
+    }
+
+    /// Attach a synthetic Linux serial-path stub (if no IDE yet) and measure.
+    ///
+    /// Captures COM1 from a guest that prints a short banner then `HLT`. Does
+    /// **not** load a bzImage, enter protected mode, or claim Linux boot / M2 exit.
+    pub fn measure_linux_serial_path(
+        &mut self,
+        max_steps: u64,
+    ) -> Result<GuestOsMeasure, MachineError> {
+        if !self.ide.present || self.ide.image.is_empty() {
+            self.attach_ide_image(synthetic_linux_serial_stub_disk());
+        }
+        let measure = self.measure_guest_boot(GuestBootMedia::IdePrefer, max_steps)?;
+        Ok(GuestOsMeasure {
+            version: GUEST_OS_MEASURE_VERSION,
+            kind: GuestOsMeasureKind::LinuxSerialPath,
+            measure,
+            honesty: "Synthetic serial-printing stub only — does NOT claim Linux boot, userspace, or Milestone 2 exit.",
+            gaps: vec![
+                "No bzImage / vmlinux fixture vendored or loaded",
+                "No Linux boot protocol (real-mode setup, protected-mode jump)",
+                "No earlyprintk / 8250 console driver path through a real kernel",
+                "Missing SeaBIOS INT 13h guest path for disked bootloaders",
+                "Protected-mode / paging / CPUID gaps may still block real kernels",
+            ],
+        })
+    }
+}
+
+/// Compact non-blank VGA text rows (`row:text`), empty when the buffer is blank.
+fn vga_text_summary(machine: &Machine) -> String {
+    let mut parts = Vec::new();
+    for row in 0..25usize {
+        let mut line = String::new();
+        let mut blank = true;
+        for col in 0..80usize {
+            let ch = machine.vga.char_at(row, col).unwrap_or(b' ');
+            if ch != b' ' && ch != 0 {
+                blank = false;
+            }
+            if (0x20..=0x7E).contains(&ch) {
+                line.push(ch as char);
+            } else {
+                line.push('.');
+            }
+        }
+        if !blank {
+            parts.push(format!("{row}:{}", line.trim_end()));
+        }
+        if parts.len() >= 3 {
+            break;
+        }
+    }
+    parts.join(" | ")
+}
+
+/// FreeDOS-*like* IDE image: MBR prints `FD` to COM1 + VGA 'F', then HLT;
+/// LBA1 holds an ASCII payload marker (not executed by this fixture).
+pub fn synthetic_freedos_like_disk() -> Vec<u8> {
+    let mut img = vec![0u8; 4 * crate::mbr::MBR_SECTOR_SIZE];
+    let mut mbr = vec![0x90u8; crate::mbr::MBR_SECTOR_SIZE];
+    // mov dx,0x3F8; mov al,'F'; out dx,al; mov al,'D'; out dx,al;
+    // mov ax,0xB800; mov es,ax; xor di,di; mov al,'F'; mov ah,0x07; stosw; hlt
+    let code: &[u8] = &[
+        0xBA, 0xF8, 0x03, // mov dx, 0x03F8
+        0xB0, b'F', // mov al, 'F'
+        0xEE, // out dx, al
+        0xB0, b'D', // mov al, 'D'
+        0xEE, // out dx, al
+        0xB8, 0x00, 0xB8, // mov ax, 0xB800
+        0x8E, 0xC0, // mov es, ax
+        0x31, 0xFF, // xor di, di
+        0xB0, b'F', // mov al, 'F'
+        0xB4, 0x07, // mov ah, 0x07
+        0xAB, // stosw
+        0xF4, // hlt
+    ];
+    mbr[..code.len()].copy_from_slice(code);
+    mbr[510] = crate::mbr::MBR_SIGNATURE_LO;
+    mbr[511] = crate::mbr::MBR_SIGNATURE_HI;
+    img[..crate::mbr::MBR_SECTOR_SIZE].copy_from_slice(&mbr);
+    let marker = b"FREEDOS-LIKE-PAYLOAD\0";
+    img[crate::mbr::MBR_SECTOR_SIZE..crate::mbr::MBR_SECTOR_SIZE + marker.len()]
+        .copy_from_slice(marker);
+    img
+}
+
+/// Linux serial-path stub: MBR prints `LX` to COM1 then HLT (no kernel).
+pub fn synthetic_linux_serial_stub_disk() -> Vec<u8> {
+    let mut img = vec![0u8; 2 * crate::mbr::MBR_SECTOR_SIZE];
+    let mut mbr = vec![0x90u8; crate::mbr::MBR_SECTOR_SIZE];
+    let code: &[u8] = &[
+        0xBA, 0xF8, 0x03, // mov dx, 0x03F8
+        0xB0, b'L', // mov al, 'L'
+        0xEE, // out dx, al
+        0xB0, b'X', // mov al, 'X'
+        0xEE, // out dx, al
+        0xF4, // hlt
+    ];
+    mbr[..code.len()].copy_from_slice(code);
+    mbr[510] = crate::mbr::MBR_SIGNATURE_LO;
+    mbr[511] = crate::mbr::MBR_SIGNATURE_HI;
+    img[..crate::mbr::MBR_SECTOR_SIZE].copy_from_slice(&mbr);
+    let marker = b"LINUX-SERIAL-STUB\0";
+    img[crate::mbr::MBR_SECTOR_SIZE..crate::mbr::MBR_SECTOR_SIZE + marker.len()]
+        .copy_from_slice(marker);
+    img
 }
 
 #[cfg(test)]
@@ -347,5 +553,49 @@ mod tests {
         assert!(measure
             .checkpoints
             .contains(&GuestBootCheckpoint::CsIpArmed));
+    }
+
+    /// FreeDOS-like harness: serial + VGA checkpoints; never claims a prompt.
+    #[test]
+    fn measure_freedos_like_serial_and_vga() {
+        let mut m = Machine::new(64 * 1024);
+        let report = m.measure_freedos_like(128).expect("freedos-like");
+        assert_eq!(report.version, GUEST_OS_MEASURE_VERSION);
+        assert_eq!(report.kind, GuestOsMeasureKind::FreeDosLike);
+        assert_eq!(report.measure.com1, "FD");
+        assert!(report.measure.serial_captured());
+        assert!(report.measure.vga_captured());
+        assert!(report
+            .measure
+            .checkpoints
+            .contains(&GuestBootCheckpoint::VgaObserved));
+        assert!(matches!(
+            report.measure.report.stop,
+            PostStopReason::Halted
+        ));
+        let text = report.to_string();
+        assert!(text.contains("NOT an OS boot"));
+        assert!(text.contains("does NOT claim a FreeDOS prompt"));
+        assert!(text.contains("freedos-like"));
+        assert!(report.gaps.iter().any(|g| g.contains("prompt")));
+        // Payload marker exists on disk but is not a boot claim.
+        assert!(m.ide.image[MBR_SECTOR_SIZE..].starts_with(b"FREEDOS-LIKE-PAYLOAD"));
+    }
+
+    /// Linux serial-path harness: COM1 banner + documented gaps; not M2 exit.
+    #[test]
+    fn measure_linux_serial_path_captures_com1_and_gaps() {
+        let mut m = Machine::new(64 * 1024);
+        let report = m.measure_linux_serial_path(64).expect("linux-serial");
+        assert_eq!(report.kind, GuestOsMeasureKind::LinuxSerialPath);
+        assert_eq!(report.measure.com1, "LX");
+        assert!(report.gaps.iter().any(|g| g.contains("bzImage")));
+        let text = report.to_string();
+        assert!(text.contains("NOT Milestone 2 exit"));
+        assert!(text.contains("linux-serial-path"));
+        assert!(matches!(
+            report.measure.report.stop,
+            PostStopReason::Halted
+        ));
     }
 }

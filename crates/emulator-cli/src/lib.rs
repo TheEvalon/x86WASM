@@ -2,8 +2,8 @@
 
 use devices::{VgaRenderMode, VGA_TEXT_COLS, VGA_TEXT_ROWS};
 use machine_pc::{
-    build_hello_rom, GuestBootMeasure, GuestBootMedia, Machine, MachineError, PostReport,
-    PostSpinConfig, PostTraceConfig, TracedPostReport, DEFAULT_POST_SPIN_WINDOW,
+    build_hello_rom, GuestBootMeasure, GuestBootMedia, GuestOsMeasure, Machine, MachineError,
+    PostReport, PostSpinConfig, PostTraceConfig, TracedPostReport, DEFAULT_POST_SPIN_WINDOW,
     DEFAULT_POST_TRACE_CAPACITY, EXPECTED_HELLO,
 };
 use std::fs;
@@ -67,6 +67,14 @@ pub struct Options {
     pub guest_floppy_first: bool,
     /// When [`Options::guest_measure`] is set, use El Torito no-emul handoff.
     pub guest_eltorito: bool,
+    /// FreeDOS-*like* measure harness (synthetic fixture if no `--ide-image`).
+    ///
+    /// Does **not** claim a FreeDOS prompt.
+    pub guest_freedos_measure: bool,
+    /// Linux serial-path measure harness (synthetic stub if no `--ide-image`).
+    ///
+    /// Does **not** claim Linux boot or Milestone 2 exit.
+    pub guest_linux_serial_measure: bool,
 }
 
 impl Default for Options {
@@ -88,6 +96,8 @@ impl Default for Options {
             guest_measure: false,
             guest_floppy_first: false,
             guest_eltorito: false,
+            guest_freedos_measure: false,
+            guest_linux_serial_measure: false,
         }
     }
 }
@@ -325,6 +335,7 @@ pub fn usage() -> String {
          \x20                  [--ide-image path.bin] [--floppy-image path.img]\n\
          \x20                  [--cdrom-image path.iso]\n\
          \x20                  [--guest-measure [--guest-floppy-first|--guest-eltorito]]\n\
+         \x20                  [--guest-freedos-measure] [--guest-linux-serial-measure]\n\
          \x20                  [--vga-text] [--vga-frame]\n\
          --rom              Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
          --bios             Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
@@ -351,6 +362,12 @@ pub fn usage() -> String {
          --guest-floppy-first  With --guest-measure, force floppy CHS (0,0,1) handoff.\n\
          --guest-eltorito   With --guest-measure, force El Torito no-emul handoff\n\
          \x20                  (requires --cdrom-image).\n\
+         --guest-freedos-measure  Measure FreeDOS-*like* synthetic MBR+payload (or\n\
+         \x20                  --ide-image). Reports serial/VGA/checkpoints; does NOT\n\
+         \x20                  claim a FreeDOS prompt.\n\
+         --guest-linux-serial-measure  Measure Linux serial-path stub (or --ide-image).\n\
+         \x20                  Captures COM1; documents gaps; does NOT claim Linux boot\n\
+         \x20                  or Milestone 2 exit.\n\
          --vga-text         Dump the {VGA_TEXT_COLS}x{VGA_TEXT_ROWS} VGA text buffer after the run.\n\
          --vga-frame        Render the display through the VGA display fetch and report the\n\
          \x20                  frame geometry, RGBA size, and whether a font is installed.\n\
@@ -456,6 +473,8 @@ where
             "--guest-measure" => opts.guest_measure = true,
             "--guest-floppy-first" => opts.guest_floppy_first = true,
             "--guest-eltorito" => opts.guest_eltorito = true,
+            "--guest-freedos-measure" => opts.guest_freedos_measure = true,
+            "--guest-linux-serial-measure" => opts.guest_linux_serial_measure = true,
             "--steps" => {
                 let v = iter.next().ok_or(CliError::MissingValue("--steps"))?;
                 opts.max_steps = v
@@ -565,6 +584,26 @@ pub fn run_guest_measure(
     machine
         .measure_guest_boot(media, max_steps)
         .map_err(|e| CliError::Machine(format!("Guest measure setup failed: {e}")))
+}
+
+/// FreeDOS-*like* measure (synthetic fixture when IDE empty). Not a prompt claim.
+pub fn run_freedos_measure(
+    machine: &mut Machine,
+    max_steps: u64,
+) -> Result<GuestOsMeasure, CliError> {
+    machine
+        .measure_freedos_like(max_steps)
+        .map_err(|e| CliError::Machine(format!("FreeDOS-like measure setup failed: {e}")))
+}
+
+/// Linux serial-path measure (synthetic stub when IDE empty). Not M2 exit.
+pub fn run_linux_serial_measure(
+    machine: &mut Machine,
+    max_steps: u64,
+) -> Result<GuestOsMeasure, CliError> {
+    machine
+        .measure_linux_serial_path(max_steps)
+        .map_err(|e| CliError::Machine(format!("Linux serial measure setup failed: {e}")))
 }
 
 /// Render the 80×25 VGA text buffer as lines of text.
@@ -1436,6 +1475,8 @@ mod tests {
         assert!(u.contains("--floppy-image"), "{u}");
         assert!(u.contains("--cdrom-image"), "{u}");
         assert!(u.contains("--guest-eltorito"), "{u}");
+        assert!(u.contains("--guest-freedos-measure"), "{u}");
+        assert!(u.contains("--guest-linux-serial-measure"), "{u}");
     }
 
     #[test]
@@ -1543,5 +1584,61 @@ mod tests {
         assert!(text.contains("not a boot-success claim"));
         assert!(text.contains("halted"), "{text}");
         assert!(text.contains("checkpoints=["), "{text}");
+    }
+
+    #[test]
+    fn parse_guest_freedos_measure() {
+        let parsed = parse_args(["--guest-freedos-measure", "--steps", "32"]).unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(Options {
+                guest_freedos_measure: true,
+                max_steps: 32,
+                ..Options::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_guest_linux_serial_measure() {
+        let parsed = parse_args(["--guest-linux-serial-measure"]).unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(Options {
+                guest_linux_serial_measure: true,
+                ..Options::default()
+            })
+        );
+    }
+
+    #[test]
+    fn freedos_measure_synthetic_reports_honesty() {
+        let opts = Options {
+            guest_freedos_measure: true,
+            max_steps: 128,
+            ..Options::default()
+        };
+        let BuiltMachine { mut machine, .. } = build_machine(&opts).expect("build");
+        let report = run_freedos_measure(&mut machine, opts.max_steps).expect("run");
+        let text = report.to_string();
+        assert!(text.contains("freedos-like"));
+        assert!(text.contains("NOT an OS boot"));
+        assert!(text.contains("does NOT claim a FreeDOS prompt"));
+        assert_eq!(report.measure.com1, "FD");
+    }
+
+    #[test]
+    fn linux_serial_measure_synthetic_reports_gaps() {
+        let opts = Options {
+            guest_linux_serial_measure: true,
+            max_steps: 64,
+            ..Options::default()
+        };
+        let BuiltMachine { mut machine, .. } = build_machine(&opts).expect("build");
+        let report = run_linux_serial_measure(&mut machine, opts.max_steps).expect("run");
+        let text = report.to_string();
+        assert!(text.contains("linux-serial-path"));
+        assert!(text.contains("NOT Milestone 2 exit"));
+        assert_eq!(report.measure.com1, "LX");
     }
 }
