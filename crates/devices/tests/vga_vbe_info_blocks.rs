@@ -25,15 +25,32 @@ fn vbe_info_block_reports_vbe2_and_only_renderable_modes() {
     assert_eq!(&block[0..4], b"VBE2");
     assert_eq!(u16::from_le_bytes([block[4], block[5]]), 0x0200);
     assert_eq!(
-        &block[10..14],
-        &[0, 0, 0, 0],
+        u32::from_le_bytes(block[10..14].try_into().unwrap()),
+        devices::VBE_CAPABILITIES_NONE,
         "Capabilities must stay truthful"
     );
+    assert_eq!(v.vbe_capabilities(), devices::VBE_CAPABILITIES_NONE);
     assert_eq!(u16::from_le_bytes([block[18], block[19]]), 4);
+    // Host embedding: VideoModePtr offset + segment 0.
+    assert_eq!(
+        u16::from_le_bytes([block[14], block[15]]),
+        devices::VBE_VIDEO_MODE_LIST_HOST_OFFSET
+    );
+    assert_eq!(u16::from_le_bytes([block[16], block[17]]), 0);
+    assert_eq!(
+        u16::from_le_bytes([block[6], block[7]]),
+        devices::VBE_OEM_STRING_HOST_OFFSET
+    );
+    assert_eq!(u16::from_le_bytes([block[8], block[9]]), 0);
+    let oem = usize::from(devices::VBE_OEM_STRING_HOST_OFFSET);
+    assert_eq!(
+        &block[oem..oem + devices::VBE_OEM_STRING.len()],
+        devices::VBE_OEM_STRING
+    );
 
     // Mode list is embedded after the fixed header region used by this model.
     let mut modes = Vec::new();
-    let mut i = 34;
+    let mut i = usize::from(devices::VBE_VIDEO_MODE_LIST_HOST_OFFSET);
     while i + 1 < block.len() {
         let mode = u16::from_le_bytes([block[i], block[i + 1]]);
         if mode == 0xFFFF {
@@ -43,6 +60,31 @@ fn vbe_info_block_reports_vbe2_and_only_renderable_modes() {
         i += 2;
     }
     assert_eq!(modes, SUPPORTED_MODES.to_vec());
+}
+
+/// Spec: VBE 2.0 Function 00h far pointers — guest delivery rewrites segment
+/// fields to the caller's ES without claiming an LFB.
+#[test]
+fn vbe_info_block_for_guest_rewrites_far_pointers() {
+    let v = VgaText::new();
+    let es = 0xA000;
+    let di = 0x0100;
+    let block = v.vbe_info_block_bytes_for_guest(es, di);
+    assert_eq!(
+        u16::from_le_bytes([block[14], block[15]]),
+        di + devices::VBE_VIDEO_MODE_LIST_HOST_OFFSET
+    );
+    assert_eq!(u16::from_le_bytes([block[16], block[17]]), es);
+    assert_eq!(
+        u16::from_le_bytes([block[6], block[7]]),
+        di + devices::VBE_OEM_STRING_HOST_OFFSET
+    );
+    assert_eq!(u16::from_le_bytes([block[8], block[9]]), es);
+    assert_eq!(
+        u32::from_le_bytes(block[10..14].try_into().unwrap()),
+        devices::VBE_CAPABILITIES_NONE
+    );
+    assert!(!v.guest_lfb_available());
 }
 
 /// Spec: VBE 2.0 ModeAttributes — D7 clear (no LFB), D6 clear (windowing

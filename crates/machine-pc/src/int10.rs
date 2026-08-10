@@ -1,21 +1,23 @@
-//! Host INT 10h video stub (AH=00h/01h/02h/03h/09h/0Ah/0Eh/0Fh).
+//! Host INT 10h video stub (AH=00h/01h/02h/03h/09h/0Ah/0Eh/0Fh + AX=4F00h).
 //!
 //! Bring-up path only: installs a real-mode IVT pointer and services selected
-//! functions via [`Machine::service_int10`]. Not a VGA BIOS and not VBE
-//! AX=4Fxxh.
+//! functions via [`Machine::service_int10`]. Not a VGA BIOS and not a full VBE
+//! implementation — only host AX=4F00h controller-info delivery from the
+//! truthful device helpers.
 //!
 //! Spec: Ralf Brown's Interrupt List — INT 10h AH=00h "SET VIDEO MODE",
 //! AH=01h "SET CURSOR TYPE", AH=02h "SET CURSOR POSITION", AH=03h "GET CURSOR
 //! POSITION AND SIZE", AH=09h "WRITE CHARACTER AND ATTRIBUTE AT CURSOR
 //! POSITION", AH=0Ah "WRITE CHARACTER ONLY AT CURSOR POSITION", AH=0Eh
-//! "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE"; IBM PC BIOS Data Area
+//! "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE", AX=4F00h "VBE Return
+//! VBE Controller Information"; VESA VBE 2.0 Function 00h; IBM PC BIOS Data Area
 //! video fields at `0040:0049` / `0040:004A` / `0040:004C` / `0040:004E` /
 //! `0040:0050`–`005F` / `0040:0060` / `0040:0062` / `0040:0063` / `0040:0084`.
 
 use crate::{Machine, MachineError};
 use devices::{
-    PortDevice, VgaRenderMode, VGA_CRTC_CURSOR_END, VGA_CRTC_CURSOR_START, VGA_CRTC_DATA,
-    VGA_CRTC_INDEX, VGA_DEFAULT_ATTR, VGA_TEXT_COLS, VGA_TEXT_ROWS,
+    PortDevice, VgaRenderMode, VBE_INFO_BLOCK_BYTES, VGA_CRTC_CURSOR_END, VGA_CRTC_CURSOR_START,
+    VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DEFAULT_ATTR, VGA_TEXT_COLS, VGA_TEXT_ROWS,
 };
 use x86_core::CpuState;
 
@@ -38,6 +40,17 @@ pub const INT10_AH_WRITE_CHAR: u8 = 0x0A;
 pub const INT10_AH_TELETYPE: u8 = 0x0E;
 /// AH=0Fh — GET CURRENT VIDEO MODE. Spec: RBIL INT 10h AH=0Fh.
 pub const INT10_AH_GET_MODE: u8 = 0x0F;
+/// AH=4Fh — VESA VBE. Spec: VBE 2.0 / RBIL INT 10h AX=4Fxxh.
+pub const INT10_AH_VBE: u8 = 0x4F;
+/// AL=00h — VBE Return Controller Information. Spec: VBE 2.0 Function 00h.
+pub const INT10_AL_VBE_CONTROLLER_INFO: u8 = 0x00;
+
+/// VBE success return in AL. Spec: VBE 2.0 — AL=`4Fh` means supported.
+pub const INT10_VBE_AL_SUPPORTED: u8 = 0x4F;
+/// VBE success return in AH. Spec: VBE 2.0 — AH=`00h` means successful.
+pub const INT10_VBE_AH_SUCCESS: u8 = 0x00;
+/// VBE failure: function call failed / unsupported. Spec: VBE 2.0 AH=`01h`.
+pub const INT10_VBE_AH_FAILED: u8 = 0x01;
 
 /// BIOS mode 03h — 80×25 color text. Spec: IBM VGA / RBIL.
 pub const INT10_MODE_03H_TEXT: u8 = 0x03;
@@ -97,6 +110,8 @@ impl Machine {
     /// - AH=0Ah — write character only at cursor (page 0 text; no advance)
     /// - AH=0Eh — teletype output in text mode (CR/LF/BS + printable)
     /// - AH=0Fh — get current video mode / columns / page from BDA
+    /// - AX=4F00h — VBE Return Controller Information into ES:DI (host copy;
+    ///   no LFB claim; other 4Fxx unsupported)
     ///
     /// Unsupported AH values leave CPU/VGA unchanged. Spec: RBIL INT 10h subset.
     pub fn service_int10(&mut self) {
@@ -109,6 +124,7 @@ impl Machine {
             INT10_AH_WRITE_CHAR => self.int10_write_char(false),
             INT10_AH_TELETYPE => self.int10_teletype(self.cpu.al()),
             INT10_AH_GET_MODE => self.int10_get_mode(),
+            INT10_AH_VBE => self.int10_vbe(),
             _ => {}
         }
     }
@@ -293,6 +309,43 @@ impl Machine {
             }
         }
         // Spec: RBIL AH=09h/0Ah — do not advance the stored cursor.
+    }
+
+    /// AH=4Fh VBE dispatcher. Spec: VBE 2.0 / RBIL AX=4Fxxh.
+    ///
+    /// Only AL=00h (controller info) is implemented. Other AL values return
+    /// AX=`014Fh` (supported function group, failed/unsupported subfunction)
+    /// without touching guest memory.
+    fn int10_vbe(&mut self) {
+        match self.cpu.al() {
+            INT10_AL_VBE_CONTROLLER_INFO => self.int10_vbe_controller_info(),
+            _ => {
+                self.cpu
+                    .set_ax(u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
+            }
+        }
+    }
+
+    /// AX=4F00h Return VBE Controller Information. Spec: VBE 2.0 Function 00h.
+    ///
+    /// Copies [`devices::VgaText::vbe_info_block_bytes_for_guest`] into real-mode
+    /// `ES:DI`. Capabilities stay clear; no LFB is advertised. VideoModePtr /
+    /// OemStringPtr are rewritten to far pointers inside the guest buffer.
+    fn int10_vbe_controller_info(&mut self) {
+        let es = self.cpu.es.selector;
+        let di = self.cpu.gpr_u16(CpuState::RDI);
+        let block = self.vga.vbe_info_block_bytes_for_guest(es, di);
+        let dest = self.cpu.es.base.wrapping_add(u64::from(di));
+        for (i, byte) in block.iter().enumerate() {
+            if self.mem.write_u8(dest.wrapping_add(i as u64), *byte).is_err() {
+                self.cpu
+                    .set_ax(u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
+                return;
+            }
+        }
+        debug_assert_eq!(block.len(), VBE_INFO_BLOCK_BYTES);
+        self.cpu
+            .set_ax(u16::from(INT10_VBE_AH_SUCCESS) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
     }
 
     fn int10_teletype(&mut self, ch: u8) {
@@ -492,6 +545,14 @@ pub fn setup_int10_write_char(cpu: &mut CpuState, ch: u8, page: u8, count: u16) 
     cpu.set_al(ch);
     cpu.set_gpr_u8(4 + CpuState::RBX, page); // BH
     cpu.set_gpr_u16(CpuState::RCX, count);
+}
+
+/// Load AX=4F00h VBE Return Controller Information with ES:DI buffer.
+pub fn setup_int10_vbe_controller_info(cpu: &mut CpuState, es: u16, di: u16) {
+    cpu.set_ah(INT10_AH_VBE);
+    cpu.set_al(INT10_AL_VBE_CONTROLLER_INFO);
+    cpu.es = x86_core::SegmentReg::real_mode(es);
+    cpu.set_gpr_u16(CpuState::RDI, di);
 }
 
 #[cfg(test)]
@@ -860,6 +921,58 @@ mod tests {
         setup_int10_write_char_attr(&mut m.cpu, b'X', 1, 0x07, 1);
         m.service_int10();
         assert_eq!(m.vga.char_at(0, 78), Some(b'W'));
+    }
+
+    #[test]
+    fn int10_ax4f00_writes_vbe_info_with_guest_far_ptrs() {
+        // Spec: VBE 2.0 Function 00h / RBIL AX=4F00h — ES:DI gets VbeInfoBlock.
+        use devices::{
+            VBE_CAPABILITIES_NONE, VBE_OEM_STRING, VBE_OEM_STRING_HOST_OFFSET,
+            VBE_PHYS_BASE_PTR_NONE, VBE_VIDEO_MODE_LIST_HOST_OFFSET,
+        };
+
+        let mut m = Machine::new(1024 * 1024);
+        let es = 0x1000u16;
+        let di = 0x0100u16;
+        setup_int10_vbe_controller_info(&mut m.cpu, es, di);
+        m.service_int10();
+
+        assert_eq!(m.cpu.ax(), 0x004F);
+        let base = (u64::from(es) << 4).wrapping_add(u64::from(di));
+        let mut block = [0u8; VBE_INFO_BLOCK_BYTES];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = m.mem.read_u8(base + i as u64).unwrap();
+        }
+        assert_eq!(&block[0..4], b"VBE2");
+        assert_eq!(
+            u32::from_le_bytes(block[10..14].try_into().unwrap()),
+            VBE_CAPABILITIES_NONE
+        );
+        // VideoModePtr / OemStringPtr rewritten to ES:(DI+host_offset).
+        assert_eq!(
+            u16::from_le_bytes([block[14], block[15]]),
+            di.wrapping_add(VBE_VIDEO_MODE_LIST_HOST_OFFSET)
+        );
+        assert_eq!(u16::from_le_bytes([block[16], block[17]]), es);
+        assert_eq!(
+            u16::from_le_bytes([block[6], block[7]]),
+            di.wrapping_add(VBE_OEM_STRING_HOST_OFFSET)
+        );
+        assert_eq!(u16::from_le_bytes([block[8], block[9]]), es);
+        let oem_at = usize::from(VBE_OEM_STRING_HOST_OFFSET);
+        assert_eq!(&block[oem_at..oem_at + VBE_OEM_STRING.len()], VBE_OEM_STRING);
+        // Honesty: still no LFB in mode info helpers.
+        assert!(!m.vga.guest_lfb_available());
+        assert_eq!(m.vga.vbe_phys_base_ptr(), VBE_PHYS_BASE_PTR_NONE);
+    }
+
+    #[test]
+    fn int10_ax4fxx_unsupported_subfunction_fails_honestly() {
+        let mut m = Machine::new(1024 * 1024);
+        m.cpu.set_ah(INT10_AH_VBE);
+        m.cpu.set_al(0x01); // Return Mode Information — not in this slice
+        m.service_int10();
+        assert_eq!(m.cpu.ax(), 0x014F);
     }
 
     #[test]

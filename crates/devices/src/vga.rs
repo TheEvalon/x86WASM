@@ -1420,6 +1420,34 @@ pub const VBE_MODE_ATTR_LFB: u16 = 1 << 7;
 /// call sites stay explicit (`docs/vga-r9-physbaseptr-honesty.md`).
 pub const VBE_PHYS_BASE_PTR_NONE: u32 = 0;
 
+/// VBE 2.0 `Capabilities` when no optional controller features are claimed.
+///
+/// Spec: VBE 2.0 Function 00h Capabilities — bit0 (8-bit DAC), bit1 (non-VGA),
+/// bit2 (programmable blanking) all clear. This model is a 6-bit DAC,
+/// VGA-compatible controller without programmable RAMDAC blanking.
+/// See `docs/vga-r12-vbe-4f00-info.md`.
+pub const VBE_CAPABILITIES_NONE: u32 = 0;
+
+/// Host-embedded offset of the VideoModePtr mode list inside
+/// [`VgaText::vbe_info_block_bytes`].
+///
+/// Spec: VBE 2.0 `VideoModePtr` is a far pointer; the host helper stores the
+/// list at this offset with segment field `0` (not a guest IVT/BIOS pointer).
+/// [`VgaText::vbe_info_block_bytes_for_guest`] rewrites the far pointer to the
+/// caller's `ES:DI` buffer. See `docs/vga-r12-vbe-4f00-info.md`.
+pub const VBE_VIDEO_MODE_LIST_HOST_OFFSET: u16 = 34;
+
+/// Host-embedded offset of the OEM string inside [`VgaText::vbe_info_block_bytes`].
+///
+/// Placed immediately after the `FFFFh`-terminated mode list that starts at
+/// [`VBE_VIDEO_MODE_LIST_HOST_OFFSET`] (6 modes × 2 + 2 = 14 bytes → offset 48).
+pub const VBE_OEM_STRING_HOST_OFFSET: u16 = 48;
+
+/// Honest OEM identity string for the host VBE info block (NUL-terminated).
+///
+/// Not a vendor marketing claim and not SeaVGABIOS — host bring-up only.
+pub const VBE_OEM_STRING: &[u8] = b"x86WASM host VGA\0";
+
 /// WinAAttributes: window exists, readable, writable. Spec: VBE 2.0.
 const VBE_WIN_A_ATTRS: u8 = 0x07;
 
@@ -3152,31 +3180,79 @@ impl VgaText {
     /// Host-side VBE 2.0 `VbeInfoBlock` for the modes this device can render.
     ///
     /// Spec: VESA VBE 2.0 Function 00h. The block uses the `VBE2` signature and
-    /// is 512 bytes. Capabilities are all clear (6-bit DAC, VGA-compatible
-    /// controller, no programmable RAMDAC blanking). `TotalMemory` is 4 —
-    /// 256 KiB of plane memory in 64 KiB units.
+    /// is 512 bytes. Capabilities are [`VBE_CAPABILITIES_NONE`] (6-bit DAC,
+    /// VGA-compatible controller, no programmable RAMDAC blanking).
+    /// `TotalMemory` is 4 — 256 KiB of plane memory in 64 KiB units.
     ///
-    /// **Model choice:** the VideoModePtr far pointer's offset field points at
-    /// byte 34 of this same buffer (segment 0). That is a host-side embedding,
-    /// not a guest real-mode pointer — there is still no INT 10h hook.
+    /// **Model choice (VideoModePtr / OemStringPtr honesty):** the far-pointer
+    /// *offset* fields point at [`VBE_VIDEO_MODE_LIST_HOST_OFFSET`] and
+    /// [`VBE_OEM_STRING_HOST_OFFSET`] inside this same buffer; *segment* fields
+    /// stay zero. That is a host-side embedding, not a guest real-mode BIOS
+    /// pointer. Use [`Self::vbe_info_block_bytes_for_guest`] when delivering the
+    /// block through host INT 10h AX=4F00h into `ES:DI`.
     ///
-    /// See `docs/vga-r5-vbe-info-blocks.md`.
+    /// See `docs/vga-r5-vbe-info-blocks.md`, `docs/vga-r12-vbe-4f00-info.md`.
     pub fn vbe_info_block_bytes(&self) -> [u8; VBE_INFO_BLOCK_BYTES] {
         let _ = self;
         let mut block = [0u8; VBE_INFO_BLOCK_BYTES];
         block[0..4].copy_from_slice(b"VBE2");
         vbe_put_u16(&mut block, 4, 0x0200);
-        // OemStringPtr / VideoModePtr / OEM name pointers: offset-only host
-        // embedding; segment fields stay zero.
-        vbe_put_u16(&mut block, 14, 34); // VideoModePtr offset → mode list
+        // OemStringPtr: host-embedded offset; segment 0.
+        vbe_put_u16(&mut block, 6, VBE_OEM_STRING_HOST_OFFSET);
+        vbe_put_u32(&mut block, 10, VBE_CAPABILITIES_NONE);
+        // VideoModePtr: host-embedded offset; segment 0.
+        vbe_put_u16(&mut block, 14, VBE_VIDEO_MODE_LIST_HOST_OFFSET);
         vbe_put_u16(&mut block, 18, 4); // TotalMemory: 256 KiB / 64 KiB
         vbe_put_u16(&mut block, 20, 0x0001); // OemSoftwareRev
-        let mut off = 34;
+        // OemVendorNamePtr / OemProductNamePtr / OemProductRevPtr stay zero —
+        // no additional vendor marketing strings beyond VBE_OEM_STRING.
+        let mut off = usize::from(VBE_VIDEO_MODE_LIST_HOST_OFFSET);
         for mode in VBE_SUPPORTED_MODES {
             vbe_put_u16(&mut block, off, mode);
             off += 2;
         }
         vbe_put_u16(&mut block, off, 0xFFFF);
+        let oem_off = usize::from(VBE_OEM_STRING_HOST_OFFSET);
+        debug_assert_eq!(off + 2, oem_off);
+        let oem_end = oem_off + VBE_OEM_STRING.len();
+        debug_assert!(oem_end <= VBE_INFO_BLOCK_BYTES);
+        block[oem_off..oem_end].copy_from_slice(VBE_OEM_STRING);
+        block
+    }
+
+    /// Truthful VBE 2.0 Capabilities dword for this controller model.
+    ///
+    /// Always [`VBE_CAPABILITIES_NONE`] — never advertise 8-bit DAC, non-VGA, or
+    /// programmable blanking. Spec: VBE 2.0 Function 00h Capabilities.
+    pub fn vbe_capabilities(&self) -> u32 {
+        let _ = self;
+        VBE_CAPABILITIES_NONE
+    }
+
+    /// `VbeInfoBlock` with OemStringPtr / VideoModePtr rewritten for a guest
+    /// buffer at real-mode `ES:DI`.
+    ///
+    /// Spec: VBE 2.0 Function 00h far pointers. Used by the host INT 10h
+    /// AX=4F00h stub. Does **not** invent an LFB or change Capabilities /
+    /// ModeAttributes / PhysBasePtr honesty.
+    pub fn vbe_info_block_bytes_for_guest(
+        &self,
+        es: u16,
+        di: u16,
+    ) -> [u8; VBE_INFO_BLOCK_BYTES] {
+        let mut block = self.vbe_info_block_bytes();
+        vbe_put_u16(
+            &mut block,
+            6,
+            di.wrapping_add(VBE_OEM_STRING_HOST_OFFSET),
+        );
+        vbe_put_u16(&mut block, 8, es);
+        vbe_put_u16(
+            &mut block,
+            14,
+            di.wrapping_add(VBE_VIDEO_MODE_LIST_HOST_OFFSET),
+        );
+        vbe_put_u16(&mut block, 16, es);
         block
     }
 
