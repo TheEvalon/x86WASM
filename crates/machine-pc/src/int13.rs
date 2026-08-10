@@ -1,4 +1,4 @@
-//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h)
+//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h/48h)
 //! and floppy subset (AH=00/02/03, `DL=00h`).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
@@ -10,10 +10,10 @@
 //! Spec: IBM PC BIOS INT 13h Disk Services (AH=00h reset, AH=02h read sectors,
 //! AH=03h write sectors, AH=08h get drive parameters); IBM/Microsoft INT 13h
 //! Extensions / RBIL (AH=41h check extensions, AH=42h extended read, AH=43h
-//! extended write). ATA IDENTIFY obsolete geometry 16 heads / 63
-//! sectors-per-track (matches `IdePrimary` IDENTIFY words 3/6). Floppy uses
-//! fixed 1.44MB geometry (80/2/18) via `Fdc82077::read_sector` /
-//! `Fdc82077::write_sector`.
+//! extended write, AH=48h extended drive parameters). ATA IDENTIFY obsolete
+//! geometry 16 heads / 63 sectors-per-track (matches `IdePrimary` IDENTIFY
+//! words 3/6). Floppy uses fixed 1.44MB geometry (80/2/18) via
+//! `Fdc82077::read_sector` / `Fdc82077::write_sector`.
 
 use crate::{Machine, MachineError};
 use devices::{FDC_1440_CYLINDERS, FDC_1440_HEADS, FDC_1440_SECTORS_PER_TRACK, FDC_SECTOR_SIZE};
@@ -38,6 +38,8 @@ pub const INT13_AH_CHECK_EXTENSIONS: u8 = 0x41;
 pub const INT13_AH_EXT_READ: u8 = 0x42;
 /// AH=43h — extended write sectors (Disk Address Packet).
 pub const INT13_AH_EXT_WRITE: u8 = 0x43;
+/// AH=48h — extended get drive parameters.
+pub const INT13_AH_EXT_GET_PARAMS: u8 = 0x48;
 
 /// Magic `BX` input for AH=41h.
 pub const INT13_EXT_MAGIC_IN: u16 = 0x55AA;
@@ -47,8 +49,16 @@ pub const INT13_EXT_MAGIC_OUT: u16 = 0xAA55;
 pub const INT13_EXT_VERSION: u8 = 0x01;
 /// `CX` bit 0 — packet-structure device access supported (AH=42h/43h here).
 pub const INT13_EXT_CX_PACKET: u16 = 0x0001;
+/// `CX` bit 2 — Enhanced Disk Drive support (AH=48h subset here).
+pub const INT13_EXT_CX_EDD: u16 = 0x0004;
+/// Subset advertised by AH=41h: packet access + EDD params (not locking).
+pub const INT13_EXT_CX_SUPPORTED: u16 = INT13_EXT_CX_PACKET | INT13_EXT_CX_EDD;
 /// Minimum Disk Address Packet size (16 bytes).
 pub const INT13_DAP_SIZE_MIN: u8 = 0x10;
+/// Minimum AH=48h result buffer size (Phoenix EDD v1.x / RBIL).
+pub const INT13_EDD_PARAMS_SIZE_MIN: u16 = 0x1A;
+/// Information flags: geometry fields are valid.
+pub const INT13_EDD_INFO_GEOMETRY_VALID: u16 = 0x0002;
 
 /// Success status in `AH` with `CF` clear.
 pub const INT13_STATUS_OK: u8 = 0x00;
@@ -92,6 +102,7 @@ impl Machine {
             INT13_AH_CHECK_EXTENSIONS => self.int13_hd_check_extensions(),
             INT13_AH_EXT_READ => self.int13_hd_ext_read_from_regs(),
             INT13_AH_EXT_WRITE => self.int13_hd_ext_write_from_regs(),
+            INT13_AH_EXT_GET_PARAMS => self.int13_hd_ext_get_params(),
             _ => self.int13_fail(INT13_STATUS_INVALID),
         }
     }
@@ -317,20 +328,16 @@ impl Machine {
             self.int13_fail(INT13_STATUS_TIMEOUT);
             return;
         }
-        let total = (self.ide.image.len() / INT13_SECTOR_SIZE) as u64;
-        // Maximum cylinder addressable with this fixed geometry (0-based).
-        let max_cyl = if total == 0 {
-            0u16
-        } else {
-            let spc = u64::from(INT13_HD_HEADS) * u64::from(INT13_HD_SPT);
-            ((total.saturating_sub(1)) / spc).min(u64::from(u16::MAX)) as u16
-        };
         // AH=08h: CX = max cylinder/sector packed; DH = max head; DL = drive count.
+        // AL unused (cleared); BL = 00h for hard disks (floppy type N/A).
+        let (max_cyl, heads, spt, _total) = self.int13_hd_geometry();
         self.cpu
-            .set_gpr_u16(CpuState::RCX, pack_cx(max_cyl, INT13_HD_SPT as u8));
+            .set_gpr_u16(CpuState::RCX, pack_cx(max_cyl, spt as u8));
         self.cpu
-            .set_gpr_u8(4 + CpuState::RDX, (INT13_HD_HEADS - 1) as u8);
+            .set_gpr_u8(4 + CpuState::RDX, heads.saturating_sub(1) as u8);
         self.cpu.set_gpr_u8_low(CpuState::RDX, 1); // one HD
+        self.cpu.set_al(0);
+        self.cpu.set_gpr_u8_low(CpuState::RBX, 0); // BL
         self.cpu.set_ah(INT13_STATUS_OK);
         self.cpu.set_cf(false);
     }
@@ -347,8 +354,9 @@ impl Machine {
         }
         self.cpu.set_ah(INT13_EXT_VERSION);
         self.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_OUT);
-        // Bit 0 only: packet access (AH=42h/43h). Removable lock / EDD are out.
-        self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_PACKET);
+        // Packet access (AH=42h/43h) + EDD params (AH=48h). Removable locking out.
+        self.cpu
+            .set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
         self.cpu.set_cf(false);
     }
 
@@ -383,6 +391,58 @@ impl Machine {
             },
             Err(status) => self.int13_fail(status),
         }
+    }
+
+    /// Spec: Phoenix EDD / IBM INT 13h Extensions AH=48h — result buffer at `DS:SI`.
+    fn int13_hd_ext_get_params(&mut self) {
+        if !self.ide.present || self.ide.image.is_empty() {
+            self.int13_fail(INT13_STATUS_TIMEOUT);
+            return;
+        }
+        let si = self.cpu.gpr_u16(CpuState::RSI);
+        let buf = self.cpu.ds.base.wrapping_add(u64::from(si));
+        let Ok(buf_size) = self.read_guest_u16(buf) else {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        };
+        if buf_size < INT13_EDD_PARAMS_SIZE_MIN {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        let (max_cyl, heads, spt, total) = self.int13_hd_geometry();
+        // Phoenix: DWORD cylinder/head/spt counts; cylinder count = max+1 when media exists.
+        let cyl_count = if total == 0 {
+            0u32
+        } else {
+            u32::from(max_cyl).saturating_add(1)
+        };
+        if self
+            .write_guest_u16(buf, INT13_EDD_PARAMS_SIZE_MIN)
+            .and_then(|_| self.write_guest_u16(buf + 2, INT13_EDD_INFO_GEOMETRY_VALID))
+            .and_then(|_| self.write_guest_u32(buf + 4, cyl_count))
+            .and_then(|_| self.write_guest_u32(buf + 8, u32::from(heads)))
+            .and_then(|_| self.write_guest_u32(buf + 12, u32::from(spt)))
+            .and_then(|_| self.write_guest_u64(buf + 16, total))
+            .and_then(|_| self.write_guest_u16(buf + 24, INT13_SECTOR_SIZE as u16))
+            .is_err()
+        {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        self.cpu.set_ah(INT13_STATUS_OK);
+        self.cpu.set_cf(false);
+    }
+
+    /// Fixed 16/63 geometry derived from the attached IDE image size.
+    fn int13_hd_geometry(&self) -> (u16, u16, u16, u64) {
+        let total = (self.ide.image.len() / INT13_SECTOR_SIZE) as u64;
+        let max_cyl = if total == 0 {
+            0u16
+        } else {
+            let spc = u64::from(INT13_HD_HEADS) * u64::from(INT13_HD_SPT);
+            ((total.saturating_sub(1)) / spc).min(u64::from(u16::MAX)) as u16
+        };
+        (max_cyl, INT13_HD_HEADS, INT13_HD_SPT, total)
     }
 
     fn int13_parse_dap(&self, dap_phys: u64) -> Result<DiskAddressPacket, u8> {
@@ -425,6 +485,34 @@ impl Machine {
             v |= u64::from(b) << (i * 8);
         }
         Ok(v)
+    }
+
+    fn write_guest_u16(&mut self, phys: u64, value: u16) -> Result<(), u8> {
+        self.mem
+            .write_u8(phys, (value & 0xFF) as u8)
+            .map_err(|_| INT13_STATUS_INVALID)?;
+        self.mem
+            .write_u8(phys + 1, (value >> 8) as u8)
+            .map_err(|_| INT13_STATUS_INVALID)?;
+        Ok(())
+    }
+
+    fn write_guest_u32(&mut self, phys: u64, value: u32) -> Result<(), u8> {
+        for (i, b) in value.to_le_bytes().iter().enumerate() {
+            self.mem
+                .write_u8(phys + i as u64, *b)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+        }
+        Ok(())
+    }
+
+    fn write_guest_u64(&mut self, phys: u64, value: u64) -> Result<(), u8> {
+        for (i, b) in value.to_le_bytes().iter().enumerate() {
+            self.mem
+                .write_u8(phys + i as u64, *b)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+        }
+        Ok(())
     }
 }
 
@@ -561,6 +649,25 @@ pub fn setup_int13_hd_ext_write(
     machine.cpu.set_al(0); // flags: no verify
     machine.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
     machine.cpu.set_gpr_u16(CpuState::RSI, dap_phys as u16);
+    machine.cpu.ds = x86_core::SegmentReg::real_mode(0);
+}
+
+/// Set up AH=48h with a result buffer of `buf_size` bytes at physical `buf_phys`.
+pub fn setup_int13_hd_ext_get_params(machine: &mut Machine, buf_phys: u64, buf_size: u16) {
+    machine
+        .mem
+        .write_u8(buf_phys, (buf_size & 0xFF) as u8)
+        .unwrap();
+    machine
+        .mem
+        .write_u8(buf_phys + 1, (buf_size >> 8) as u8)
+        .unwrap();
+    for i in 2..usize::from(buf_size.max(INT13_EDD_PARAMS_SIZE_MIN)) {
+        machine.mem.write_u8(buf_phys + i as u64, 0).unwrap();
+    }
+    machine.cpu.set_ah(INT13_AH_EXT_GET_PARAMS);
+    machine.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+    machine.cpu.set_gpr_u16(CpuState::RSI, buf_phys as u16);
     machine.cpu.ds = x86_core::SegmentReg::real_mode(0);
 }
 
@@ -939,6 +1046,8 @@ mod tests {
         assert!(cyl >= 1);
         assert_eq!(m.cpu.gpr_u8(4 + CpuState::RDX), (INT13_HD_HEADS - 1) as u8);
         assert_eq!(m.cpu.gpr_u8_low(CpuState::RDX), 1);
+        assert_eq!(m.cpu.al(), 0);
+        assert_eq!(m.cpu.gpr_u8_low(CpuState::RBX), 0);
     }
 
     /// Spec: unsupported AH → invalid function.
@@ -1065,7 +1174,7 @@ mod tests {
         }
     }
 
-    /// Spec: IBM/MS INT 13h Extensions AH=41h — magic BX handshake + packet bit.
+    /// Spec: IBM/MS INT 13h Extensions AH=41h — magic BX handshake + packet/EDD bits.
     #[test]
     fn int13_ah41_reports_extensions() {
         let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
@@ -1076,9 +1185,14 @@ mod tests {
         assert!(!cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_EXT_VERSION);
         assert_eq!(m.cpu.gpr_u16(CpuState::RBX), INT13_EXT_MAGIC_OUT);
+        assert_eq!(m.cpu.gpr_u16(CpuState::RCX), INT13_EXT_CX_SUPPORTED);
         assert_eq!(
             m.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_PACKET,
             INT13_EXT_CX_PACKET
+        );
+        assert_eq!(
+            m.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_EDD,
+            INT13_EXT_CX_EDD
         );
     }
 
@@ -1297,5 +1411,63 @@ mod tests {
         m.service_int13_floppy();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: Phoenix EDD AH=48h — geometry + total sectors from IDE image.
+    #[test]
+    fn int13_ah48_returns_edd_params() {
+        let sectors = 16 * 63 * 2;
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(sectors));
+        setup_int13_hd_ext_get_params(&mut m, 0x6000, INT13_EDD_PARAMS_SIZE_MIN);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(
+            m.read_guest_u16(0x6000).unwrap(),
+            INT13_EDD_PARAMS_SIZE_MIN
+        );
+        assert_eq!(
+            m.read_guest_u16(0x6002).unwrap(),
+            INT13_EDD_INFO_GEOMETRY_VALID
+        );
+        // Two cylinders of 16*63 → cyl_count = 2.
+        assert_eq!(
+            u32::from(m.mem.read_u8(0x6004).unwrap())
+                | (u32::from(m.mem.read_u8(0x6005).unwrap()) << 8)
+                | (u32::from(m.mem.read_u8(0x6006).unwrap()) << 16)
+                | (u32::from(m.mem.read_u8(0x6007).unwrap()) << 24),
+            2
+        );
+        assert_eq!(
+            u32::from(m.mem.read_u8(0x6008).unwrap())
+                | (u32::from(m.mem.read_u8(0x6009).unwrap()) << 8),
+            u32::from(INT13_HD_HEADS)
+        );
+        assert_eq!(
+            u32::from(m.mem.read_u8(0x600C).unwrap())
+                | (u32::from(m.mem.read_u8(0x600D).unwrap()) << 8),
+            u32::from(INT13_HD_SPT)
+        );
+        assert_eq!(m.read_guest_u64(0x6010).unwrap(), sectors as u64);
+        assert_eq!(
+            m.read_guest_u16(0x6018).unwrap(),
+            INT13_SECTOR_SIZE as u16
+        );
+    }
+
+    /// Spec: AH=48h rejects short buffers and missing media.
+    #[test]
+    fn int13_ah48_rejects_short_buffer_and_no_media() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        setup_int13_hd_ext_get_params(&mut m, 0x6100, 0x10);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_hd_ext_get_params(&mut bare, 0x6100, INT13_EDD_PARAMS_SIZE_MIN);
+        bare.service_int13_hd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
     }
 }
