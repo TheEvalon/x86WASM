@@ -273,7 +273,10 @@ impl LocalApicMmio {
     ///
     /// Returns the vector whose ISR bit was cleared, if any.
     pub fn eoi(&mut self) -> Option<u8> {
-        let vec = self.in_service.take().or_else(|| highest_set_bit(&self.isr));
+        let vec = self
+            .in_service
+            .take()
+            .or_else(|| highest_set_bit(&self.isr));
         if let Some(v) = vec {
             bitmap_clear(&mut self.isr, v);
         }

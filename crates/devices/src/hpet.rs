@@ -558,7 +558,7 @@ mod tests {
             (HPET_TN_INT_ENB | HPET_TN_TYPE_PERIODIC | HPET_TN_VAL_SET) as u32,
         );
         write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 5); // period = 5
-        // Without VAL_SET, rewrite comparator to first match at 20.
+                                                         // Without VAL_SET, rewrite comparator to first match at 20.
         write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 20);
         assert_eq!(hpet.t0_periodic_period(), 5);
         assert_eq!(hpet.t0_comparator(), 20);

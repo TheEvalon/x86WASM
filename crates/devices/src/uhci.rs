@@ -84,7 +84,10 @@ pub enum UhciTdError {
     /// Empty host/device buffer supplied for a data-bearing transfer.
     EmptyBuffer,
     /// Buffer pointer + length wraps the 32-bit physical address space.
-    GuestAddressOverflow { phys_addr: u32, bytes_requested: usize },
+    GuestAddressOverflow {
+        phys_addr: u32,
+        bytes_requested: usize,
+    },
 }
 
 /// Read a little-endian `u16` from the UHCI I/O register file.
@@ -141,10 +144,7 @@ fn encode_actlen(bytes: usize) -> u32 {
 }
 
 /// Resolve the first TD address from a frame-list link (one optional QH hop).
-fn resolve_td_addr<R: FnMut(u32) -> u8>(
-    mem_read: &mut R,
-    link: u32,
-) -> Result<u32, UhciTdError> {
+fn resolve_td_addr<R: FnMut(u32) -> u8>(mem_read: &mut R, link: u32) -> Result<u32, UhciTdError> {
     if link & UHCI_LINK_TERMINATE != 0 {
         return Err(UhciTdError::NothingToDo);
     }
@@ -328,7 +328,12 @@ mod tests {
         fn read_bytes(&self, addr: u32, len: usize) -> Vec<u8> {
             let bytes = self.bytes.borrow();
             (0..len)
-                .map(|i| bytes.get(&addr.wrapping_add(i as u32)).copied().unwrap_or(0))
+                .map(|i| {
+                    bytes
+                        .get(&addr.wrapping_add(i as u32))
+                        .copied()
+                        .unwrap_or(0)
+                })
                 .collect()
         }
         fn get(&self, addr: u32) -> u8 {
@@ -352,11 +357,7 @@ mod tests {
             4,
             PciConfig::make_address(0, 1, 2, PCI_COMMAND_OFFSET, true),
         );
-        pci.port_write(
-            0xCFC,
-            2,
-            u32::from(PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER),
-        );
+        pci.port_write(0xCFC, 2, u32::from(PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER));
         let _ = PCI_DEVICE_PIIX3_USB;
     }
 
@@ -390,7 +391,13 @@ mod tests {
 
         write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
         write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FRNUM, 2, 0);
-        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_USBCMD, 2, u32::from(UHCI_USBCMD_RS));
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
 
         let mut device = [0xAAu8, 0xBB, 0xCC, 0xDD];
         let result = pci
@@ -433,7 +440,13 @@ mod tests {
         mem.write_bytes(buf_addr, &[0x11, 0x22]);
 
         write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
-        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_USBCMD, 2, u32::from(UHCI_USBCMD_RS));
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
 
         let mut device = [0u8; 4];
         let result = pci
@@ -460,7 +473,13 @@ mod tests {
             pci.run_one_uhci_td(&mut device, |_| 0, |_, _| {}),
             Err(UhciTdError::NotRunning)
         );
-        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_USBCMD, 2, u32::from(UHCI_USBCMD_RS));
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
         // Empty frame list (T=1).
         write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, 0x3000);
         mem.write_u32(0x3000, UHCI_LINK_TERMINATE);
@@ -487,7 +506,13 @@ mod tests {
         let mut pci = PciConfig::new();
         let bar = 0xD000u16;
         enable_uhci_io(&mut pci, bar);
-        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_USBCMD, 2, u32::from(UHCI_USBCMD_RS));
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
         write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, 0xABCD_1000);
         pci.reset();
         // After reset BAR decode is off and register file is zero.
