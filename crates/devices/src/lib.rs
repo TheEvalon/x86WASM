@@ -39,6 +39,7 @@ mod pic;
 mod pit;
 mod port92;
 mod serial;
+mod uhci;
 mod vga;
 
 pub use apm::{ApmSmi, APM_CNT_PORT, APM_STS_PORT};
@@ -212,6 +213,11 @@ pub use pit::{
     PORT61_OUT2, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL,
 };
 pub use port92::{Port92, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL_A};
+pub use uhci::{
+    run_one_td, UhciTdError, UhciTdTransfer, UHCI_LINK_QH, UHCI_LINK_TERMINATE, UHCI_PID_IN,
+    UHCI_PID_OUT, UHCI_PID_SETUP, UHCI_TD_ACTIVE, UHCI_TD_IOC, UHCI_TD_MAX_TRANSFER,
+    UHCI_USBCMD_RS, UHCI_USBSTS_HCHALTED, UHCI_USBSTS_USBINT,
+};
 pub use serial::{DebugConsole, Serial16550, SerialOutput};
 pub use vga::{
     vga_bringup_font_glyphs, vga_dac_default_ram, VgaFrame, VgaPlaneAccess, VgaPlaneAddressing,

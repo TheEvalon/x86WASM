@@ -125,8 +125,10 @@
 //!
 //! - PIIX USB UHCI BAR0 I/O decode: when Command.IO is set and UHCI BAR0 has
 //!   I/O form (bit0), the 32-byte UHCI register block at `BAR0 & 0xFFE0` is a
-//!   noop store/readback (USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC).
-//!   No host-controller schedule/DMA engine. LEGSUP remains PCI config `0xC0`.
+//!   store/readback file (USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC).
+//!   Bounded one-TD schedule walk is [`PciConfig::run_one_uhci_td`] /
+//!   [`crate::uhci::run_one_td`] (host helper; no auto schedule / USB devices).
+//!   LEGSUP remains PCI config `0xC0`.
 //!
 //! # Unsupported (explicit)
 //!
@@ -1012,7 +1014,7 @@ pub struct PciConfig {
     pub acpi_pm_io: [u8; PCI_PIIX_ACPI_PM_IO_SIZE as usize],
     /// PIIX USB UHCI I/O register file (32 bytes at BAR0).
     /// Spec: UHCI 1.1 — USBCMD/USBSTS/USBINTR/FRNUM/FLBASEADD/SOFMOD/PORTSC.
-    /// Store/readback only; no schedule/DMA/port engine. Reset all zeros.
+    /// Store/readback; one-TD schedule via [`Self::run_one_uhci_td`]. Reset zeros.
     pub uhci_io: [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
     /// Software PIRQA–PIRQD line levels (PCI INTx stub for tests).
     /// Spec: Intel 82371SB — PIRQ# pins; devices assert via `set_pirq_line`.
@@ -2727,6 +2729,31 @@ impl PciConfig {
             }
             _ => {}
         }
+    }
+
+    /// Host helper: execute one UHCI TD from the current frame-list slot.
+    ///
+    /// Spec: UHCI 1.1 — schedule walk lives in [`crate::uhci::run_one_td`]; this
+    /// wrapper only gates on PIIX USB Command.BusMaster and passes the BAR0
+    /// register file. BAR decode / port R/W remain here.
+    pub fn run_one_uhci_td<R, W>(
+        &mut self,
+        device_buf: &mut [u8],
+        mem_read: R,
+        mem_write: W,
+    ) -> Result<crate::uhci::UhciTdTransfer, crate::uhci::UhciTdError>
+    where
+        R: FnMut(u32) -> u8,
+        W: FnMut(u32, u8),
+    {
+        let bus_master = self.piix_usb_command() & PCI_COMMAND_BUS_MASTER != 0;
+        crate::uhci::run_one_td(
+            &mut self.uhci_io,
+            bus_master,
+            device_buf,
+            mem_read,
+            mem_write,
+        )
     }
 }
 

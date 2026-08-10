@@ -14,6 +14,6 @@ implemented in this lane.
 
 ## Remaining for a dedicated owner
 
-- One-TD schedule walk (frame list → QH → TD) with host mem callbacks
-- USBSTS/USBCMD side effects for that stub only
+- ~~One-TD schedule walk (frame list → QH → TD) with host mem callbacks~~ → **done in R8** (`docs/uhci-r8-one-td.md`)
+- Multi-TD / port / IRQ / real USB device stack still deferred
 - Honesty: no full UHCI HC, no real USB devices
