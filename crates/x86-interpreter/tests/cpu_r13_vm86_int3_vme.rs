@@ -1,16 +1,13 @@
-//! Round-12 slice 2: soft-int interrupt-redirection bitmap stub when `CR4.VME=1`.
+//! Round-13 slice 4: `INT3` under VME is **not** redirect-bitmap governed.
 //!
-//! For `INT n` (`0xCD`) in VM86 with `CR4.VME=1`, consult the 32-byte software
-//! interrupt redirection bitmap in the current 32-bit TSS (Vol. 3 §20.3 /
-//! Figure 20-5). Bit clear → redirect through the 8086 IVT at linear 0 while
-//! staying in VM86. Bit set → existing protected-mode IDT / IOPL `#GP` path.
+//! Even with `CR4.VME=1` and the software-interrupt redirection bit for
+//! vector 3 clear, `INT3` (`0xCC`) delivers through the protected-mode IDT
+//! (VM86→CPL0 9-dword frame). It is not IOPL-sensitive. `INTO` remains
+//! non-redirected (R12). Single-step (`TF` / `#DB`) under VME is explicitly
+//! unsupported in this slice.
 //!
-//! `INT3` / `INTO` are **not** redirected (bitmap applies only to `INT n`).
-//! CPUID.VME stays clear. Full method-6 VIF push image is approximated by the
-//! ordinary FLAGS push (documented unsupported remainder).
-//!
-//! Spec: Intel SDM Vol. 3 §§20.2–20.3 Table 20-2 / Figure 20-5; Vol. 2 INT n;
-//! Vol. 3 §7.2.1 (TSS I/O map base at offset 66h).
+//! Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1" (Virtual-8086 Mode Exceptions);
+//! Vol. 3 §20.2.2 Table 20-2 (bitmap applies to `INT n` only); Vol. 3 Table 20-1.
 
 use x86_core::CpuState;
 use x86_interpreter::{step, Bus, ExecError};
@@ -30,8 +27,13 @@ impl RamBus {
         self.mem[addr..addr + bytes.len()].copy_from_slice(bytes);
     }
 
-    fn peek_u16(&self, addr: usize) -> u16 {
-        u16::from_le_bytes([self.mem[addr], self.mem[addr + 1]])
+    fn peek_u32(&self, addr: usize) -> u32 {
+        u32::from_le_bytes([
+            self.mem[addr],
+            self.mem[addr + 1],
+            self.mem[addr + 2],
+            self.mem[addr + 3],
+        ])
     }
 
     fn poke_u16(&mut self, addr: usize, value: u16) {
@@ -72,13 +74,12 @@ impl Bus for RamBus {
 
 const GDT: usize = 0x2000;
 const IDT: usize = 0x2800;
-/// TSS large enough for redirect bitmap (I/O map base 0x88 → map at 0x68..0x87).
 const TSS: usize = 0x3000;
 const TSS_LIMIT: u32 = 0x87;
 const IO_MAP_BASE: u16 = 0x88;
 const REDIRECT_MAP: usize = TSS + (IO_MAP_BASE as usize) - 32;
 const MONITOR_CODE: usize = 0x1000;
-const HANDLER_IDT: u32 = 0x0000_1800;
+const HANDLER_BP: u32 = 0x0000_1800;
 const HANDLER_GP: u32 = 0x0000_1900;
 const KERNEL_ESP0: u32 = 0x0000_9000;
 const SEL_KCODE: u16 = 0x0008;
@@ -87,10 +88,8 @@ const SEL_TSS: u16 = 0x0018;
 
 const VM86_CS: u16 = 0x1000;
 const VM86_IP: u16 = 0x0100;
-/// Stack segment base `0x10000` so SP near 64 KiB stays inside a 256 KiB RAM.
 const VM86_SS: u16 = 0x1000;
 const VM86_SP: u16 = 0xFFFE;
-/// IVT-redirected handler lives in the same VM86 CS.
 const IVT_HANDLER_IP: u16 = 0x0400;
 
 const CR4_VME: u64 = 1;
@@ -125,7 +124,8 @@ fn set_redirect_bit(bus: &mut RamBus, vector: u8, set: bool) {
     }
 }
 
-fn install_tables(bus: &mut RamBus) {
+fn enter_vm86(guest: &[u8], iopl: u8) -> (CpuState, RamBus) {
+    let mut bus = RamBus::new(0x40000);
     bus.write_bytes(GDT, &[0u8; 8]);
     bus.write_bytes(GDT + 8, &encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0));
     bus.write_bytes(GDT + 16, &encode_seg_desc(0, 0xF_FFFF, 0x93, 0xC0));
@@ -133,35 +133,25 @@ fn install_tables(bus: &mut RamBus) {
     bus.poke_u32(TSS + 4, KERNEL_ESP0);
     bus.poke_u16(TSS + 8, SEL_KDATA);
     bus.poke_u16(TSS + 0x66, IO_MAP_BASE);
-    // Default: all redirect bits set (IDT / #GP path) until a test clears one.
     for b in 0..32 {
         bus.mem[REDIRECT_MAP + b] = 0xFF;
     }
-
-    bus.write_bytes(
-        IDT + 0x21 * 8,
-        &encode_idt_gate32(HANDLER_IDT, SEL_KCODE, 0xEE),
-    );
+    bus.write_bytes(IDT + 3 * 8, &encode_idt_gate32(HANDLER_BP, SEL_KCODE, 0xEE));
     bus.write_bytes(
         IDT + 13 * 8,
         &encode_idt_gate32(HANDLER_GP, SEL_KCODE, 0x8E),
     );
-}
-
-fn enter_vm86(guest: &[u8], iopl: u8, cr4_vme: bool) -> (CpuState, RamBus) {
-    // 256 KiB: VM86 SS base 0x10000 + SP near 64 KiB must be addressable.
-    let mut bus = RamBus::new(0x40000);
-    install_tables(&mut bus);
     bus.mem[MONITOR_CODE] = 0xCF;
-    bus.mem[HANDLER_IDT as usize] = 0xF4;
+    bus.mem[HANDLER_BP as usize] = 0xF4;
     bus.mem[HANDLER_GP as usize] = 0xF4;
 
     let linear = (u32::from(VM86_CS) << 4) + u32::from(VM86_IP);
     bus.write_bytes(linear as usize, guest);
     let ivt_lin = (u32::from(VM86_CS) << 4) + u32::from(IVT_HANDLER_IP);
     bus.mem[ivt_lin as usize] = 0xF4;
-    bus.poke_u16(0x21 * 4, IVT_HANDLER_IP);
-    bus.poke_u16(0x21 * 4 + 2, VM86_CS);
+    // Tempting IVT entry for vector 3 — must NOT be used by INT3.
+    bus.poke_u16(3 * 4, IVT_HANDLER_IP);
+    bus.poke_u16(3 * 4 + 2, VM86_CS);
 
     let eflags = 0x0002 | (u32::from(iopl) << 12) | (1 << 9) | (1 << 17);
     let frame = (KERNEL_ESP0 - 36) as usize;
@@ -177,9 +167,7 @@ fn enter_vm86(guest: &[u8], iopl: u8, cr4_vme: bool) -> (CpuState, RamBus) {
 
     let mut cpu = CpuState::reset();
     cpu.cr0 |= 1;
-    if cr4_vme {
-        cpu.cr4 |= CR4_VME;
-    }
+    cpu.cr4 |= CR4_VME;
     cpu.cs = x86_core::SegmentReg {
         selector: SEL_KCODE,
         base: 0,
@@ -211,68 +199,48 @@ fn enter_vm86(guest: &[u8], iopl: u8, cr4_vme: bool) -> (CpuState, RamBus) {
     (cpu, bus)
 }
 
-/// VME=1, redirect bit clear, IOPL=0: `INT 21h` stays in VM86 via IVT
-/// (method 6: pushed FLAGS has IOPL=3 and IF←VIF).
+/// VME=1, redirect bit 3 clear, IOPL=0: `INT3` still uses IDT `#BP`, not IVT.
 #[test]
-fn vme_int_n_redirect_bit_clear_uses_ivt_at_iopl0() {
-    let (mut cpu, mut bus) = enter_vm86(&[0xCD, 0x21], 0, true);
-    set_redirect_bit(&mut bus, 0x21, false);
-    cpu.rflags |= 1 << 19; // VIF=1 → pushed IF=1
-    let vif_set = true;
+fn vme_int3_ignores_clear_redirect_bit_uses_idt() {
+    let (mut cpu, mut bus) = enter_vm86(&[0xCC], 0);
+    set_redirect_bit(&mut bus, 3, false);
 
     step(&mut cpu, &mut bus).unwrap();
 
-    assert_ne!(cpu.rflags & (1 << 17), 0, "must stay in VM86");
-    assert_eq!(cpu.cs.selector, VM86_CS);
-    assert_eq!(cpu.rip, u64::from(IVT_HANDLER_IP));
-    let sp = cpu.gpr_u16(CpuState::RSP);
-    assert_eq!(sp, VM86_SP - 6);
-    let stack_base = (u32::from(VM86_SS) << 4) as usize;
-    assert_eq!(bus.peek_u16(stack_base + sp as usize), VM86_IP + 2);
-    assert_eq!(bus.peek_u16(stack_base + sp as usize + 2), VM86_CS);
-    let pushed = bus.peek_u16(stack_base + sp as usize + 4);
-    assert_eq!((pushed >> 12) & 3, 3, "method-6 IOPL=3 in image");
-    assert_eq!(pushed & (1 << 9) != 0, vif_set, "method-6 IF←VIF");
-    assert_eq!(cpu.rflags & (1 << 9), 0, "IF cleared on redirect");
-    assert_eq!(
-        cpu.rflags & (1 << 19),
-        0,
-        "VIF cleared on method-6 redirect"
+    assert_eq!(cpu.rip, u64::from(HANDLER_BP), "must hit IDT #BP handler");
+    assert_eq!(cpu.rflags & (1 << 17), 0, "left VM86 via CPL0 delivery");
+    assert_ne!(
+        cpu.rip,
+        u64::from(IVT_HANDLER_IP),
+        "must not follow IVT redirect"
     );
+    // 9-dword VM86 frame on kernel stack: ESP0 - 36.
+    let frame = (KERNEL_ESP0 - 36) as usize;
+    assert_eq!(bus.peek_u32(frame), u32::from(VM86_IP) + 1); // return IP after CC
+    assert_eq!(bus.peek_u32(frame + 4), u32::from(VM86_CS));
 }
 
-/// VME=1, redirect bit set, IOPL=0: still `#GP(0)` through the IDT (no silent IVT).
+/// Contrast: `INT 3` (`CD 03`) **does** redirect when bit clear.
 #[test]
-fn vme_int_n_redirect_bit_set_iopl0_raises_gp() {
-    let (mut cpu, mut bus) = enter_vm86(&[0xCD, 0x21], 0, true);
-    set_redirect_bit(&mut bus, 0x21, true);
+fn vme_int_n_vector3_redirects_when_bit_clear() {
+    let (mut cpu, mut bus) = enter_vm86(&[0xCD, 0x03], 0);
+    set_redirect_bit(&mut bus, 3, false);
 
     step(&mut cpu, &mut bus).unwrap();
 
-    assert_eq!(cpu.rip, u64::from(HANDLER_GP));
-    assert_eq!(cpu.rflags & (1 << 17), 0);
-}
-
-/// Without VME, IOPL=0 still `#GP` even if a clear bit happens to exist in TSS.
-#[test]
-fn without_vme_redirect_bitmap_ignored_iopl0_gp() {
-    let (mut cpu, mut bus) = enter_vm86(&[0xCD, 0x21], 0, false);
-    set_redirect_bit(&mut bus, 0x21, false);
-
-    step(&mut cpu, &mut bus).unwrap();
-
-    assert_eq!(cpu.rip, u64::from(HANDLER_GP));
-    assert_eq!(cpu.rflags & (1 << 17), 0);
-}
-
-/// VME=1, redirect bit clear, IOPL=3: IVT redirect (method 5 class).
-#[test]
-fn vme_int_n_redirect_bit_clear_iopl3_uses_ivt() {
-    let (mut cpu, mut bus) = enter_vm86(&[0xCD, 0x21], 3, true);
-    set_redirect_bit(&mut bus, 0x21, false);
-
-    step(&mut cpu, &mut bus).unwrap();
-
-    assert_ne!(cpu.rflags & (1 << 17), 0);
+    assert_ne!(cpu.rflags & (1 << 17), 0, "stay in VM86");
     assert_eq!(cpu.rip, u64::from(IVT_HANDLER_IP));
+}
+
+/// `INT3` with IOPL=0 under VME is not `#GP` (not IOPL-sensitive).
+#[test]
+fn vme_int3_iopl0_delivers_not_gp() {
+    let (mut cpu, mut bus) = enter_vm86(&[0xCC], 0);
+    // Bit set would force IDT path for INT n; INT3 ignores the map entirely.
+    set_redirect_bit(&mut bus, 3, true);
+
+    step(&mut cpu, &mut bus).unwrap();
+
+    assert_eq!(cpu.rip, u64::from(HANDLER_BP));
+    assert_ne!(cpu.rip, u64::from(HANDLER_GP));
 }
