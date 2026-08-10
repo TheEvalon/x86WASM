@@ -9,9 +9,10 @@
 //!   no INT 13h CD emulation.
 
 use firmware_interface::{
-    ElToritoError, EL_TORITO_BOOTABLE, EL_TORITO_BOOT_SYSTEM_ID, EL_TORITO_KEY_55, EL_TORITO_KEY_AA,
-    EL_TORITO_PLATFORM_X86, EL_TORITO_SECTOR_BYTES, EL_TORITO_VALIDATION_HEADER_ID,
-    ISO9660_STANDARD_ID, ISO9660_VD_BOOT_RECORD, ISO9660_VD_TERMINATOR,
+    ElToritoError, EL_TORITO_BOOTABLE, EL_TORITO_BOOT_SYSTEM_ID, EL_TORITO_KEY_55,
+    EL_TORITO_KEY_AA, EL_TORITO_PLATFORM_X86, EL_TORITO_SECTOR_BYTES,
+    EL_TORITO_VALIDATION_HEADER_ID, ISO9660_STANDARD_ID, ISO9660_VD_BOOT_RECORD,
+    ISO9660_VD_TERMINATOR,
 };
 use machine_pc::Machine;
 
@@ -84,8 +85,5 @@ fn machine_reports_bootable_el_torito_from_atapi_image() {
 fn empty_atapi_tray_rejects_el_torito_inspect() {
     let mut m = Machine::new(16 * 1024 * 1024);
     m.ide.attach_atapi_cdrom();
-    assert_eq!(
-        m.inspect_atapi_el_torito(),
-        Err(ElToritoError::Truncated)
-    );
+    assert_eq!(m.inspect_atapi_el_torito(), Err(ElToritoError::Truncated));
 }

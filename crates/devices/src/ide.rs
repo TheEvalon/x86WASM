@@ -1734,9 +1734,7 @@ impl IdePrimary {
     /// Only page `01h` is implemented; page `3Fh` returns that single page.
     fn mode_sense_pages(&self, page_code: u8) -> Option<Vec<u8>> {
         match page_code & 0x3F {
-            ATAPI_MODE_PAGE_ERROR_RECOVERY | 0x3F => {
-                Some(self.mode_page_error_recovery().to_vec())
-            }
+            ATAPI_MODE_PAGE_ERROR_RECOVERY | 0x3F => Some(self.mode_page_error_recovery().to_vec()),
             _ => None,
         }
     }
@@ -1810,8 +1808,7 @@ impl IdePrimary {
             );
             return;
         };
-        let allocation =
-            usize::from(u16::from_be_bytes([self.packet_cmd[7], self.packet_cmd[8]]));
+        let allocation = usize::from(u16::from_be_bytes([self.packet_cmd[7], self.packet_cmd[8]]));
         let pages = if pc == 0x01 {
             let mut mask = pages;
             if mask.len() > 2 {
@@ -1912,14 +1909,12 @@ impl IdePrimary {
                 sff
             }
         };
-        let allocation =
-            usize::from(u16::from_be_bytes([self.packet_cmd[7], self.packet_cmd[8]]));
+        let allocation = usize::from(u16::from_be_bytes([self.packet_cmd[7], self.packet_cmd[8]]));
         let blocks = self.atapi_cdrom_blocks() as u32;
         let data = match format {
             0 => {
                 let start_track = self.packet_cmd[6];
-                if start_track != 0 && start_track != 1 && start_track != ATAPI_TOC_TRACK_LEAD_OUT
-                {
+                if start_track != 0 && start_track != 1 && start_track != ATAPI_TOC_TRACK_LEAD_OUT {
                     self.complete_packet_check_condition(
                         ATAPI_SENSE_ILLEGAL_REQUEST,
                         ATAPI_ASC_INVALID_FIELD_IN_CDB,

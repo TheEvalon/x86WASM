@@ -86,7 +86,9 @@ impl core::fmt::Display for ElToritoError {
 impl std::error::Error for ElToritoError {}
 
 fn sector<'a>(image: &'a [u8], lba: u32) -> Result<&'a [u8], ElToritoError> {
-    let start = (lba as usize).checked_mul(EL_TORITO_SECTOR_BYTES).ok_or(ElToritoError::Truncated)?;
+    let start = (lba as usize)
+        .checked_mul(EL_TORITO_SECTOR_BYTES)
+        .ok_or(ElToritoError::Truncated)?;
     let end = start
         .checked_add(EL_TORITO_SECTOR_BYTES)
         .ok_or(ElToritoError::Truncated)?;

@@ -93,7 +93,7 @@ fn read_toc_returns_single_data_track_and_lead_out() {
     assert_eq!(u16::from_be_bytes([data[0], data[1]]), 18);
     assert_eq!(data[2], 1); // first track
     assert_eq!(data[3], 1); // last track
-    // Track 1 descriptor
+                            // Track 1 descriptor
     assert_eq!(data[5], TOC_CTRL_DATA);
     assert_eq!(data[6], 1);
     assert_eq!(&data[8..12], &0u32.to_be_bytes());

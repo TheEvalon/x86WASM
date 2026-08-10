@@ -88,7 +88,11 @@ fn mode_sense10_returns_error_recovery_page_when_empty() {
     let mode_len = u16::from_be_bytes([data[0], data[1]]);
     assert_eq!(mode_len, 14, "mode data length excludes itself");
     assert_eq!(data[2], MEDIUM_NO_DISC);
-    assert_eq!(u16::from_be_bytes([data[6], data[7]]), 0, "no block descriptors");
+    assert_eq!(
+        u16::from_be_bytes([data[6], data[7]]),
+        0,
+        "no block descriptors"
+    );
     assert_eq!(data[8] & 0x3F, PAGE_ERROR_RECOVERY);
     assert_eq!(data[9], PAGE_LENGTH_ERROR_RECOVERY);
     assert_eq!(status(&mut ide) & ATA_SR_ERR, 0);
