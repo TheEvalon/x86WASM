@@ -11,6 +11,7 @@
 mod eltorito_load;
 mod hello_rom;
 mod hpet_wire;
+mod ioapic_wire;
 mod lapic_wire;
 mod mbr;
 mod mem;
@@ -871,6 +872,15 @@ impl Machine {
     /// CPU or assert the INTR pin. See `docs/lapic-r7-timer-lvt.md`.
     pub fn tick_lapic_timer(&mut self, bus_clocks: u64) -> bool {
         lapic_wire::tick_lapic_timer(&mut self.lapic, bus_clocks)
+    }
+
+    /// Assert an I/O APIC GSI pin; Fixed RTE deliveries matching this LAPIC ID
+    /// latch via [`devices::LocalApicMmio::inject_fixed`].
+    ///
+    /// Spec: Intel 82093AA redirection table. Does **not** mirror onto DualPic.
+    /// See `docs/ioapic-r7-rte-irq.md`.
+    pub fn assert_ioapic_gsi(&mut self, gsi: u8, high: bool) -> Option<devices::IoApicDelivery> {
+        ioapic_wire::assert_ioapic_gsi(&mut self.ioapic, &mut self.lapic, gsi, high)
     }
 
     /// Advance CMOS/RTC by `periods` model quanta and sync IRQF → PIC IRQ8.

@@ -215,6 +215,21 @@ impl LocalApicMmio {
         Some(vec)
     }
 
+    /// Latch a Fixed-mode vector from the I/O APIC (software-enable gated).
+    ///
+    /// Spec: SDM §10.8 / 82093AA Fixed delivery. Returns `true` when newly
+    /// latched. Does not overwrite an already-pending vector.
+    pub fn inject_fixed(&mut self, vector: u8) -> bool {
+        if !self.software_enabled() {
+            return false;
+        }
+        if self.pending_vector.is_some() {
+            return false;
+        }
+        self.pending_vector = Some(vector);
+        true
+    }
+
     fn fire_timer_interrupt(&mut self) {
         if !self.software_enabled() {
             return;
