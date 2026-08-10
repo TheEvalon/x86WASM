@@ -1072,7 +1072,7 @@ impl Machine {
         count: u8,
         dest: u64,
     ) -> Result<u8, u8> {
-        self.int13_floppy_xfer(cylinder, head, sector, count, dest, false, false)
+        self.int13_floppy_xfer(cylinder, head, sector, count, FloppyXfer::Read { dest })
     }
 
     /// Write `count` floppy sectors from physical `src` starting at CHS.
@@ -1087,7 +1087,7 @@ impl Machine {
         count: u8,
         src: u64,
     ) -> Result<u8, u8> {
-        self.int13_floppy_xfer(cylinder, head, sector, count, src, false, true)
+        self.int13_floppy_xfer(cylinder, head, sector, count, FloppyXfer::Write { src })
     }
 
     /// Verify `count` floppy sectors are readable at CHS (no guest buffer write).
@@ -1101,7 +1101,7 @@ impl Machine {
         sector: u8,
         count: u8,
     ) -> Result<u8, u8> {
-        self.int13_floppy_xfer(cylinder, head, sector, count, 0, true, false)
+        self.int13_floppy_xfer(cylinder, head, sector, count, FloppyXfer::Verify)
     }
 
     fn int13_floppy_xfer(
@@ -1110,14 +1110,12 @@ impl Machine {
         mut head: u8,
         mut sector: u8,
         count: u8,
-        mut phys: u64,
-        verify_only: bool,
-        write: bool,
+        mode: FloppyXfer,
     ) -> Result<u8, u8> {
         if !self.fdc.has_media() {
             return Err(INT13_STATUS_TIMEOUT);
         }
-        if write && self.fdc.write_protected {
+        if matches!(mode, FloppyXfer::Write { .. }) && self.fdc.write_protected {
             return Err(INT13_STATUS_WRITE_PROTECTED);
         }
         if count == 0 || sector == 0 || head >= FDC_1440_HEADS {
@@ -1126,7 +1124,12 @@ impl Machine {
         if sector > FDC_1440_SECTORS_PER_TRACK || cylinder >= FDC_1440_CYLINDERS {
             return Err(INT13_STATUS_SECTOR_NOT_FOUND);
         }
-        if !verify_only {
+        let mut phys = match mode {
+            FloppyXfer::Read { dest } => dest,
+            FloppyXfer::Write { src } => src,
+            FloppyXfer::Verify => 0,
+        };
+        if !matches!(mode, FloppyXfer::Verify) {
             let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
             let end = phys.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
             if end > self.mem.ram_len() as u64 {
@@ -1135,30 +1138,33 @@ impl Machine {
         }
 
         for i in 0..count {
-            if write {
-                let mut sector_buf = [0u8; FDC_SECTOR_SIZE];
-                for (j, b) in sector_buf.iter_mut().enumerate() {
-                    *b = self
-                        .mem
-                        .read_u8(phys + j as u64)
-                        .map_err(|_| INT13_STATUS_INVALID)?;
-                }
-                if !self.fdc.write_sector(cylinder, head, sector, &sector_buf) {
-                    return Err(INT13_STATUS_SECTOR_NOT_FOUND);
-                }
-            } else {
-                let Some(sector_buf) = self.fdc.read_sector(cylinder, head, sector) else {
-                    return Err(INT13_STATUS_SECTOR_NOT_FOUND);
-                };
-                if !verify_only {
-                    for (j, b) in sector_buf.iter().enumerate() {
-                        self.mem
-                            .write_u8(phys + j as u64, *b)
+            match mode {
+                FloppyXfer::Write { .. } => {
+                    let mut sector_buf = [0u8; FDC_SECTOR_SIZE];
+                    for (j, b) in sector_buf.iter_mut().enumerate() {
+                        *b = self
+                            .mem
+                            .read_u8(phys + j as u64)
                             .map_err(|_| INT13_STATUS_INVALID)?;
+                    }
+                    if !self.fdc.write_sector(cylinder, head, sector, &sector_buf) {
+                        return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+                    }
+                }
+                FloppyXfer::Read { .. } | FloppyXfer::Verify => {
+                    let Some(sector_buf) = self.fdc.read_sector(cylinder, head, sector) else {
+                        return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+                    };
+                    if matches!(mode, FloppyXfer::Read { .. }) {
+                        for (j, b) in sector_buf.iter().enumerate() {
+                            self.mem
+                                .write_u8(phys + j as u64, *b)
+                                .map_err(|_| INT13_STATUS_INVALID)?;
+                        }
                     }
                 }
             }
-            if !verify_only {
+            if !matches!(mode, FloppyXfer::Verify) {
                 phys = phys.wrapping_add(INT13_SECTOR_SIZE as u64);
             }
             if i + 1 < count {
@@ -1278,6 +1284,13 @@ impl Machine {
         self.cpu.set_ah(INT13_DISK_TYPE_FLOPPY_CHANGE_LINE);
         self.cpu.set_cf(false);
     }
+}
+
+/// Floppy INT 13h transfer mode for the shared CHS walker.
+enum FloppyXfer {
+    Read { dest: u64 },
+    Write { src: u64 },
+    Verify,
 }
 
 /// Advance floppy CHS by one sector within 1.44MB geometry.
