@@ -1756,6 +1756,8 @@ fn cr0_pe(cpu: &CpuState) -> bool {
 
 /// `EFLAGS.VM` — virtual-8086 mode (SDM Vol. 1 §3.4.3; Vol. 3 §20.1).
 const EFLAGS_VM: u64 = 1 << 17;
+const EFLAGS_VIF: u64 = 1 << 19;
+const EFLAGS_VIP: u64 = 1 << 20;
 /// `EFLAGS.NT` (nested task).
 const EFLAGS_NT: u64 = 1 << 14;
 
@@ -1834,7 +1836,6 @@ fn vme_soft_int_redirect_bit_set(
 ///
 /// Bounded stub: pushes the live FLAGS image (does **not** rewrite IOPL=3 /
 /// VIF→IF for method 6), clears IF/TF, loads CS:IP from linear `vector*4`.
-/// Unsupported: method-6 VIF image rewrite; VIP/VIF `CLI`/`STI`.
 /// Spec: Intel SDM Vol. 3 §20.2.2 Table 20-2; Vol. 2 INT n.
 fn vm86_vme_redirect_soft_int(
     cpu: &mut CpuState,
@@ -1880,7 +1881,7 @@ fn vm86_software_int_n(
 /// `#GP(0)` when `CLI`/`STI` lack sufficient IOPL privilege (no VME/PVI).
 ///
 /// Real-address mode always succeeds. Protected mode (VM=0): require
-/// `IOPL ≥ CPL`. Virtual-8086 mode: require `IOPL = 3` (CPL is forced to 3).
+/// `IOPL ≥ CPL`. Virtual-8086 mode without VME: require `IOPL = 3`.
 /// Spec: Intel SDM Vol. 2 "CLI"/"STI" Table 3-7; Vol. 3 §20.2.1.
 fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
     if !cr0_pe(cpu) {
@@ -1892,6 +1893,42 @@ fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
     } else {
         Err(arch_fault_with_error_code(13, 0))
     }
+}
+
+/// Execute `CLI` (`set=false`) or `STI` (`set=true`).
+///
+/// With `CR4.VME=1` and `EFLAGS.VM=1` and `IOPL < 3`, operate on `VIF` instead
+/// of `IF` (no `#GP` for IOPL). Enabling `VIF`/`IF` while `VIP=1` raises
+/// `#GP(0)`. Without VME (or with `IOPL = 3`), the ordinary IOPL/`IF` path
+/// applies. `CPUID.VME` stays clear.
+/// Spec: Intel SDM Vol. 2 "CLI"/"STI"; Vol. 3 §§20.2–20.3 Table 20-2.
+fn cli_sti_execute(cpu: &mut CpuState, set: bool) -> Result<(), ExecError> {
+    let vm = eflags_vm(cpu.rflags);
+    let vme = cr4_vme(cpu);
+    let iopl = eflags_iopl(cpu.rflags);
+
+    if cr0_pe(cpu) && vm && vme && iopl < 3 {
+        if set {
+            if cpu.rflags & EFLAGS_VIP != 0 {
+                return Err(arch_fault_with_error_code(13, 0));
+            }
+            cpu.rflags |= EFLAGS_VIF;
+        } else {
+            cpu.rflags &= !EFLAGS_VIF;
+        }
+        return Ok(());
+    }
+
+    require_iopl_for_cli_sti(cpu)?;
+    if set {
+        if cr0_pe(cpu) && vm && vme && cpu.rflags & EFLAGS_VIP != 0 {
+            return Err(arch_fault_with_error_code(13, 0));
+        }
+        cpu.set_interrupt_flag(true);
+    } else {
+        cpu.set_interrupt_flag(false);
+    }
+    Ok(())
 }
 
 /// Pop FLAGS/EFLAGS with IOPL/IF privilege masking.
@@ -6865,17 +6902,17 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0xFA => {
-            // CLI — Spec: Intel SDM Vol. 2 "CLI" Table 3-7; Vol. 3 §20.2.1.
-            // Unsupported: VME/PVI (`CR4` reserved; CPUID clear) → no VIF path.
-            require_iopl_for_cli_sti(cpu)?;
-            cpu.set_interrupt_flag(false);
+            // CLI — Spec: Intel SDM Vol. 2 "CLI" Table 3-7; Vol. 3 §20.2.1 /
+            // §§20.2–20.3 Table 20-2 (VME → VIF when IOPL<3).
+            // Unsupported: PVI; STI interrupt-shadow delay; CPUID.VME.
+            cli_sti_execute(cpu, false)?;
             set_current_ip(cpu, next_ip);
         }
         0xFB => {
-            // STI — Spec: Intel SDM Vol. 2 "STI" Table 3-8; Vol. 3 §20.2.1.
-            // Unsupported: VME/PVI VIF path; interrupt-shadow delay after STI.
-            require_iopl_for_cli_sti(cpu)?;
-            cpu.set_interrupt_flag(true);
+            // STI — Spec: Intel SDM Vol. 2 "STI" Table 3-8; Vol. 3 §20.2.1 /
+            // §§20.2–20.3 Table 20-2 (VME → VIF when IOPL<3; VIP∧VIF #GP).
+            // Unsupported: PVI; interrupt-shadow delay after STI; CPUID.VME.
+            cli_sti_execute(cpu, true)?;
             set_current_ip(cpu, next_ip);
         }
         0x90 => set_current_ip(cpu, next_ip),
