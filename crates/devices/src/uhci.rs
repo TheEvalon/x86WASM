@@ -414,7 +414,8 @@ fn bump_frnum(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
 /// Spec: UHCI 1.1 §2.1.2 — HCHalted is set by the HC after it stops; this stub
 /// reflects Run/Stop rather than a separate halt latch.
 pub fn usbsts_read(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> u16 {
-    let mut sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) & (UHCI_USBSTS_RWC_MASK | UHCI_USBSTS_HCHALTED);
+    let mut sts =
+        reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) & (UHCI_USBSTS_RWC_MASK | UHCI_USBSTS_HCHALTED);
     if reg_u16(regs, PCI_PIIX_USB_UHCI_USBCMD) & UHCI_USBCMD_RS == 0 {
         sts |= UHCI_USBSTS_HCHALTED;
     } else {
@@ -429,7 +430,11 @@ pub fn usbsts_read(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> u16 {
 pub fn usbsts_write_w1c(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize], value: u16) {
     let cur = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS);
     let cleared = cur & !(value & UHCI_USBSTS_RWC_MASK);
-    set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, cleared & UHCI_USBSTS_RWC_MASK);
+    set_reg_u16(
+        regs,
+        PCI_PIIX_USB_UHCI_USBSTS,
+        cleared & UHCI_USBSTS_RWC_MASK,
+    );
 }
 
 /// Read USBINTR (bits 3:0 only).
@@ -439,7 +444,11 @@ pub fn usbintr_read(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> u16 {
 
 /// Write USBINTR; reserved bits 15:4 hardwired 0.
 pub fn usbintr_write(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize], value: u16) {
-    set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBINTR, value & UHCI_USBINTR_WRITABLE);
+    set_reg_u16(
+        regs,
+        PCI_PIIX_USB_UHCI_USBINTR,
+        value & UHCI_USBINTR_WRITABLE,
+    );
 }
 
 /// Host/device IRQ line from USBSTS ∩ USBINTR (plus unmaskable HCPE).

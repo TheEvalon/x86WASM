@@ -131,9 +131,8 @@ pub const HPET_DEFAULT_IOAPIC_GSI: u8 = 2;
 /// Includes `PER_INT_CAP` + `INT_ROUTE_CAP=IRQ2`. Explicitly **excludes**
 /// `Tn_FSB_INT_DEL_CAP` ([`HPET_TN_FSB_INT_DEL_CAP`] = 0) so MSI/FSB is not
 /// falsely advertised.
-pub const HPET_T0_CONFIG_CAPS: u64 = HPET_TN_PER_INT_CAP
-    | HPET_TN_FSB_INT_DEL_CAP
-    | ((HPET_T0_INT_ROUTE_CAP as u64) << 32);
+pub const HPET_T0_CONFIG_CAPS: u64 =
+    HPET_TN_PER_INT_CAP | HPET_TN_FSB_INT_DEL_CAP | ((HPET_T0_INT_ROUTE_CAP as u64) << 32);
 
 /// Writable Timer 0 config bits retained by this stub.
 const HPET_T0_CONFIG_WRITABLE: u64 =
@@ -713,7 +712,11 @@ mod tests {
             HPET_REG_T0_CONFIG,
             (HPET_TN_INT_ENB | HPET_TN_FSB_EN | (5 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
         );
-        assert_eq!(hpet.t0_config() & HPET_TN_FSB_EN, 0, "FSB_EN must not stick");
+        assert_eq!(
+            hpet.t0_config() & HPET_TN_FSB_EN,
+            0,
+            "FSB_EN must not stick"
+        );
         assert_eq!(hpet.t0_int_route(), 0, "unadvertised IRQ5 must not stick");
         assert_eq!(hpet.ioapic_gsi(), HPET_DEFAULT_IOAPIC_GSI);
     }

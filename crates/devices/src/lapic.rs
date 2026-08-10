@@ -1012,7 +1012,11 @@ mod tests {
             0x20 | LAPIC_ICR_DELIVERY_STATUS | LAPIC_ICR_SHORTHAND_SELF,
         );
         let low = read_u32(&lapic, LAPIC_REG_ICR_LOW);
-        assert_eq!(low & LAPIC_ICR_DELIVERY_STATUS, 0, "Delivery Status RO Idle");
+        assert_eq!(
+            low & LAPIC_ICR_DELIVERY_STATUS,
+            0,
+            "Delivery Status RO Idle"
+        );
         assert_eq!(low & LAPIC_ICR_VECTOR_MASK, 0x20);
         assert_eq!(low & LAPIC_ICR_SHORTHAND_MASK, LAPIC_ICR_SHORTHAND_SELF);
     }
