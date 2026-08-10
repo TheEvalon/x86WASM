@@ -1892,12 +1892,15 @@ fn protected_far_jump(
     Ok(())
 }
 
-/// Protected-mode far `CALL` into a same-CPL GDT code segment.
+/// Protected-mode far `CALL` into a same-CPL GDT code segment or through a
+/// 32-bit GDT call gate.
 ///
-/// Validates the target first, then pushes the return `CS`/`IP` (or `EIP`) link,
-/// then loads CS. Call gates and privilege changes remain unsupported. Far
-/// `CALL` to a TSS or task gate (nested task) is explicitly unsupported here.
-/// Spec: Intel SDM Vol. 2 CALL; Vol. 3 §§5.8.1, 6.13, 7.3.
+/// Call-gate path (type `0xC`, param count 0): same-CPL or privilege-changing
+/// transfer using TSS `SSn:ESPn` when the target code DPL is more privileged.
+/// Spec: Intel SDM Vol. 2 CALL; Vol. 3 §§5.8.1–5.8.2, 6.13, 7.3.
+///
+/// Unsupported here: 16-bit call gates (`type=4`), non-zero param count,
+/// LDT-resident gates, nested-task `CALL` to TSS/task gate.
 fn protected_far_call(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1909,6 +1912,9 @@ fn protected_far_call(
     if protected_far_is_task_target(cpu, bus, selector)? {
         // Nested-task CALL (NT=1 / back-link) is out of scope for this slice.
         return Err(ExecError::Unsupported(0x9A));
+    }
+    if protected_far_is_call_gate(cpu, bus, selector)? {
+        return call_gate_far_call(cpu, bus, selector, next_ip);
     }
     let (sel, parsed) = prepare_protected_far_cs(cpu, bus, target_offset, selector)?;
     let return_cs = cpu.cs.selector;
@@ -1922,6 +1928,179 @@ fn protected_far_call(
     cpu.cs
         .load_descriptor_cache(sel, parsed.base, parsed.limit, parsed.flags);
     cpu.rip = u64::from(target_offset);
+    Ok(())
+}
+
+/// System-descriptor type: 32-bit call gate (SDM Vol. 3 Table 3-2).
+const DESC_TYPE_CALL_GATE32: u8 = 0xC;
+/// System-descriptor type: 16-bit call gate (unsupported in this slice).
+const DESC_TYPE_CALL_GATE16: u8 = 0x4;
+
+fn protected_far_is_call_gate(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<bool, ExecError> {
+    if is_null_selector(selector) || selector & 0x4 != 0 {
+        return Ok(false);
+    }
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Ok(false);
+    }
+    let access = bus
+        .read_system_u8(cpu.gdtr.base.wrapping_add(offset).wrapping_add(5))
+        .map_err(|error| classify_mem_fault(error, false))?;
+    if access & 0x10 != 0 {
+        return Ok(false);
+    }
+    Ok(matches!(
+        access & 0x0F,
+        DESC_TYPE_CALL_GATE16 | DESC_TYPE_CALL_GATE32
+    ))
+}
+
+fn read_tss32_inner_stack_arch(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    new_cpl: u8,
+) -> Result<(u16, u32), ExecError> {
+    let type_field = (cpu.tr.flags & 0x0F) as u8;
+    if type_field != DESC_TYPE_TSS32_BUSY && type_field != DESC_TYPE_TSS32_AVAILABLE {
+        return Err(selector_fault(13, cpu.tr.selector));
+    }
+    if cpu.tr.limit < TSS32_MIN_LIMIT {
+        return Err(selector_fault(13, cpu.tr.selector));
+    }
+    let (esp_off, ss_off) = match new_cpl {
+        0 => (4u32, 8u32),
+        1 => (12, 16),
+        2 => (20, 24),
+        _ => return Err(arch_fault_with_error_code(13, 0)),
+    };
+    if ss_off + 1 > cpu.tr.limit {
+        return Err(selector_fault(13, cpu.tr.selector));
+    }
+    let base = cpu.tr.base;
+    let esp = tss32_read_u32(bus, base, esp_off)?;
+    let ss = tss32_read_u16(bus, base, ss_off)?;
+    Ok((ss, esp))
+}
+
+/// Far `CALL` through a 32-bit GDT call gate (param count must be 0).
+///
+/// Spec: Intel SDM Vol. 2 "CALL"; Vol. 3 §5.8.2 Figures 5-8 / 5-9.
+fn call_gate_far_call(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    gate_selector: u16,
+    next_ip: u32,
+) -> Result<(), ExecError> {
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let rpl = (gate_selector & 3) as u8;
+    let gate = read_gdt_raw_descriptor(cpu, bus, gate_selector)?;
+    let gate_access = gate[5];
+    let gate_type = gate_access & 0x0F;
+    if gate_type == DESC_TYPE_CALL_GATE16 {
+        return Err(ExecError::Unsupported(0x9A));
+    }
+    if gate_type != DESC_TYPE_CALL_GATE32 {
+        return Err(selector_fault(13, gate_selector));
+    }
+    let gate_dpl = (gate_access >> 5) & 3;
+    if cpl > gate_dpl || rpl > gate_dpl {
+        return Err(selector_fault(13, gate_selector));
+    }
+    if gate_access & 0x80 == 0 {
+        return Err(selector_fault(11, gate_selector));
+    }
+    let param_count = gate[4] & 0x1F;
+    if param_count != 0 {
+        // Parameter copying is deferred; refuse rather than silently drop args.
+        return Err(ExecError::Unsupported(0x9A));
+    }
+
+    let code_selector = u16::from_le_bytes([gate[2], gate[3]]);
+    if is_null_selector(code_selector) || code_selector & 0x4 != 0 {
+        return Err(selector_fault(13, code_selector));
+    }
+    let code_desc = read_gdt_segment_descriptor(cpu, bus, code_selector)?;
+    let code_access = code_desc[5];
+    let s_bit = code_access & 0x10 != 0;
+    let executable = code_access & 0x08 != 0;
+    let conforming = executable && code_access & 0x04 != 0;
+    let code_dpl = (code_access >> 5) & 3;
+    if !s_bit || !executable {
+        return Err(selector_fault(13, code_selector));
+    }
+    // Destination must be more privileged or same: DPL ≤ CPL.
+    // Nonconforming privilege change requires DPL < CPL; conforming never
+    // changes CPL. Spec: Vol. 3 §5.8.2.
+    if code_dpl > cpl {
+        return Err(selector_fault(13, code_selector));
+    }
+    if !conforming && code_dpl < cpl {
+        // privilege change — allowed
+    } else if !conforming && code_dpl != cpl {
+        return Err(selector_fault(13, code_selector));
+    } else if conforming && code_dpl > cpl {
+        return Err(selector_fault(13, code_selector));
+    }
+    if code_access & 0x80 == 0 {
+        return Err(selector_fault(11, code_selector));
+    }
+    let parsed = parse_segment_descriptor(code_desc);
+    if parsed.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
+        return Err(selector_fault(13, code_selector));
+    }
+    let gate_offset = u32::from(u16::from_le_bytes([gate[0], gate[1]]))
+        | (u32::from(u16::from_le_bytes([gate[6], gate[7]])) << 16);
+    if gate_offset > parsed.limit {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    let privilege_change = !conforming && code_dpl < cpl;
+    let new_cpl = if privilege_change { code_dpl } else { cpl };
+    let new_cs_sel = (code_selector & !3) | u16::from(new_cpl);
+
+    let return_cs = cpu.cs.selector;
+    let old_ss = cpu.ss.selector;
+    let old_esp = stack_pointer(cpu);
+
+    if privilege_change {
+        let (ss_sel, mut sp) = read_tss32_inner_stack_arch(cpu, bus, new_cpl)?;
+        let ss_loaded = prepare_ss_from_gdt_for_cpl(cpu, bus, ss_sel, new_cpl)?;
+        // Privilege-changing CALL frame (Vol. 3 Figure 5-9), low→high:
+        // EIP, CS, ESP, SS. Writes are supervisor accesses (§4.6.1).
+        let frame = [
+            next_ip,
+            u32::from(return_cs),
+            old_esp,
+            u32::from(old_ss),
+        ];
+        let stack_b32 = ss_loaded.default_big();
+        for &value in frame.iter().rev() {
+            sp = if stack_b32 {
+                sp.wrapping_sub(4)
+            } else {
+                u32::from((sp as u16).wrapping_sub(4))
+            };
+            let addr = seg_linear_checked(&ss_loaded, u64::from(sp), 4, true)?;
+            for (index, byte) in value.to_le_bytes().iter().enumerate() {
+                bus.write_system_u8(addr.wrapping_add(index as u64), *byte)
+                    .map_err(|error| classify_mem_fault(error, true))?;
+            }
+        }
+        cpu.ss = ss_loaded;
+        set_stack_pointer(cpu, sp);
+    } else {
+        // Same privilege: 32-bit gate pushes dword CS and EIP.
+        push32(cpu, bus, u32::from(return_cs))?;
+        push32(cpu, bus, next_ip)?;
+    }
+    cpu.cs
+        .load_descriptor_cache(new_cs_sel, parsed.base, parsed.limit, parsed.flags);
+    cpu.rip = u64::from(gate_offset);
     Ok(())
 }
 
