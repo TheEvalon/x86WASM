@@ -10,8 +10,10 @@
 //! Round-7: Timer 0 can raise a **device-level** interrupt latch when the main
 //! counter reaches the comparator while globally and per-timer enabled. Hosts
 //! advance the counter via [`HpetMmio::advance_main_counter`] (not step-clock).
-//! PIC / I/O APIC delivery is **not** auto-wired here — see
-//! `docs/hpet-r7-comparator-irq.md`.
+//! Round-8: Timer 0 periodic `Tn_VAL_SET_CNF` sequences update the period on
+//! the next comparator write (HPET 1.0a), then re-arm comparator = main+period
+//! on each fire. PIC / I/O APIC delivery is **not** auto-wired here — see
+//! `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`.
 
 /// Classic HPET MMIO base (PC firmware convention / ACPI GAS address).
 pub const HPET_DEFAULT_BASE: u64 = 0xFED0_0000;
@@ -120,6 +122,8 @@ pub struct HpetMmio {
     t0_comparator: u64,
     /// Periodic accumulator / next match (used when `Tn_TYPE_CNF` is set).
     t0_periodic_period: u64,
+    /// Pending `Tn_VAL_SET_CNF`: next comparator write loads the period.
+    t0_val_set_pending: bool,
     /// Edge-triggered IRQ latch (cleared when status is cleared).
     irq_edge_latched: bool,
     /// One-shot: suppress re-fire until comparator is rewritten.
@@ -144,6 +148,7 @@ impl HpetMmio {
             t0_config: 0,
             t0_comparator: 0,
             t0_periodic_period: 0,
+            t0_val_set_pending: false,
             irq_edge_latched: false,
             t0_oneshot_armed: true,
             qword_scratch: [0; 8],
@@ -172,6 +177,11 @@ impl HpetMmio {
 
     pub fn t0_comparator(&self) -> u64 {
         self.t0_comparator
+    }
+
+    /// Periodic period last loaded via `Tn_VAL_SET_CNF` + comparator write.
+    pub fn t0_periodic_period(&self) -> u64 {
+        self.t0_periodic_period
     }
 
     /// Timer 0 config as visible to software (writable bits + RO caps).
@@ -316,11 +326,10 @@ impl HpetMmio {
             if !route_ok {
                 retained &= !HPET_TN_INT_ROUTE_MASK;
             }
-            // Periodic type only if capability is set (it is).
+            // Spec: HPET 1.0a — Tn_VAL_SET_CNF is W1 and not retained; it arms
+            // the next comparator write to load the periodic accumulator.
             if raw & HPET_TN_VAL_SET != 0 {
-                // Spec: VAL_SET allows software to set the accumulator; we
-                // treat the current comparator as the periodic period.
-                self.t0_periodic_period = self.t0_comparator.max(1) & HPET_COUNTER_MASK;
+                self.t0_val_set_pending = true;
             }
             self.t0_config = retained;
         }
@@ -330,10 +339,23 @@ impl HpetMmio {
         self.qword_scratch = self.t0_comparator.to_le_bytes();
         if byte_index < 8 {
             self.qword_scratch[byte_index] = val;
-            self.t0_comparator = u64::from_le_bytes(self.qword_scratch) & HPET_COUNTER_MASK;
-            self.t0_oneshot_armed = true;
-            if self.t0_config & HPET_TN_TYPE_PERIODIC != 0 && self.t0_periodic_period == 0 {
-                self.t0_periodic_period = self.t0_comparator.max(1);
+            let value = u64::from_le_bytes(self.qword_scratch) & HPET_COUNTER_MASK;
+            self.t0_comparator = value;
+            // Commit period side effects once per 32-bit low-dword store
+            // (byte lanes 0..3 assembled; fire on lane 3) so multi-byte MMIO
+            // writes do not snapshot a partial value under VAL_SET.
+            if byte_index == 3 {
+                if self.t0_val_set_pending && self.t0_config & HPET_TN_TYPE_PERIODIC != 0 {
+                    // Spec: VAL_SET + comparator write → period; comparator
+                    // already holds the programmed value as next match seed.
+                    self.t0_periodic_period = value.max(1);
+                    self.t0_val_set_pending = false;
+                } else if self.t0_config & HPET_TN_TYPE_PERIODIC != 0
+                    && self.t0_periodic_period == 0
+                {
+                    self.t0_periodic_period = value.max(1);
+                }
+                self.t0_oneshot_armed = true;
             }
         }
     }
@@ -503,13 +525,18 @@ mod tests {
     fn timer0_periodic_rearms_comparator() {
         let mut hpet = HpetMmio::new();
         write_u32(&mut hpet, HPET_REG_CONFIG, 1);
-        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 10);
-        // VAL_SET + periodic + INT_ENB.
+        // VAL_SET + periodic + INT_ENB, then comparator write loads period.
         write_u32(
             &mut hpet,
             HPET_REG_T0_CONFIG,
             (HPET_TN_INT_ENB | HPET_TN_TYPE_PERIODIC | HPET_TN_VAL_SET) as u32,
         );
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 10);
+        assert_eq!(hpet.t0_periodic_period(), 10);
+        assert_eq!(hpet.t0_comparator(), 10);
+        // VAL_SET is not retained in the visible config.
+        assert_eq!(hpet.t0_config() & HPET_TN_VAL_SET, 0);
+
         assert!(hpet.advance_main_counter(10));
         assert!(hpet.irq_line());
         assert_eq!(hpet.t0_comparator(), 20);
@@ -518,6 +545,27 @@ mod tests {
         assert!(hpet.advance_main_counter(10));
         assert!(hpet.irq_line());
         assert_eq!(hpet.t0_comparator(), 30);
+    }
+
+    /// Spec: HPET 1.0a — after period is set, a normal comparator write changes next match.
+    #[test]
+    fn timer0_periodic_val_set_then_next_match_write() {
+        let mut hpet = HpetMmio::new();
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | HPET_TN_TYPE_PERIODIC | HPET_TN_VAL_SET) as u32,
+        );
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 5); // period = 5
+        // Without VAL_SET, rewrite comparator to first match at 20.
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 20);
+        assert_eq!(hpet.t0_periodic_period(), 5);
+        assert_eq!(hpet.t0_comparator(), 20);
+
+        assert!(!hpet.advance_main_counter(19));
+        assert!(hpet.advance_main_counter(1));
+        assert_eq!(hpet.t0_comparator(), 25); // 20 main + period 5 after fire at 20
     }
 
     #[test]
