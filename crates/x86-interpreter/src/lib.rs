@@ -1767,6 +1767,19 @@ fn eflags_iopl(rflags: u64) -> u8 {
     ((rflags >> 12) & 3) as u8
 }
 
+/// `#GP(0)` when VM86 software `INT n` lacks IOPL=3 (no VME).
+///
+/// Applies only to opcode `CD` (`INT imm8`). `INT3` and `INTO` are not
+/// IOPL-sensitive and must not call this. Spec: Intel SDM Vol. 3 §20.2.2
+/// Table 20-2; Vol. 2 INT n Virtual-8086 Mode Exceptions.
+fn require_vm86_iopl_for_soft_int(cpu: &CpuState) -> Result<(), ExecError> {
+    if eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
+        Err(arch_fault_with_error_code(13, 0))
+    } else {
+        Ok(())
+    }
+}
+
 /// `#GP(0)` when `CLI`/`STI` lack sufficient IOPL privilege (no VME/PVI).
 ///
 /// Real-address mode always succeeds. Protected mode (VM=0): require
@@ -2401,8 +2414,8 @@ fn protected_iret(
 /// Architectural CPL becomes 3 via `EFLAGS.VM=1`.
 ///
 /// Unsupported here: VME/PVI (`CR4` bits stay reserved/clear; CPUID does not
-/// advertise them); VM86 interrupt/exception delivery that builds this frame;
-/// 16-bit `IRET` enter (VM lives in EFLAGS[31:16]).
+/// advertise them); 16-bit `IRET` enter (VM lives in EFLAGS[31:16]).
+/// VM86→CPL0 delivery that **builds** this frame is in `deliver_protected_mode_gate`.
 ///
 /// Spec: Intel SDM Vol. 2 "IRET/IRETD" RETURN-TO-VIRTUAL-8086-MODE; Vol. 3
 /// §§20.2–20.3 Figure 20-4; Vol. 3 §3.4.2 (real-mode base).
@@ -2457,8 +2470,7 @@ fn return_to_virtual_8086_mode(
 /// Without VME: `IOPL < 3` → `#GP(0)`; `IOPL = 3` → real-mode-like pop that
 /// leaves `VM`/`IOPL`/`VIP`/`VIF` unchanged (Vol. 2 IRET
 /// RETURN-FROM-VIRTUAL-8086-MODE). Leaving VM86 entirely requires a privilege
-/// transition to CPL 0 (interrupt/task) then `IRETD` with `VM=0` in the image —
-/// interrupt delivery that builds the 9-dword frame remains unsupported.
+/// transition to CPL 0 (interrupt/task) then `IRETD` with `VM=0` in the image.
 ///
 /// Spec: Intel SDM Vol. 2 "IRET/IRETD"; Vol. 3 §20.2.3 / ch.20.
 fn vm86_iret(
@@ -4804,12 +4816,19 @@ impl ProtectedGateSource {
 /// 32-bit TSS, the new SS is validated at the inner CPL, and the outer
 /// `SS:ESP` are pushed ahead of the ordinary frame (Vol. 3 §6.12.1 Figure 6-5).
 /// Inner-stack accesses use supervisor mode (§4.6.1). Same-CPL delivery is
-/// unchanged. Task gates, VM86, and nested #DF/triple-fault remain out of scope.
+/// unchanged.
+///
+/// Virtual-8086 mode (`EFLAGS.VM=1`): architectural CPL is 3 (CS[1:0] is not
+/// RPL). A privilege-changing 386 gate pushes the **9-dword** VM86 frame
+/// GS/FS/DS/ES + SS:ESP + EFLAGS(with VM) + CS:EIP (Vol. 3 §20.2 Figure 20-2),
+/// then loads DS/ES/FS/GS with null selectors. 16-bit gates and same-CPL
+/// delivery from VM86 remain unsupported. Task gates, VME/PVI, and nested
+/// #DF synthesis beyond the existing path remain out of scope.
 ///
 /// Gate DPL is checked only for software INT/INT3/INTO. A violation raises
 /// #GP with IDT=1 and EXT=0; faults, NMI, and external IRQs bypass gate DPL.
 /// Spec: Intel SDM Vol. 2 INT n/INT3/INTO; Vol. 3
-/// §§6.10, 6.11.2, 6.12.1, 6.12.3, 6.13.
+/// §§6.10, 6.11.2, 6.12.1, 6.12.3, 6.13, 20.2–20.3.
 fn deliver_protected_mode_gate(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -4857,7 +4876,16 @@ fn deliver_protected_mode_gate(
         ));
     }
 
-    let cpl = (cpu.cs.selector & 3) as u8;
+    // VM86 forces CPL=3; CS[1:0] is not RPL (Vol. 3 §§5.5, 20.1.1).
+    let from_vm86 = eflags_vm(cpu.rflags);
+    let cpl = architectural_cpl(cpu);
+    if from_vm86 && !gate32 {
+        // VM86 extended frame is dword-width (Figure 20-2); 286 gates unsupported.
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::GateType(gate_access),
+        ));
+    }
     if cpu.cs.flags & x86_core::SegmentReg::FLAG_LONG != 0 {
         return Err(protected_mode_delivery_error(
             vector,
@@ -4929,6 +4957,14 @@ fn deliver_protected_mode_gate(
             ProtectedModeDeliveryError::TargetCode,
         ));
     }
+    // Same-CPL delivery from VM86 (handler DPL=3) is not modeled; monitors use
+    // ring-0 gates. Spec honesty: Vol. 3 §20.2 privilege-changing frame.
+    if from_vm86 && !privilege_change {
+        return Err(protected_mode_delivery_error(
+            vector,
+            ProtectedModeDeliveryError::CurrentPrivilege,
+        ));
+    }
     let new_cpl = dpl;
 
     let parsed_target = parse_segment_descriptor(descriptor);
@@ -4961,7 +4997,8 @@ fn deliver_protected_mode_gate(
 
     // Privilege-changing delivery loads SS:ESP from the TSS, then pushes the
     // outer SS:ESP before the ordinary FLAGS/CS/IP[/error] frame (Figure 6-5).
-    // Same-CPL keeps the current stack. Spec: Intel SDM Vol. 3 §6.12.1.
+    // From VM86, also push GS/FS/DS/ES ahead of SS:ESP (Figure 20-2).
+    // Same-CPL keeps the current stack. Spec: Intel SDM Vol. 3 §6.12.1 / §20.2.
     let error_code = source.error_code();
     let entry_size: usize = if gate32 { 4 } else { 2 };
     let saved_flags = if gate32 {
@@ -4971,6 +5008,10 @@ fn deliver_protected_mode_gate(
     };
     let old_ss = cpu.ss.selector;
     let old_sp = stack_pointer(cpu);
+    let old_es = cpu.es.selector;
+    let old_ds = cpu.ds.selector;
+    let old_fs = cpu.fs.selector;
+    let old_gs = cpu.gs.selector;
 
     let (stack_seg, mut final_sp, system_stack_access) = if privilege_change {
         let (ss_sel, esp) = read_tss32_inner_stack(cpu, bus, new_cpl, vector)?;
@@ -4990,10 +5031,11 @@ fn deliver_protected_mode_gate(
     };
 
     let mut frame_entries = Vec::with_capacity(if privilege_change {
+        let base = if from_vm86 { 9 } else { 5 };
         if error_code.is_some() {
-            6
+            base + 1
         } else {
-            5
+            base
         }
     } else if error_code.is_some() {
         4
@@ -5001,6 +5043,14 @@ fn deliver_protected_mode_gate(
         3
     });
     if privilege_change {
+        // Push order (first = highest address): GS, FS, DS, ES, SS, ESP, then
+        // EFLAGS/CS/EIP below. Spec: Vol. 3 Figure 20-2 / Figure 6-5.
+        if from_vm86 {
+            frame_entries.push(u32::from(old_gs));
+            frame_entries.push(u32::from(old_fs));
+            frame_entries.push(u32::from(old_ds));
+            frame_entries.push(u32::from(old_es));
+        }
         frame_entries.push(u32::from(old_ss));
         frame_entries.push(old_sp);
     }
@@ -5085,6 +5135,13 @@ fn deliver_protected_mode_gate(
     cpu.rflags &= !((1 << 8) | (1 << 14) | (1 << 16) | (1 << 17));
     if interrupt_gate {
         cpu.set_interrupt_flag(false);
+    }
+    // VM86 → protected: nullify data segments (Vol. 3 §20.2).
+    if from_vm86 {
+        cpu.es.load_null_selector(0);
+        cpu.ds.load_null_selector(0);
+        cpu.fs.load_null_selector(0);
+        cpu.gs.load_null_selector(0);
     }
     Ok(())
 }
@@ -6886,20 +6943,19 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xEA => {
             // JMP far ptr16:16 / ptr16:32.
-            // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H); Vol. 3 §5.8.1.
-            // Protected mode is bounded to ptr16:16 targeting a same-level
-            // nonconforming D=0 GDT code segment. Gates/tasks and ptr16:32 are
-            // separate slices.
+            // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
+            // Protected mode (VM=0) is bounded to GDT code / task targets.
+            // Virtual-8086 mode: real-address-like CS:IP reload; stay VM=1.
             let offset = if opsz32(&insn) {
                 insn.immediate as u32
             } else {
                 u32::from(insn.immediate as u16)
             };
             let selector = insn.displacement as u16;
-            if cr0_pe(cpu) {
+            if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                 protected_far_jump(cpu, bus, offset, selector, next_ip)?;
             } else {
-                // Real-address code fetch still uses IP16; ptr16:32 is truncated.
+                // Real-address / VM86: code fetch still uses IP16; ptr16:32 truncated.
                 cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
                 cpu.set_ip16(offset as u16);
             }
@@ -7026,16 +7082,17 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x9A => {
             // CALL far ptr16:16 / ptr16:32.
-            // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H); Vol. 3 §5.8.1.
-            // Protected mode: same-CPL nonconforming GDT code (no call gates).
-            // Real-address OperandSize=32: push CS (16) then EIP (32) — 6-byte frame.
+            // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
+            // Protected (VM=0): same-CPL GDT code / call gate / task.
+            // Virtual-8086: real-address-like push CS:IP; stay VM=1.
+            // Unsupported from VM86: privilege-changing call gates.
             let selector = insn.displacement as u16;
             let offset = if opsz32(&insn) {
                 insn.immediate as u32
             } else {
                 u32::from(insn.immediate as u16)
             };
-            if cr0_pe(cpu) {
+            if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                 protected_far_call(cpu, bus, offset, selector, next_ip, opsz32(&insn))?;
             } else if opsz32(&insn) {
                 push16(cpu, bus, cpu.cs.selector)?;
@@ -7217,21 +7274,24 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xCC => {
             // INT3 — one-byte breakpoint; saved return IP is the following byte.
-            // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §§6.4, 6.12.1.
-            // Unsupported here: ICEBP/INT1 (F1).
+            // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §§6.4, 6.12.1, 20.2.2.
+            // Not IOPL-sensitive in VM86 (Table 20-1). Unsupported: ICEBP/INT1.
             deliver_software_interrupt(cpu, bus, 3, next_ip)?;
         }
         0xCD => {
             // INT imm8 — saved return IP is the following instruction.
-            // Spec: Intel SDM Vol. 2 "INT n"; Vol. 3 §§6.4, 6.12.1.
+            // Spec: Intel SDM Vol. 2 "INT n"; Vol. 3 §§6.4, 6.12.1, 20.2.2.
+            // VM86 without VME: IOPL < 3 → #GP(0).
+            require_vm86_iopl_for_soft_int(cpu)?;
             deliver_software_interrupt(cpu, bus, insn.immediate as u8, next_ip)?;
         }
         0xCE => {
             // INTO — if OF=1, #OF (vector 4) trap; else fall through.
             // Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1";
-            // Vol. 3 §§6.12.1, 6.15 (#OF — trap).
+            // Vol. 3 §§6.12.1, 6.15 (#OF — trap), 20.2.2.
+            // INTO is not IOPL-sensitive in VM86 (unlike INT n).
             // Saved IP is the following instruction (trap class).
-            // Unsupported here: 64-bit mode (#UD).
+            // Unsupported here: 64-bit mode (#UD); VME redirect.
             if cpu.rflags & (1 << 11) != 0 {
                 deliver_software_interrupt(cpu, bus, 4, next_ip)?;
             } else {
@@ -7746,7 +7806,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                             .map_err(|e| classify_mem_fault(e, uses_ss))?;
                         (u32::from(offset), selector)
                     };
-                    if cr0_pe(cpu) {
+                    if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                         protected_far_call(cpu, bus, offset, selector, next_ip, op32)?;
                     } else if op32 {
                         push16(cpu, bus, cpu.cs.selector)?;
@@ -7797,9 +7857,10 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                             .map_err(|e| classify_mem_fault(e, uses_ss))?;
                         (u32::from(offset), selector)
                     };
-                    if cr0_pe(cpu) {
+                    if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                         protected_far_jump(cpu, bus, offset, selector, next_ip)?;
                     } else {
+                        // Real-address / VM86 (Vol. 3 §20.1): stay in current mode.
                         cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
                         cpu.set_ip16(offset as u16);
                     }
