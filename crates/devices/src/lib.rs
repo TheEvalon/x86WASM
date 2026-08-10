@@ -16,6 +16,10 @@
 //! 82077AA FDC port stub (0x3F0–0x3F5/0x3F7; Specify/Recalibrate/Seek/Sense Int; IRQ6);
 //! FDC READ ID track scan and Configure EIS implied seek (1.44MB media only);
 //! QEMU fw_cfg I/O subset (0x510/0x511 traditional + 0x514 DMA read/skip/select).
+//! Classic LPT1/LPT2 parallel-port register-file stub (0x378–0x37A / 0x278–0x27A).
+//! Local APIC MMIO identity stub at 0xFEE00000 (ID/Version; no delivery).
+//! HPET MMIO capability stub at 0xFED00000 (CAPS/ID; counter stuck at 0).
+//! I/O APIC MMIO stub at 0xFEC00000 (IOREGSEL/IOWIN + 24-entry RTE stub).
 
 #![forbid(unsafe_code)]
 
@@ -24,8 +28,12 @@ mod cmos;
 mod dma;
 mod fdc;
 mod fw_cfg;
+mod hpet;
 mod i8042;
 mod ide;
+mod ioapic;
+mod lapic;
+mod lpt;
 mod pci;
 mod pic;
 mod pit;
@@ -86,6 +94,11 @@ pub use fw_cfg::{
     FW_CFG_SYSTEM_STATE_ENABLED, FW_CFG_TEST_FILE_BYTES, FW_CFG_TEST_FILE_NAME, FW_CFG_UUID,
     FW_CFG_UUID_SIZE, FW_CFG_VERSION, FW_CFG_VERSION_DMA,
 };
+pub use hpet::{
+    HpetMmio, HPET_CAPS_ID_VALUE, HPET_CFG_ENABLE, HPET_COUNTER_CLK_PERIOD_FS, HPET_DEFAULT_BASE,
+    HPET_NUM_TIM_CAP, HPET_REG_CAPS_ID, HPET_REG_CONFIG, HPET_REG_MAIN_COUNTER, HPET_REV_ID,
+    HPET_VENDOR_ID, HPET_WINDOW_SIZE,
+};
 pub use i8042::{
     CFG_AUX_CLOCK_DISABLE, CFG_INT1, CFG_INT12, CFG_KBD_CLOCK_DISABLE, CFG_TRANSLATE,
     CMD_DISABLE_AUX, CMD_DISABLE_KBD, CMD_ENABLE_AUX, CMD_ENABLE_KBD, CMD_PULSE_RESET,
@@ -117,6 +130,19 @@ pub use ide::{
     IDE_SECONDARY_CTRL, IDE_SECONDARY_DATA, IDE_SECONDARY_DRIVE, IDE_SECONDARY_ERROR,
     IDE_SECONDARY_LBA_HI, IDE_SECONDARY_LBA_LO, IDE_SECONDARY_LBA_MID, IDE_SECONDARY_SECCOUNT,
     IDE_SECONDARY_STATUS,
+};
+pub use ioapic::{
+    IoApicMmio, IOAPIC_DEFAULT_BASE, IOAPIC_IND_ARB, IOAPIC_IND_ID, IOAPIC_IND_REDTBL0,
+    IOAPIC_IND_VER, IOAPIC_IOREGSEL, IOAPIC_IOWIN, IOAPIC_MAX_REDIRECTION_ENTRY,
+    IOAPIC_REDIRECTION_COUNT, IOAPIC_VERSION_ID, IOAPIC_VER_VALUE, IOAPIC_WINDOW_SIZE,
+};
+pub use lapic::{
+    LocalApicMmio, LAPIC_DEFAULT_BASE, LAPIC_MAX_LVT_ENTRY, LAPIC_REG_ID, LAPIC_REG_VERSION,
+    LAPIC_VERSION_ID, LAPIC_VERSION_VALUE, LAPIC_WINDOW_SIZE,
+};
+pub use lpt::{
+    ParallelPort, LPT1_BASE, LPT2_BASE, LPT_CONTROL, LPT_DATA, LPT_LAST_OFFSET, LPT_STATUS,
+    LPT_STATUS_BUSY_N, LPT_STATUS_NO_PRINTER,
 };
 pub use pci::{
     decode_bmide_prd, pirqrc_routed_irq, sanitize_piix_elcr, BmidePrdEntry, BmidePrdError,
