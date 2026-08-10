@@ -42,10 +42,10 @@
 //!   [`FW_CFG_FILE_MAX_CPUS`], all 16-bit little-endian and all kept in step by
 //!   [`FwCfg::set_cpu_count`]. Default `1`, which is the number of CPUs this
 //!   tree actually has.
-//! - Host-settable and **absent by default**: [`FW_CFG_UUID`] (`0x0002`),
-//!   [`FW_CFG_NOGRAPHIC`] (`0x0004`), [`FW_CFG_FILE_BOOTORDER`] and
-//!   [`FW_CFG_FILE_SYSTEM_STATES`]. Each describes a machine fact this device
-//!   cannot state on its own, so it stays absent until a host supplies it.
+//! - Host-settable and **absent by default** on the bare device: [`FW_CFG_UUID`]
+//!   (`0x0002`), [`FW_CFG_NOGRAPHIC`] (`0x0004`), [`FW_CFG_FILE_BOOTORDER`] and
+//!   [`FW_CFG_FILE_SYSTEM_STATES`]. The machine model publishes default
+//!   `bootorder` and `etc/system-states` (S0+S5) through sync.
 //!
 //! # Deliberately absent: `etc/table-loader`
 //!
@@ -128,14 +128,33 @@ pub const FW_CFG_FILE_MAX_CPUS: &str = "etc/max-cpus";
 ///
 /// Interface reference (ADR-0005): six bytes indexed by S-state, each with bit
 /// 7 marking the state as supported and bits 6:4 carrying the `SLP_TYP` value
-/// to write. **Absent by default** — this tree implements no ACPI power-state
-/// machine, so it has nothing truthful to say here. See
-/// [`FwCfg::set_system_states`].
+/// to write. The bare [`FwCfg`] device leaves the file **absent**;
+/// `Machine::sync_firmware_configuration` publishes
+/// [`FW_CFG_DEFAULT_SYSTEM_STATES`] once the PM1a sleep stub can honor S5
+/// (docs/fwcfg-r8-system-states.md, docs/acpi-r8-pm1-sleep.md).
 pub const FW_CFG_FILE_SYSTEM_STATES: &str = "etc/system-states";
 /// Number of bytes in the `etc/system-states` blob (one per S-state, S0–S5).
 pub const FW_CFG_SYSTEM_STATES_SIZE: usize = 6;
 /// `etc/system-states` per-state bit 7 — this sleep state is supported.
 pub const FW_CFG_SYSTEM_STATE_ENABLED: u8 = 0x80;
+/// Shift of `SLP_TYP` within an `etc/system-states` byte (bits 6:4).
+///
+/// Interface reference (ADR-0005): matches PM1_CNT `SLP_TYPx` placement in the
+/// published blob encoding.
+pub const FW_CFG_SYSTEM_STATE_SLP_TYP_SHIFT: u8 = 4;
+/// Machine-default `etc/system-states`: S0 + S5 only.
+///
+/// S0 is always “supported” (running). S5 soft-off uses `SLP_TYP=0`
+/// ([`crate::ACPI_SLP_TYP_S5`]) matching the PM1a sleep stub. S1–S4 stay clear
+/// — there is no resume machine (docs/fwcfg-r8-system-states.md).
+pub const FW_CFG_DEFAULT_SYSTEM_STATES: [u8; FW_CFG_SYSTEM_STATES_SIZE] = [
+    FW_CFG_SYSTEM_STATE_ENABLED, // S0
+    0,                           // S1
+    0,                           // S2
+    0,                           // S3
+    0,                           // S4
+    FW_CFG_SYSTEM_STATE_ENABLED | (0 << FW_CFG_SYSTEM_STATE_SLP_TYP_SHIFT), // S5, typ 0
+];
 /// Firmware file carrying the boot order as newline-separated device paths.
 ///
 /// Interface reference (ADR-0005): the file name and the NUL-terminated,
@@ -178,6 +197,9 @@ const _: () = assert!(FW_CFG_MAX_CPUS < FW_CFG_FILE_DIR);
 const _: () = assert!(FW_CFG_UUID_SIZE == 16);
 const _: () = assert!(FW_CFG_SYSTEM_STATES_SIZE == 6);
 const _: () = assert!(FW_CFG_SYSTEM_STATE_ENABLED == 1 << 7);
+const _: () = assert!(FW_CFG_SYSTEM_STATE_SLP_TYP_SHIFT == 4);
+const _: () = assert!(FW_CFG_DEFAULT_SYSTEM_STATES[0] == FW_CFG_SYSTEM_STATE_ENABLED);
+const _: () = assert!(FW_CFG_DEFAULT_SYSTEM_STATES[5] == FW_CFG_SYSTEM_STATE_ENABLED);
 const _: () = assert!(FW_CFG_DEFAULT_CPU_COUNT >= 1);
 
 /// DMA address register — high 32 bits (big-endian), x86 I/O.
@@ -484,9 +506,9 @@ impl FwCfg {
     /// [`FW_CFG_SYSTEM_STATE_ENABLED`] marking the state as supported and bits
     /// 6:4 carrying the `SLP_TYP` value.
     ///
-    /// This device never publishes the file on its own. Nothing in this tree
-    /// implements an ACPI power-state machine — the PIIX PM I/O block is a noop
-    /// store/readback — so it has no state it could honestly claim.
+    /// The bare device never publishes the file on its own. The machine model
+    /// publishes [`FW_CFG_DEFAULT_SYSTEM_STATES`] through sync once the PM1a
+    /// sleep stub can honor S5 (docs/fwcfg-r8-system-states.md).
     pub fn set_system_states(&mut self, states: [u8; FW_CFG_SYSTEM_STATES_SIZE]) -> u16 {
         self.set_file(FW_CFG_FILE_SYSTEM_STATES, states)
             .expect("etc/system-states is a valid fw_cfg file name")

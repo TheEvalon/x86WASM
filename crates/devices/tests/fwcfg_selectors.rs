@@ -167,11 +167,11 @@ fn bootorder_is_absent_until_a_host_states_a_policy() {
 }
 
 /// `etc/system-states` describes which ACPI sleep states the platform supports.
-/// This machine implements no ACPI power-state machine at all — the PIIX PM I/O
-/// block is a noop store/readback — so the file stays absent. A host that can
-/// justify the contents may publish them; nothing in this tree can.
+/// The bare [`FwCfg`] device leaves the file absent; a host (or
+/// `Machine::sync_firmware_configuration`) may publish a truthful blob via
+/// [`FwCfg::set_system_states`]. Spec / model: ADR-0005, docs/fwcfg-r8-system-states.md.
 #[test]
-fn system_states_is_absent_because_no_sleep_state_is_implemented() {
+fn system_states_absent_on_bare_device_and_publishable() {
     let mut cfg = FwCfg::new();
     assert_eq!(cfg.file_selector(FILE_SYSTEM_STATES), None);
     assert!(!cfg.file_names().contains(&FILE_SYSTEM_STATES));
