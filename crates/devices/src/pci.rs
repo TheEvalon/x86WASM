@@ -166,11 +166,10 @@
 //! - Subsystem identification: Subsystem Vendor ID / Subsystem ID are read-only
 //!   zero, so a guest cannot tell this machine apart by subsystem.
 //! - BIST: read-only zero; no built-in self test exists on any function.
-//! - PIIX IDE programming interface `0x80` advertises the bus-master IDE bit.
-//!   The BMIDE register block and the bounded PRD walkers exist, but there is
-//!   still no ATA-command-driven DMA engine behind them, so that bit is an
-//!   **overstatement inherited from round 2** and is recorded here rather than
-//!   quietly changed under firmware that keys on the PIIX3 device ID.
+//! - PIIX IDE programming interface [`PCI_PROG_IF_IDE_BUS_MASTER`] (`0x80`)
+//!   advertises the bus-master IDE bit to match the BMIDE BAR + host PRD
+//!   stubs. Guest BMICOM.SSBM and ATA READ|WRITE DMA do not start transfers;
+//!   see `docs/pci-r4-bar-sizing-and-enumeration.md`.
 //! - USB host controller (UHCI frame list / ports / IRQ)
 //! - ACPI SCI delivery onto the interrupt controller / SMI / GPE / sleep-state
 //!   transitions (`SLP_EN`) / ACPI tables
@@ -378,6 +377,15 @@ pub const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
 pub const PCI_SUBCLASS_USB: u8 = 0x03;
 /// UHCI programming interface (PCI class code prog IF).
 pub const PCI_PROG_IF_UHCI: u8 = 0x00;
+/// PIIX IDE programming interface: bus-master IDE capable (PCI class code bit 7).
+///
+/// Spec: PCI Local Bus — mass-storage / IDE Prog IF bit 7 advertises a bus-master
+/// IDE programming interface. This tree keeps `0x80` because the BMIDE I/O BAR
+/// and host-called PRD walkers exist (`start_bm_read` / `start_bm_write`). It does
+/// **not** mean a guest write to BMICOM.SSBM or an ATA READ/WRITE DMA command
+/// starts a transfer — see `docs/pci-r4-bar-sizing-and-enumeration.md` and
+/// `docs/pci-bmide-prd-directions.md`.
+pub const PCI_PROG_IF_IDE_BUS_MASTER: u8 = 0x80;
 /// Header type multi-function bit.
 pub const PCI_HEADER_MULTIFUNCTION: u8 = 0x80;
 /// Offset of Base Address Register 0 in a Type 0 configuration header.
@@ -1203,8 +1211,9 @@ impl PciConfig {
 
     fn init_piix_ide() -> [u8; 256] {
         let mut cfg = [0u8; 256];
-        // Spec: PCI class mass-storage / IDE (0x0101); prog IF 0x80 = bus master
-        // IDE capable bit advertised by classic PIIX; DMA engine still unsupported.
+        // Spec: PCI class mass-storage / IDE (0x0101); prog IF bit 7 =
+        // [`PCI_PROG_IF_IDE_BUS_MASTER`]. Qualified: BMIDE BAR + host PRD stubs
+        // exist; guest SSBM / ATA DMA commands do not start transfers.
         // Public PIIX3 IDE function ID 8086:7010.
         Self::write_id(
             &mut cfg,
@@ -1212,7 +1221,7 @@ impl PciConfig {
                 vendor: PCI_VENDOR_INTEL,
                 device: PCI_DEVICE_PIIX3_IDE,
                 revision: 0x00,
-                prog_if: 0x80,
+                prog_if: PCI_PROG_IF_IDE_BUS_MASTER,
                 subclass: PCI_SUBCLASS_IDE,
                 class: PCI_CLASS_STORAGE,
                 header_type: 0x00,
@@ -3168,7 +3177,7 @@ mod tests {
         let class_dword = pci.port_read(PCI_CONFIG_DATA, 4);
         assert_eq!((class_dword >> 24) as u8, PCI_CLASS_STORAGE);
         assert_eq!((class_dword >> 16) as u8, PCI_SUBCLASS_IDE);
-        assert_eq!((class_dword >> 8) as u8, 0x80); // prog IF bus-master capable bit
+        assert_eq!((class_dword >> 8) as u8, PCI_PROG_IF_IDE_BUS_MASTER);
     }
 
     /// Spec: Intel 82371SB — PIIX IDE BMIBA at PCI config `0x20` is an I/O BAR
