@@ -1380,6 +1380,16 @@ impl PciConfig {
         start < 0x64 && end > 0x60
     }
 
+    /// Mirror [`Self::acpi_sci_asserted`] onto a software PIRQ line.
+    ///
+    /// Spec: ACPI SCI is normally routed via FADT `SCI_INT` / interrupt-link,
+    /// not PIRQRC. This tree has no FADT yet, so the host may optionally soft-wire
+    /// the SCI **level** onto PIRQA–D for tests (docs/pci-r8-sci-pirq.md).
+    /// Does not touch DualPic until [`Self::sync_pirq_to_pic`].
+    pub fn sync_acpi_sci_to_pirq(&mut self, pirq: u8) {
+        self.set_pirq_line(pirq, self.acpi_sci_asserted());
+    }
+
     /// Drive DualPic ISA IRQ lines from latched PIRQ levels through PIRQRC routes.
     ///
     /// Spec: Intel 82371SB — when PIRQRC bit7 is clear, an asserted PIRQ# connects

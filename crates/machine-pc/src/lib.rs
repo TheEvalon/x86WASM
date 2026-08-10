@@ -1073,6 +1073,15 @@ impl Machine {
         self.pci.sync_pirq_to_pic(&mut self.pic);
     }
 
+    /// Soft-wire ACPI SCI level onto a software PIRQ and sync through PIRQRC.
+    ///
+    /// Spec: ACPI SCI / Intel 82371SB PIRQRC — optional host stub until FADT
+    /// `SCI_INT` exists (docs/pci-r8-sci-pirq.md). `pirq` is 0=A … 3=D.
+    pub fn sync_acpi_sci_to_pirq(&mut self, pirq: u8) {
+        self.pci.sync_acpi_sci_to_pirq(pirq);
+        self.pci.sync_pirq_to_pic(&mut self.pic);
+    }
+
     /// Re-apply latched PIRQ levels through current PIRQRC routes onto DualPic.
     ///
     /// Spec: Intel 82371SB — call after PIRQRC config writes while a PIRQ is held.
