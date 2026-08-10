@@ -13,9 +13,11 @@
 //! Round-8: Timer 0 periodic `Tn_VAL_SET_CNF` sequences update the period on
 //! the next comparator write (HPET 1.0a), then re-arm comparator = main+period
 //! on each fire. Round-10: host `Machine::advance_hpet_ioapic` drives I/O APIC
-//! GSI (default IRQ2) from [`HpetMmio::irq_line`] / [`HpetMmio::ioapic_gsi`] —
-//! see `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`,
-//! `docs/hpet-r10-ioapic-wire.md`.
+//! GSI (default IRQ2) from [`HpetMmio::irq_line`] / [`HpetMmio::ioapic_gsi`].
+//! Round-11: 32-bit main-counter wrap crossing is tested; level IRQ still
+//! asserted after EOI is re-driven onto the I/O APIC GSI (host wire).
+//! See `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`,
+//! `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`.
 
 /// Classic HPET MMIO base (PC firmware convention / ACPI GAS address).
 pub const HPET_DEFAULT_BASE: u64 = 0xFED0_0000;
@@ -241,6 +243,11 @@ impl HpetMmio {
     /// (status bit newly set / edge latched). When `ENABLE_CNF` is clear the
     /// counter is halted (HPET 1.0a) and this is a no-op. Not driven by the
     /// machine step clock — hosts must call this explicitly.
+    ///
+    /// Spec: HPET 1.0a with `COUNT_SIZE_CAP` clear — counter is 32-bit;
+    /// wrap from `0xFFFF_FFFF` → `0` is detected when the comparator lies in
+    /// the crossed range. A single `delta` that wraps more than once is not
+    /// fully simulated (at most one wrap edge is evaluated).
     pub fn advance_main_counter(&mut self, delta: u64) -> bool {
         if delta == 0 || self.config & HPET_CFG_ENABLE == 0 {
             return false;
@@ -622,5 +629,40 @@ mod tests {
             (HPET_TN_INT_ENB | (2 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
         );
         assert_eq!(hpet.ioapic_gsi(), 2);
+    }
+
+    /// Spec: HPET 1.0a — 32-bit main counter wrap can cross a low comparator.
+    #[test]
+    fn main_counter_32bit_wrap_crosses_comparator() {
+        let mut hpet = HpetMmio::new();
+        // Program main counter while halted so byte-wise MMIO assembly does not
+        // spuriously cross a live comparator.
+        write_u32(&mut hpet, HPET_REG_MAIN_COUNTER, 0xFFFF_FFF0);
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 0x10);
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | HPET_TN_INT_TYPE) as u32,
+        );
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        assert!(!hpet.irq_line());
+        // Advance past wrap: 0xFFFFFFF0 + 0x30 → 0x20, crossing cmp 0x10.
+        assert!(hpet.advance_main_counter(0x30));
+        assert_eq!(hpet.main_counter(), 0x20);
+        assert_eq!(hpet.intr_status() & 1, 1);
+        assert!(hpet.irq_line());
+    }
+
+    /// Spec: HPET 1.0a — wrap with comparator still ahead of `before` fires.
+    #[test]
+    fn main_counter_wrap_fires_when_comparator_near_top() {
+        let mut hpet = HpetMmio::new();
+        write_u32(&mut hpet, HPET_REG_MAIN_COUNTER, 0xFFFF_FFF0);
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 0xFFFF_FFF8);
+        write_u32(&mut hpet, HPET_REG_T0_CONFIG, HPET_TN_INT_ENB as u32);
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        assert!(hpet.advance_main_counter(0x20)); // crosses 0xFFFFFFF8 then wraps
+        assert_eq!(hpet.main_counter(), 0x10);
+        assert_eq!(hpet.intr_status() & 1, 1);
     }
 }

@@ -988,9 +988,12 @@ impl Machine {
 
     /// Local APIC EOI + I/O APIC Remote IRR clear for the retired vector.
     ///
-    /// Spec: SDM §10.8.5 / 82093AA Remote IRR. See `docs/ioapic-r8-eoi.md`.
+    /// Spec: SDM §10.8.5 / 82093AA Remote IRR. When HPET Timer 0 is still
+    /// level-asserted (`T0_INT_STS` set), re-drives the GSI so the I/O APIC can
+    /// re-deliver after Remote IRR clears — see `docs/hpet-r11-wrap-irq.md`.
     pub fn eoi_lapic_ioapic(&mut self) -> Option<u8> {
-        ioapic_wire::eoi_lapic_and_ioapic(&mut self.ioapic, &mut self.lapic)
+        hpet_wire::eoi_lapic_ioapic_resync_hpet(&self.hpet, &mut self.ioapic, &mut self.lapic)
+            .map(|(vec, _)| vec)
     }
 
     // -------------------------------------------------------------------------

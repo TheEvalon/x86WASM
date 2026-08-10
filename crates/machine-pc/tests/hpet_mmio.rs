@@ -109,7 +109,8 @@ fn machine_hpet_comparator_delivers_fixed_via_ioapic() {
     assert_eq!(m.pic.slave.irr, 0);
 }
 
-/// Spec: HPET level IRQ + IOAPIC level RTE — Remote IRR until EOI.
+/// Spec: HPET level IRQ + IOAPIC level RTE — Remote IRR until EOI; still-asserted
+/// HPET line re-delivers after EOI (R11).
 #[test]
 fn machine_hpet_level_ioapic_sets_remote_irr() {
     let mut m = Machine::new(64 * 1024);
@@ -149,6 +150,53 @@ fn machine_hpet_level_ioapic_sets_remote_irr() {
     assert_eq!(m.lapic.take_interrupt(), Some(0x53));
     // Still high + Remote IRR → suppressed.
     assert!(m.advance_hpet_ioapic(0).is_none());
+    // EOI clears Remote IRR; HPET level still asserted → re-delivery.
     assert_eq!(m.eoi_lapic_ioapic(), Some(0x53));
+    assert!(m.hpet.irq_line());
+    assert!(m.ioapic.remote_irr(2));
+    assert_eq!(m.lapic.take_interrupt(), Some(0x53));
+}
+
+/// Spec: HPET 1.0a + 82093AA — after EOI, W1C of T0_INT_STS drops the line so
+/// no re-assert.
+#[test]
+fn machine_hpet_level_eoi_no_reassert_after_status_clear() {
+    let mut m = Machine::new(64 * 1024);
+    write_u32_mmio(
+        &mut m,
+        LAPIC_DEFAULT_BASE,
+        LAPIC_REG_SVR,
+        LAPIC_SVR_SW_ENABLE | 0xFF,
+    );
+    assert!(m
+        .ioapic
+        .mmio_write_u8(IOAPIC_DEFAULT_BASE, IOAPIC_IND_REDTBL0 + 4));
+    write_u32_mmio(
+        &mut m,
+        IOAPIC_DEFAULT_BASE,
+        IOAPIC_IOWIN,
+        IOAPIC_RTE_LEVEL | 0x54,
+    );
+    assert!(m
+        .ioapic
+        .mmio_write_u8(IOAPIC_DEFAULT_BASE, IOAPIC_IND_REDTBL0 + 5));
+    write_u32_mmio(&mut m, IOAPIC_DEFAULT_BASE, IOAPIC_IOWIN, 0);
+
+    write_u32_mmio(&mut m, HPET_DEFAULT_BASE, HPET_REG_CONFIG, 1);
+    write_u32_mmio(
+        &mut m,
+        HPET_DEFAULT_BASE,
+        HPET_REG_T0_CONFIG,
+        (HPET_TN_INT_ENB | HPET_TN_INT_TYPE | (2 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+    );
+    write_u32_mmio(&mut m, HPET_DEFAULT_BASE, HPET_REG_T0_COMPARATOR, 5);
+    assert!(m.advance_hpet_ioapic(5).is_some());
+    assert_eq!(m.lapic.take_interrupt(), Some(0x54));
+    // Guest clears level status before EOI.
+    write_u32_mmio(&mut m, HPET_DEFAULT_BASE, devices::HPET_REG_INTR_STATUS, 1);
+    assert!(!m.hpet.irq_line());
+    let _ = m.sync_hpet_irq_to_ioapic();
+    assert_eq!(m.eoi_lapic_ioapic(), Some(0x54));
     assert!(!m.ioapic.remote_irr(2));
+    assert!(m.lapic.take_interrupt().is_none());
 }
