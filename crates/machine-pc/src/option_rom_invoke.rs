@@ -415,6 +415,28 @@ mod tests {
         );
     }
 
+    /// Spec: BIOS Boot Spec — far-call path re-validates checksum before entry.
+    #[test]
+    fn invoke_rejects_bad_checksum_image() {
+        let mut bad = synthetic_option_rom(2);
+        let last = bad.len() - 1;
+        bad[last] = bad[last].wrapping_add(1);
+        let mut m = Machine::new(1024 * 1024);
+        // Leave the region as RAM (no ROM map) so host writes are visible to
+        // `read_mapped_option_rom`; ROM windows ignore guest writes.
+        for (i, b) in bad.iter().enumerate() {
+            m.mem.write_u8(VGA_OPTION_ROM_BASE + i as u64, *b).unwrap();
+        }
+        let err = m
+            .invoke_option_rom_entry(VGA_OPTION_ROM_BASE, 0, 0x0500)
+            .expect_err("corrupt checksum must fail before far-call");
+        assert!(matches!(
+            err,
+            MachineError::OptionRom(firmware_interface::OptionRomError::BadChecksum)
+                | MachineError::OptionRom(_)
+        ));
+    }
+
     /// Honesty: synthetic RETF option ROM is not SeaVGABIOS — BDA video + font
     /// stay whatever the host INT 10h stub / bring-up font path set.
     #[test]

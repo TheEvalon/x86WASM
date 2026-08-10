@@ -115,10 +115,8 @@ impl Machine {
             INT10_MODE_03H_TEXT => {
                 self.vga.reset();
                 self.write_bda_video(mode, VGA_TEXT_COLS as u16, INT10_MODE03_PAGE_SIZE, 0, 0);
-                let _ = self.write_bda_cursor_type(
-                    INT10_MODE03_CURSOR_START,
-                    INT10_MODE03_CURSOR_END,
-                );
+                let _ =
+                    self.write_bda_cursor_type(INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END);
             }
             INT10_MODE_13H_GRAPHICS => {
                 self.vga.program_bios_mode13h();
@@ -370,7 +368,10 @@ mod tests {
         assert_eq!(m.mem.read_u8(BDA_VIDEO_COLS).unwrap(), VGA_TEXT_COLS as u8);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0).unwrap(), 0);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 1).unwrap(), 0);
-        assert_eq!(m.read_bda_u16(BDA_VIDEO_PAGE_SIZE), Some(INT10_MODE03_PAGE_SIZE));
+        assert_eq!(
+            m.read_bda_u16(BDA_VIDEO_PAGE_SIZE),
+            Some(INT10_MODE03_PAGE_SIZE)
+        );
         assert_eq!(m.read_bda_u16(BDA_VIDEO_PAGE_START), Some(0));
         assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
         assert_eq!(

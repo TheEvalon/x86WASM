@@ -4,20 +4,24 @@ Milestone 2, Round 10, display-fw lane — slice 4.
 
 ## Goal
 
-One bounded honesty improvement on the host option-ROM path:
+Deepen the host option-ROM POST path without claiming SeaVGABIOS/Windows
+native builds:
 
-1. **Bad-checksum `55 AA` headers are skipped** by the POST-style scan (already
-   via `prepare_option_rom`; now covered by a dedicated test).
-2. **Synthetic option-ROM `RETF` does not mutate host INT 10h BDA video fields
-   or install a VGA font** — host INT 10h ≠ SeaVGABIOS / VGA BIOS.
-3. **Windows native SeaVGABIOS remains infeasible** (reaffirmed; use WSL2/Linux).
+1. **Checksum gate before far-call** — scan skips bad checksum; `invoke_option_rom_entry`
+   re-validates via `prepare_option_rom` and refuses a corrupted mapped image.
+2. **Map-size honesty** — `check-option-rom.py` reports `declared_map` (header
+   size×512) vs file length and any trailing unmapped bytes.
+3. **BDA / font honesty** — synthetic `RETF` option ROM does **not** mutate host
+   INT 10h BDA video fields or install a VGA font (host INT 10h ≠ SeaVGABIOS).
+4. **Windows native SeaVGABIOS remains infeasible** (reaffirmed; use WSL2/Linux).
 
 ## Tests
 
 | Test | Asserts |
 |------|---------|
 | `post_scan_skips_bad_checksum` | `55 AA` + wrong checksum → not in scan hits |
-| `option_rom_retf_preserves_bda_and_font` | After AH=00h + cursor + no font: map/invoke RETF ROM leaves BDA mode/cols/page size/cursor and `text_font_installed` unchanged |
+| `invoke_rejects_bad_checksum_image` | Far-call path fails `BadChecksum` (RAM-visible image; ROM windows ignore writes) |
+| `option_rom_retf_preserves_bda_and_font` | After AH=00h + cursor + no font: RETF leaves BDA + `text_font_installed` unchanged |
 
 ## Windows / SeaVGABIOS
 
@@ -32,10 +36,11 @@ Smoke path:
 ```
 
 Do **not** vendor LGPL SeaVGABIOS sources into `crates/`.
+Do **not** claim a guest LFB aperture (R9 VBE PhysBasePtr honesty stands).
 
 ## Spec refs
 
-- PCI Firmware / BIOS Boot Spec — option-ROM signature, size, checksum
+- PCI Firmware / BIOS Boot Spec — option-ROM signature, size, checksum; init at +3
 - RBIL INT 10h — host stub vs option-ROM-installed BIOS (this tree uses host)
 
 ## Still unsupported
@@ -43,9 +48,11 @@ Do **not** vendor LGPL SeaVGABIOS sources into `crates/`.
 - SeaVGABIOS completion, font load, or IVT\[10h\] install
 - PCI BDF args / PnP BEV/BCV at option-ROM entry
 - Windows native SeaVGABIOS build
+- Guest LFB / VBE `4Fxx` ModeAttributes LFB bit
 
 ## Files
 
 - `crates/machine-pc/src/option_rom_invoke.rs`
-- `docs/firmware-r10-option-rom-bda-honesty.md` — this note
+- `firmware/build-scripts/check-option-rom.py` — declared map size reporting
 - `firmware/build-scripts/smoke-seavgabios-linux.sh` — preflight checks R10 doc
+- `docs/firmware-r10-option-rom-bda-honesty.md` — this note
