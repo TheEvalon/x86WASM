@@ -1,5 +1,5 @@
 //! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h/48h)
-//! and floppy subset (AH=00/02/03, `DL=00h`).
+//! and floppy subset (AH=00/02/03/08/15, `DL=00h`).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
 //! applies classic INT 13h register conventions against the primary IDE image
@@ -8,12 +8,12 @@
 //! translation modes.
 //!
 //! Spec: IBM PC BIOS INT 13h Disk Services (AH=00h reset, AH=02h read sectors,
-//! AH=03h write sectors, AH=08h get drive parameters); IBM/Microsoft INT 13h
-//! Extensions / RBIL (AH=41h check extensions, AH=42h extended read, AH=43h
-//! extended write, AH=48h extended drive parameters). ATA IDENTIFY obsolete
-//! geometry 16 heads / 63 sectors-per-track (matches `IdePrimary` IDENTIFY
-//! words 3/6). Floppy uses fixed 1.44MB geometry (80/2/18) via
-//! `Fdc82077::read_sector` / `Fdc82077::write_sector`.
+//! AH=03h write sectors, AH=08h get drive parameters, AH=15h get disk type);
+//! IBM/Microsoft INT 13h Extensions / RBIL (AH=41h check extensions, AH=42h
+//! extended read, AH=43h extended write, AH=48h extended drive parameters).
+//! ATA IDENTIFY obsolete geometry 16 heads / 63 sectors-per-track (matches
+//! `IdePrimary` IDENTIFY words 3/6). Floppy uses fixed 1.44MB geometry (80/2/18)
+//! via `Fdc82077::read_sector` / `Fdc82077::write_sector`.
 
 use crate::{Machine, MachineError};
 use devices::{FDC_1440_CYLINDERS, FDC_1440_HEADS, FDC_1440_SECTORS_PER_TRACK, FDC_SECTOR_SIZE};
@@ -32,6 +32,8 @@ pub const INT13_AH_READ: u8 = 0x02;
 pub const INT13_AH_WRITE: u8 = 0x03;
 /// AH=08h — get drive parameters.
 pub const INT13_AH_GET_DRIVE_PARAMS: u8 = 0x08;
+/// AH=15h — get disk type / media sense (AT and later).
+pub const INT13_AH_GET_DISK_TYPE: u8 = 0x15;
 /// AH=41h — check extensions present.
 pub const INT13_AH_CHECK_EXTENSIONS: u8 = 0x41;
 /// AH=42h — extended read sectors (Disk Address Packet).
@@ -70,6 +72,24 @@ pub const INT13_STATUS_WRITE_PROTECTED: u8 = 0x03;
 pub const INT13_STATUS_SECTOR_NOT_FOUND: u8 = 0x04;
 /// Drive not ready (no attached IDE / floppy image).
 pub const INT13_STATUS_TIMEOUT: u8 = 0x80;
+
+/// AH=15h type: no such drive (CF clear).
+pub const INT13_DISK_TYPE_NONE: u8 = 0x00;
+/// AH=15h type: floppy without change-line support.
+pub const INT13_DISK_TYPE_FLOPPY: u8 = 0x01;
+/// AH=15h type: floppy with change-line support (82077AA DIR DSKCHG).
+pub const INT13_DISK_TYPE_FLOPPY_CHANGE_LINE: u8 = 0x02;
+/// AH=15h type: hard disk.
+pub const INT13_DISK_TYPE_HARD: u8 = 0x03;
+
+/// AH=08h floppy `BL` — 1.44 MB 3½″ (CMOS/RBIL type `04h`).
+pub const INT13_FLOPPY_TYPE_1440: u8 = 0x04;
+/// Max cylinder for 1.44MB geometry (`FDC_1440_CYLINDERS - 1`).
+pub const INT13_FLOPPY_MAX_CYLINDER: u8 = FDC_1440_CYLINDERS - 1;
+/// Max head for 1.44MB geometry (`FDC_1440_HEADS - 1`).
+pub const INT13_FLOPPY_MAX_HEAD: u8 = FDC_1440_HEADS - 1;
+/// Sectors per track for 1.44MB geometry.
+pub const INT13_FLOPPY_SPT: u8 = FDC_1440_SECTORS_PER_TRACK;
 
 /// Heads matching IDE IDENTIFY obsolete word 3.
 pub const INT13_HD_HEADS: u16 = 16;
@@ -699,10 +719,12 @@ impl Machine {
 
     /// Host-side INT 13h floppy dispatch (`DL = 00h`) using current CPU registers.
     ///
-    /// Supports AH=00h reset, AH=02h read, AH=03h write against attached FDC
-    /// 1.44MB media. Spec: IBM PC BIOS INT 13h floppy disk services; geometry
-    /// matches [`FDC_1440_CYLINDERS`] / [`FDC_1440_HEADS`] /
-    /// [`FDC_1440_SECTORS_PER_TRACK`].
+    /// Supports AH=00h reset, AH=02h read, AH=03h write, AH=08h get-params, and
+    /// AH=15h get disk type against attached FDC 1.44MB media. Spec: IBM PC BIOS
+    /// INT 13h / RBIL floppy disk services; geometry matches
+    /// [`FDC_1440_CYLINDERS`] / [`FDC_1440_HEADS`] /
+    /// [`FDC_1440_SECTORS_PER_TRACK`]. Diskette parameter table (`ES:DI` on
+    /// AH=08h) is out of scope.
     pub fn service_int13_floppy(&mut self) {
         let dl = self.cpu.gpr_u8_low(CpuState::RDX);
         if dl != INT13_DRIVE_FD0 {
@@ -713,6 +735,8 @@ impl Machine {
             INT13_AH_RESET => self.int13_floppy_reset(),
             INT13_AH_READ => self.int13_floppy_read_from_regs(),
             INT13_AH_WRITE => self.int13_floppy_write_from_regs(),
+            INT13_AH_GET_DRIVE_PARAMS => self.int13_floppy_get_params(),
+            INT13_AH_GET_DISK_TYPE => self.int13_floppy_get_disk_type(),
             _ => self.int13_fail(INT13_STATUS_INVALID),
         }
     }
@@ -867,6 +891,41 @@ impl Machine {
             }
         }
     }
+
+    /// Spec: IBM BIOS / RBIL INT 13h AH=08h floppy — return 1.44MB max CHS and
+    /// drive type `BL=04h`. No media → [`INT13_STATUS_TIMEOUT`]. `ES:DI` diskette
+    /// parameter table is not filled (out of scope).
+    fn int13_floppy_get_params(&mut self) {
+        if !self.fdc.has_media() {
+            self.int13_fail(INT13_STATUS_TIMEOUT);
+            return;
+        }
+        self.cpu.set_gpr_u16(
+            CpuState::RCX,
+            pack_cx(u16::from(INT13_FLOPPY_MAX_CYLINDER), INT13_FLOPPY_SPT),
+        );
+        self.cpu
+            .set_gpr_u8(4 + CpuState::RDX, INT13_FLOPPY_MAX_HEAD);
+        self.cpu.set_gpr_u8_low(CpuState::RDX, 1); // one floppy drive
+        self.cpu.set_gpr_u8_low(CpuState::RBX, INT13_FLOPPY_TYPE_1440); // BL
+        self.cpu.set_al(0);
+        self.cpu.set_ah(INT13_STATUS_OK);
+        self.cpu.set_cf(false);
+    }
+
+    /// Spec: IBM BIOS / RBIL INT 13h AH=15h — disk type in `AH` with CF clear.
+    /// Attached 1.44MB media reports change-line support (`02h`); no media →
+    /// type `00h` (no such drive).
+    fn int13_floppy_get_disk_type(&mut self) {
+        if !self.fdc.has_media() {
+            self.cpu.set_ah(INT13_DISK_TYPE_NONE);
+            self.cpu.set_cf(false);
+            return;
+        }
+        // 82077AA DIR exposes DSKCHG — change-line capable floppy.
+        self.cpu.set_ah(INT13_DISK_TYPE_FLOPPY_CHANGE_LINE);
+        self.cpu.set_cf(false);
+    }
 }
 
 /// Advance floppy CHS by one sector within 1.44MB geometry.
@@ -924,6 +983,20 @@ pub fn setup_int13_floppy_write(
     cpu.set_gpr_u8(4 + CpuState::RDX, head);
     cpu.set_gpr_u16(CpuState::RBX, bx);
     cpu.es = x86_core::SegmentReg::real_mode(es);
+}
+
+/// Convenience: set up INT 13h AH=08h registers for floppy get-params.
+pub fn setup_int13_floppy_get_params(cpu: &mut CpuState) {
+    cpu.set_ah(INT13_AH_GET_DRIVE_PARAMS);
+    cpu.set_al(0);
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
+}
+
+/// Convenience: set up INT 13h AH=15h registers for floppy get disk type.
+pub fn setup_int13_floppy_get_disk_type(cpu: &mut CpuState) {
+    cpu.set_ah(INT13_AH_GET_DISK_TYPE);
+    cpu.set_al(0);
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
 }
 
 #[cfg(test)]
@@ -1410,6 +1483,52 @@ mod tests {
         m.service_int13_floppy();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: IBM/RBIL INT 13h AH=08h floppy — 1.44MB max CHS + `BL=04h`.
+    #[test]
+    fn int13_floppy_ah08_returns_1440_geometry() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        setup_int13_floppy_get_params(&mut m.cpu);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.gpr_u8_low(CpuState::RBX), INT13_FLOPPY_TYPE_1440);
+        let (cyl, spt) = unpack_cx(m.cpu.gpr_u16(CpuState::RCX));
+        assert_eq!(cyl, u16::from(INT13_FLOPPY_MAX_CYLINDER));
+        assert_eq!(spt, INT13_FLOPPY_SPT);
+        assert_eq!(m.cpu.gpr_u8(4 + CpuState::RDX), INT13_FLOPPY_MAX_HEAD);
+        assert_eq!(m.cpu.gpr_u8_low(CpuState::RDX), 1);
+    }
+
+    /// Spec: AH=08h with no floppy media → timeout (honest CF/AH).
+    #[test]
+    fn int13_floppy_ah08_no_media_timeout() {
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_floppy_get_params(&mut bare.cpu);
+        bare.service_int13();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    /// Spec: IBM/RBIL INT 13h AH=15h — change-line floppy when media attached.
+    #[test]
+    fn int13_floppy_ah15_reports_change_line_type() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        setup_int13_floppy_get_disk_type(&mut m.cpu);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_DISK_TYPE_FLOPPY_CHANGE_LINE);
+    }
+
+    /// Spec: AH=15h with no media → type `00h` (no such drive), CF clear.
+    #[test]
+    fn int13_floppy_ah15_no_media_type_none() {
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_floppy_get_disk_type(&mut bare.cpu);
+        bare.service_int13_floppy();
+        assert!(!cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_DISK_TYPE_NONE);
     }
 
     /// Spec: Phoenix EDD AH=48h — geometry + total sectors from IDE image.
