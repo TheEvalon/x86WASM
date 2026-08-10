@@ -213,6 +213,10 @@ pub struct Machine {
     pub com1: Serial16550,
     /// COM2 (`0x2F8`–`0x2FF`) — same 16550 debug-UART stub as COM1.
     pub com2: Serial16550,
+    /// COM3 (`0x3E8`–`0x3EF`) — POST probe UART stub (no IRQ wire this slice).
+    pub com3: Serial16550,
+    /// COM4 (`0x2E8`–`0x2EF`) — POST probe UART stub (no IRQ wire this slice).
+    pub com4: Serial16550,
     pub debug: DebugConsole,
     /// Dual 8259A — ICW + OCW/IRQ (ports 0x20/0x21/0xA0/0xA1).
     pub pic: DualPic,
@@ -291,6 +295,8 @@ impl Machine {
             mem: PhysMem::new(ram_size),
             com1: Serial16550::new(0x3F8),
             com2: Serial16550::new(0x2F8),
+            com3: Serial16550::new(0x3E8),
+            com4: Serial16550::new(0x2E8),
             debug: DebugConsole::new(),
             pic: DualPic::new(),
             pit: Pit8254::new(),
@@ -751,6 +757,8 @@ impl Machine {
         self.cpu = CpuState::reset();
         self.com1 = Serial16550::new(0x3F8);
         self.com2 = Serial16550::new(0x2F8);
+        self.com3 = Serial16550::new(0x3E8);
+        self.com4 = Serial16550::new(0x2E8);
         self.debug = DebugConsole::new();
         self.pic.reset();
         self.pit.reset();
@@ -804,6 +812,10 @@ impl Machine {
     /// SeaBIOS `qemu_reboot` (`PORT_PCI_REBOOT`). Returns `true` when a request
     /// was taken and reset ran. Called automatically after each [`Self::step`].
     /// Distinct from keyboard Resend `0xFE` on data port `0x60`.
+    ///
+    /// Battery-backed CMOS (including shutdown status `0Fh`) survives this reset
+    /// via [`CmosRtc::reset`]; the Machine does **not** dispatch on the shutdown
+    /// code (JMP via BDA `40:67` / INT 19h remain firmware).
     pub fn service_8042_pulse_reset(&mut self) -> bool {
         let from_kbd = self.kbd.take_system_reset_request();
         let from_port92 = self.port92.take_system_reset_request();
@@ -816,6 +828,21 @@ impl Machine {
         }
     }
 
+    /// IBM PC/AT CMOS shutdown status byte (index `0Fh`).
+    ///
+    /// Spec: RBIL CMOS 0Fh — see [`CmosRtc::shutdown_status`].
+    pub fn shutdown_status(&self) -> u8 {
+        self.cmos.shutdown_status()
+    }
+
+    /// Store CMOS shutdown / reset code (index `0Fh`).
+    ///
+    /// Spec: RBIL CMOS 0Fh — see [`CmosRtc::set_shutdown_status`]. Does not
+    /// dispatch POST resume actions.
+    pub fn set_shutdown_status(&mut self, code: u8) {
+        self.cmos.set_shutdown_status(code);
+    }
+
     /// Borrow the decode view for tests (`step`/`run` keep split borrows of `cpu`).
     #[cfg(test)]
     fn bus_mut(&mut self) -> MachineBus<'_> {
@@ -823,6 +850,8 @@ impl Machine {
             mem: &mut self.mem,
             com1: &mut self.com1,
             com2: &mut self.com2,
+            com3: &mut self.com3,
+            com4: &mut self.com4,
             debug: &mut self.debug,
             pic: &mut self.pic,
             pit: &mut self.pit,
@@ -863,6 +892,8 @@ impl Machine {
                 mem: &mut self.mem,
                 com1: &mut self.com1,
                 com2: &mut self.com2,
+                com3: &mut self.com3,
+                com4: &mut self.com4,
                 debug: &mut self.debug,
                 pic: &mut self.pic,
                 pit: &mut self.pit,
@@ -928,6 +959,16 @@ impl Machine {
     /// COM2 THR sink (separate from COM1 / debug port).
     pub fn com2_text(&self) -> String {
         self.com2.output().as_str_lossy()
+    }
+
+    /// COM3 THR sink (POST probe UART; no IRQ).
+    pub fn com3_text(&self) -> String {
+        self.com3.output().as_str_lossy()
+    }
+
+    /// COM4 THR sink (POST probe UART; no IRQ).
+    pub fn com4_text(&self) -> String {
+        self.com4.output().as_str_lossy()
     }
 
     pub fn debug_text(&self) -> String {
@@ -1144,6 +1185,8 @@ impl Machine {
             mem: &mut self.mem,
             com1: &mut self.com1,
             com2: &mut self.com2,
+            com3: &mut self.com3,
+            com4: &mut self.com4,
             debug: &mut self.debug,
             pic: &mut self.pic,
             pit: &mut self.pit,
@@ -1400,6 +1443,8 @@ struct MachineBus<'a> {
     mem: &'a mut PhysMem,
     com1: &'a mut Serial16550,
     com2: &'a mut Serial16550,
+    com3: &'a mut Serial16550,
+    com4: &'a mut Serial16550,
     debug: &'a mut DebugConsole,
     pic: &'a mut DualPic,
     pit: &'a mut Pit8254,
@@ -1707,7 +1752,9 @@ impl MachineBus<'_> {
             APM_CNT_PORT | APM_STS_PORT => self.apm.port_read(port, size),
             CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
+            0x2E8..0x2F0 => self.com4.port_read(port, size),
             0x2F8..0x300 => self.com2.port_read(port, size),
+            0x3E8..0x3F0 => self.com3.port_read(port, size),
             0x3F8..0x400 => self.com1.port_read(port, size),
             0x402 => self.debug.port_read(port, size),
             _ => self.ports.port_read(port, size),
@@ -1843,7 +1890,9 @@ impl MachineBus<'_> {
                 self.mem.set_a20_enabled(enabled);
                 self.port92.set_a20_enabled(enabled);
             }
+            0x2E8..0x2F0 => self.com4.port_write(port, size, value),
             0x2F8..0x300 => self.com2.port_write(port, size, value),
+            0x3E8..0x3F0 => self.com3.port_write(port, size, value),
             0x3F8..0x400 => self.com1.port_write(port, size, value),
             0x402 => self.debug.port_write(port, size, value),
             _ => self.ports.port_write(port, size, value),
@@ -3088,10 +3137,12 @@ mod tests {
     }
 
     /// Spec: IBM PC / OSDev Parallel Port — LPT1/LPT2 DATA/STATUS/CONTROL claimed;
-    /// `0x3E9`/`0x2E9` are not classic LPT and stay open-bus.
+    /// COM3/COM4 IER sites `0x3E9`/`0x2E9` are claimed by UART stubs (not LPT).
     #[test]
     fn machine_bus_lpt1_lpt2_claimed_probe_sites_open_bus() {
         let mut m = Machine::new(64 * 1024);
+        assert_eq!(m.lpt1.control(), devices::LPT_CONTROL_DEFAULT);
+        assert_eq!(m.lpt2.control(), devices::LPT_CONTROL_DEFAULT);
         {
             let mut bus = m.bus_mut();
             bus.port_out_u8(0x378, 0xA5).unwrap();
@@ -3104,10 +3155,44 @@ mod tests {
             assert_eq!(bus.port_in_u8(0x278).unwrap(), 0x5A);
             assert_eq!(bus.port_in_u8(0x279).unwrap(), LPT_STATUS_NO_PRINTER);
 
-            // Documented open-bus: not LPT DATA/STATUS/CONTROL.
-            assert_eq!(bus.port_in_u8(0x3E9).unwrap(), 0xFF);
-            assert_eq!(bus.port_in_u8(0x2E9).unwrap(), 0xFF);
+            // COM3/COM4 IER (historically logged POST probes) — claimed UART, IER=0.
+            assert_eq!(bus.port_in_u8(0x3E9).unwrap(), 0x00);
+            assert_eq!(bus.port_in_u8(0x2E9).unwrap(), 0x00);
+            // LPT3 window stays ISA open-bus (unclaimed).
+            assert_eq!(bus.port_in_u8(0x3BC).unwrap(), 0xFF);
         }
+    }
+
+    /// Spec: NS16550A / classic PC COM3 `0x3E8` / COM4 `0x2E8` — THR + LSR on MachineBus.
+    #[test]
+    fn machine_bus_com3_com4_probe_claimed() {
+        let mut m = Machine::new(64 * 1024);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(0x3E8, b'3').unwrap();
+            bus.port_out_u8(0x2E8, b'4').unwrap();
+            assert_eq!(bus.port_in_u8(0x3ED).unwrap() & 0x60, 0x60);
+            assert_eq!(bus.port_in_u8(0x2ED).unwrap() & 0x60, 0x60);
+        }
+        assert_eq!(m.com3_text(), "3");
+        assert_eq!(m.com4_text(), "4");
+    }
+
+    /// Spec: RBIL CMOS 0Fh — shutdown byte survives CF9/`Machine::reset` pulse.
+    #[test]
+    fn machine_cmos_shutdown_survives_cf9_pulse_reset() {
+        use devices::{CF9_RST_CPU, CF9_SYS_RST, PORT_RESET_CTRL, SHUTDOWN_JMP};
+        let mut m = Machine::new(64 * 1024);
+        m.set_shutdown_status(SHUTDOWN_JMP);
+        assert_eq!(m.shutdown_status(), SHUTDOWN_JMP);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PORT_RESET_CTRL, CF9_SYS_RST | CF9_RST_CPU)
+                .unwrap();
+        }
+        assert!(m.service_8042_pulse_reset());
+        assert_eq!(m.shutdown_status(), SHUTDOWN_JMP);
+        assert_eq!(m.cf9.value(), 0);
     }
 
     /// Spec: SDM Vol. 3A §10.4.4 / §10.4.8 — Local APIC ID/Version on MachineBus.

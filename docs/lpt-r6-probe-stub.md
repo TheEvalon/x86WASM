@@ -30,9 +30,9 @@ Status writes are ignored (input register; IRQ7 clear deferred).
 
 ## `0x3E9` / `0x2E9`
 
-These are **not** classic LPT register sites (COM3/COM4 `base+1` IER). They
-remain ISA open-bus in this slice; documented so a later UART or probe-note
-slice can own them deliberately.
+These are **not** classic LPT register sites (COM3/COM4 `base+1` IER). R6 left
+them ISA open-bus; **R13 claims them** as UART stubs — see
+`docs/platform-r13-com34.md`.
 
 ## Unsupported (explicit)
 
@@ -43,4 +43,9 @@ slice can own them deliberately.
 
 - `crates/devices/src/lpt.rs` unit tests.
 - `crates/machine-pc` unit tests `machine_bus_lpt1_lpt2_claimed_probe_sites_open_bus`.
-- `crates/machine-pc/tests/platform_io_r6.rs` probe claim coverage (with LAPIC/HPET/IOAPIC).
+- `crates/machine-pc/tests/lpt_ports.rs` probe claim coverage.
+
+## Follow-on
+
+R13 deepens control idle default and LPT2/LPT3 honesty:
+`docs/lpt-r13-primary.md`, `docs/lpt-r13-secondary.md`.

@@ -1,14 +1,29 @@
-//! COM1 (`0x3F8`), COM2 (`0x2F8`), and Bochs/QEMU-style debug port `0x402`.
+//! COM1 (`0x3F8`), COM2 (`0x2F8`), COM3 (`0x3E8`), COM4 (`0x2E8`), and Bochs/QEMU-style
+//! debug port `0x402`.
 //!
 //! 16550 programming model (M1/M2 debug UART + bounded RX):
 //! - THR (DLAB=0) appends to a per-port TX sink.
 //! - Host [`Serial16550::push_rx`] feeds RBR; LSR.DR and IER.ERBFI / IIR RDA
 //!   (`100b`) drive [`Serial16550::irq_line`] with priority over THRE.
-//! - Machine routes COM1 → IRQ4 and COM2 → IRQ3.
+//! - Machine routes COM1 → IRQ4 and COM2 → IRQ3. COM3/COM4 expose the same
+//!   register file for POST probes but do **not** share ISA IRQ4/IRQ3 in this
+//!   slice (shared-IRQ honesty deferred).
 //!
-//! Spec: NS16550A / classic PC COM1–COM2 I/O map (THR/RBR/IER/IIR/LSR subset).
+//! Spec: NS16550A / classic PC COM1–COM4 I/O map (THR/RBR/IER/IIR/LSR subset).
 
 use crate::PortDevice;
+
+/// Classic COM1 base (IRQ4 on a real PC/AT).
+pub const COM1_BASE: u16 = 0x3F8;
+/// Classic COM2 base (IRQ3).
+pub const COM2_BASE: u16 = 0x2F8;
+/// Classic COM3 base (historically IRQ4 shared; IRQ not wired here).
+pub const COM3_BASE: u16 = 0x3E8;
+/// Classic COM4 base (historically IRQ3 shared; IRQ not wired here).
+pub const COM4_BASE: u16 = 0x2E8;
+
+/// Width of a classic 16550 I/O window (THR…SCR).
+pub const COM_IO_SPAN: u16 = 8;
 
 const IER_RDA: u8 = 1 << 0;
 const IER_THRE: u8 = 1 << 1;
@@ -46,7 +61,7 @@ impl SerialOutput {
     }
 }
 
-/// Very small 16550 subset at a classic COM base (`0x3F8` COM1 / `0x2F8` COM2).
+/// Very small 16550 subset at a classic COM base (`0x3F8`/`0x2F8`/`0x3E8`/`0x2E8`).
 #[derive(Clone, Debug)]
 pub struct Serial16550 {
     pub base: u16,
@@ -66,7 +81,7 @@ pub struct Serial16550 {
 
 impl Default for Serial16550 {
     fn default() -> Self {
-        Self::new(0x3F8)
+        Self::new(COM1_BASE)
     }
 }
 
@@ -128,7 +143,15 @@ impl Serial16550 {
     }
 
     fn owns(&self, port: u16) -> bool {
-        (self.base..self.base.saturating_add(8)).contains(&port)
+        (self.base..self.base.saturating_add(COM_IO_SPAN)).contains(&port)
+    }
+
+    /// Whether `port` falls in any classic COM1–COM4 window.
+    pub fn owns_classic_com(port: u16) -> bool {
+        (COM1_BASE..COM1_BASE + COM_IO_SPAN).contains(&port)
+            || (COM2_BASE..COM2_BASE + COM_IO_SPAN).contains(&port)
+            || (COM3_BASE..COM3_BASE + COM_IO_SPAN).contains(&port)
+            || (COM4_BASE..COM4_BASE + COM_IO_SPAN).contains(&port)
     }
 
     fn lsr(&self) -> u8 {
@@ -441,5 +464,25 @@ mod tests {
     #[test]
     fn com1_and_com2_thre_interrupt_behavior_matches() {
         assert_eq!(thre_interrupt_trace(0x3F8), thre_interrupt_trace(0x2F8));
+    }
+
+    /// Spec: classic PC COM3 `0x3E8` / COM4 `0x2E8` — same 16550 window as COM1/2.
+    /// SeaBIOS POST historically probed IER at `0x3E9` / `0x2E9` (base+1).
+    #[test]
+    fn com3_com4_ier_and_lsr_probe_sites() {
+        let mut c3 = Serial16550::new(COM3_BASE);
+        let mut c4 = Serial16550::new(COM4_BASE);
+        assert_eq!(c3.port_read(COM3_BASE + 1, 1), 0); // IER
+        assert_eq!(c4.port_read(COM4_BASE + 1, 1), 0);
+        assert_eq!(c3.port_read(COM3_BASE + 5, 1) & 0x60, 0x60); // LSR THRE|TEMT
+        assert_eq!(c4.port_read(COM4_BASE + 5, 1) & 0x60, 0x60);
+        c3.port_write(COM3_BASE, 1, u32::from(b'3'));
+        c4.port_write(COM4_BASE, 1, u32::from(b'4'));
+        assert_eq!(c3.output().as_bytes(), b"3");
+        assert_eq!(c4.output().as_bytes(), b"4");
+        assert!(Serial16550::owns_classic_com(0x3E9));
+        assert!(Serial16550::owns_classic_com(0x2E9));
+        assert!(!Serial16550::owns_classic_com(0x3E7));
+        assert!(!Serial16550::owns_classic_com(0x2F0));
     }
 }
