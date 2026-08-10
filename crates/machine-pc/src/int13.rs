@@ -1,4 +1,4 @@
-//! Host-side IBM BIOS INT 13h hard-disk subset (AH=02 read at minimum).
+//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
 //! applies classic INT 13h register conventions against the primary IDE image,
@@ -7,8 +7,9 @@
 //! INT 13h (see [`crate::mbr`] for floppy → `0x7C00` handoff).
 //!
 //! Spec: IBM PC BIOS INT 13h Disk Services (AH=00h reset, AH=02h read sectors,
-//! AH=08h get drive parameters); ATA IDENTIFY obsolete geometry 16 heads / 63
-//! sectors-per-track (matches `IdePrimary` IDENTIFY words 3/6).
+//! AH=03h write sectors, AH=08h get drive parameters); ATA IDENTIFY obsolete
+//! geometry 16 heads / 63 sectors-per-track (matches `IdePrimary` IDENTIFY
+//! words 3/6).
 
 use crate::{Machine, MachineError};
 use x86_core::CpuState;
@@ -20,6 +21,8 @@ pub const INT13_DRIVE_HD0: u8 = 0x80;
 pub const INT13_AH_RESET: u8 = 0x00;
 /// AH=02h — read disk sectors into `ES:BX`.
 pub const INT13_AH_READ: u8 = 0x02;
+/// AH=03h — write disk sectors from `ES:BX`.
+pub const INT13_AH_WRITE: u8 = 0x03;
 /// AH=08h — get drive parameters.
 pub const INT13_AH_GET_DRIVE_PARAMS: u8 = 0x08;
 
@@ -58,6 +61,7 @@ impl Machine {
         match self.cpu.ah() {
             INT13_AH_RESET => self.int13_hd_reset(),
             INT13_AH_READ => self.int13_hd_read_from_regs(),
+            INT13_AH_WRITE => self.int13_hd_write_from_regs(),
             INT13_AH_GET_DRIVE_PARAMS => self.int13_hd_get_params(),
             _ => self.int13_fail(INT13_STATUS_INVALID),
         }
@@ -76,6 +80,50 @@ impl Machine {
         count: u8,
         dest: u64,
     ) -> Result<u8, u8> {
+        let (byte_off, bytes, dest) =
+            self.int13_hd_chs_bounds(cylinder, head, sector, count, dest)?;
+        for i in 0..bytes {
+            let b = self.ide.image[byte_off + i];
+            self.mem
+                .write_u8(dest + i as u64, b)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+        }
+        Ok(count)
+    }
+
+    /// Write `count` sectors from physical `src` into primary IDE at packed
+    /// INT 13h CHS, without touching CPU registers.
+    ///
+    /// Spec: IBM PC BIOS INT 13h AH=03h — same CHS packing as AH=02h; buffer
+    /// is the source.
+    pub fn int13_hd_write_chs_from_phys(
+        &mut self,
+        cylinder: u16,
+        head: u8,
+        sector: u8,
+        count: u8,
+        src: u64,
+    ) -> Result<u8, u8> {
+        let (byte_off, bytes, src) =
+            self.int13_hd_chs_bounds(cylinder, head, sector, count, src)?;
+        for i in 0..bytes {
+            let b = self
+                .mem
+                .read_u8(src + i as u64)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+            self.ide.image[byte_off + i] = b;
+        }
+        Ok(count)
+    }
+
+    fn int13_hd_chs_bounds(
+        &self,
+        cylinder: u16,
+        head: u8,
+        sector: u8,
+        count: u8,
+        phys: u64,
+    ) -> Result<(usize, usize, u64), u8> {
         if !self.ide.present || self.ide.image.is_empty() {
             return Err(INT13_STATUS_TIMEOUT);
         }
@@ -97,18 +145,11 @@ impl Machine {
 
         let byte_off = (start_lba as usize).saturating_mul(INT13_SECTOR_SIZE);
         let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
-        let end = dest.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
+        let end = phys.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
         if end > self.mem.ram_len() as u64 {
             return Err(INT13_STATUS_INVALID);
         }
-
-        for i in 0..bytes {
-            let b = self.ide.image[byte_off + i];
-            self.mem
-                .write_u8(dest + i as u64, b)
-                .map_err(|_| INT13_STATUS_INVALID)?;
-        }
-        Ok(count)
+        Ok((byte_off, bytes, phys))
     }
 }
 
@@ -141,6 +182,23 @@ impl Machine {
         let dest = self.cpu.es.base.wrapping_add(u64::from(bx));
 
         match self.int13_hd_read_chs_to_phys(cylinder, dh, sector, al, dest) {
+            Ok(n) => self.int13_ok_al(n),
+            Err(status) => {
+                self.cpu.set_al(0);
+                self.int13_fail(status);
+            }
+        }
+    }
+
+    fn int13_hd_write_from_regs(&mut self) {
+        let al = self.cpu.al();
+        let cx = self.cpu.gpr_u16(CpuState::RCX);
+        let dh = self.cpu.gpr_u8(4 + CpuState::RDX);
+        let bx = self.cpu.gpr_u16(CpuState::RBX);
+        let (cylinder, sector) = unpack_cx(cx);
+        let src = self.cpu.es.base.wrapping_add(u64::from(bx));
+
+        match self.int13_hd_write_chs_from_phys(cylinder, dh, sector, al, src) {
             Ok(n) => self.int13_ok_al(n),
             Err(status) => {
                 self.cpu.set_al(0);
@@ -212,6 +270,25 @@ pub fn setup_int13_hd_read(
     bx: u16,
 ) {
     cpu.set_ah(INT13_AH_READ);
+    cpu.set_al(count);
+    cpu.set_gpr_u16(CpuState::RCX, pack_cx(cylinder, sector));
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+    cpu.set_gpr_u8(4 + CpuState::RDX, head);
+    cpu.set_gpr_u16(CpuState::RBX, bx);
+    cpu.es = x86_core::SegmentReg::real_mode(es);
+}
+
+/// Convenience: set up INT 13h AH=03h registers for a hard-disk write.
+pub fn setup_int13_hd_write(
+    cpu: &mut CpuState,
+    cylinder: u16,
+    head: u8,
+    sector: u8,
+    count: u8,
+    es: u16,
+    bx: u16,
+) {
+    cpu.set_ah(INT13_AH_WRITE);
     cpu.set_al(count);
     cpu.set_gpr_u16(CpuState::RCX, pack_cx(cylinder, sector));
     cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
@@ -372,11 +449,86 @@ mod tests {
     #[test]
     fn int13_unsupported_ah_fails() {
         let mut m = Machine::with_ide(64 * 1024, synthetic_disk(1));
-        m.cpu.set_ah(0x42); // IBM/MS extensions — out of scope
+        m.cpu.set_ah(0x05); // Format track — out of scope
         m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
         m.service_int13_hd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: IBM BIOS INT 13h AH=03h — write ES:BX to CHS (0,0,1) / LBA0.
+    #[test]
+    fn int13_ah03_writes_lba0_from_es_bx() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        for i in 0..INT13_SECTOR_SIZE {
+            m.mem.write_u8(0x9000 + i as u64, 0x5A).unwrap();
+        }
+        m.mem.write_u8(0x9000, 0xE9).unwrap();
+        m.mem.write_u8(0x9000 + 510, MBR_SIGNATURE_LO).unwrap();
+        m.mem.write_u8(0x9000 + 511, MBR_SIGNATURE_HI).unwrap();
+        setup_int13_hd_write(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x9000);
+        m.service_int13_hd();
+
+        assert!(!cf(&m.cpu), "CF clear on success");
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.al(), 1);
+        assert_eq!(m.ide.image[0], 0xE9);
+        assert_eq!(m.ide.image[1], 0x5A);
+        assert_eq!(m.ide.image[510], MBR_SIGNATURE_LO);
+        assert_eq!(m.ide.image[511], MBR_SIGNATURE_HI);
+    }
+
+    /// Spec: multi-sector AH=03h writes consecutive LBAs.
+    #[test]
+    fn int13_ah03_writes_two_sectors() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        for i in 0..(2 * INT13_SECTOR_SIZE) {
+            m.mem.write_u8(0xA000 + i as u64, 0x11).unwrap();
+        }
+        m.mem.write_u8(0xA000, 0xAA).unwrap();
+        m.mem
+            .write_u8(0xA000 + INT13_SECTOR_SIZE as u64, 0xBB)
+            .unwrap();
+        setup_int13_hd_write(&mut m.cpu, 0, 0, 1, 2, 0x0000, 0xA000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.ide.image[0], 0xAA);
+        assert_eq!(m.ide.image[INT13_SECTOR_SIZE], 0xBB);
+    }
+
+    /// Spec: AH=03h then AH=02h round-trips the same buffer.
+    #[test]
+    fn int13_ah03_then_ah02_round_trip() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        for i in 0..INT13_SECTOR_SIZE {
+            m.mem.write_u8(0xB000 + i as u64, (i & 0xFF) as u8).unwrap();
+        }
+        setup_int13_hd_write(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0xB000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0xC000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        for i in 0..INT13_SECTOR_SIZE {
+            assert_eq!(m.mem.read_u8(0xC000 + i as u64).unwrap(), (i & 0xFF) as u8);
+        }
+    }
+
+    /// Spec: AH=03h OOB / no media mirror AH=02h status codes.
+    #[test]
+    fn int13_ah03_rejects_oob_and_no_media() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        assert_eq!(
+            m.int13_hd_write_chs_from_phys(0, 0, 1, 8, 0x7000),
+            Err(INT13_STATUS_SECTOR_NOT_FOUND)
+        );
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_hd_write(&mut bare.cpu, 0, 0, 1, 1, 0x0000, 0x7000);
+        bare.service_int13_hd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
     }
 
     #[test]

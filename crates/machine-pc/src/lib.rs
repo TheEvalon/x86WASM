@@ -30,9 +30,10 @@ mod xbcs;
 pub use guest_boot::{GuestBootMeasure, GuestBootMedia};
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int13::{
-    chs_to_lba, pack_cx, setup_int13_hd_read, unpack_cx, INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ,
-    INT13_AH_RESET, INT13_DRIVE_HD0, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE,
-    INT13_STATUS_INVALID, INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
+    chs_to_lba, pack_cx, setup_int13_hd_read, setup_int13_hd_write, unpack_cx,
+    INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ, INT13_AH_RESET, INT13_AH_WRITE, INT13_DRIVE_HD0,
+    INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE, INT13_STATUS_INVALID, INT13_STATUS_OK,
+    INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
 };
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::{
