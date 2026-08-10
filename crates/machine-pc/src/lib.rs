@@ -37,10 +37,10 @@ pub use guest_boot::{
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int10::{
-    setup_int10_get_cursor, setup_int10_set_cursor, setup_int10_set_mode, setup_int10_teletype,
-    BDA_ACTIVE_PAGE, BDA_CURSOR_PAGE0, BDA_CURSOR_TYPE, BDA_VIDEO_COLS, BDA_VIDEO_MODE,
-    INT10_AH_GET_CURSOR, INT10_AH_SET_CURSOR, INT10_AH_SET_MODE, INT10_AH_TELETYPE,
-    INT10_MODE03_CURSOR_END, INT10_MODE03_CURSOR_START, INT10_MODE_03H_TEXT,
+    setup_int10_get_cursor, setup_int10_get_mode, setup_int10_set_cursor, setup_int10_set_mode,
+    setup_int10_teletype, BDA_ACTIVE_PAGE, BDA_CURSOR_PAGE0, BDA_CURSOR_TYPE, BDA_VIDEO_COLS,
+    BDA_VIDEO_MODE, INT10_AH_GET_CURSOR, INT10_AH_GET_MODE, INT10_AH_SET_CURSOR, INT10_AH_SET_MODE,
+    INT10_AH_TELETYPE, INT10_MODE03_CURSOR_END, INT10_MODE03_CURSOR_START, INT10_MODE_03H_TEXT,
     INT10_MODE_13H_GRAPHICS, INT10_VECTOR,
 };
 pub use int13::{

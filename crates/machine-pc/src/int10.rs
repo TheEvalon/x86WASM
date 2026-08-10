@@ -1,4 +1,4 @@
-//! Host INT 10h video stub (AH=00h/02h/03h/0Eh).
+//! Host INT 10h video stub (AH=00h/02h/03h/0Eh/0Fh).
 //!
 //! Bring-up path only: installs a real-mode IVT pointer and services selected
 //! functions via [`Machine::service_int10`]. Not a VGA BIOS and not VBE
@@ -6,8 +6,9 @@
 //!
 //! Spec: Ralf Brown's Interrupt List — INT 10h AH=00h "SET VIDEO MODE",
 //! AH=02h "SET CURSOR POSITION", AH=03h "GET CURSOR POSITION AND SIZE",
-//! AH=0Eh "TELETYPE OUTPUT"; IBM PC BIOS Data Area video fields at
-//! `0040:0049` / `0040:004A` / `0040:0050` / `0040:0060` / `0040:0062`.
+//! AH=0Eh "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE"; IBM PC BIOS
+//! Data Area video fields at `0040:0049` / `0040:004A` / `0040:0050` /
+//! `0040:0060` / `0040:0062`.
 
 use crate::{Machine, MachineError};
 use devices::{VgaRenderMode, VGA_DEFAULT_ATTR, VGA_TEXT_COLS, VGA_TEXT_ROWS};
@@ -24,6 +25,8 @@ pub const INT10_AH_SET_CURSOR: u8 = 0x02;
 pub const INT10_AH_GET_CURSOR: u8 = 0x03;
 /// AH=0Eh — TELETYPE OUTPUT. Spec: RBIL INT 10h AH=0Eh.
 pub const INT10_AH_TELETYPE: u8 = 0x0E;
+/// AH=0Fh — GET CURRENT VIDEO MODE. Spec: RBIL INT 10h AH=0Fh.
+pub const INT10_AH_GET_MODE: u8 = 0x0F;
 
 /// BIOS mode 03h — 80×25 color text. Spec: IBM VGA / RBIL.
 pub const INT10_MODE_03H_TEXT: u8 = 0x03;
@@ -59,6 +62,7 @@ impl Machine {
     /// - AH=02h — set cursor position (page 0; BDA `0040:0050`)
     /// - AH=03h — get cursor position and size (page 0; BDA + CRTC scanlines)
     /// - AH=0Eh — teletype output in text mode (CR/LF/BS + printable)
+    /// - AH=0Fh — get current video mode (AL/AH/BH from BDA)
     ///
     /// Unsupported AH values leave CPU/VGA unchanged. Spec: RBIL INT 10h subset.
     pub fn service_int10(&mut self) {
@@ -67,6 +71,7 @@ impl Machine {
             INT10_AH_SET_CURSOR => self.int10_set_cursor(),
             INT10_AH_GET_CURSOR => self.int10_get_cursor(),
             INT10_AH_TELETYPE => self.int10_teletype(self.cpu.al()),
+            INT10_AH_GET_MODE => self.int10_get_mode(),
             _ => {}
         }
     }
@@ -157,6 +162,21 @@ impl Machine {
         self.cpu.set_gpr_u8_low(CpuState::RDX, col); // DL
         self.cpu.set_gpr_u8(4 + CpuState::RCX, start); // CH
         self.cpu.set_gpr_u8_low(CpuState::RCX, end); // CL
+    }
+
+    /// AH=0Fh GET CURRENT VIDEO MODE. Spec: RBIL — AL=mode, AH=columns, BH=page.
+    fn int10_get_mode(&mut self) {
+        let mode = self
+            .read_bda_u8(BDA_VIDEO_MODE)
+            .unwrap_or(INT10_MODE_03H_TEXT);
+        let cols = self
+            .read_bda_cols()
+            .unwrap_or(VGA_TEXT_COLS as u16)
+            .min(u16::from(u8::MAX)) as u8;
+        let page = self.read_bda_u8(BDA_ACTIVE_PAGE).unwrap_or(0);
+        self.cpu.set_al(mode);
+        self.cpu.set_ah(cols);
+        self.cpu.set_gpr_u8(4 + CpuState::RBX, page); // BH
     }
 
     fn int10_teletype(&mut self, ch: u8) {
@@ -278,6 +298,11 @@ pub fn setup_int10_set_cursor(cpu: &mut CpuState, page: u8, row: u8, col: u8) {
 pub fn setup_int10_get_cursor(cpu: &mut CpuState, page: u8) {
     cpu.set_ah(INT10_AH_GET_CURSOR);
     cpu.set_gpr_u8(4 + CpuState::RBX, page); // BH
+}
+
+/// Load AH for GET CURRENT VIDEO MODE.
+pub fn setup_int10_get_mode(cpu: &mut CpuState) {
+    cpu.set_ah(INT10_AH_GET_MODE);
 }
 
 /// Load AH/AL for teletype output.
@@ -411,6 +436,28 @@ mod tests {
         m.service_int10();
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0).unwrap(), 0);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn int10_ah0f_returns_mode_cols_page() {
+        // Spec: RBIL INT 10h AH=0Fh — AL=mode, AH=columns, BH=active page.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+
+        setup_int10_get_mode(&mut m.cpu);
+        m.service_int10();
+        assert_eq!(m.cpu.al(), INT10_MODE_03H_TEXT);
+        assert_eq!(m.cpu.ah(), VGA_TEXT_COLS as u8);
+        assert_eq!(m.cpu.gpr_u8(4 + CpuState::RBX), 0); // BH
+
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_13H_GRAPHICS);
+        m.service_int10();
+        setup_int10_get_mode(&mut m.cpu);
+        m.service_int10();
+        assert_eq!(m.cpu.al(), INT10_MODE_13H_GRAPHICS);
+        assert_eq!(m.cpu.ah(), 40);
+        assert_eq!(m.cpu.gpr_u8(4 + CpuState::RBX), 0);
     }
 
     #[test]
