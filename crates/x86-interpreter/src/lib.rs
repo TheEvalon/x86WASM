@@ -1563,6 +1563,42 @@ fn write_rm_u32(
     }
 }
 
+/// Read an 8-byte memory operand; register form is `#UD`.
+///
+/// Spec: Intel SDM Vol. 2 "CMPXCHG8B" — destination is memory only.
+fn read_mem_u64(cpu: &CpuState, bus: &mut dyn Bus, insn: &DecodedInsn) -> Result<u64, ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        return Err(arch_fault(6));
+    }
+    let (addr, _, uses_ss) = ea(cpu, insn, 8)?;
+    let lo = bus
+        .read_u32(addr)
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    let hi = bus
+        .read_u32(addr.wrapping_add(4))
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    Ok(u64::from(lo) | (u64::from(hi) << 32))
+}
+
+/// Write an 8-byte memory operand; register form is `#UD`.
+fn write_mem_u64(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    val: u64,
+) -> Result<(), ExecError> {
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    if m.mod_ == 3 {
+        return Err(arch_fault(6));
+    }
+    let (addr, _, uses_ss) = ea(cpu, insn, 8)?;
+    bus.write_u32(addr, val as u32)
+        .map_err(|e| classify_mem_fault(e, uses_ss))?;
+    bus.write_u32(addr.wrapping_add(4), (val >> 32) as u32)
+        .map_err(|e| classify_mem_fault(e, uses_ss))
+}
+
 /// Stack-address size selected by the cached `SS.B` bit.
 ///
 /// The `0x67` address-size prefix applies to memory operands, **not** to the
@@ -1771,25 +1807,18 @@ fn parse_segment_descriptor(desc: [u8; 8]) -> ParsedSegmentDescriptor {
     ParsedSegmentDescriptor { base, limit, flags }
 }
 
-/// Same-level protected-mode direct far jump through a GDT code segment.
+/// Validate a same-CPL protected far code transfer without committing state.
 ///
-/// This bounded path accepts only nonconforming ring-0 code segments, with
-/// either `D=0` (16-bit) or `D=1` (default-32) execution; `L=1` remains out of
-/// scope. `target_offset` is the full `ptr16:32` / `m16:32` offset (a
-/// `ptr16:16` form supplies a zero-extended 16-bit offset). Selector
-/// validation faults use the selector-derived error code; a target offset past
-/// the effective segment limit raises `#GP(0)`. The visible CS selector, hidden
-/// cache (including the D/B, AVL, L, and G attributes), and EIP are committed
-/// together only after all eight descriptor bytes and every check succeed.
-///
-/// Spec: Intel SDM Vol. 2 JMP (Operation; Protected Mode Exceptions); Vol. 3
-/// §§3.4.5, 5.8.1, 6.13.
-fn protected_far_jump(
-    cpu: &mut CpuState,
+/// Accepts a present nonconforming `L=0` GDT code segment at CPL 0 with
+/// `DPL == CPL` and `RPL ≤ CPL`. Returns the CPL-adjusted selector and parsed
+/// descriptor cache fields. Spec: Intel SDM Vol. 2 JMP/CALL (Protected Mode
+/// Exceptions); Vol. 3 §§3.4.5, 5.8.1, 6.13.
+fn prepare_protected_far_cs(
+    cpu: &CpuState,
     bus: &mut dyn Bus,
     target_offset: u32,
     selector: u16,
-) -> Result<(), ExecError> {
+) -> Result<(u16, ParsedSegmentDescriptor), ExecError> {
     if is_null_selector(selector) {
         return Err(selector_fault(13, selector));
     }
@@ -1833,16 +1862,55 @@ fn protected_far_jump(
         return Err(selector_fault(13, selector));
     }
     if target_offset > parsed.limit {
-        // JMP Protected Mode Exceptions: target offset beyond CS.limit → #GP(0).
+        // Target offset beyond CS.limit → #GP(0).
         return Err(arch_fault_with_error_code(13, 0));
     }
 
-    cpu.cs.load_descriptor_cache(
-        (selector & !3) | u16::from(cpl),
-        parsed.base,
-        parsed.limit,
-        parsed.flags,
-    );
+    Ok(((selector & !3) | u16::from(cpl), parsed))
+}
+
+/// Protected-mode far `JMP` into a same-CPL GDT code segment.
+///
+/// This bounded path accepts only nonconforming ring-0 code segments, with
+/// either `D=0` (16-bit) or `D=1` (default-32) execution; `L=1` remains out of
+/// scope. Spec: Intel SDM Vol. 2 JMP; Vol. 3 §§3.4.5, 5.8.1, 6.13.
+fn protected_far_jump(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    target_offset: u32,
+    selector: u16,
+) -> Result<(), ExecError> {
+    let (sel, parsed) = prepare_protected_far_cs(cpu, bus, target_offset, selector)?;
+    cpu.cs
+        .load_descriptor_cache(sel, parsed.base, parsed.limit, parsed.flags);
+    cpu.rip = u64::from(target_offset);
+    Ok(())
+}
+
+/// Protected-mode far `CALL` into a same-CPL GDT code segment.
+///
+/// Validates the target first, then pushes the return `CS`/`IP` (or `EIP`) link,
+/// then loads CS. Call gates, privilege changes, and LDT targets remain
+/// unsupported. Spec: Intel SDM Vol. 2 CALL; Vol. 3 §§5.8.1, 6.13.
+fn protected_far_call(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    target_offset: u32,
+    selector: u16,
+    next_ip: u32,
+    operand_size_32: bool,
+) -> Result<(), ExecError> {
+    let (sel, parsed) = prepare_protected_far_cs(cpu, bus, target_offset, selector)?;
+    let return_cs = cpu.cs.selector;
+    if operand_size_32 {
+        push16(cpu, bus, return_cs)?;
+        push32(cpu, bus, next_ip)?;
+    } else {
+        push16(cpu, bus, return_cs)?;
+        push16(cpu, bus, next_ip as u16)?;
+    }
+    cpu.cs
+        .load_descriptor_cache(sel, parsed.base, parsed.limit, parsed.flags);
     cpu.rip = u64::from(target_offset);
     Ok(())
 }
@@ -2025,6 +2093,120 @@ fn read_gdt_segment_descriptor(
             .map_err(|error| classify_mem_fault(error, false))?;
     }
     Ok(descriptor)
+}
+
+/// Soft GDT descriptor fetch for `LAR`/`LSL`: null, LDT (TI=1), or out-of-limit
+/// returns `None` (caller clears ZF). Memory faults still propagate.
+/// Spec: Intel SDM Vol. 2 "LAR"/"LSL"; Vol. 3 §§3.5.1, 5.5.
+fn try_read_gdt_descriptor_for_lar_lsl(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<Option<[u8; 8]>, ExecError> {
+    if is_null_selector(selector) || selector & 0x4 != 0 {
+        return Ok(None);
+    }
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Ok(None);
+    }
+    let addr = cpu.gdtr.base.wrapping_add(offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(Some(descriptor))
+}
+
+/// Whether a descriptor type is valid for `LAR` (SDM Vol. 2 Table for LAR).
+fn lar_type_valid(access: u8) -> bool {
+    if access & 0x10 != 0 {
+        return true; // all code/data
+    }
+    matches!(access & 0x0F, 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x9 | 0xB | 0xC)
+}
+
+/// Whether a descriptor type is valid for `LSL` (SDM Vol. 2 Table for LSL).
+fn lsl_type_valid(access: u8) -> bool {
+    if access & 0x10 != 0 {
+        return true; // all code/data
+    }
+    matches!(access & 0x0F, 0x1 | 0x2 | 0x3 | 0x9 | 0xB)
+}
+
+/// Soft privilege / type check shared by `LAR` and `LSL`.
+///
+/// Not-present descriptors clear ZF. Conforming code skips the DPL check.
+/// Spec: Intel SDM Vol. 2 "LAR"/"LSL".
+fn lar_lsl_descriptor_usable(access: u8, selector: u16, cpl: u8, for_lsl: bool) -> bool {
+    if access & 0x80 == 0 {
+        return false;
+    }
+    if for_lsl {
+        if !lsl_type_valid(access) {
+            return false;
+        }
+    } else if !lar_type_valid(access) {
+        return false;
+    }
+    let s_bit = access & 0x10 != 0;
+    let executable = access & 0x08 != 0;
+    let conforming = s_bit && executable && access & 0x04 != 0;
+    if conforming {
+        return true;
+    }
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    cpl <= dpl && rpl <= dpl
+}
+
+/// Access-rights value loaded by `LAR` (bits 7:0 and 31:24 clear; 19:16 zeroed).
+fn lar_access_rights_value(desc: [u8; 8]) -> u32 {
+    (u32::from(desc[5]) << 8) | (u32::from(desc[6] & 0xF0) << 16)
+}
+
+/// Execute `LAR` or `LSL`. Real-address mode → `#UD`.
+///
+/// Spec: Intel SDM Vol. 2 "LAR"/"LSL". Unsupported here: LDT resolution (TI=1
+/// clears ZF), long mode, and the `#UD` for a `LOCK` prefix.
+fn exec_lar_lsl(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    for_lsl: bool,
+) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        return Err(arch_fault(6));
+    }
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    // Source selector is always 16-bit (r16/m16), even under a 32-bit operand size.
+    let selector = read_rm_u16(cpu, bus, insn)?;
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let ok = match try_read_gdt_descriptor_for_lar_lsl(cpu, bus, selector)? {
+        Some(desc) if lar_lsl_descriptor_usable(desc[5], selector, cpl, for_lsl) => {
+            if for_lsl {
+                let limit = parse_segment_descriptor(desc).limit;
+                if opsz32(insn) {
+                    cpu.set_gpr_u32(m.reg as usize, limit);
+                } else {
+                    cpu.set_gpr_u16(m.reg as usize, limit as u16);
+                }
+            } else {
+                let ar = lar_access_rights_value(desc);
+                if opsz32(insn) {
+                    cpu.set_gpr_u32(m.reg as usize, ar);
+                } else {
+                    cpu.set_gpr_u16(m.reg as usize, ar as u16);
+                }
+            }
+            true
+        }
+        _ => false,
+    };
+    cpu.set_zf(ok);
+    Ok(())
 }
 
 /// Validate a DS/ES/FS/GS descriptor and return cached base/limit/AR.
@@ -3664,15 +3846,17 @@ const CPUID_FEATURE_CMOV: u32 = 1 << 15;
 /// * `PSE` — `CR4.PSE` and 4-MiB pages are implemented by the paging engine,
 ///   and §4.1.4 makes the CPUID bit the guest's licence to set `CR4.PSE`.
 /// * `MSR` — `RDMSR`/`WRMSR` decode, check privilege, and raise the
-///   architectural `#GP` for the MSR addresses they do not implement.
+///   architectural `#GP` for the MSR addresses they do not implement (except
+///   the bounded `IA32_APIC_BASE` presence path).
 /// * `PGE` — `CR4.PGE` and global-page TLB retention are implemented.
 /// * `CMOV` — the `0F 40`–`0F 4F` conditional moves are implemented. The
 ///   `FCMOVcc` half of this bit's definition needs an FPU, which `FPU`
 ///   (`EDX[0]`) correctly reports as absent.
 ///
-/// Deliberately still clear: `PAE` (`EDX[6]`), `PAT` (`EDX[16]`) and `PSE-36`
-/// (`EDX[17]`) — the paging engine models none of them, and its default profile
-/// assumes exactly that. Everything else — `FPU`, `TSC`, `APIC`, `MTRR`, `CX8`,
+/// Deliberately still clear: `CX8` (`EDX[8]`) even though `CMPXCHG8B` executes
+/// — Round 6 keeps the feature bit clear until the form is considered solid;
+/// `PAE` (`EDX[6]`), `PAT` (`EDX[16]`) and `PSE-36` (`EDX[17]`) — the paging
+/// engine models none of them. Everything else — `FPU`, `TSC`, `APIC`, `MTRR`,
 /// `MMX`, `SSE` — stays clear because none of those are implemented.
 /// Spec: Intel SDM Vol. 2 "CPUID" (Table 3-11); Vol. 3 §4.1.4; `AGENTS.md`
 /// truthful-CPUID rule.
@@ -3741,22 +3925,56 @@ fn cpuid_leaf(leaf: u32) -> CpuidResult {
     }
 }
 
+/// `IA32_APIC_BASE` MSR index. Spec: Intel SDM Vol. 4 MSR `1Bh`.
+const MSR_IA32_APIC_BASE: u32 = 0x1B;
+/// BSP flag (bit 8). Spec: SDM Vol. 3 §10.4.4.
+const IA32_APIC_BASE_BSP: u64 = 1 << 8;
+/// Enable x2APIC mode (bit 10 / EXTD) — unsupported; writing 1 raises `#GP(0)`.
+const IA32_APIC_BASE_X2APIC: u64 = 1 << 10;
+/// APIC Global Enable (bit 11 / EN). Spec: SDM Vol. 3 §10.4.4.
+const IA32_APIC_BASE_ENABLE: u64 = 1 << 11;
+/// Fields software may write: EN | base[35:12] (36-bit physical address model).
+/// BSP is read-only and forced from the prior value; bits 0–7, 9, 10 (x2APIC),
+/// and [63:36] are reserved for this tree.
+const IA32_APIC_BASE_SOFTWARE_WRITABLE: u64 = IA32_APIC_BASE_ENABLE | 0x0000_000F_FFFF_F000;
+
 /// Read a model-specific register, or `None` when the address is reserved or
 /// unimplemented.
 ///
-/// No MSR is implemented in this slice. The emulator models no time-stamp
-/// counter, local APIC, MTRRs, `SYSENTER` state, or `EFER`, so there is nothing
-/// it could report truthfully; every address takes the architectural `#GP` path
-/// rather than returning a fabricated zero.
+/// Implemented: `IA32_APIC_BASE` (`0x1B`) only. Every other address takes the
+/// architectural `#GP` path rather than returning a fabricated zero.
 /// Spec: Intel SDM Vol. 2 "RDMSR"; Vol. 4 (MSR listings).
-fn read_msr(_index: u32) -> Option<u64> {
-    None
+fn read_msr(cpu: &CpuState, index: u32) -> Option<u64> {
+    match index {
+        MSR_IA32_APIC_BASE => Some(cpu.ia32_apic_base),
+        _ => None,
+    }
 }
 
 /// Write a model-specific register, returning `false` when the address is
-/// reserved or unimplemented. See [`read_msr`] — no MSR is implemented.
-fn write_msr(_index: u32, _value: u64) -> bool {
-    false
+/// reserved/unimplemented or the value sets a reserved bit (`#GP`).
+///
+/// Spec: Intel SDM Vol. 2 "WRMSR"; Vol. 3 §10.4.4 / Vol. 4 IA32_APIC_BASE.
+fn write_msr(cpu: &mut CpuState, index: u32, value: u64) -> bool {
+    match index {
+        MSR_IA32_APIC_BASE => {
+            // x2APIC EXTD (bit 10) and any other non-software-writable bit → #GP(0).
+            // BSP (bit 8) is read-only: a write that changes it is also `#GP`.
+            let prior_bsp = cpu.ia32_apic_base & IA32_APIC_BASE_BSP;
+            if value & IA32_APIC_BASE_X2APIC != 0 {
+                return false;
+            }
+            if value & !(IA32_APIC_BASE_SOFTWARE_WRITABLE | IA32_APIC_BASE_BSP) != 0 {
+                return false;
+            }
+            if value & IA32_APIC_BASE_BSP != prior_bsp {
+                return false;
+            }
+            cpu.ia32_apic_base = (value & IA32_APIC_BASE_SOFTWARE_WRITABLE) | prior_bsp;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `#GP(0)` unless the processor is at CPL 0.
@@ -4623,6 +4841,18 @@ fn step_two_byte(
                 _ => Err(ExecError::Unsupported(0x00)),
             }
         }
+        0x02 => {
+            // LAR r, r/m16 — Spec: Intel SDM Vol. 2 "LAR".
+            exec_lar_lsl(cpu, bus, insn, false)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0x03 => {
+            // LSL r, r/m16 — Spec: Intel SDM Vol. 2 "LSL".
+            exec_lar_lsl(cpu, bus, insn, true)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
         0x01 => {
             // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2;
             // "SGDT"/"SIDT"/"LGDT"/"LIDT"/"SMSW"/"LMSW"/"INVLPG".
@@ -4961,7 +5191,7 @@ fn step_two_byte(
             // instruction requires CPL 0.
             require_cpl0(cpu)?;
             let index = cpu.gpr_u32(CpuState::RCX);
-            let value = read_msr(index).ok_or_else(|| arch_fault_with_error_code(13, 0))?;
+            let value = read_msr(cpu, index).ok_or_else(|| arch_fault_with_error_code(13, 0))?;
             cpu.set_gpr_u32(CpuState::RAX, value as u32);
             cpu.set_gpr_u32(CpuState::RDX, (value >> 32) as u32);
             set_current_ip(cpu, next_ip);
@@ -4976,7 +5206,7 @@ fn step_two_byte(
             let index = cpu.gpr_u32(CpuState::RCX);
             let value = (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
                 | u64::from(cpu.gpr_u32(CpuState::RAX));
-            if !write_msr(index, value) {
+            if !write_msr(cpu, index, value) {
                 return Err(arch_fault_with_error_code(13, 0));
             }
             set_current_ip(cpu, next_ip);
@@ -5214,6 +5444,39 @@ fn step_two_byte(
                 }
                 set_sub_flags_u16(cpu, accumulator, temp, accumulator.wrapping_sub(temp));
             }
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0xC7 => {
+            // Group 9 — Spec: Intel SDM Vol. 2 "CMPXCHG8B/CMPXCHG16B"; opcode
+            // map Group 9 (`0F C7`). Implemented: /1 CMPXCHG8B m64.
+            // `TEMP64 := DEST; IF EDX:EAX = TEMP64 THEN ZF := 1; DEST := ECX:EBX
+            // ELSE ZF := 0; EDX:EAX := TEMP64; DEST := TEMP64`. Only ZF is
+            // written. Register destination is `#UD`. LOCK may be decoded; this
+            // single-processor model does not enforce multi-processor atomicity.
+            // Unsupported here: other /r forms, CMPXCHG16B / REX.W.
+            let m = insn.modrm.ok_or(ExecError::Unsupported(0xC7))?;
+            if m.reg != 1 {
+                return Err(ExecError::Unsupported(0xC7));
+            }
+            let temp = read_mem_u64(cpu, bus, insn)?;
+            let edx_eax = (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32)
+                | u64::from(cpu.gpr_u32(CpuState::RAX));
+            let equal = edx_eax == temp;
+            let new_dest = if equal {
+                (u64::from(cpu.gpr_u32(CpuState::RCX)) << 32)
+                    | u64::from(cpu.gpr_u32(CpuState::RBX))
+            } else {
+                temp
+            };
+            // Memory write commits before register/flag updates so a write
+            // fault leaves EDX:EAX and ZF unchanged (precise exceptions).
+            write_mem_u64(cpu, bus, insn, new_dest)?;
+            if !equal {
+                cpu.set_gpr_u32(CpuState::RAX, temp as u32);
+                cpu.set_gpr_u32(CpuState::RDX, (temp >> 32) as u32);
+            }
+            cpu.set_zf(equal);
             set_current_ip(cpu, next_ip);
             Ok(())
         }
@@ -5674,23 +5937,28 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0x9A => {
-            // CALL far ptr16:16 / ptr16:32 — real-address mode.
-            // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H).
+            // CALL far ptr16:16 / ptr16:32.
+            // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H); Vol. 3 §5.8.1.
+            // Protected mode: same-CPL nonconforming GDT code (no call gates).
             // Real-address OperandSize=32: push CS (16) then EIP (32) — 6-byte frame.
-            // Unsupported here: protected-mode privilege / gate transfer.
             let selector = insn.displacement as u16;
-            if opsz32(&insn) {
-                let offset = insn.immediate as u32;
+            let offset = if opsz32(&insn) {
+                insn.immediate as u32
+            } else {
+                u32::from(insn.immediate as u16)
+            };
+            if cr0_pe(cpu) {
+                protected_far_call(cpu, bus, offset, selector, next_ip, opsz32(&insn))?;
+            } else if opsz32(&insn) {
                 push16(cpu, bus, cpu.cs.selector)?;
                 push32(cpu, bus, next_ip)?;
                 cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
                 cpu.set_ip16(offset as u16);
             } else {
-                let offset = insn.immediate as u16;
                 push16(cpu, bus, cpu.cs.selector)?;
                 push16(cpu, bus, next_ip as u16)?;
                 cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-                cpu.set_ip16(offset);
+                cpu.set_ip16(offset as u16);
             }
         }
         0xCA => {
@@ -6318,7 +6586,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // Group 5 r/m16|32 — INC/DEC/CALL/JMP/PUSH.
             // Spec: Intel SDM Vol. 2 "INC"/"DEC"/"CALL"/"JMP"/"PUSH"; opcode map Group 5;
             // Ch. 2 (66H). /7 reserved and far CALL/JMP register forms → #UD (Vol. 3 §6.15).
-            // Protected-mode far CALL and 16:32/gate/task transfers remain unsupported.
+            // Protected-mode far CALL/JMP are same-CPL GDT code only (no call gates).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             let op32 = opsz32(&insn);
             match m.reg {
@@ -6367,11 +6635,11 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 3 => {
                     // CALL FAR m16:16 / m16:32 — absolute indirect far (memory only).
                     // Spec: Intel SDM Vol. 2 "CALL"; opcode map Group 5 /3; Ch. 2 (66H).
-                    // Register form is invalid (#UD). Unsupported: protected-mode gates.
+                    // Register form is invalid (#UD). Protected: same-CPL GDT code.
                     if m.mod_ == 3 {
                         return real_mode_ud(cpu, bus);
                     }
-                    if op32 {
+                    let (offset, selector) = if op32 {
                         let (addr, _, uses_ss) = ea(cpu, &insn, 6)?;
                         let offset = bus
                             .read_u32(addr)
@@ -6379,10 +6647,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                         let selector = bus
                             .read_u16(addr.wrapping_add(4))
                             .map_err(|e| classify_mem_fault(e, uses_ss))?;
-                        push16(cpu, bus, cpu.cs.selector)?;
-                        push32(cpu, bus, next_ip)?;
-                        cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-                        cpu.set_ip16(offset as u16);
+                        (offset, selector)
                     } else {
                         let (addr, _, uses_ss) = ea(cpu, &insn, 4)?;
                         let offset = bus
@@ -6391,10 +6656,20 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                         let selector = bus
                             .read_u16(addr.wrapping_add(2))
                             .map_err(|e| classify_mem_fault(e, uses_ss))?;
+                        (u32::from(offset), selector)
+                    };
+                    if cr0_pe(cpu) {
+                        protected_far_call(cpu, bus, offset, selector, next_ip, op32)?;
+                    } else if op32 {
+                        push16(cpu, bus, cpu.cs.selector)?;
+                        push32(cpu, bus, next_ip)?;
+                        cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+                        cpu.set_ip16(offset as u16);
+                    } else {
                         push16(cpu, bus, cpu.cs.selector)?;
                         push16(cpu, bus, next_ip as u16)?;
                         cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
-                        cpu.set_ip16(offset);
+                        cpu.set_ip16(offset as u16);
                     }
                 }
                 4 => {
@@ -19076,6 +19351,69 @@ mod tests {
         assert_eq!(cpu, before, "far JMP committed state before #GP");
     }
 
+    /// Intel SDM Vol. 2 "CALL" (far); Vol. 3 §5.8.1: same-CPL far CALL into a
+    /// nonconforming GDT code segment pushes the return link then loads CS.
+    /// Call gates and privilege changes remain unsupported.
+    #[test]
+    fn protected_far_call_direct_and_indirect_push_return_link() {
+        // 9A ptr16:32 — D=1 default form into the D=0 code segment at PM32_DATA.
+        let mut direct = vec![0x9A];
+        direct.extend_from_slice(&(PM32_DATA as u32).to_le_bytes());
+        direct.extend_from_slice(&PM32_CS16.to_le_bytes());
+        let (mut cpu, mut bus) = pm32_fixture(&direct, PM32_CODE, true);
+        let return_ip = (PM32_CODE + direct.len()) as u32;
+        let sp_before = cpu.gpr_u16(CpuState::RSP);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, PM32_CS16);
+        assert!(!cpu.cs.default_big());
+        assert_eq!(cpu.cs.flags, 0x009A);
+        assert_eq!(cpu.rip, PM32_DATA as u64);
+        // 6-byte frame: CS then EIP (SS.B=0 wraps SP).
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp_before.wrapping_sub(6));
+        let sp = cpu.gpr_u16(CpuState::RSP) as usize;
+        assert_eq!(
+            u32::from_le_bytes(bus.mem[sp..sp + 4].try_into().unwrap()),
+            return_ip
+        );
+        assert_eq!(
+            u16::from_le_bytes(bus.mem[sp + 4..sp + 6].try_into().unwrap()),
+            PM32_CS32
+        );
+
+        // FF /3 m16:16 under D=0: call into D=1 code.
+        // ModRM 0x1E = mod=00,reg=3,rm=6 → [disp16]; pointer at 0x3000.
+        let indirect = [0xFF, 0x1E, 0x00, 0x30];
+        let (mut cpu, mut bus) = pm32_fixture(&indirect, PM32_CODE, false);
+        bus.mem[0x3000..0x3002].copy_from_slice(&(0x1000u16).to_le_bytes());
+        bus.mem[0x3002..0x3004].copy_from_slice(&PM32_CS32.to_le_bytes());
+        let return_ip = (PM32_CODE + indirect.len()) as u16;
+        let sp_before = cpu.gpr_u16(CpuState::RSP);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.cs.selector, PM32_CS32);
+        assert!(cpu.cs.default_big());
+        assert_eq!(cpu.rip, 0x1000);
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), sp_before.wrapping_sub(4));
+        let sp = cpu.gpr_u16(CpuState::RSP) as usize;
+        assert_eq!(
+            u16::from_le_bytes(bus.mem[sp..sp + 2].try_into().unwrap()),
+            return_ip
+        );
+        assert_eq!(
+            u16::from_le_bytes(bus.mem[sp + 2..sp + 4].try_into().unwrap()),
+            PM32_CS16
+        );
+
+        // Null selector → #GP(0), stack and CS unchanged.
+        let mut bad = vec![0x9A];
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        bad.extend_from_slice(&0u16.to_le_bytes());
+        let (mut cpu, mut bus) = pm32_fixture(&bad, PM32_CODE, true);
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before, "far CALL null selector must be atomic");
+        assert_eq!(cpu.gpr_u16(CpuState::RSP), before.gpr_u16(CpuState::RSP));
+    }
+
     /// A 286 (16-bit) gate cannot carry a 32-bit return EIP, so a fault raised
     /// while `CS.D=1` cannot enter that gate. Delivery fails, escalates to
     /// `#DF`, and with no usable `#DF` gate becomes a triple fault.
@@ -21394,6 +21732,263 @@ mod tests {
         assert_ne!(cpu.rflags & (1 << 6), 0);
     }
 
+    /// Intel SDM Vol. 2 "CMPXCHG8B": compare `EDX:EAX` with `m64`; on equal
+    /// set ZF and store `ECX:EBX`, else clear ZF, load `m64` into `EDX:EAX`, and
+    /// write the old value back. CF/PF/AF/SF/OF are unaffected. Register form
+    /// is `#UD`. LOCK may prefix the memory form.
+    #[test]
+    fn cmpxchg8b_equal_unequal_flags_lock_and_ud() {
+        // 0F C7 /1 [0x4000] — equal path.
+        let flags = 0x0002 | 1 | (1 << 2) | (1 << 4) | (1 << 7) | (1 << 11);
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.rflags = flags;
+            cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+            cpu.set_gpr_u32(CpuState::RDX, 0x3333_4444);
+            cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            cpu.set_gpr_u32(CpuState::RCX, 0xCCCC_DDDD);
+            mem[0x4000..0x4008].copy_from_slice(&0x3333_4444_1111_2222u64.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0xAAAA_BBBB);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0xCCCC_DDDD);
+        assert_eq!(
+            cpu.gpr_u32(CpuState::RAX),
+            0x1111_2222,
+            "accumulator unchanged"
+        );
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0x3333_4444);
+        assert_ne!(cpu.rflags & (1 << 6), 0, "ZF set on match");
+        assert_eq!(
+            cpu.rflags & !(1 << 6),
+            flags & !(1 << 6),
+            "only ZF may change"
+        );
+        assert_eq!(cpu.ip16(), 5);
+
+        // Unequal path: memory written back, EDX:EAX takes TEMP, ZF clear.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.rflags = flags | (1 << 6);
+            cpu.set_gpr_u32(CpuState::RAX, 0);
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+            cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            cpu.set_gpr_u32(CpuState::RCX, 0xCCCC_DDDD);
+            mem[0x4000..0x4008].copy_from_slice(&0xFEED_FACE_DEAD_BEEFu64.to_le_bytes());
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0xDEAD_BEEF, "write-back");
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0xFEED_FACE);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xDEAD_BEEF);
+        assert_eq!(cpu.gpr_u32(CpuState::RDX), 0xFEED_FACE);
+        assert_eq!(cpu.rflags & (1 << 6), 0, "ZF clear on mismatch");
+        assert_eq!(cpu.rflags & !(1 << 6), flags & !(1 << 6));
+
+        // LOCK prefix is accepted on the memory form (no multi-processor atomicity).
+        let (mut cpu, mut bus) =
+            real_mode_fixture(&[0xF0, 0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+                cpu.set_gpr_u32(CpuState::RAX, 1);
+                cpu.set_gpr_u32(CpuState::RDX, 2);
+                cpu.set_gpr_u32(CpuState::RBX, 3);
+                cpu.set_gpr_u32(CpuState::RCX, 4);
+                mem[0x4000..0x4008].copy_from_slice(&0x0000_0002_0000_0001u64.to_le_bytes());
+            });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 3);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 4);
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+
+        // Register form: 0F C7 /1 CX → #UD.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0xC9], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RAX, 1);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+        assert_eq!(cpu, before);
+
+        // Other Group 9 /r remain unimplemented.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x06, 0x00, 0x40], |_, _| {});
+        assert_eq!(
+            step_inner(&mut cpu, &mut bus),
+            Err(ExecError::Unsupported(0xC7))
+        );
+    }
+
+    /// Intel SDM Vol. 2 "CMPXCHG8B": a memory write fault after the compare
+    /// leaves EDX:EAX and flags unchanged; segment-limit faults on the 8-byte
+    /// span are `#GP`/`#SS` before any register update.
+    #[test]
+    fn cmpxchg8b_memory_faults_are_atomic() {
+        // Limit ends at 0x4003 so the 8-byte access at 0x4000 fails #GP.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0xC7, 0x0E, 0x00, 0x40], |cpu, mem| {
+            cpu.ds.limit = 0x4003;
+            cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+            cpu.set_gpr_u32(CpuState::RDX, 0x3333_4444);
+            cpu.set_gpr_u32(CpuState::RBX, 0xAAAA_BBBB);
+            cpu.set_gpr_u32(CpuState::RCX, 0xCCCC_DDDD);
+            cpu.rflags = 0x0002 | (1 << 6);
+            mem[0x4000..0x4008].copy_from_slice(&0x3333_4444_1111_2222u64.to_le_bytes());
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0x1111_2222);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0x3333_4444);
+
+        // Protected mode: same equal/unequal ZF contract under PE=1.
+        // 0F C7 /1 [disp32] — ModR/M 0x0D = mod=00, reg=1, rm=5.
+        let (mut cpu, mut bus) =
+            pm32_fixture(&[0x0F, 0xC7, 0x0D, 0x00, 0x40, 0x00, 0x00], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RAX, 0x10);
+        cpu.set_gpr_u32(CpuState::RDX, 0x20);
+        cpu.set_gpr_u32(CpuState::RBX, 0x30);
+        cpu.set_gpr_u32(CpuState::RCX, 0x40);
+        bus.mem[0x4000..0x4008].copy_from_slice(&0x0000_0020_0000_0010u64.to_le_bytes());
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(bus.read_u32(0x4000).unwrap(), 0x30);
+        assert_eq!(bus.read_u32(0x4004).unwrap(), 0x40);
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
+    }
+
+    /// Intel SDM Vol. 2 "LAR"/"LSL": protected-mode soft checks set ZF and
+    /// optionally load access rights / effective limit; real-address mode is `#UD`.
+    #[test]
+    fn lar_lsl_zf_matrices_null_type_and_privilege() {
+        // Real-address mode → #UD.
+        for opcode in [0x02u8, 0x03] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xC1], |_, _| {});
+            let before = cpu.clone();
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+            assert_eq!(cpu, before);
+        }
+
+        // LAR EAX, CX against the fixture ring-0 data selector 0x0018 (access 0x92).
+        // Expected AR: (0x92 << 8) = 0x0000_9200.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RCX, 0x0018);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        cpu.rflags = 0x0002; // ZF clear
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "LAR ZF set");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x0000_9200);
+        assert_eq!(cpu.rip, (PM32_CODE + 3) as u64);
+
+        // LSL EAX, CX — byte-granular limit 0xFFFF.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RCX, 0x0018);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "LSL ZF set");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xFFFF);
+
+        // Null selector → ZF=0, destination unchanged.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RCX, 0);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1111_2222);
+
+        // Extend GDT: index 4 = page-granular data, index 5 = 32-bit call gate,
+        // index 6 = interrupt gate (invalid for both), index 7 = conforming code DPL=0.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 32..PM32_GDT + 40]
+            .copy_from_slice(&encode_seg_desc(0, 0xF_FFFF, 0x92, 0x80)); // G=1
+        bus.mem[PM32_GDT + 40..PM32_GDT + 48].copy_from_slice(&encode_seg_desc(0x1000, 0, 0x8C, 0)); // type 0xC call gate-ish S=0
+                                                                                                     // Force system call-gate type 0xC: access = P|DPL0|type = 0x8C.
+        bus.mem[PM32_GDT + 40 + 5] = 0x8C;
+        bus.mem[PM32_GDT + 48..PM32_GDT + 56].copy_from_slice(&encode_seg_desc(0, 0, 0x8E, 0)); // 32-bit interrupt gate
+        bus.mem[PM32_GDT + 48 + 5] = 0x8E;
+        bus.mem[PM32_GDT + 56..PM32_GDT + 64].copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9E, 0)); // conforming code
+
+        // LSL of G=1 data → 0xFFFF_FFFF.
+        cpu.set_gpr_u32(CpuState::RCX, 0x0020);
+        cpu.set_gpr_u32(CpuState::RAX, 0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xFFFF_FFFF);
+
+        // LAR accepts 32-bit call gate (type 0xC); LSL rejects it.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 40..PM32_GDT + 48].copy_from_slice(&[0u8; 8]);
+        bus.mem[PM32_GDT + 40 + 5] = 0x8C; // type C call gate, P=1
+        cpu.set_gpr_u32(CpuState::RCX, 0x0028);
+        cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_AAAA);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "LAR allows call gate");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x0000_8C00);
+
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 40 + 5] = 0x8C;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0028);
+        cpu.set_gpr_u32(CpuState::RAX, 0xBBBB_BBBB);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0, "LSL rejects call gate");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xBBBB_BBBB);
+
+        // Interrupt gate invalid for LAR → ZF=0.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 48 + 5] = 0x8E;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0030);
+        cpu.set_gpr_u32(CpuState::RAX, 0xCCCC_CCCC);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xCCCC_CCCC);
+
+        // Privilege: CPL=3 vs DPL=0 data → ZF=0.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.cs.selector |= 3;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0018);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDDDD_DDDD);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0, "CPL > DPL clears ZF");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xDDDD_DDDD);
+
+        // Conforming code: CPL=3, DPL=0 still succeeds for LAR.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 56..PM32_GDT + 64].copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9E, 0));
+        cpu.cs.selector |= 3;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0038);
+        cpu.set_gpr_u32(CpuState::RAX, 0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "conforming skips DPL check");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x0000_9E00);
+
+        // Not-present data: ZF=0, destination unchanged.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 32..PM32_GDT + 40].copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x12, 0)); // P=0 data
+        cpu.set_gpr_u32(CpuState::RCX, 0x0020);
+        cpu.set_gpr_u32(CpuState::RAX, 0xEEEE_EEEE);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0, "P=0 clears ZF");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xEEEE_EEEE);
+
+        // 16-bit operand size truncates LSL limit and LAR AR to low word.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x66, 0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 32..PM32_GDT + 40]
+            .copy_from_slice(&encode_seg_desc(0, 0xF_FFFF, 0x92, 0x80));
+        cpu.set_gpr_u32(CpuState::RCX, 0x0020);
+        cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_BBBB);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(
+            cpu.gpr_u32(CpuState::RAX),
+            0xAAAA_FFFF,
+            "16-bit LSL keeps EAX[31:16]"
+        );
+    }
+
     /// Intel SDM Vol. 2 "CPUID": leaf 0 reports the highest basic leaf in EAX
     /// and the vendor string in EBX:EDX:ECX. The string is deliberately not an
     /// Intel or AMD signature, so software cannot infer unimplemented features
@@ -21442,6 +22037,7 @@ mod tests {
             "exactly PSE, MSR, PGE and CMOV"
         );
         assert_eq!(ecx, 0, "no ECX feature is implemented");
+        assert_eq!(edx & (1 << 8), 0, "CX8 stays clear despite CMPXCHG8B");
 
         // Named guards for the features most likely to be assumed present.
         for (bit, name) in [
@@ -21516,15 +22112,13 @@ mod tests {
         }
     }
 
-    /// Intel SDM Vol. 2 "RDMSR"/"WRMSR": "Specifying a reserved or unimplemented
-    /// MSR address in ECX will also cause a general protection exception." This
-    /// slice implements no MSR, so every address faults rather than returning a
-    /// fabricated zero, and the CPU state is unchanged.
+    /// Intel SDM Vol. 2 "RDMSR"/"WRMSR": reserved or unimplemented MSR addresses
+    /// raise `#GP(0)`. `IA32_APIC_BASE` (`0x1B`) is implemented; everything else
+    /// in this list still faults with CPU state unchanged.
     #[test]
     fn rdmsr_wrmsr_fault_on_every_unimplemented_msr_address() {
         for index in [
             0x0000_0010u32, // IA32_TIME_STAMP_COUNTER
-            0x0000_001B,    // IA32_APIC_BASE
             0x0000_00FE,    // IA32_MTRRCAP
             0x0000_02FF,    // IA32_MTRR_DEF_TYPE
             0xC000_0080,    // IA32_EFER
@@ -21543,14 +22137,110 @@ mod tests {
         }
     }
 
+    /// Intel SDM Vol. 3 §10.4.4 / Vol. 4 MSR `1Bh` (`IA32_APIC_BASE`): reset
+    /// BSP=1, EN=0 (bit 11), EXTD=0 (bit 10), base=`0xFEE0_0000`; WRMSR/RDMSR
+    /// round-trip EN and the base; reserved bits (including x2APIC bit 10) and
+    /// BSP changes raise `#GP(0)`.
+    #[test]
+    fn ia32_apic_base_msr_read_write_and_reserved_gp() {
+        // RDMSR of the reset value.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x32], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+            cpu.set_gpr_u32(CpuState::RDX, 0xCAFE_BABE);
+        });
+        assert_eq!(cpu.ia32_apic_base, x86_core::IA32_APIC_BASE_RESET);
+        step(&mut cpu, &mut bus).unwrap();
+        let value =
+            (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32) | u64::from(cpu.gpr_u32(CpuState::RAX));
+        assert_eq!(value, x86_core::IA32_APIC_BASE_RESET);
+        assert_eq!(value & IA32_APIC_BASE_BSP, IA32_APIC_BASE_BSP);
+        assert_eq!(value & IA32_APIC_BASE_ENABLE, 0);
+        assert_eq!(value & IA32_APIC_BASE_X2APIC, 0);
+        assert_eq!(value & !0xFFF, 0xFEE0_0000);
+
+        // WRMSR: enable + relocate base, keep BSP.
+        let new_val = 0xFEC0_0000 | IA32_APIC_BASE_BSP | IA32_APIC_BASE_ENABLE;
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, new_val as u32);
+            cpu.set_gpr_u32(CpuState::RDX, (new_val >> 32) as u32);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.ia32_apic_base, new_val);
+
+        // Round-trip RDMSR.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x32], |cpu, _| {
+            cpu.ia32_apic_base = new_val;
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+        });
+        step(&mut cpu, &mut bus).unwrap();
+        let readback =
+            (u64::from(cpu.gpr_u32(CpuState::RDX)) << 32) | u64::from(cpu.gpr_u32(CpuState::RAX));
+        assert_eq!(readback, new_val);
+
+        // Reserved bit 0 → #GP(0), state unchanged.
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, (x86_core::IA32_APIC_BASE_RESET as u32) | 1);
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // x2APIC EXTD bit 10 → #GP(0).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(
+                CpuState::RAX,
+                (x86_core::IA32_APIC_BASE_RESET as u32) | IA32_APIC_BASE_X2APIC as u32,
+            );
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // Clearing BSP (read-only) → #GP(0).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, 0xFEE0_0000); // BSP cleared
+            cpu.set_gpr_u32(CpuState::RDX, 0);
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // Bit above the 36-bit phys model (bit 36) → #GP(0).
+        let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, 0x30], |cpu, _| {
+            cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+            cpu.set_gpr_u32(CpuState::RAX, x86_core::IA32_APIC_BASE_RESET as u32);
+            cpu.set_gpr_u32(CpuState::RDX, 1 << 4); // bit 36 of the MSR
+        });
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+
+        // CPL 3 still faults before the MSR is considered.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x32], PM32_CODE, true);
+        cpu.cs.selector |= 3;
+        cpu.set_gpr_u32(CpuState::RCX, MSR_IA32_APIC_BASE);
+        let before = cpu.clone();
+        assert_arch_fault(step_inner(&mut cpu, &mut bus), 13, Some(0));
+        assert_eq!(cpu, before);
+    }
+
     /// Intel SDM Vol. 2 "RDMSR"/"WRMSR"/"INVD"/"WBINVD" (Protected Mode
     /// Exceptions): `#GP(0)` when the current privilege level is not 0.
     /// Real-address mode always runs at CPL 0.
     #[test]
     fn system_instructions_require_cpl0_in_protected_mode() {
         for opcode in [0x32u8, 0x30, 0x08, 0x09] {
-            // CPL 0: INVD/WBINVD retire; RDMSR/WRMSR still fault on the address.
+            // CPL 0: INVD/WBINVD retire; RDMSR/WRMSR of an unimplemented index
+            // still fault on the address (use TSC index so APIC_BASE is not hit).
             let (mut cpu, mut bus) = pm32_fixture(&[0x0F, opcode], PM32_CODE, true);
+            cpu.set_gpr_u32(CpuState::RCX, 0x10); // IA32_TIME_STAMP_COUNTER
             let result = step_inner(&mut cpu, &mut bus);
             if matches!(opcode, 0x08 | 0x09) {
                 result.unwrap();

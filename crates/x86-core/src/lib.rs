@@ -5,6 +5,19 @@
 
 #![forbid(unsafe_code)]
 
+/// `IA32_APIC_BASE` (MSR `0x1B`) reset value used by this tree.
+///
+/// BSP (bit 8) = 1, APIC Global Enable EN (bit 11) = 0, EXTD (bit 10) = 0,
+/// base = `0xFEE0_0000`. Enable stays clear until Local APIC MMIO is real; the
+/// CPU only stores the MSR. Spec: Intel SDM Vol. 3 §10.4.4 / Vol. 4 MSR `1Bh`.
+pub const IA32_APIC_BASE_RESET: u64 = 0xFEE0_0100;
+
+/// Serde default for [`CpuState::ia32_apic_base`] (snapshot version-compat).
+#[cfg(feature = "serde")]
+fn default_ia32_apic_base() -> u64 {
+    IA32_APIC_BASE_RESET
+}
+
 /// Segment register selector + hidden descriptor cache.
 ///
 /// Spec: Intel SDM Vol. 3 §3.4.2–§3.4.3 (visible selector; cached base/limit/AR).
@@ -150,6 +163,14 @@ pub struct CpuState {
     pub cr4: u64,
     pub cr8: u64,
     pub efer: u64,
+    /// `IA32_APIC_BASE` (MSR `0x1B`) — BSP, global enable, and APIC base field.
+    ///
+    /// Reset: BSP=1, EN (bit 11)=0, EXTD (bit 10)=0, base=`0xFEE0_0000`
+    /// (`0xFEE0_0100`). Enable stays clear until a real Local APIC exists; this
+    /// MSR only stores/readbacks CPU state (no MMIO side effect).
+    /// Spec: Intel SDM Vol. 3 §10.4.4 / Vol. 4 MSR `1Bh`.
+    #[cfg_attr(feature = "serde", serde(default = "default_ia32_apic_base"))]
+    pub ia32_apic_base: u64,
     pub halted: bool,
     /// Maskable-interrupt inhibition after a successful `MOV SS` / `POP SS`.
     ///
@@ -219,6 +240,7 @@ impl CpuState {
             cr4: 0,
             cr8: 0,
             efer: 0,
+            ia32_apic_base: IA32_APIC_BASE_RESET,
             halted: false,
             maskable_interrupt_shadow: 0,
             pending_irq: None,
@@ -460,6 +482,9 @@ impl CpuState {
         if self.cr0 != other.cr0 {
             out.push("cr0");
         }
+        if self.ia32_apic_base != other.ia32_apic_base {
+            out.push("ia32_apic_base");
+        }
         if self.halted != other.halted {
             out.push("halted");
         }
@@ -539,6 +564,11 @@ mod tests {
         assert_eq!(cpu.cs.base, 0xFFFF_0000);
         assert_eq!(cpu.rflags, 0x2);
         assert_eq!(cpu.cr0, 0x6000_0010);
+        assert_eq!(cpu.ia32_apic_base, IA32_APIC_BASE_RESET);
+        assert_eq!(cpu.ia32_apic_base & (1 << 8), 1 << 8, "BSP set");
+        assert_eq!(cpu.ia32_apic_base & (1 << 10), 0, "EXTD clear");
+        assert_eq!(cpu.ia32_apic_base & (1 << 11), 0, "EN clear");
+        assert_eq!(cpu.ia32_apic_base & !0xFFF, 0xFEE0_0000);
         assert!(!cpu.halted);
     }
 

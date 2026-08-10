@@ -136,7 +136,9 @@ Not supported:
   extending the bit-string address.
 - `LOCK` is decoded but has no atomicity effect (single-processor model), and
   `LOCK` with a register destination does not raise `#UD`.
-- The REX.W 64-bit forms, `CMPXCHG8B`/`CMPXCHG16B`, and `TZCNT`/`LZCNT`.
+- The REX.W 64-bit forms, `CMPXCHG16B`, and `TZCNT`/`LZCNT`.
+  Round 6 adds `CMPXCHG8B m64` (`0F C7 /1`) without advertising `CPUID.CX8`;
+  see `docs/cpu-r6-cmpxchg8b.md`.
 
 ## Slice 4 — system and identification
 
@@ -187,7 +189,8 @@ safe; over-reporting is not. The complete guest-visible output is:
 
 `RDMSR`/`WRMSR` implement the full instruction mechanics — `ECX` selects the
 MSR, `EDX:EAX` carries the 64-bit value, CPL 0 is required outside real-address
-mode — but **no MSR is implemented**. Every address raises `#GP(0)`, which is
+mode — but only `IA32_APIC_BASE` (`0x1B`) is implemented (see
+`docs/cpu-r6-apic-base-msr.md`). Every other address raises `#GP(0)`, which is
 the architectural response for a reserved or unimplemented MSR address.
 
 This is deliberate rather than a stub returning zero. The emulator models no
@@ -207,7 +210,8 @@ SeaBIOS does.
 
 Not supported:
 
-- Any implemented MSR, and therefore any `WRMSR` reserved-bit `#GP`.
+- Other MSR addresses beyond `IA32_APIC_BASE` (`0x1B`), and therefore any
+  `WRMSR` reserved-bit `#GP` outside that MSR's writable mask.
 - CPUID `ECX` sub-leaf selection (no leaf that uses it is implemented) and the
   extended leaves `0x8000_0001`+ (including the processor brand string).
 - The `#UD` that a `LOCK` prefix should raise on `CPUID`, `RDMSR`, `WRMSR`,
@@ -216,10 +220,11 @@ Not supported:
 
 ## Remaining unimplemented `0F` opcodes
 
-The map still has no entry for `0F 00` (Group 6 `LLDT`/`LTR`/`SLDT`/`STR`/
-`VERR`/`VERW`), `0F 02`/`0F 03` (`LAR`/`LSL`), `0F 05`/`0F 07`/`0F 34`/`0F 35`
+The map still has no entry for Group 6 `SLDT`/`LLDT`/`VERR`/`VERW` (STR/LTR
+are present), `0F 05`/`0F 07`/`0F 34`/`0F 35`
 (`SYSCALL`/`SYSRET`/`SYSENTER`/`SYSEXIT`), `0F 0D`/`0F 18`–`0F 1F` (prefetch and
-the multi-byte `NOP`), `0F 21`/`0F 23` (debug registers), `0F 31` (`RDTSC`),
-`0F 33` (`RDPMC`), `0F 40`–`0F 4F` (`CMOVcc`), `0F A4`/`0F A5`/`0F AC`/`0F AD`
-(`SHLD`/`SHRD`), `0F C7` (Group 9 `CMPXCHG8B`), `0F AE` (Group 15), `0F 09`-era
-`0F 0F` 3DNow!, or any MMX/SSE/AVX opcode.
+the multi-byte `NOP`), `0F 21`/`0x23` (debug registers), `0F 31` (`RDTSC`),
+`0F 33` (`RDPMC`), `0F AE` (Group 15), other Group 9 `/r` forms beyond
+`CMPXCHG8B`, `0F 0F` 3DNow!, or any MMX/SSE/AVX opcode. Round 6 added
+`LAR`/`LSL`, `CMPXCHG8B`, and `IA32_APIC_BASE`; see `docs/cpu-r6-*.md`.
+`CPUID.CX8` stays clear.

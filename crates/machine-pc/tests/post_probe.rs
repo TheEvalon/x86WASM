@@ -25,21 +25,21 @@ fn bios_rom_with_code(code: &[u8]) -> Vec<u8> {
 
 /// Second opcode byte of a two-byte instruction this build cannot decode.
 ///
-/// `0F C7` is the Group 9 escape — `CMPXCHG8B m64` (Intel SDM Vol. 2
-/// "CMPXCHG8B/CMPXCHG16B"; opcode map Table A-3, Group 9). It is absent from
-/// `x86-spec`'s two-byte subset, so the decoder rejects it with
-/// `UnsupportedOpcode(0xC7)`.
+/// `0F AE` is Group 15 (`FXSAVE`/`FXRSTOR`/`LFENCE`/… — Intel SDM Vol. 2 opcode
+/// map Table A-3, Group 15). It is absent from `x86-spec`'s two-byte subset, so
+/// the decoder rejects it with `UnsupportedOpcode(0xAE)`.
 ///
 /// The four probe tests below need *some* undecodable two-byte opcode; which
-/// one is an accident of what is implemented today. Two consecutive rounds
+/// one is an accident of what is implemented today. Three consecutive rounds
 /// implemented the previous stand-in out from under them — first the near
-/// `Jcc` map, then `CMOVcc` at `0F 40` — each time surfacing as four unrelated
-/// -looking failures. Naming the choice once means the next occurrence is one
-/// edit, and `known_absent_opcode_is_still_absent` fails first and says so.
+/// `Jcc` map, then `CMOVcc` at `0F 40`, then Group 9 `CMPXCHG8B` at `0F C7` —
+/// each time surfacing as four unrelated-looking failures. Naming the choice
+/// once means the next occurrence is one edit, and
+/// `known_absent_opcode_is_still_absent` fails first and says so.
 ///
 /// A replacement must stay three bytes when encoded (escape, opcode, ModR/M)
 /// so the `steps`, `ip`, and `opcode_bytes` expectations below still hold.
-const KNOWN_ABSENT_2BYTE_OPCODE: u8 = 0xC7;
+const KNOWN_ABSENT_2BYTE_OPCODE: u8 = 0xAE;
 
 /// [`KNOWN_ABSENT_2BYTE_OPCODE`] encoded with a ModR/M byte: `mod=11`, `reg=0`,
 /// `rm=1`. Register-direct, so no SIB or displacement follows.

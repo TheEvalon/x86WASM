@@ -542,6 +542,13 @@ pub fn decode_with_mode(bytes: &[u8], mode: DecodeMode) -> Result<DecodedInsn, D
                 Some(7) => "BTC",
                 _ => def.mnemonic,
             }
+        } else if opcode == 0xC7 {
+            // Group 9 (`0F C7`): /1 CMPXCHG8B m64. Other /r keep the placeholder.
+            // Spec: Intel SDM Vol. 2 "CMPXCHG8B/CMPXCHG16B"; opcode map Group 9.
+            match modrm.map(|m| m.reg) {
+                Some(1) => "CMPXCHG8B",
+                _ => def.mnemonic,
+            }
         } else {
             def.mnemonic
         }
@@ -674,9 +681,12 @@ mod tests {
         assert_eq!(decode(&[0x0F]), Err(DecodeError::Truncated));
         // 0F 01 is GRP7 (needs ModRM); truncated without ModRM.
         assert_eq!(decode(&[0x0F, 0x01]), Err(DecodeError::Truncated));
+        // 0F 02/03 LAR/LSL need ModRM.
+        assert_eq!(decode(&[0x0F, 0x02]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x0F, 0x03]), Err(DecodeError::Truncated));
         assert!(matches!(
-            decode(&[0x0F, 0x02]),
-            Err(DecodeError::UnsupportedOpcode(0x02))
+            decode(&[0x0F, 0x04]),
+            Err(DecodeError::UnsupportedOpcode(0x04))
         ));
     }
 
@@ -693,6 +703,16 @@ mod tests {
         let ltr_ax = decode(&[0x0F, 0x00, 0xD8]).unwrap(); // LTR AX
         assert_eq!(ltr_ax.modrm.unwrap().reg, 3);
         assert_eq!(ltr_ax.length, 3);
+
+        // Spec: Intel SDM Vol. 2 "LAR"/"LSL" — 0F 02 /r, 0F 03 /r.
+        let lar = decode(&[0x0F, 0x02, 0xC1]).unwrap(); // LAR AX, CX
+        assert_eq!(lar.mnemonic, "LAR");
+        assert_eq!(lar.opcode, 0x02);
+        assert_eq!(lar.length, 3);
+        let lsl = decode(&[0x0F, 0x03, 0x1E, 0x00, 0x40]).unwrap(); // LSL BX, [0x4000]
+        assert_eq!(lsl.mnemonic, "LSL");
+        assert_eq!(lsl.displacement, 0x4000);
+        assert_eq!(lsl.length, 5);
 
         // Spec: Intel SDM Vol. 2 LGDT/SGDT — 0F 01 /2 and /0, memory form.
         let sgdt = decode(&[0x0F, 0x01, 0x06, 0x00, 0x20]).unwrap(); // SGDT [0x2000]
@@ -2265,6 +2285,41 @@ mod tests {
         assert_eq!(d.length, 4);
 
         assert_eq!(decode(&[0x0F, 0xBA, 0xE0]), Err(DecodeError::Truncated));
+    }
+
+    /// Intel SDM Vol. 2 "CMPXCHG8B" / opcode map Group 9 (`0F C7`): `/1` names
+    /// the compare-exchange; other `/r` values keep the group placeholder.
+    #[test]
+    fn decode_group9_cmpxchg8b() {
+        // 0F C7 /1 m64 — CMPXCHG8B [0x4000]
+        let d = decode(&[0x0F, 0xC7, 0x0E, 0x00, 0x40]).unwrap();
+        assert!(d.two_byte);
+        assert_eq!(d.mnemonic, "CMPXCHG8B");
+        assert_eq!(d.opcode, 0xC7);
+        assert_eq!(d.modrm.unwrap().reg, 1);
+        assert_eq!(d.modrm.unwrap().mod_, 0);
+        assert_eq!(d.displacement, 0x4000);
+        assert_eq!(d.immediate, 0);
+        assert_eq!(d.length, 5);
+
+        // LOCK is architectural for the memory form; decode must accept it.
+        let d = decode(&[0xF0, 0x0F, 0xC7, 0x0E, 0x00, 0x40]).unwrap();
+        assert!(d.prefixes.lock);
+        assert_eq!(d.mnemonic, "CMPXCHG8B");
+        assert_eq!(d.length, 6);
+
+        // Register form still decodes; #UD is an interpreter concern.
+        let d = decode(&[0x0F, 0xC7, 0xC9]).unwrap(); // /1, mod=11, rm=CX
+        assert_eq!(d.mnemonic, "CMPXCHG8B");
+        assert_eq!(d.modrm.unwrap().mod_, 3);
+        assert_eq!(d.length, 3);
+
+        // /0 keeps the group mnemonic.
+        assert_eq!(
+            decode(&[0x0F, 0xC7, 0x06, 0x00, 0x40]).unwrap().mnemonic,
+            "GRP9"
+        );
+        assert_eq!(decode(&[0x0F, 0xC7]), Err(DecodeError::Truncated));
     }
 
     /// Intel SDM Vol. 2 "BSF"/"BSR"/"BSWAP"/"XADD"/"CMPXCHG": ModR/M forms with
