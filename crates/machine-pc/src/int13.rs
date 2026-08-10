@@ -1,28 +1,34 @@
-//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h/48h)
-//! and floppy subset (AH=00/02/03/08/15, `DL=00h`).
+//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h/43h/48h),
+//! floppy subset (AH=00/02/03/08/15, `DL=00h`), and CD/El Torito subset
+//! (AH=41h/42h/48h/4Bh, `DL=E0h`).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
-//! applies classic INT 13h register conventions against the primary IDE image
-//! or attached FDC media, mirroring [`crate::mbr::Machine::load_mbr_to_7c00`]'s
-//! host-side media path. This is **not** a guest IVT BIOS and not CHS
-//! translation modes.
+//! applies classic INT 13h register conventions against the primary IDE image,
+//! attached FDC media, or ATAPI CD medium, mirroring
+//! [`crate::mbr::Machine::load_mbr_to_7c00`]'s host-side media path. This is
+//! **not** a guest IVT BIOS and not CHS translation modes.
 //!
 //! Spec: IBM PC BIOS INT 13h Disk Services (AH=00h reset, AH=02h read sectors,
 //! AH=03h write sectors, AH=08h get drive parameters, AH=15h get disk type);
 //! IBM/Microsoft INT 13h Extensions / RBIL (AH=41h check extensions, AH=42h
-//! extended read, AH=43h extended write, AH=48h extended drive parameters).
+//! extended read, AH=43h extended write, AH=48h extended drive parameters);
+//! El Torito 1.0 / RBIL AH=4Bh AL=00h bootable CD-ROM status packet.
 //! ATA IDENTIFY obsolete geometry 16 heads / 63 sectors-per-track (matches
 //! `IdePrimary` IDENTIFY words 3/6). Floppy uses fixed 1.44MB geometry (80/2/18)
-//! via `Fdc82077::read_sector` / `Fdc82077::write_sector`.
+//! via `Fdc82077::read_sector` / `Fdc82077::write_sector`. CD uses Mode-1
+//! 2048-byte LBAs from the attached ATAPI image.
 
 use crate::{Machine, MachineError};
 use devices::{FDC_1440_CYLINDERS, FDC_1440_HEADS, FDC_1440_SECTORS_PER_TRACK, FDC_SECTOR_SIZE};
+use firmware_interface::EL_TORITO_SECTOR_BYTES;
 use x86_core::CpuState;
 
 /// First floppy (`DL`).
 pub const INT13_DRIVE_FD0: u8 = 0x00;
 /// First hard disk (IBM BIOS `DL`).
 pub const INT13_DRIVE_HD0: u8 = 0x80;
+/// First CD-ROM / El Torito no-emulation drive number commonly assigned by BIOS.
+pub const INT13_DRIVE_CD0: u8 = 0xE0;
 
 /// AH=00h — reset disk system.
 pub const INT13_AH_RESET: u8 = 0x00;
@@ -42,6 +48,12 @@ pub const INT13_AH_EXT_READ: u8 = 0x42;
 pub const INT13_AH_EXT_WRITE: u8 = 0x43;
 /// AH=48h — extended get drive parameters.
 pub const INT13_AH_EXT_GET_PARAMS: u8 = 0x48;
+/// AH=4Bh — bootable CD-ROM (El Torito) get status / terminate emulation.
+pub const INT13_AH_CDROM_EMULATION: u8 = 0x4B;
+/// AH=4Bh AL=00h — get status (fill specification packet at `DS:SI`).
+pub const INT13_CD_AL_GET_STATUS: u8 = 0x00;
+/// El Torito / RBIL specification packet size (`13h` = 19 bytes).
+pub const INT13_CD_SPEC_PACKET_SIZE: u8 = 0x13;
 
 /// Magic `BX` input for AH=41h.
 pub const INT13_EXT_MAGIC_IN: u16 = 0x55AA;
@@ -98,6 +110,8 @@ pub const INT13_HD_SPT: u16 = 63;
 
 /// ATA / BIOS sector size.
 pub const INT13_SECTOR_SIZE: usize = 512;
+/// CD Mode-1 user-data / El Torito logical block size (AH=42h/48h on `DL=E0h`).
+pub const INT13_CD_SECTOR_SIZE: usize = EL_TORITO_SECTOR_BYTES;
 
 impl Machine {
     /// Host-side INT 13h hard-disk dispatch using current CPU registers.
@@ -741,13 +755,199 @@ impl Machine {
         }
     }
 
-    /// Route INT 13h by `DL`: floppy `00h` or hard disk `80h`.
+    /// Route INT 13h by `DL`: floppy `00h`, hard disk `80h`, or CD `E0h`.
     pub fn service_int13(&mut self) {
         match self.cpu.gpr_u8_low(CpuState::RDX) {
             INT13_DRIVE_FD0 => self.service_int13_floppy(),
             INT13_DRIVE_HD0 => self.service_int13_hd(),
+            INT13_DRIVE_CD0 => self.service_int13_cd(),
             _ => self.int13_fail(INT13_STATUS_INVALID),
         }
+    }
+
+    /// Host-side INT 13h CD/El Torito dispatch (`DL = E0h`).
+    ///
+    /// Supports AH=41h/42h/48h against the ATAPI Mode-1 medium (2048-byte LBAs)
+    /// and AH=4Bh AL=00h get-status (specification packet at `DS:SI`). Spec:
+    /// IBM/MS INT 13h Extensions + El Torito 1.0 / RBIL AH=4Bh. Not SeaBIOS;
+    /// terminate-emulation (`AL=01h`) and floppy/HDD emulation media remain out.
+    pub fn service_int13_cd(&mut self) {
+        let dl = self.cpu.gpr_u8_low(CpuState::RDX);
+        if dl != INT13_DRIVE_CD0 {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        match self.cpu.ah() {
+            INT13_AH_CHECK_EXTENSIONS => self.int13_cd_check_extensions(),
+            INT13_AH_EXT_READ => self.int13_cd_ext_read_from_regs(),
+            INT13_AH_EXT_GET_PARAMS => self.int13_cd_ext_get_params(),
+            INT13_AH_CDROM_EMULATION => self.int13_cd_emulation_from_regs(),
+            _ => self.int13_fail(INT13_STATUS_INVALID),
+        }
+    }
+
+    /// Read `count` Mode-1 (2048-byte) CD sectors from the ATAPI medium at LBA.
+    ///
+    /// Spec: IBM/MS INT 13h Extensions AH=42h applied to El Torito/ATAPI CD —
+    /// packet `count` is in 2048-byte blocks (not 512). Host helper only.
+    pub fn int13_cd_read_lba_to_phys(
+        &mut self,
+        lba: u64,
+        count: u16,
+        dest: u64,
+    ) -> Result<u16, u8> {
+        if !self.ide.is_atapi_cdrom() {
+            return Err(INT13_STATUS_TIMEOUT);
+        }
+        let Some(image) = self.ide.atapi_medium_image() else {
+            return Err(INT13_STATUS_TIMEOUT);
+        };
+        if count == 0 {
+            return Err(INT13_STATUS_INVALID);
+        }
+        let total = (image.len() / INT13_CD_SECTOR_SIZE) as u64;
+        let need = u64::from(count);
+        if lba.checked_add(need).is_none_or(|end| end > total) {
+            return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+        }
+        let byte_off = (lba as usize).saturating_mul(INT13_CD_SECTOR_SIZE);
+        let bytes = usize::from(count).saturating_mul(INT13_CD_SECTOR_SIZE);
+        let end = dest.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
+        if end > self.mem.ram_len() as u64 {
+            return Err(INT13_STATUS_INVALID);
+        }
+        let chunk = image[byte_off..byte_off + bytes].to_vec();
+        for (i, b) in chunk.iter().enumerate() {
+            self.mem
+                .write_u8(dest + i as u64, *b)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+        }
+        Ok(count)
+    }
+
+    fn int13_cd_has_medium(&self) -> bool {
+        self.ide.is_atapi_cdrom() && self.ide.atapi_medium_image().is_some()
+    }
+
+    fn int13_cd_check_extensions(&mut self) {
+        if self.cpu.gpr_u16(CpuState::RBX) != INT13_EXT_MAGIC_IN {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        if !self.int13_cd_has_medium() {
+            self.int13_fail(INT13_STATUS_TIMEOUT);
+            return;
+        }
+        self.cpu.set_ah(INT13_EXT_VERSION);
+        self.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_OUT);
+        // Packet access (AH=42h) + EDD params (AH=48h). Removable locking out.
+        self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
+        self.cpu.set_cf(false);
+    }
+
+    fn int13_cd_ext_read_from_regs(&mut self) {
+        let si = self.cpu.gpr_u16(CpuState::RSI);
+        let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
+        match self.int13_parse_dap(dap_phys) {
+            Ok(dap) => match self.int13_cd_read_lba_to_phys(dap.lba, dap.count, dap.buf) {
+                Ok(_) => {
+                    self.cpu.set_ah(INT13_STATUS_OK);
+                    self.cpu.set_cf(false);
+                }
+                Err(status) => self.int13_fail(status),
+            },
+            Err(status) => self.int13_fail(status),
+        }
+    }
+
+    fn int13_cd_ext_get_params(&mut self) {
+        if !self.int13_cd_has_medium() {
+            self.int13_fail(INT13_STATUS_TIMEOUT);
+            return;
+        }
+        let total = self
+            .ide
+            .atapi_medium_image()
+            .map(|img| (img.len() / INT13_CD_SECTOR_SIZE) as u64)
+            .unwrap_or(0);
+        let si = self.cpu.gpr_u16(CpuState::RSI);
+        let buf = self.cpu.ds.base.wrapping_add(u64::from(si));
+        let Ok(buf_size) = self.read_guest_u16(buf) else {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        };
+        if buf_size < INT13_EDD_PARAMS_SIZE_MIN {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        // CD: report linear LBA geometry (cyl=total, heads=1, spt=1) + 2048-byte
+        // sector size. Spec: Phoenix EDD / IBM INT 13h Extensions AH=48h.
+        if self
+            .write_guest_u16(buf, INT13_EDD_PARAMS_SIZE_MIN)
+            .and_then(|_| self.write_guest_u16(buf + 2, INT13_EDD_INFO_GEOMETRY_VALID))
+            .and_then(|_| self.write_guest_u32(buf + 4, total as u32))
+            .and_then(|_| self.write_guest_u32(buf + 8, 1))
+            .and_then(|_| self.write_guest_u32(buf + 12, 1))
+            .and_then(|_| self.write_guest_u64(buf + 16, total))
+            .and_then(|_| self.write_guest_u16(buf + 24, INT13_CD_SECTOR_SIZE as u16))
+            .is_err()
+        {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        self.cpu.set_ah(INT13_STATUS_OK);
+        self.cpu.set_cf(false);
+    }
+
+    /// Spec: El Torito / RBIL INT 13h AH=4Bh — AL=00h fills a 19-byte
+    /// specification packet at `DS:SI` from the attached ATAPI El Torito catalog.
+    fn int13_cd_emulation_from_regs(&mut self) {
+        if self.cpu.al() != INT13_CD_AL_GET_STATUS {
+            // AL=01h terminate-emulation and other subfunctions are out of scope.
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        if !self.int13_cd_has_medium() {
+            self.int13_fail(INT13_STATUS_TIMEOUT);
+            return;
+        }
+        let info = match self.inspect_atapi_el_torito() {
+            Ok(info) if info.bootable => info,
+            _ => {
+                self.int13_fail(INT13_STATUS_INVALID);
+                return;
+            }
+        };
+        let si = self.cpu.gpr_u16(CpuState::RSI);
+        let pkt = self.cpu.ds.base.wrapping_add(u64::from(si));
+        let end = pkt.wrapping_add(u64::from(INT13_CD_SPEC_PACKET_SIZE));
+        if end > self.mem.ram_len() as u64 {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        // El Torito specification packet (19 bytes). CHS fields stay 0 for no-emul.
+        let mut buf = [0u8; INT13_CD_SPEC_PACKET_SIZE as usize];
+        buf[0] = INT13_CD_SPEC_PACKET_SIZE;
+        buf[1] = info.media_type;
+        buf[2] = INT13_DRIVE_CD0;
+        buf[3] = 0; // controller index
+        buf[4..8].copy_from_slice(&info.load_rba.to_le_bytes());
+        buf[8] = 0; // device specification (IDE primary master stub)
+        buf[9] = 0;
+        buf[10] = 0; // buffer segment unused for get-status
+        buf[11] = 0;
+        let load_seg = info.effective_load_segment();
+        buf[12..14].copy_from_slice(&load_seg.to_le_bytes());
+        buf[14..16].copy_from_slice(&info.sector_count.to_le_bytes());
+        // offsets 16..18: cylinder/sector/head remain 0 for media type 00h
+        for (i, b) in buf.iter().enumerate() {
+            if self.mem.write_u8(pkt + i as u64, *b).is_err() {
+                self.int13_fail(INT13_STATUS_INVALID);
+                return;
+            }
+        }
+        self.cpu.set_ah(INT13_STATUS_OK);
+        self.cpu.set_cf(false);
     }
 
     /// Read `count` floppy sectors starting at CHS into physical `dest`.
@@ -997,6 +1197,57 @@ pub fn setup_int13_floppy_get_disk_type(cpu: &mut CpuState) {
     cpu.set_ah(INT13_AH_GET_DISK_TYPE);
     cpu.set_al(0);
     cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
+}
+
+/// Convenience: set up INT 13h AH=4Bh AL=00h CD get-status (`DS:SI` packet).
+pub fn setup_int13_cd_get_status(cpu: &mut CpuState, ds: u16, si: u16) {
+    cpu.set_ah(INT13_AH_CDROM_EMULATION);
+    cpu.set_al(INT13_CD_AL_GET_STATUS);
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
+    cpu.set_gpr_u16(CpuState::RSI, si);
+    cpu.ds = x86_core::SegmentReg::real_mode(ds);
+}
+
+/// Write a DAP and set AH=42h / DS:SI / DL=`E0h` for CD extended read.
+pub fn setup_int13_cd_ext_read(
+    machine: &mut Machine,
+    dap_phys: u64,
+    lba: u64,
+    count: u16,
+    buf_seg: u16,
+    buf_off: u16,
+) {
+    write_dap(machine, dap_phys, lba, count, buf_seg, buf_off);
+    machine.cpu.set_ah(INT13_AH_EXT_READ);
+    machine.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
+    machine.cpu.set_gpr_u16(CpuState::RSI, dap_phys as u16);
+    machine.cpu.ds = x86_core::SegmentReg::real_mode(0);
+}
+
+/// Set up AH=48h for CD with a result buffer at physical `buf_phys`.
+pub fn setup_int13_cd_ext_get_params(machine: &mut Machine, buf_phys: u64, buf_size: u16) {
+    machine
+        .mem
+        .write_u8(buf_phys, (buf_size & 0xFF) as u8)
+        .unwrap();
+    machine
+        .mem
+        .write_u8(buf_phys + 1, (buf_size >> 8) as u8)
+        .unwrap();
+    for i in 2..usize::from(buf_size.max(INT13_EDD_PARAMS_SIZE_MIN)) {
+        machine.mem.write_u8(buf_phys + i as u64, 0).unwrap();
+    }
+    machine.cpu.set_ah(INT13_AH_EXT_GET_PARAMS);
+    machine.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
+    machine.cpu.set_gpr_u16(CpuState::RSI, buf_phys as u16);
+    machine.cpu.ds = x86_core::SegmentReg::real_mode(0);
+}
+
+/// Convenience: set up INT 13h AH=41h for CD extensions check.
+pub fn setup_int13_cd_check_extensions(cpu: &mut CpuState) {
+    cpu.set_ah(INT13_AH_CHECK_EXTENSIONS);
+    cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_IN);
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_CD0);
 }
 
 #[cfg(test)]
@@ -1579,6 +1830,174 @@ mod tests {
         let mut bare = Machine::new(64 * 1024);
         setup_int13_hd_ext_get_params(&mut bare, 0x6100, INT13_EDD_PARAMS_SIZE_MIN);
         bare.service_int13_hd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    fn write_iso_sector(img: &mut [u8], lba: u32, data: &[u8]) {
+        let start = lba as usize * firmware_interface::EL_TORITO_SECTOR_BYTES;
+        img[start..start + data.len()].copy_from_slice(data);
+    }
+
+    /// Minimal bootable El Torito ISO (no-emul) for AH=4Bh tests.
+    fn synthetic_eltorito_iso() -> Vec<u8> {
+        use firmware_interface::{
+            EL_TORITO_BOOTABLE, EL_TORITO_BOOT_SYSTEM_ID, EL_TORITO_KEY_55, EL_TORITO_KEY_AA,
+            EL_TORITO_MEDIA_NO_EMUL, EL_TORITO_PLATFORM_X86, EL_TORITO_SECTOR_BYTES,
+            EL_TORITO_VALIDATION_HEADER_ID, ISO9660_STANDARD_ID, ISO9660_VD_BOOT_RECORD,
+            ISO9660_VD_TERMINATOR,
+        };
+        let mut img = vec![0u8; 32 * EL_TORITO_SECTOR_BYTES];
+        let mut pvd = vec![0u8; EL_TORITO_SECTOR_BYTES];
+        pvd[0] = 1;
+        pvd[1..6].copy_from_slice(ISO9660_STANDARD_ID);
+        pvd[6] = 1;
+        write_iso_sector(&mut img, 16, &pvd);
+
+        let mut br = vec![0u8; EL_TORITO_SECTOR_BYTES];
+        br[0] = ISO9660_VD_BOOT_RECORD;
+        br[1..6].copy_from_slice(ISO9660_STANDARD_ID);
+        br[6] = 1;
+        br[7..7 + EL_TORITO_BOOT_SYSTEM_ID.len()].copy_from_slice(EL_TORITO_BOOT_SYSTEM_ID);
+        let catalog_lba = 20u32;
+        br[0x47..0x4B].copy_from_slice(&catalog_lba.to_le_bytes());
+        write_iso_sector(&mut img, 17, &br);
+
+        let mut term = vec![0u8; EL_TORITO_SECTOR_BYTES];
+        term[0] = ISO9660_VD_TERMINATOR;
+        term[1..6].copy_from_slice(ISO9660_STANDARD_ID);
+        term[6] = 1;
+        write_iso_sector(&mut img, 18, &term);
+
+        let mut cat = vec![0u8; EL_TORITO_SECTOR_BYTES];
+        let mut validation = [0u8; 32];
+        validation[0] = EL_TORITO_VALIDATION_HEADER_ID;
+        validation[1] = EL_TORITO_PLATFORM_X86;
+        validation[30] = EL_TORITO_KEY_55;
+        validation[31] = EL_TORITO_KEY_AA;
+        let mut sum = 0u16;
+        for i in (0..32).step_by(2) {
+            if i == 28 {
+                continue;
+            }
+            sum = sum.wrapping_add(u16::from_le_bytes([validation[i], validation[i + 1]]));
+        }
+        let checksum = 0u16.wrapping_sub(sum);
+        validation[28..30].copy_from_slice(&checksum.to_le_bytes());
+        cat[0..32].copy_from_slice(&validation);
+        cat[32] = EL_TORITO_BOOTABLE;
+        cat[33] = EL_TORITO_MEDIA_NO_EMUL;
+        cat[38..40].copy_from_slice(&4u16.to_le_bytes());
+        cat[40..44].copy_from_slice(&24u32.to_le_bytes());
+        write_iso_sector(&mut img, catalog_lba, &cat);
+
+        let mut boot = vec![0x90u8; EL_TORITO_SECTOR_BYTES];
+        boot[0] = 0xF4;
+        write_iso_sector(&mut img, 24, &boot);
+        img
+    }
+
+    /// Spec: El Torito / RBIL INT 13h AH=4Bh AL=00h — fill CD status packet.
+    #[test]
+    fn int13_cd_ah4b_get_status_packet() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        setup_int13_cd_get_status(&mut m.cpu, 0x0000, 0x5000);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(0x5000).unwrap(), INT13_CD_SPEC_PACKET_SIZE);
+        assert_eq!(
+            m.mem.read_u8(0x5001).unwrap(),
+            firmware_interface::EL_TORITO_MEDIA_NO_EMUL
+        );
+        assert_eq!(m.mem.read_u8(0x5002).unwrap(), INT13_DRIVE_CD0);
+        let rba = u32::from(m.mem.read_u8(0x5004).unwrap())
+            | (u32::from(m.mem.read_u8(0x5005).unwrap()) << 8)
+            | (u32::from(m.mem.read_u8(0x5006).unwrap()) << 16)
+            | (u32::from(m.mem.read_u8(0x5007).unwrap()) << 24);
+        assert_eq!(rba, 24);
+        let load_seg = u16::from(m.mem.read_u8(0x500C).unwrap())
+            | (u16::from(m.mem.read_u8(0x500D).unwrap()) << 8);
+        assert_eq!(
+            load_seg,
+            firmware_interface::EL_TORITO_DEFAULT_LOAD_SEGMENT
+        );
+        let sectors = u16::from(m.mem.read_u8(0x500E).unwrap())
+            | (u16::from(m.mem.read_u8(0x500F).unwrap()) << 8);
+        assert_eq!(sectors, 4);
+    }
+
+    /// Spec: AH=4Bh with no ATAPI medium → timeout; terminate AL rejected.
+    #[test]
+    fn int13_cd_ah4b_errors() {
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_cd_get_status(&mut bare.cpu, 0x0000, 0x5000);
+        bare.service_int13_cd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+
+        let mut m = Machine::new(64 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        setup_int13_cd_get_status(&mut m.cpu, 0x0000, 0x5000);
+        m.cpu.set_al(0x01); // terminate-emulation — unsupported
+        m.service_int13_cd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: IBM/MS INT 13h Extensions AH=41h on CD `DL=E0h`.
+    #[test]
+    fn int13_cd_ah41_extensions_present() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        setup_int13_cd_check_extensions(&mut m.cpu);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_EXT_VERSION);
+        assert_eq!(m.cpu.gpr_u16(CpuState::RBX), INT13_EXT_MAGIC_OUT);
+        assert_eq!(m.cpu.gpr_u16(CpuState::RCX), INT13_EXT_CX_SUPPORTED);
+    }
+
+    /// Spec: AH=42h CD DAP read — 2048-byte Mode-1 LBA from ATAPI medium.
+    #[test]
+    fn int13_cd_ah42_reads_mode1_lba() {
+        let mut m = Machine::new(128 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        // LBA 24 holds the El Torito boot image (HLT at offset 0).
+        setup_int13_cd_ext_read(&mut m, 0x4000, 24, 1, 0x0000, 0x8000);
+        m.service_int13();
+        assert!(!cf(&m.cpu), "CF clear on CD AH=42h");
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xF4);
+        // OOB LBA → sector not found.
+        setup_int13_cd_ext_read(&mut m, 0x4000, 0xFFFF, 1, 0x0000, 0x8000);
+        m.service_int13_cd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+    }
+
+    /// Spec: Phoenix EDD AH=48h on CD — total blocks + sector size 2048.
+    #[test]
+    fn int13_cd_ah48_returns_edd_params() {
+        let iso = synthetic_eltorito_iso();
+        let blocks = (iso.len() / INT13_CD_SECTOR_SIZE) as u64;
+        let mut m = Machine::new(64 * 1024);
+        m.attach_atapi_cdrom_image(iso);
+        setup_int13_cd_ext_get_params(&mut m, 0x6000, INT13_EDD_PARAMS_SIZE_MIN);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.read_guest_u16(0x6000).unwrap(), INT13_EDD_PARAMS_SIZE_MIN);
+        assert_eq!(m.read_guest_u64(0x6010).unwrap(), blocks);
+        assert_eq!(
+            m.read_guest_u16(0x6018).unwrap(),
+            INT13_CD_SECTOR_SIZE as u16
+        );
+        // No medium → timeout.
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_cd_ext_get_params(&mut bare, 0x6000, INT13_EDD_PARAMS_SIZE_MIN);
+        bare.service_int13_cd();
         assert!(cf(&bare.cpu));
         assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
     }
