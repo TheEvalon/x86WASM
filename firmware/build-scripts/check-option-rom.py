@@ -49,8 +49,14 @@ def check(path: str) -> int:
         return 1
 
     print(
-        f"{path}: option ROM ok - {len(data)} bytes, {blocks} blocks "
-        f"({declared} bytes) declared, checksum 0"
+        f"{path}: option ROM ok - file={len(data)} bytes, "
+        f"declared_map={declared} bytes ({blocks}×{BLOCK_BYTES}), "
+        f"checksum=0"
+        + (
+            f", trailing_unmapped={len(data) - declared}"
+            if len(data) > declared
+            else ""
+        )
     )
     return 0
 

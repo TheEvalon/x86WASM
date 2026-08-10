@@ -71,6 +71,7 @@ preflight() {
   [[ -f "${ROOT}/firmware/seavgabios/LICENSE.notice" ]] || die "missing LICENSE.notice"
   [[ -f "${ROOT}/docs/firmware-r7-seavgabios-build.md" ]] || die "missing R7 build doc"
   [[ -f "${ROOT}/docs/firmware-r9-seavgabios-linux-smoke.md" ]] || die "missing R9 smoke doc"
+  [[ -f "${ROOT}/docs/firmware-r10-option-rom-bda-honesty.md" ]] || die "missing R10 option-ROM honesty doc"
 
   local py
   py="$(resolve_python)"
