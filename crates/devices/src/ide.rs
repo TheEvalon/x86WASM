@@ -555,6 +555,14 @@ pub const ATAPI_CMD_MODE_SENSE_6: u8 = 0x1A;
 ///
 /// Spec: SFF-8020i §9.8.4 — ATAPI CD-ROM MODE SENSE with 8-byte header.
 pub const ATAPI_CMD_MODE_SENSE_10: u8 = 0x5A;
+/// Packet command `START STOP UNIT`.
+///
+/// Spec: SFF-8020i §9.8.26 — LoEj/Start control medium load/eject readiness.
+pub const ATAPI_CMD_START_STOP_UNIT: u8 = 0x1B;
+/// Packet command `READ TOC/PMA/ATIP`.
+///
+/// Spec: SFF-8020i §9.8.20 — table of contents for the loaded data CD.
+pub const ATAPI_CMD_READ_TOC: u8 = 0x43;
 
 /// MODE SENSE page code `01h` — Read Error Recovery Parameters.
 ///
@@ -566,6 +574,17 @@ pub const ATAPI_MODE_PAGE_ERROR_RECOVERY_LEN: u8 = 0x06;
 pub const ATAPI_MEDIUM_TYPE_NO_DISC: u8 = 0x70;
 /// Medium type `01h` — 120 mm CD-ROM data only. Spec: SFF-8020i Table 46.
 pub const ATAPI_MEDIUM_TYPE_120MM_DATA: u8 = 0x01;
+/// START STOP UNIT byte 4 bit0 — Start. Spec: SFF-8020i §9.8.26.
+pub const ATAPI_START_STOP_START: u8 = 0x01;
+/// START STOP UNIT byte 4 bit1 — LoEj (load/eject). Spec: SFF-8020i §9.8.26.
+pub const ATAPI_START_STOP_LOEJ: u8 = 0x02;
+/// READ TOC ADR/Control for a Mode-1 data track (ADR=1, Control=4).
+///
+/// Spec: SFF-8020i Table 118 — `04h` = copy prohibited, digital data; ADR in
+/// the high nibble of the combined ADR/Control byte is typically `1h`.
+pub const ATAPI_TOC_ADR_CONTROL_DATA: u8 = 0x14;
+/// READ TOC track number for the lead-out area.
+pub const ATAPI_TOC_TRACK_LEAD_OUT: u8 = 0xAA;
 
 /// Sense key `0h` NO SENSE. Spec: SFF-8020i Table "Sense Key Definitions".
 pub const ATAPI_SENSE_NO_SENSE: u8 = 0x00;
@@ -1475,6 +1494,8 @@ impl IdePrimary {
             ATAPI_CMD_READ_10 if self.atapi_cdrom => self.exec_packet_read10(),
             ATAPI_CMD_MODE_SENSE_6 if self.atapi_cdrom => self.exec_packet_mode_sense6(),
             ATAPI_CMD_MODE_SENSE_10 if self.atapi_cdrom => self.exec_packet_mode_sense10(),
+            ATAPI_CMD_START_STOP_UNIT if self.atapi_cdrom => self.exec_packet_start_stop(),
+            ATAPI_CMD_READ_TOC if self.atapi_cdrom => self.exec_packet_read_toc(),
             _ => self.complete_packet_check_condition(
                 ATAPI_SENSE_ILLEGAL_REQUEST,
                 ATAPI_ASC_INVALID_COMMAND_OPERATION_CODE,
@@ -1776,6 +1797,152 @@ impl IdePrimary {
         let mode_len = (data.len() - 2) as u16;
         data[0..2].copy_from_slice(&mode_len.to_be_bytes());
         self.begin_packet_data_in(&data, allocation);
+    }
+
+    /// `START STOP UNIT` — start/stop spindle and soft load/eject.
+    ///
+    /// Spec: SFF-8020i §9.8.26 / Table 136:
+    /// - LoEj=0 Start=0 → stop (no medium change)
+    /// - LoEj=0 Start=1 → start (no medium change)
+    /// - LoEj=1 Start=0 → eject / unload → medium not present
+    /// - LoEj=1 Start=1 → load: no-op when already loaded; empty stays empty
+    ///   (host must re-attach an image — there is no tray motor)
+    fn exec_packet_start_stop(&mut self) {
+        let loej = self.packet_cmd[4] & ATAPI_START_STOP_LOEJ != 0;
+        let start = self.packet_cmd[4] & ATAPI_START_STOP_START != 0;
+        if loej && !start {
+            self.unload_atapi_medium();
+        }
+        // Load with empty tray cannot invent media; stop/start are no-ops.
+        let _ = start;
+        self.complete_packet_good();
+    }
+
+    /// Convert a logical block address to MSF (M, S, F) with the 150-frame offset.
+    ///
+    /// Spec: SFF-8020i §7.6 / Red Book — MSF addresses include the 2-second
+    /// pre-gap; LBA 0 ↔ 00:02:00.
+    fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
+        let abs = lba.saturating_add(150);
+        let frame = (abs % 75) as u8;
+        let sec = ((abs / 75) % 60) as u8;
+        let min = (abs / (75 * 60)) as u8;
+        (min, sec, frame)
+    }
+
+    /// `READ TOC` — single-session TOC for a data CD image.
+    ///
+    /// Spec: SFF-8020i §9.8.20 format `00b` (Table 112). One Mode-1 data track
+    /// starting at LBA 0 and lead-out at `blocks`. Format is taken from MMC
+    /// byte 2 bits (3:0) when non-zero, otherwise SFF-8020i byte 9 bits (7:6).
+    /// Only format `0` (TOC) and `1` (multi-session summary for a single
+    /// session) are implemented.
+    fn exec_packet_read_toc(&mut self) {
+        if !self.atapi_medium_loaded() {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_NOT_READY,
+                ATAPI_ASC_MEDIUM_NOT_PRESENT,
+                0,
+            );
+            return;
+        }
+        let msf = self.packet_cmd[1] & 0x02 != 0;
+        let format = {
+            let mmc = self.packet_cmd[2] & 0x0F;
+            let sff = (self.packet_cmd[9] >> 6) & 0x03;
+            if mmc != 0 {
+                mmc
+            } else {
+                sff
+            }
+        };
+        let allocation =
+            usize::from(u16::from_be_bytes([self.packet_cmd[7], self.packet_cmd[8]]));
+        let blocks = self.atapi_cdrom_blocks() as u32;
+        let data = match format {
+            0 => {
+                let start_track = self.packet_cmd[6];
+                if start_track != 0 && start_track != 1 && start_track != ATAPI_TOC_TRACK_LEAD_OUT
+                {
+                    self.complete_packet_check_condition(
+                        ATAPI_SENSE_ILLEGAL_REQUEST,
+                        ATAPI_ASC_INVALID_FIELD_IN_CDB,
+                        0,
+                    );
+                    return;
+                }
+                self.build_toc_format0(msf, start_track, blocks)
+            }
+            1 => {
+                // Single-session summary: first=last session 1, first track LBA 0.
+                let mut data = vec![0u8; 12];
+                data[0..2].copy_from_slice(&10u16.to_be_bytes());
+                data[2] = 1;
+                data[3] = 1;
+                data[5] = ATAPI_TOC_ADR_CONTROL_DATA;
+                data[6] = 1;
+                if msf {
+                    let (m, s, f) = Self::lba_to_msf(0);
+                    data[9] = m;
+                    data[10] = s;
+                    data[11] = f;
+                }
+                data
+            }
+            _ => {
+                self.complete_packet_check_condition(
+                    ATAPI_SENSE_ILLEGAL_REQUEST,
+                    ATAPI_ASC_INVALID_FIELD_IN_CDB,
+                    0,
+                );
+                return;
+            }
+        };
+        self.begin_packet_data_in(&data, allocation);
+    }
+
+    fn build_toc_format0(&self, msf: bool, start_track: u8, blocks: u32) -> Vec<u8> {
+        let mut descriptors: Vec<[u8; 8]> = Vec::new();
+        let include_track1 = start_track == 0 || start_track == 1;
+        let include_lead_out =
+            start_track == 0 || start_track == 1 || start_track == ATAPI_TOC_TRACK_LEAD_OUT;
+        if include_track1 {
+            let mut d = [0u8; 8];
+            d[1] = ATAPI_TOC_ADR_CONTROL_DATA;
+            d[2] = 1;
+            if msf {
+                let (m, s, f) = Self::lba_to_msf(0);
+                d[5] = m;
+                d[6] = s;
+                d[7] = f;
+            } else {
+                d[4..8].copy_from_slice(&0u32.to_be_bytes());
+            }
+            descriptors.push(d);
+        }
+        if include_lead_out {
+            let mut d = [0u8; 8];
+            d[1] = ATAPI_TOC_ADR_CONTROL_DATA;
+            d[2] = ATAPI_TOC_TRACK_LEAD_OUT;
+            if msf {
+                let (m, s, f) = Self::lba_to_msf(blocks);
+                d[5] = m;
+                d[6] = s;
+                d[7] = f;
+            } else {
+                d[4..8].copy_from_slice(&blocks.to_be_bytes());
+            }
+            descriptors.push(d);
+        }
+        let body_len = 2 + descriptors.len() * 8;
+        let mut data = Vec::with_capacity(2 + body_len);
+        data.extend_from_slice(&(body_len as u16).to_be_bytes());
+        data.push(1); // first track
+        data.push(1); // last track
+        for d in descriptors {
+            data.extend_from_slice(&d);
+        }
+        data
     }
 
     /// `READ (10)` — transfer logical blocks from the attached medium.
