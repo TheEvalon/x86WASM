@@ -232,13 +232,13 @@ fn vme_int_n_redirect_bit_clear_uses_ivt_at_iopl0() {
     assert_eq!(bus.peek_u16(stack_base + sp as usize + 2), VM86_CS);
     let pushed = bus.peek_u16(stack_base + sp as usize + 4);
     assert_eq!((pushed >> 12) & 3, 3, "method-6 IOPL=3 in image");
-    assert_eq!(
-        pushed & (1 << 9) != 0,
-        vif_set,
-        "method-6 IF←VIF"
-    );
+    assert_eq!(pushed & (1 << 9) != 0, vif_set, "method-6 IF←VIF");
     assert_eq!(cpu.rflags & (1 << 9), 0, "IF cleared on redirect");
-    assert_eq!(cpu.rflags & (1 << 19), 0, "VIF cleared on method-6 redirect");
+    assert_eq!(
+        cpu.rflags & (1 << 19),
+        0,
+        "VIF cleared on method-6 redirect"
+    );
 }
 
 /// VME=1, redirect bit set, IOPL=0: still `#GP(0)` through the IDT (no silent IVT).

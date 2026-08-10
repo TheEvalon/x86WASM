@@ -136,10 +136,7 @@ fn enter_vm86(guest: &[u8], iopl: u8) -> (CpuState, RamBus) {
     for b in 0..32 {
         bus.mem[REDIRECT_MAP + b] = 0xFF;
     }
-    bus.write_bytes(
-        IDT + 3 * 8,
-        &encode_idt_gate32(HANDLER_BP, SEL_KCODE, 0xEE),
-    );
+    bus.write_bytes(IDT + 3 * 8, &encode_idt_gate32(HANDLER_BP, SEL_KCODE, 0xEE));
     bus.write_bytes(
         IDT + 13 * 8,
         &encode_idt_gate32(HANDLER_GP, SEL_KCODE, 0x8E),
