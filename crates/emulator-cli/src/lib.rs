@@ -57,12 +57,16 @@ pub struct Options {
     pub ide_image: Option<PathBuf>,
     /// Raw 1.44MB floppy image for guest boot measure / attach.
     pub floppy_image: Option<PathBuf>,
-    /// Measure-first guest boot (load MBR/VBR → `0x7C00`, probe first stop).
+    /// Raw ATAPI/ISO CD-ROM image for El Torito guest measure.
+    pub cdrom_image: Option<PathBuf>,
+    /// Measure-first guest boot (load MBR/VBR/El Torito → entry, probe first stop).
     ///
     /// Does **not** claim FreeDOS/Linux boot success.
     pub guest_measure: bool,
-    /// When [`Options::guest_measure`] is set with both images, prefer floppy.
+    /// When [`Options::guest_measure`] is set with both IDE and floppy, prefer floppy.
     pub guest_floppy_first: bool,
+    /// When [`Options::guest_measure`] is set, use El Torito no-emul handoff.
+    pub guest_eltorito: bool,
 }
 
 impl Default for Options {
@@ -80,8 +84,10 @@ impl Default for Options {
             option_rom_base: DEFAULT_OPTION_ROM_BASE,
             ide_image: None,
             floppy_image: None,
+            cdrom_image: None,
             guest_measure: false,
             guest_floppy_first: false,
+            guest_eltorito: false,
         }
     }
 }
@@ -287,7 +293,7 @@ impl std::fmt::Display for CliError {
             Self::RomAndBios => write!(f, "Use only one of --rom or --bios"),
             Self::GuestMeasureNeedsImage => write!(
                 f,
-                "--guest-measure requires --ide-image and/or --floppy-image"
+                "--guest-measure requires --ide-image, --floppy-image, and/or --cdrom-image"
             ),
             Self::Io(msg) => write!(f, "{msg}"),
             Self::Machine(msg) => write!(f, "{msg}"),
@@ -317,7 +323,8 @@ pub fn usage() -> String {
          \x20                  [--post-trace [N]] [--post-spin [N]]\n\
          \x20                  [--option-rom path.bin [--option-rom-base ADDR]]\n\
          \x20                  [--ide-image path.bin] [--floppy-image path.img]\n\
-         \x20                  [--guest-measure [--guest-floppy-first]]\n\
+         \x20                  [--cdrom-image path.iso]\n\
+         \x20                  [--guest-measure [--guest-floppy-first|--guest-eltorito]]\n\
          \x20                  [--vga-text] [--vga-frame]\n\
          --rom              Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
          --bios             Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
@@ -337,10 +344,13 @@ pub fn usage() -> String {
          --option-rom-base  Physical base for --option-rom (default 0x{DEFAULT_OPTION_ROM_BASE:05X}).\n\
          --ide-image        Attach a raw IDE disk image (primary master).\n\
          --floppy-image     Attach a raw 1.44MB floppy image.\n\
-         --guest-measure    Load boot sector to 0x7C00 and report the first stop reason\n\
-         \x20                  (measure-first; not a FreeDOS/Linux boot-success claim).\n\
-         \x20                  Requires --ide-image and/or --floppy-image.\n\
+         --cdrom-image      Attach a raw ATAPI/ISO CD-ROM image (El Torito measure).\n\
+         --guest-measure    Load boot image and report the first stop reason (v2 harness:\n\
+         \x20                  checkpoints + serial capture; not a FreeDOS/Linux success claim).\n\
+         \x20                  Requires --ide-image, --floppy-image, and/or --cdrom-image.\n\
          --guest-floppy-first  With --guest-measure, force floppy CHS (0,0,1) handoff.\n\
+         --guest-eltorito   With --guest-measure, force El Torito no-emul handoff\n\
+         \x20                  (requires --cdrom-image).\n\
          --vga-text         Dump the {VGA_TEXT_COLS}x{VGA_TEXT_ROWS} VGA text buffer after the run.\n\
          --vga-frame        Render the display through the VGA display fetch and report the\n\
          \x20                  frame geometry, RGBA size, and whether a font is installed.\n\
@@ -439,8 +449,13 @@ where
                     .ok_or(CliError::MissingValue("--floppy-image"))?;
                 opts.floppy_image = Some(PathBuf::from(path.as_ref()));
             }
+            "--cdrom-image" => {
+                let path = iter.next().ok_or(CliError::MissingValue("--cdrom-image"))?;
+                opts.cdrom_image = Some(PathBuf::from(path.as_ref()));
+            }
             "--guest-measure" => opts.guest_measure = true,
             "--guest-floppy-first" => opts.guest_floppy_first = true,
+            "--guest-eltorito" => opts.guest_eltorito = true,
             "--steps" => {
                 let v = iter.next().ok_or(CliError::MissingValue("--steps"))?;
                 opts.max_steps = v
@@ -454,7 +469,14 @@ where
     if opts.rom_path.is_some() && opts.bios_path.is_some() {
         return Err(CliError::RomAndBios);
     }
-    if opts.guest_measure && opts.ide_image.is_none() && opts.floppy_image.is_none() {
+    if opts.guest_measure
+        && opts.ide_image.is_none()
+        && opts.floppy_image.is_none()
+        && opts.cdrom_image.is_none()
+    {
+        return Err(CliError::GuestMeasureNeedsImage);
+    }
+    if opts.guest_eltorito && opts.cdrom_image.is_none() {
         return Err(CliError::GuestMeasureNeedsImage);
     }
     Ok(ParsedArgs::Run(opts))
@@ -509,6 +531,10 @@ pub fn build_machine(opts: &Options) -> Result<BuiltMachine, CliError> {
             .attach_floppy_image(data)
             .map_err(|e| CliError::Machine(format!("Failed to attach floppy: {e}")))?;
     }
+    if let Some(path) = &opts.cdrom_image {
+        let data = read_file(path)?;
+        machine.attach_atapi_cdrom_image(data);
+    }
 
     Ok(BuiltMachine {
         machine,
@@ -519,7 +545,11 @@ pub fn build_machine(opts: &Options) -> Result<BuiltMachine, CliError> {
 
 /// Media policy for [`run_guest_measure`].
 pub fn guest_boot_media(opts: &Options) -> GuestBootMedia {
-    if opts.guest_floppy_first || (opts.floppy_image.is_some() && opts.ide_image.is_none()) {
+    if opts.guest_eltorito
+        || (opts.cdrom_image.is_some() && opts.ide_image.is_none() && opts.floppy_image.is_none())
+    {
+        GuestBootMedia::ElTorito
+    } else if opts.guest_floppy_first || (opts.floppy_image.is_some() && opts.ide_image.is_none()) {
         GuestBootMedia::FloppyFirst
     } else {
         GuestBootMedia::IdePrefer
@@ -1404,6 +1434,8 @@ mod tests {
         assert!(u.contains("--guest-measure"), "{u}");
         assert!(u.contains("--ide-image"), "{u}");
         assert!(u.contains("--floppy-image"), "{u}");
+        assert!(u.contains("--cdrom-image"), "{u}");
+        assert!(u.contains("--guest-eltorito"), "{u}");
     }
 
     #[test]
@@ -1438,6 +1470,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_guest_measure_with_cdrom_eltorito() {
+        let parsed = parse_args([
+            "--cdrom-image",
+            "cd.iso",
+            "--guest-measure",
+            "--guest-eltorito",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(Options {
+                cdrom_image: Some(PathBuf::from("cd.iso")),
+                guest_measure: true,
+                guest_eltorito: true,
+                ..Options::default()
+            })
+        );
+    }
+
+    #[test]
     fn guest_boot_media_policy() {
         let ide_only = Options {
             ide_image: Some(PathBuf::from("a")),
@@ -1460,6 +1512,13 @@ mod tests {
             ..Options::default()
         };
         assert_eq!(guest_boot_media(&both_force), GuestBootMedia::FloppyFirst);
+
+        let cdrom_only = Options {
+            cdrom_image: Some(PathBuf::from("c")),
+            guest_measure: true,
+            ..Options::default()
+        };
+        assert_eq!(guest_boot_media(&cdrom_only), GuestBootMedia::ElTorito);
     }
 
     /// Synthetic IDE MBR → measure-first halt (not a boot-success claim).
@@ -1480,8 +1539,9 @@ mod tests {
         let measure =
             run_guest_measure(&mut machine, guest_boot_media(&opts), opts.max_steps).expect("run");
         let text = measure.to_string();
-        assert!(text.contains("guest-measure:"));
+        assert!(text.contains("guest-measure-v2:"));
         assert!(text.contains("not a boot-success claim"));
         assert!(text.contains("halted"), "{text}");
+        assert!(text.contains("checkpoints=["), "{text}");
     }
 }

@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod eltorito_load;
 mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
@@ -27,12 +28,17 @@ mod vga_font;
 mod vga_frame;
 mod xbcs;
 
-pub use guest_boot::{GuestBootMeasure, GuestBootMedia};
+pub use guest_boot::{
+    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GUEST_BOOT_MEASURE_VERSION,
+};
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int13::{
-    chs_to_lba, pack_cx, setup_int13_hd_read, unpack_cx, INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ,
-    INT13_AH_RESET, INT13_DRIVE_HD0, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE,
-    INT13_STATUS_INVALID, INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
+    chs_to_lba, pack_cx, setup_int13_hd_ext_read, setup_int13_hd_read, setup_int13_hd_write,
+    unpack_cx, INT13_AH_CHECK_EXTENSIONS, INT13_AH_EXT_READ, INT13_AH_EXT_WRITE,
+    INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ, INT13_AH_RESET, INT13_AH_WRITE, INT13_DAP_SIZE_MIN,
+    INT13_DRIVE_HD0, INT13_EXT_CX_PACKET, INT13_EXT_MAGIC_IN, INT13_EXT_MAGIC_OUT,
+    INT13_EXT_VERSION, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE, INT13_STATUS_INVALID,
+    INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
 };
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::{
@@ -110,6 +116,24 @@ pub enum MachineError {
     /// Guest RAM must cover `0x7C00`..`0x7DFF` for the boot-sector copy.
     #[error("RAM too small for MBR at 0x7C00")]
     MbrRamTooSmall,
+    /// El Torito catalog parse failed for [`Machine::load_eltorito_to_7c00`].
+    #[error(transparent)]
+    ElTorito(#[from] firmware_interface::ElToritoError),
+    /// Default entry is not bootable (`88h`).
+    #[error("El Torito default entry is not bootable")]
+    ElToritoNotBootable,
+    /// Only no-emulation media type `00h` is loaded in this slice.
+    #[error("El Torito media type not supported (no-emulation only)")]
+    ElToritoUnsupportedMedia,
+    /// Boot image extent is outside the attached CD image.
+    #[error("El Torito boot image out of range")]
+    ElToritoBootImageOob,
+    /// Guest RAM too small for the El Torito load address + sector count.
+    #[error("RAM too small for El Torito boot image")]
+    ElToritoRamTooSmall,
+    /// Sector count was zero or overflowed.
+    #[error("El Torito sector count invalid")]
+    ElToritoInvalidSectorCount,
     /// Option-ROM base is not a valid legacy entry (`CS:IP` cannot be formed).
     #[error("option ROM entry base is invalid")]
     OptionRomEntryInvalid,
@@ -626,8 +650,8 @@ impl Machine {
     ///
     /// Wraps [`IdePrimary::attach_atapi_cdrom_image`]. Does not claim a CMOS
     /// fixed-disk geometry (`ide_disk_sectors` stays unset). Host-side El Torito
-    /// inspection: [`Self::inspect_atapi_el_torito`]. INT 13h CD boot remains
-    /// deferred.
+    /// parse/handoff: [`Self::inspect_atapi_el_torito`] /
+    /// [`Self::load_eltorito_to_7c00`]. INT 13h CD boot remains deferred.
     pub fn attach_atapi_cdrom_image(&mut self, image: Vec<u8>) {
         self.ide.attach_atapi_cdrom_image(image);
     }
@@ -635,7 +659,7 @@ impl Machine {
     /// Parse El Torito from the attached ATAPI CD-ROM image (host-side only).
     ///
     /// Spec: El Torito 1.0 — Boot Record + Validation Entry (`55h`/`AAh`) +
-    /// Initial/Default Entry. Does not load or execute a boot image.
+    /// Initial/Default Entry. Load/execute uses [`Self::load_eltorito_to_7c00`].
     pub fn inspect_atapi_el_torito(
         &self,
     ) -> Result<firmware_interface::ElToritoInfo, firmware_interface::ElToritoError> {

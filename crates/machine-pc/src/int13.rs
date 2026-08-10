@@ -1,4 +1,4 @@
-//! Host-side IBM BIOS INT 13h hard-disk subset (AH=02 read at minimum).
+//! Host-side IBM BIOS INT 13h hard-disk subset (AH=00/02/03/08 + 41h/42h).
 //!
 //! Closest approach in-tree to SeaBIOS disk services: a **host** dispatcher that
 //! applies classic INT 13h register conventions against the primary IDE image,
@@ -7,8 +7,10 @@
 //! INT 13h (see [`crate::mbr`] for floppy → `0x7C00` handoff).
 //!
 //! Spec: IBM PC BIOS INT 13h Disk Services (AH=00h reset, AH=02h read sectors,
-//! AH=08h get drive parameters); ATA IDENTIFY obsolete geometry 16 heads / 63
-//! sectors-per-track (matches `IdePrimary` IDENTIFY words 3/6).
+//! AH=03h write sectors, AH=08h get drive parameters); IBM/Microsoft INT 13h
+//! Extensions (AH=41h check extensions, AH=42h extended read). ATA IDENTIFY
+//! obsolete geometry 16 heads / 63 sectors-per-track (matches `IdePrimary`
+//! IDENTIFY words 3/6).
 
 use crate::{Machine, MachineError};
 use x86_core::CpuState;
@@ -20,8 +22,27 @@ pub const INT13_DRIVE_HD0: u8 = 0x80;
 pub const INT13_AH_RESET: u8 = 0x00;
 /// AH=02h — read disk sectors into `ES:BX`.
 pub const INT13_AH_READ: u8 = 0x02;
+/// AH=03h — write disk sectors from `ES:BX`.
+pub const INT13_AH_WRITE: u8 = 0x03;
 /// AH=08h — get drive parameters.
 pub const INT13_AH_GET_DRIVE_PARAMS: u8 = 0x08;
+/// AH=41h — check extensions present.
+pub const INT13_AH_CHECK_EXTENSIONS: u8 = 0x41;
+/// AH=42h — extended read sectors (Disk Address Packet).
+pub const INT13_AH_EXT_READ: u8 = 0x42;
+/// AH=43h — extended write (unsupported in this subset).
+pub const INT13_AH_EXT_WRITE: u8 = 0x43;
+
+/// Magic `BX` input for AH=41h.
+pub const INT13_EXT_MAGIC_IN: u16 = 0x55AA;
+/// Magic `BX` output for AH=41h success.
+pub const INT13_EXT_MAGIC_OUT: u16 = 0xAA55;
+/// Major version returned in `AH` on AH=41h success (IBM/MS INT 13h Extensions).
+pub const INT13_EXT_VERSION: u8 = 0x01;
+/// `CX` bit 0 — packet-structure device access supported (AH=42h subset here).
+pub const INT13_EXT_CX_PACKET: u16 = 0x0001;
+/// Minimum Disk Address Packet size (16 bytes).
+pub const INT13_DAP_SIZE_MIN: u8 = 0x10;
 
 /// Success status in `AH` with `CF` clear.
 pub const INT13_STATUS_OK: u8 = 0x00;
@@ -58,9 +79,49 @@ impl Machine {
         match self.cpu.ah() {
             INT13_AH_RESET => self.int13_hd_reset(),
             INT13_AH_READ => self.int13_hd_read_from_regs(),
+            INT13_AH_WRITE => self.int13_hd_write_from_regs(),
             INT13_AH_GET_DRIVE_PARAMS => self.int13_hd_get_params(),
+            INT13_AH_CHECK_EXTENSIONS => self.int13_hd_check_extensions(),
+            INT13_AH_EXT_READ => self.int13_hd_ext_read_from_regs(),
             _ => self.int13_fail(INT13_STATUS_INVALID),
         }
+    }
+
+    /// Read `count` 512-byte sectors from primary IDE starting at absolute LBA
+    /// into physical `dest`.
+    ///
+    /// Spec: IBM/MS INT 13h Extensions AH=42h — LBA addressing; host helper
+    /// without touching CPU registers.
+    pub fn int13_hd_read_lba_to_phys(
+        &mut self,
+        lba: u64,
+        count: u16,
+        dest: u64,
+    ) -> Result<u16, u8> {
+        if !self.ide.present || self.ide.image.is_empty() {
+            return Err(INT13_STATUS_TIMEOUT);
+        }
+        if count == 0 {
+            return Err(INT13_STATUS_INVALID);
+        }
+        let total = (self.ide.image.len() / INT13_SECTOR_SIZE) as u64;
+        let need = u64::from(count);
+        if lba.checked_add(need).is_none_or(|end| end > total) {
+            return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+        }
+        let byte_off = (lba as usize).saturating_mul(INT13_SECTOR_SIZE);
+        let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
+        let end = dest.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
+        if end > self.mem.ram_len() as u64 {
+            return Err(INT13_STATUS_INVALID);
+        }
+        for i in 0..bytes {
+            let b = self.ide.image[byte_off + i];
+            self.mem
+                .write_u8(dest + i as u64, b)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+        }
+        Ok(count)
     }
 
     /// Read `count` sectors from primary IDE starting at packed INT 13h CHS
@@ -76,6 +137,50 @@ impl Machine {
         count: u8,
         dest: u64,
     ) -> Result<u8, u8> {
+        let (byte_off, bytes, dest) =
+            self.int13_hd_chs_bounds(cylinder, head, sector, count, dest)?;
+        for i in 0..bytes {
+            let b = self.ide.image[byte_off + i];
+            self.mem
+                .write_u8(dest + i as u64, b)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+        }
+        Ok(count)
+    }
+
+    /// Write `count` sectors from physical `src` into primary IDE at packed
+    /// INT 13h CHS, without touching CPU registers.
+    ///
+    /// Spec: IBM PC BIOS INT 13h AH=03h — same CHS packing as AH=02h; buffer
+    /// is the source.
+    pub fn int13_hd_write_chs_from_phys(
+        &mut self,
+        cylinder: u16,
+        head: u8,
+        sector: u8,
+        count: u8,
+        src: u64,
+    ) -> Result<u8, u8> {
+        let (byte_off, bytes, src) =
+            self.int13_hd_chs_bounds(cylinder, head, sector, count, src)?;
+        for i in 0..bytes {
+            let b = self
+                .mem
+                .read_u8(src + i as u64)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+            self.ide.image[byte_off + i] = b;
+        }
+        Ok(count)
+    }
+
+    fn int13_hd_chs_bounds(
+        &self,
+        cylinder: u16,
+        head: u8,
+        sector: u8,
+        count: u8,
+        phys: u64,
+    ) -> Result<(usize, usize, u64), u8> {
         if !self.ide.present || self.ide.image.is_empty() {
             return Err(INT13_STATUS_TIMEOUT);
         }
@@ -97,18 +202,11 @@ impl Machine {
 
         let byte_off = (start_lba as usize).saturating_mul(INT13_SECTOR_SIZE);
         let bytes = usize::from(count).saturating_mul(INT13_SECTOR_SIZE);
-        let end = dest.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
+        let end = phys.checked_add(bytes as u64).ok_or(INT13_STATUS_INVALID)?;
         if end > self.mem.ram_len() as u64 {
             return Err(INT13_STATUS_INVALID);
         }
-
-        for i in 0..bytes {
-            let b = self.ide.image[byte_off + i];
-            self.mem
-                .write_u8(dest + i as u64, b)
-                .map_err(|_| INT13_STATUS_INVALID)?;
-        }
-        Ok(count)
+        Ok((byte_off, bytes, phys))
     }
 }
 
@@ -149,6 +247,23 @@ impl Machine {
         }
     }
 
+    fn int13_hd_write_from_regs(&mut self) {
+        let al = self.cpu.al();
+        let cx = self.cpu.gpr_u16(CpuState::RCX);
+        let dh = self.cpu.gpr_u8(4 + CpuState::RDX);
+        let bx = self.cpu.gpr_u16(CpuState::RBX);
+        let (cylinder, sector) = unpack_cx(cx);
+        let src = self.cpu.es.base.wrapping_add(u64::from(bx));
+
+        match self.int13_hd_write_chs_from_phys(cylinder, dh, sector, al, src) {
+            Ok(n) => self.int13_ok_al(n),
+            Err(status) => {
+                self.cpu.set_al(0);
+                self.int13_fail(status);
+            }
+        }
+    }
+
     fn int13_hd_get_params(&mut self) {
         if !self.ide.present {
             self.int13_fail(INT13_STATUS_TIMEOUT);
@@ -171,6 +286,88 @@ impl Machine {
         self.cpu.set_ah(INT13_STATUS_OK);
         self.cpu.set_cf(false);
     }
+
+    /// Spec: IBM/MS INT 13h Extensions AH=41h — `BX=55AAh` in, `BX=AA55h` out.
+    fn int13_hd_check_extensions(&mut self) {
+        if self.cpu.gpr_u16(CpuState::RBX) != INT13_EXT_MAGIC_IN {
+            self.int13_fail(INT13_STATUS_INVALID);
+            return;
+        }
+        if !self.ide.present {
+            self.int13_fail(INT13_STATUS_TIMEOUT);
+            return;
+        }
+        self.cpu.set_ah(INT13_EXT_VERSION);
+        self.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_OUT);
+        // Bit 0 only: packet access. Removable lock / EDD / AH=43h write are out.
+        self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_PACKET);
+        self.cpu.set_cf(false);
+    }
+
+    /// Spec: IBM/MS INT 13h Extensions AH=42h — Disk Address Packet at `DS:SI`.
+    fn int13_hd_ext_read_from_regs(&mut self) {
+        let si = self.cpu.gpr_u16(CpuState::RSI);
+        let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
+        match self.int13_parse_dap(dap_phys) {
+            Ok(dap) => match self.int13_hd_read_lba_to_phys(dap.lba, dap.count, dap.dest) {
+                Ok(_) => {
+                    self.cpu.set_ah(INT13_STATUS_OK);
+                    self.cpu.set_cf(false);
+                }
+                Err(status) => self.int13_fail(status),
+            },
+            Err(status) => self.int13_fail(status),
+        }
+    }
+
+    fn int13_parse_dap(&self, dap_phys: u64) -> Result<DiskAddressPacket, u8> {
+        let size = self
+            .mem
+            .read_u8(dap_phys)
+            .map_err(|_| INT13_STATUS_INVALID)?;
+        if size < INT13_DAP_SIZE_MIN {
+            return Err(INT13_STATUS_INVALID);
+        }
+        let count = self.read_guest_u16(dap_phys + 2)?;
+        let buf_off = self.read_guest_u16(dap_phys + 4)?;
+        let buf_seg = self.read_guest_u16(dap_phys + 6)?;
+        let lba = self.read_guest_u64(dap_phys + 8)?;
+        // Classic packet: transfer buffer is real-mode `seg:off`. Flat 64-bit
+        // buffer form (`size >= 18h` with `FFFF:FFFF` pointer) is unsupported.
+        if buf_seg == 0xFFFF && buf_off == 0xFFFF {
+            return Err(INT13_STATUS_INVALID);
+        }
+        let dest = (u64::from(buf_seg) << 4).wrapping_add(u64::from(buf_off));
+        Ok(DiskAddressPacket { count, dest, lba })
+    }
+
+    fn read_guest_u16(&self, phys: u64) -> Result<u16, u8> {
+        let lo = self.mem.read_u8(phys).map_err(|_| INT13_STATUS_INVALID)?;
+        let hi = self
+            .mem
+            .read_u8(phys + 1)
+            .map_err(|_| INT13_STATUS_INVALID)?;
+        Ok(u16::from(lo) | (u16::from(hi) << 8))
+    }
+
+    fn read_guest_u64(&self, phys: u64) -> Result<u64, u8> {
+        let mut v = 0u64;
+        for i in 0..8u64 {
+            let b = self
+                .mem
+                .read_u8(phys + i)
+                .map_err(|_| INT13_STATUS_INVALID)?;
+            v |= u64::from(b) << (i * 8);
+        }
+        Ok(v)
+    }
+}
+
+/// Parsed classic 16-byte Disk Address Packet (IBM/MS INT 13h Extensions).
+struct DiskAddressPacket {
+    count: u16,
+    dest: u64,
+    lba: u64,
 }
 
 /// Pack cylinder + 1-based sector into INT 13h `CX`.
@@ -218,6 +415,55 @@ pub fn setup_int13_hd_read(
     cpu.set_gpr_u8(4 + CpuState::RDX, head);
     cpu.set_gpr_u16(CpuState::RBX, bx);
     cpu.es = x86_core::SegmentReg::real_mode(es);
+}
+
+/// Convenience: set up INT 13h AH=03h registers for a hard-disk write.
+pub fn setup_int13_hd_write(
+    cpu: &mut CpuState,
+    cylinder: u16,
+    head: u8,
+    sector: u8,
+    count: u8,
+    es: u16,
+    bx: u16,
+) {
+    cpu.set_ah(INT13_AH_WRITE);
+    cpu.set_al(count);
+    cpu.set_gpr_u16(CpuState::RCX, pack_cx(cylinder, sector));
+    cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+    cpu.set_gpr_u8(4 + CpuState::RDX, head);
+    cpu.set_gpr_u16(CpuState::RBX, bx);
+    cpu.es = x86_core::SegmentReg::real_mode(es);
+}
+
+/// Write a classic 16-byte Disk Address Packet and set AH=42h / DS:SI / DL.
+pub fn setup_int13_hd_ext_read(
+    machine: &mut Machine,
+    dap_phys: u64,
+    lba: u64,
+    count: u16,
+    buf_seg: u16,
+    buf_off: u16,
+) {
+    let mut dap = [0u8; 16];
+    dap[0] = INT13_DAP_SIZE_MIN;
+    dap[2] = (count & 0xFF) as u8;
+    dap[3] = (count >> 8) as u8;
+    dap[4] = (buf_off & 0xFF) as u8;
+    dap[5] = (buf_off >> 8) as u8;
+    dap[6] = (buf_seg & 0xFF) as u8;
+    dap[7] = (buf_seg >> 8) as u8;
+    for (i, b) in lba.to_le_bytes().iter().enumerate() {
+        dap[8 + i] = *b;
+    }
+    for (i, b) in dap.iter().enumerate() {
+        machine.mem.write_u8(dap_phys + i as u64, *b).unwrap();
+    }
+    // Place DAP at physical address under DS:SI with DS=0 for harness simplicity.
+    machine.cpu.set_ah(INT13_AH_EXT_READ);
+    machine.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+    machine.cpu.set_gpr_u16(CpuState::RSI, dap_phys as u16);
+    machine.cpu.ds = x86_core::SegmentReg::real_mode(0);
 }
 
 impl Machine {
@@ -372,11 +618,86 @@ mod tests {
     #[test]
     fn int13_unsupported_ah_fails() {
         let mut m = Machine::with_ide(64 * 1024, synthetic_disk(1));
-        m.cpu.set_ah(0x42); // IBM/MS extensions — out of scope
+        m.cpu.set_ah(0x05); // Format track — out of scope
         m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
         m.service_int13_hd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: IBM BIOS INT 13h AH=03h — write ES:BX to CHS (0,0,1) / LBA0.
+    #[test]
+    fn int13_ah03_writes_lba0_from_es_bx() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        for i in 0..INT13_SECTOR_SIZE {
+            m.mem.write_u8(0x9000 + i as u64, 0x5A).unwrap();
+        }
+        m.mem.write_u8(0x9000, 0xE9).unwrap();
+        m.mem.write_u8(0x9000 + 510, MBR_SIGNATURE_LO).unwrap();
+        m.mem.write_u8(0x9000 + 511, MBR_SIGNATURE_HI).unwrap();
+        setup_int13_hd_write(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x9000);
+        m.service_int13_hd();
+
+        assert!(!cf(&m.cpu), "CF clear on success");
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.al(), 1);
+        assert_eq!(m.ide.image[0], 0xE9);
+        assert_eq!(m.ide.image[1], 0x5A);
+        assert_eq!(m.ide.image[510], MBR_SIGNATURE_LO);
+        assert_eq!(m.ide.image[511], MBR_SIGNATURE_HI);
+    }
+
+    /// Spec: multi-sector AH=03h writes consecutive LBAs.
+    #[test]
+    fn int13_ah03_writes_two_sectors() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        for i in 0..(2 * INT13_SECTOR_SIZE) {
+            m.mem.write_u8(0xA000 + i as u64, 0x11).unwrap();
+        }
+        m.mem.write_u8(0xA000, 0xAA).unwrap();
+        m.mem
+            .write_u8(0xA000 + INT13_SECTOR_SIZE as u64, 0xBB)
+            .unwrap();
+        setup_int13_hd_write(&mut m.cpu, 0, 0, 1, 2, 0x0000, 0xA000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.ide.image[0], 0xAA);
+        assert_eq!(m.ide.image[INT13_SECTOR_SIZE], 0xBB);
+    }
+
+    /// Spec: AH=03h then AH=02h round-trips the same buffer.
+    #[test]
+    fn int13_ah03_then_ah02_round_trip() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        for i in 0..INT13_SECTOR_SIZE {
+            m.mem.write_u8(0xB000 + i as u64, (i & 0xFF) as u8).unwrap();
+        }
+        setup_int13_hd_write(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0xB000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0xC000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        for i in 0..INT13_SECTOR_SIZE {
+            assert_eq!(m.mem.read_u8(0xC000 + i as u64).unwrap(), (i & 0xFF) as u8);
+        }
+    }
+
+    /// Spec: AH=03h OOB / no media mirror AH=02h status codes.
+    #[test]
+    fn int13_ah03_rejects_oob_and_no_media() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        assert_eq!(
+            m.int13_hd_write_chs_from_phys(0, 0, 1, 8, 0x7000),
+            Err(INT13_STATUS_SECTOR_NOT_FOUND)
+        );
+        let mut bare = Machine::new(64 * 1024);
+        setup_int13_hd_write(&mut bare.cpu, 0, 0, 1, 1, 0x0000, 0x7000);
+        bare.service_int13_hd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
     }
 
     #[test]
@@ -415,5 +736,87 @@ mod tests {
                 m2.mem.read_u8(MBR_PHYS_ADDR + i as u64).unwrap()
             );
         }
+    }
+
+    /// Spec: IBM/MS INT 13h Extensions AH=41h — magic BX handshake + packet bit.
+    #[test]
+    fn int13_ah41_reports_extensions() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        m.cpu.set_ah(INT13_AH_CHECK_EXTENSIONS);
+        m.cpu.set_gpr_u16(CpuState::RBX, INT13_EXT_MAGIC_IN);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_EXT_VERSION);
+        assert_eq!(m.cpu.gpr_u16(CpuState::RBX), INT13_EXT_MAGIC_OUT);
+        assert_eq!(
+            m.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_PACKET,
+            INT13_EXT_CX_PACKET
+        );
+    }
+
+    /// Spec: AH=41h requires BX=55AAh.
+    #[test]
+    fn int13_ah41_rejects_bad_magic() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(1));
+        m.cpu.set_ah(INT13_AH_CHECK_EXTENSIONS);
+        m.cpu.set_gpr_u16(CpuState::RBX, 0x1234);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: AH=42h reads LBA via Disk Address Packet into seg:off.
+    #[test]
+    fn int13_ah42_ext_read_lba0() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        setup_int13_hd_ext_read(&mut m, 0x5000, 0, 1, 0x0000, 0x7C00);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(MBR_PHYS_ADDR).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(MBR_PHYS_ADDR + 510).unwrap(), 0x55);
+    }
+
+    /// Spec: AH=42h multi-block LBA read.
+    #[test]
+    fn int13_ah42_ext_read_two_blocks() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        setup_int13_hd_ext_read(&mut m, 0x5100, 0, 2, 0x0000, 0x8000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(0x8200).unwrap(), 0xA5);
+    }
+
+    /// Spec: AH=42h OOB LBA → sector not found; tiny DAP → invalid.
+    #[test]
+    fn int13_ah42_rejects_oob_and_short_dap() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        setup_int13_hd_ext_read(&mut m, 0x5200, 8, 1, 0x0000, 0x7000);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+
+        m.mem.write_u8(0x5300, 0x08).unwrap(); // size < 10h
+        m.cpu.set_ah(INT13_AH_EXT_READ);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.cpu.set_gpr_u16(CpuState::RSI, 0x5300);
+        m.cpu.ds = x86_core::SegmentReg::real_mode(0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Honesty: AH=43h extended write is not implemented.
+    #[test]
+    fn int13_ah43_ext_write_unsupported() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        m.cpu.set_ah(INT13_AH_EXT_WRITE);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
     }
 }
