@@ -538,10 +538,25 @@ impl Machine {
     /// Attach a raw CD-ROM image (2048-byte Mode-1 blocks) as ATAPI Device 0.
     ///
     /// Wraps [`IdePrimary::attach_atapi_cdrom_image`]. Does not claim a CMOS
-    /// fixed-disk geometry (`ide_disk_sectors` stays unset). ISO 9660 / El
-    /// Torito boot remain deferred.
+    /// fixed-disk geometry (`ide_disk_sectors` stays unset). Full INT 13h CD
+    /// boot remains deferred; host-side El Torito validation is available via
+    /// [`Self::inspect_atapi_el_torito`].
     pub fn attach_atapi_cdrom_image(&mut self, image: Vec<u8>) {
         self.ide.attach_atapi_cdrom_image(image);
+    }
+
+    /// Parse El Torito from the attached ATAPI CD-ROM image (host-side only).
+    ///
+    /// Spec: El Torito 1.0 — Boot Record + Validation Entry (`55h`/`AAh`) +
+    /// Initial/Default Entry. Does not load or execute a boot image.
+    pub fn inspect_atapi_el_torito(
+        &self,
+    ) -> Result<firmware_interface::ElToritoInfo, firmware_interface::ElToritoError> {
+        let image = self
+            .ide
+            .atapi_medium_image()
+            .ok_or(firmware_interface::ElToritoError::Truncated)?;
+        firmware_interface::parse_el_torito(image)
     }
 
     /// Decoded view of a PAM configuration register (reserved bits read 0).

@@ -966,6 +966,18 @@ impl IdePrimary {
         self.is_atapi_cdrom() && self.atapi_prevent_removal
     }
 
+    /// Borrow the loaded CD-ROM medium image bytes, if any.
+    ///
+    /// Host-side helpers (El Torito detection) read this without going through
+    /// PACKET. Empty when not CD-ROM capable or when the tray is empty.
+    pub fn atapi_medium_image(&self) -> Option<&[u8]> {
+        if self.atapi_medium_loaded() {
+            Some(self.image.as_slice())
+        } else {
+            None
+        }
+    }
+
     /// Number of 2048-byte logical blocks on the loaded CD-ROM medium.
     pub fn atapi_cdrom_blocks(&self) -> u64 {
         if !self.is_atapi_cdrom() {
@@ -3581,6 +3593,11 @@ impl IdeSecondary {
     /// See [`IdePrimary::atapi_removal_prevented`].
     pub fn atapi_removal_prevented(&self) -> bool {
         self.inner.atapi_removal_prevented()
+    }
+
+    /// See [`IdePrimary::atapi_medium_image`].
+    pub fn atapi_medium_image(&self) -> Option<&[u8]> {
+        self.inner.atapi_medium_image()
     }
 
     /// See [`IdePrimary::atapi_sense`].
