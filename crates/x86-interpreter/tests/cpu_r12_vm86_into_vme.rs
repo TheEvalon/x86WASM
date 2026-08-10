@@ -138,10 +138,7 @@ fn enter_vm86(guest: &[u8], iopl: u8, cr4_vme: bool) -> (CpuState, RamBus) {
     }
 
     // Vector 4: #OF / INT 4 gate (DPL=3 for software INTO and INT 4).
-    bus.write_bytes(
-        IDT + 4 * 8,
-        &encode_idt_gate32(HANDLER_OF, SEL_KCODE, 0xEE),
-    );
+    bus.write_bytes(IDT + 4 * 8, &encode_idt_gate32(HANDLER_OF, SEL_KCODE, 0xEE));
     bus.write_bytes(
         IDT + 13 * 8,
         &encode_idt_gate32(HANDLER_GP, SEL_KCODE, 0x8E),
