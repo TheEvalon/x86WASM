@@ -114,15 +114,15 @@ pub use xbcs::{
 };
 
 use devices::{
-    ApmSmi, CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
-    FwCfgDmaOutcome, HpetMmio, IdePrimary, IdeSecondary, IoApicMmio, LocalApicMmio, ParallelPort,
-    PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, APM_CNT_PORT, APM_STS_PORT,
-    CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA,
-    EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_BOOT_ORDER,
-    FW_CFG_DEFAULT_CPU_COUNT, FW_CFG_DEFAULT_SYSTEM_STATES, I8042, I8042_DATA, I8042_STATUS_CMD,
-    PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
-    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    ApmSmi, Cf9Reset, CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry,
+    Fdc82077, FwCfg, FwCfgDmaOutcome, HpetMmio, IdePrimary, IdeSecondary, IoApicMmio,
+    LocalApicMmio, ParallelPort, PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText,
+    APM_CNT_PORT, APM_STS_PORT, CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED,
+    EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ,
+    FW_CFG_DEFAULT_BOOT_ORDER, FW_CFG_DEFAULT_CPU_COUNT, FW_CFG_DEFAULT_SYSTEM_STATES, I8042,
+    I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
+    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
+    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -214,6 +214,8 @@ pub struct Machine {
     pub kbd: I8042,
     /// System Control Port A (`0x92`) — Fast Gate A20 + fast reset pulse.
     pub port92: Port92,
+    /// ICH Reset Control Register (`0xCF9`) — SeaBIOS/QEMU `PORT_PCI_REBOOT`.
+    pub cf9: Cf9Reset,
     /// APM/SMI command+status (`0xB2`/`0xB3`) with SMM-completion stub.
     pub apm: ApmSmi,
     /// LPT1 parallel port (`0x378`–`0x37A`) — data/status/control stub.
@@ -284,6 +286,7 @@ impl Machine {
             cmos: CmosRtc::new(),
             kbd: I8042::new(),
             port92: Port92::new(),
+            cf9: Cf9Reset::new(),
             apm: ApmSmi::new(),
             lpt1: ParallelPort::lpt1(),
             lpt2: ParallelPort::lpt2(),
@@ -743,6 +746,7 @@ impl Machine {
         self.cmos.reset();
         self.kbd.reset();
         self.port92.reset();
+        self.cf9.reset();
         self.apm.reset();
         self.lpt1.reset();
         self.lpt2.reset();
@@ -783,14 +787,17 @@ impl Machine {
     /// - 8042 pulse-reset `0xFE` on `0x64` ([`I8042::take_system_reset_request`])
     /// - 8042 output-port write (`0xD1`) with bit0 clear (same kbd latch)
     /// - System Control Port A `0x92` bit0 write-1 ([`Port92::take_system_reset_request`])
+    /// - ICH Reset Control `0xCF9` RST_CPU write-1 ([`Cf9Reset::take_system_reset_request`])
     ///
-    /// Spec: OSDev I8042 / IBM PC AT + OSDev A20 Line (fast reset). Returns `true` when a
-    /// request was taken and reset ran. Called automatically after each
-    /// [`Self::step`]. Distinct from keyboard Resend `0xFE` on data port `0x60`.
+    /// Spec: OSDev I8042 / IBM PC AT + OSDev A20 Line (fast reset) + Intel ICH RCR /
+    /// SeaBIOS `qemu_reboot` (`PORT_PCI_REBOOT`). Returns `true` when a request
+    /// was taken and reset ran. Called automatically after each [`Self::step`].
+    /// Distinct from keyboard Resend `0xFE` on data port `0x60`.
     pub fn service_8042_pulse_reset(&mut self) -> bool {
         let from_kbd = self.kbd.take_system_reset_request();
         let from_port92 = self.port92.take_system_reset_request();
-        if from_kbd || from_port92 {
+        let from_cf9 = self.cf9.take_system_reset_request();
+        if from_kbd || from_port92 || from_cf9 {
             self.reset();
             true
         } else {
@@ -811,6 +818,7 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             port92: &mut self.port92,
+            cf9: &mut self.cf9,
             apm: &mut self.apm,
             lpt1: &mut self.lpt1,
             lpt2: &mut self.lpt2,
@@ -850,6 +858,7 @@ impl Machine {
                 cmos: &mut self.cmos,
                 kbd: &mut self.kbd,
                 port92: &mut self.port92,
+                cf9: &mut self.cf9,
                 apm: &mut self.apm,
                 lpt1: &mut self.lpt1,
                 lpt2: &mut self.lpt2,
@@ -1130,6 +1139,7 @@ impl Machine {
             cmos: &mut self.cmos,
             kbd: &mut self.kbd,
             port92: &mut self.port92,
+            cf9: &mut self.cf9,
             apm: &mut self.apm,
             lpt1: &mut self.lpt1,
             lpt2: &mut self.lpt2,
@@ -1385,6 +1395,7 @@ struct MachineBus<'a> {
     cmos: &'a mut CmosRtc,
     kbd: &'a mut I8042,
     port92: &'a mut Port92,
+    cf9: &'a mut Cf9Reset,
     apm: &'a mut ApmSmi,
     lpt1: &'a mut ParallelPort,
     lpt2: &'a mut ParallelPort,
@@ -1639,6 +1650,11 @@ impl MachineBus<'_> {
         if Dma8237::owns_port(port) {
             return self.dma.port_read(port, size);
         }
+        // Spec: Intel ICH RCR / PCI 3.0 §3.2.2.3.2 — byte/word at 0xCF9 is
+        // ordinary I/O (Reset Control), not CONFIG_ADDRESS.
+        if Cf9Reset::owns_access(port, size) {
+            return self.cf9.port_read(port, size);
+        }
         // Spec: Intel 82371SB/AB — BMIDE at BMIBA / ACPI PM at PMBASE / UHCI at BAR0 when Command.IO.
         if self.pci.bmide_owns_port(port)
             || self.pci.acpi_pm_owns_port(port)
@@ -1715,6 +1731,13 @@ impl MachineBus<'_> {
         }
         if Dma8237::owns_port(port) {
             self.dma.port_write(port, size, value);
+            return;
+        }
+        // Spec: Intel ICH RCR / PCI 3.0 §3.2.2.3.2 — byte/word at 0xCF9 is
+        // ordinary I/O (Reset Control). RST_CPU latches system reset for
+        // [`Machine::service_8042_pulse_reset`] after the bus borrow ends.
+        if Cf9Reset::owns_access(port, size) {
+            self.cf9.port_write(port, size, value);
             return;
         }
         // Spec: Intel 82371SB/AB — BMIDE / ACPI PM / UHCI decode; CF8/CFC + ELCR via owns_port.
@@ -1977,10 +2000,10 @@ impl Bus for MachineBus<'_> {
 mod tests {
     use super::*;
     use devices::{
-        DualPic, Fdc82077, PciConfig, Pit8254, Port92, CFG_INT1, CFG_INT12, CFG_TRANSLATE,
-        CMD_ENABLE_KBD, CMD_PULSE_RESET, CMD_READ_CONFIG, CMD_SELF_TEST, CMD_WRITE_CONFIG,
-        CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, FDC_1440_IMAGE_SIZE, FDC_CMD_CONFIGURE,
-        FDC_CMD_MFM, FDC_CMD_READ_DATA, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK,
+        DualPic, Fdc82077, PciConfig, Pit8254, Port92, CF9_RST_CPU, CF9_SYS_RST, CFG_INT1,
+        CFG_INT12, CFG_TRANSLATE, CMD_ENABLE_KBD, CMD_PULSE_RESET, CMD_READ_CONFIG, CMD_SELF_TEST,
+        CMD_WRITE_CONFIG, CMD_WRITE_OUTPUT_PORT, CMOS_DATA, CMOS_INDEX, FDC_1440_IMAGE_SIZE,
+        FDC_CMD_CONFIGURE, FDC_CMD_MFM, FDC_CMD_READ_DATA, FDC_CMD_RECALIBRATE, FDC_CMD_SEEK,
         FDC_CMD_SENSE_DRIVE_STATUS, FDC_CMD_SENSE_INT, FDC_CMD_SPECIFY, FDC_CMD_WRITE_DATA,
         FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR, FDC_MSR_DIO, FDC_MSR_RQM,
         FDC_SECTOR_SIZE, FDC_ST0_IC_ABNORMAL, FDC_ST0_SEEK_END, FDC_ST1_EN, FDC_ST3_RESERVED_BIT3,
@@ -1992,10 +2015,11 @@ mod tests {
         PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
         PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL,
         PORT61_ENABLE_PARITY, PORT61_GATE2, PORT61_OUT2, PORT61_PARITY_STATUS, PORT61_SPKR_DATA,
-        PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A, REG_STATUS_A,
-        REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE,
-        STC_IRQF, STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX,
-        VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ, VGA_MISC_OUTPUT_WRITE,
+        PORT92_A20, PORT92_RESET, PORT_RESET_CTRL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+        REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK, STATUS_AUX_OBF, STATUS_IBF,
+        STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DAC_DATA,
+        VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX, VGA_MISC_OUTPUT_DEFAULT, VGA_MISC_OUTPUT_READ,
+        VGA_MISC_OUTPUT_WRITE,
     };
 
     #[test]
@@ -3418,6 +3442,7 @@ mod tests {
         assert_eq!(m.cmos, Machine::new(64 * 1024).cmos);
         assert_eq!(m.kbd, I8042::new());
         assert_eq!(m.port92, Port92::new());
+        assert_eq!(m.cf9.value(), 0);
         assert_eq!(m.apm, ApmSmi::new());
         assert_eq!(m.lpt1, ParallelPort::lpt1());
         assert_eq!(m.lpt2, ParallelPort::lpt2());
@@ -3623,6 +3648,83 @@ mod tests {
         assert_eq!(m.port92, Port92::new());
         assert_eq!(m.apm, ApmSmi::new());
         assert!(!m.service_8042_pulse_reset());
+    }
+
+    /// Spec: Intel ICH RCR / SeaBIOS `qemu_reboot` — OUT 0xCF9,0x02 then 0x06
+    /// latches system-reset on the shared [`Machine::service_8042_pulse_reset`] path.
+    #[test]
+    fn machine_bus_cf9_seabios_reboot_sequence_restores_cpu_reset_vector() {
+        let mut m = Machine::new(64 * 1024);
+        m.cpu.set_ip16(0x1234);
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x1000);
+        m.cpu.gpr[CpuState::RAX] = 0xDEAD_BEEF;
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(PORT_RESET_CTRL, CF9_SYS_RST).unwrap();
+            bus.port_out_u8(PORT_RESET_CTRL, CF9_SYS_RST | CF9_RST_CPU)
+                .unwrap();
+        }
+        assert_eq!(m.cf9.reset_pulse_count(), 1);
+        assert!(m.service_8042_pulse_reset());
+        let fresh = CpuState::reset();
+        assert_eq!(m.cpu.rip, fresh.rip);
+        assert_eq!(m.cpu.cs.selector, fresh.cs.selector);
+        assert_eq!(m.cpu.cs.base, fresh.cs.base);
+        assert_eq!(m.cpu.gpr[CpuState::RAX], 0);
+        assert_eq!(m.cf9.value(), 0);
+        assert_eq!(
+            m.cf9.reset_pulse_count(),
+            1,
+            "pulse count is host diagnostic"
+        );
+        assert!(!m.service_8042_pulse_reset());
+    }
+
+    /// Spec: PCI 3.0 §3.2.2.3.2 — DWORD CONFIG_ADDRESS at 0xCF8 still latches;
+    /// CF9 byte RCR does not disturb the latch.
+    #[test]
+    fn cf9_byte_reset_does_not_disturb_pci_config_address_latch() {
+        let mut m = Machine::new(64 * 1024);
+        let addr = PciConfig::make_address(0, 0, 0, 0x00, true);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(PCI_CONFIG_ADDRESS, addr).unwrap();
+            bus.port_out_u8(PORT_RESET_CTRL, CF9_SYS_RST | CF9_RST_CPU)
+                .unwrap();
+            assert_eq!(bus.port_in_u32(PCI_CONFIG_ADDRESS).unwrap(), addr);
+        }
+        assert!(m.cf9.take_system_reset_request());
+    }
+
+    /// Guest OUT path: SeaBIOS-style CF9 hard reset after a step.
+    #[test]
+    fn guest_out_cf9_hard_reset_restores_reset_vector() {
+        let mut m = Machine::new(64 * 1024);
+        let prog: &[u8] = &[
+            0xBA, 0xF9, 0x0C, // mov dx, 0xCF9
+            0xB0, 0x02, // mov al, 2
+            0xEE, // out dx, al
+            0xB0, 0x06, // mov al, 6
+            0xEE, // out dx, al → RST_CPU → Machine::reset
+        ];
+        for (i, b) in prog.iter().enumerate() {
+            m.mem.write_u8(i as u64, *b).unwrap();
+        }
+        m.cpu = CpuState::reset();
+        m.cpu.cs = x86_core::SegmentReg::real_mode_code(0x0000);
+        m.cpu.set_ip16(0);
+        m.cpu.halted = false;
+        m.step().unwrap(); // mov dx
+        m.step().unwrap(); // mov al, 2
+        m.step().unwrap(); // out 0x02
+        assert!(!m.cf9.take_system_reset_request());
+        m.step().unwrap(); // mov al, 6
+        m.step().unwrap(); // out 0x06 → reset
+        let fresh = CpuState::reset();
+        assert_eq!(m.cpu.rip, fresh.rip);
+        assert_eq!(m.cpu.cs.selector, fresh.cs.selector);
+        assert_eq!(m.cpu.cs.base, fresh.cs.base);
+        assert!(m.cf9.reset_pulse_count() >= 1);
     }
 
     /// Guest OUT path: port 0x92 clears A20 then pulses fast reset.

@@ -3,6 +3,7 @@
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! System Control Port A 0x92 (Fast Gate A20 + fast reset);
+//! ICH Reset Control Register 0xCF9 (SeaBIOS/QEMU `PORT_PCI_REBOOT`);
 //! APM/SMI ports 0xB2/0xB3 (APM_CNT/APM_STS + SMM handshake stub);
 //! 8237A DMA register/page stubs (no transfer engine);
 //! VGA text frame buffer MMIO stub at 0xB8000 + CRTC 0x3D4/0x3D5 noop;
@@ -24,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 mod apm;
+mod cf9;
 mod cmos;
 mod dma;
 mod fdc;
@@ -43,6 +45,7 @@ mod uhci;
 mod vga;
 
 pub use apm::{ApmSmi, APM_CNT_PORT, APM_STS_PORT};
+pub use cf9::{Cf9Reset, CF9_RST_CPU, CF9_SYS_RST, PORT_RESET_CTRL};
 
 pub use cmos::{
     CmosRtc, CMOS_BASE_MEMORY_MAX_KB, CMOS_CHECKSUM_FIRST, CMOS_CHECKSUM_LAST, CMOS_DATA,
