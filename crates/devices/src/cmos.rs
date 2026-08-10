@@ -161,6 +161,12 @@ pub const REG_SHUTDOWN: u8 = 0x0F;
 
 /// Shutdown status `00h`: soft reset or unexpected shutdown.
 pub const SHUTDOWN_SOFT_OR_UNEXPECTED: u8 = 0x00;
+/// Shutdown status `01h`: after memory size determination.
+pub const SHUTDOWN_AFTER_MEM_SIZE: u8 = 0x01;
+/// Shutdown status `02h`: after successful memory test.
+pub const SHUTDOWN_AFTER_MEM_TEST_OK: u8 = 0x02;
+/// Shutdown status `03h`: after failed memory test.
+pub const SHUTDOWN_AFTER_MEM_TEST_FAIL: u8 = 0x03;
 /// Shutdown status `04h`: INT 19h reboot request.
 pub const SHUTDOWN_INT19: u8 = 0x04;
 /// Shutdown status `05h`: flush keyboard (EOI) and jump via BDA `40:67`.
@@ -169,6 +175,10 @@ pub const SHUTDOWN_JMP_WITH_EOI: u8 = 0x05;
 pub const SHUTDOWN_BLOCK_MOVE: u8 = 0x09;
 /// Shutdown status `0Ah`: jump via BDA `40:67` (SeaBIOS soft-reset code).
 pub const SHUTDOWN_JMP: u8 = 0x0A;
+/// Shutdown status `0Bh`: resume via IRET through BDA `40:67`.
+pub const SHUTDOWN_IRET: u8 = 0x0B;
+/// Shutdown status `0Ch`: resume via RETF through BDA `40:67`.
+pub const SHUTDOWN_RETF: u8 = 0x0C;
 
 /// IBM PS/2 diagnostic status byte (index `0x0E`).
 ///
@@ -656,10 +666,19 @@ impl CmosRtc {
     /// IBM PC/AT CMOS shutdown status byte (index [`REG_SHUTDOWN`] / `0x0F`).
     ///
     /// Spec: RBIL CMOS 0Fh — POST reset code. Ordinary R/W CMOS RAM; see
-    /// [`REG_SHUTDOWN`] for value meanings. Exposed for a future Machine soft-
-    /// reset path without requiring MachineBus port I/O.
+    /// [`REG_SHUTDOWN`] for value meanings. Exposed for Machine soft-reset
+    /// observability without requiring MachineBus port I/O.
     pub fn shutdown_status(&self) -> u8 {
         self.ram[REG_SHUTDOWN as usize]
+    }
+
+    /// Store the CMOS shutdown / reset code (index [`REG_SHUTDOWN`]).
+    ///
+    /// Spec: RBIL CMOS 0Fh — ordinary battery CMOS write. Does **not** dispatch
+    /// POST actions (JMP via `40:67`, INT 19h, etc.); that remains firmware /
+    /// a future Machine soft-reset path. Survives [`CmosRtc::reset`].
+    pub fn set_shutdown_status(&mut self, code: u8) {
+        self.ram[REG_SHUTDOWN as usize] = code;
     }
 
     /// Populate the CMOS memory-size registers from the machine's RAM size.
@@ -1651,15 +1670,17 @@ mod tests {
 
         // Other common SeaBIOS / POST codes also store/read back.
         for code in [
+            SHUTDOWN_AFTER_MEM_SIZE,
+            SHUTDOWN_AFTER_MEM_TEST_OK,
+            SHUTDOWN_AFTER_MEM_TEST_FAIL,
             SHUTDOWN_INT19,
             SHUTDOWN_JMP_WITH_EOI,
             SHUTDOWN_BLOCK_MOVE,
-            0x01,
-            0x0B,
-            0x0C,
+            SHUTDOWN_IRET,
+            SHUTDOWN_RETF,
             0xFF,
         ] {
-            c.write_reg(REG_SHUTDOWN, code);
+            c.set_shutdown_status(code);
             assert_eq!(c.shutdown_status(), code);
             c.port_write(CMOS_INDEX, 1, u32::from(REG_SHUTDOWN));
             assert_eq!(c.port_read(CMOS_DATA, 1) as u8, code);

@@ -23,6 +23,9 @@ pub const LPT1_BASE: u16 = 0x378;
 /// Classic LPT2 base.
 pub const LPT2_BASE: u16 = 0x278;
 
+/// Classic LPT3 base (MDA/printer adapter). Not claimed by this stub.
+pub const LPT3_BASE: u16 = 0x3BC;
+
 /// Data register offset from base.
 pub const LPT_DATA: u16 = 0;
 
@@ -38,6 +41,21 @@ pub const LPT_LAST_OFFSET: u16 = 2;
 /// Status bit7 — Busy, active low (1 = not busy / inactive).
 pub const LPT_STATUS_BUSY_N: u8 = 1 << 7;
 
+/// Control bit0 — Strobe.
+pub const LPT_CTRL_STROBE: u8 = 1 << 0;
+
+/// Control bit1 — Auto Line Feed.
+pub const LPT_CTRL_AUTOLF: u8 = 1 << 1;
+
+/// Control bit2 — Initialize Printer, **active low** (1 = not asserting /INIT).
+pub const LPT_CTRL_INIT_N: u8 = 1 << 2;
+
+/// Control bit3 — Select Input (select printer).
+pub const LPT_CTRL_SELECT: u8 = 1 << 3;
+
+/// Control bit4 — IRQ enable (IRQ7). Not delivered in this stub.
+pub const LPT_CTRL_IRQ_ENABLE: u8 = 1 << 4;
+
 /// Reset / no-printer status: Busy# inactive (bit7 = 1) plus other floating-high
 /// lines commonly observed on an empty port (`Ack#`, `Select`, `Error#`).
 ///
@@ -47,9 +65,17 @@ pub const LPT_STATUS_BUSY_N: u8 = 1 << 7;
 /// reports no printer traffic.
 pub const LPT_STATUS_NO_PRINTER: u8 = 0xDF;
 
-/// Power-on / reset defaults.
+/// Power-on / reset data default.
 const LPT_DATA_DEFAULT: u8 = 0x00;
-const LPT_CONTROL_DEFAULT: u8 = 0x00;
+
+/// Power-on / reset control default: `/INIT` inactive + Select asserted.
+///
+/// Spec: IBM PC Technical Reference Parallel Printer Adapter control port —
+/// bit2 `/INIT` is active-low; bit3 Select Input selects the printer. Classic
+/// adapters leave `/INIT` deasserted and Select asserted after reset (`0x0C`).
+/// R13 deepens the R6 stub (which left control `0x00`) so firmware RMW of the
+/// control register starts from the documented idle state.
+pub const LPT_CONTROL_DEFAULT: u8 = LPT_CTRL_INIT_N | LPT_CTRL_SELECT;
 
 /// One classic parallel-port register file (3 I/O bytes).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +137,11 @@ impl ParallelPort {
         (LPT1_BASE..=LPT1_BASE + LPT_LAST_OFFSET).contains(&port)
             || (LPT2_BASE..=LPT2_BASE + LPT_LAST_OFFSET).contains(&port)
     }
+
+    /// Whether `port` is the classic LPT3 window (unclaimed by this model).
+    pub fn is_lpt3_window(port: u16) -> bool {
+        (LPT3_BASE..=LPT3_BASE + LPT_LAST_OFFSET).contains(&port)
+    }
 }
 
 impl PortDevice for ParallelPort {
@@ -147,14 +178,17 @@ impl PortDevice for ParallelPort {
 mod tests {
     use super::*;
 
-    /// Spec: OSDev Parallel Port — reset leaves data/control clear; status shows
-    /// Busy# inactive (bit7 = 1) for no printer.
+    /// Spec: OSDev Parallel Port — reset leaves data clear; control idle
+    /// (`/INIT` inactive + Select); status shows Busy# inactive (bit7 = 1).
     #[test]
     fn reset_defaults_no_printer_status_busy_inactive() {
         let p = ParallelPort::lpt1();
         assert_eq!(p.base(), LPT1_BASE);
         assert_eq!(p.data(), 0);
-        assert_eq!(p.control(), 0);
+        assert_eq!(p.control(), LPT_CONTROL_DEFAULT);
+        assert_eq!(p.control(), 0x0C);
+        assert_eq!(p.control() & LPT_CTRL_INIT_N, LPT_CTRL_INIT_N);
+        assert_eq!(p.control() & LPT_CTRL_SELECT, LPT_CTRL_SELECT);
         assert_eq!(p.status(), LPT_STATUS_NO_PRINTER);
         assert_ne!(p.status(), 0xFF, "must not look like open bus");
         assert_eq!(p.status() & LPT_STATUS_BUSY_N, LPT_STATUS_BUSY_N);
@@ -200,9 +234,30 @@ mod tests {
         assert!(!p2.owns_port(0x27B));
         assert!(ParallelPort::owns_classic_lpt(0x378));
         assert!(ParallelPort::owns_classic_lpt(0x27A));
-        // COM3/COM4 IER sites are not LPT — leave open-bus to the machine.
+        // COM3/COM4 IER sites are not LPT — owned by UART stubs on MachineBus.
         assert!(!ParallelPort::owns_classic_lpt(0x3E9));
         assert!(!ParallelPort::owns_classic_lpt(0x2E9));
+        // LPT3 window is documented but unclaimed.
+        assert!(ParallelPort::is_lpt3_window(LPT3_BASE));
+        assert!(ParallelPort::is_lpt3_window(LPT3_BASE + 2));
+        assert!(!ParallelPort::owns_classic_lpt(LPT3_BASE));
+    }
+
+    /// Spec: LPT1 and LPT2 are independent register files.
+    #[test]
+    fn lpt1_and_lpt2_are_independent() {
+        let mut p1 = ParallelPort::lpt1();
+        let mut p2 = ParallelPort::lpt2();
+        p1.port_write(LPT1_BASE, 1, 0x11);
+        p1.port_write(LPT1_BASE + LPT_CONTROL, 1, 0x01);
+        p2.port_write(LPT2_BASE, 1, 0x22);
+        p2.port_write(LPT2_BASE + LPT_CONTROL, 1, 0x02);
+        assert_eq!(p1.data(), 0x11);
+        assert_eq!(p1.control(), 0x01);
+        assert_eq!(p2.data(), 0x22);
+        assert_eq!(p2.control(), 0x02);
+        assert_eq!(p1.status(), LPT_STATUS_NO_PRINTER);
+        assert_eq!(p2.status(), LPT_STATUS_NO_PRINTER);
     }
 
     #[test]

@@ -242,9 +242,9 @@ fn probe_reports_real_mode_failure_in_the_ip16_window() {
 /// Ports no device claims are recorded (port, direction, size, first value).
 #[test]
 fn probe_records_unclaimed_port_accesses() {
-    // MOV DX,0x2E8 / MOV AL,0x5A / OUT DX,AL / IN AL,DX / IN AL,DX / HLT.
-    // 0x2E8 is outside COM2 (`0x2F8`) and LPT2 (`0x278`); left as open-bus.
-    let rom = bios_rom_with_code(&[0xBA, 0xE8, 0x02, 0xB0, 0x5A, 0xEE, 0xEC, 0xEC, 0xF4]);
+    // MOV DX,0x3BC / MOV AL,0x5A / OUT DX,AL / IN AL,DX / IN AL,DX / HLT.
+    // LPT3 `0x3BC` is classic but unclaimed (R13 LPT honesty); open-bus.
+    let rom = bios_rom_with_code(&[0xBA, 0xBC, 0x03, 0xB0, 0x5A, 0xEE, 0xEC, 0xEC, 0xF4]);
     let mut m = Machine::with_bios_rom(1024 * 1024, &rom).expect("load BIOS");
 
     let report = m.probe_post(64);
@@ -253,7 +253,7 @@ fn probe_records_unclaimed_port_accesses() {
     let writes: Vec<_> = report
         .unclaimed_ports
         .iter()
-        .filter(|a| a.port == 0x2E8 && a.write)
+        .filter(|a| a.port == 0x3BC && a.write)
         .collect();
     assert_eq!(writes.len(), 1, "{report}");
     assert_eq!(writes[0].size, 1);
@@ -263,7 +263,7 @@ fn probe_records_unclaimed_port_accesses() {
     let reads: Vec<_> = report
         .unclaimed_ports
         .iter()
-        .filter(|a| a.port == 0x2E8 && !a.write)
+        .filter(|a| a.port == 0x3BC && !a.write)
         .collect();
     assert_eq!(reads.len(), 1, "{report}");
     assert_eq!(reads[0].count, 2);

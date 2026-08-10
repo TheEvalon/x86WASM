@@ -1,5 +1,6 @@
 //! Device models. Milestone 1: COM1 data port + debug port 0x402.
-//! Milestone 2 (serial): COM2 (`0x2F8`–`0x2FF`) mirrors COM1 16550 debug UART.
+//! Milestone 2 (serial): COM2 (`0x2F8`–`0x2FF`) mirrors COM1 16550 debug UART;
+//! COM3 (`0x3E8`–`0x3EF`) / COM4 (`0x2E8`–`0x2EF`) likewise for POST probe sites.
 //! Milestone 2 (partial): 8259 PIC ICW+OCW/IRQ; 8254 PIT ch0+ch2/port 0x61 speaker;
 //! CMOS/RTC IRQ8; 8042/PS2 on MachineBus 0x60/0x64 (IRQ1 + scancode inject + A20);
 //! System Control Port A 0x92 (Fast Gate A20 + fast reset);
@@ -61,10 +62,11 @@ pub use cmos::{
     REG_EXT_MEM_LOW, REG_FLOPPY_TYPE, REG_HARD_DISK0_EXT_TYPE, REG_HARD_DISK0_PARAMS,
     REG_HARD_DISK1_EXT_TYPE, REG_HARD_DISK1_PARAMS, REG_HARD_DISK_TYPE, REG_MEM_ABOVE_16M_HIGH,
     REG_MEM_ABOVE_16M_LOW, REG_MEM_ABOVE_4G_HIGH, REG_MEM_ABOVE_4G_LOW, REG_MEM_ABOVE_4G_MID,
-    REG_SHUTDOWN, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, REG_STATUS_D, SHUTDOWN_BLOCK_MOVE,
-    SHUTDOWN_INT19, SHUTDOWN_JMP, SHUTDOWN_JMP_WITH_EOI, SHUTDOWN_SOFT_OR_UNEXPECTED, STATUS_A_UIP,
-    STB_24_12, STB_AIE, STB_DM, STB_PIE, STB_SET, STB_UIE, STC_AF, STC_IRQF, STC_PF, STC_UF,
-    UIP_WINDOW_PERIODS,
+    REG_SHUTDOWN, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, REG_STATUS_D, SHUTDOWN_AFTER_MEM_SIZE,
+    SHUTDOWN_AFTER_MEM_TEST_FAIL, SHUTDOWN_AFTER_MEM_TEST_OK, SHUTDOWN_BLOCK_MOVE, SHUTDOWN_INT19,
+    SHUTDOWN_IRET, SHUTDOWN_JMP, SHUTDOWN_JMP_WITH_EOI, SHUTDOWN_RETF, SHUTDOWN_SOFT_OR_UNEXPECTED,
+    STATUS_A_UIP, STB_24_12, STB_AIE, STB_DM, STB_PIE, STB_SET, STB_UIE, STC_AF, STC_IRQF, STC_PF,
+    STC_UF, UIP_WINDOW_PERIODS,
 };
 pub use dma::{
     Dma8237, DmaChannel, DmaController, DmaTransferError, DMA_MASTER_BASE, DMA_PAGE_CH0,
@@ -165,8 +167,9 @@ pub use lapic::{
     LAPIC_WINDOW_SIZE,
 };
 pub use lpt::{
-    ParallelPort, LPT1_BASE, LPT2_BASE, LPT_CONTROL, LPT_DATA, LPT_LAST_OFFSET, LPT_STATUS,
-    LPT_STATUS_BUSY_N, LPT_STATUS_NO_PRINTER,
+    ParallelPort, LPT1_BASE, LPT2_BASE, LPT3_BASE, LPT_CONTROL, LPT_CONTROL_DEFAULT,
+    LPT_CTRL_AUTOLF, LPT_CTRL_INIT_N, LPT_CTRL_IRQ_ENABLE, LPT_CTRL_SELECT, LPT_CTRL_STROBE,
+    LPT_DATA, LPT_LAST_OFFSET, LPT_STATUS, LPT_STATUS_BUSY_N, LPT_STATUS_NO_PRINTER,
 };
 pub use pci::{
     decode_bmide_prd, pirqrc_routed_irq, sanitize_piix_elcr, BmidePrdEntry, BmidePrdError,
@@ -226,7 +229,10 @@ pub use pit::{
     PORT61_PARITY_STATUS, PORT61_REFRESH_TOGGLE, PORT61_SPKR_DATA, PORT_SYSTEM_CONTROL,
 };
 pub use port92::{Port92, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL_A};
-pub use serial::{DebugConsole, Serial16550, SerialOutput};
+pub use serial::{
+    DebugConsole, Serial16550, SerialOutput, COM1_BASE, COM2_BASE, COM3_BASE, COM4_BASE,
+    COM_IO_SPAN,
+};
 pub use uhci::{
     latch_resume_detect, latch_usb_error, portsc_attach_device, portsc_detach_device, portsc_read,
     portsc_write, run_n_frames, run_one_td, uhci_interrupt_pending, usbintr_read, usbintr_write,
