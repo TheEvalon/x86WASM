@@ -1767,10 +1767,11 @@ fn eflags_iopl(rflags: u64) -> u8 {
     ((rflags >> 12) & 3) as u8
 }
 
-/// `#GP(0)` when VM86 software `INT n` / `INTO` lack IOPL=3 (no VME).
+/// `#GP(0)` when VM86 software `INT n` lacks IOPL=3 (no VME).
 ///
-/// `INT3` is not IOPL-sensitive and must not call this. Spec: Intel SDM
-/// Vol. 3 §20.2.2 Table 20-1; Vol. 2 INT n/INTO (Virtual-8086 Mode Exceptions).
+/// Applies only to opcode `CD` (`INT imm8`). `INT3` and `INTO` are not
+/// IOPL-sensitive and must not call this. Spec: Intel SDM Vol. 3 §20.2.2
+/// Table 20-2; Vol. 2 INT n Virtual-8086 Mode Exceptions.
 fn require_vm86_iopl_for_soft_int(cpu: &CpuState) -> Result<(), ExecError> {
     if eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
         Err(arch_fault_with_error_code(13, 0))
@@ -7288,11 +7289,10 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // INTO — if OF=1, #OF (vector 4) trap; else fall through.
             // Spec: Intel SDM Vol. 2 "INT n/INTO/INT3/INT1";
             // Vol. 3 §§6.12.1, 6.15 (#OF — trap), 20.2.2.
-            // VM86 without VME: IOPL < 3 → #GP(0) when the interrupt is taken.
+            // INTO is not IOPL-sensitive in VM86 (unlike INT n).
             // Saved IP is the following instruction (trap class).
             // Unsupported here: 64-bit mode (#UD); VME redirect.
             if cpu.rflags & (1 << 11) != 0 {
-                require_vm86_iopl_for_soft_int(cpu)?;
                 deliver_software_interrupt(cpu, bus, 4, next_ip)?;
             } else {
                 set_current_ip(cpu, next_ip);

@@ -71,8 +71,9 @@ const SEL_KDATA: u16 = 0x0010;
 
 const VM86_CS: u16 = 0x1000;
 const VM86_IP: u16 = 0x0100;
-const VM86_SS: u16 = 0x2000;
-const VM86_SP: u16 = 0xFFFE;
+const VM86_SS: u16 = 0x0100;
+const VM86_SP: u16 = 0x8000;
+const VM86_DS: u16 = 0x3000;
 const TARGET_CS: u16 = 0x1800;
 const TARGET_IP: u16 = 0x0200;
 
@@ -91,7 +92,8 @@ fn encode_seg_desc(base: u32, limit20: u32, access: u8, gran_flags: u8) -> [u8; 
 }
 
 fn enter_vm86(guest: &[u8]) -> (CpuState, RamBus) {
-    let mut bus = RamBus::new(0x20000);
+    // Cover CS/SS/DS/target linear addresses (SS:SP ≈ 0x9000; DS:0100 ≈ 0x30100).
+    let mut bus = RamBus::new(0x40000);
     bus.write_bytes(GDT, &[0u8; 8]);
     bus.write_bytes(GDT + 8, &encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0));
     bus.write_bytes(GDT + 16, &encode_seg_desc(0, 0xF_FFFF, 0x93, 0xC0));
@@ -108,7 +110,7 @@ fn enter_vm86(guest: &[u8]) -> (CpuState, RamBus) {
     bus.poke_u32(frame + 12, u32::from(VM86_SP));
     bus.poke_u32(frame + 16, u32::from(VM86_SS));
     bus.poke_u32(frame + 20, 0x3000);
-    bus.poke_u32(frame + 24, 0x4000);
+    bus.poke_u32(frame + 24, u32::from(VM86_DS));
     bus.poke_u32(frame + 28, 0x5000);
     bus.poke_u32(frame + 32, 0x6000);
 
@@ -201,9 +203,9 @@ fn vm86_far_call_then_retf_round_trip() {
 /// Indirect far `CALL m16:16` (Group 5 `/3`) in VM86.
 #[test]
 fn vm86_far_call_indirect_m16_16_stays_vm() {
-    // FF 1E 00 01 — CALL FAR [0x0100] (DS=0x4000 → linear 0x40100)
+    // FF 1E 00 01 — CALL FAR [0x0100] (DS=0x3000 → linear 0x30100)
     let (mut cpu, mut bus) = enter_vm86(&[0xFF, 0x1E, 0x00, 0x01]);
-    let ptr = (0x4000u32 << 4) + 0x0100;
+    let ptr = (u32::from(VM86_DS) << 4) + 0x0100;
     bus.poke_u16(ptr as usize, TARGET_IP);
     bus.poke_u16(ptr as usize + 2, TARGET_CS);
     let target = (u32::from(TARGET_CS) << 4) + u32::from(TARGET_IP);
