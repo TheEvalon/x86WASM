@@ -1767,7 +1767,8 @@ fn eflags_iopl(rflags: u64) -> u8 {
     ((rflags >> 12) & 3) as u8
 }
 
-/// `#GP(0)` when VM86 software `INT n` lacks IOPL=3 (no VME).
+/// `#GP(0)` when VM86 software `INT n` lacks IOPL=3 (no VME, or VME redirect
+/// bit set so the protected-mode path is taken).
 ///
 /// Applies only to opcode `CD` (`INT imm8`). `INT3` and `INTO` are not
 /// IOPL-sensitive and must not call this. Spec: Intel SDM Vol. 3 §20.2.2
@@ -1778,6 +1779,102 @@ fn require_vm86_iopl_for_soft_int(cpu: &CpuState) -> Result<(), ExecError> {
     } else {
         Ok(())
     }
+}
+
+fn cr4_vme(cpu: &CpuState) -> bool {
+    cpu.cr4 & CR4_VME != 0
+}
+
+/// Read the software-interrupt redirection bit for `vector` from the current
+/// 32-bit TSS (Vol. 3 Figure 20-5).
+///
+/// The 32-byte map ends at the I/O-permission-map base (TSS offset 66h). When
+/// the map is missing (`I/O base < 32` or not fully inside `TR.limit`), every
+/// bit is treated as **set** (protected-mode / `#GP` path) rather than
+/// inventing an IVT redirect. Spec: Intel SDM Vol. 3 §§20.2–20.3, §7.2.1.
+fn vme_soft_int_redirect_bit_set(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+) -> Result<bool, ExecError> {
+    let type_field = (cpu.tr.flags & 0x0F) as u8;
+    if type_field != DESC_TYPE_TSS32_BUSY && type_field != DESC_TYPE_TSS32_AVAILABLE {
+        return Ok(true);
+    }
+    if cpu.tr.limit < TSS32_MIN_LIMIT {
+        return Ok(true);
+    }
+    const IO_MAP_BASE_OFF: u64 = 0x66;
+    let mut base_bytes = [0u8; 2];
+    for (index, byte) in base_bytes.iter_mut().enumerate() {
+        let addr = cpu.tr.base.wrapping_add(IO_MAP_BASE_OFF + index as u64);
+        *byte = bus
+            .read_system_u8(addr)
+            .map_err(|_| ExecError::MemoryFault(addr))?;
+    }
+    let io_map_base = u16::from_le_bytes(base_bytes) as u32;
+    if io_map_base < 32 {
+        return Ok(true);
+    }
+    let map_start = io_map_base - 32;
+    let map_end = io_map_base - 1; // inclusive
+    if map_end > cpu.tr.limit {
+        return Ok(true);
+    }
+    let byte_off = map_start + u32::from(vector) / 8;
+    let addr = cpu.tr.base.wrapping_add(u64::from(byte_off));
+    let byte = bus
+        .read_system_u8(addr)
+        .map_err(|_| ExecError::MemoryFault(addr))?;
+    Ok(byte & (1 << (vector % 8)) != 0)
+}
+
+/// VME interrupt redirection: deliver `INT n` through the 8086 IVT at linear 0
+/// while remaining in virtual-8086 mode (Table 20-2 methods 5/6 class).
+///
+/// Bounded stub: pushes the live FLAGS image (does **not** rewrite IOPL=3 /
+/// VIF→IF for method 6), clears IF/TF, loads CS:IP from linear `vector*4`.
+/// Unsupported: method-6 VIF image rewrite; VIP/VIF `CLI`/`STI`.
+/// Spec: Intel SDM Vol. 3 §20.2.2 Table 20-2; Vol. 2 INT n.
+fn vm86_vme_redirect_soft_int(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    return_ip: u32,
+) -> Result<(), ExecError> {
+    debug_assert!(eflags_vm(cpu.rflags));
+    let flags16 = cpu.rflags as u16;
+    push16(cpu, bus, flags16)?;
+    push16(cpu, bus, cpu.cs.selector)?;
+    push16(cpu, bus, return_ip as u16)?;
+    cpu.rflags &= !((1 << 9) | (1 << 8));
+    let entry = u64::from(vector) * 4;
+    let offset = bus
+        .read_u16(entry)
+        .map_err(|e| classify_mem_fault(e, false))?;
+    let selector = bus
+        .read_u16(entry.wrapping_add(2))
+        .map_err(|e| classify_mem_fault(e, false))?;
+    cpu.cs = x86_core::SegmentReg::real_mode_code(selector);
+    cpu.set_ip16(offset);
+    Ok(())
+}
+
+/// `INT n` from VM86: optional VME redirect, else IOPL gate + IDT delivery.
+fn vm86_software_int_n(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    vector: u8,
+    return_ip: u32,
+) -> Result<(), ExecError> {
+    if eflags_vm(cpu.rflags) && cr4_vme(cpu) {
+        let bit_set = vme_soft_int_redirect_bit_set(cpu, bus, vector)?;
+        if !bit_set {
+            return vm86_vme_redirect_soft_int(cpu, bus, vector, return_ip);
+        }
+    }
+    require_vm86_iopl_for_soft_int(cpu)?;
+    deliver_software_interrupt(cpu, bus, vector, return_ip)
 }
 
 /// `#GP(0)` when `CLI`/`STI` lack sufficient IOPL privilege (no VME/PVI).
@@ -7304,9 +7401,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xCD => {
             // INT imm8 — saved return IP is the following instruction.
             // Spec: Intel SDM Vol. 2 "INT n"; Vol. 3 §§6.4, 6.12.1, 20.2.2.
-            // VM86 without VME: IOPL < 3 → #GP(0).
-            require_vm86_iopl_for_soft_int(cpu)?;
-            deliver_software_interrupt(cpu, bus, insn.immediate as u8, next_ip)?;
+            // VM86 + CR4.VME: consult TSS interrupt-redirection bitmap
+            // (Table 20-2). Without VME / bit set: IOPL < 3 → #GP(0).
+            vm86_software_int_n(cpu, bus, insn.immediate as u8, next_ip)?;
         }
         0xCE => {
             // INTO — if OF=1, #OF (vector 4) trap; else fall through.
