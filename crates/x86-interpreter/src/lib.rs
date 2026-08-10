@@ -1801,7 +1801,9 @@ fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
 ///
 /// VM86 without VME: `IOPL < 3` → `#GP(0)`. Otherwise load permitted bits;
 /// `VM`/`RF` are never taken from the image; RF is cleared; bit 1 stays set.
-/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2.
+/// `VIP`/`VIF` are **never** loaded from the image (VME is unsupported —
+/// CPUID.VME clear, `CR4.VME` reserved); they remain sticky.
+/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2 / Table 20-2 (VME=0).
 fn popf_execute(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -2471,8 +2473,10 @@ fn return_to_virtual_8086_mode(
 /// leaves `VM`/`IOPL`/`VIP`/`VIF` unchanged (Vol. 2 IRET
 /// RETURN-FROM-VIRTUAL-8086-MODE). Leaving VM86 entirely requires a privilege
 /// transition to CPL 0 (interrupt/task) then `IRETD` with `VM=0` in the image.
+/// Unsupported: VME redirect of IOPL-sensitive IRET; VIP∧VIF `#GP` is a VME
+/// feature and is **not** implemented here (CPUID.VME clear).
 ///
-/// Spec: Intel SDM Vol. 2 "IRET/IRETD"; Vol. 3 §20.2.3 / ch.20.
+/// Spec: Intel SDM Vol. 2 "IRET/IRETD"; Vol. 3 §20.2.3 / ch.20 / Table 20-2.
 fn vm86_iret(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -2938,11 +2942,12 @@ fn write_sreg(
     selector: u16,
 ) -> Result<(), ExecError> {
     // Caller must reject MOV CS and reserved Sreg encodings (#UD) before calling.
-    // PE=0: sticky unreal real-mode base (SDM Vol. 3 §3.4.2–§3.4.3).
-    // PE=1: DS/ES/FS/GS/SS load from GDT (SS requires writable data; null → #GP).
+    // PE=0 or VM86: sticky unreal / real-address base (SDM Vol. 3 §3.4.2–§3.4.3,
+    // §20.1.1). PE=1 and VM=0: DS/ES/FS/GS/SS load from GDT.
+    let use_gdt = cr0_pe(cpu) && !eflags_vm(cpu.rflags);
     match sreg {
-        0 | 3 | 4 | 5 if cr0_pe(cpu) => load_data_sreg_from_gdt(cpu, bus, sreg, selector),
-        2 if cr0_pe(cpu) => load_ss_from_gdt(cpu, bus, selector),
+        0 | 3 | 4 | 5 if use_gdt => load_data_sreg_from_gdt(cpu, bus, sreg, selector),
+        2 if use_gdt => load_ss_from_gdt(cpu, bus, selector),
         0 => {
             cpu.es.load_real_mode_selector(selector);
             Ok(())
@@ -3021,9 +3026,11 @@ fn pop_sreg(
 
 /// Validate a selector for ES/SS/DS/FS/GS without mutating CPU state.
 ///
-/// Returns `None` in real-address mode, where the load is the sticky-unreal
-/// `selector << 4` base update with no descriptor to read.
-/// Spec: Intel SDM Vol. 3 §§3.4.2, 3.5.1, 5.4.1.
+/// Returns `None` in real-address mode **and** virtual-8086 mode, where the
+/// load is the sticky-unreal / real-address `selector << 4` base update with
+/// no descriptor to read (Vol. 3 §20.1.1). Protected mode (`PE=1`, `VM=0`)
+/// reads the GDT.
+/// Spec: Intel SDM Vol. 3 §§3.4.2, 3.5.1, 5.4.1, 20.1.1.
 fn prepare_sreg_load(
     cpu: &CpuState,
     bus: &mut dyn Bus,
@@ -3031,7 +3038,7 @@ fn prepare_sreg_load(
     selector: u16,
 ) -> Result<Option<x86_core::SegmentReg>, ExecError> {
     debug_assert!(matches!(sreg, 0 | 2 | 3 | 4 | 5));
-    if !cr0_pe(cpu) {
+    if !cr0_pe(cpu) || eflags_vm(cpu.rflags) {
         return Ok(None);
     }
     Ok(Some(if sreg == 2 {
@@ -6945,7 +6952,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // JMP far ptr16:16 / ptr16:32.
             // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
             // Protected mode (VM=0) is bounded to GDT code / task targets.
-            // Virtual-8086 mode: real-address-like CS:IP reload; stay VM=1.
+            // Virtual-8086 / real-address: reload CS:IP; opsize-32 truncates the
+            // offset to IP16 (Vol. 2 JMP real-address note). Stay VM=1 when set.
             let offset = if opsz32(&insn) {
                 insn.immediate as u32
             } else {
@@ -7007,9 +7015,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
+            // Protected (`PE=1`, `VM=0`) uses GDT; real-address / VM86 use
+            // `selector << 4` (Vol. 3 §20.1.1).
+            let use_gdt = cr0_pe(cpu) && !eflags_vm(cpu.rflags);
             if opsz32(&insn) {
                 let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
-                let protected_es = if cr0_pe(cpu) {
+                let protected_es = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
@@ -7023,7 +7034,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 }
             } else {
                 let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
-                let protected_es = if cr0_pe(cpu) {
+                let protected_es = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
@@ -7043,15 +7054,16 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // In protected mode, validate/load DS through the shared DS/ES
             // descriptor path only after the complete pointer is readable.
             // Spec: Intel SDM Vol. 2 "LDS" (Operation, Protected Mode
-            // Exceptions); Vol. 3 §§3.4.2–3.4.5, 5.3–5.6.
+            // Exceptions); Vol. 3 §§3.4.2–3.4.5, 5.3–5.6, 20.1.1.
             // Register form (mod=11) → #UD (Vol. 3 §6.15).
             let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
             if m.mod_ == 3 {
                 return real_mode_ud(cpu, bus);
             }
+            let use_gdt = cr0_pe(cpu) && !eflags_vm(cpu.rflags);
             if opsz32(&insn) {
                 let (offset, selector) = read_far_ptr32(cpu, bus, &insn)?;
-                let protected_ds = if cr0_pe(cpu) {
+                let protected_ds = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
@@ -7065,7 +7077,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 }
             } else {
                 let (offset, selector) = read_far_ptr16(cpu, bus, &insn)?;
-                let protected_ds = if cr0_pe(cpu) {
+                let protected_ds = if use_gdt {
                     Some(prepare_data_sreg_from_gdt(cpu, bus, selector)?)
                 } else {
                     None
@@ -7084,7 +7096,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // CALL far ptr16:16 / ptr16:32.
             // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
             // Protected (VM=0): same-CPL GDT code / call gate / task.
-            // Virtual-8086: real-address-like push CS:IP; stay VM=1.
+            // Virtual-8086 / real-address: push CS:IP (opsize-32 → EIP32 then
+            // CS16 = 6-byte frame); truncate target offset to IP16; stay VM=1.
             // Unsupported from VM86: privilege-changing call gates.
             let selector = insn.displacement as u16;
             let offset = if opsz32(&insn) {
@@ -7108,9 +7121,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xCA => {
             // RETF iw — far return with stack release.
-            // Spec: Intel SDM Vol. 2 "RET" (far, imm16); Ch. 2 (66H).
-            // Opsize 32: pop EIP32 then CS16; Imm16 release always.
-            // Unsupported here: protected-mode privilege checks.
+            // Spec: Intel SDM Vol. 2 "RET" (far, imm16); Ch. 2 (66H); §20.1.
+            // Opsize 32: pop EIP32 then CS16 (truncate EIP→IP16); Imm16 release.
+            // Real-address / VM86 path (protected privilege-changing RETF out).
             let release = insn.immediate as u16;
             if opsz32(&insn) {
                 let eip = pop32(cpu, bus)?;
@@ -7128,8 +7141,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xCB => {
             // RETF — far return.
-            // Spec: Intel SDM Vol. 2 "RET" (far); Ch. 2 (66H).
-            // Opsize 16: pop IP then CS; opsize 32: pop EIP then CS (6-byte frame).
+            // Spec: Intel SDM Vol. 2 "RET" (far); Ch. 2 (66H); Vol. 3 §20.1.
+            // Opsize 16: pop IP then CS; opsize 32: pop EIP then CS (6-byte
+            // frame, EIP truncated to IP16). VM86 stays in VM86.
             if opsz32(&insn) {
                 let eip = pop32(cpu, bus)?;
                 let cs_sel = pop16(cpu, bus)?;
@@ -7275,7 +7289,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         0xCC => {
             // INT3 — one-byte breakpoint; saved return IP is the following byte.
             // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §§6.4, 6.12.1, 20.2.2.
-            // Not IOPL-sensitive in VM86 (Table 20-1). Unsupported: ICEBP/INT1.
+            // Not IOPL-sensitive in VM86 (Table 20-1). Uses the VM86→CPL0
+            // 9-dword frame when VM=1. Unsupported: ICEBP/INT1 (`F1`) — remains
+            // a sparse-table decode miss (not silent #DB).
             deliver_software_interrupt(cpu, bus, 3, next_ip)?;
         }
         0xCD => {
