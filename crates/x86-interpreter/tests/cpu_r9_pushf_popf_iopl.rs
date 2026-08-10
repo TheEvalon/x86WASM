@@ -70,8 +70,9 @@ const SEL_UCODE: u16 = 0x001B;
 const SEL_UDATA: u16 = 0x0023;
 const VM86_CS: u16 = 0x1000;
 const VM86_IP: u16 = 0x0100;
-const VM86_SS: u16 = 0x0100;
-const VM86_SP: u16 = 0x8000;
+const VM86_SS: u16 = 0x2000;
+/// Keep SP mid-segment so SS:SP linear stays inside a 256 KiB lab RAM image.
+const VM86_SP: u16 = 0x7FFE;
 
 fn encode_seg_desc(base: u32, limit20: u32, access: u8, gran_flags: u8) -> [u8; 8] {
     let lim = limit20 & 0xF_FFFF;
@@ -88,7 +89,7 @@ fn encode_seg_desc(base: u32, limit20: u32, access: u8, gran_flags: u8) -> [u8; 
 }
 
 fn enter_vm86(iopl: u8, guest: &[u8]) -> (CpuState, RamBus) {
-    let mut bus = RamBus::new(0x20000);
+    let mut bus = RamBus::new(0x40000);
     bus.write_bytes(GDT, &[0u8; 8]);
     bus.write_bytes(GDT + 8, &encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0));
     bus.write_bytes(GDT + 16, &encode_seg_desc(0, 0xF_FFFF, 0x93, 0xC0));
@@ -165,12 +166,7 @@ fn ring3_fixture(code: &[u8], flags: u64) -> (CpuState, RamBus) {
     (cpu, bus)
 }
 
-/// VM86 + IOPL=0: `PUSHF` → `#GP(0)`.
-#[test]
-fn vm86_pushf_with_iopl_below_3_raises_gp0() {
-    let (mut cpu, mut bus) = enter_vm86(0, &[0x9C]);
-    let sp_before = cpu.gpr_u16(CpuState::RSP);
-    let err = step(&mut cpu, &mut bus).expect_err("PUSHF");
+fn assert_gp0(err: ExecError) {
     assert!(
         matches!(
             err,
@@ -181,6 +177,15 @@ fn vm86_pushf_with_iopl_below_3_raises_gp0() {
         ),
         "got {err:?}"
     );
+}
+
+/// VM86 + IOPL=0: `PUSHF` → `#GP(0)`.
+#[test]
+fn vm86_pushf_with_iopl_below_3_raises_gp0() {
+    let (mut cpu, mut bus) = enter_vm86(0, &[0x9C]);
+    let sp_before = cpu.gpr_u16(CpuState::RSP);
+    let err = step(&mut cpu, &mut bus).expect_err("PUSHF");
+    assert_gp0(err);
     assert_eq!(cpu.gpr_u16(CpuState::RSP), sp_before);
 }
 
@@ -200,23 +205,28 @@ fn vm86_pushf_with_iopl3_reflects_iopl() {
 #[test]
 fn vm86_popf_with_iopl_below_3_raises_gp0() {
     let (mut cpu, mut bus) = enter_vm86(0, &[0x9D]);
-    // Seed a FLAGS image under SP (would be popped if allowed).
     let linear = (u32::from(VM86_SS) << 4) + u32::from(VM86_SP) - 2;
     bus.poke_u16(linear as usize, 0x3202); // try IOPL=3, IF=1
     cpu.set_gpr_u16(CpuState::RSP, VM86_SP - 2);
 
     let err = step(&mut cpu, &mut bus).expect_err("POPF");
-    assert!(
-        matches!(
-            err,
-            ExecError::ArchFault {
-                vector: 13,
-                error_code: Some(0),
-            } | ExecError::TripleFault { .. }
-        ),
-        "got {err:?}"
-    );
+    assert_gp0(err);
     assert_eq!((cpu.rflags >> 12) & 3, 0);
+}
+
+/// VM86 + IOPL=3: `POPF` may clear IF; IOPL stays 3.
+#[test]
+fn vm86_popf_with_iopl3_clears_if_keeps_iopl() {
+    let (mut cpu, mut bus) = enter_vm86(3, &[0x9D, 0xF4]);
+    let linear = (u32::from(VM86_SS) << 4) + u32::from(VM86_SP) - 2;
+    bus.poke_u16(linear as usize, 0x3002); // IOPL=3 in image (ignored), IF=0
+    cpu.set_gpr_u16(CpuState::RSP, VM86_SP - 2);
+    assert!(cpu.interrupt_flag());
+
+    step(&mut cpu, &mut bus).unwrap();
+    assert!(!cpu.interrupt_flag(), "IF cleared by POPF");
+    assert_eq!((cpu.rflags >> 12) & 3, 3, "IOPL sticky under VM86");
+    assert!(cpu.rflags & (1 << 17) != 0, "VM sticky");
 }
 
 /// Ring-3 POPF cannot raise IOPL (no exception; privileged bits ignored).

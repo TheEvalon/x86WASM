@@ -1789,7 +1789,11 @@ fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
 /// VM86 without VME: `IOPL < 3` → `#GP(0)`. Otherwise load permitted bits;
 /// `VM`/`RF` are never taken from the image; RF is cleared; bit 1 stays set.
 /// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2.
-fn popf_execute(cpu: &mut CpuState, bus: &mut dyn Bus, operand_size_32: bool) -> Result<(), ExecError> {
+fn popf_execute(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    operand_size_32: bool,
+) -> Result<(), ExecError> {
     if cr0_pe(cpu) && eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
         return Err(arch_fault_with_error_code(13, 0));
     }
@@ -1853,7 +1857,7 @@ fn popf_execute(cpu: &mut CpuState, bus: &mut dyn Bus, operand_size_32: bool) ->
     let preserve = !mask;
     let mut new_flags = (cpu.rflags & preserve) | (image & mask) | 2;
     new_flags &= !(1 << 16); // RF := 0
-    // Keep VM sticky (never from image).
+                             // Keep VM sticky (never from image).
     if vm {
         new_flags |= EFLAGS_VM;
     } else {
@@ -2257,10 +2261,7 @@ fn protected_iret(
     operand_size_32: bool,
     next_ip: u32,
 ) -> Result<(), ExecError> {
-    debug_assert!(
-        !eflags_vm(cpu.rflags),
-        "VM86 IRET must use vm86_iret"
-    );
+    debug_assert!(!eflags_vm(cpu.rflags), "VM86 IRET must use vm86_iret");
     if cpu.rflags & EFLAGS_NT != 0 {
         return task_switch(cpu, bus, TaskSwitchCause::Iret, None, next_ip);
     }
@@ -2445,8 +2446,7 @@ fn return_to_virtual_8086_mode(
     cpu.fs = x86_core::SegmentReg::real_mode(new_fs);
     cpu.gs = x86_core::SegmentReg::real_mode(new_gs);
     cpu.rip = u64::from(eip);
-    cpu.rflags =
-        (cpu.rflags & !0xFFFF_FFFF) | (u64::from(eflags) & DEFINED_FLAGS32_WITH_VM) | 2;
+    cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | (u64::from(eflags) & DEFINED_FLAGS32_WITH_VM) | 2;
     // ESP image is a full dword; subsequent VM86 stack ops use SP when B=0.
     cpu.set_gpr_u32(CpuState::RSP, new_esp);
     Ok(())
@@ -2483,11 +2483,12 @@ fn vm86_iret(
         }
         let sticky = cpu.rflags & STICKY_HIGH;
         // Load defined bits except the sticky VM/IOPL/VIP/VIF set.
-        const DEFINED32: u64 = 0x003D_7FD5;
+        // RF (bit 16) is architecturally cleared after IRET (Vol. 2).
+        const DEFINED32_NO_RF: u64 = 0x003C_7FD5;
         cpu.cs = x86_core::SegmentReg::real_mode_code(cs_sel);
         cpu.rip = u64::from(eip);
         cpu.rflags = (cpu.rflags & !0xFFFF_FFFF)
-            | (u64::from(flags) & DEFINED32 & !STICKY_HIGH)
+            | (u64::from(flags) & DEFINED32_NO_RF & !STICKY_HIGH)
             | sticky
             | 2;
     } else {
@@ -2499,10 +2500,8 @@ fn vm86_iret(
         cpu.set_ip16(ip);
         // Low FLAGS without IOPL; IOPL sticky. VM lives in high word.
         const DEFINED16_NO_IOPL: u64 = 0x4FD5; // excludes IOPL bits 13:12
-        cpu.rflags = (cpu.rflags & !0xFFFF)
-            | (u64::from(flags) & DEFINED16_NO_IOPL)
-            | sticky_iopl
-            | 2;
+        cpu.rflags =
+            (cpu.rflags & !0xFFFF) | (u64::from(flags) & DEFINED16_NO_IOPL) | sticky_iopl | 2;
     }
     Ok(())
 }
@@ -21383,8 +21382,7 @@ mod tests {
         // Only three dwords are on the stack; slots 3..8 read as zero and would
         // form a vacuous VM86 state — ensure ESP advances past a full 9-dword
         // frame when VM is set (36 bytes), not the protected 3-dword path.
-        let (mut cpu, mut bus) =
-            pm32_iretd_fixture(0x0100, 0x1000, 0x0002 | (1 << 17), descriptor);
+        let (mut cpu, mut bus) = pm32_iretd_fixture(0x0100, 0x1000, 0x0002 | (1 << 17), descriptor);
         // Extend the stack image with the remaining six dwords of a VM86 frame.
         let frame = (PM32_TEST_ESP - 36) as usize;
         let eip = 0x0100u32.to_le_bytes();
