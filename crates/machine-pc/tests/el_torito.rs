@@ -104,7 +104,10 @@ fn load_eltorito_to_7c00_sets_cs_ip_and_memory() {
     assert_eq!(m.cpu.cs.selector, EL_TORITO_DEFAULT_LOAD_SEGMENT);
     assert_eq!(m.cpu.ip16(), 0);
     assert_eq!(m.mem.read_u8(EL_TORITO_DEFAULT_LOAD_PHYS).unwrap(), 0xF4);
-    assert_eq!(m.mem.read_u8(EL_TORITO_DEFAULT_LOAD_PHYS + 1).unwrap(), 0x90);
+    assert_eq!(
+        m.mem.read_u8(EL_TORITO_DEFAULT_LOAD_PHYS + 1).unwrap(),
+        0x90
+    );
 }
 
 /// Spec: after handoff, guest fetch at `07C0:0000` runs the boot image.
