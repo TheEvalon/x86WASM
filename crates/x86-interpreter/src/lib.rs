@@ -7069,16 +7069,17 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0x9A => {
             // CALL far ptr16:16 / ptr16:32.
-            // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H); Vol. 3 §5.8.1.
-            // Protected mode: same-CPL nonconforming GDT code (no call gates).
-            // Real-address OperandSize=32: push CS (16) then EIP (32) — 6-byte frame.
+            // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
+            // Protected (VM=0): same-CPL GDT code / call gate / task.
+            // Virtual-8086: real-address-like push CS:IP; stay VM=1.
+            // Unsupported from VM86: privilege-changing call gates.
             let selector = insn.displacement as u16;
             let offset = if opsz32(&insn) {
                 insn.immediate as u32
             } else {
                 u32::from(insn.immediate as u16)
             };
-            if cr0_pe(cpu) {
+            if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                 protected_far_call(cpu, bus, offset, selector, next_ip, opsz32(&insn))?;
             } else if opsz32(&insn) {
                 push16(cpu, bus, cpu.cs.selector)?;
@@ -7789,7 +7790,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                             .map_err(|e| classify_mem_fault(e, uses_ss))?;
                         (u32::from(offset), selector)
                     };
-                    if cr0_pe(cpu) {
+                    if cr0_pe(cpu) && !eflags_vm(cpu.rflags) {
                         protected_far_call(cpu, bus, offset, selector, next_ip, op32)?;
                     } else if op32 {
                         push16(cpu, bus, cpu.cs.selector)?;
