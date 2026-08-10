@@ -175,10 +175,7 @@ mod tests {
         assert!(hpet.owns(HPET_DEFAULT_BASE));
         assert!(!hpet.owns(HPET_DEFAULT_BASE + HPET_WINDOW_SIZE));
         assert_eq!(read_u32(&hpet, HPET_REG_CAPS_ID), HPET_CAPS_ID_VALUE as u32);
-        assert_eq!(
-            read_u32(&hpet, 0x04),
-            (HPET_CAPS_ID_VALUE >> 32) as u32
-        );
+        assert_eq!(read_u32(&hpet, 0x04), (HPET_CAPS_ID_VALUE >> 32) as u32);
         assert_eq!(HPET_CAPS_ID_VALUE as u8, HPET_REV_ID);
         assert_eq!(((HPET_CAPS_ID_VALUE >> 8) & 0x1F) as u8, HPET_NUM_TIM_CAP);
         assert_eq!((HPET_CAPS_ID_VALUE >> 16) as u16, HPET_VENDOR_ID);

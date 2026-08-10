@@ -19,6 +19,7 @@
 //! Classic LPT1/LPT2 parallel-port register-file stub (0x378–0x37A / 0x278–0x27A).
 //! Local APIC MMIO identity stub at 0xFEE00000 (ID/Version; no delivery).
 //! HPET MMIO capability stub at 0xFED00000 (CAPS/ID; counter stuck at 0).
+//! I/O APIC MMIO stub at 0xFEC00000 (IOREGSEL/IOWIN + 24-entry RTE stub).
 
 #![forbid(unsafe_code)]
 
@@ -30,6 +31,7 @@ mod fw_cfg;
 mod hpet;
 mod i8042;
 mod ide;
+mod ioapic;
 mod lapic;
 mod lpt;
 mod pci;
@@ -128,6 +130,11 @@ pub use ide::{
     IDE_SECONDARY_CTRL, IDE_SECONDARY_DATA, IDE_SECONDARY_DRIVE, IDE_SECONDARY_ERROR,
     IDE_SECONDARY_LBA_HI, IDE_SECONDARY_LBA_LO, IDE_SECONDARY_LBA_MID, IDE_SECONDARY_SECCOUNT,
     IDE_SECONDARY_STATUS,
+};
+pub use ioapic::{
+    IoApicMmio, IOAPIC_DEFAULT_BASE, IOAPIC_IND_ARB, IOAPIC_IND_ID, IOAPIC_IND_REDTBL0,
+    IOAPIC_IND_VER, IOAPIC_IOREGSEL, IOAPIC_IOWIN, IOAPIC_MAX_REDIRECTION_ENTRY,
+    IOAPIC_REDIRECTION_COUNT, IOAPIC_VERSION_ID, IOAPIC_VER_VALUE, IOAPIC_WINDOW_SIZE,
 };
 pub use lapic::{
     LocalApicMmio, LAPIC_DEFAULT_BASE, LAPIC_MAX_LVT_ENTRY, LAPIC_REG_ID, LAPIC_REG_VERSION,

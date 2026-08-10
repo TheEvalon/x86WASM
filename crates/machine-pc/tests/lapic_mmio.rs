@@ -11,9 +11,7 @@ use machine_pc::Machine;
 fn device_lapic_wired_on_machine_reset() {
     let mut m = Machine::new(64 * 1024);
     assert_eq!(
-        m.lapic
-            .mmio_read_u8(LAPIC_DEFAULT_BASE + 0x30)
-            .unwrap(),
+        m.lapic.mmio_read_u8(LAPIC_DEFAULT_BASE + 0x30).unwrap(),
         LAPIC_VERSION_VALUE as u8
     );
     assert!(m

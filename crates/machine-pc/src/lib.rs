@@ -52,13 +52,13 @@ pub use xbcs::{
 
 use devices::{
     ApmSmi, CmosRtc, DebugConsole, Dma8237, DmaTransferError, DualPic, E820Entry, Fdc82077, FwCfg,
-    FwCfgDmaOutcome, HpetMmio, IdePrimary, IdeSecondary, LocalApicMmio, ParallelPort, PciConfig,
-    Pit8254, Port92, PortDevice, Serial16550, VgaText, APM_CNT_PORT, APM_STS_PORT, CMOS_DATA,
-    CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA, EQUIP_DISPLAY_ENABLED,
-    EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA,
-    I8042_STATUS_CMD, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD,
-    PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA,
-    PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
+    FwCfgDmaOutcome, HpetMmio, IdePrimary, IdeSecondary, IoApicMmio, LocalApicMmio, ParallelPort,
+    PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, APM_CNT_PORT, APM_STS_PORT,
+    CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA,
+    EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_CPU_COUNT,
+    I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA,
+    PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA,
+    PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -121,6 +121,8 @@ pub struct Machine {
     pub lapic: LocalApicMmio,
     /// HPET presence MMIO at `0xFED0_0000` (CAPS/ID; counter stuck at 0).
     pub hpet: HpetMmio,
+    /// I/O APIC presence MMIO at `0xFEC0_0000` (IOREGSEL/IOWIN + RTE stub).
+    pub ioapic: IoApicMmio,
     /// Dual 8237A DMA — register/page stubs (ports 0x00–0x0F, 0xC0–0xDE, pages).
     pub dma: Dma8237,
     /// VGA color text plane at 0xB8000 + CRTC/Seq/GC/ATC/DAC/Misc stubs.
@@ -176,6 +178,7 @@ impl Machine {
             lpt2: ParallelPort::lpt2(),
             lapic: LocalApicMmio::new(),
             hpet: HpetMmio::new(),
+            ioapic: IoApicMmio::new(),
             dma: Dma8237::new(),
             vga: VgaText::new(),
             pci: PciConfig::new(),
@@ -592,6 +595,7 @@ impl Machine {
         self.lpt2.reset();
         self.lapic.reset();
         self.hpet.reset();
+        self.ioapic.reset();
         self.dma.reset();
         self.vga.reset();
         self.pci.reset();
@@ -657,6 +661,7 @@ impl Machine {
             lpt2: &mut self.lpt2,
             lapic: &mut self.lapic,
             hpet: &mut self.hpet,
+            ioapic: &mut self.ioapic,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
@@ -695,6 +700,7 @@ impl Machine {
                 lpt2: &mut self.lpt2,
                 lapic: &mut self.lapic,
                 hpet: &mut self.hpet,
+                ioapic: &mut self.ioapic,
                 dma: &mut self.dma,
                 vga: &mut self.vga,
                 pci: &mut self.pci,
@@ -886,6 +892,7 @@ impl Machine {
             lpt2: &mut self.lpt2,
             lapic: &mut self.lapic,
             hpet: &mut self.hpet,
+            ioapic: &mut self.ioapic,
             dma: &mut self.dma,
             vga: &mut self.vga,
             pci: &mut self.pci,
@@ -1086,6 +1093,7 @@ struct MachineBus<'a> {
     lpt2: &'a mut ParallelPort,
     lapic: &'a mut LocalApicMmio,
     hpet: &'a mut HpetMmio,
+    ioapic: &'a mut IoApicMmio,
     dma: &'a mut Dma8237,
     vga: &'a mut VgaText,
     pci: &'a mut PciConfig,
@@ -1549,6 +1557,10 @@ impl Bus for MachineBus<'_> {
         if let Some(b) = self.hpet.mmio_read_u8(effective) {
             return Ok(b);
         }
+        // Spec: Intel 82093AA — I/O APIC base FEC0_0000H.
+        if let Some(b) = self.ioapic.mmio_read_u8(effective) {
+            return Ok(b);
+        }
         // Probe-only: anything decoding to neither RAM nor ROM is open bus.
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
             self.ports.record_unmapped_mmio(effective, false);
@@ -1589,6 +1601,9 @@ impl Bus for MachineBus<'_> {
             return Ok(());
         }
         if self.hpet.mmio_write_u8(effective, val) {
+            return Ok(());
+        }
+        if self.ioapic.mmio_write_u8(effective, val) {
             return Ok(());
         }
         if self.ports.probe_enabled() && !self.mem.is_mapped(addr) {
@@ -2756,8 +2771,8 @@ mod tests {
     /// Spec: SDM Vol. 3A §10.4.4 — claimed LAPIC page is not logged as unmapped MMIO.
     #[test]
     fn machine_bus_lapic_page_not_unmapped_under_probe() {
-        use devices::{LAPIC_DEFAULT_BASE, LAPIC_REG_VERSION, LAPIC_VERSION_VALUE};
         use crate::UNMAPPED_MMIO_PAGE_SIZE;
+        use devices::{LAPIC_DEFAULT_BASE, LAPIC_REG_VERSION, LAPIC_VERSION_VALUE};
         let mut m = Machine::new(64 * 1024);
         m.ports.set_probe(true);
         {
@@ -2779,10 +2794,8 @@ mod tests {
     /// Spec: IA-PC HPET 1.0a — CAPS/ID + config on MachineBus; page claimed.
     #[test]
     fn machine_bus_hpet_caps_and_probe_claim() {
-        use devices::{
-            HPET_CAPS_ID_VALUE, HPET_CFG_ENABLE, HPET_DEFAULT_BASE, HPET_REG_CONFIG,
-        };
         use crate::UNMAPPED_MMIO_PAGE_SIZE;
+        use devices::{HPET_CAPS_ID_VALUE, HPET_CFG_ENABLE, HPET_DEFAULT_BASE, HPET_REG_CONFIG};
         let mut m = Machine::new(64 * 1024);
         m.ports.set_probe(true);
         {
@@ -2805,6 +2818,56 @@ mod tests {
         }
         let page = HPET_DEFAULT_BASE & !(UNMAPPED_MMIO_PAGE_SIZE - 1);
         assert!(!m.ports.unmapped_mmio().iter().any(|a| a.page == page));
+    }
+
+    /// Spec: Intel 82093AA — I/O APIC ID/VER + RTE stub; page claimed.
+    #[test]
+    fn machine_bus_ioapic_and_platform_wire_all() {
+        use crate::UNMAPPED_MMIO_PAGE_SIZE;
+        use devices::{
+            HPET_CAPS_ID_VALUE, HPET_DEFAULT_BASE, IOAPIC_DEFAULT_BASE, IOAPIC_IND_VER,
+            IOAPIC_IOREGSEL, IOAPIC_IOWIN, IOAPIC_VER_VALUE, LAPIC_DEFAULT_BASE, LAPIC_REG_VERSION,
+            LAPIC_VERSION_VALUE, LPT1_BASE, LPT_STATUS_NO_PRINTER,
+        };
+        let mut m = Machine::new(64 * 1024);
+        m.ports.set_probe(true);
+        {
+            let mut bus = m.bus_mut();
+            // LPT still claimed.
+            assert_eq!(
+                bus.port_in_u8(LPT1_BASE + 1).unwrap(),
+                LPT_STATUS_NO_PRINTER
+            );
+            // LAPIC Version.
+            assert_eq!(
+                bus.read_u32(LAPIC_DEFAULT_BASE + u64::from(LAPIC_REG_VERSION))
+                    .unwrap(),
+                LAPIC_VERSION_VALUE
+            );
+            // HPET CAPS.
+            assert_eq!(
+                bus.read_u32(HPET_DEFAULT_BASE).unwrap(),
+                HPET_CAPS_ID_VALUE as u32
+            );
+            // I/O APIC version via select/window.
+            bus.write_u8(
+                IOAPIC_DEFAULT_BASE + u64::from(IOAPIC_IOREGSEL),
+                IOAPIC_IND_VER,
+            )
+            .unwrap();
+            assert_eq!(
+                bus.read_u32(IOAPIC_DEFAULT_BASE + u64::from(IOAPIC_IOWIN))
+                    .unwrap(),
+                IOAPIC_VER_VALUE
+            );
+        }
+        for base in [LAPIC_DEFAULT_BASE, HPET_DEFAULT_BASE, IOAPIC_DEFAULT_BASE] {
+            let page = base & !(UNMAPPED_MMIO_PAGE_SIZE - 1);
+            assert!(
+                !m.ports.unmapped_mmio().iter().any(|a| a.page == page),
+                "page 0x{page:X} must be claimed"
+            );
+        }
     }
 
     /// Spec: IBM PC/AT Technical Reference — port `0x80` is the manufacturing
@@ -3025,6 +3088,7 @@ mod tests {
         assert_eq!(m.lpt2, ParallelPort::lpt2());
         assert_eq!(m.lapic, LocalApicMmio::new());
         assert_eq!(m.hpet, HpetMmio::new());
+        assert_eq!(m.ioapic, IoApicMmio::new());
         assert_eq!(m.pci, PciConfig::new());
         assert!(m.mem.a20_enabled());
         assert_eq!(m.com1_text(), "");
