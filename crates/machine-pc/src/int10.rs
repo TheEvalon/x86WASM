@@ -280,15 +280,15 @@ impl Machine {
         } else {
             0
         };
-        let count = self.cpu.gpr_u16(CpuState::RCX).min(INT10_WRITE_CHAR_MAX_COUNT);
+        let count = self
+            .cpu
+            .gpr_u16(CpuState::RCX)
+            .min(INT10_WRITE_CHAR_MAX_COUNT);
         if count == 0 {
             return;
         }
         let (row0, col0) = self.read_bda_cursor().unwrap_or((0, 0));
-        let cols = self
-            .read_bda_cols()
-            .unwrap_or(VGA_TEXT_COLS as u16)
-            .max(1) as usize;
+        let cols = self.read_bda_cols().unwrap_or(VGA_TEXT_COLS as u16).max(1) as usize;
         let rows = VGA_TEXT_ROWS;
         let mut row = usize::from(row0);
         let mut col = usize::from(col0);
@@ -320,8 +320,9 @@ impl Machine {
         match self.cpu.al() {
             INT10_AL_VBE_CONTROLLER_INFO => self.int10_vbe_controller_info(),
             _ => {
-                self.cpu
-                    .set_ax(u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
+                self.cpu.set_ax(
+                    u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED),
+                );
             }
         }
     }
@@ -337,9 +338,14 @@ impl Machine {
         let block = self.vga.vbe_info_block_bytes_for_guest(es, di);
         let dest = self.cpu.es.base.wrapping_add(u64::from(di));
         for (i, byte) in block.iter().enumerate() {
-            if self.mem.write_u8(dest.wrapping_add(i as u64), *byte).is_err() {
-                self.cpu
-                    .set_ax(u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
+            if self
+                .mem
+                .write_u8(dest.wrapping_add(i as u64), *byte)
+                .is_err()
+            {
+                self.cpu.set_ax(
+                    u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED),
+                );
                 return;
             }
         }
@@ -775,7 +781,10 @@ mod tests {
             m.read_bda_cursor_type(),
             Some((INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END))
         );
-        assert_eq!(m.vga.crtc_cursor_start_scanline(), INT10_MODE03_CURSOR_START);
+        assert_eq!(
+            m.vga.crtc_cursor_start_scanline(),
+            INT10_MODE03_CURSOR_START
+        );
         assert_eq!(m.vga.crtc_cursor_end_scanline(), INT10_MODE03_CURSOR_END);
 
         setup_int10_set_cursor(&mut m.cpu, 0, 3, 7);
@@ -960,7 +969,10 @@ mod tests {
         );
         assert_eq!(u16::from_le_bytes([block[8], block[9]]), es);
         let oem_at = usize::from(VBE_OEM_STRING_HOST_OFFSET);
-        assert_eq!(&block[oem_at..oem_at + VBE_OEM_STRING.len()], VBE_OEM_STRING);
+        assert_eq!(
+            &block[oem_at..oem_at + VBE_OEM_STRING.len()],
+            VBE_OEM_STRING
+        );
         // Honesty: still no LFB in mode info helpers.
         assert!(!m.vga.guest_lfb_available());
         assert_eq!(m.vga.vbe_phys_base_ptr(), VBE_PHYS_BASE_PTR_NONE);

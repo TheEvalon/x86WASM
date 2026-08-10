@@ -3204,8 +3204,8 @@ impl VgaText {
         vbe_put_u16(&mut block, 14, VBE_VIDEO_MODE_LIST_HOST_OFFSET);
         vbe_put_u16(&mut block, 18, 4); // TotalMemory: 256 KiB / 64 KiB
         vbe_put_u16(&mut block, 20, 0x0001); // OemSoftwareRev
-        // OemVendorNamePtr / OemProductNamePtr / OemProductRevPtr stay zero —
-        // no additional vendor marketing strings beyond VBE_OEM_STRING.
+                                             // OemVendorNamePtr / OemProductNamePtr / OemProductRevPtr stay zero —
+                                             // no additional vendor marketing strings beyond VBE_OEM_STRING.
         let mut off = usize::from(VBE_VIDEO_MODE_LIST_HOST_OFFSET);
         for mode in VBE_SUPPORTED_MODES {
             vbe_put_u16(&mut block, off, mode);
@@ -3235,17 +3235,9 @@ impl VgaText {
     /// Spec: VBE 2.0 Function 00h far pointers. Used by the host INT 10h
     /// AX=4F00h stub. Does **not** invent an LFB or change Capabilities /
     /// ModeAttributes / PhysBasePtr honesty.
-    pub fn vbe_info_block_bytes_for_guest(
-        &self,
-        es: u16,
-        di: u16,
-    ) -> [u8; VBE_INFO_BLOCK_BYTES] {
+    pub fn vbe_info_block_bytes_for_guest(&self, es: u16, di: u16) -> [u8; VBE_INFO_BLOCK_BYTES] {
         let mut block = self.vbe_info_block_bytes();
-        vbe_put_u16(
-            &mut block,
-            6,
-            di.wrapping_add(VBE_OEM_STRING_HOST_OFFSET),
-        );
+        vbe_put_u16(&mut block, 6, di.wrapping_add(VBE_OEM_STRING_HOST_OFFSET));
         vbe_put_u16(&mut block, 8, es);
         vbe_put_u16(
             &mut block,
