@@ -25,6 +25,7 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 | `0x43` | 8254 PIT control word |
 | `0x61` | System Control Port B subset — bit0 GATE2 and bit1 speaker data are writable; read-only bit4 toggles on every PIT channel-1 refresh rising edge; read-only bit5 is OUT2; reset clears bit4 |
 | `0x92` | System Control Port A (`devices::Port92`) — bit1 Fast Gate A20 → `PhysMem` (mirrored to 8042 output-port bit1); bit0 write-1 fast reset pulse → same `take_system_reset_request` / `Machine::service_8042_pulse_reset` latch as 8042 `0xFE`; other bits RMW store only |
+| `0xCF9` (byte/word) | ICH Reset Control Register (`devices::Cf9Reset`) — SeaBIOS/QEMU `PORT_PCI_REBOOT`; bit1 SYS_RST store; bit2 RST_CPU write-1 → same system-reset latch. **Not** PCI CONFIG_ADDRESS (dword at `0xCF8` only; PCI 3.0 §3.2.2.3.2) |
 | `0xB2` / `0xB3` | APM_CNT / APM_STS (`devices::ApmSmi`) — store/readback + SMM-completion stub on CNT write |
 | `0x378`–`0x37A` | LPT1 parallel port (`devices::ParallelPort`) — data/status/control stub; status `0xDF` (Busy# inactive); no IRQ7/ECP |
 | `0x278`–`0x27A` | LPT2 parallel port — same stub as LPT1 |
