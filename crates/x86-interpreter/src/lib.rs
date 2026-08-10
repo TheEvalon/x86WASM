@@ -1763,6 +1763,27 @@ fn eflags_vm(rflags: u64) -> bool {
     rflags & EFLAGS_VM != 0
 }
 
+fn eflags_iopl(rflags: u64) -> u8 {
+    ((rflags >> 12) & 3) as u8
+}
+
+/// `#GP(0)` when `CLI`/`STI` lack sufficient IOPL privilege (no VME/PVI).
+///
+/// Real-address mode always succeeds. Protected mode (VM=0): require
+/// `IOPL ≥ CPL`. Virtual-8086 mode: require `IOPL = 3` (CPL is forced to 3).
+/// Spec: Intel SDM Vol. 2 "CLI"/"STI" Table 3-7; Vol. 3 §20.2.1.
+fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        return Ok(());
+    }
+    let cpl = architectural_cpl(cpu);
+    if eflags_iopl(cpu.rflags) >= cpl {
+        Ok(())
+    } else {
+        Err(arch_fault_with_error_code(13, 0))
+    }
+}
+
 /// Architectural CPL: 0 in real-address mode, 3 while `EFLAGS.VM=1`, else CS.RPL.
 ///
 /// Spec: Intel SDM Vol. 3 §5.5; §20.1.1 (VM86 forces CPL 3; CS[1:0] is not RPL).
@@ -6563,10 +6584,16 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0xFA => {
+            // CLI — Spec: Intel SDM Vol. 2 "CLI" Table 3-7; Vol. 3 §20.2.1.
+            // Unsupported: VME/PVI (`CR4` reserved; CPUID clear) → no VIF path.
+            require_iopl_for_cli_sti(cpu)?;
             cpu.set_interrupt_flag(false);
             set_current_ip(cpu, next_ip);
         }
         0xFB => {
+            // STI — Spec: Intel SDM Vol. 2 "STI" Table 3-8; Vol. 3 §20.2.1.
+            // Unsupported: VME/PVI VIF path; interrupt-shadow delay after STI.
+            require_iopl_for_cli_sti(cpu)?;
             cpu.set_interrupt_flag(true);
             set_current_ip(cpu, next_ip);
         }
