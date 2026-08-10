@@ -1,22 +1,24 @@
-//! Host INT 10h video stub (AH=00h/01h/02h/03h/09h/0Ah/0Eh/0Fh + AX=4F00h).
+//! Host INT 10h video stub (AH=00h/01h/02h/03h/09h/0Ah/0Eh/0Fh/13h + AX=4F00h/4F01h).
 //!
 //! Bring-up path only: installs a real-mode IVT pointer and services selected
 //! functions via [`Machine::service_int10`]. Not a VGA BIOS and not a full VBE
-//! implementation — only host AX=4F00h controller-info delivery from the
-//! truthful device helpers.
+//! implementation — host AX=4F00h/4F01h delivery from truthful device helpers
+//! with **no guest LFB** claim.
 //!
 //! Spec: Ralf Brown's Interrupt List — INT 10h AH=00h "SET VIDEO MODE",
 //! AH=01h "SET CURSOR TYPE", AH=02h "SET CURSOR POSITION", AH=03h "GET CURSOR
 //! POSITION AND SIZE", AH=09h "WRITE CHARACTER AND ATTRIBUTE AT CURSOR
 //! POSITION", AH=0Ah "WRITE CHARACTER ONLY AT CURSOR POSITION", AH=0Eh
-//! "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE", AX=4F00h "VBE Return
-//! VBE Controller Information"; VESA VBE 2.0 Function 00h; IBM PC BIOS Data Area
-//! video fields at `0040:0049` / `0040:004A` / `0040:004C` / `0040:004E` /
-//! `0040:0050`–`005F` / `0040:0060` / `0040:0062` / `0040:0063` / `0040:0084`.
+//! "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE", AH=13h "WRITE STRING",
+//! AX=4F00h / AX=4F01h VBE; VESA VBE 2.0 Functions 00h/01h; FreeVGA CRTC Cursor
+//! Location; IBM PC BIOS Data Area video fields at `0040:0049` / `0040:004A` /
+//! `0040:004C` / `0040:004E` / `0040:0050`–`005F` / `0040:0060` / `0040:0062` /
+//! `0040:0063` / `0040:0084`.
 
 use crate::{Machine, MachineError};
 use devices::{
-    PortDevice, VgaRenderMode, VBE_INFO_BLOCK_BYTES, VGA_CRTC_CURSOR_END, VGA_CRTC_CURSOR_START,
+    PortDevice, VgaRenderMode, VBE_INFO_BLOCK_BYTES, VBE_MODE_INFO_BLOCK_BYTES,
+    VGA_CRTC_CURSOR_END, VGA_CRTC_CURSOR_LOC_HIGH, VGA_CRTC_CURSOR_LOC_LOW, VGA_CRTC_CURSOR_START,
     VGA_CRTC_DATA, VGA_CRTC_INDEX, VGA_DEFAULT_ATTR, VGA_TEXT_COLS, VGA_TEXT_ROWS,
 };
 use x86_core::CpuState;
@@ -40,10 +42,14 @@ pub const INT10_AH_WRITE_CHAR: u8 = 0x0A;
 pub const INT10_AH_TELETYPE: u8 = 0x0E;
 /// AH=0Fh — GET CURRENT VIDEO MODE. Spec: RBIL INT 10h AH=0Fh.
 pub const INT10_AH_GET_MODE: u8 = 0x0F;
+/// AH=13h — WRITE STRING. Spec: RBIL INT 10h AH=13h.
+pub const INT10_AH_WRITE_STRING: u8 = 0x13;
 /// AH=4Fh — VESA VBE. Spec: VBE 2.0 / RBIL INT 10h AX=4Fxxh.
 pub const INT10_AH_VBE: u8 = 0x4F;
 /// AL=00h — VBE Return Controller Information. Spec: VBE 2.0 Function 00h.
 pub const INT10_AL_VBE_CONTROLLER_INFO: u8 = 0x00;
+/// AL=01h — VBE Return Mode Information. Spec: VBE 2.0 Function 01h.
+pub const INT10_AL_VBE_MODE_INFO: u8 = 0x01;
 
 /// VBE success return in AL. Spec: VBE 2.0 — AL=`4Fh` means supported.
 pub const INT10_VBE_AL_SUPPORTED: u8 = 0x4F;
@@ -91,12 +97,20 @@ pub const INT10_CRT_BASE_COLOR: u16 = 0x3D4;
 /// Mode-03h / mode-13h BDA rows-minus-one (`25 - 1`). Spec: RBIL `0040:0084`.
 pub const INT10_MODE03_ROWS_MINUS_1: u8 = (VGA_TEXT_ROWS as u8).saturating_sub(1);
 
-/// Bound CX repeat count for AH=09h/0Ah so a pathological count cannot walk
+/// Bound CX repeat count for AH=09h/0Ah/13h so a pathological count cannot walk
 /// forever. One full 80×25 page is enough for host bring-up.
 pub const INT10_WRITE_CHAR_MAX_COUNT: u16 = (VGA_TEXT_COLS * VGA_TEXT_ROWS) as u16;
 
-/// Default teletype attribute in text mode (light grey on black).
+/// Default teletype / scroll-fill attribute in text mode (light grey on black).
+///
+/// Spec: classic IBM VGA BIOS teletype / scroll blank line uses attribute
+/// `07h` when no richer regen attribute is available.
 const INT10_TTY_ATTR: u8 = VGA_DEFAULT_ATTR;
+
+/// AH=13h AL bit0 — update cursor after write. Spec: RBIL INT 10h AH=13h.
+pub const INT10_WRITE_STRING_UPDATE_CURSOR: u8 = 0x01;
+/// AH=13h AL bit1 — string is char,attr pairs. Spec: RBIL INT 10h AH=13h.
+pub const INT10_WRITE_STRING_HAS_ATTR: u8 = 0x02;
 
 impl Machine {
     /// Dispatch host INT 10h for the AH currently in `CPU.AH`.
@@ -104,16 +118,19 @@ impl Machine {
     /// Supported:
     /// - AH=00h AL=03h / AL=13h — set video mode (text reset / mode 13h program)
     /// - AH=01h — set cursor type (BDA `0040:0060` + CRTC Cursor Start/End)
-    /// - AH=02h — set cursor position (page 0; BDA `0040:0050`)
+    /// - AH=02h — set cursor position (page 0; BDA `0040:0050` + CRTC Location)
     /// - AH=03h — get cursor position and size (page 0; BDA + CRTC scanlines)
     /// - AH=09h — write character+attribute at cursor (page 0 text; no advance)
     /// - AH=0Ah — write character only at cursor (page 0 text; no advance)
-    /// - AH=0Eh — teletype output in text mode (CR/LF/BS + printable)
+    /// - AH=0Eh — teletype output in text mode (CR/LF/BS + printable; scroll)
     /// - AH=0Fh — get current video mode / columns / page from BDA
+    /// - AH=13h — write string (page 0 text; bounded CX; optional cursor update)
     /// - AX=4F00h — VBE Return Controller Information into ES:DI (host copy;
-    ///   no LFB claim; other 4Fxx unsupported)
+    ///   no LFB claim)
+    /// - AX=4F01h — VBE Return Mode Information into ES:DI (CX=mode; no LFB)
     ///
-    /// Unsupported AH values leave CPU/VGA unchanged. Spec: RBIL INT 10h subset.
+    /// Unsupported AH / other 4Fxx values leave CPU/VGA unchanged or return
+    /// AX=`014Fh`. Spec: RBIL INT 10h subset / VBE 2.0.
     pub fn service_int10(&mut self) {
         match self.cpu.ah() {
             INT10_AH_SET_MODE => self.int10_set_mode(self.cpu.al()),
@@ -124,6 +141,7 @@ impl Machine {
             INT10_AH_WRITE_CHAR => self.int10_write_char(false),
             INT10_AH_TELETYPE => self.int10_teletype(self.cpu.al()),
             INT10_AH_GET_MODE => self.int10_get_mode(),
+            INT10_AH_WRITE_STRING => self.int10_write_string(),
             INT10_AH_VBE => self.int10_vbe(),
             _ => {}
         }
@@ -207,8 +225,8 @@ impl Machine {
 
     /// AH=02h SET CURSOR POSITION. Spec: RBIL — BH=page, DH=row, DL=col.
     ///
-    /// Page 0 only: writes BDA `0040:0050`. Full CRTC Location High/Low sync is
-    /// out of scope (prefer BDA + existing VGA helpers for reads).
+    /// Page 0 only: writes BDA `0040:0050` and programs FreeVGA CRTC Cursor
+    /// Location High/Low (`0x0E`/`0x0F`) so host render matches BDA.
     fn int10_set_cursor(&mut self) {
         let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
         if page != 0 {
@@ -313,12 +331,13 @@ impl Machine {
 
     /// AH=4Fh VBE dispatcher. Spec: VBE 2.0 / RBIL AX=4Fxxh.
     ///
-    /// Only AL=00h (controller info) is implemented. Other AL values return
-    /// AX=`014Fh` (supported function group, failed/unsupported subfunction)
-    /// without touching guest memory.
+    /// AL=00h (controller info) and AL=01h (mode info) are implemented. Other
+    /// AL values return AX=`014Fh` without touching guest memory. Mode info
+    /// never advertises a guest LFB (`PhysBasePtr` / ModeAttributes D7 clear).
     fn int10_vbe(&mut self) {
         match self.cpu.al() {
             INT10_AL_VBE_CONTROLLER_INFO => self.int10_vbe_controller_info(),
+            INT10_AL_VBE_MODE_INFO => self.int10_vbe_mode_info(),
             _ => {
                 self.cpu.set_ax(
                     u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED),
@@ -354,16 +373,124 @@ impl Machine {
             .set_ax(u16::from(INT10_VBE_AH_SUCCESS) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
     }
 
+    /// AX=4F01h Return VBE Mode Information. Spec: VBE 2.0 Function 01h.
+    ///
+    /// CX = mode number; copies [`devices::VgaText::vbe_mode_info_block_bytes`]
+    /// into `ES:DI` when the mode is advertised. Unknown modes return AX=`014Fh`.
+    /// Honesty: ModeAttributes D7 clear and PhysBasePtr /
+    /// OffScreenMem* stay zero — no guest LFB (`docs/vga-r13-vbe-4f01-mode-info.md`).
+    fn int10_vbe_mode_info(&mut self) {
+        let mode = self.cpu.gpr_u16(CpuState::RCX);
+        let Some(block) = self.vga.vbe_mode_info_block_bytes(mode) else {
+            self.cpu
+                .set_ax(u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
+            return;
+        };
+        let di = self.cpu.gpr_u16(CpuState::RDI);
+        let dest = self.cpu.es.base.wrapping_add(u64::from(di));
+        for (i, byte) in block.iter().enumerate() {
+            if self
+                .mem
+                .write_u8(dest.wrapping_add(i as u64), *byte)
+                .is_err()
+            {
+                self.cpu.set_ax(
+                    u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED),
+                );
+                return;
+            }
+        }
+        debug_assert_eq!(block.len(), VBE_MODE_INFO_BLOCK_BYTES);
+        self.cpu
+            .set_ax(u16::from(INT10_VBE_AH_SUCCESS) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
+    }
+
+    /// AH=13h WRITE STRING. Spec: RBIL — AL=write mode, BH=page, BL=attr (if
+    /// chars-only), CX=length, DH/DL=start row/col, ES:BP=string.
+    ///
+    /// Bounded host stub: page 0 + text mode only; CX capped at
+    /// [`INT10_WRITE_CHAR_MAX_COUNT`]; AL bits 0–1 only (cursor update /
+    /// char+attr pairs). Stops at the end of the 80×25 page (no scroll).
+    /// Spec: RBIL INT 10h AH=13h; see `docs/vga-r13-int10-write-string.md`.
+    fn int10_write_string(&mut self) {
+        if self.vga.render_mode() != VgaRenderMode::Text {
+            return;
+        }
+        let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
+        if page != 0 {
+            return;
+        }
+        let mode = self.cpu.al();
+        if mode & !0x03 != 0 {
+            // Reserved AL bits — leave hardware alone (honest subset).
+            return;
+        }
+        let update_cursor = (mode & INT10_WRITE_STRING_UPDATE_CURSOR) != 0;
+        let has_attr = (mode & INT10_WRITE_STRING_HAS_ATTR) != 0;
+        let bl_attr = self.cpu.gpr_u8_low(CpuState::RBX); // BL
+        let count = self
+            .cpu
+            .gpr_u16(CpuState::RCX)
+            .min(INT10_WRITE_CHAR_MAX_COUNT);
+        if count == 0 {
+            return;
+        }
+        let mut row = usize::from(self.cpu.gpr_u8(4 + CpuState::RDX)); // DH
+        let mut col = usize::from(self.cpu.gpr_u8_low(CpuState::RDX)); // DL
+        let cols = self.read_bda_cols().unwrap_or(VGA_TEXT_COLS as u16).max(1) as usize;
+        let rows = VGA_TEXT_ROWS;
+        let src = self
+            .cpu
+            .es
+            .base
+            .wrapping_add(u64::from(self.cpu.gpr_u16(CpuState::RBP)));
+        let stride = if has_attr { 2u64 } else { 1u64 };
+        for i in 0..u64::from(count) {
+            if row >= rows {
+                break;
+            }
+            let off = src.wrapping_add(i.wrapping_mul(stride));
+            let Ok(ch) = self.mem.read_u8(off) else {
+                break;
+            };
+            let attr = if has_attr {
+                match self.mem.read_u8(off.wrapping_add(1)) {
+                    Ok(a) => a,
+                    Err(_) => break,
+                }
+            } else {
+                bl_attr
+            };
+            let _ = self.vga.put_char(row, col, ch, attr);
+            col += 1;
+            if col >= cols {
+                col = 0;
+                row += 1;
+            }
+        }
+        if update_cursor {
+            let max_row = rows.saturating_sub(1);
+            let (out_row, out_col) = if row > max_row {
+                (max_row as u8, (cols.saturating_sub(1)) as u8)
+            } else {
+                (row as u8, col.min(cols.saturating_sub(1)) as u8)
+            };
+            let _ = self.write_bda_cursor(out_row, out_col);
+        }
+    }
+
     fn int10_teletype(&mut self, ch: u8) {
         // Graphics teletype and multi-page are out of scope; only text mode.
         if self.vga.render_mode() != VgaRenderMode::Text {
             return;
         }
-        let page = self.read_bda_u8(BDA_ACTIVE_PAGE).unwrap_or(0);
+        // Spec: RBIL AH=0Eh — BH = page number (page 0 only in this stub).
+        let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
         if page != 0 {
-            // Only page 0 is modeled in the text helpers.
             return;
         }
+        let cols = self.read_bda_cols().unwrap_or(VGA_TEXT_COLS as u16).max(1) as u8;
+        let max_row = (VGA_TEXT_ROWS as u8).saturating_sub(1);
         let (mut row, mut col) = self.read_bda_cursor().unwrap_or((0, 0));
         match ch {
             0x0D => {
@@ -371,8 +498,10 @@ impl Machine {
                 col = 0;
             }
             0x0A => {
-                // LF — next row, wrap at bottom without scroll (bounded stub).
-                if row + 1 < VGA_TEXT_ROWS as u8 {
+                // LF — next row; scroll at bottom. Spec: RBIL / classic BIOS TTY.
+                if row >= max_row {
+                    self.int10_scroll_up_one(INT10_TTY_ATTR);
+                } else {
                     row += 1;
                 }
             }
@@ -384,6 +513,9 @@ impl Machine {
                 // Bell — no speaker path in this stub.
             }
             _ => {
+                // Attr deepen: write with the cell's current attribute (default
+                // `07h`), and use that same attribute when a wrap scroll fills
+                // the blank bottom line. Spec: classic BIOS teletype scroll fill.
                 let attr = self
                     .vga
                     .attr_at(usize::from(row), usize::from(col))
@@ -391,19 +523,44 @@ impl Machine {
                 let _ = self
                     .vga
                     .put_char(usize::from(row), usize::from(col), ch, attr);
-                col += 1;
-                if col as usize >= VGA_TEXT_COLS {
+                col = col.saturating_add(1);
+                if col >= cols {
                     col = 0;
-                    if row + 1 < VGA_TEXT_ROWS as u8 {
+                    if row >= max_row {
+                        self.int10_scroll_up_one(attr);
+                    } else {
                         row += 1;
                     }
                 }
             }
         }
-        let _ = self.write_bda_cursor(row, col);
+        let _ = self.write_bda_cursor(row.min(max_row), col.min(cols.saturating_sub(1)));
     }
 
-    /// Write the core BDA video fields kept coherent with AH=00/01/02/03/09/0A/0F.
+    /// Scroll the text viewport up one row and blank the bottom line.
+    ///
+    /// Spec: classic IBM VGA BIOS teletype / scroll — moved rows keep their
+    /// character+attribute pairs; the new bottom row is spaces with `fill_attr`.
+    fn int10_scroll_up_one(&mut self, fill_attr: u8) {
+        let cols = self
+            .read_bda_cols()
+            .unwrap_or(VGA_TEXT_COLS as u16)
+            .max(1)
+            .min(VGA_TEXT_COLS as u16) as usize;
+        for row in 0..(VGA_TEXT_ROWS - 1) {
+            for col in 0..cols {
+                let ch = self.vga.char_at(row + 1, col).unwrap_or(b' ');
+                let attr = self.vga.attr_at(row + 1, col).unwrap_or(fill_attr);
+                let _ = self.vga.put_char(row, col, ch, attr);
+            }
+        }
+        let bottom = VGA_TEXT_ROWS - 1;
+        for col in 0..cols {
+            let _ = self.vga.put_char(bottom, col, b' ', fill_attr);
+        }
+    }
+
+    /// Write the core BDA video fields kept coherent with AH=00/01/02/03/09/0A/0E/0F/13.
     ///
     /// Spec: RBIL BIOS Data Area — mode `0040:0049`, columns `0040:004A`,
     /// page size `0040:004C`, page start `0040:004E`, cursor pages
@@ -425,6 +582,9 @@ impl Machine {
             let _ = self.mem.write_u8(base, 0);
             let _ = self.mem.write_u8(base + 1, 0);
         }
+        // Mode set leaves the hardware cursor at (0,0). Spec: FreeVGA CRTC
+        // Cursor Location High/Low.
+        self.program_crtc_cursor_location(0, 0);
     }
 
     fn write_bda_u16(&mut self, phys: u64, val: u16) -> Result<(), MachineError> {
@@ -437,6 +597,10 @@ impl Machine {
         Ok(())
     }
 
+    /// Write BDA page-0 cursor and sync FreeVGA CRTC Cursor Location.
+    ///
+    /// Spec: RBIL `0040:0050`; FreeVGA CRT Controller Cursor Location High/Low
+    /// (`0x0E`/`0x0F`) — character-cell address relative to Start Address.
     fn write_bda_cursor(&mut self, row: u8, col: u8) -> Result<(), MachineError> {
         self.mem
             .write_u8(BDA_CURSOR_PAGE0, col)
@@ -444,7 +608,28 @@ impl Machine {
         self.mem
             .write_u8(BDA_CURSOR_PAGE0 + 1, row)
             .map_err(|_| MachineError::MbrRamTooSmall)?;
+        self.program_crtc_cursor_location(row, col);
         Ok(())
+    }
+
+    /// Program CRTC Cursor Location High/Low to match a BDA row/col.
+    ///
+    /// Spec: FreeVGA CRT Controller — Location is the CRTC address counter of
+    /// the cursor cell (`StartAddress + row * pitch + col`).
+    fn program_crtc_cursor_location(&mut self, row: u8, col: u8) {
+        let pitch = self.vga.text_row_pitch_chars() as u16;
+        let start = self.vga.text_start_address();
+        let loc = start
+            .wrapping_add(u16::from(row).wrapping_mul(pitch))
+            .wrapping_add(u16::from(col));
+        self.vga
+            .port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_LOC_HIGH));
+        self.vga
+            .port_write(VGA_CRTC_DATA, 1, u32::from((loc >> 8) as u8));
+        self.vga
+            .port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_CURSOR_LOC_LOW));
+        self.vga
+            .port_write(VGA_CRTC_DATA, 1, u32::from((loc & 0xFF) as u8));
     }
 
     fn write_bda_cursor_type(&mut self, start: u8, end: u8) -> Result<(), MachineError> {
@@ -530,10 +715,11 @@ pub fn setup_int10_get_mode(cpu: &mut CpuState) {
     cpu.set_ah(INT10_AH_GET_MODE);
 }
 
-/// Load AH/AL for teletype output.
+/// Load AH/AL for teletype output (BH=page 0).
 pub fn setup_int10_teletype(cpu: &mut CpuState, ch: u8) {
     cpu.set_ah(INT10_AH_TELETYPE);
     cpu.set_al(ch);
+    cpu.set_gpr_u8(4 + CpuState::RBX, 0); // BH = page 0
 }
 
 /// Load AH=09h write character and attribute.
@@ -553,10 +739,43 @@ pub fn setup_int10_write_char(cpu: &mut CpuState, ch: u8, page: u8, count: u16) 
     cpu.set_gpr_u16(CpuState::RCX, count);
 }
 
+/// Load AH=13h write string registers (ES:BP already set by caller if needed).
+#[allow(clippy::too_many_arguments)] // BIOS register load mirrors AH=13h arity.
+pub fn setup_int10_write_string(
+    cpu: &mut CpuState,
+    write_mode: u8,
+    page: u8,
+    attr: u8,
+    length: u16,
+    row: u8,
+    col: u8,
+    es: u16,
+    bp: u16,
+) {
+    cpu.set_ah(INT10_AH_WRITE_STRING);
+    cpu.set_al(write_mode);
+    cpu.set_gpr_u8(4 + CpuState::RBX, page); // BH
+    cpu.set_gpr_u8_low(CpuState::RBX, attr); // BL
+    cpu.set_gpr_u16(CpuState::RCX, length);
+    cpu.set_gpr_u8(4 + CpuState::RDX, row); // DH
+    cpu.set_gpr_u8_low(CpuState::RDX, col); // DL
+    cpu.es = x86_core::SegmentReg::real_mode(es);
+    cpu.set_gpr_u16(CpuState::RBP, bp);
+}
+
 /// Load AX=4F00h VBE Return Controller Information with ES:DI buffer.
 pub fn setup_int10_vbe_controller_info(cpu: &mut CpuState, es: u16, di: u16) {
     cpu.set_ah(INT10_AH_VBE);
     cpu.set_al(INT10_AL_VBE_CONTROLLER_INFO);
+    cpu.es = x86_core::SegmentReg::real_mode(es);
+    cpu.set_gpr_u16(CpuState::RDI, di);
+}
+
+/// Load AX=4F01h VBE Return Mode Information with CX=mode and ES:DI buffer.
+pub fn setup_int10_vbe_mode_info(cpu: &mut CpuState, mode: u16, es: u16, di: u16) {
+    cpu.set_ah(INT10_AH_VBE);
+    cpu.set_al(INT10_AL_VBE_MODE_INFO);
+    cpu.set_gpr_u16(CpuState::RCX, mode);
     cpu.es = x86_core::SegmentReg::real_mode(es);
     cpu.set_gpr_u16(CpuState::RDI, di);
 }
@@ -979,12 +1198,184 @@ mod tests {
     }
 
     #[test]
+    fn int10_ax4f01_writes_mode_info_without_lfb() {
+        // Spec: VBE 2.0 Function 01h / RBIL AX=4F01h — ES:DI gets ModeInfoBlock.
+        use devices::{VBE_MODE_ATTR_LFB, VBE_MODE_INFO_BLOCK_BYTES, VBE_PHYS_BASE_PTR_NONE};
+
+        let mut m = Machine::new(1024 * 1024);
+        let es = 0x2000u16;
+        let di = 0x0000u16;
+        setup_int10_vbe_mode_info(&mut m.cpu, 0x13, es, di);
+        m.service_int10();
+        assert_eq!(m.cpu.ax(), 0x004F);
+
+        let base = (u64::from(es) << 4).wrapping_add(u64::from(di));
+        let mut block = [0u8; VBE_MODE_INFO_BLOCK_BYTES];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = m.mem.read_u8(base + i as u64).unwrap();
+        }
+        let attrs = u16::from_le_bytes([block[0], block[1]]);
+        assert_eq!(attrs & VBE_MODE_ATTR_LFB, 0);
+        assert_eq!(
+            u32::from_le_bytes(block[40..44].try_into().unwrap()),
+            VBE_PHYS_BASE_PTR_NONE
+        );
+        // OffScreenMemOffset / Size stay zero (no LFB offscreen bank).
+        assert_eq!(u32::from_le_bytes(block[44..48].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes([block[48], block[49]]), 0);
+        assert_eq!(u16::from_le_bytes([block[18], block[19]]), 320);
+        assert_eq!(block[25], 8);
+    }
+
+    #[test]
+    fn int10_ax4f01_unknown_mode_fails_honestly() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_vbe_mode_info(&mut m.cpu, 0x101, 0x1000, 0);
+        m.service_int10();
+        assert_eq!(m.cpu.ax(), 0x014F);
+    }
+
+    #[test]
     fn int10_ax4fxx_unsupported_subfunction_fails_honestly() {
         let mut m = Machine::new(1024 * 1024);
         m.cpu.set_ah(INT10_AH_VBE);
-        m.cpu.set_al(0x01); // Return Mode Information — not in this slice
+        m.cpu.set_al(0x02); // Set Mode — not in this stub
         m.service_int10();
         assert_eq!(m.cpu.ax(), 0x014F);
+    }
+
+    #[test]
+    fn int10_ah0e_scrolls_at_bottom_preserving_attrs() {
+        // Spec: RBIL AH=0Eh + classic BIOS teletype scroll — wrap past last row
+        // scrolls up; blank line filled with the written cell attribute.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        // Seed row 24 with a distinctive attribute, then teletype wrap-scroll.
+        assert!(m.vga.put_char(24, 0, b'Z', 0x1E));
+        setup_int10_set_cursor(&mut m.cpu, 0, 24, 0);
+        m.service_int10();
+        setup_int10_teletype(&mut m.cpu, b'A');
+        m.service_int10();
+        // Fill rest of last row to force wrap... easier: set cursor to last cell.
+        setup_int10_set_cursor(&mut m.cpu, 0, 24, 79);
+        m.service_int10();
+        assert!(m.vga.put_char(24, 79, b' ', 0x2F));
+        setup_int10_teletype(&mut m.cpu, b'X');
+        m.service_int10();
+
+        // Prior last-row content scrolled to row 23; bottom blanked with 0x2F.
+        assert_eq!(m.vga.char_at(23, 79), Some(b'X'));
+        assert_eq!(m.vga.attr_at(23, 79), Some(0x2F));
+        assert_eq!(m.vga.char_at(24, 0), Some(b' '));
+        assert_eq!(m.vga.attr_at(24, 0), Some(0x2F));
+        assert_eq!(m.read_bda_cursor(), Some((24, 0)));
+    }
+
+    #[test]
+    fn int10_ah0e_lf_scrolls_at_bottom() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        assert!(m.vga.put_char(0, 0, b'T', 0x07));
+        assert!(m.vga.put_char(24, 5, b'B', 0x4E));
+        setup_int10_set_cursor(&mut m.cpu, 0, 24, 5);
+        m.service_int10();
+        setup_int10_teletype(&mut m.cpu, 0x0A); // LF on last row
+        m.service_int10();
+        assert_eq!(m.vga.char_at(23, 5), Some(b'B'));
+        assert_eq!(m.vga.attr_at(23, 5), Some(0x4E));
+        assert_eq!(m.vga.char_at(24, 5), Some(b' '));
+        assert_eq!(m.vga.attr_at(24, 5), Some(INT10_TTY_ATTR));
+        assert_eq!(m.read_bda_cursor(), Some((24, 5)));
+    }
+
+    #[test]
+    fn int10_ah13_writes_string_chars_only_and_updates_cursor() {
+        // Spec: RBIL INT 10h AH=13h AL=01h — chars + BL attr; update cursor.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        let es = 0x1000u16;
+        let bp = 0x0100u16;
+        let phys = (u64::from(es) << 4) + u64::from(bp);
+        for (i, ch) in b"Hi".iter().enumerate() {
+            m.mem.write_u8(phys + i as u64, *ch).unwrap();
+        }
+        setup_int10_write_string(
+            &mut m.cpu,
+            INT10_WRITE_STRING_UPDATE_CURSOR,
+            0,
+            0x1E,
+            2,
+            2,
+            3,
+            es,
+            bp,
+        );
+        m.service_int10();
+        assert_eq!(m.vga.char_at(2, 3), Some(b'H'));
+        assert_eq!(m.vga.attr_at(2, 3), Some(0x1E));
+        assert_eq!(m.vga.char_at(2, 4), Some(b'i'));
+        assert_eq!(m.vga.attr_at(2, 4), Some(0x1E));
+        assert_eq!(m.read_bda_cursor(), Some((2, 5)));
+        assert_eq!(m.vga.crtc_cursor_row_col(), (2, 5));
+    }
+
+    #[test]
+    fn int10_ah13_writes_char_attr_pairs_without_cursor_update() {
+        // Spec: RBIL AH=13h AL=02h — alternating char,attr; cursor unchanged.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_cursor(&mut m.cpu, 0, 1, 1);
+        m.service_int10();
+        let es = 0x1000u16;
+        let bp = 0x0200u16;
+        let phys = (u64::from(es) << 4) + u64::from(bp);
+        m.mem.write_u8(phys, b'A').unwrap();
+        m.mem.write_u8(phys + 1, 0x4E).unwrap();
+        m.mem.write_u8(phys + 2, b'B').unwrap();
+        m.mem.write_u8(phys + 3, 0x2A).unwrap();
+        setup_int10_write_string(
+            &mut m.cpu,
+            INT10_WRITE_STRING_HAS_ATTR,
+            0,
+            0x07,
+            2,
+            4,
+            0,
+            es,
+            bp,
+        );
+        m.service_int10();
+        assert_eq!(m.vga.char_at(4, 0), Some(b'A'));
+        assert_eq!(m.vga.attr_at(4, 0), Some(0x4E));
+        assert_eq!(m.vga.char_at(4, 1), Some(b'B'));
+        assert_eq!(m.vga.attr_at(4, 1), Some(0x2A));
+        assert_eq!(m.read_bda_cursor(), Some((1, 1)));
+    }
+
+    #[test]
+    fn int10_crtc_bda_cursor_sync_after_ah02_and_teletype() {
+        // Spec: FreeVGA CRTC Cursor Location tracks BDA after host writes.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        assert_eq!(m.vga.crtc_cursor_location(), 0);
+        assert_eq!(m.vga.crtc_cursor_row_col(), (0, 0));
+
+        setup_int10_set_cursor(&mut m.cpu, 0, 3, 7);
+        m.service_int10();
+        assert_eq!(m.read_bda_cursor(), Some((3, 7)));
+        assert_eq!(m.vga.crtc_cursor_row_col(), (3, 7));
+        assert_eq!(m.vga.crtc_cursor_location(), 3 * 80 + 7);
+
+        setup_int10_teletype(&mut m.cpu, b'Q');
+        m.service_int10();
+        assert_eq!(m.read_bda_cursor(), Some((3, 8)));
+        assert_eq!(m.vga.crtc_cursor_row_col(), (3, 8));
+        assert_eq!(m.vga.char_at(3, 7), Some(b'Q'));
     }
 
     #[test]

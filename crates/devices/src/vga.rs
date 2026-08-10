@@ -1420,6 +1420,17 @@ pub const VBE_MODE_ATTR_LFB: u16 = 1 << 7;
 /// call sites stay explicit (`docs/vga-r9-physbaseptr-honesty.md`).
 pub const VBE_PHYS_BASE_PTR_NONE: u32 = 0;
 
+/// VBE 2.0 `OffScreenMemOffset` when no off-screen LFB bank exists.
+///
+/// Spec: VBE 2.0 ModeInfoBlock offset 44 — meaningful only with LFB; stays
+/// zero while [`VgaText::guest_lfb_available`] is false.
+pub const VBE_OFFSCREEN_MEM_OFFSET_NONE: u32 = 0;
+
+/// VBE 2.0 `OffScreenMemSize` (KiB) when no off-screen LFB bank exists.
+///
+/// Spec: VBE 2.0 ModeInfoBlock offset 48 — stays zero without a guest LFB.
+pub const VBE_OFFSCREEN_MEM_SIZE_NONE: u16 = 0;
+
 /// VBE 2.0 `Capabilities` when no optional controller features are claimed.
 ///
 /// Spec: VBE 2.0 Function 00h Capabilities — bit0 (8-bit DAC), bit1 (non-VGA),
@@ -3372,10 +3383,14 @@ impl VgaText {
         block[27] = model;
         block[28] = 0; // BankSize (CGA-style; unused)
         block[29] = 0; // NumberOfImagePages (pages − 1)
-                       // PhysBasePtr at offset 40 — deliberately zero (no LFB hardware).
+                       // PhysBasePtr / OffScreenMem* — deliberately zero (no LFB hardware).
+                       // Spec: VBE 2.0 ModeInfoBlock offsets 40 / 44 / 48.
         vbe_put_u32(&mut block, 40, self.vbe_phys_base_ptr());
+        vbe_put_u32(&mut block, 44, VBE_OFFSCREEN_MEM_OFFSET_NONE);
+        vbe_put_u16(&mut block, 48, VBE_OFFSCREEN_MEM_SIZE_NONE);
         // ModeAttributes D7 must stay clear while guest_lfb_available is false.
         debug_assert_eq!(attrs & VBE_MODE_ATTR_LFB, 0);
+        debug_assert_eq!(self.vbe_phys_base_ptr(), VBE_PHYS_BASE_PTR_NONE);
         Some(block)
     }
 

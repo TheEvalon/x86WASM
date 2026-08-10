@@ -113,6 +113,16 @@ fn mode_info_blocks_are_banked_vga_compatible_without_lfb() {
         let phys = u32::from_le_bytes(block[40..44].try_into().unwrap());
         assert_eq!(phys, 0, "mode {mode:#x}: PhysBasePtr stays zero");
         assert_eq!(phys, v.vbe_phys_base_ptr());
+        assert_eq!(
+            u32::from_le_bytes(block[44..48].try_into().unwrap()),
+            devices::VBE_OFFSCREEN_MEM_OFFSET_NONE,
+            "mode {mode:#x}: OffScreenMemOffset stays zero"
+        );
+        assert_eq!(
+            u16::from_le_bytes([block[48], block[49]]),
+            devices::VBE_OFFSCREEN_MEM_SIZE_NONE,
+            "mode {mode:#x}: OffScreenMemSize stays zero"
+        );
     }
     assert!(v.vbe_mode_info_block_bytes(0x101).is_none());
 }
