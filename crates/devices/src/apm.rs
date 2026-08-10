@@ -11,11 +11,15 @@
 //! - SeaBIOS `smm_relocate_and_restore` (emulator SMM bring-up):
 //!   `outb(0x01, PORT_SMI_STATUS); outb(0x00, PORT_SMI_CMD);` then polls
 //!   `while (inb(PORT_SMI_STATUS) != 0)` until the SMI handler clears status.
+//! - SeaBIOS `call32_smm` (optional): `outb` to APM_CNT then `HLT` waiting for
+//!   an architectural SMI to resume — without real SMM this model only
+//!   **unhalts** so the path cannot wedge; it does not rewrite EIP/SMBASE.
 //!
 //! This model stores both registers and, on every APM_CNT write, **stub-
 //! completes** the handshake by clearing APM_STS to `0x00` as a real SMI
-//! handler would. It does **not** enter System Management Mode, relocate
-//! SMBASE, or deliver an architectural SMI.
+//! handler would, and latches a pending SMI stub for a later HLT wake. It does
+//! **not** enter System Management Mode, relocate SMBASE, or deliver an
+//! architectural SMI.
 
 use crate::PortDevice;
 
@@ -38,6 +42,11 @@ pub struct ApmSmi {
     sts: u8,
     /// Number of APM_CNT writes that ran the completion stub (SMI not delivered).
     stub_completions: u64,
+    /// APM_CNT write latched an SMI stub that has not yet been consumed by a
+    /// status-0 poll read or a halt-wake service.
+    smi_pending: bool,
+    /// Number of times a pending SMI stub cleared `HLT` (still no real SMM).
+    smi_wake_stubs: u64,
 }
 
 impl Default for ApmSmi {
@@ -52,13 +61,13 @@ impl ApmSmi {
             cnt: APM_DEFAULT,
             sts: APM_DEFAULT,
             stub_completions: 0,
+            smi_pending: false,
+            smi_wake_stubs: 0,
         }
     }
 
     pub fn reset(&mut self) {
-        self.cnt = APM_DEFAULT;
-        self.sts = APM_DEFAULT;
-        self.stub_completions = 0;
+        *self = Self::new();
     }
 
     /// Whether this device claims `port` (byte ports `0xB2` and `0xB3` only).
@@ -79,6 +88,30 @@ impl ApmSmi {
         self.stub_completions
     }
 
+    /// Whether an APM_CNT write still awaits poll-consume or halt-wake.
+    pub fn smi_pending(&self) -> bool {
+        self.smi_pending
+    }
+
+    /// How many times a pending stub resumed a halted CPU (no real SMM).
+    pub fn smi_wake_stubs(&self) -> u64 {
+        self.smi_wake_stubs
+    }
+
+    /// If a stub SMI is pending and the CPU is halted, clear halt and consume
+    /// the pending latch (Intel SDM Vol. 2 `HLT` — SMI resumes execution).
+    ///
+    /// Returns true when a wake occurred. Does **not** rewrite EIP / SMBASE.
+    pub fn service_halt_wake(&mut self, halted: &mut bool) -> bool {
+        if !self.smi_pending || !*halted {
+            return false;
+        }
+        self.smi_pending = false;
+        *halted = false;
+        self.smi_wake_stubs = self.smi_wake_stubs.saturating_add(1);
+        true
+    }
+
     fn write_cnt(&mut self, value: u8) {
         self.cnt = value;
         // Spec: a write to APM_CNT raises SMI# when APMC_EN is set; the SMI
@@ -86,11 +119,22 @@ impl ApmSmi {
         // stub completes that handshake immediately and records the gap.
         self.sts = 0x00;
         self.stub_completions = self.stub_completions.saturating_add(1);
+        self.smi_pending = true;
     }
 
     fn write_sts(&mut self, value: u8) {
         // Spec: APM_STS is a software scratchpad; writes do not raise SMI#.
         self.sts = value;
+    }
+
+    fn read_sts(&mut self) -> u8 {
+        let v = self.sts;
+        // SeaBIOS `smm_relocate_and_restore` poll completes when status reads 0.
+        // Consume the pending latch so a later unrelated `HLT` is not woken.
+        if v == 0 {
+            self.smi_pending = false;
+        }
+        v
     }
 }
 
@@ -98,7 +142,7 @@ impl PortDevice for ApmSmi {
     fn port_read(&mut self, port: u16, _size: u8) -> u32 {
         match port {
             APM_CNT_PORT => u32::from(self.cnt),
-            APM_STS_PORT => u32::from(self.sts),
+            APM_STS_PORT => u32::from(self.read_sts()),
             _ => 0xFFFF_FFFF,
         }
     }
@@ -124,6 +168,8 @@ mod tests {
         assert_eq!(apm.port_read(APM_CNT_PORT, 1), 0);
         assert_eq!(apm.port_read(APM_STS_PORT, 1), 0);
         assert_eq!(apm.stub_completions(), 0);
+        assert!(!apm.smi_pending());
+        assert_eq!(apm.smi_wake_stubs(), 0);
     }
 
     /// Spec: APM_STS is a scratchpad; writing it does not clear itself or raise SMI.
@@ -135,6 +181,7 @@ mod tests {
         assert_eq!(apm.port_read(APM_STS_PORT, 1), 0x01);
         assert_eq!(apm.stub_completions(), 0);
         assert_eq!(apm.command(), 0);
+        assert!(!apm.smi_pending());
     }
 
     /// Spec: APM_CNT stores the command; this stub then clears APM_STS as the
@@ -147,7 +194,12 @@ mod tests {
         assert_eq!(apm.command(), 0x00);
         assert_eq!(apm.status(), 0x00);
         assert_eq!(apm.stub_completions(), 1);
+        assert!(apm.smi_pending());
         assert_eq!(apm.port_read(APM_STS_PORT, 1), 0x00);
+        assert!(
+            !apm.smi_pending(),
+            "status-0 poll read consumes pending latch"
+        );
     }
 
     /// SeaBIOS SMM bring-up sequence must leave the status poll satisfied.
@@ -164,6 +216,27 @@ mod tests {
         }
         assert_eq!(spins, 0);
         assert_eq!(apm.stub_completions(), 1);
+        assert!(!apm.smi_pending());
+    }
+
+    /// Spec: Intel SDM Vol. 2 `HLT` — SMI resumes a halted processor. Without
+    /// real SMM this stub only clears halt so `call32_smm`-style OUT+HLT cannot
+    /// wedge; EIP is unchanged.
+    #[test]
+    fn pending_smi_stub_wakes_halt_without_smm() {
+        let mut apm = ApmSmi::new();
+        apm.port_write(APM_CNT_PORT, 1, 0x01); // CALL32-style command byte
+        assert!(apm.smi_pending());
+        let mut halted = true;
+        assert!(apm.service_halt_wake(&mut halted));
+        assert!(!halted);
+        assert!(!apm.smi_pending());
+        assert_eq!(apm.smi_wake_stubs(), 1);
+        // Second service is a no-op.
+        halted = true;
+        assert!(!apm.service_halt_wake(&mut halted));
+        assert!(halted);
+        assert_eq!(apm.smi_wake_stubs(), 1);
     }
 
     #[test]
@@ -179,8 +252,11 @@ mod tests {
         let mut apm = ApmSmi::new();
         apm.port_write(APM_STS_PORT, 1, 0x5A);
         apm.port_write(APM_CNT_PORT, 1, 0x12);
+        let mut halted = true;
+        assert!(apm.service_halt_wake(&mut halted));
         assert_eq!(apm.command(), 0x12);
         assert_eq!(apm.stub_completions(), 1);
+        assert_eq!(apm.smi_wake_stubs(), 1);
         apm.reset();
         assert_eq!(apm, ApmSmi::new());
     }

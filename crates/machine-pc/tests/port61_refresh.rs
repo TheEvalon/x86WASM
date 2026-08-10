@@ -1,8 +1,6 @@
-use devices::{PortDevice, PIT_CH1_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL};
+use devices::{PortDevice, PIT_CH1_DATA, PIT_CONTROL, PORT61_REFRESH_TOGGLE, PORT_SYSTEM_CONTROL};
 use machine_pc::Machine;
 use x86_core::{CpuState, SegmentReg};
-
-const PORT61_REFRESH_TOGGLE: u8 = 1 << 4;
 
 /// Spec: Intel 8254 mode 2 + IBM PC/AT System Control Port B — channel-1
 /// refresh edges toggle read-only port `0x61` bit 4 without asserting IRQ0.
@@ -48,5 +46,26 @@ fn guest_reads_refresh_toggle_and_cannot_overwrite_it() {
         machine.pit.port61_read() & PORT61_REFRESH_TOGGLE,
         0,
         "machine reset must clear refresh detect"
+    );
+}
+
+/// Spec: IBM PC/AT refresh — [`Machine::tick_pit`] advances ch1 so bit4 toggles
+/// without a separate `tick_ch1` call (POST step-clock path).
+#[test]
+fn tick_pit_advances_refresh_detect_bit4() {
+    let mut machine = Machine::new(64 * 1024);
+    machine.pit.port_write(PIT_CONTROL, 1, 0x74); // ch1 lohi mode 2
+    machine.pit.port_write(PIT_CH1_DATA, 1, 0x02);
+    machine.pit.port_write(PIT_CH1_DATA, 1, 0x00);
+    assert_eq!(machine.pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+    let irr_before = machine.pic.master.irr;
+    machine.tick_pit(4); // load + countdown + rising refresh edge
+    assert_eq!(
+        machine.pit.port61_read() & PORT61_REFRESH_TOGGLE,
+        PORT61_REFRESH_TOGGLE
+    );
+    assert_eq!(
+        machine.pic.master.irr, irr_before,
+        "ch1 refresh must not assert IRQ0"
     );
 }

@@ -13,6 +13,7 @@ mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
 mod int13;
+mod int16;
 mod ioapic_wire;
 mod lapic_wire;
 mod mbr;
@@ -40,6 +41,7 @@ pub use int13::{
     INT13_EXT_VERSION, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE, INT13_STATUS_INVALID,
     INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
 };
+pub use int16::{Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_GET_KEYSTROKE, INT16_BUFFER_CAP};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
@@ -221,6 +223,8 @@ pub struct Machine {
     ide_disk_sectors: Option<u64>,
     /// fw_cfg `bootorder` policy: machine default HDD/CD/floppy, or a host override.
     fw_cfg_boot_order: FwCfgBootOrderPolicy,
+    /// Host INT 16h typeahead buffer (AH=00/01 stub; not the BDA ring).
+    int16_buf: Vec<crate::int16::Int16Key>,
 }
 
 impl Machine {
@@ -256,6 +260,7 @@ impl Machine {
             ports: PortBus::new(),
             ide_disk_sectors: None,
             fw_cfg_boot_order: FwCfgBootOrderPolicy::Default,
+            int16_buf: Vec::new(),
         };
         machine
             .mem
@@ -472,25 +477,17 @@ impl Machine {
     ///
     /// Spec: Intel 8254 (CLK-driven counter), Motorola MC146818A (periodic
     /// quantum + one-second update cycle), and Intel 82371AB ACPI `PM_TMR`
-    /// (24-bit free-running counter at 3.579545 MHz), all driven from the
-    /// retired-instruction count rather than host wall clock so a run is
-    /// reproducible.
+    /// (24-bit free-running counter at 3.579545 MHz via [`Self::tick_pit`]),
+    /// all driven from the retired-instruction count rather than host wall
+    /// clock so a run is reproducible.
     fn advance_step_clock(&mut self) {
         let ticks = self.step_clock.charge_step();
         if ticks.is_empty() {
             return;
         }
         if ticks.pit_clocks > 0 {
+            // Spec: Intel 82371AB — PM_TMR freeruns at 3× PIT via [`Self::tick_pit`].
             self.tick_pit(ticks.pit_clocks);
-            // Spec: Intel 82371AB — PM_TMR runs at 3.579545 MHz = 3 × PIT CLK.
-            // Authority lives in `PciConfig::acpi_pm_io[+8]`; prefer
-            // [`PciConfig::tick_acpi_pm`] so MSB toggle can set TMR_STS.
-            let pm = ticks
-                .pit_clocks
-                .saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK);
-            if pm > 0 {
-                self.pci.tick_acpi_pm(pm.min(u64::from(u32::MAX)) as u32);
-            }
         }
         if ticks.cmos_periods > 0 {
             self.tick_cmos(ticks.cmos_periods);
@@ -718,6 +715,7 @@ impl Machine {
         self.fdc.reset();
         self.fw_cfg.reset();
         self.post_diag.reset();
+        self.int16_buf.clear();
         // Configuration survives reset (like the fw_cfg host configuration);
         // only partial timer quanta are dropped.
         self.step_clock.reset_accumulators();
@@ -830,7 +828,19 @@ impl Machine {
         self.advance_step_clock();
         // Spec: OSDev I8042 / A20 Line — system-reset after OUT (CPU not in bus view).
         let _ = self.service_8042_pulse_reset();
+        // Spec: Intel SDM Vol. 2 `HLT` — SMI resumes a halt. APM_CNT stub may
+        // clear halt without entering SMM (see `docs/apm-r9-smi-handshake.md`).
+        let _ = self.service_apm_smi_halt_wake();
         Ok(())
+    }
+
+    /// If APM_CNT latched a pending SMI stub and the CPU is halted, resume.
+    ///
+    /// Spec: Intel SDM Vol. 2 `HLT` — SMI is a wake event. This path only clears
+    /// `halted`; it does **not** enter SMM, relocate SMBASE, or rewrite EIP.
+    /// See `docs/apm-r9-smi-handshake.md`.
+    pub fn service_apm_smi_halt_wake(&mut self) -> bool {
+        self.apm.service_halt_wake(&mut self.cpu.halted)
     }
 
     pub fn run(&mut self, max_steps: u64) -> Result<u64, MachineError> {
@@ -863,10 +873,15 @@ impl Machine {
         self.load_rom(&rom)
     }
 
-    /// Advance PIT channel 0 (and ch2 speaker timer) by `clocks` model ticks
-    /// and sync ch0 OUT → PIC IRQ0.
+    /// Advance PIT channel 0, channel 1 (DRAM refresh), and channel 2 (speaker)
+    /// by `clocks` model ticks; sync ch0 OUT → PIC IRQ0; freerun ACPI `PM_TMR`
+    /// at 3× PIT.
     ///
-    /// Spec: Intel 8254 ch0 OUT; Intel 8259A edge IR (low→high latches IRR).
+    /// Spec: Intel 8254 ch0 OUT; Intel 8259A edge IR (low→high latches IRR);
+    /// IBM PC/AT — ch1 OUT is the DRAM-refresh request and toggles System
+    /// Control Port B bit4 on each rising edge (no IRQ); ch2 is the speaker
+    /// timer via port `0x61`; Intel 82371AB — `PM_TMR` at 3.579545 MHz = 3 ×
+    /// PIT CLK into `PciConfig::acpi_pm_io[+8]` via [`PciConfig::tick_acpi_pm`].
     /// Guest wall-clock rate is **not** host-real-time — callers choose the quantum.
     ///
     /// When `tick_ch0` reports a rising OUT edge, IR0 is pulsed (deassert then
@@ -874,7 +889,14 @@ impl Machine {
     // --- PIT→IRQ0 (slice/device-pit-irq0); keep MachineBus edits minimal for 8042 merge ---
     pub fn tick_pit(&mut self, clocks: u64) {
         let rising = self.pit.tick_ch0(clocks);
+        let _ = self.pit.tick_ch1(clocks);
         let _ = self.pit.tick_ch2(clocks);
+        // Spec: Intel 82371AB / ACPI — one PM_TMR clock path (3× PIT) for every
+        // machine PIT quantum, including step-clock and host `tick_pit` calls.
+        let pm = clocks.saturating_mul(ACPI_PM_CLOCKS_PER_PIT_CLOCK);
+        if pm > 0 {
+            self.pci.tick_acpi_pm(pm.min(u64::from(u32::MAX)) as u32);
+        }
         if rising {
             self.pic.set_irq_line(0, false);
             self.pic.set_irq_line(0, true);
