@@ -681,9 +681,12 @@ mod tests {
         assert_eq!(decode(&[0x0F]), Err(DecodeError::Truncated));
         // 0F 01 is GRP7 (needs ModRM); truncated without ModRM.
         assert_eq!(decode(&[0x0F, 0x01]), Err(DecodeError::Truncated));
+        // 0F 02/03 LAR/LSL need ModRM.
+        assert_eq!(decode(&[0x0F, 0x02]), Err(DecodeError::Truncated));
+        assert_eq!(decode(&[0x0F, 0x03]), Err(DecodeError::Truncated));
         assert!(matches!(
-            decode(&[0x0F, 0x02]),
-            Err(DecodeError::UnsupportedOpcode(0x02))
+            decode(&[0x0F, 0x04]),
+            Err(DecodeError::UnsupportedOpcode(0x04))
         ));
     }
 
@@ -700,6 +703,16 @@ mod tests {
         let ltr_ax = decode(&[0x0F, 0x00, 0xD8]).unwrap(); // LTR AX
         assert_eq!(ltr_ax.modrm.unwrap().reg, 3);
         assert_eq!(ltr_ax.length, 3);
+
+        // Spec: Intel SDM Vol. 2 "LAR"/"LSL" — 0F 02 /r, 0F 03 /r.
+        let lar = decode(&[0x0F, 0x02, 0xC1]).unwrap(); // LAR AX, CX
+        assert_eq!(lar.mnemonic, "LAR");
+        assert_eq!(lar.opcode, 0x02);
+        assert_eq!(lar.length, 3);
+        let lsl = decode(&[0x0F, 0x03, 0x1E, 0x00, 0x40]).unwrap(); // LSL BX, [0x4000]
+        assert_eq!(lsl.mnemonic, "LSL");
+        assert_eq!(lsl.displacement, 0x4000);
+        assert_eq!(lsl.length, 5);
 
         // Spec: Intel SDM Vol. 2 LGDT/SGDT — 0F 01 /2 and /0, memory form.
         let sgdt = decode(&[0x0F, 0x01, 0x06, 0x00, 0x20]).unwrap(); // SGDT [0x2000]

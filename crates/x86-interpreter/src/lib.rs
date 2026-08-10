@@ -2067,6 +2067,120 @@ fn read_gdt_segment_descriptor(
     Ok(descriptor)
 }
 
+/// Soft GDT descriptor fetch for `LAR`/`LSL`: null, LDT (TI=1), or out-of-limit
+/// returns `None` (caller clears ZF). Memory faults still propagate.
+/// Spec: Intel SDM Vol. 2 "LAR"/"LSL"; Vol. 3 §§3.5.1, 5.5.
+fn try_read_gdt_descriptor_for_lar_lsl(
+    cpu: &CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+) -> Result<Option<[u8; 8]>, ExecError> {
+    if is_null_selector(selector) || selector & 0x4 != 0 {
+        return Ok(None);
+    }
+    let offset = u64::from(selector >> 3) * 8;
+    if offset + 7 > u64::from(cpu.gdtr.limit) {
+        return Ok(None);
+    }
+    let addr = cpu.gdtr.base.wrapping_add(offset);
+    let mut descriptor = [0u8; 8];
+    for (index, byte) in descriptor.iter_mut().enumerate() {
+        *byte = bus
+            .read_system_u8(addr.wrapping_add(index as u64))
+            .map_err(|error| classify_mem_fault(error, false))?;
+    }
+    Ok(Some(descriptor))
+}
+
+/// Whether a descriptor type is valid for `LAR` (SDM Vol. 2 Table for LAR).
+fn lar_type_valid(access: u8) -> bool {
+    if access & 0x10 != 0 {
+        return true; // all code/data
+    }
+    matches!(access & 0x0F, 0x1 | 0x2 | 0x3 | 0x4 | 0x5 | 0x9 | 0xB | 0xC)
+}
+
+/// Whether a descriptor type is valid for `LSL` (SDM Vol. 2 Table for LSL).
+fn lsl_type_valid(access: u8) -> bool {
+    if access & 0x10 != 0 {
+        return true; // all code/data
+    }
+    matches!(access & 0x0F, 0x1 | 0x2 | 0x3 | 0x9 | 0xB)
+}
+
+/// Soft privilege / type check shared by `LAR` and `LSL`.
+///
+/// Not-present descriptors clear ZF. Conforming code skips the DPL check.
+/// Spec: Intel SDM Vol. 2 "LAR"/"LSL".
+fn lar_lsl_descriptor_usable(access: u8, selector: u16, cpl: u8, for_lsl: bool) -> bool {
+    if access & 0x80 == 0 {
+        return false;
+    }
+    if for_lsl {
+        if !lsl_type_valid(access) {
+            return false;
+        }
+    } else if !lar_type_valid(access) {
+        return false;
+    }
+    let s_bit = access & 0x10 != 0;
+    let executable = access & 0x08 != 0;
+    let conforming = s_bit && executable && access & 0x04 != 0;
+    if conforming {
+        return true;
+    }
+    let rpl = (selector & 3) as u8;
+    let dpl = (access >> 5) & 3;
+    cpl <= dpl && rpl <= dpl
+}
+
+/// Access-rights value loaded by `LAR` (bits 7:0 and 31:24 clear; 19:16 zeroed).
+fn lar_access_rights_value(desc: [u8; 8]) -> u32 {
+    (u32::from(desc[5]) << 8) | (u32::from(desc[6] & 0xF0) << 16)
+}
+
+/// Execute `LAR` or `LSL`. Real-address mode → `#UD`.
+///
+/// Spec: Intel SDM Vol. 2 "LAR"/"LSL". Unsupported here: LDT resolution (TI=1
+/// clears ZF), long mode, and the `#UD` for a `LOCK` prefix.
+fn exec_lar_lsl(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    insn: &DecodedInsn,
+    for_lsl: bool,
+) -> Result<(), ExecError> {
+    if !cr0_pe(cpu) {
+        return Err(arch_fault(6));
+    }
+    let m = insn.modrm.ok_or(ExecError::Unsupported(insn.opcode))?;
+    // Source selector is always 16-bit (r16/m16), even under a 32-bit operand size.
+    let selector = read_rm_u16(cpu, bus, insn)?;
+    let cpl = (cpu.cs.selector & 3) as u8;
+    let ok = match try_read_gdt_descriptor_for_lar_lsl(cpu, bus, selector)? {
+        Some(desc) if lar_lsl_descriptor_usable(desc[5], selector, cpl, for_lsl) => {
+            if for_lsl {
+                let limit = parse_segment_descriptor(desc).limit;
+                if opsz32(insn) {
+                    cpu.set_gpr_u32(m.reg as usize, limit);
+                } else {
+                    cpu.set_gpr_u16(m.reg as usize, limit as u16);
+                }
+            } else {
+                let ar = lar_access_rights_value(desc);
+                if opsz32(insn) {
+                    cpu.set_gpr_u32(m.reg as usize, ar);
+                } else {
+                    cpu.set_gpr_u16(m.reg as usize, ar as u16);
+                }
+            }
+            true
+        }
+        _ => false,
+    };
+    cpu.set_zf(ok);
+    Ok(())
+}
+
 /// Validate a DS/ES/FS/GS descriptor and return cached base/limit/AR.
 ///
 /// Data and readable code are accepted. Data and nonconforming code require
@@ -4700,6 +4814,18 @@ fn step_two_byte(
                 }
                 _ => Err(ExecError::Unsupported(0x00)),
             }
+        }
+        0x02 => {
+            // LAR r, r/m16 — Spec: Intel SDM Vol. 2 "LAR".
+            exec_lar_lsl(cpu, bus, insn, false)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
+        }
+        0x03 => {
+            // LSL r, r/m16 — Spec: Intel SDM Vol. 2 "LSL".
+            exec_lar_lsl(cpu, bus, insn, true)?;
+            set_current_ip(cpu, next_ip);
+            Ok(())
         }
         0x01 => {
             // Group 7 — Spec: Intel SDM Vol. 2 opcode map 2;
@@ -21616,6 +21742,151 @@ mod tests {
         assert_eq!(bus.read_u32(0x4004).unwrap(), 0x40);
         assert_ne!(cpu.rflags & (1 << 6), 0);
         assert_eq!(cpu.rip, (PM32_CODE + 7) as u64);
+    }
+
+    /// Intel SDM Vol. 2 "LAR"/"LSL": protected-mode soft checks set ZF and
+    /// optionally load access rights / effective limit; real-address mode is `#UD`.
+    #[test]
+    fn lar_lsl_zf_matrices_null_type_and_privilege() {
+        // Real-address mode → #UD.
+        for opcode in [0x02u8, 0x03] {
+            let (mut cpu, mut bus) = real_mode_fixture(&[0x0F, opcode, 0xC1], |_, _| {});
+            let before = cpu.clone();
+            assert_arch_fault(step_inner(&mut cpu, &mut bus), 6, None);
+            assert_eq!(cpu, before);
+        }
+
+        // LAR EAX, CX against the fixture ring-0 data selector 0x0018 (access 0x92).
+        // Expected AR: (0x92 << 8) = 0x0000_9200.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RCX, 0x0018);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        cpu.rflags = 0x0002; // ZF clear
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "LAR ZF set");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x0000_9200);
+        assert_eq!(cpu.rip, (PM32_CODE + 3) as u64);
+
+        // LSL EAX, CX — byte-granular limit 0xFFFF.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RCX, 0x0018);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDEAD_BEEF);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "LSL ZF set");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xFFFF);
+
+        // Null selector → ZF=0, destination unchanged.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.set_gpr_u32(CpuState::RCX, 0);
+        cpu.set_gpr_u32(CpuState::RAX, 0x1111_2222);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x1111_2222);
+
+        // Extend GDT: index 4 = page-granular data, index 5 = 32-bit call gate,
+        // index 6 = interrupt gate (invalid for both), index 7 = conforming code DPL=0.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 32..PM32_GDT + 40]
+            .copy_from_slice(&encode_seg_desc(0, 0xF_FFFF, 0x92, 0x80)); // G=1
+        bus.mem[PM32_GDT + 40..PM32_GDT + 48]
+            .copy_from_slice(&encode_seg_desc(0x1000, 0, 0x8C, 0)); // type 0xC call gate-ish S=0
+        // Force system call-gate type 0xC: access = P|DPL0|type = 0x8C.
+        bus.mem[PM32_GDT + 40 + 5] = 0x8C;
+        bus.mem[PM32_GDT + 48..PM32_GDT + 56]
+            .copy_from_slice(&encode_seg_desc(0, 0, 0x8E, 0)); // 32-bit interrupt gate
+        bus.mem[PM32_GDT + 48 + 5] = 0x8E;
+        bus.mem[PM32_GDT + 56..PM32_GDT + 64]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9E, 0)); // conforming code
+
+        // LSL of G=1 data → 0xFFFF_FFFF.
+        cpu.set_gpr_u32(CpuState::RCX, 0x0020);
+        cpu.set_gpr_u32(CpuState::RAX, 0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xFFFF_FFFF);
+
+        // LAR accepts 32-bit call gate (type 0xC); LSL rejects it.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 40..PM32_GDT + 48].copy_from_slice(&[0u8; 8]);
+        bus.mem[PM32_GDT + 40 + 5] = 0x8C; // type C call gate, P=1
+        cpu.set_gpr_u32(CpuState::RCX, 0x0028);
+        cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_AAAA);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "LAR allows call gate");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x0000_8C00);
+
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 40 + 5] = 0x8C;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0028);
+        cpu.set_gpr_u32(CpuState::RAX, 0xBBBB_BBBB);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0, "LSL rejects call gate");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xBBBB_BBBB);
+
+        // Interrupt gate invalid for LAR → ZF=0.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 48 + 5] = 0x8E;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0030);
+        cpu.set_gpr_u32(CpuState::RAX, 0xCCCC_CCCC);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xCCCC_CCCC);
+
+        // Privilege: CPL=3 vs DPL=0 data → ZF=0.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.cs.selector |= 3;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0018);
+        cpu.set_gpr_u32(CpuState::RAX, 0xDDDD_DDDD);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0, "CPL > DPL clears ZF");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xDDDD_DDDD);
+
+        // Conforming code: CPL=3, DPL=0 still succeeds for LAR.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 56..PM32_GDT + 64]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x9E, 0));
+        cpu.cs.selector |= 3;
+        cpu.set_gpr_u32(CpuState::RCX, 0x0038);
+        cpu.set_gpr_u32(CpuState::RAX, 0);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0, "conforming skips DPL check");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0x0000_9E00);
+
+        // Not-present data: ZF=0, destination unchanged.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x0F, 0x02, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 32..PM32_GDT + 40]
+            .copy_from_slice(&encode_seg_desc(0, 0xFFFF, 0x12, 0)); // P=0 data
+        cpu.set_gpr_u32(CpuState::RCX, 0x0020);
+        cpu.set_gpr_u32(CpuState::RAX, 0xEEEE_EEEE);
+        cpu.rflags = 0x0002 | (1 << 6);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.rflags & (1 << 6), 0, "P=0 clears ZF");
+        assert_eq!(cpu.gpr_u32(CpuState::RAX), 0xEEEE_EEEE);
+
+        // 16-bit operand size truncates LSL limit and LAR AR to low word.
+        let (mut cpu, mut bus) = pm32_fixture(&[0x66, 0x0F, 0x03, 0xC1], PM32_CODE, true);
+        cpu.gdtr.limit = 63;
+        bus.mem[PM32_GDT + 32..PM32_GDT + 40]
+            .copy_from_slice(&encode_seg_desc(0, 0xF_FFFF, 0x92, 0x80));
+        cpu.set_gpr_u32(CpuState::RCX, 0x0020);
+        cpu.set_gpr_u32(CpuState::RAX, 0xAAAA_BBBB);
+        step(&mut cpu, &mut bus).unwrap();
+        assert_ne!(cpu.rflags & (1 << 6), 0);
+        assert_eq!(
+            cpu.gpr_u32(CpuState::RAX),
+            0xAAAA_FFFF,
+            "16-bit LSL keeps EAX[31:16]"
+        );
     }
 
     /// Intel SDM Vol. 2 "CPUID": leaf 0 reports the highest basic leaf in EAX
