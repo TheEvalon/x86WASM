@@ -20,6 +20,7 @@ mod post_spin;
 mod post_trace;
 mod step_clock;
 mod vga_font;
+mod vga_frame;
 mod xbcs;
 
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
@@ -27,6 +28,7 @@ pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO
 pub use option_rom_invoke::{
     OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET, OPTION_ROM_RESUME_PHYS,
 };
+pub use vga_frame::HostVgaFrame;
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
     PAM_FIELD_MASK, PAM_FIELD_RE, PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST,
