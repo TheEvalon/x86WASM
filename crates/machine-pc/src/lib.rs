@@ -74,10 +74,10 @@ use devices::{
     PciConfig, Pit8254, Port92, PortDevice, Serial16550, VgaText, APM_CNT_PORT, APM_STS_PORT,
     CMOS_DATA, CMOS_INDEX, E820_TYPE_MEMORY, E820_TYPE_RESERVED, EQUIP_DISPLAY_EGA_VGA,
     EQUIP_DISPLAY_ENABLED, EQUIP_KEYBOARD_ENABLED, FDC_DOR_DMA_IRQ, FW_CFG_DEFAULT_BOOT_ORDER,
-    FW_CFG_DEFAULT_CPU_COUNT, I8042, I8042_DATA, I8042_STATUS_CMD, PCI_CONFIG_DATA, PIC_MASTER_CMD,
-    PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA, PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE,
-    PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT_SYSTEM_CONTROL,
-    PORT_SYSTEM_CONTROL_A,
+    FW_CFG_DEFAULT_CPU_COUNT, FW_CFG_DEFAULT_SYSTEM_STATES, I8042, I8042_DATA, I8042_STATUS_CMD,
+    PCI_CONFIG_DATA, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+    PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH1_DATA, PIT_CH2_DATA, PIT_CONTROL,
+    PORT_SYSTEM_CONTROL, PORT_SYSTEM_CONTROL_A,
 };
 use firmware_interface::{
     prepare_bios_rom, prepare_option_rom, BiosRomError, OptionRomError, RomImage,
@@ -391,12 +391,13 @@ impl Machine {
         self.fw_cfg.set_ram_size(ram);
         // Interface reference (ADR-0005): NB_CPUS / max-cpus / etc/max-cpus.
         // This machine has one execution context and no SMP, so the truthful
-        // count is 1. Host-settable UUID / nographic / etc/system-states stay
-        // absent until the host has a truthful value. `bootorder` publishes the
-        // machine default (HDD → CD → floppy) unless overridden via
-        // [`Self::set_fw_cfg_boot_order`]. `etc/table-loader` is never
-        // published: there are no ACPI tables to load (ADR-0008 /
-        // docs/fwcfg-r4-selectors.md).
+        // count is 1. Host-settable UUID / nographic stay absent until the host
+        // has a truthful value. `bootorder` publishes the machine default
+        // (HDD → CD → floppy) unless overridden via
+        // [`Self::set_fw_cfg_boot_order`]. `etc/system-states` publishes
+        // S0 + S5 only (PM1a soft-off stub — docs/fwcfg-r8-system-states.md).
+        // `etc/table-loader` is never published: there are no ACPI tables to
+        // load (ADR-0008 / docs/fwcfg-r4-selectors.md).
         self.fw_cfg.set_cpu_count(FW_CFG_DEFAULT_CPU_COUNT);
         let boot_paths: Vec<String> = match &self.fw_cfg_boot_order {
             FwCfgBootOrderPolicy::Default => FW_CFG_DEFAULT_BOOT_ORDER
@@ -407,6 +408,7 @@ impl Machine {
         };
         let boot_refs: Vec<&str> = boot_paths.iter().map(String::as_str).collect();
         self.fw_cfg.set_boot_order(&boot_refs);
+        self.fw_cfg.set_system_states(FW_CFG_DEFAULT_SYSTEM_STATES);
         let entries = self.e820_entries();
         self.fw_cfg.set_e820_entries(&entries);
     }
@@ -1055,6 +1057,21 @@ impl Machine {
         self.sync_com2_irq3();
     }
 
+    /// Consume an ACPI soft-off request latched by `PM1a_CNT` `SLP_EN` + S5 typ.
+    ///
+    /// Spec: ACPI PM1_CNT sleep enable; model docs/acpi-r8-pm1-sleep.md.
+    /// Same take pattern as 8042/`0x92` system-reset — host decides what to do.
+    pub fn take_acpi_power_off_request(&mut self) -> bool {
+        self.pci.take_acpi_power_off_request()
+    }
+
+    /// Consume a non-S5 ACPI sleep request (`SLP_TYP`), if any.
+    ///
+    /// Spec: ACPI PM1_CNT; no resume path in this tree (docs/acpi-r8-pm1-sleep.md).
+    pub fn take_acpi_sleep_request(&mut self) -> Option<u8> {
+        self.pci.take_acpi_sleep_request()
+    }
+
     /// Assert/deassert a software PIRQA–PIRQD line and sync through PIRQRC to DualPic.
     ///
     /// Spec: Intel 82371SB — PIRQ# → ISA IRQ selected by PIRQRC[A:D] when bit7
@@ -1062,6 +1079,15 @@ impl Machine {
     /// `pirq` is 0=A … 3=D.
     pub fn assert_pirq(&mut self, pirq: u8, high: bool) {
         self.pci.set_pirq_line(pirq, high);
+        self.pci.sync_pirq_to_pic(&mut self.pic);
+    }
+
+    /// Soft-wire ACPI SCI level onto a software PIRQ and sync through PIRQRC.
+    ///
+    /// Spec: ACPI SCI / Intel 82371SB PIRQRC — optional host stub until FADT
+    /// `SCI_INT` exists (docs/pci-r8-sci-pirq.md). `pirq` is 0=A … 3=D.
+    pub fn sync_acpi_sci_to_pirq(&mut self, pirq: u8) {
+        self.pci.sync_acpi_sci_to_pirq(pirq);
         self.pci.sync_pirq_to_pic(&mut self.pic);
     }
 

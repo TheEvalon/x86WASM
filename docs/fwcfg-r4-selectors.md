@@ -51,13 +51,14 @@ it is absent until a host supplies it.
 | `0x0002` UUID | `set_system_uuid` / `clear_system_uuid` | 16 raw bytes |
 | `0x0004` nographic | `set_nographic` | LE16, 1 = no graphics adapter |
 | `bootorder` | `set_boot_order` / machine sync | newline-separated paths, trailing newline, NUL-terminated |
-| `etc/system-states` | `set_system_states` | 6 bytes indexed by S-state; bit 7 supported, bits 6:4 `SLP_TYP` |
+| `etc/system-states` | `set_system_states` / machine sync | 6 bytes indexed by S-state; bit 7 supported, bits 6:4 `SLP_TYP` |
 
-`etc/system-states` deserves its own sentence: this tree implements no ACPI
-power-state machine at all — sleep-state transitions are out of scope — so
-publishing a states blob would advertise a surface that does not exist.
-`set_boot_order(&[])` removes the file rather than publishing an empty policy,
-for the same reason `set_e820_entries(&[])` removes `etc/e820`.
+`etc/system-states`: the bare device leaves it absent. Round 8’s PM1a soft-off
+stub makes S0+S5 publishable — `Machine::sync_firmware_configuration` writes
+`FW_CFG_DEFAULT_SYSTEM_STATES` (docs/fwcfg-r8-system-states.md). S1–S4 stay
+unsupported. `set_boot_order(&[])` removes the bootorder file rather than
+publishing an empty policy, for the same reason `set_e820_entries(&[])` removes
+`etc/e820`.
 
 ### Machine-default `bootorder`
 
@@ -95,6 +96,6 @@ unknown selector still yields the specification's `0x00`.
 `FwCfg::new()` and `Machine::sync_firmware_configuration` both publish the
 CPU-count views (`NB_CPUS` / `max-cpus` / `etc/max-cpus` = 1). Sync also
 publishes the machine-default `bootorder` (HDD → CD → floppy) unless the host
-has overridden it. UUID, nographic, and `etc/system-states` remain absent until
-the host supplies a truthful value. **`etc/table-loader` stays absent through
-sync** (ADR-0008).
+has overridden it, and `etc/system-states` (S0 + S5 — docs/fwcfg-r8-system-states.md).
+UUID and nographic remain absent until the host supplies a truthful value.
+**`etc/table-loader` stays absent through sync** (ADR-0008).
