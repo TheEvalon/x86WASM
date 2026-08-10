@@ -1784,6 +1784,89 @@ fn require_iopl_for_cli_sti(cpu: &CpuState) -> Result<(), ExecError> {
     }
 }
 
+/// Pop FLAGS/EFLAGS with IOPL/IF privilege masking.
+///
+/// VM86 without VME: `IOPL < 3` → `#GP(0)`. Otherwise load permitted bits;
+/// `VM`/`RF` are never taken from the image; RF is cleared; bit 1 stays set.
+/// Spec: Intel SDM Vol. 2 "POPF/POPFD"; Vol. 3 §20.2.2.
+fn popf_execute(cpu: &mut CpuState, bus: &mut dyn Bus, operand_size_32: bool) -> Result<(), ExecError> {
+    if cr0_pe(cpu) && eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
+        return Err(arch_fault_with_error_code(13, 0));
+    }
+
+    let image = if operand_size_32 {
+        u64::from(pop32(cpu, bus)?)
+    } else {
+        u64::from(pop16(cpu, bus)?)
+    };
+
+    let cpl = architectural_cpl(cpu);
+    let iopl = eflags_iopl(cpu.rflags);
+    let vm = eflags_vm(cpu.rflags);
+
+    // Bits always loadable from the image width (status/control except IF/IOPL).
+    // Low-word changeable: CF PF AF ZF SF TF DF OF NT (+ IF/IOPL conditionally).
+    const STATUS16: u64 = 0x08D5; // CF PF AF ZF SF TF DF OF (no IF/IOPL/NT yet)
+    const NT_BIT: u64 = 1 << 14;
+    const IF_BIT: u64 = 1 << 9;
+    const IOPL_BITS: u64 = 3 << 12;
+    // High dword changeable at CPL 0 (32-bit opsize): AC ID (VIF/VIP never from POPF).
+    const HIGH_CPL0: u64 = (1 << 18) | (1 << 21); // AC | ID
+
+    let mut change = STATUS16 | NT_BIT;
+    if operand_size_32 {
+        // RF is architecturally cleared after POPF; VM never loads from image.
+        if cpl == 0 && !vm {
+            change |= HIGH_CPL0;
+        } else if !vm {
+            // CPL > 0 protected: AC and ID still changeable on 32-bit POPF.
+            change |= HIGH_CPL0;
+        }
+        // VM86 IOPL=3: all non-reserved except IOPL/VIP/VIF/VM/RF — IF yes.
+        if vm {
+            change |= IF_BIT;
+        }
+    }
+
+    if !vm {
+        if cpl == 0 {
+            change |= IOPL_BITS | IF_BIT;
+        } else {
+            // IOPL never changes at CPL > 0.
+            if cpl <= iopl {
+                change |= IF_BIT;
+            }
+        }
+    } else {
+        // VM86 with IOPL=3: IF may change; IOPL may not.
+        change |= IF_BIT;
+    }
+
+    let mask = if operand_size_32 {
+        change | 0 // full low 32 via change bits only
+    } else {
+        change & 0xFFFF
+    };
+
+    // Preserve bits outside the writable set, including VM/RF/VIP/VIF and
+    // upper RFLAGS. Clear RF after POPF (SDM Vol. 2 POPF note).
+    let preserve = !mask;
+    let mut new_flags = (cpu.rflags & preserve) | (image & mask) | 2;
+    new_flags &= !(1 << 16); // RF := 0
+    // Keep VM sticky (never from image).
+    if vm {
+        new_flags |= EFLAGS_VM;
+    } else {
+        new_flags &= !EFLAGS_VM;
+    }
+    if operand_size_32 {
+        cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | (new_flags & 0xFFFF_FFFF);
+    } else {
+        cpu.rflags = (cpu.rflags & !0xFFFF) | (new_flags & 0xFFFF);
+    }
+    Ok(())
+}
+
 /// Architectural CPL: 0 in real-address mode, 3 while `EFLAGS.VM=1`, else CS.RPL.
 ///
 /// Spec: Intel SDM Vol. 3 §5.5; §20.1.1 (VM86 forces CPL 3; CS[1:0] is not RPL).
@@ -7045,8 +7128,12 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0x9C => {
-            // PUSHF/PUSHFD — Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ"; Ch. 2 (66H).
-            // Real-address mode: push FLAGS (16) or EFLAGS (32). Unsupported: PUSHFQ.
+            // PUSHF/PUSHFD — Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ".
+            // VM86 without VME: IOPL < 3 → #GP(0) (Vol. 3 §20.2.2).
+            // Unsupported: PUSHFQ; VME VIP/VIF push masking.
+            if cr0_pe(cpu) && eflags_vm(cpu.rflags) && eflags_iopl(cpu.rflags) < 3 {
+                return Err(arch_fault_with_error_code(13, 0));
+            }
             if opsz32(&insn) {
                 push32(cpu, bus, cpu.rflags as u32)?;
             } else {
@@ -7055,18 +7142,10 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             set_current_ip(cpu, next_ip);
         }
         0x9D => {
-            // POPF/POPFD — Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ"; Ch. 2 (66H).
-            // Real-address mode: VM and RF unaffected; reserved bit 1 stays set.
-            // Unsupported here: IOPL/VIP/VIF privilege masking (protected / V86); POPFQ.
-            if opsz32(&insn) {
-                let flags = pop32(cpu, bus)?;
-                let vm_rf = cpu.rflags & ((1 << 16) | (1 << 17));
-                cpu.rflags = (cpu.rflags & !0xFFFF_FFFF) | u64::from(flags) | 2;
-                cpu.rflags = (cpu.rflags & !((1 << 16) | (1 << 17))) | vm_rf;
-            } else {
-                let flags = pop16(cpu, bus)?;
-                cpu.rflags = (cpu.rflags & !0xFFFF) | u64::from(flags) | 2;
-            }
+            // POPF/POPFD — Spec: Intel SDM Vol. 2 "POPF/POPFD/POPFQ"; Vol. 3
+            // §20.2.2. Privilege masks IOPL/IF; VM/RF never loaded from image.
+            // Unsupported: POPFQ; VME 16-bit POPF with IOPL<3.
+            popf_execute(cpu, bus, opsz32(&insn))?;
             set_current_ip(cpu, next_ip);
         }
         0x9E => {
@@ -15724,9 +15803,9 @@ mod tests {
 
     /// PUSHFD/POPFD round-trip in real-address mode (opsize 32).
     /// Spec: Intel SDM Vol. 2 "PUSHF/PUSHFD/PUSHFQ", "POPF/POPFD/POPFQ"; Ch. 2 (66H).
-    /// VM and RF are unaffected by POPFD in real-address mode.
+    /// `VM` is unaffected by POPFD; `RF` is cleared after POPF (Vol. 2 POPF note).
     #[test]
-    fn pushfd_popfd_round_trip_preserves_vm_rf() {
+    fn pushfd_popfd_round_trip_preserves_vm_clears_rf() {
         let mut mem = vec![0u8; 0x10000];
         mem[0] = 0x66;
         mem[1] = 0x9C; // PUSHFD
@@ -15740,7 +15819,7 @@ mod tests {
         cpu.rip = 0;
         let sp0 = 0xFFFE_u16;
         cpu.set_gpr_u16(CpuState::RSP, sp0);
-        // CF+PF+AF+ZF+SF+IF+OF + synthetic VM/RF that must survive POPFD.
+        // CF+PF+AF+ZF+SF+IF+OF + synthetic VM/RF.
         cpu.rflags = 0x0002_0AD7 | (1 << 16) | (1 << 17);
         let flags_before = cpu.rflags;
         let mut bus = VecBus { mem, ports: vec![] };
@@ -15756,10 +15835,10 @@ mod tests {
         cpu.rflags = (1 << 16) | (1 << 17) | 2;
         step(&mut cpu, &mut bus).unwrap(); // POPFD
         assert_eq!(cpu.gpr_u16(CpuState::RSP), sp0);
-        // Lower image restored (bit 1 forced); VM/RF unchanged from pre-POPFD.
+        // Lower image restored (bit 1 forced); VM sticky; RF cleared.
         assert_eq!(cpu.rflags & 0xFFFF, u64::from(flags_before as u16 | 2));
-        assert_ne!(cpu.rflags & (1 << 16), 0); // RF
-        assert_ne!(cpu.rflags & (1 << 17), 0); // VM
+        assert_eq!(cpu.rflags & (1 << 16), 0); // RF cleared
+        assert_ne!(cpu.rflags & (1 << 17), 0); // VM preserved
     }
 
     /// RET iw / RETF iw release stack bytes after the return frame.
