@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod bda_kbd;
+mod boot_media;
 mod eltorito_load;
 mod guest_boot;
 mod hello_rom;
@@ -36,16 +37,22 @@ pub use bda_kbd::{
     BDA_KBD_BUF_END_OFF, BDA_KBD_BUF_START, BDA_KBD_BUF_START_OFF, BDA_KBD_CAPACITY, BDA_KBD_HEAD,
     BDA_KBD_TAIL, BDA_PHYS_BASE,
 };
+pub use boot_media::{
+    classify_int19_boot_image, classify_machine_int19_media, synthetic_int19_bootable_floppy,
+    synthetic_int19_bootable_hd, synthetic_int19_freedos_stub_hd, Int19BootMediaClass,
+    MBR_PART0_OFF, MBR_PART_BOOTABLE, MBR_PART_TYPE_FAT12,
+};
 pub use guest_boot::{
-    classify_bzimage_early, classify_freedos_next_gap, classify_guest_first_failure,
-    inspect_linux_boot_protocol_header, linux_realmode_bytes, linux_setup_sect_count,
-    synthetic_freedos_like_disk, synthetic_linux_boot_protocol_header,
-    synthetic_linux_serial_stub_disk, BzImageEarlyClass, BzImageLoadError, BzImageNextStep,
-    FreedosNextGap, GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GuestFailureSite,
-    GuestFirstFailureClass, GuestOsMeasure, GuestOsMeasureKind, Int13ProbeSnapshot,
-    LinuxBootProtocolError, LinuxBootProtocolHeader, BDA_EQUIPMENT, BDA_HD_COUNT,
-    GUEST_BOOT_MEASURE_VERSION, GUEST_OS_MEASURE_VERSION, LINUX_BOOT_FLAG_AA55,
-    LINUX_BOOT_HEADER_MAGIC, LINUX_BOOT_HEADER_MIN_LEN, LINUX_REALMODE_LOAD_ADDR,
+    classify_bzimage_early, classify_bzimage_setup_deeper, classify_eltorito_media_boot,
+    classify_freedos_next_gap, classify_guest_first_failure, inspect_linux_boot_protocol_header,
+    linux_realmode_bytes, linux_setup_sect_count, synthetic_freedos_like_disk,
+    synthetic_linux_boot_protocol_header, synthetic_linux_serial_stub_disk, BzImageEarlyClass,
+    BzImageLoadError, BzImageNextStep, ElToritoMediaBootClass, FreedosNextGap, GuestBootCheckpoint,
+    GuestBootMeasure, GuestBootMedia, GuestFailureSite, GuestFirstFailureClass, GuestOsMeasure,
+    GuestOsMeasureKind, Int13ProbeSnapshot, LinuxBootProtocolError, LinuxBootProtocolHeader,
+    MediaBootReadiness, BDA_EQUIPMENT, BDA_HD_COUNT, GUEST_BOOT_MEASURE_VERSION,
+    GUEST_OS_MEASURE_VERSION, LINUX_BOOT_FLAG_AA55, LINUX_BOOT_HEADER_MAGIC,
+    LINUX_BOOT_HEADER_MIN_LEN, LINUX_REALMODE_LOAD_ADDR,
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int10::{
@@ -68,8 +75,8 @@ pub use int13::{
     setup_int13_cd_terminate, setup_int13_floppy_get_disk_type, setup_int13_floppy_get_params,
     setup_int13_floppy_read, setup_int13_floppy_verify, setup_int13_floppy_write,
     setup_int13_hd_ext_get_params, setup_int13_hd_ext_read, setup_int13_hd_ext_write,
-    setup_int13_hd_read, setup_int13_hd_verify, setup_int13_hd_write, unpack_cx,
-    INT13_AH_CDROM_EMULATION, INT13_AH_CDROM_INITIATE, INT13_AH_CHECK_EXTENSIONS,
+    setup_int13_hd_read, setup_int13_hd_verify, setup_int13_hd_write, unpack_cx, BDA_FLOPPY_STATUS,
+    BDA_HD_STATUS, INT13_AH_CDROM_EMULATION, INT13_AH_CDROM_INITIATE, INT13_AH_CHECK_EXTENSIONS,
     INT13_AH_EXT_GET_PARAMS, INT13_AH_EXT_READ, INT13_AH_EXT_SEEK, INT13_AH_EXT_VERIFY,
     INT13_AH_EXT_WRITE, INT13_AH_GET_DISK_TYPE, INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ,
     INT13_AH_RESET, INT13_AH_VERIFY, INT13_AH_WRITE, INT13_CD_AL_GET_STATUS, INT13_CD_AL_TERMINATE,

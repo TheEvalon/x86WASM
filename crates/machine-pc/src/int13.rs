@@ -33,6 +33,10 @@ pub const INT13_DRIVE_CD0: u8 = 0xE0;
 
 /// AH=00h — reset disk system.
 pub const INT13_AH_RESET: u8 = 0x00;
+/// BDA last floppy operation status (`0040:0041`). Spec: RBIL memory map.
+pub const BDA_FLOPPY_STATUS: u64 = 0x441;
+/// BDA last hard-disk operation status (`0040:0074`). Spec: RBIL memory map.
+pub const BDA_HD_STATUS: u64 = 0x474;
 /// AH=02h — read disk sectors into `ES:BX`.
 pub const INT13_AH_READ: u8 = 0x02;
 /// AH=03h — write disk sectors from `ES:BX`.
@@ -363,10 +367,17 @@ impl Machine {
     }
 
     fn int13_hd_reset(&mut self) {
-        if !self.ide.present {
+        // Spec: IBM BIOS / RBIL INT 13h AH=00h — require attached fixed-disk media.
+        // Empty image is treated like no media (CF + AH=80h), matching AH=08h.
+        if !self.ide.present || self.ide.image.is_empty() {
             self.int13_fail(INT13_STATUS_TIMEOUT);
             return;
         }
+        // Controller soft-reset preserves the image (ATA/ATAPI-6 reset semantics
+        // via IdePrimary::reset) and clears in-flight DRQ/command state.
+        self.ide.reset();
+        // Spec: RBIL BDA 0040:0074 — last HD status cleared on successful reset.
+        let _ = self.mem.write_u8(BDA_HD_STATUS, INT13_STATUS_OK);
         self.int13_ok_al(0);
     }
 
@@ -1180,10 +1191,19 @@ impl Machine {
     }
 
     fn int13_floppy_reset(&mut self) {
+        // Spec: IBM BIOS / RBIL INT 13h AH=00h — require floppy media.
         if !self.fdc.has_media() {
             self.int13_fail(INT13_STATUS_TIMEOUT);
             return;
         }
+        // Hardware-style FDC reset preserves media/WP/DSKCHG (devices::Fdc82077::reset).
+        self.fdc.reset();
+        // BIOS leaves the controller out of DOR reset so later AH=02h can run.
+        use devices::{PortDevice, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N};
+        self.fdc
+            .port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        // Spec: RBIL BDA 0040:0041 — last floppy status cleared on successful reset.
+        let _ = self.mem.write_u8(BDA_FLOPPY_STATUS, INT13_STATUS_OK);
         self.int13_ok_al(0);
     }
 
@@ -1452,7 +1472,7 @@ pub fn setup_int13_cd_check_extensions(cpu: &mut CpuState) {
 mod tests {
     use super::*;
     use crate::mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
-    use devices::FDC_1440_IMAGE_SIZE;
+    use devices::{PortDevice, FDC_1440_IMAGE_SIZE};
 
     fn synthetic_disk(sectors: usize) -> Vec<u8> {
         let mut img = vec![0u8; sectors * INT13_SECTOR_SIZE];
@@ -1583,6 +1603,98 @@ mod tests {
         m.service_int13_hd();
         assert!(!cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+    }
+
+    /// Spec: AH=00h without HD media → CF + AH=80h (empty image included).
+    #[test]
+    fn int13_ah00_hd_no_media_sets_timeout() {
+        let mut bare = Machine::new(64 * 1024);
+        bare.cpu.set_ah(INT13_AH_RESET);
+        bare.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        bare.service_int13_hd();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+
+        let mut empty = Machine::with_ide(64 * 1024, Vec::new());
+        empty.cpu.set_ah(INT13_AH_RESET);
+        empty.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        empty.service_int13();
+        assert!(cf(&empty.cpu));
+        assert_eq!(empty.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    /// Spec: AH=00h clears BDA 0040:0074 and IDE DRQ after a partial IDENTIFY.
+    #[test]
+    fn int13_ah00_hd_clears_bda_and_ide_drq() {
+        use devices::{ATA_CMD_IDENTIFY, ATA_SR_DRQ, IDE_PRIMARY_DRIVE, IDE_PRIMARY_STATUS};
+
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        m.mem.write_u8(BDA_HD_STATUS, 0x04).unwrap();
+        // Arm IDENTIFY so Status has DRQ.
+        m.ide.port_write(IDE_PRIMARY_DRIVE, 1, 0xA0);
+        m.ide
+            .port_write(IDE_PRIMARY_STATUS, 1, u32::from(ATA_CMD_IDENTIFY));
+        assert_ne!(
+            m.ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ,
+            0,
+            "IDENTIFY should assert DRQ"
+        );
+
+        m.cpu.set_ah(INT13_AH_RESET);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(BDA_HD_STATUS).unwrap(), INT13_STATUS_OK);
+        assert_eq!(
+            m.ide.port_read(IDE_PRIMARY_STATUS, 1) as u8 & ATA_SR_DRQ,
+            0,
+            "AH=00h must clear DRQ via IdePrimary::reset"
+        );
+        assert!(m.ide.present);
+        assert_eq!(m.ide.image.len(), 2 * INT13_SECTOR_SIZE);
+    }
+
+    /// Spec: AH=00h floppy clears BDA 0040:0041 and resets FDC (media preserved).
+    #[test]
+    fn int13_ah00_floppy_clears_bda_and_resets_fdc() {
+        use devices::{
+            FDC_1440_IMAGE_SIZE, FDC_DOR, FDC_DOR_DMA_IRQ, FDC_DOR_RESET_N, FDC_FIFO, FDC_MSR,
+            FDC_MSR_RQM,
+        };
+
+        let mut floppy = vec![0u8; FDC_1440_IMAGE_SIZE];
+        floppy[510] = 0x55;
+        floppy[511] = 0xAA;
+        let mut m = Machine::with_floppy(64 * 1024, floppy).expect("floppy");
+        m.mem.write_u8(BDA_FLOPPY_STATUS, 0x80).unwrap();
+        // Bring FDC out of reset, then leave Specify mid-command.
+        m.fdc
+            .port_write(FDC_DOR, 1, u32::from(FDC_DOR_RESET_N | FDC_DOR_DMA_IRQ));
+        m.fdc.port_write(FDC_FIFO, 1, 0x03);
+        assert_ne!(m.fdc.msr() & FDC_MSR_RQM, 0);
+
+        m.cpu.set_ah(INT13_AH_RESET);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(BDA_FLOPPY_STATUS).unwrap(), INT13_STATUS_OK);
+        assert!(m.fdc.has_media());
+        // After AH=00h, command phase again (RQM, ready for a new opcode).
+        let msr = m.fdc.port_read(FDC_MSR, 1) as u8;
+        assert_eq!(msr & FDC_MSR_RQM, FDC_MSR_RQM);
+    }
+
+    /// Spec: AH=00h floppy without media → CF + AH=80h.
+    #[test]
+    fn int13_ah00_floppy_no_media_sets_timeout() {
+        let mut m = Machine::new(64 * 1024);
+        m.cpu.set_ah(INT13_AH_RESET);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_FD0);
+        m.service_int13_floppy();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_TIMEOUT);
     }
 
     /// Spec: AH=08h returns fixed 16-head / 63-spt geometry from image size.

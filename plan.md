@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-10, round-13 boot-guest lane `slice/r13-boot-guest` on base `f579e8c`): **in progress -- R13 boot-guest lane.** INT19-candidate HD/floppy attach helpers; FreeDOS measure v6 media readiness (beyond no-media reboot loop); INT 13h AH=00h HD+floppy deepen (IDE/FDC reset + BDA status); Linux bzImage setup deepen (`cmd_line_ptr`/`init_size`) + El Torito media boot classify. See `docs/boot-r13-*.md`, `docs/storage-r13-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS.
+
 Status (2026-08-10, round-12 parallel integration `merge/m2-r12-parallel-16` on base `01050d2`): **in progress -- twelfth parallel campaign merged (+ POST CF9).** Five lanes: ICH `0xCF9` reset (`F000:C897` was `wait_irq`; causal miss was CF9/`qemu_reboot`); UHCI QH depth4 + USBSTS/USBINTR + LAPIC ICR + HPET MSI honesty; INT10 AH=01/09/0A + BDA video + VBE 4F00 no-LFB; INT13 AH=04/41 + FreeDOS/Linux measure deepen; CR4.VME sticky + redirect bitmap + 16-bit IDT from VM86 + INTO/VME. See `docs/m2-r12-parallel-integration.md`, `docs/post-c897-*.md`. **20M POST remeasure stops at `F000:9842` no-media reboot loop (past C897).** FreeDOS prompt / Linux serial shell still open. Honesty: no guest LFB; no CPUID.VME/APIC; ADR-0008 table-loader absent.
 Status (2026-08-10, round-12 cpu-vm86 lane `slice/r12-cpu-vm86` on base `01050d2`): **in progress -- R12 cpu-vm86 lane.** `CR4.VME` sticky without `CPUID.VME`; soft-int TSS redirect-bitmap stub; 16-bit IDT gate from VM86 (9-word frame); `INTO`/#OF IOPL+bitmap honesty vs `INT n`. See `docs/cpu-r12-*.md`. **Not** full VME (no VIF/`CLI`/`STI`, no `CPUID.VME`); POST still open.
 
