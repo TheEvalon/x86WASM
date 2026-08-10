@@ -35,5 +35,5 @@ Format field: MMC byte 2 bits (3:0) when non-zero, else SFF-8020i byte 9 bits
 - Audio CD / multi-track / multi-session PhotoCD TOCs
 - Raw lead-in Q (`format 2`), PMA/ATIP
 - Physical tray / Unit Attention on medium change
-- PREVENT/ALLOW interaction with eject (slice 3)
+- PREVENT/ALLOW interaction with eject — see `docs/atapi-r6-prevent-allow.md`
 - El Torito / INT 13h CD boot
