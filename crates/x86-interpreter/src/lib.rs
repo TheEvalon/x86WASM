@@ -6952,7 +6952,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // JMP far ptr16:16 / ptr16:32.
             // Spec: Intel SDM Vol. 2 "JMP"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
             // Protected mode (VM=0) is bounded to GDT code / task targets.
-            // Virtual-8086 mode: real-address-like CS:IP reload; stay VM=1.
+            // Virtual-8086 / real-address: reload CS:IP; opsize-32 truncates the
+            // offset to IP16 (Vol. 2 JMP real-address note). Stay VM=1 when set.
             let offset = if opsz32(&insn) {
                 insn.immediate as u32
             } else {
@@ -7095,7 +7096,8 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // CALL far ptr16:16 / ptr16:32.
             // Spec: Intel SDM Vol. 2 "CALL"; Ch. 2 (66H); Vol. 3 §5.8.1 / §20.1.
             // Protected (VM=0): same-CPL GDT code / call gate / task.
-            // Virtual-8086: real-address-like push CS:IP; stay VM=1.
+            // Virtual-8086 / real-address: push CS:IP (opsize-32 → EIP32 then
+            // CS16 = 6-byte frame); truncate target offset to IP16; stay VM=1.
             // Unsupported from VM86: privilege-changing call gates.
             let selector = insn.displacement as u16;
             let offset = if opsz32(&insn) {
@@ -7119,9 +7121,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xCA => {
             // RETF iw — far return with stack release.
-            // Spec: Intel SDM Vol. 2 "RET" (far, imm16); Ch. 2 (66H).
-            // Opsize 32: pop EIP32 then CS16; Imm16 release always.
-            // Unsupported here: protected-mode privilege checks.
+            // Spec: Intel SDM Vol. 2 "RET" (far, imm16); Ch. 2 (66H); §20.1.
+            // Opsize 32: pop EIP32 then CS16 (truncate EIP→IP16); Imm16 release.
+            // Real-address / VM86 path (protected privilege-changing RETF out).
             let release = insn.immediate as u16;
             if opsz32(&insn) {
                 let eip = pop32(cpu, bus)?;
@@ -7139,8 +7141,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
         }
         0xCB => {
             // RETF — far return.
-            // Spec: Intel SDM Vol. 2 "RET" (far); Ch. 2 (66H).
-            // Opsize 16: pop IP then CS; opsize 32: pop EIP then CS (6-byte frame).
+            // Spec: Intel SDM Vol. 2 "RET" (far); Ch. 2 (66H); Vol. 3 §20.1.
+            // Opsize 16: pop IP then CS; opsize 32: pop EIP then CS (6-byte
+            // frame, EIP truncated to IP16). VM86 stays in VM86.
             if opsz32(&insn) {
                 let eip = pop32(cpu, bus)?;
                 let cs_sel = pop16(cpu, bus)?;
