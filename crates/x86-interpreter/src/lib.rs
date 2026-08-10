@@ -1892,15 +1892,17 @@ fn protected_far_jump(
     Ok(())
 }
 
-/// Protected-mode far `CALL` into a same-CPL GDT code segment or through a
-/// 32-bit GDT call gate.
+/// Protected-mode far `CALL` into a same-CPL GDT code segment, through a
+/// 32-bit GDT call gate, or a CALL-form hardware task switch to a 32-bit TSS /
+/// task gate.
 ///
 /// Call-gate path (type `0xC`, param count 0): same-CPL or privilege-changing
 /// transfer using TSS `SSn:ESPn` when the target code DPL is more privileged.
-/// Spec: Intel SDM Vol. 2 CALL; Vol. 3 §§5.8.1–5.8.2, 6.13, 7.3.
+/// Task path: available 32-bit TSS or task gate (see [`task_switch_call`]).
+/// Spec: Intel SDM Vol. 2 CALL; Vol. 3 §§5.8.1–5.8.2, 6.13, 7.2–7.3.
 ///
 /// Unsupported here: 16-bit call gates (`type=4`), non-zero param count,
-/// LDT-resident gates, nested-task `CALL` to TSS/task gate.
+/// LDT-resident gates (except LDT call gates already handled separately).
 fn protected_far_call(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
@@ -1910,8 +1912,7 @@ fn protected_far_call(
     operand_size_32: bool,
 ) -> Result<(), ExecError> {
     if protected_far_is_task_target(cpu, bus, selector)? {
-        // Nested-task CALL (NT=1 / back-link) is out of scope for this slice.
-        return Err(ExecError::Unsupported(0x9A));
+        return task_switch_call(cpu, bus, selector, next_ip);
     }
     if protected_far_is_call_gate(cpu, bus, selector)? {
         return call_gate_far_call(cpu, bus, selector, next_ip);
@@ -2104,28 +2105,36 @@ fn call_gate_far_call(
     Ok(())
 }
 
-/// Protected-mode `IRET` / `IRETD`: same-CPL or outer-privilege return.
+/// Protected-mode `IRET` / `IRETD`: nested-task return, same-CPL, or outer return.
 ///
-/// `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame (`IRETD`)
-/// or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`). Stack-pointer width follows
-/// the current `SS.B`. When the return CS.RPL is greater than CPL, the frame
-/// also carries outer `ESP`/`SS`, which are validated and loaded so CPL drops
-/// to the return RPL (Vol. 2 IRET; Vol. 3 §6.12.1).
+/// When `NT=1`, perform an IRET-form hardware task switch to the previous-task
+/// link (Vol. 3 §7.3) instead of popping a stack frame. `next_ip` is the EIP
+/// saved into the outgoing TSS for that path.
 ///
-/// This bounded path still requires the instruction itself to execute at
-/// CPL 0. Same-CPL returns reload a nonconforming present `L=0` ring-0 GDT
-/// code segment; outer returns require a nonconforming segment whose DPL
-/// equals the return RPL, plus a matching writable SS. `NT=1` task returns
-/// and `VM=1` images remain unsupported.
+/// Otherwise `operand_size_32` selects the 32-bit `EIP`/`CS`/`EFLAGS` frame
+/// (`IRETD`) or the 16-bit `IP`/`CS`/`FLAGS` frame (`IRET`). Stack-pointer
+/// width follows the current `SS.B`. When the return CS.RPL is greater than CPL,
+/// the frame also carries outer `ESP`/`SS`, which are validated and loaded so
+/// CPL drops to the return RPL (Vol. 2 IRET; Vol. 3 §6.12.1).
+///
+/// Non-nested returns still require the instruction itself to execute at CPL 0.
+/// `VM=1` (virtual-8086 IRET) remains unsupported.
 ///
 /// Spec: Intel SDM Vol. 2 IRET/IRETD/IRETQ; Vol. 1 §3.4.3; Vol. 3
-/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13.
+/// §§3.4.2–3.4.5, 5.5, 6.12.1, 6.13, 7.3.
 fn protected_iret(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
     operand_size_32: bool,
+    next_ip: u32,
 ) -> Result<(), ExecError> {
-    if cpu.cs.selector & 3 != 0 || cpu.rflags & ((1 << 14) | (1 << 17)) != 0 {
+    if cpu.rflags & (1 << 17) != 0 {
+        return Err(ExecError::Unsupported(0xCF));
+    }
+    if cpu.rflags & (1 << 14) != 0 {
+        return task_switch(cpu, bus, TaskSwitchCause::Iret, None, next_ip);
+    }
+    if cpu.cs.selector & 3 != 0 {
         return Err(ExecError::Unsupported(0xCF));
     }
     let cpl = 0u8;
@@ -4940,6 +4949,7 @@ const DESC_TYPE_TASK_GATE: u8 = 0x5;
 const DESC_TYPE_LDT: u8 = 0x2;
 
 /// 32-bit TSS field offsets (SDM Vol. 3 §7.2.1 Figure 7-2).
+const TSS32_OFF_LINK: u32 = 0;
 const TSS32_OFF_CR3: u32 = 28;
 const TSS32_OFF_EIP: u32 = 32;
 const TSS32_OFF_EFLAGS: u32 = 36;
@@ -4958,6 +4968,17 @@ const TSS32_OFF_DS: u32 = 84;
 const TSS32_OFF_FS: u32 = 88;
 const TSS32_OFF_GS: u32 = 92;
 const TSS32_OFF_LDTR: u32 = 96;
+
+/// How a hardware task switch was requested (SDM Vol. 3 §7.3 / Table 7-1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskSwitchCause {
+    /// Far `JMP` — clear outgoing busy, clear `NT`.
+    Jmp,
+    /// Far `CALL` — keep outgoing busy, set `NT`, write previous-task link.
+    Call,
+    /// `IRET` with `NT=1` — clear outgoing busy, clear `NT` (link from current TSS).
+    Iret,
+}
 
 /// `LTR r/m16` — load TR from a present available 32-bit TSS descriptor.
 ///
@@ -5197,8 +5218,8 @@ fn protected_far_is_task_target(
 
 /// Resolve a far selector to an available 32-bit TSS (direct or via task gate).
 ///
-/// Spec: Intel SDM Vol. 3 §7.3 / Figure 7-5 (privilege checks for JMP).
-fn resolve_jmp_task_tss_selector(
+/// Spec: Intel SDM Vol. 3 §7.3 / Figure 7-5 (privilege checks for JMP and CALL).
+fn resolve_task_tss_selector(
     cpu: &CpuState,
     bus: &mut dyn Bus,
     selector: u16,
@@ -5356,16 +5377,40 @@ fn prepare_task_ldtr(
 
 /// Hardware task switch via far `JMP` to a 32-bit TSS or task gate.
 ///
-/// Saves outgoing state into the current busy TSS, marks it available, loads
-/// the incoming available TSS, marks it busy, sets `CR0.TS`, and clears `NT`.
 /// Spec: Intel SDM Vol. 2 "JMP"; Vol. 3 §§7.2–7.3.
-///
-/// Unsupported here: nested-task `CALL`/`INT` switches, `EFLAGS.VM=1` targets,
-/// 16-bit TSS, IDT task-gate delivery, and LDT-resident TSS/gate descriptors.
 fn task_switch_jmp(
     cpu: &mut CpuState,
     bus: &mut dyn Bus,
     selector: u16,
+    next_ip: u32,
+) -> Result<(), ExecError> {
+    task_switch(cpu, bus, TaskSwitchCause::Jmp, Some(selector), next_ip)
+}
+
+/// Hardware task switch via far `CALL` to a 32-bit TSS or task gate.
+///
+/// Keeps the outgoing TSS busy, writes the previous-task link, and sets `NT`.
+/// Spec: Intel SDM Vol. 2 "CALL"; Vol. 3 §§7.2–7.3 Table 7-1.
+fn task_switch_call(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    selector: u16,
+    next_ip: u32,
+) -> Result<(), ExecError> {
+    task_switch(cpu, bus, TaskSwitchCause::Call, Some(selector), next_ip)
+}
+
+/// Shared 32-bit TSS task-switch engine (JMP / CALL / IRET forms).
+///
+/// Spec: Intel SDM Vol. 3 §§7.2–7.3.
+///
+/// Unsupported here: `EFLAGS.VM=1` targets, 16-bit TSS, IDT task-gate delivery,
+/// and LDT-resident TSS/gate descriptors.
+fn task_switch(
+    cpu: &mut CpuState,
+    bus: &mut dyn Bus,
+    cause: TaskSwitchCause,
+    selector: Option<u16>,
     next_ip: u32,
 ) -> Result<(), ExecError> {
     let old_type = (cpu.tr.flags & 0x0F) as u8;
@@ -5373,7 +5418,33 @@ fn task_switch_jmp(
         return Err(selector_fault(13, cpu.tr.selector));
     }
 
-    let (new_sel, new_desc) = resolve_jmp_task_tss_selector(cpu, bus, selector)?;
+    let (new_sel, new_desc) = match cause {
+        TaskSwitchCause::Jmp | TaskSwitchCause::Call => {
+            let sel = selector.expect("JMP/CALL require a far selector");
+            resolve_task_tss_selector(cpu, bus, sel)?
+        }
+        TaskSwitchCause::Iret => {
+            // Nested-task return: destination is the previous-task link and must
+            // already be busy. Spec: Vol. 3 §7.3 / Vol. 2 IRET.
+            let link = tss32_read_u16(bus, cpu.tr.base, TSS32_OFF_LINK)?;
+            if is_null_selector(link) || link & 0x4 != 0 {
+                return Err(selector_fault(13, link));
+            }
+            let tss_desc = read_gdt_raw_descriptor(cpu, bus, link)?;
+            let tss_access = tss_desc[5];
+            if tss_access & 0x10 != 0 || tss_access & 0x0F != DESC_TYPE_TSS32_BUSY {
+                return Err(selector_fault(13, link));
+            }
+            if tss_access & 0x80 == 0 {
+                return Err(selector_fault(11, link));
+            }
+            let parsed = parse_segment_descriptor(tss_desc);
+            if parsed.limit < TSS32_MIN_LIMIT {
+                return Err(selector_fault(13, link));
+            }
+            (link, tss_desc)
+        }
+    };
     let new_parsed = parse_segment_descriptor(new_desc);
     let new_base = new_parsed.base;
 
@@ -5381,7 +5452,11 @@ fn task_switch_jmp(
     // VM86 task entry is a later slice.
     let new_eflags = tss32_read_u32(bus, new_base, TSS32_OFF_EFLAGS)?;
     if new_eflags & (1 << 17) != 0 {
-        return Err(ExecError::Unsupported(0xEA));
+        return Err(ExecError::Unsupported(match cause {
+            TaskSwitchCause::Call => 0x9A,
+            TaskSwitchCause::Iret => 0xCF,
+            TaskSwitchCause::Jmp => 0xEA,
+        }));
     }
     let new_eip = tss32_read_u32(bus, new_base, TSS32_OFF_EIP)?;
     let new_cr3 = tss32_read_u32(bus, new_base, TSS32_OFF_CR3)?;
@@ -5416,6 +5491,7 @@ fn task_switch_jmp(
 
     // Save outgoing architectural state into the current TSS.
     let old_base = cpu.tr.base;
+    let old_sel = cpu.tr.selector;
     tss32_write_u32(bus, old_base, TSS32_OFF_EIP, next_ip)?;
     tss32_write_u32(bus, old_base, TSS32_OFF_EFLAGS, cpu.rflags as u32)?;
     tss32_write_u32(bus, old_base, TSS32_OFF_EAX, cpu.gpr_u32(CpuState::RAX))?;
@@ -5435,11 +5511,24 @@ fn task_switch_jmp(
     tss32_write_u16(bus, old_base, TSS32_OFF_LDTR, cpu.ldtr.selector)?;
     tss32_write_u32(bus, old_base, TSS32_OFF_CR3, cpu.cr3 as u32)?;
 
-    // JMP clears the busy bit on the outgoing TSS and does not set NT.
-    let old_access = ((cpu.tr.flags & 0xFF) as u8 & 0xF0) | DESC_TYPE_TSS32_AVAILABLE;
-    write_gdt_access_byte(cpu, bus, cpu.tr.selector, old_access)?;
-    let new_access = (new_desc[5] & 0xF0) | DESC_TYPE_TSS32_BUSY;
-    write_gdt_access_byte(cpu, bus, new_sel, new_access)?;
+    match cause {
+        TaskSwitchCause::Call => {
+            // Nested CALL: old stays busy; write previous-task link; set NT.
+            tss32_write_u16(bus, new_base, TSS32_OFF_LINK, old_sel)?;
+            let new_access = (new_desc[5] & 0xF0) | DESC_TYPE_TSS32_BUSY;
+            write_gdt_access_byte(cpu, bus, new_sel, new_access)?;
+        }
+        TaskSwitchCause::Jmp | TaskSwitchCause::Iret => {
+            // JMP / IRET: clear busy on the outgoing TSS.
+            let old_access = ((cpu.tr.flags & 0xFF) as u8 & 0xF0) | DESC_TYPE_TSS32_AVAILABLE;
+            write_gdt_access_byte(cpu, bus, old_sel, old_access)?;
+            if cause == TaskSwitchCause::Jmp {
+                let new_access = (new_desc[5] & 0xF0) | DESC_TYPE_TSS32_BUSY;
+                write_gdt_access_byte(cpu, bus, new_sel, new_access)?;
+            }
+            // IRET returns to an already-busy TSS; leave its busy bit set.
+        }
+    }
 
     cpu.tr
         .load_descriptor_cache(new_sel, new_base, new_parsed.limit, {
@@ -5451,8 +5540,13 @@ fn task_switch_jmp(
     cpu.cr3 = u64::from(new_cr3);
     note_control_register_write(cpu, bus, 3);
     cpu.rip = u64::from(new_eip);
-    // JMP clears NT in the loaded EFLAGS image. Spec: Vol. 3 §7.3.
-    cpu.rflags = u64::from(new_eflags & !(1 << 14));
+    // JMP/IRET clear NT; CALL sets NT. Spec: Vol. 3 §7.3 Table 7-1.
+    let mut loaded_flags = new_eflags;
+    match cause {
+        TaskSwitchCause::Call => loaded_flags |= 1 << 14,
+        TaskSwitchCause::Jmp | TaskSwitchCause::Iret => loaded_flags &= !(1 << 14),
+    }
+    cpu.rflags = u64::from(loaded_flags);
     cpu.set_gpr_u32(CpuState::RAX, new_eax);
     cpu.set_gpr_u32(CpuState::RCX, new_ecx);
     cpu.set_gpr_u32(CpuState::RDX, new_edx);
@@ -6903,7 +6997,7 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // IRET/IRETD — Spec: Intel SDM Vol. 2 "IRET/IRETD/IRETQ".
             // The effective operand size selects the 6-byte or 12-byte frame.
             if cr0_pe(cpu) {
-                protected_iret(cpu, bus, opsz32(&insn))?;
+                protected_iret(cpu, bus, opsz32(&insn), next_ip)?;
             } else {
                 // Preserve the existing real-address 16-bit stack-frame path.
                 // Real-address `IRETD` (`0x66 CF`, 12-byte frame) is not modeled.
@@ -7650,6 +7744,26 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
                 if index < lower || index > upper {
                     return real_mode_exception(cpu, bus, 5);
                 }
+            }
+            set_current_ip(cpu, next_ip);
+        }
+        0x63 => {
+            // ARPL r/m16, r16 — Spec: Intel SDM Vol. 2 "ARPL".
+            // Real-address / virtual-8086 mode → #UD. Always 16-bit operands.
+            // If DEST.RPL < SRC.RPL, set DEST.RPL = SRC.RPL and ZF=1; else ZF=0.
+            if !cr0_pe(cpu) {
+                return Err(arch_fault(6));
+            }
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let dest = read_rm_u16(cpu, bus, &insn)?;
+            let src = cpu.gpr_u16(m.reg as usize);
+            let dest_rpl = dest & 3;
+            let src_rpl = src & 3;
+            if dest_rpl < src_rpl {
+                write_rm_u16(cpu, bus, &insn, (dest & !3) | src_rpl)?;
+                cpu.set_zf(true);
+            } else {
+                cpu.set_zf(false);
             }
             set_current_ip(cpu, next_ip);
         }
@@ -21009,24 +21123,15 @@ mod tests {
         assert_eq!(cpu, before, "EIP past limit committed state");
     }
 
-    /// Returning to virtual-8086 mode (`VM=1` in the popped image) and nested
-    /// task returns (`NT=1`) are outside this bounded same-CPL slice and are
-    /// reported instead of being silently ignored.
+    /// Returning to virtual-8086 mode (`VM=1` in the popped image) remains
+    /// outside this path and is reported rather than silently ignored.
+    /// Nested-task `NT=1` returns are covered by `cpu_r8_iret_nt`.
     /// Spec: Intel SDM Vol. 2 "IRET/IRETD" (Operation); Vol. 3 §§6.12.1, 20.2.
     #[test]
-    fn protected_iretd_rejects_vm86_and_nested_task_returns() {
+    fn protected_iretd_rejects_vm86_return_image() {
         let descriptor = encode_seg_desc(0, 0xF_FFFF, 0x9A, 0xC0);
         let (mut cpu, mut bus) =
             pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002 | (1 << 17), descriptor);
-        let before = cpu.clone();
-        assert_eq!(
-            step_inner(&mut cpu, &mut bus),
-            Err(ExecError::Unsupported(0xCF))
-        );
-        assert_eq!(cpu, before);
-
-        let (mut cpu, mut bus) = pm32_iretd_fixture(0x2000, PM32_CS32, 0x0002, descriptor);
-        cpu.rflags |= 1 << 14; // NT
         let before = cpu.clone();
         assert_eq!(
             step_inner(&mut cpu, &mut bus),
