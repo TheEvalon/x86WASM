@@ -34,11 +34,11 @@ the platform-io ownership area.
 - HPET MMIO `0xFED00000`
 - I/O APIC MMIO `0xFEC00000`
 
-## Unsupported (explicit)
+## Unsupported (explicit) — R6 scope
 
-- IRQ remapping / delivery from IOAPIC to Local APIC / CPU
+- IRQ remapping / delivery from IOAPIC to Local APIC / CPU (Fixed RTE stub in R7; see `docs/ioapic-r7-rte-irq.md`)
 - EOI / remote IRR side effects
-- Mask/trigger polarity beyond store/readback
+- ExtINT virtual-wire / DualPic mirror
 
 ## Tests
 

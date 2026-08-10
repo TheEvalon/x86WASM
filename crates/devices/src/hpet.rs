@@ -1,12 +1,17 @@
-//! HPET MMIO capability stub (classic base `0xFED0_0000`).
+//! HPET MMIO with one comparator IRQ stub (classic base `0xFED0_0000`).
 //!
 //! Spec: IA-PC HPET (High Precision Event Timers) Specification, Revision 1.0a:
 //! - General Capabilities and ID Register at offset `00h` (64-bit RO)
-//! - General Configuration Register at offset `10h` (ENABLE_CNF bit 0)
+//! - General Configuration Register at offset `10h` (`ENABLE_CNF` bit 0)
+//! - General Interrupt Status Register at offset `20h` (level clear-by-write-1)
 //! - Main Counter Register at offset `F0h`
+//! - Timer 0 Configuration/Capability at `100h`, Comparator at `108h`
 //!
-//! Presence stub for firmware probes. Main counter stays at zero (no freerun).
-//! Comparator interrupts, MSI, and ACPI table mapping are out of scope.
+//! Round-7: Timer 0 can raise a **device-level** interrupt latch when the main
+//! counter reaches the comparator while globally and per-timer enabled. Hosts
+//! advance the counter via [`HpetMmio::advance_main_counter`] (not step-clock).
+//! PIC / I/O APIC delivery is **not** auto-wired here — see
+//! `docs/hpet-r7-comparator-irq.md`.
 
 /// Classic HPET MMIO base (PC firmware convention / ACPI GAS address).
 pub const HPET_DEFAULT_BASE: u64 = 0xFED0_0000;
@@ -20,21 +25,49 @@ pub const HPET_REG_CAPS_ID: u32 = 0x00;
 /// General Configuration Register offset.
 pub const HPET_REG_CONFIG: u32 = 0x10;
 
+/// General Interrupt Status Register offset.
+pub const HPET_REG_INTR_STATUS: u32 = 0x20;
+
 /// Main Counter Register offset.
 pub const HPET_REG_MAIN_COUNTER: u32 = 0xF0;
 
-/// ENABLE_CNF — General Configuration bit 0.
+/// Timer 0 Configuration and Capability Register offset.
+pub const HPET_REG_T0_CONFIG: u32 = 0x100;
+
+/// Timer 0 Comparator Value Register offset.
+pub const HPET_REG_T0_COMPARATOR: u32 = 0x108;
+
+/// `ENABLE_CNF` — General Configuration bit 0.
 pub const HPET_CFG_ENABLE: u64 = 1 << 0;
+
+/// Timer n Interrupt Type (`Tn_INT_TYPE_CNF`) — bit 1 (1 = level).
+pub const HPET_TN_INT_TYPE: u64 = 1 << 1;
+
+/// Timer n Interrupt Enable (`Tn_INT_ENB_CNF`) — bit 2.
+pub const HPET_TN_INT_ENB: u64 = 1 << 2;
+
+/// Timer n Type (`Tn_TYPE_CNF`) — bit 3 (1 = periodic).
+pub const HPET_TN_TYPE_PERIODIC: u64 = 1 << 3;
+
+/// Timer n Periodic Interrupt Capable (`Tn_PER_INT_CAP`) — bit 4 (RO).
+pub const HPET_TN_PER_INT_CAP: u64 = 1 << 4;
+
+/// Timer n Value Set (`Tn_VAL_SET_CNF`) — bit 6 (W1; not retained).
+pub const HPET_TN_VAL_SET: u64 = 1 << 6;
+
+/// Timer n Interrupt Route field (`Tn_INT_ROUTE_CNF`) — bits 13:9.
+pub const HPET_TN_INT_ROUTE_SHIFT: u32 = 9;
+
+/// Mask for `Tn_INT_ROUTE_CNF`.
+pub const HPET_TN_INT_ROUTE_MASK: u64 = 0x3E00;
 
 /// Revision ID (CAPS bits 7:0).
 pub const HPET_REV_ID: u8 = 0x01;
 
-/// Number of timers minus one (CAPS bits 12:8). `0` → one timer block in CAPS;
-/// comparator programming remains unsupported.
+/// Number of timers minus one (CAPS bits 12:8). `0` → one timer (Timer 0).
 pub const HPET_NUM_TIM_CAP: u8 = 0;
 
-/// COUNT_SIZE_CAP clear — main counter treated as 32-bit capable in CAPS.
-/// (Actual counter stays zero; freerun is not modeled.)
+/// `COUNT_SIZE_CAP` clear — main counter treated as 32-bit capable in CAPS.
 pub const HPET_COUNT_SIZE_CAP: u64 = 0;
 
 /// Vendor ID (CAPS bits 31:16) — Intel PCI vendor for a PC-compatible stub.
@@ -43,8 +76,8 @@ pub const HPET_VENDOR_ID: u16 = 0x8086;
 /// Counter clock period in femtoseconds (CAPS bits 63:32).
 ///
 /// Model choice: period for a nominal 14.31818 MHz HPET
-/// (`1e15 / 14_318_180 ≈ 69_841_279`). Informational only — the main counter
-/// does **not** advance in this stub.
+/// (`1e15 / 14_318_180 ≈ 69_841_279`). Informational for CAPS; hosts advance
+/// the main counter in abstract ticks via [`HpetMmio::advance_main_counter`].
 pub const HPET_COUNTER_CLK_PERIOD_FS: u32 = 69_841_279;
 
 /// Composed 64-bit General Capabilities and ID value.
@@ -54,16 +87,45 @@ pub const HPET_CAPS_ID_VALUE: u64 = (HPET_REV_ID as u64)
     | ((HPET_VENDOR_ID as u64) << 16)
     | ((HPET_COUNTER_CLK_PERIOD_FS as u64) << 32);
 
-/// HPET presence MMIO (CAPS RO; config store/readback; counter stuck at 0).
+/// Timer 0 interrupt routing capability (RO bits 63:32 of T0 config).
+///
+/// Spec: HPET 1.0a — bit *N* set ⇒ Timer may route to I/O APIC IRQ *N*.
+/// This stub advertises IRQ2 only (common non-legacy route). Delivery onto
+/// the I/O APIC / PIC is out of scope for this device slice.
+pub const HPET_T0_INT_ROUTE_CAP: u32 = 1 << 2;
+
+/// RO capability bits always present in Timer 0 config.
+pub const HPET_T0_CONFIG_CAPS: u64 = HPET_TN_PER_INT_CAP | ((HPET_T0_INT_ROUTE_CAP as u64) << 32);
+
+/// Writable Timer 0 config bits retained by this stub.
+const HPET_T0_CONFIG_WRITABLE: u64 =
+    HPET_TN_INT_TYPE | HPET_TN_INT_ENB | HPET_TN_TYPE_PERIODIC | HPET_TN_INT_ROUTE_MASK;
+
+/// 32-bit main-counter / comparator mask (`COUNT_SIZE_CAP` clear).
+const HPET_COUNTER_MASK: u64 = 0xFFFF_FFFF;
+
+/// HPET MMIO: CAPS + config + main counter + Timer 0 comparator IRQ stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HpetMmio {
     base: u64,
     /// General Configuration — only `ENABLE_CNF` retained.
     config: u64,
-    /// Main counter — always 0 (honesty: no freerun / step-clock advance).
+    /// Main counter (32-bit modeled; upper bits forced 0).
     main_counter: u64,
-    /// Scratch for assembling multi-byte config writes.
-    config_scratch: [u8; 8],
+    /// General Interrupt Status — bit 0 = Timer 0 (`T0_INT_STS`).
+    intr_status: u64,
+    /// Timer 0 writable config bits (OR'd with RO caps on read).
+    t0_config: u64,
+    /// Timer 0 comparator value (32-bit modeled).
+    t0_comparator: u64,
+    /// Periodic accumulator / next match (used when `Tn_TYPE_CNF` is set).
+    t0_periodic_period: u64,
+    /// Edge-triggered IRQ latch (cleared when status is cleared).
+    irq_edge_latched: bool,
+    /// One-shot: suppress re-fire until comparator is rewritten.
+    t0_oneshot_armed: bool,
+    /// Scratch for assembling multi-byte writes.
+    qword_scratch: [u8; 8],
 }
 
 impl Default for HpetMmio {
@@ -78,7 +140,13 @@ impl HpetMmio {
             base: HPET_DEFAULT_BASE,
             config: 0,
             main_counter: 0,
-            config_scratch: [0; 8],
+            intr_status: 0,
+            t0_config: 0,
+            t0_comparator: 0,
+            t0_periodic_period: 0,
+            irq_edge_latched: false,
+            t0_oneshot_armed: true,
+            qword_scratch: [0; 8],
         }
     }
 
@@ -98,20 +166,175 @@ impl HpetMmio {
         self.main_counter
     }
 
+    pub fn intr_status(&self) -> u64 {
+        self.intr_status
+    }
+
+    pub fn t0_comparator(&self) -> u64 {
+        self.t0_comparator
+    }
+
+    /// Timer 0 config as visible to software (writable bits + RO caps).
+    pub fn t0_config(&self) -> u64 {
+        (self.t0_config & HPET_T0_CONFIG_WRITABLE) | HPET_T0_CONFIG_CAPS
+    }
+
+    /// `Tn_INT_ROUTE_CNF` field (bits 13:9).
+    pub fn t0_int_route(&self) -> u8 {
+        ((self.t0_config & HPET_TN_INT_ROUTE_MASK) >> HPET_TN_INT_ROUTE_SHIFT) as u8
+    }
+
     pub fn owns(&self, addr: u64) -> bool {
         (self.base..self.base.saturating_add(HPET_WINDOW_SIZE)).contains(&addr)
+    }
+
+    /// Device-level interrupt request.
+    ///
+    /// Spec: HPET 1.0a — `Tn_INT_ENB_CNF` gates interrupt generation; level
+    /// mode follows `Tn_INT_STS`, edge mode latches until status is cleared.
+    /// This is **not** wired to PIC/IOAPIC by the device itself.
+    pub fn irq_line(&self) -> bool {
+        if self.config & HPET_CFG_ENABLE == 0 || self.t0_config & HPET_TN_INT_ENB == 0 {
+            return false;
+        }
+        if self.t0_config & HPET_TN_INT_TYPE != 0 {
+            self.intr_status & 1 != 0
+        } else {
+            self.irq_edge_latched
+        }
+    }
+
+    /// Advance the main counter by `delta` ticks and evaluate Timer 0.
+    ///
+    /// Returns `true` if this advance caused a new Timer 0 interrupt event
+    /// (status bit newly set / edge latched). When `ENABLE_CNF` is clear the
+    /// counter is halted (HPET 1.0a) and this is a no-op. Not driven by the
+    /// machine step clock — hosts must call this explicitly.
+    pub fn advance_main_counter(&mut self, delta: u64) -> bool {
+        if delta == 0 || self.config & HPET_CFG_ENABLE == 0 {
+            return false;
+        }
+        let before = self.main_counter;
+        self.main_counter = before.wrapping_add(delta) & HPET_COUNTER_MASK;
+        self.eval_timer0(before)
+    }
+
+    fn eval_timer0(&mut self, before: u64) -> bool {
+        let after = self.main_counter;
+        let cmp = self.t0_comparator & HPET_COUNTER_MASK;
+        let crossed = if before <= after {
+            before < cmp && after >= cmp
+        } else {
+            // 32-bit wrap: fire if comparator was ahead of `before` or behind `after`.
+            before < cmp || after >= cmp
+        };
+        if !crossed {
+            return false;
+        }
+
+        let periodic = self.t0_config & HPET_TN_TYPE_PERIODIC != 0;
+        if !periodic && !self.t0_oneshot_armed {
+            return false;
+        }
+
+        let already = self.intr_status & 1 != 0;
+        self.intr_status |= 1;
+        if self.t0_config & HPET_TN_INT_TYPE == 0 {
+            self.irq_edge_latched = true;
+        }
+        if periodic {
+            let period = if self.t0_periodic_period == 0 {
+                cmp.max(1)
+            } else {
+                self.t0_periodic_period
+            };
+            self.t0_comparator = after.wrapping_add(period) & HPET_COUNTER_MASK;
+        } else {
+            self.t0_oneshot_armed = false;
+        }
+        !already || self.t0_config & HPET_TN_INT_TYPE == 0
     }
 
     fn read_qword(&self, dword_off: u32) -> u64 {
         match dword_off {
             HPET_REG_CAPS_ID => HPET_CAPS_ID_VALUE,
-            // High half of CAPS when reading +4.
             0x04 => HPET_CAPS_ID_VALUE >> 32,
             HPET_REG_CONFIG => self.config,
             0x14 => self.config >> 32,
+            HPET_REG_INTR_STATUS => self.intr_status,
+            0x24 => self.intr_status >> 32,
             HPET_REG_MAIN_COUNTER => self.main_counter,
             0xF4 => self.main_counter >> 32,
+            HPET_REG_T0_CONFIG => self.t0_config(),
+            0x104 => self.t0_config() >> 32,
+            HPET_REG_T0_COMPARATOR => self.t0_comparator,
+            0x10C => self.t0_comparator >> 32,
             _ => 0,
+        }
+    }
+
+    fn write_config_byte(&mut self, byte_index: usize, val: u8) {
+        self.qword_scratch = self.config.to_le_bytes();
+        if byte_index < 8 {
+            self.qword_scratch[byte_index] = val;
+            let raw = u64::from_le_bytes(self.qword_scratch);
+            self.config = raw & HPET_CFG_ENABLE;
+        }
+    }
+
+    fn write_intr_status_byte(&mut self, byte_index: usize, val: u8) {
+        // Spec: write-1-to-clear for level-triggered status bits.
+        if byte_index == 0 {
+            let clear = u64::from(val);
+            self.intr_status &= !clear;
+            if clear & 1 != 0 {
+                self.irq_edge_latched = false;
+            }
+        }
+    }
+
+    fn write_main_counter_byte(&mut self, byte_index: usize, val: u8) {
+        self.qword_scratch = self.main_counter.to_le_bytes();
+        if byte_index < 8 {
+            self.qword_scratch[byte_index] = val;
+            let before = self.main_counter;
+            self.main_counter = u64::from_le_bytes(self.qword_scratch) & HPET_COUNTER_MASK;
+            // Software write can land exactly on the comparator.
+            let _ = self.eval_timer0(before);
+        }
+    }
+
+    fn write_t0_config_byte(&mut self, byte_index: usize, val: u8) {
+        self.qword_scratch = self.t0_config().to_le_bytes();
+        if byte_index < 8 {
+            self.qword_scratch[byte_index] = val;
+            let raw = u64::from_le_bytes(self.qword_scratch);
+            let route = (raw & HPET_TN_INT_ROUTE_MASK) >> HPET_TN_INT_ROUTE_SHIFT;
+            // Only advertised routes stick; others force 0.
+            let route_ok = (HPET_T0_INT_ROUTE_CAP & (1u32 << route)) != 0;
+            let mut retained = raw & HPET_T0_CONFIG_WRITABLE;
+            if !route_ok {
+                retained &= !HPET_TN_INT_ROUTE_MASK;
+            }
+            // Periodic type only if capability is set (it is).
+            if raw & HPET_TN_VAL_SET != 0 {
+                // Spec: VAL_SET allows software to set the accumulator; we
+                // treat the current comparator as the periodic period.
+                self.t0_periodic_period = self.t0_comparator.max(1) & HPET_COUNTER_MASK;
+            }
+            self.t0_config = retained;
+        }
+    }
+
+    fn write_t0_comparator_byte(&mut self, byte_index: usize, val: u8) {
+        self.qword_scratch = self.t0_comparator.to_le_bytes();
+        if byte_index < 8 {
+            self.qword_scratch[byte_index] = val;
+            self.t0_comparator = u64::from_le_bytes(self.qword_scratch) & HPET_COUNTER_MASK;
+            self.t0_oneshot_armed = true;
+            if self.t0_config & HPET_TN_TYPE_PERIODIC != 0 && self.t0_periodic_period == 0 {
+                self.t0_periodic_period = self.t0_comparator.max(1);
+            }
         }
     }
 
@@ -137,17 +360,26 @@ impl HpetMmio {
         let lane = (off & 3) as usize;
         match dword_off {
             HPET_REG_CONFIG | 0x14 => {
-                self.config_scratch = self.config.to_le_bytes();
                 let idx = (dword_off - HPET_REG_CONFIG) as usize + lane;
-                if idx < 8 {
-                    self.config_scratch[idx] = val;
-                    // Spec: only ENABLE_CNF (bit0) is retained; other config
-                    // bits (LEG_RT_CNF, etc.) are dropped in this stub.
-                    let raw = u64::from_le_bytes(self.config_scratch);
-                    self.config = raw & HPET_CFG_ENABLE;
-                }
+                self.write_config_byte(idx, val);
             }
-            // CAPS is RO; main counter writes accepted but ignored (stays 0).
+            HPET_REG_INTR_STATUS | 0x24 => {
+                let idx = (dword_off - HPET_REG_INTR_STATUS) as usize + lane;
+                self.write_intr_status_byte(idx, val);
+            }
+            HPET_REG_MAIN_COUNTER | 0xF4 => {
+                let idx = (dword_off - HPET_REG_MAIN_COUNTER) as usize + lane;
+                self.write_main_counter_byte(idx, val);
+            }
+            HPET_REG_T0_CONFIG | 0x104 => {
+                let idx = (dword_off - HPET_REG_T0_CONFIG) as usize + lane;
+                self.write_t0_config_byte(idx, val);
+            }
+            HPET_REG_T0_COMPARATOR | 0x10C => {
+                let idx = (dword_off - HPET_REG_T0_COMPARATOR) as usize + lane;
+                self.write_t0_comparator_byte(idx, val);
+            }
+            // CAPS is RO; other offsets claimed with no side effect.
             _ => {}
         }
         true
@@ -166,6 +398,12 @@ mod tests {
                 .unwrap();
         }
         u32::from_le_bytes(b)
+    }
+
+    fn write_u32(hpet: &mut HpetMmio, off: u32, value: u32) {
+        for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+            assert!(hpet.mmio_write_u8(HPET_DEFAULT_BASE + u64::from(off) + i as u64, byte));
+        }
     }
 
     /// Spec: HPET 1.0a — CAPS/ID readable; vendor/rev/timer count documented.
@@ -189,17 +427,16 @@ mod tests {
         assert!(hpet.mmio_write_u8(HPET_DEFAULT_BASE + u64::from(HPET_REG_CONFIG), 0x01));
         assert_eq!(hpet.config(), HPET_CFG_ENABLE);
         assert_eq!(read_u32(&hpet, HPET_REG_CONFIG), 1);
-        // Other bits masked off.
         assert!(hpet.mmio_write_u8(HPET_DEFAULT_BASE + u64::from(HPET_REG_CONFIG), 0x03));
         assert_eq!(hpet.config(), HPET_CFG_ENABLE);
     }
 
     #[test]
-    fn main_counter_stays_zero() {
+    fn main_counter_writable_32bit() {
         let mut hpet = HpetMmio::new();
-        assert!(hpet.mmio_write_u8(HPET_DEFAULT_BASE + u64::from(HPET_REG_MAIN_COUNTER), 0xFF));
-        assert_eq!(hpet.main_counter(), 0);
-        assert_eq!(read_u32(&hpet, HPET_REG_MAIN_COUNTER), 0);
+        write_u32(&mut hpet, HPET_REG_MAIN_COUNTER, 0x1234_5678);
+        assert_eq!(hpet.main_counter(), 0x1234_5678);
+        assert_eq!(read_u32(&hpet, HPET_REG_MAIN_COUNTER), 0x1234_5678);
     }
 
     #[test]
@@ -208,5 +445,99 @@ mod tests {
         assert!(hpet.mmio_write_u8(HPET_DEFAULT_BASE + u64::from(HPET_REG_CONFIG), 0x01));
         hpet.reset();
         assert_eq!(hpet, HpetMmio::new());
+    }
+
+    /// Spec: HPET 1.0a — Timer 0 config RO caps + INT_ENB / comparator.
+    #[test]
+    fn timer0_config_caps_and_comparator_store() {
+        let mut hpet = HpetMmio::new();
+        let cfg = hpet.t0_config();
+        assert_ne!(cfg & HPET_TN_PER_INT_CAP, 0);
+        assert_eq!((cfg >> 32) as u32, HPET_T0_INT_ROUTE_CAP);
+        assert_eq!(read_u32(&hpet, 0x104), HPET_T0_INT_ROUTE_CAP);
+
+        // Enable interrupts + route to IRQ2 (advertised).
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | (2 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        assert_ne!(hpet.t0_config() & HPET_TN_INT_ENB, 0);
+        assert_eq!(hpet.t0_int_route(), 2);
+
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 100);
+        assert_eq!(hpet.t0_comparator(), 100);
+        assert_eq!(read_u32(&hpet, HPET_REG_T0_COMPARATOR), 100);
+    }
+
+    /// Spec: HPET 1.0a — one-shot comparator fires INT_STS / irq_line when enabled.
+    #[test]
+    fn timer0_oneshot_raises_stub_irq_on_advance() {
+        let mut hpet = HpetMmio::new();
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | HPET_TN_INT_TYPE | (2 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 50);
+        assert!(!hpet.irq_line());
+
+        assert!(hpet.advance_main_counter(50));
+        assert_eq!(hpet.main_counter(), 50);
+        assert_eq!(hpet.intr_status() & 1, 1);
+        assert!(hpet.irq_line());
+
+        // One-shot does not re-fire on further advances without rewriting CMP.
+        assert!(!hpet.advance_main_counter(100));
+        assert!(hpet.irq_line());
+
+        // Write-1-to-clear status deasserts level IRQ.
+        write_u32(&mut hpet, HPET_REG_INTR_STATUS, 1);
+        assert_eq!(hpet.intr_status() & 1, 0);
+        assert!(!hpet.irq_line());
+    }
+
+    /// Spec: HPET 1.0a — periodic type re-arms comparator after fire.
+    #[test]
+    fn timer0_periodic_rearms_comparator() {
+        let mut hpet = HpetMmio::new();
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 10);
+        // VAL_SET + periodic + INT_ENB.
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | HPET_TN_TYPE_PERIODIC | HPET_TN_VAL_SET) as u32,
+        );
+        assert!(hpet.advance_main_counter(10));
+        assert!(hpet.irq_line());
+        assert_eq!(hpet.t0_comparator(), 20);
+
+        write_u32(&mut hpet, HPET_REG_INTR_STATUS, 1);
+        assert!(hpet.advance_main_counter(10));
+        assert!(hpet.irq_line());
+        assert_eq!(hpet.t0_comparator(), 30);
+    }
+
+    #[test]
+    fn irq_gated_by_global_and_timer_enable() {
+        let mut hpet = HpetMmio::new();
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        write_u32(&mut hpet, HPET_REG_T0_CONFIG, HPET_TN_INT_ENB as u32);
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 1);
+        assert!(hpet.advance_main_counter(1));
+        assert_eq!(hpet.intr_status() & 1, 1);
+        assert!(hpet.irq_line());
+        // Clearing Tn_INT_ENB gates irq_line; status bit remains until W1C.
+        write_u32(&mut hpet, HPET_REG_T0_CONFIG, 0);
+        assert!(!hpet.irq_line());
+        assert_eq!(hpet.intr_status() & 1, 1);
+        // ENABLE_CNF=0 halts further advances.
+        write_u32(&mut hpet, HPET_REG_CONFIG, 0);
+        write_u32(&mut hpet, HPET_REG_T0_CONFIG, HPET_TN_INT_ENB as u32);
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 100);
+        assert!(!hpet.advance_main_counter(100));
+        assert_eq!(hpet.main_counter(), 1);
     }
 }

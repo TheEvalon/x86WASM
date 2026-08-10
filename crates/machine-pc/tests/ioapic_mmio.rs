@@ -1,9 +1,13 @@
 //! I/O APIC MMIO device is owned by Machine and survives reset.
 //!
-//! Spec: Intel 82093AA — IOREGSEL/IOWIN presence. Wire-all coverage is in
-//! `machine_bus_ioapic_and_platform_wire_all`.
+//! Spec: Intel 82093AA — IOREGSEL/IOWIN presence + RTE → LAPIC Fixed path.
+//! Wire-all coverage is in `machine_bus_ioapic_and_platform_wire_all`.
 
-use devices::{IoApicMmio, IOAPIC_DEFAULT_BASE, IOAPIC_IND_VER, IOAPIC_IOREGSEL, IOAPIC_VER_VALUE};
+use devices::{
+    IoApicMmio, IOAPIC_DEFAULT_BASE, IOAPIC_IND_REDTBL0, IOAPIC_IND_VER, IOAPIC_IOREGSEL,
+    IOAPIC_IOWIN, IOAPIC_VER_VALUE, LAPIC_DEFAULT_BASE, LAPIC_REG_ID, LAPIC_REG_SVR,
+    LAPIC_SVR_SW_ENABLE,
+};
 use machine_pc::Machine;
 
 #[test]
@@ -24,4 +28,47 @@ fn device_ioapic_wired_on_machine_reset() {
     assert_eq!(u32::from_le_bytes(bytes), IOAPIC_VER_VALUE);
     m.reset();
     assert_eq!(m.ioapic, IoApicMmio::new());
+}
+
+fn write_ioapic_u32(m: &mut Machine, off: u32, value: u32) {
+    for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+        assert!(m
+            .ioapic
+            .mmio_write_u8(IOAPIC_DEFAULT_BASE + u64::from(off) + i as u64, b));
+    }
+}
+
+fn write_lapic_u32(m: &mut Machine, off: u32, value: u32) {
+    for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+        assert!(m
+            .lapic
+            .mmio_write_u8(LAPIC_DEFAULT_BASE + u64::from(off) + i as u64, b));
+    }
+}
+
+/// Spec: 82093AA Fixed RTE → Local APIC when dest APIC ID matches.
+#[test]
+fn machine_ioapic_rte_delivers_to_matching_lapic() {
+    let mut m = Machine::new(64 * 1024);
+    // LAPIC ID = 1, software enabled.
+    write_lapic_u32(&mut m, LAPIC_REG_ID, 0x0100_0000);
+    write_lapic_u32(&mut m, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+
+    // GSI 7 → vector 0x37, unmasked Fixed, dest APIC ID 1.
+    assert!(m
+        .ioapic
+        .mmio_write_u8(IOAPIC_DEFAULT_BASE, IOAPIC_IND_REDTBL0 + 14));
+    write_ioapic_u32(&mut m, IOAPIC_IOWIN, 0x0000_0037);
+    assert!(m
+        .ioapic
+        .mmio_write_u8(IOAPIC_DEFAULT_BASE, IOAPIC_IND_REDTBL0 + 15));
+    write_ioapic_u32(&mut m, IOAPIC_IOWIN, 0x0100_0000);
+
+    let d = m.assert_ioapic_gsi(7, true).expect("delivery");
+    assert_eq!(d.vector, 0x37);
+    assert_eq!(d.dest_apic_id, 1);
+    assert_eq!(m.lapic.take_interrupt(), Some(0x37));
+    // Honesty: DualPic IRR unchanged.
+    assert_eq!(m.pic.master.irr, 0);
+    assert_eq!(m.pic.slave.irr, 0);
 }

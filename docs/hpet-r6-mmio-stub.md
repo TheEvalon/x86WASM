@@ -24,9 +24,9 @@ the register window stops those probes from appearing as unmapped open-bus.
 
 `COUNT_SIZE_CAP` is clear (32-bit counter advertised; still stuck at zero).
 
-## Unsupported (explicit)
+## Unsupported (explicit) — R6 scope
 
-- Comparator timers / IRQ / MSI
+- Comparator timers / IRQ / MSI (added in R7; see `docs/hpet-r7-comparator-irq.md`)
 - Legacy-replacement routing
 - Freerunning counter advance from the step clock
 - ACPI HPET table / FADT mapping

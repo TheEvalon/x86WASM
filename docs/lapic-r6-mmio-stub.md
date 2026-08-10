@@ -29,10 +29,10 @@ appearing as unmapped open-bus.
 Leaf 1 `EDX` bit 9 (`APIC`) remains clear. This stub is presence-only and
 must not be taken as an advertised, usable local APIC.
 
-## Unsupported (explicit)
+## Unsupported (explicit) — R6 scope
 
-- LVT timer / LINT / thermal / perfmon delivery
-- ICR / IPI, EOI side effects, SVR, LDR/DFR, ESR
+- LVT timer / LINT / thermal / perfmon delivery (timer+LVT partial in R7; see `docs/lapic-r7-timer-lvt.md`)
+- ICR / IPI, full IRR/ISR, LDR/DFR, ESR
 - x2APIC MSR interface
 - APIC base MSR (`IA32_APIC_BASE`) relocation
 

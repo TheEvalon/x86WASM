@@ -9,6 +9,9 @@
 #![forbid(unsafe_code)]
 
 mod hello_rom;
+mod hpet_wire;
+mod ioapic_wire;
+mod lapic_wire;
 mod mbr;
 mod mem;
 mod ports;
@@ -832,6 +835,33 @@ impl Machine {
     /// Drive PIC IRQ0 from the current PIT ch0 OUT level (level follow).
     pub fn sync_pit_irq0(&mut self) {
         self.pic.set_irq_line(0, self.pit.out_ch0());
+    }
+
+    /// Host-driven HPET main-counter advance (Timer 0 comparator stub).
+    ///
+    /// Spec: IA-PC HPET 1.0a — comparator match can set `T0_INT_STS` /
+    /// [`devices::HpetMmio::irq_line`]. Does **not** assert PIC or I/O APIC.
+    /// See `docs/hpet-r7-comparator-irq.md`.
+    pub fn advance_hpet(&mut self, delta: u64) -> bool {
+        hpet_wire::advance_hpet(&mut self.hpet, delta)
+    }
+
+    /// Host-driven Local APIC timer tick (ICR/CCR/DCR + LVT Timer stub).
+    ///
+    /// Spec: Intel SDM Vol. 3A §10.5 — may latch a local vector via
+    /// [`devices::LocalApicMmio::take_interrupt`]. Does **not** inject into the
+    /// CPU or assert the INTR pin. See `docs/lapic-r7-timer-lvt.md`.
+    pub fn tick_lapic_timer(&mut self, bus_clocks: u64) -> bool {
+        lapic_wire::tick_lapic_timer(&mut self.lapic, bus_clocks)
+    }
+
+    /// Assert an I/O APIC GSI pin; Fixed RTE deliveries matching this LAPIC ID
+    /// latch via [`devices::LocalApicMmio::inject_fixed`].
+    ///
+    /// Spec: Intel 82093AA redirection table. Does **not** mirror onto DualPic.
+    /// See `docs/ioapic-r7-rte-irq.md`.
+    pub fn assert_ioapic_gsi(&mut self, gsi: u8, high: bool) -> Option<devices::IoApicDelivery> {
+        ioapic_wire::assert_ioapic_gsi(&mut self.ioapic, &mut self.lapic, gsi, high)
     }
 
     /// Advance CMOS/RTC by `periods` model quanta and sync IRQF → PIC IRQ8.
