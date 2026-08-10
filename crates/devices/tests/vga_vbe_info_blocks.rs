@@ -47,20 +47,30 @@ fn vbe_info_block_reports_vbe2_and_only_renderable_modes() {
 
 /// Spec: VBE 2.0 ModeAttributes — D7 clear (no LFB), D6 clear (windowing
 /// available), PhysBasePtr zero for every mode this model advertises.
+///
+/// R9 honesty: [`VgaText::guest_lfb_available`] is false and
+/// [`VgaText::vbe_phys_base_ptr`] is [`devices::VBE_PHYS_BASE_PTR_NONE`].
 #[test]
 fn mode_info_blocks_are_banked_vga_compatible_without_lfb() {
     let v = VgaText::new();
+    assert!(!v.guest_lfb_available());
+    assert_eq!(v.vbe_phys_base_ptr(), devices::VBE_PHYS_BASE_PTR_NONE);
     for mode in SUPPORTED_MODES {
         let block = v
             .vbe_mode_info_block_bytes(mode)
             .unwrap_or_else(|| panic!("mode {mode:#x} must be described"));
         let attrs = u16::from_le_bytes([block[0], block[1]]);
-        assert_eq!(attrs & (1 << 7), 0, "mode {mode:#x}: no LFB bit");
+        assert_eq!(
+            attrs & devices::VBE_MODE_ATTR_LFB,
+            0,
+            "mode {mode:#x}: no LFB bit"
+        );
         assert_eq!(attrs & (1 << 6), 0, "mode {mode:#x}: windowing available");
         assert_eq!(attrs & (1 << 5), 0, "mode {mode:#x}: VGA compatible");
         assert_eq!(attrs & 1, 1, "mode {mode:#x}: supported");
         let phys = u32::from_le_bytes(block[40..44].try_into().unwrap());
         assert_eq!(phys, 0, "mode {mode:#x}: PhysBasePtr stays zero");
+        assert_eq!(phys, v.vbe_phys_base_ptr());
     }
     assert!(v.vbe_mode_info_block_bytes(0x101).is_none());
 }

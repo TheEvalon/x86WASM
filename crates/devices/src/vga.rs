@@ -1408,6 +1408,17 @@ const VBE_MODE_ATTR_BASE: u16 = 0x0001 | 0x0002 | 0x0008;
 const VBE_MODE_ATTR_TTY: u16 = 0x0004;
 /// ModeAttributes D4 — graphics mode.
 const VBE_MODE_ATTR_GRAPHICS: u16 = 0x0010;
+/// ModeAttributes D7 — linear framebuffer available. Always clear here.
+///
+/// Spec: VBE 2.0 ModeAttributes bit 7. Kept named so honesty tests and docs
+/// can cite the bit without inventing a guest LFB (`docs/vga-r9-physbaseptr-honesty.md`).
+pub const VBE_MODE_ATTR_LFB: u16 = 1 << 7;
+/// VBE 2.0 `PhysBasePtr` when no guest-mappable LFB exists.
+///
+/// Spec: VBE 2.0 ModeInfoBlock offset 40 — mandatory dword; zero means no
+/// linear framebuffer aperture. Prefer this constant over a bare `0` so
+/// call sites stay explicit (`docs/vga-r9-physbaseptr-honesty.md`).
+pub const VBE_PHYS_BASE_PTR_NONE: u32 = 0;
 
 /// WinAAttributes: window exists, readable, writable. Spec: VBE 2.0.
 const VBE_WIN_A_ATTRS: u8 = 0x07;
@@ -2949,6 +2960,52 @@ impl VgaText {
         self.gc_regs[usize::from(VGA_GC_MODE)] & VGA_GC_MODE_SHIFT256 != 0
     }
 
+    /// Program the IBM mode 13h register signature this device recognizes.
+    ///
+    /// Spec: IBM VGA mode 13h / FreeVGA — graphics + `A0000` 64K window, 256-color
+    /// shift, chain-4, ATC ATGE|8BIT, CRTC doubleword + Offset `0x28`. Clears
+    /// display memory first (BIOS mode-set behavior). Used by the host INT 10h
+    /// AH=00h stub (`docs/vga-r9-int10-stub.md`).
+    pub fn program_bios_mode13h(&mut self) {
+        self.planes.fill(0);
+        self.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MISC));
+        self.port_write(
+            VGA_GC_DATA,
+            1,
+            u32::from(
+                VGA_GC_MISC_GRAPHICS_MODE
+                    | (VGA_GC_MEMORY_MAP_A0000_64K << VGA_GC_MISC_MEMORY_MAP_SHIFT),
+            ),
+        );
+        self.port_write(VGA_GC_INDEX, 1, u32::from(VGA_GC_MODE));
+        self.port_write(VGA_GC_DATA, 1, u32::from(VGA_GC_MODE_SHIFT256));
+        self.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_MEMORY_MODE));
+        self.port_write(
+            VGA_SEQ_DATA,
+            1,
+            u32::from(
+                VGA_SEQ_MEMORY_MODE_EXTENDED
+                    | VGA_SEQ_MEMORY_MODE_ODD_EVEN_DISABLE
+                    | VGA_SEQ_MEMORY_MODE_CHAIN4,
+            ),
+        );
+        self.port_write(VGA_SEQ_INDEX, 1, u32::from(VGA_SEQ_MAP_MASK));
+        self.port_write(VGA_SEQ_DATA, 1, u32::from(VGA_SEQ_MAP_MASK_PLANES));
+        self.port_read(VGA_INPUT_STATUS_1, 1);
+        self.port_write(VGA_ATC_ADDRESS_DATA, 1, u32::from(VGA_ATC_MODE_CONTROL));
+        self.port_write(
+            VGA_ATC_ADDRESS_DATA,
+            1,
+            u32::from(VGA_ATC_MODE_ATGE | VGA_ATC_MODE_8BIT),
+        );
+        self.port_read(VGA_INPUT_STATUS_1, 1);
+        self.port_write(VGA_ATC_ADDRESS_DATA, 1, 0x20); // PAS
+        self.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_UNDERLINE_LOCATION));
+        self.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_UNDERLINE_DW));
+        self.port_write(VGA_CRTC_INDEX, 1, u32::from(VGA_CRTC_OFFSET));
+        self.port_write(VGA_CRTC_DATA, 1, u32::from(VGA_CRTC_OFFSET_DEFAULT));
+    }
+
     /// True when the register file carries the whole mode-13h signature.
     ///
     /// All five must hold, because this model claims only this programming:
@@ -3123,12 +3180,32 @@ impl VgaText {
         block
     }
 
+    /// Whether a guest-mappable VBE linear framebuffer exists.
+    ///
+    /// Always `false` in this model: there is no high BAR / PhysBasePtr aperture.
+    /// Host capture uses [`Self::vbe_host_linear_framebuffer`] / frame helpers
+    /// instead (`docs/vga-r9-physbaseptr-honesty.md`).
+    pub fn guest_lfb_available(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// VBE 2.0 `PhysBasePtr` for every advertised mode.
+    ///
+    /// Spec: VBE 2.0 ModeInfoBlock. Returns [`VBE_PHYS_BASE_PTR_NONE`] while
+    /// [`Self::guest_lfb_available`] is false — never invent a non-zero pointer.
+    pub fn vbe_phys_base_ptr(&self) -> u32 {
+        debug_assert!(!self.guest_lfb_available());
+        VBE_PHYS_BASE_PTR_NONE
+    }
+
     /// Host-side VBE 2.0 `ModeInfoBlock` for one supported BIOS mode.
     ///
     /// Spec: VESA VBE 2.0 Function 01h. Returns `None` for modes this model
     /// does not render. Every returned block leaves ModeAttributes D7 clear and
     /// `PhysBasePtr` zero — there is no guest-mappable linear framebuffer
-    /// aperture to advertise (`docs/vga-r5-vbe-banked-framebuffer.md`).
+    /// aperture to advertise (`docs/vga-r5-vbe-banked-framebuffer.md`,
+    /// `docs/vga-r9-physbaseptr-honesty.md`).
     pub fn vbe_mode_info_block_bytes(&self, mode: u16) -> Option<[u8; VBE_MODE_INFO_BLOCK_BYTES]> {
         let _ = self;
         let (attrs, win_seg, pitch, width, height, planes, bpp, model, xchar, ychar) = match mode {
@@ -3228,7 +3305,9 @@ impl VgaText {
         block[28] = 0; // BankSize (CGA-style; unused)
         block[29] = 0; // NumberOfImagePages (pages − 1)
                        // PhysBasePtr at offset 40 — deliberately zero (no LFB hardware).
-        vbe_put_u32(&mut block, 40, 0);
+        vbe_put_u32(&mut block, 40, self.vbe_phys_base_ptr());
+        // ModeAttributes D7 must stay clear while guest_lfb_available is false.
+        debug_assert_eq!(attrs & VBE_MODE_ATTR_LFB, 0);
         Some(block)
     }
 
