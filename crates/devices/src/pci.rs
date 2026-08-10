@@ -158,7 +158,9 @@
 //! - Status error *signaling* beyond config Master-Abort: host / ISA / IDE /
 //!   USB / ACPI still do not latch RW1C bits from data-path parity / target
 //!   abort / SERR events. Config Mechanism #1 absent-target cycles **do** set
-//!   Received Master Abort on the host-bridge Status (PCI 3.0 §6.2.3).
+//!   Received Master Abort on the host-bridge Status (PCI 3.0 §6.2.3) and do
+//!   **not** set STA/RTA. Host [`PciConfig::latch_status_errors`] may inject
+//!   RW1C bits for tests (docs/pci-r8-status-errors.md).
 //! - Capability list walk (CapList hardwired 0 on host / ISA / IDE / USB / ACPI;
 //!   the Capabilities Pointer at `0x34` is read-only zero to match)
 //! - PCI interrupts: every function's Interrupt Pin is read-only zero, because
@@ -1596,12 +1598,41 @@ impl PciConfig {
     /// — "Received Master Abort: This bit must be set by a master device
     /// whenever its transaction (except for Special Cycle) is terminated with
     /// Master-Abort." Mechanism #1 config cycles are initiated by the host
-    /// bridge, so an absent target sets this bit there (RW1C).
+    /// bridge, so an absent target sets this bit there (RW1C). Signaled /
+    /// Received Target Abort are not set by a Master-Abort completion
+    /// (docs/pci-r8-status-errors.md).
     fn set_host_bridge_received_master_abort(&mut self) {
         let st = PCI_STATUS_OFFSET as usize;
         let mut status = u16::from_le_bytes([self.host_bridge[st], self.host_bridge[st + 1]]);
         status |= PCI_STATUS_REC_MASTER_ABORT;
         self.host_bridge[st..st + 2].copy_from_slice(&status.to_le_bytes());
+    }
+
+    /// OR RW1C Status error bits onto a present function (host / test inject).
+    ///
+    /// Spec: PCI 3.0 §6.2.3 — devices latch MDPE/STA/RTA/RMA/SSE/DPE on real
+    /// error events. This tree auto-latches only host-bridge RMA on config
+    /// Master-Abort; callers may inject other RW1C bits for honesty tests or
+    /// future data-path hooks. Returns `false` when the address is absent or
+    /// `bits` is empty / outside [`PCI_STATUS_RW1C_MASK`].
+    pub fn latch_status_errors(&mut self, bus: u8, device: u8, function: u8, bits: u16) -> bool {
+        let masked = bits & PCI_STATUS_RW1C_MASK;
+        if masked == 0 || masked != bits {
+            return false;
+        }
+        // Temporarily select the target so `selected_cfg_mut` resolves it.
+        let saved = self.address;
+        self.address = Self::make_address(bus, device, function, PCI_STATUS_OFFSET, true);
+        let Some(cfg) = self.selected_cfg_mut() else {
+            self.address = saved;
+            return false;
+        };
+        let st = PCI_STATUS_OFFSET as usize;
+        let mut status = u16::from_le_bytes([cfg[st], cfg[st + 1]]);
+        status |= masked;
+        cfg[st..st + 2].copy_from_slice(&status.to_le_bytes());
+        self.address = saved;
+        true
     }
 
     fn write_data(&mut self, size: u8, port: u16, value: u32) {

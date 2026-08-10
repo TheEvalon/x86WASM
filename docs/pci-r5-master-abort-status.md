@@ -22,4 +22,6 @@ I/O and do **not** set the bit.
 ## Not implemented
 
 - Received Master Abort from non-config bus masters.
-- Signaled/Received Target Abort, parity, SERR latching from real data paths.
+- Signaled/Received Target Abort, parity, SERR latching from real data paths
+  (host may inject RW1C bits via `PciConfig::latch_status_errors` —
+  docs/pci-r8-status-errors.md).
