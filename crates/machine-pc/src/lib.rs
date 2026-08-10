@@ -8,12 +8,14 @@
 
 #![forbid(unsafe_code)]
 
+mod bda_kbd;
 mod eltorito_load;
 mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
 mod int10;
 mod int13;
+mod int15_apm;
 mod int16;
 mod ioapic_wire;
 mod lapic_wire;
@@ -30,6 +32,10 @@ mod vga_font;
 mod vga_frame;
 mod xbcs;
 
+pub use bda_kbd::{
+    BDA_KBD_BUF_END_OFF, BDA_KBD_BUF_START, BDA_KBD_BUF_START_OFF, BDA_KBD_CAPACITY, BDA_KBD_HEAD,
+    BDA_KBD_TAIL, BDA_PHYS_BASE,
+};
 pub use guest_boot::{
     classify_guest_first_failure, synthetic_freedos_like_disk, synthetic_linux_serial_stub_disk,
     GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GuestFailureSite,
@@ -62,6 +68,11 @@ pub use int13::{
     INT13_FLOPPY_TYPE_1440, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE, INT13_STATUS_INVALID,
     INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
     INT13_STATUS_WRITE_PROTECTED,
+};
+pub use int15_apm::{
+    APM_AL_CONNECT_16, APM_AL_CONNECT_32, APM_AL_CONNECT_REAL, APM_AL_DISCONNECT,
+    APM_AL_INSTALLATION_CHECK, APM_ERR_INTERFACE_CONNECTED, APM_ERR_INTERFACE_NOT_CONNECTED,
+    APM_ERR_UNSUPPORTED, APM_VERSION_MAJOR, APM_VERSION_MINOR, INT15_AH_APM, INT15_VECTOR,
 };
 pub use int16::{Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_GET_KEYSTROKE, INT16_BUFFER_CAP};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
@@ -251,6 +262,10 @@ pub struct Machine {
     fw_cfg_boot_order: FwCfgBootOrderPolicy,
     /// Host INT 16h typeahead buffer (AH=00/01 stub; not the BDA ring).
     int16_buf: Vec<crate::int16::Int16Key>,
+    /// Host APM BIOS 1.2 real-mode interface connected (INT 15h AH=53h stub).
+    ///
+    /// Not real SMM — connect state only for the installation/connect subset.
+    apm_rm_connected: bool,
 }
 
 impl Machine {
@@ -287,6 +302,7 @@ impl Machine {
             ide_disk_sectors: None,
             fw_cfg_boot_order: FwCfgBootOrderPolicy::Default,
             int16_buf: Vec::new(),
+            apm_rm_connected: false,
         };
         machine
             .mem
@@ -742,6 +758,7 @@ impl Machine {
         self.fw_cfg.reset();
         self.post_diag.reset();
         self.int16_buf.clear();
+        self.apm_rm_connected = false;
         // Configuration survives reset (like the fw_cfg host configuration);
         // only partial timer quanta are dropped.
         self.step_clock.reset_accumulators();
@@ -1218,6 +1235,24 @@ impl Machine {
         }
         self.cpu.request_nmi();
         true
+    }
+
+    /// Latch port `0x61` parity-check status and deliver `#NMI` when enabled.
+    ///
+    /// Spec: IBM PC/AT System Control Port B — bit7 status + bit2 enable; CMOS
+    /// `0x70` bit7 still masks delivery. No real DRAM parity hardware.
+    pub fn inject_parity_nmi(&mut self) -> bool {
+        let want = self.pit.assert_parity_error();
+        want && self.inject_nmi()
+    }
+
+    /// Latch port `0x61` IOCHK status and deliver `#NMI` when enabled.
+    ///
+    /// Spec: IBM PC/AT System Control Port B — bit6 status + bit3 enable; CMOS
+    /// `0x70` bit7 still masks delivery. No real ISA IOCHK hardware.
+    pub fn inject_iochk_nmi(&mut self) -> bool {
+        let want = self.pit.assert_iochk_error();
+        want && self.inject_nmi()
     }
 
     /// Bounded PIIX BMIDE one-PRD Read stub against [`PhysMem`].
@@ -1949,8 +1984,9 @@ mod tests {
         FW_CFG_SIGNATURE, FW_CFG_SIGNATURE_BYTES, FW_CFG_VERSION, FW_CFG_VERSION_DMA, I8042,
         I8042_DATA, I8042_STATUS_CMD, LPT_STATUS_NO_PRINTER, PCI_CONFIG_ADDRESS, PCI_CONFIG_DATA,
         PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD, PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
-        PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL, PORT61_GATE2,
-        PORT61_OUT2, PORT61_SPKR_DATA, PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL,
+        PIIX_ELCR_MASTER, PIIX_ELCR_SLAVE, PIT_CH0_DATA, PIT_CH2_DATA, PIT_CONTROL,
+        PORT61_ENABLE_PARITY, PORT61_GATE2, PORT61_OUT2, PORT61_PARITY_STATUS, PORT61_SPKR_DATA,
+        PORT92_A20, PORT92_RESET, PORT_SYSTEM_CONTROL,
         PORT_SYSTEM_CONTROL_A, REG_STATUS_A, REG_STATUS_B, REG_STATUS_C, SELF_TEST_OK,
         STATUS_AUX_OBF, STATUS_IBF, STATUS_OBF, STB_PIE, STC_IRQF, STC_PF, VGA_CRTC_DATA,
         VGA_CRTC_INDEX, VGA_DAC_DATA, VGA_DAC_READ_INDEX, VGA_DAC_WRITE_INDEX,
@@ -5101,5 +5137,20 @@ mod tests {
             *byte = bus.port_in_u8(FW_CFG_DATA).unwrap();
         }
         assert_eq!(ram_size, (RAM_SIZE as u64).to_le_bytes());
+    }
+
+    /// Spec: IBM PC/AT port 0x61 — parity NMI needs bit2 enable; CMOS 0x70 bit7 masks.
+    #[test]
+    fn inject_parity_nmi_requires_port61_enable() {
+        let mut m = Machine::new(64 * 1024);
+        // CMOS index bit7 clear → NMI delivery allowed; port61 parity enable off.
+        m.cmos.write_index(0x00);
+        assert!(!m.inject_parity_nmi());
+        assert!(m.pit.port61_read() & PORT61_PARITY_STATUS != 0);
+        assert!(!m.cpu.pending_nmi);
+
+        m.pit.port61_write(PORT61_ENABLE_PARITY | PORT61_PARITY_STATUS); // clear status, enable
+        assert!(m.inject_parity_nmi());
+        assert!(m.cpu.pending_nmi);
     }
 }

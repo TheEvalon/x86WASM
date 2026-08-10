@@ -44,7 +44,8 @@
 //! - DRAM refresh *bus-cycle* side effects (only the ch1 OUT / refresh request
 //!   pin is modeled); host PC-speaker audio output
 //! - Host-real-time wall-clock rate (callers choose tick quantum)
-//! - Port `0x61` NMI/parity side effects (bits other than 0/1/4/5)
+//! - Real DRAM parity / ISA IOCHK hardware error generation (host inject only;
+//!   port `0x61` bits 2/3/6/7 enable+status are modeled)
 //! - Invalid BCD digit programming (nibbles A–F): decode treats each nibble as a
 //!   weighted decade digit; hardware behavior for illegal BCD is unspecified
 //!
@@ -75,10 +76,26 @@ pub const PORT_SYSTEM_CONTROL: u16 = 0x61;
 pub const PORT61_GATE2: u8 = 1 << 0;
 /// Port `0x61` bit1: speaker data enable (latched; no host audio).
 pub const PORT61_SPKR_DATA: u8 = 1 << 1;
+/// Port `0x61` bit2: enable RAM parity check → `#NMI` when status latches.
+///
+/// Spec: IBM PC/AT System Control Port B — bit2 enables parity-check NMI.
+pub const PORT61_ENABLE_PARITY: u8 = 1 << 2;
+/// Port `0x61` bit3: enable I/O channel check (IOCHK) → `#NMI` when status latches.
+///
+/// Spec: IBM PC/AT System Control Port B — bit3 enables channel-check NMI.
+pub const PORT61_ENABLE_IOCHK: u8 = 1 << 3;
 /// Port `0x61` bit4: read-only refresh-detect toggle driven by channel 1.
 pub const PORT61_REFRESH_TOGGLE: u8 = 1 << 4;
 /// Port `0x61` bit5: PIT channel 2 OUT (read).
 pub const PORT61_OUT2: u8 = 1 << 5;
+/// Port `0x61` bit6: I/O channel check status (read); write-1 clears.
+pub const PORT61_IOCHK_STATUS: u8 = 1 << 6;
+/// Port `0x61` bit7: RAM parity check status (read); write-1 clears.
+pub const PORT61_PARITY_STATUS: u8 = 1 << 7;
+
+/// Writable latch mask for port `0x61` bits 3:0.
+const PORT61_WRITABLE: u8 =
+    PORT61_GATE2 | PORT61_SPKR_DATA | PORT61_ENABLE_PARITY | PORT61_ENABLE_IOCHK;
 
 /// Control-word SC field: select channel / latch / read-back.
 const CW_SC_SHIFT: u8 = 6;
@@ -669,10 +686,14 @@ impl PitChannel {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pit8254 {
     pub channels: [PitChannel; 3],
-    /// Port `0x61` bits 1:0 — GATE2 + speaker data enable (no host audio).
+    /// Port `0x61` bits 3:0 — GATE2, speaker data, parity/IOCHK enables.
     port61_lo: u8,
     /// Port `0x61` bit4 — toggles on every channel-1 refresh rising edge.
     refresh_detect: bool,
+    /// Port `0x61` bit6 — latched I/O channel check status (host inject).
+    iochk_status: bool,
+    /// Port `0x61` bit7 — latched RAM parity check status (host inject).
+    parity_status: bool,
 }
 
 impl Pit8254 {
@@ -681,6 +702,8 @@ impl Pit8254 {
             channels: [PitChannel::new(), PitChannel::new(), PitChannel::new()],
             port61_lo: 0,
             refresh_detect: false,
+            iochk_status: false,
+            parity_status: false,
         };
         // Ch2 GATE follows port 0x61 bit0 (cleared at reset → GATE low).
         s.channels[2].gate = false;
@@ -693,6 +716,8 @@ impl Pit8254 {
         }
         self.port61_lo = 0;
         self.refresh_detect = false;
+        self.iochk_status = false;
+        self.parity_status = false;
         self.channels[2].gate = false;
     }
 
@@ -764,27 +789,72 @@ impl Pit8254 {
         }
     }
 
-    /// Read system control port B subset: bits 1:0 latched, bit4 refresh detect,
-    /// and bit5 = ch2 OUT.
+    /// Read system control port B: bits 3:0 latched, bit4 refresh detect,
+    /// bit5 = ch2 OUT, bits 7:6 parity/IOCHK status.
     ///
     /// Spec: IBM PC/AT System Control Port B — bit0 GATE2, bit1 speaker data,
-    /// bit4 refresh detect, bit5 OUT2.
+    /// bit2 enable parity check, bit3 enable IOCHK, bit4 refresh detect,
+    /// bit5 OUT2, bit6 IOCHK status, bit7 parity status.
     pub fn port61_read(&self) -> u8 {
-        let mut v = self.port61_lo & (PORT61_GATE2 | PORT61_SPKR_DATA);
+        let mut v = self.port61_lo & PORT61_WRITABLE;
         if self.refresh_detect {
             v |= PORT61_REFRESH_TOGGLE;
         }
         if self.out_ch2() {
             v |= PORT61_OUT2;
         }
+        if self.iochk_status {
+            v |= PORT61_IOCHK_STATUS;
+        }
+        if self.parity_status {
+            v |= PORT61_PARITY_STATUS;
+        }
         v
     }
 
-    /// Write system control port B subset (bits 1:0). Updates ch2 GATE; read-only
-    /// refresh-detect bit4 and OUT2 bit5 are ignored.
+    /// Write system control port B bits 3:0; write-1 clears status bits 7:6.
+    ///
+    /// Spec: IBM PC/AT — bits 3:0 are latched enables/gates; writing `1` to
+    /// bit6 clears IOCHK status and writing `1` to bit7 clears parity status.
+    /// Read-only refresh-detect bit4 and OUT2 bit5 are ignored on write.
     pub fn port61_write(&mut self, value: u8) {
-        self.port61_lo = value & (PORT61_GATE2 | PORT61_SPKR_DATA);
+        self.port61_lo = value & PORT61_WRITABLE;
         self.channels[2].set_gate(self.port61_lo & PORT61_GATE2 != 0);
+        if value & PORT61_IOCHK_STATUS != 0 {
+            self.iochk_status = false;
+        }
+        if value & PORT61_PARITY_STATUS != 0 {
+            self.parity_status = false;
+        }
+    }
+
+    /// Whether RAM parity-check NMI is enabled (port `0x61` bit2).
+    pub fn parity_nmi_enabled(&self) -> bool {
+        self.port61_lo & PORT61_ENABLE_PARITY != 0
+    }
+
+    /// Whether I/O channel-check NMI is enabled (port `0x61` bit3).
+    pub fn iochk_nmi_enabled(&self) -> bool {
+        self.port61_lo & PORT61_ENABLE_IOCHK != 0
+    }
+
+    /// Latch RAM parity-check status (bit7). Returns `true` when bit2 enable
+    /// is set so the platform should deliver `#NMI` (CMOS mask still applies).
+    ///
+    /// Spec: IBM PC/AT — parity error sets status and raises NMI when enabled.
+    /// This model has no real DRAM parity hardware; host/tests call this.
+    pub fn assert_parity_error(&mut self) -> bool {
+        self.parity_status = true;
+        self.parity_nmi_enabled()
+    }
+
+    /// Latch I/O channel-check status (bit6). Returns `true` when bit3 enable
+    /// is set so the platform should deliver `#NMI` (CMOS mask still applies).
+    ///
+    /// Spec: IBM PC/AT — IOCHK sets status and raises NMI when enabled.
+    pub fn assert_iochk_error(&mut self) -> bool {
+        self.iochk_status = true;
+        self.iochk_nmi_enabled()
     }
 
     /// Advance channel 0 by `clocks` model ticks.
@@ -1535,6 +1605,56 @@ mod tests {
 
         pit.reset();
         assert_eq!(pit.port61_read() & PORT61_REFRESH_TOGGLE, 0);
+    }
+
+    /// Spec: IBM PC/AT System Control Port B — bit2/3 enables + bit6/7 status
+    /// with write-1 clear; host inject latches status and reports NMI request.
+    #[test]
+    fn port61_parity_iochk_enable_status_and_clear() {
+        let mut pit = Pit8254::new();
+        assert_eq!(
+            pit.port61_read() & (PORT61_ENABLE_PARITY | PORT61_ENABLE_IOCHK),
+            0
+        );
+        assert!(!pit.assert_parity_error());
+        assert_ne!(pit.port61_read() & PORT61_PARITY_STATUS, 0);
+        assert!(!pit.assert_iochk_error());
+        assert_ne!(pit.port61_read() & PORT61_IOCHK_STATUS, 0);
+
+        pit.port61_write(PORT61_ENABLE_PARITY | PORT61_ENABLE_IOCHK);
+        assert!(pit.parity_nmi_enabled());
+        assert!(pit.iochk_nmi_enabled());
+        assert!(pit.assert_parity_error());
+        assert!(pit.assert_iochk_error());
+        assert_eq!(
+            pit.port61_read()
+                & (PORT61_ENABLE_PARITY
+                    | PORT61_ENABLE_IOCHK
+                    | PORT61_PARITY_STATUS
+                    | PORT61_IOCHK_STATUS),
+            PORT61_ENABLE_PARITY | PORT61_ENABLE_IOCHK | PORT61_PARITY_STATUS | PORT61_IOCHK_STATUS
+        );
+
+        // Write-1 clears status; enables stay latched.
+        pit.port61_write(
+            PORT61_ENABLE_PARITY | PORT61_ENABLE_IOCHK | PORT61_PARITY_STATUS | PORT61_IOCHK_STATUS,
+        );
+        assert_eq!(
+            pit.port61_read() & (PORT61_PARITY_STATUS | PORT61_IOCHK_STATUS),
+            0
+        );
+        assert!(pit.parity_nmi_enabled());
+        assert!(pit.iochk_nmi_enabled());
+
+        pit.reset();
+        assert_eq!(
+            pit.port61_read()
+                & (PORT61_ENABLE_PARITY
+                    | PORT61_ENABLE_IOCHK
+                    | PORT61_PARITY_STATUS
+                    | PORT61_IOCHK_STATUS),
+            0
+        );
     }
 
     /// Spec: IBM PC/AT port 0x61 — bit0 GATE2, bit1 speaker data, bit5 OUT2.
