@@ -7503,8 +7503,9 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             // INT3 — one-byte breakpoint; saved return IP is the following byte.
             // Spec: Intel SDM Vol. 2 "INT3"; Vol. 3 §§6.4, 6.12.1, 20.2.2.
             // Not IOPL-sensitive in VM86 (Table 20-1). Uses the VM86→CPL0
-            // 9-dword frame when VM=1. Unsupported: ICEBP/INT1 (`F1`) — remains
-            // a sparse-table decode miss (not silent #DB).
+            // 9-dword frame when VM=1. **Not** governed by the VME software-
+            // interrupt redirection bitmap (that applies only to `INT n`).
+            // Unsupported: ICEBP/INT1 (`F1`); TF/#DB single-step under VME.
             deliver_software_interrupt(cpu, bus, 3, next_ip)?;
         }
         0xCD => {
