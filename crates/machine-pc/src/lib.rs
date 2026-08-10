@@ -12,6 +12,7 @@ mod eltorito_load;
 mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
+mod int10;
 mod int13;
 mod int16;
 mod ioapic_wire;
@@ -33,6 +34,11 @@ pub use guest_boot::{
     GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GUEST_BOOT_MEASURE_VERSION,
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
+pub use int10::{
+    setup_int10_set_mode, setup_int10_teletype, BDA_ACTIVE_PAGE, BDA_CURSOR_PAGE0, BDA_VIDEO_COLS,
+    BDA_VIDEO_MODE, INT10_AH_SET_MODE, INT10_AH_TELETYPE, INT10_MODE_03H_TEXT,
+    INT10_MODE_13H_GRAPHICS, INT10_VECTOR,
+};
 pub use int13::{
     chs_to_lba, pack_cx, setup_int13_hd_ext_read, setup_int13_hd_read, setup_int13_hd_write,
     unpack_cx, INT13_AH_CHECK_EXTENSIONS, INT13_AH_EXT_READ, INT13_AH_EXT_WRITE,
@@ -49,7 +55,8 @@ pub use mem::{
     PAM_REGISTER_LAST, PAM_WINDOW_BASE, PAM_WINDOW_END,
 };
 pub use option_rom_invoke::{
-    OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET, OPTION_ROM_RESUME_PHYS,
+    OptionRomScanHit, OPTION_ROM_INVOKE_DEFAULT_SP, OPTION_ROM_INVOKE_ENTRY_OFFSET,
+    OPTION_ROM_RESUME_PHYS,
 };
 pub use ports::{
     UnclaimedPortAccess, UnmappedMmioAccess, UNCLAIMED_PORT_LIMIT, UNMAPPED_MMIO_LIMIT,
@@ -145,6 +152,9 @@ pub enum MachineError {
     /// Real-mode stack could not accept the far-call return frame.
     #[error("option ROM invoke stack fault")]
     OptionRomStackFault,
+    /// POST-style option-ROM invoke did not return to the resume CS:IP in budget.
+    #[error("option ROM scan invoke did not return to resume point")]
+    OptionRomScanDidNotReturn,
 }
 
 /// Host override for fw_cfg `bootorder`, or the machine default when `Default`.

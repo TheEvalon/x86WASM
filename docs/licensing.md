@@ -52,6 +52,8 @@ an explicit review allows committing it.
 
 **No `vgabios.bin` is committed.** R7 (2026-08-10) confirmed the Windows host
 cannot build in-session; use Linux/WSL2 per `docs/firmware-r7-seavgabios-build.md`.
+R9 adds `firmware/build-scripts/smoke-seavgabios-linux.sh` and
+`docs/firmware-r9-seavgabios-linux-smoke.md` (preflight + optional `--build`).
 The pin and the notices remain the committed surface ahead of a CI/local Linux build.
 
 ## Provenance rules

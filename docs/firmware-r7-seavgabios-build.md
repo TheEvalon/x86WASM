@@ -26,6 +26,10 @@ Build config (honest for this emulator): `CONFIG_QEMU=y`, `CONFIG_VGA_STANDARD_V
 
 This R7 worktree session ran on **Windows 10** without a usable WSL bash (`wsl … bash` → no bash). Native Win32 lacks the i386/`-m32` GNU toolchain SeaVGABIOS expects. **The ROM was not built in-session.** Artifacts remain gitignored; no binary is committed.
 
+R9 smoke: `firmware/build-scripts/smoke-seavgabios-linux.sh --preflight` validates
+scripts/pin/header checker without a full build;
+`--build` remains Linux/WSL-only (`docs/firmware-r9-seavgabios-linux-smoke.md`).
+
 ## Reproducible Linux / WSL2 steps
 
 On Ubuntu 22.04+ (native or WSL2):
