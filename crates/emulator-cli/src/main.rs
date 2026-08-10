@@ -1,8 +1,9 @@
 //! Native CLI: run a ROM/BIOS (default: built-in HELLO ROM) until HLT.
 
 use emulator_cli::{
-    build_machine, parse_args, run_machine, run_post_probe_options, usage, vga_frame_report,
-    vga_text_dump, BuiltMachine, CliError, Options, ParsedArgs,
+    build_machine, guest_boot_media, parse_args, run_guest_measure, run_machine,
+    run_post_probe_options, usage, vga_frame_report, vga_text_dump, BuiltMachine, CliError,
+    Options, ParsedArgs,
 };
 use machine_pc::Machine;
 use std::env;
@@ -26,6 +27,7 @@ fn arg_exit_code(e: &CliError) -> ExitCode {
     match e {
         CliError::UnknownArgument(_)
         | CliError::RomAndBios
+        | CliError::GuestMeasureNeedsImage
         | CliError::MissingValue(_)
         | CliError::InvalidSteps(_)
         | CliError::InvalidAddress(_) => ExitCode::from(2),
@@ -58,6 +60,21 @@ fn main() -> ExitCode {
         }
     };
     let option_rom_line = option_rom.map(|info| info.to_string());
+
+    if opts.guest_measure {
+        match run_guest_measure(&mut machine, guest_boot_media(&opts), opts.max_steps) {
+            Ok(measure) => {
+                println!("{measure}");
+                print_diagnostics(&machine, option_rom_line, &opts);
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                print_diagnostics(&machine, option_rom_line, &opts);
+                return arg_exit_code(&e);
+            }
+        }
+    }
 
     if opts.post_probe {
         println!(
