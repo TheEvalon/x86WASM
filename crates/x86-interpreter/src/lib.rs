@@ -7747,6 +7747,26 @@ fn step_inner(cpu: &mut CpuState, bus: &mut dyn Bus) -> Result<(), ExecError> {
             }
             set_current_ip(cpu, next_ip);
         }
+        0x63 => {
+            // ARPL r/m16, r16 — Spec: Intel SDM Vol. 2 "ARPL".
+            // Real-address / virtual-8086 mode → #UD. Always 16-bit operands.
+            // If DEST.RPL < SRC.RPL, set DEST.RPL = SRC.RPL and ZF=1; else ZF=0.
+            if !cr0_pe(cpu) {
+                return Err(arch_fault(6));
+            }
+            let m = insn.modrm.ok_or(ExecError::Unsupported(op))?;
+            let dest = read_rm_u16(cpu, bus, &insn)?;
+            let src = cpu.gpr_u16(m.reg as usize);
+            let dest_rpl = dest & 3;
+            let src_rpl = src & 3;
+            if dest_rpl < src_rpl {
+                write_rm_u16(cpu, bus, &insn, (dest & !3) | src_rpl)?;
+                cpu.set_zf(true);
+            } else {
+                cpu.set_zf(false);
+            }
+            set_current_ip(cpu, next_ip);
+        }
         0x8F => {
             // POP r/m16|32 — Group /0 only.
             // Spec: Intel SDM Vol. 2 "POP"; Ch. 2 (66H).

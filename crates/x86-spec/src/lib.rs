@@ -932,6 +932,13 @@ pub const M1_SUBSET: &[InstrDef] = &[
         sdm: "BOUND",
     },
     InstrDef {
+        mnemonic: "ARPL",
+        opcode: 0x63,
+        encoding: Encoding::Modrm,
+        width: Width::W16,
+        sdm: "ARPL",
+    },
+    InstrDef {
         mnemonic: "POP",
         opcode: 0x8F,
         encoding: Encoding::Modrm,
