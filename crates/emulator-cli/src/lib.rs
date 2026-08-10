@@ -2,8 +2,9 @@
 
 use devices::{VgaRenderMode, VGA_TEXT_COLS, VGA_TEXT_ROWS};
 use machine_pc::{
-    build_hello_rom, Machine, MachineError, PostReport, PostSpinConfig, PostTraceConfig,
-    TracedPostReport, DEFAULT_POST_SPIN_WINDOW, DEFAULT_POST_TRACE_CAPACITY, EXPECTED_HELLO,
+    build_hello_rom, GuestBootMeasure, GuestBootMedia, Machine, MachineError, PostReport,
+    PostSpinConfig, PostTraceConfig, TracedPostReport, DEFAULT_POST_SPIN_WINDOW,
+    DEFAULT_POST_TRACE_CAPACITY, EXPECTED_HELLO,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,6 +53,16 @@ pub struct Options {
     pub option_rom_path: Option<PathBuf>,
     /// Physical base for [`Options::option_rom_path`].
     pub option_rom_base: u64,
+    /// Raw IDE disk image for guest boot measure / attach.
+    pub ide_image: Option<PathBuf>,
+    /// Raw 1.44MB floppy image for guest boot measure / attach.
+    pub floppy_image: Option<PathBuf>,
+    /// Measure-first guest boot (load MBR/VBR → `0x7C00`, probe first stop).
+    ///
+    /// Does **not** claim FreeDOS/Linux boot success.
+    pub guest_measure: bool,
+    /// When [`Options::guest_measure`] is set with both images, prefer floppy.
+    pub guest_floppy_first: bool,
 }
 
 impl Default for Options {
@@ -67,6 +78,10 @@ impl Default for Options {
             vga_frame: false,
             option_rom_path: None,
             option_rom_base: DEFAULT_OPTION_ROM_BASE,
+            ide_image: None,
+            floppy_image: None,
+            guest_measure: false,
+            guest_floppy_first: false,
         }
     }
 }
@@ -171,6 +186,7 @@ pub struct BuiltMachine {
 
 /// Result of parsing argv (excluding program name).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // `Options` carries several PathBufs for CLI media/firmware.
 pub enum ParsedArgs {
     Help,
     Run(Options),
@@ -255,6 +271,7 @@ pub enum CliError {
     InvalidSteps(String),
     InvalidAddress(String),
     RomAndBios,
+    GuestMeasureNeedsImage,
     Io(String),
     Machine(String),
     Execution(ExecutionFailure),
@@ -268,6 +285,10 @@ impl std::fmt::Display for CliError {
             Self::InvalidSteps(v) => write!(f, "Invalid --steps value: {v}"),
             Self::InvalidAddress(v) => write!(f, "Invalid --option-rom-base value: {v}"),
             Self::RomAndBios => write!(f, "Use only one of --rom or --bios"),
+            Self::GuestMeasureNeedsImage => write!(
+                f,
+                "--guest-measure requires --ide-image and/or --floppy-image"
+            ),
             Self::Io(msg) => write!(f, "{msg}"),
             Self::Machine(msg) => write!(f, "{msg}"),
             Self::Execution(failure) => write!(
@@ -295,6 +316,8 @@ pub fn usage() -> String {
         "Usage: emulator-cli [--rom path.bin | --bios path.bin] [--steps N] [--post-probe]\n\
          \x20                  [--post-trace [N]] [--post-spin [N]]\n\
          \x20                  [--option-rom path.bin [--option-rom-base ADDR]]\n\
+         \x20                  [--ide-image path.bin] [--floppy-image path.img]\n\
+         \x20                  [--guest-measure [--guest-floppy-first]]\n\
          \x20                  [--vga-text] [--vga-frame]\n\
          --rom              Load a lab ROM at top-of-4GiB only (HELLO-style).\n\
          --bios             Load a legacy BIOS via dual map (top-of-4GiB + below-1MiB alias).\n\
@@ -312,6 +335,12 @@ pub fn usage() -> String {
          \x20                  55AA/size/checksum header. Mapping only: nothing scans or\n\
          \x20                  executes option ROMs yet.\n\
          --option-rom-base  Physical base for --option-rom (default 0x{DEFAULT_OPTION_ROM_BASE:05X}).\n\
+         --ide-image        Attach a raw IDE disk image (primary master).\n\
+         --floppy-image     Attach a raw 1.44MB floppy image.\n\
+         --guest-measure    Load boot sector to 0x7C00 and report the first stop reason\n\
+         \x20                  (measure-first; not a FreeDOS/Linux boot-success claim).\n\
+         \x20                  Requires --ide-image and/or --floppy-image.\n\
+         --guest-floppy-first  With --guest-measure, force floppy CHS (0,0,1) handoff.\n\
          --vga-text         Dump the {VGA_TEXT_COLS}x{VGA_TEXT_ROWS} VGA text buffer after the run.\n\
          --vga-frame        Render the display through the VGA display fetch and report the\n\
          \x20                  frame geometry, RGBA size, and whether a font is installed.\n\
@@ -400,6 +429,18 @@ where
                     .ok_or(CliError::MissingValue("--option-rom-base"))?;
                 opts.option_rom_base = parse_address(v.as_ref())?;
             }
+            "--ide-image" => {
+                let path = iter.next().ok_or(CliError::MissingValue("--ide-image"))?;
+                opts.ide_image = Some(PathBuf::from(path.as_ref()));
+            }
+            "--floppy-image" => {
+                let path = iter
+                    .next()
+                    .ok_or(CliError::MissingValue("--floppy-image"))?;
+                opts.floppy_image = Some(PathBuf::from(path.as_ref()));
+            }
+            "--guest-measure" => opts.guest_measure = true,
+            "--guest-floppy-first" => opts.guest_floppy_first = true,
             "--steps" => {
                 let v = iter.next().ok_or(CliError::MissingValue("--steps"))?;
                 opts.max_steps = v
@@ -412,6 +453,9 @@ where
     }
     if opts.rom_path.is_some() && opts.bios_path.is_some() {
         return Err(CliError::RomAndBios);
+    }
+    if opts.guest_measure && opts.ide_image.is_none() && opts.floppy_image.is_none() {
+        return Err(CliError::GuestMeasureNeedsImage);
     }
     Ok(ParsedArgs::Run(opts))
 }
@@ -455,11 +499,42 @@ pub fn build_machine(opts: &Options) -> Result<BuiltMachine, CliError> {
         None => None,
     };
 
+    if let Some(path) = &opts.ide_image {
+        let data = read_file(path)?;
+        machine.attach_ide_image(data);
+    }
+    if let Some(path) = &opts.floppy_image {
+        let data = read_file(path)?;
+        machine
+            .attach_floppy_image(data)
+            .map_err(|e| CliError::Machine(format!("Failed to attach floppy: {e}")))?;
+    }
+
     Ok(BuiltMachine {
         machine,
         kind,
         option_rom,
     })
+}
+
+/// Media policy for [`run_guest_measure`].
+pub fn guest_boot_media(opts: &Options) -> GuestBootMedia {
+    if opts.guest_floppy_first || (opts.floppy_image.is_some() && opts.ide_image.is_none()) {
+        GuestBootMedia::FloppyFirst
+    } else {
+        GuestBootMedia::IdePrefer
+    }
+}
+
+/// Load boot sector to `0x7C00` and measure the first stop (not boot success).
+pub fn run_guest_measure(
+    machine: &mut Machine,
+    media: GuestBootMedia,
+    max_steps: u64,
+) -> Result<GuestBootMeasure, CliError> {
+    machine
+        .measure_guest_boot(media, max_steps)
+        .map_err(|e| CliError::Machine(format!("Guest measure setup failed: {e}")))
 }
 
 /// Render the 80×25 VGA text buffer as lines of text.
@@ -1321,5 +1396,92 @@ mod tests {
         let lines: Vec<&str> = dump.lines().collect();
         assert!(lines[0].contains("start=0x0050"), "{}", lines[0]);
         assert!(lines[1].starts_with("00 |Q"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn usage_mentions_guest_measure_flags() {
+        let u = usage();
+        assert!(u.contains("--guest-measure"), "{u}");
+        assert!(u.contains("--ide-image"), "{u}");
+        assert!(u.contains("--floppy-image"), "{u}");
+    }
+
+    #[test]
+    fn parse_guest_measure_requires_image() {
+        assert_eq!(
+            parse_args(["--guest-measure"]),
+            Err(CliError::GuestMeasureNeedsImage)
+        );
+    }
+
+    #[test]
+    fn parse_guest_measure_with_ide_image() {
+        let parsed = parse_args([
+            "--ide-image",
+            "disk.bin",
+            "--guest-measure",
+            "--guest-floppy-first",
+            "--steps",
+            "100",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(Options {
+                ide_image: Some(PathBuf::from("disk.bin")),
+                guest_measure: true,
+                guest_floppy_first: true,
+                max_steps: 100,
+                ..Options::default()
+            })
+        );
+    }
+
+    #[test]
+    fn guest_boot_media_policy() {
+        let ide_only = Options {
+            ide_image: Some(PathBuf::from("a")),
+            guest_measure: true,
+            ..Options::default()
+        };
+        assert_eq!(guest_boot_media(&ide_only), GuestBootMedia::IdePrefer);
+
+        let floppy_only = Options {
+            floppy_image: Some(PathBuf::from("b")),
+            guest_measure: true,
+            ..Options::default()
+        };
+        assert_eq!(guest_boot_media(&floppy_only), GuestBootMedia::FloppyFirst);
+
+        let both_force = Options {
+            ide_image: Some(PathBuf::from("a")),
+            floppy_image: Some(PathBuf::from("b")),
+            guest_floppy_first: true,
+            ..Options::default()
+        };
+        assert_eq!(guest_boot_media(&both_force), GuestBootMedia::FloppyFirst);
+    }
+
+    /// Synthetic IDE MBR → measure-first halt (not a boot-success claim).
+    #[test]
+    fn guest_measure_synthetic_ide_hlt() {
+        let mut sector = vec![0x90u8; 512];
+        sector[0] = 0xF4;
+        sector[510] = 0x55;
+        sector[511] = 0xAA;
+        let file = TempFile::create("guest-mbr", &sector);
+        let opts = Options {
+            ide_image: Some(file.0.clone()),
+            guest_measure: true,
+            max_steps: 64,
+            ..Options::default()
+        };
+        let BuiltMachine { mut machine, .. } = build_machine(&opts).expect("build");
+        let measure =
+            run_guest_measure(&mut machine, guest_boot_media(&opts), opts.max_steps).expect("run");
+        let text = measure.to_string();
+        assert!(text.contains("guest-measure:"));
+        assert!(text.contains("not a boot-success claim"));
+        assert!(text.contains("halted"), "{text}");
     }
 }

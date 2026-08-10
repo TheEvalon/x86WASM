@@ -7,15 +7,15 @@ Classic PC subset for firmware and OS bring-up. See ADR `docs/adr/0001-machine-m
 - Contiguous RAM from physical `0` (default size configurable; CLI default 16 MiB).
 - ROM window mapped at `0xFFFF_0000` (64 KiB) so the Intel reset vector at `CS.base + 0xFFF0` = `0xFFFF_FFF0` fetches ROM (HELLO / `load_rom`).
 - BIOS path (`Machine::load_bios_rom` / `with_bios_rom` via `firmware_interface::prepare_bios_rom`): image right-aligned under 4 GiB; last ≤128 KiB also aliased below 1 MiB (`0x000F_0000` for 64 KiB, `0x000E_0000` for 128 KiB). Mapping only — not SeaBIOS POST.
-- Boot-sector handoff (`Machine::load_mbr_to_7c00`): host copies LBA0 from primary IDE (`attach_ide_image` / `with_ide`) or, if IDE absent, floppy CHS `(0,0,1)` into physical `0x7C00` (512 bytes), requires classic `0x55AA` signature, sets `CS:IP = 0000:7C00`. Not INT 13h / SeaBIOS POST.
+- Boot-sector handoff (`Machine::load_mbr_to_7c00`): host copies LBA0 from primary IDE (`attach_ide_image` / `with_ide`) or, if IDE absent, floppy CHS `(0,0,1)` into physical `0x7C00` (512 bytes), requires classic `0x55AA` signature, sets `CS:IP = 0000:7C00`. Explicit floppy-first: `Machine::load_floppy_boot_to_7c00`. Host INT 13h HD subset: `Machine::service_int13_hd` (AH=00/02/08, `DL=80h`). Not SeaBIOS POST / full INT 13h.
 - A20 gate on `PhysMem`: when disabled, physical address bit 20 is forced clear on CPU bus read/write. Controlled by 8042 output-port bit1 (`0xD1` write / `0xD0` read) and System Control Port A (`0x92`) bit1 (Fast Gate A20); `MachineBus` mirrors bit1 between the two so either path updates `PhysMem`. Reset default: A20 enabled.
 
 ## Port I/O (M1 + M2 partial)
 
 | Port | Device |
 |---|---|
-| `0x3F8`–`0x3FF` | COM1 — THR writes emit guest serial bytes; IER bit1 / IIR THRE latch modeled at device level; LSR THRE/TEMT polling; external IRQ4 routing is not wired |
-| `0x2F8`–`0x2FF` | COM2 — same THRE-capable 16550 subset as COM1 with a separate sink; external IRQ3 routing is not wired |
+| `0x3F8`–`0x3FF` | COM1 — THR TX sink; host `push_rx` → RBR + LSR.DR; IER ERBFI/ETBEI; IIR RDA (`0x04`) priority over THRE (`0x02`); IRQ4 via `poll_external_irq` / `sync_com1_irq4` |
+| `0x2F8`–`0x2FF` | COM2 — same 16550 subset as COM1; IRQ3 via `sync_com2_irq3` |
 | `0x402` | Debug console (Bochs/QEMU-style; write = one output byte) |
 | `0x20` / `0x21` | 8259A master PIC (command / data) ? ICW + OCW1/EOI/IRR/ISR/poll |
 | `0xA0` / `0xA1` | 8259A slave PIC (command / data) ? ICW + OCW1/EOI/IRR/ISR/poll |
@@ -88,7 +88,7 @@ Unit models owned by `machine-pc::Machine` and decoded on `MachineBus`: `devices
 
 ## Spec / oracle notes
 
-- Serial: NS16550A-compatible programming model (subset) — COM1 `0x3F8`–`0x3FF` and COM2 `0x2F8`–`0x2FF`; THR (DLAB=0) emits host-captured bytes; RBR empty; LSR THR/transmitter empty bits always set for polling OUT. IER bit1 enables a device-level THRE request; IIR reports `0x02` and clears it, while a synchronous THR drain reasserts it. COM IRQ3/IRQ4 routing, FIFOs, receive data, modem sources, and other UART side effects remain unsupported.
+- Serial: NS16550A-compatible programming model (subset) — COM1 `0x3F8`–`0x3FF` and COM2 `0x2F8`–`0x2FF`; THR (DLAB=0) emits host-captured bytes; host `push_rx` fills RBR and sets LSR.DR; LSR THRE/TEMT always set for polling OUT. IER bit0 (ERBFI) / bit1 (ETBEI); IIR RDA `0x04` (priority) and THRE `0x02` (clear-on-IIR-read). COM1/COM2 `irq_line` → IRQ4/IRQ3. FIFOs, line/modem status IRQs, and baud-timed RX remain unsupported.
 - Debug port `0x402`: widely used by SeaBIOS/QEMU guests for early console; treat as write-only byte sink for M1.
 - 8259A: Intel 8259A Programmable Interrupt Controller datasheet (ICW1â€“ICW4 incl. ICW1.LTIM level/edge trigger, AEOI + SFNM, OCW1â€“OCW3 EOI/IMR/IRR/ISR, OCW2 Automatic Rotation + Specific Rotation, OCW3 format + Poll Command + Special Mask Mode `ESMM`/`SMM`, DEFAULT IR7 when IR drops before first INTA); classic PC cascade on IRQ2.
 - 8254: Intel 8254 PIT datasheet â€” channels 0/1/2 control word, lo/hi access, counter latch, Read-Back command (`SC=11` COUNT/STATUS/CNTn + status byte OUT/NULL COUNT/RW/M/BCD), BCD=1 four-decade counting (written 0 â†’ 10_000), "Mode Definitions" modes 0/1/2/3/4/5 OUT + GATE-pin operations summary; ch0 OUT â†’ IRQ0 via `Machine::tick_pit` / `poll_external_irq` level follow; ch1 mode-2 refresh OUT through explicit `Pit8254::tick_ch1` (no IRQ), with each rising edge toggling read-only System Control Port B bit4; ch2 GATE/OUT via port `0x61`. No host audio, DRAM-refresh bus-cycle side effects, NMI/parity bits, or host-real-time claims.

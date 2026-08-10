@@ -54,17 +54,37 @@ impl Machine {
     ///
     /// Spec: IBM PC BIOS INT 19h / OSDev Boot Sequence — MBR at `0000:7C00`.
     /// Does **not** run SeaBIOS POST or INT 13h; host-side media→RAM copy only.
+    /// For an explicit floppy-first handoff even when IDE is attached, use
+    /// [`Self::load_floppy_boot_to_7c00`].
     pub fn load_mbr_to_7c00(&mut self) -> Result<(), MachineError> {
+        let sector = self
+            .read_boot_sector_ide_prefer()?
+            .ok_or(MachineError::NoBootMedia)?;
+        self.install_boot_sector_at_7c00(&sector)
+    }
+
+    /// Load floppy CHS `(0,0,1)` into phys [`MBR_PHYS_ADDR`] and set
+    /// `CS:IP = 0000:7C00`, **ignoring** any attached IDE image.
+    ///
+    /// Spec: IBM PC BIOS INT 19h floppy boot path — first floppy sector to
+    /// `0000:7C00` with `0x55AA`. Host-side only (not INT 13h AH=02h on `DL=00h`).
+    pub fn load_floppy_boot_to_7c00(&mut self) -> Result<(), MachineError> {
+        let sector = self
+            .read_floppy_boot_sector()?
+            .ok_or(MachineError::NoBootMedia)?;
+        self.install_boot_sector_at_7c00(&sector)
+    }
+
+    fn install_boot_sector_at_7c00(
+        &mut self,
+        sector: &[u8; MBR_SECTOR_SIZE],
+    ) -> Result<(), MachineError> {
         let need = (MBR_PHYS_ADDR as usize)
             .checked_add(MBR_SECTOR_SIZE)
             .ok_or(MachineError::MbrRamTooSmall)?;
         if self.mem.ram_len() < need {
             return Err(MachineError::MbrRamTooSmall);
         }
-
-        let sector = self
-            .read_boot_sector_lba0()?
-            .ok_or(MachineError::NoBootMedia)?;
 
         if sector[510] != MBR_SIGNATURE_LO || sector[511] != MBR_SIGNATURE_HI {
             return Err(MachineError::InvalidMbrSignature);
@@ -83,7 +103,7 @@ impl Machine {
     }
 
     /// Prefer IDE LBA0; else floppy cylinder 0 / head 0 / sector 1.
-    fn read_boot_sector_lba0(&self) -> Result<Option<[u8; MBR_SECTOR_SIZE]>, MachineError> {
+    fn read_boot_sector_ide_prefer(&self) -> Result<Option<[u8; MBR_SECTOR_SIZE]>, MachineError> {
         if self.ide.present {
             if self.ide.image.len() < MBR_SECTOR_SIZE {
                 return Err(MachineError::IncompleteBootSector);
@@ -93,6 +113,11 @@ impl Machine {
             return Ok(Some(sector));
         }
 
+        self.read_floppy_boot_sector()
+    }
+
+    /// Floppy boot sector at CHS `(0,0,1)` when media is attached.
+    fn read_floppy_boot_sector(&self) -> Result<Option<[u8; MBR_SECTOR_SIZE]>, MachineError> {
         Ok(self.fdc.read_sector(0, 0, 1))
     }
 }
@@ -214,6 +239,45 @@ mod tests {
         assert_eq!(m.mem.read_u8(0x7C00 + 1).unwrap(), 0x33);
         assert_eq!(m.mem.read_u8(0x7DFE).unwrap(), 0x55);
         assert_eq!(m.mem.read_u8(0x7DFF).unwrap(), 0xAA);
+    }
+
+    /// Spec: explicit floppy handoff ignores attached IDE (INT 19h floppy-first).
+    #[test]
+    fn load_floppy_boot_to_7c00_ignores_ide() {
+        let ide_mbr = synthetic_mbr(0x11);
+        let mut floppy = vec![0x22u8; FDC_1440_IMAGE_SIZE];
+        floppy[..MBR_SECTOR_SIZE].copy_from_slice(&synthetic_mbr(0x44));
+
+        let mut m = Machine::with_ide(64 * 1024, ide_mbr);
+        m.attach_floppy_image(floppy).expect("floppy");
+        m.load_floppy_boot_to_7c00().expect("floppy-first");
+
+        assert_eq!(m.cpu.cs.selector, 0);
+        assert_eq!(m.cpu.ip16(), 0x7C00);
+        assert_eq!(m.mem.read_u8(0x7C00 + 1).unwrap(), 0x44);
+        assert_ne!(m.mem.read_u8(0x7C00 + 1).unwrap(), 0x11);
+        assert_eq!(m.mem.read_u8(0x7DFE).unwrap(), 0x55);
+    }
+
+    #[test]
+    fn load_floppy_boot_to_7c00_rejects_no_floppy() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_mbr(0x11));
+        assert!(matches!(
+            m.load_floppy_boot_to_7c00(),
+            Err(MachineError::NoBootMedia)
+        ));
+    }
+
+    #[test]
+    fn load_floppy_boot_to_7c00_rejects_bad_signature() {
+        let mut floppy = vec![0u8; FDC_1440_IMAGE_SIZE];
+        floppy[510] = 0x00;
+        floppy[511] = 0x00;
+        let mut m = Machine::with_floppy(64 * 1024, floppy).expect("floppy");
+        assert!(matches!(
+            m.load_floppy_boot_to_7c00(),
+            Err(MachineError::InvalidMbrSignature)
+        ));
     }
 
     #[test]

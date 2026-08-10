@@ -8,8 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
+mod int13;
 mod ioapic_wire;
 mod lapic_wire;
 mod mbr;
@@ -25,7 +27,13 @@ mod vga_font;
 mod vga_frame;
 mod xbcs;
 
+pub use guest_boot::{GuestBootMeasure, GuestBootMedia};
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
+pub use int13::{
+    chs_to_lba, pack_cx, setup_int13_hd_read, unpack_cx, INT13_AH_GET_DRIVE_PARAMS, INT13_AH_READ,
+    INT13_AH_RESET, INT13_DRIVE_HD0, INT13_HD_HEADS, INT13_HD_SPT, INT13_SECTOR_SIZE,
+    INT13_STATUS_INVALID, INT13_STATUS_OK, INT13_STATUS_SECTOR_NOT_FOUND, INT13_STATUS_TIMEOUT,
+};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
@@ -1014,8 +1022,8 @@ impl Machine {
     /// Drive PIC IRQ4 from the current COM1 16550 interrupt line (level follow).
     ///
     /// Spec: IBM PC/AT ISA interrupt assignment — COM1 (`0x3F8`) is IRQ4 (master
-    /// IR4). The 16550 subset only raises THRE (NS16550A IER bit1 / IIR `010b`);
-    /// receive-data-available is never asserted because there is no receive path.
+    /// IR4). The 16550 raises RDA (IER bit0 / IIR `100b`) and/or THRE (IER bit1 /
+    /// IIR `010b`) via [`Serial16550::irq_line`].
     pub fn sync_com1_irq4(&mut self) {
         self.pic.set_irq_line(4, self.com1.irq_line());
     }
@@ -1023,9 +1031,21 @@ impl Machine {
     /// Drive PIC IRQ3 from the current COM2 16550 interrupt line (level follow).
     ///
     /// Spec: IBM PC/AT ISA interrupt assignment — COM2 (`0x2F8`) is IRQ3 (master
-    /// IR3). Same THRE-only source as [`Self::sync_com1_irq4`].
+    /// IR3). Same RDA/THRE sources as [`Self::sync_com1_irq4`].
     pub fn sync_com2_irq3(&mut self) {
         self.pic.set_irq_line(3, self.com2.irq_line());
+    }
+
+    /// Host injects one RX byte into COM1 RBR (NS16550A receive path).
+    pub fn com1_push_rx(&mut self, byte: u8) {
+        self.com1.push_rx(byte);
+        self.sync_com1_irq4();
+    }
+
+    /// Host injects one RX byte into COM2 RBR (NS16550A receive path).
+    pub fn com2_push_rx(&mut self, byte: u8) {
+        self.com2.push_rx(byte);
+        self.sync_com2_irq3();
     }
 
     /// Assert/deassert a software PIRQA–PIRQD line and sync through PIRQRC to DualPic.
@@ -2093,9 +2113,47 @@ mod tests {
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xF7); // unmask IR3 (IRQ3)
     }
 
+    /// Spec: NS16550A IER bit0 (ERBFI) + IIR RDA `100b`; COM1 → IRQ4.
+    #[test]
+    fn com1_rda_asserts_irq4_cleared_by_rbr_read() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq4(&mut m);
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(0x3F9, 0x01).unwrap(); // IER ERBFI
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        m.com1_push_rx(b'Q');
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), Some(0x0C));
+            assert_eq!(bus.poll_external_irq(), None);
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+            assert_eq!(bus.port_in_u8(0x3FA).unwrap(), 0x04); // IIR RDA
+            assert_eq!(bus.port_in_u8(0x3F8).unwrap(), b'Q');
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+        assert!(!m.com1.irq_line());
+    }
+
+    /// Spec: COM2 RDA → IRQ3 (master IR3, vector `0x0B`).
+    #[test]
+    fn com2_rda_asserts_irq3() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq3(&mut m);
+        m.com2.port_write(0x2F9, 1, 0x01);
+        m.com2_push_rx(b'Z');
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), Some(0x0B));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+            assert_eq!(bus.port_in_u8(0x2F8).unwrap(), b'Z');
+        }
+        assert!(!m.com2.irq_line());
+    }
+
     /// Spec: NS16550A IER bit1 (ETBEI) + IIR THRE ID `010b`; IBM PC/AT ISA
     /// interrupt assignment COM1 `0x3F8` → IRQ4 (master IR4, vector `0x0C`).
-    /// The 16550 subset has no receive path, so ERBFI/RDA never drives the line.
     #[test]
     fn com1_thre_asserts_irq4_eoi_clears() {
         let mut m = Machine::new(64 * 1024);
