@@ -4,14 +4,15 @@
 //! use `DualPic`; IOAPIC GSI pins are a separate path. See
 //! `docs/ioapic-r7-rte-irq.md`, `docs/ioapic-r8-eoi.md`.
 
-use devices::{IoApicDelivery, IoApicMmio, LocalApicMmio};
+use devices::{IoApicDelivery, IoApicMmio, LocalApicMmio, IOAPIC_RTE_LEVEL};
 
 /// Assert an I/O APIC input pin and, on Fixed delivery to this LAPIC's ID,
 /// latch the vector on the Local APIC.
 ///
 /// Returns the delivery descriptor when the RTE produced one (even if the
 /// Local APIC dropped it due to software-disable or a busy pending slot).
-/// Level-triggered Fixed deliveries set Remote IRR inside [`IoApicMmio::assert_pin`].
+/// Level-triggered Fixed deliveries set Remote IRR inside [`IoApicMmio::assert_pin`]
+/// and record TMR on the Local APIC via [`LocalApicMmio::inject_fixed_trigger`].
 pub fn assert_ioapic_gsi(
     ioapic: &mut IoApicMmio,
     lapic: &mut LocalApicMmio,
@@ -20,7 +21,11 @@ pub fn assert_ioapic_gsi(
 ) -> Option<IoApicDelivery> {
     let delivery = ioapic.assert_pin(gsi, high)?;
     if delivery.dest_apic_id == lapic.apic_id() {
-        let _ = lapic.inject_fixed(delivery.vector);
+        let level = ioapic
+            .redtbl_low(gsi)
+            .map(|low| low & IOAPIC_RTE_LEVEL != 0)
+            .unwrap_or(false);
+        let _ = lapic.inject_fixed_trigger(delivery.vector, level);
     }
     Some(delivery)
 }

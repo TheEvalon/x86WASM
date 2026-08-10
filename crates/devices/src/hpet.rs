@@ -12,8 +12,10 @@
 //! advance the counter via [`HpetMmio::advance_main_counter`] (not step-clock).
 //! Round-8: Timer 0 periodic `Tn_VAL_SET_CNF` sequences update the period on
 //! the next comparator write (HPET 1.0a), then re-arm comparator = main+period
-//! on each fire. PIC / I/O APIC delivery is **not** auto-wired here — see
-//! `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`.
+//! on each fire. Round-10: host `Machine::advance_hpet_ioapic` drives I/O APIC
+//! GSI (default IRQ2) from [`HpetMmio::irq_line`] / [`HpetMmio::ioapic_gsi`] —
+//! see `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`,
+//! `docs/hpet-r10-ioapic-wire.md`.
 
 /// Classic HPET MMIO base (PC firmware convention / ACPI GAS address).
 pub const HPET_DEFAULT_BASE: u64 = 0xFED0_0000;
@@ -92,9 +94,13 @@ pub const HPET_CAPS_ID_VALUE: u64 = (HPET_REV_ID as u64)
 /// Timer 0 interrupt routing capability (RO bits 63:32 of T0 config).
 ///
 /// Spec: HPET 1.0a — bit *N* set ⇒ Timer may route to I/O APIC IRQ *N*.
-/// This stub advertises IRQ2 only (common non-legacy route). Delivery onto
-/// the I/O APIC / PIC is out of scope for this device slice.
+/// This stub advertises IRQ2 only (common non-legacy route; QEMU/SeaBIOS-
+/// compatible default GSI). See `docs/hpet-r10-ioapic-wire.md`.
 pub const HPET_T0_INT_ROUTE_CAP: u32 = 1 << 2;
+
+/// Default I/O APIC GSI for Timer 0 when `Tn_INT_ROUTE_CNF` is unset or
+/// outside [`HPET_T0_INT_ROUTE_CAP`] (IRQ2).
+pub const HPET_DEFAULT_IOAPIC_GSI: u8 = 2;
 
 /// RO capability bits always present in Timer 0 config.
 pub const HPET_T0_CONFIG_CAPS: u64 = HPET_TN_PER_INT_CAP | ((HPET_T0_INT_ROUTE_CAP as u64) << 32);
@@ -194,6 +200,20 @@ impl HpetMmio {
         ((self.t0_config & HPET_TN_INT_ROUTE_MASK) >> HPET_TN_INT_ROUTE_SHIFT) as u8
     }
 
+    /// I/O APIC GSI selected for Timer 0 IRQ delivery.
+    ///
+    /// Uses programmed `Tn_INT_ROUTE_CNF` when that IRQ is advertised in
+    /// [`HPET_T0_INT_ROUTE_CAP`]; otherwise [`HPET_DEFAULT_IOAPIC_GSI`] (2).
+    /// Spec: HPET 1.0a route field + common QEMU/SeaBIOS non-legacy IRQ2.
+    pub fn ioapic_gsi(&self) -> u8 {
+        let route = self.t0_int_route();
+        if route < 32 && (HPET_T0_INT_ROUTE_CAP & (1u32 << route)) != 0 {
+            route
+        } else {
+            HPET_DEFAULT_IOAPIC_GSI
+        }
+    }
+
     pub fn owns(&self, addr: u64) -> bool {
         (self.base..self.base.saturating_add(HPET_WINDOW_SIZE)).contains(&addr)
     }
@@ -202,7 +222,8 @@ impl HpetMmio {
     ///
     /// Spec: HPET 1.0a — `Tn_INT_ENB_CNF` gates interrupt generation; level
     /// mode follows `Tn_INT_STS`, edge mode latches until status is cleared.
-    /// This is **not** wired to PIC/IOAPIC by the device itself.
+    /// Host wiring (R10) mirrors this onto the I/O APIC GSI from
+    /// [`Self::ioapic_gsi`]; the device itself does not touch DualPic.
     pub fn irq_line(&self) -> bool {
         if self.config & HPET_CFG_ENABLE == 0 || self.t0_config & HPET_TN_INT_ENB == 0 {
             return false;
@@ -587,5 +608,19 @@ mod tests {
         write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 100);
         assert!(!hpet.advance_main_counter(100));
         assert_eq!(hpet.main_counter(), 1);
+    }
+
+    /// Spec: HPET 1.0a — `Tn_INT_ROUTE_CNF` must be advertised; else default GSI 2.
+    #[test]
+    fn ioapic_gsi_defaults_to_irq2_when_route_unset() {
+        let mut hpet = HpetMmio::new();
+        assert_eq!(hpet.t0_int_route(), 0);
+        assert_eq!(hpet.ioapic_gsi(), HPET_DEFAULT_IOAPIC_GSI);
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | (2 << HPET_TN_INT_ROUTE_SHIFT)) as u32,
+        );
+        assert_eq!(hpet.ioapic_gsi(), 2);
     }
 }
