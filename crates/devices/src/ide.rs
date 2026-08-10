@@ -563,6 +563,10 @@ pub const ATAPI_CMD_START_STOP_UNIT: u8 = 0x1B;
 ///
 /// Spec: SFF-8020i §9.8.20 — table of contents for the loaded data CD.
 pub const ATAPI_CMD_READ_TOC: u8 = 0x43;
+/// Packet command `PREVENT/ALLOW MEDIUM REMOVAL`.
+///
+/// Spec: SFF-8020i §9.8.12 — Prevent bit locks soft eject / tray removal.
+pub const ATAPI_CMD_PREVENT_ALLOW: u8 = 0x1E;
 
 /// MODE SENSE page code `01h` — Read Error Recovery Parameters.
 ///
@@ -605,6 +609,10 @@ pub const ATAPI_ASC_LBA_OUT_OF_RANGE: u8 = 0x21;
 pub const ATAPI_ASC_INVALID_FIELD_IN_CDB: u8 = 0x24;
 /// Additional sense code `3Ah` MEDIUM NOT PRESENT.
 pub const ATAPI_ASC_MEDIUM_NOT_PRESENT: u8 = 0x3A;
+/// Additional sense code `53h` MEDIUM REMOVAL PREVENTED.
+///
+/// Spec: SFF-8020i ASC table — eject while PREVENT is in effect.
+pub const ATAPI_ASC_MEDIUM_REMOVAL_PREVENTED: u8 = 0x53;
 
 /// Fixed-format sense data length this device returns, in bytes.
 ///
@@ -695,6 +703,8 @@ pub struct IdePrimary {
     /// Spec: ATA/ATAPI-6 §8.16.9 / SFF-8020i — only set when READ CAPACITY and
     /// READ (10) exist. See `docs/atapi-r5-cdrom-medium.md`.
     atapi_cdrom: bool,
+    /// PREVENT/ALLOW medium-removal lock. Spec: SFF-8020i §9.8.12.
+    atapi_prevent_removal: bool,
     error: u8,
     features: u8,
     sector_count: u8,
@@ -795,6 +805,7 @@ impl IdePrimary {
             image: Vec::new(),
             packet_device: false,
             atapi_cdrom: false,
+            atapi_prevent_removal: false,
             error: 0,
             features: 0,
             sector_count: 0,
@@ -850,6 +861,7 @@ impl IdePrimary {
         // An attached disk image is an ATA device, not a packet device.
         self.packet_device = false;
         self.atapi_cdrom = false;
+        self.atapi_prevent_removal = false;
         self.reset_ready();
     }
 
@@ -866,6 +878,7 @@ impl IdePrimary {
         self.present = true;
         self.packet_device = true;
         self.atapi_cdrom = false;
+        self.atapi_prevent_removal = false;
         self.reset_ready();
     }
 
@@ -886,6 +899,7 @@ impl IdePrimary {
         self.present = true;
         self.packet_device = true;
         self.atapi_cdrom = true;
+        self.atapi_prevent_removal = false;
         self.reset_ready();
     }
 
@@ -945,6 +959,11 @@ impl IdePrimary {
     /// True when a CD-ROM medium image is loaded (at least one 2048-byte block).
     pub fn atapi_medium_loaded(&self) -> bool {
         self.is_atapi_cdrom() && !self.image.is_empty()
+    }
+
+    /// True when PREVENT/ALLOW has locked medium removal.
+    pub fn atapi_removal_prevented(&self) -> bool {
+        self.is_atapi_cdrom() && self.atapi_prevent_removal
     }
 
     /// Number of 2048-byte logical blocks on the loaded CD-ROM medium.
@@ -1028,8 +1047,10 @@ impl IdePrimary {
         self.block_left = 0;
         // Spec: ATA/ATAPI-6 §9.10 / §9.11 — a reset ends any PACKET command in
         // progress, and §8.7.5 gives the same outcome for DEVICE RESET.
+        // Spec: SFF-8020i §10.8.11 — hard reset clears PREVENT medium removal.
         self.clear_packet_state();
         self.clear_sense();
+        self.atapi_prevent_removal = false;
         self.status = if self.present { self.reset_status() } else { 0 };
     }
 
@@ -1496,6 +1517,7 @@ impl IdePrimary {
             ATAPI_CMD_MODE_SENSE_10 if self.atapi_cdrom => self.exec_packet_mode_sense10(),
             ATAPI_CMD_START_STOP_UNIT if self.atapi_cdrom => self.exec_packet_start_stop(),
             ATAPI_CMD_READ_TOC if self.atapi_cdrom => self.exec_packet_read_toc(),
+            ATAPI_CMD_PREVENT_ALLOW if self.atapi_cdrom => self.exec_packet_prevent_allow(),
             _ => self.complete_packet_check_condition(
                 ATAPI_SENSE_ILLEGAL_REQUEST,
                 ATAPI_ASC_INVALID_COMMAND_OPERATION_CODE,
@@ -1592,6 +1614,8 @@ impl IdePrimary {
         }
         self.clear_packet_state();
         self.clear_sense();
+        // Spec: SFF-8020i §10.8.11 — DEVICE RESET ends PREVENT like a hard reset.
+        self.atapi_prevent_removal = false;
         self.transferring = false;
         self.pio_in = false;
         self.sector_buffer_write = false;
@@ -1807,14 +1831,34 @@ impl IdePrimary {
     /// - LoEj=1 Start=0 → eject / unload → medium not present
     /// - LoEj=1 Start=1 → load: no-op when already loaded; empty stays empty
     ///   (host must re-attach an image — there is no tray motor)
+    ///
+    /// Spec: SFF-8020i §9.8.12 / Table 137 — eject while PREVENT is set →
+    /// NOT READY / ASC `53h` MEDIUM REMOVAL PREVENTED.
     fn exec_packet_start_stop(&mut self) {
         let loej = self.packet_cmd[4] & ATAPI_START_STOP_LOEJ != 0;
         let start = self.packet_cmd[4] & ATAPI_START_STOP_START != 0;
         if loej && !start {
+            if self.atapi_prevent_removal {
+                self.complete_packet_check_condition(
+                    ATAPI_SENSE_NOT_READY,
+                    ATAPI_ASC_MEDIUM_REMOVAL_PREVENTED,
+                    0,
+                );
+                return;
+            }
             self.unload_atapi_medium();
         }
-        // Load with empty tray cannot invent media; stop/start are no-ops.
         let _ = start;
+        self.complete_packet_good();
+    }
+
+    /// `PREVENT/ALLOW MEDIUM REMOVAL` — set or clear the soft eject lock.
+    ///
+    /// Spec: SFF-8020i §9.8.12 — Prevent bit in byte 4; unlocked by default;
+    /// hard reset clears the condition. This model always accepts the command
+    /// (ACK) and stores the flag; there is no physical door motor.
+    fn exec_packet_prevent_allow(&mut self) {
+        self.atapi_prevent_removal = self.packet_cmd[4] & 0x01 != 0;
         self.complete_packet_good();
     }
 
@@ -3532,6 +3576,11 @@ impl IdeSecondary {
     /// See [`IdePrimary::atapi_medium_loaded`].
     pub fn atapi_medium_loaded(&self) -> bool {
         self.inner.atapi_medium_loaded()
+    }
+
+    /// See [`IdePrimary::atapi_removal_prevented`].
+    pub fn atapi_removal_prevented(&self) -> bool {
+        self.inner.atapi_removal_prevented()
     }
 
     /// See [`IdePrimary::atapi_sense`].
