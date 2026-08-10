@@ -546,6 +546,26 @@ pub const ATAPI_CMD_READ_CAPACITY: u8 = 0x25;
 ///
 /// Spec: SFF-8020i / MMC — read logical blocks from CD-ROM medium.
 pub const ATAPI_CMD_READ_10: u8 = 0x28;
+/// Packet command `MODE SENSE (6)`.
+///
+/// Spec: MMC / SPC — 4-byte mode parameter header + page(s). CD-ROM capable
+/// devices only; see `docs/atapi-r6-mode-sense.md`.
+pub const ATAPI_CMD_MODE_SENSE_6: u8 = 0x1A;
+/// Packet command `MODE SENSE (10)`.
+///
+/// Spec: SFF-8020i §9.8.4 — ATAPI CD-ROM MODE SENSE with 8-byte header.
+pub const ATAPI_CMD_MODE_SENSE_10: u8 = 0x5A;
+
+/// MODE SENSE page code `01h` — Read Error Recovery Parameters.
+///
+/// Spec: SFF-8020i §9.8.5.3 / Table 52.
+pub const ATAPI_MODE_PAGE_ERROR_RECOVERY: u8 = 0x01;
+/// Page length for Read Error Recovery (bytes after the length byte).
+pub const ATAPI_MODE_PAGE_ERROR_RECOVERY_LEN: u8 = 0x06;
+/// Medium type `70h` — door closed, no disc. Spec: SFF-8020i Table 46.
+pub const ATAPI_MEDIUM_TYPE_NO_DISC: u8 = 0x70;
+/// Medium type `01h` — 120 mm CD-ROM data only. Spec: SFF-8020i Table 46.
+pub const ATAPI_MEDIUM_TYPE_120MM_DATA: u8 = 0x01;
 
 /// Sense key `0h` NO SENSE. Spec: SFF-8020i Table "Sense Key Definitions".
 pub const ATAPI_SENSE_NO_SENSE: u8 = 0x00;
@@ -1444,7 +1464,7 @@ impl IdePrimary {
     ///
     /// Spec: SFF-8020i / MMC command packet set. Minimal PACKET devices run
     /// `TEST UNIT READY`, `REQUEST SENSE`, and `INQUIRY`. CD-ROM capable
-    /// devices also run `READ CAPACITY` and `READ (10)`.
+    /// devices also run `READ CAPACITY`, `READ (10)`, and `MODE SENSE`.
     fn execute_packet_command(&mut self) {
         self.packet_phase = PacketPhase::Idle;
         match self.packet_cmd[0] {
@@ -1453,6 +1473,8 @@ impl IdePrimary {
             ATAPI_CMD_INQUIRY => self.exec_packet_inquiry(),
             ATAPI_CMD_READ_CAPACITY if self.atapi_cdrom => self.exec_packet_read_capacity(),
             ATAPI_CMD_READ_10 if self.atapi_cdrom => self.exec_packet_read10(),
+            ATAPI_CMD_MODE_SENSE_6 if self.atapi_cdrom => self.exec_packet_mode_sense6(),
+            ATAPI_CMD_MODE_SENSE_10 if self.atapi_cdrom => self.exec_packet_mode_sense10(),
             _ => self.complete_packet_check_condition(
                 ATAPI_SENSE_ILLEGAL_REQUEST,
                 ATAPI_ASC_INVALID_COMMAND_OPERATION_CODE,
@@ -1621,6 +1643,139 @@ impl IdePrimary {
         data[0..4].copy_from_slice(&last_lba.to_be_bytes());
         data[4..8].copy_from_slice(&(ATAPI_CDROM_BLOCK_BYTES as u32).to_be_bytes());
         self.begin_packet_data_in(&data, ATAPI_READ_CAPACITY_DATA_BYTES);
+    }
+
+    /// Medium type code for MODE SENSE. Spec: SFF-8020i Table 46.
+    fn atapi_medium_type(&self) -> u8 {
+        if self.atapi_medium_loaded() {
+            ATAPI_MEDIUM_TYPE_120MM_DATA
+        } else {
+            ATAPI_MEDIUM_TYPE_NO_DISC
+        }
+    }
+
+    /// Read Error Recovery page (`01h`). Spec: SFF-8020i Table 52.
+    ///
+    /// Defaults: error recovery parameter `00h` (maximum recovery, recovered
+    /// errors not reported), read retry count `0`, PS clear (not savable).
+    fn mode_page_error_recovery(&self) -> [u8; 8] {
+        [
+            ATAPI_MODE_PAGE_ERROR_RECOVERY,
+            ATAPI_MODE_PAGE_ERROR_RECOVERY_LEN,
+            0x00, // error recovery parameter
+            0x00, // read retry count
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ]
+    }
+
+    /// Build MODE SENSE page payload for the requested page code.
+    ///
+    /// Spec: SFF-8020i §9.8.4 — unsupported page → ILLEGAL REQUEST / `24h`.
+    /// Only page `01h` is implemented; page `3Fh` returns that single page.
+    fn mode_sense_pages(&self, page_code: u8) -> Option<Vec<u8>> {
+        match page_code & 0x3F {
+            ATAPI_MODE_PAGE_ERROR_RECOVERY | 0x3F => {
+                Some(self.mode_page_error_recovery().to_vec())
+            }
+            _ => None,
+        }
+    }
+
+    /// `MODE SENSE (6)` — 4-byte header + page(s), no block descriptors.
+    ///
+    /// Spec: MMC / SPC CDB: byte 2 = PC|Page Code, byte 4 = allocation length.
+    /// Empty medium still succeeds (SFF-8020i Table 8).
+    fn exec_packet_mode_sense6(&mut self) {
+        let page_code = self.packet_cmd[2] & 0x3F;
+        let pc = (self.packet_cmd[2] >> 6) & 0x03;
+        // Saved values are not implemented.
+        if pc == 0x03 {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_ILLEGAL_REQUEST,
+                ATAPI_ASC_INVALID_FIELD_IN_CDB,
+                0,
+            );
+            return;
+        }
+        let Some(pages) = self.mode_sense_pages(page_code) else {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_ILLEGAL_REQUEST,
+                ATAPI_ASC_INVALID_FIELD_IN_CDB,
+                0,
+            );
+            return;
+        };
+        let allocation = usize::from(self.packet_cmd[4]);
+        // Changeable values: page header retained, parameters zeroed.
+        let pages = if pc == 0x01 {
+            let mut mask = pages;
+            if mask.len() > 2 {
+                for b in &mut mask[2..] {
+                    *b = 0;
+                }
+            }
+            mask
+        } else {
+            pages
+        };
+        let mut data = Vec::with_capacity(4 + pages.len());
+        data.push(0); // mode data length filled below
+        data.push(self.atapi_medium_type());
+        data.push(0); // device-specific parameter
+        data.push(0); // block descriptor length
+        data.extend_from_slice(&pages);
+        data[0] = (data.len() - 1) as u8;
+        self.begin_packet_data_in(&data, allocation);
+    }
+
+    /// `MODE SENSE (10)` — 8-byte header + page(s), no block descriptors.
+    ///
+    /// Spec: SFF-8020i §9.8.4 / Table 45. Allocation length at bytes 7–8.
+    fn exec_packet_mode_sense10(&mut self) {
+        let page_code = self.packet_cmd[2] & 0x3F;
+        let pc = (self.packet_cmd[2] >> 6) & 0x03;
+        if pc == 0x03 {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_ILLEGAL_REQUEST,
+                ATAPI_ASC_INVALID_FIELD_IN_CDB,
+                0,
+            );
+            return;
+        }
+        let Some(pages) = self.mode_sense_pages(page_code) else {
+            self.complete_packet_check_condition(
+                ATAPI_SENSE_ILLEGAL_REQUEST,
+                ATAPI_ASC_INVALID_FIELD_IN_CDB,
+                0,
+            );
+            return;
+        };
+        let allocation =
+            usize::from(u16::from_be_bytes([self.packet_cmd[7], self.packet_cmd[8]]));
+        let pages = if pc == 0x01 {
+            let mut mask = pages;
+            if mask.len() > 2 {
+                for b in &mut mask[2..] {
+                    *b = 0;
+                }
+            }
+            mask
+        } else {
+            pages
+        };
+        let mut data = Vec::with_capacity(8 + pages.len());
+        data.extend_from_slice(&[0, 0]); // mode data length filled below
+        data.push(self.atapi_medium_type());
+        data.push(0); // device-specific / reserved
+        data.extend_from_slice(&[0, 0]); // reserved
+        data.extend_from_slice(&[0, 0]); // block descriptor length
+        data.extend_from_slice(&pages);
+        let mode_len = (data.len() - 2) as u16;
+        data[0..2].copy_from_slice(&mode_len.to_be_bytes());
+        self.begin_packet_data_in(&data, allocation);
     }
 
     /// `READ (10)` — transfer logical blocks from the attached medium.
