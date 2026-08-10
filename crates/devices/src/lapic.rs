@@ -1,14 +1,17 @@
-//! Local APIC MMIO identity stub (default base `0xFEE0_0000`).
+//! Local APIC MMIO with timer + LVT/spurious stub (default base `0xFEE0_0000`).
 //!
 //! Spec: Intel SDM Vol. 3A Chapter 10 "Advanced Programmable Interrupt
 //! Controller (APIC)":
 //! - §10.4.4 — default physical base `FEE0_0000H` (4 KiB window)
-//! - §10.4.6 / §10.4.8 — Local APIC ID Register at offset `20H` (APIC ID in
-//!   bits 31:24); Local APIC Version Register at offset `30H` (version in
-//!   bits 7:0; Max LVT Entry in bits 23:16)
+//! - §10.4.6 / §10.4.8 — Local APIC ID @ `20H`; Version @ `30H`
+//! - §10.4.14 / §10.9 — Spurious Interrupt Vector Register @ `F0H`
+//! - §10.5.1 — LVT Timer @ `320H`
+//! - §10.5.4 — Timer ICR `380H`, CCR `390H`, DCR `3E0H`
 //!
-//! Presence stub for firmware probes. CPUID leaf 1 EDX bit 9 (`APIC`) stays
-//! clear in the interpreter — this window must not advertise a usable APIC.
+//! Round-7: software-enabled APIC + programmed one-shot/periodic timer can
+//! latch a **local** interrupt vector via [`LocalApicMmio::take_interrupt`].
+//! CPUID leaf 1 EDX bit 9 (`APIC`) stays clear — presence ≠ advertised APIC.
+//! See `docs/lapic-r7-timer-lvt.md`.
 
 /// Default Local APIC physical base (SDM Vol. 3A §10.4.4).
 pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
@@ -22,26 +25,74 @@ pub const LAPIC_REG_ID: u32 = 0x20;
 /// Local APIC Version Register offset.
 pub const LAPIC_REG_VERSION: u32 = 0x30;
 
+/// End Of Interrupt Register offset.
+pub const LAPIC_REG_EOI: u32 = 0xB0;
+
+/// Spurious Interrupt Vector Register offset (SDM §10.9).
+pub const LAPIC_REG_SVR: u32 = 0xF0;
+
+/// LVT Timer Register offset (SDM §10.5.1).
+pub const LAPIC_REG_LVT_TIMER: u32 = 0x320;
+
+/// Initial Count Register (timer) offset.
+pub const LAPIC_REG_TIMER_ICR: u32 = 0x380;
+
+/// Current Count Register (timer) offset.
+pub const LAPIC_REG_TIMER_CCR: u32 = 0x390;
+
+/// Divide Configuration Register offset.
+pub const LAPIC_REG_TIMER_DCR: u32 = 0x3E0;
+
 /// Version field (bits 7:0) — `0x14` is in the integrated local-APIC range
 /// documented for P6 / Pentium 4 class (SDM Vol. 3A §10.4.8).
 pub const LAPIC_VERSION_ID: u8 = 0x14;
 
-/// Max LVT Entry (bits 23:16). Value `3` → LVT entries 0..=3. Timer / LINT /
-/// thermal / perfmon delivery are **not** modeled.
+/// Max LVT Entry (bits 23:16). Value `3` → LVT entries 0..=3.
 pub const LAPIC_MAX_LVT_ENTRY: u8 = 3;
 
 /// Composed Version register value (RO).
 pub const LAPIC_VERSION_VALUE: u32 =
     (LAPIC_VERSION_ID as u32) | ((LAPIC_MAX_LVT_ENTRY as u32) << 16);
 
-/// Local APIC presence MMIO: ID store/readback (bits 31:24), Version RO.
+/// SVR software-enable bit (SDM §10.9 bit 8).
+pub const LAPIC_SVR_SW_ENABLE: u32 = 1 << 8;
+
+/// SVR spurious vector field (bits 7:0).
+pub const LAPIC_SVR_VECTOR_MASK: u32 = 0xFF;
+
+/// LVT mask bit (bit 16).
+pub const LAPIC_LVT_MASK: u32 = 1 << 16;
+
+/// LVT Timer mode bit (bit 17): 0 = one-shot, 1 = periodic.
+pub const LAPIC_LVT_TIMER_PERIODIC: u32 = 1 << 17;
+
+/// LVT vector field (bits 7:0).
+pub const LAPIC_LVT_VECTOR_MASK: u32 = 0xFF;
+
+/// Local APIC MMIO: ID/Version + SVR + LVT Timer + timer ICR/CCR/DCR stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalApicMmio {
     base: u64,
     /// APIC ID in bits 31:24 of the ID register (SDM §10.4.6).
     apic_id: u8,
-    /// Scratch for byte-lane assembly of ID writes.
-    id_scratch: [u8; 4],
+    /// Spurious Interrupt Vector Register.
+    svr: u32,
+    /// LVT Timer register.
+    lvt_timer: u32,
+    /// Timer initial count.
+    timer_icr: u32,
+    /// Timer current count.
+    timer_ccr: u32,
+    /// Divide configuration (only bits 3,1,0 matter).
+    timer_dcr: u32,
+    /// Accumulator of bus clocks toward one CCR decrement.
+    divide_accum: u32,
+    /// Latched local interrupt vector awaiting [`Self::take_interrupt`].
+    pending_vector: Option<u8>,
+    /// In-service vector after accept (cleared by EOI).
+    in_service: Option<u8>,
+    /// Scratch for byte-lane assembly of dword writes.
+    dword_scratch: [u8; 4],
 }
 
 impl Default for LocalApicMmio {
@@ -55,7 +106,17 @@ impl LocalApicMmio {
         Self {
             base: LAPIC_DEFAULT_BASE,
             apic_id: 0,
-            id_scratch: [0; 4],
+            // Spec: SDM §10.4.7.11 — SVR reset: vector often `0xFF`, enable clear.
+            svr: 0xFF,
+            // LVT Timer reset: masked.
+            lvt_timer: LAPIC_LVT_MASK,
+            timer_icr: 0,
+            timer_ccr: 0,
+            timer_dcr: 0, // divide by 2
+            divide_accum: 0,
+            pending_vector: None,
+            in_service: None,
+            dword_scratch: [0; 4],
         }
     }
 
@@ -72,12 +133,171 @@ impl LocalApicMmio {
         self.apic_id
     }
 
+    pub fn svr(&self) -> u32 {
+        self.svr
+    }
+
+    pub fn lvt_timer(&self) -> u32 {
+        self.lvt_timer
+    }
+
+    pub fn timer_icr(&self) -> u32 {
+        self.timer_icr
+    }
+
+    pub fn timer_ccr(&self) -> u32 {
+        self.timer_ccr
+    }
+
+    pub fn timer_dcr(&self) -> u32 {
+        self.timer_dcr
+    }
+
+    /// Software enable from SVR bit 8.
+    pub fn software_enabled(&self) -> bool {
+        self.svr & LAPIC_SVR_SW_ENABLE != 0
+    }
+
     pub fn owns(&self, addr: u64) -> bool {
         (self.base..self.base.saturating_add(LAPIC_WINDOW_SIZE)).contains(&addr)
     }
 
+    /// Divide value from DCR bits 3/1/0 (SDM §10.5.4).
+    pub fn timer_divide_value(dcr: u32) -> u32 {
+        let key = ((dcr & 0x8) >> 1) | (dcr & 0x3);
+        match key {
+            0b000 => 2,
+            0b001 => 4,
+            0b010 => 8,
+            0b011 => 16,
+            0b100 => 32,
+            0b101 => 64,
+            0b110 => 128,
+            _ => 1, // 0b111
+        }
+    }
+
     fn id_value(&self) -> u32 {
         u32::from(self.apic_id) << 24
+    }
+
+    fn read_dword(&self, off: u32) -> u32 {
+        match off {
+            LAPIC_REG_ID => self.id_value(),
+            LAPIC_REG_VERSION => LAPIC_VERSION_VALUE,
+            LAPIC_REG_EOI => 0,
+            LAPIC_REG_SVR => self.svr,
+            LAPIC_REG_LVT_TIMER => self.lvt_timer,
+            LAPIC_REG_TIMER_ICR => self.timer_icr,
+            LAPIC_REG_TIMER_CCR => self.timer_ccr,
+            LAPIC_REG_TIMER_DCR => self.timer_dcr & 0xB, // bits 3,1,0
+            _ => 0,
+        }
+    }
+
+    /// True if a local interrupt is latched and awaiting accept.
+    pub fn interrupt_pending(&self) -> bool {
+        self.pending_vector.is_some()
+    }
+
+    /// Peek the latched local vector, if any.
+    pub fn pending_vector(&self) -> Option<u8> {
+        self.pending_vector
+    }
+
+    /// Accept the latched local interrupt (moves to in-service).
+    ///
+    /// Spec: SDM §10.8.3 — accepting an interrupt loads ISR; EOI later clears.
+    /// This stub does not inject into the CPU interpreter — hosts must deliver.
+    pub fn take_interrupt(&mut self) -> Option<u8> {
+        let vec = self.pending_vector.take()?;
+        self.in_service = Some(vec);
+        Some(vec)
+    }
+
+    fn fire_timer_interrupt(&mut self) {
+        if !self.software_enabled() {
+            return;
+        }
+        if self.lvt_timer & LAPIC_LVT_MASK != 0 {
+            return;
+        }
+        let vector = (self.lvt_timer & LAPIC_LVT_VECTOR_MASK) as u8;
+        // Soft-priority floor: vectors 0..=15 are reserved; still latch for
+        // honesty when software programmed them (tests may use ≥0x20).
+        if self.pending_vector.is_none() {
+            self.pending_vector = Some(vector);
+        }
+    }
+
+    /// Advance the local APIC timer by `bus_clocks` (host-driven).
+    ///
+    /// Returns `true` if this tick newly latched a local interrupt.
+    /// Not wired to the machine step clock or CPU INTR pin automatically.
+    pub fn tick_timer(&mut self, bus_clocks: u64) -> bool {
+        if bus_clocks == 0 || self.timer_ccr == 0 {
+            return false;
+        }
+        let divide = Self::timer_divide_value(self.timer_dcr);
+        let mut clocks = bus_clocks;
+        let mut fired = false;
+        while clocks > 0 && self.timer_ccr > 0 {
+            let need = u64::from(divide.saturating_sub(self.divide_accum));
+            if clocks < need {
+                self.divide_accum += clocks as u32;
+                break;
+            }
+            clocks -= need;
+            self.divide_accum = 0;
+            self.timer_ccr -= 1;
+            if self.timer_ccr == 0 {
+                let before = self.pending_vector;
+                self.fire_timer_interrupt();
+                if before.is_none() && self.pending_vector.is_some() {
+                    fired = true;
+                }
+                if self.lvt_timer & LAPIC_LVT_TIMER_PERIODIC != 0 && self.timer_icr != 0 {
+                    self.timer_ccr = self.timer_icr;
+                } else {
+                    break;
+                }
+            }
+        }
+        fired
+    }
+
+    fn write_dword(&mut self, off: u32, value: u32) {
+        match off {
+            LAPIC_REG_ID => {
+                self.apic_id = ((value >> 24) & 0xFF) as u8;
+            }
+            LAPIC_REG_EOI => {
+                // Spec: SDM §10.8.5 — write to EOI signals end of interrupt.
+                self.in_service = None;
+            }
+            LAPIC_REG_SVR => {
+                // Retain vector + software enable; other SVR bits dropped.
+                self.svr = value & (LAPIC_SVR_VECTOR_MASK | LAPIC_SVR_SW_ENABLE);
+            }
+            LAPIC_REG_LVT_TIMER => {
+                // Retain vector, mask, timer mode.
+                self.lvt_timer =
+                    value & (LAPIC_LVT_VECTOR_MASK | LAPIC_LVT_MASK | LAPIC_LVT_TIMER_PERIODIC);
+            }
+            LAPIC_REG_TIMER_ICR => {
+                self.timer_icr = value;
+                self.timer_ccr = value;
+                self.divide_accum = 0;
+            }
+            LAPIC_REG_TIMER_CCR => {
+                // CCR is read-only architecturally; accept write, ignore.
+            }
+            LAPIC_REG_TIMER_DCR => {
+                self.timer_dcr = value & 0xB;
+                self.divide_accum = 0;
+            }
+            _ => {}
+        }
     }
 
     /// Byte read within the claimed window, or `None` if unclaimed.
@@ -88,20 +308,10 @@ impl LocalApicMmio {
         let off = (addr - self.base) as u32;
         let dword_off = off & !3;
         let lane = (off & 3) as usize;
-        let value = match dword_off {
-            LAPIC_REG_ID => self.id_value(),
-            LAPIC_REG_VERSION => LAPIC_VERSION_VALUE,
-            // Unimplemented offsets: zeros (EOI/SVR/LVT/ICR not modeled).
-            _ => 0,
-        };
-        Some(value.to_le_bytes()[lane])
+        Some(self.read_dword(dword_off).to_le_bytes()[lane])
     }
 
     /// Byte write within the claimed window.
-    ///
-    /// Spec: SDM §10.4.6 — software may program the Local APIC ID field
-    /// (bits 31:24). Other offsets accept the write (claimed) with no side
-    /// effect in this stub.
     pub fn mmio_write_u8(&mut self, addr: u64, val: u8) -> bool {
         if !self.owns(addr) {
             return false;
@@ -109,13 +319,9 @@ impl LocalApicMmio {
         let off = (addr - self.base) as u32;
         let dword_off = off & !3;
         let lane = (off & 3) as usize;
-        if dword_off == LAPIC_REG_ID {
-            self.id_scratch = self.id_value().to_le_bytes();
-            self.id_scratch[lane] = val;
-            // Only bits 31:24 are architecturally the APIC ID; lower bytes
-            // are reserved / ignored on many implementations.
-            self.apic_id = self.id_scratch[3];
-        }
+        self.dword_scratch = self.read_dword(dword_off).to_le_bytes();
+        self.dword_scratch[lane] = val;
+        self.write_dword(dword_off, u32::from_le_bytes(self.dword_scratch));
         true
     }
 }
@@ -134,6 +340,12 @@ mod tests {
         u32::from_le_bytes(b)
     }
 
+    fn write_u32(lapic: &mut LocalApicMmio, off: u32, value: u32) {
+        for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+            assert!(lapic.mmio_write_u8(LAPIC_DEFAULT_BASE + u64::from(off) + i as u64, byte));
+        }
+    }
+
     /// Spec: SDM Vol. 3A §10.4.4 / §10.4.8 — ID=0, Version `0x14` / MaxLVT=3.
     #[test]
     fn id_and_version_presence_defaults() {
@@ -146,6 +358,8 @@ mod tests {
         assert_eq!(read_u32(&lapic, LAPIC_REG_VERSION), LAPIC_VERSION_VALUE);
         assert_eq!(LAPIC_VERSION_VALUE as u8, LAPIC_VERSION_ID);
         assert_eq!((LAPIC_VERSION_VALUE >> 16) as u8, LAPIC_MAX_LVT_ENTRY);
+        assert_eq!(lapic.svr(), 0xFF);
+        assert_eq!(lapic.lvt_timer() & LAPIC_LVT_MASK, LAPIC_LVT_MASK);
     }
 
     /// Spec: SDM §10.4.6 — ID bits 31:24 are writable.
@@ -155,22 +369,97 @@ mod tests {
         assert!(lapic.mmio_write_u8(LAPIC_DEFAULT_BASE + u64::from(LAPIC_REG_ID) + 3, 0x02));
         assert_eq!(lapic.apic_id(), 0x02);
         assert_eq!(read_u32(&lapic, LAPIC_REG_ID), 0x0200_0000);
-        // Version remains RO.
         assert_eq!(read_u32(&lapic, LAPIC_REG_VERSION), LAPIC_VERSION_VALUE);
     }
 
     #[test]
     fn unimplemented_offsets_read_zero_writes_claimed() {
         let mut lapic = LocalApicMmio::new();
-        assert_eq!(lapic.mmio_read_u8(LAPIC_DEFAULT_BASE + 0xB0), Some(0)); // EOI
-        assert!(lapic.mmio_write_u8(LAPIC_DEFAULT_BASE + 0xB0, 0x00));
+        assert_eq!(lapic.mmio_read_u8(LAPIC_DEFAULT_BASE + 0x280), Some(0)); // ESR
+        assert!(lapic.mmio_write_u8(LAPIC_DEFAULT_BASE + 0x280, 0x00));
     }
 
     #[test]
-    fn reset_restores_id_zero() {
+    fn reset_restores_defaults() {
         let mut lapic = LocalApicMmio::new();
         assert!(lapic.mmio_write_u8(LAPIC_DEFAULT_BASE + u64::from(LAPIC_REG_ID) + 3, 0x07));
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0x20);
         lapic.reset();
         assert_eq!(lapic, LocalApicMmio::new());
+    }
+
+    /// Spec: SDM §10.5.4 — DCR divide encodings.
+    #[test]
+    fn dcr_divide_encodings() {
+        assert_eq!(LocalApicMmio::timer_divide_value(0b0000), 2);
+        assert_eq!(LocalApicMmio::timer_divide_value(0b0001), 4);
+        assert_eq!(LocalApicMmio::timer_divide_value(0b0010), 8);
+        assert_eq!(LocalApicMmio::timer_divide_value(0b0011), 16);
+        assert_eq!(LocalApicMmio::timer_divide_value(0b1000), 32);
+        assert_eq!(LocalApicMmio::timer_divide_value(0b1001), 64);
+        assert_eq!(LocalApicMmio::timer_divide_value(0b1010), 128);
+        assert_eq!(LocalApicMmio::timer_divide_value(0b1011), 1);
+    }
+
+    /// Spec: SDM §10.5.4 / §10.5.1 — one-shot ICR→CCR countdown raises LVT vector.
+    #[test]
+    fn oneshot_timer_latches_lvt_vector() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011); // divide by 1
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40); // vector 0x40, unmasked, one-shot
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 3);
+        assert_eq!(lapic.timer_ccr(), 3);
+        assert!(!lapic.interrupt_pending());
+
+        assert!(!lapic.tick_timer(2));
+        assert_eq!(lapic.timer_ccr(), 1);
+        assert!(lapic.tick_timer(1));
+        assert_eq!(lapic.timer_ccr(), 0);
+        assert_eq!(lapic.pending_vector(), Some(0x40));
+        assert_eq!(lapic.take_interrupt(), Some(0x40));
+        assert!(!lapic.interrupt_pending());
+
+        // EOI clears in-service; one-shot stays at 0.
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        assert!(!lapic.tick_timer(10));
+        assert_eq!(lapic.timer_ccr(), 0);
+    }
+
+    /// Spec: SDM §10.5.1 — periodic mode reloads CCR from ICR.
+    #[test]
+    fn periodic_timer_reloads_and_refires() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011);
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_LVT_TIMER,
+            0x41 | LAPIC_LVT_TIMER_PERIODIC,
+        );
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 2);
+        assert!(lapic.tick_timer(2));
+        assert_eq!(lapic.take_interrupt(), Some(0x41));
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+        assert_eq!(lapic.timer_ccr(), 2);
+        assert!(lapic.tick_timer(2));
+        assert_eq!(lapic.pending_vector(), Some(0x41));
+    }
+
+    /// Spec: SDM §10.9 / §10.5.1 — masked LVT or software-disabled APIC blocks delivery.
+    #[test]
+    fn mask_and_software_enable_gate_delivery() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011);
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40); // unmasked but SVR enable off
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 1);
+        assert!(!lapic.tick_timer(1));
+        assert!(!lapic.interrupt_pending());
+
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40 | LAPIC_LVT_MASK);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 1);
+        assert!(!lapic.tick_timer(1));
+        assert!(!lapic.interrupt_pending());
     }
 }

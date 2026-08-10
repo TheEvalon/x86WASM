@@ -11,6 +11,7 @@
 mod eltorito_load;
 mod hello_rom;
 mod hpet_wire;
+mod lapic_wire;
 mod mbr;
 mod mem;
 mod ports;
@@ -861,6 +862,15 @@ impl Machine {
     /// See `docs/hpet-r7-comparator-irq.md`.
     pub fn advance_hpet(&mut self, delta: u64) -> bool {
         hpet_wire::advance_hpet(&mut self.hpet, delta)
+    }
+
+    /// Host-driven Local APIC timer tick (ICR/CCR/DCR + LVT Timer stub).
+    ///
+    /// Spec: Intel SDM Vol. 3A §10.5 — may latch a local vector via
+    /// [`devices::LocalApicMmio::take_interrupt`]. Does **not** inject into the
+    /// CPU or assert the INTR pin. See `docs/lapic-r7-timer-lvt.md`.
+    pub fn tick_lapic_timer(&mut self, bus_clocks: u64) -> bool {
+        lapic_wire::tick_lapic_timer(&mut self.lapic, bus_clocks)
     }
 
     /// Advance CMOS/RTC by `periods` model quanta and sync IRQF → PIC IRQ8.
