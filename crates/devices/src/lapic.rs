@@ -19,10 +19,13 @@
 //! clears the single in-service tracker). Round-10: Trigger Mode Register
 //! (TMR) tracks edge vs level on Fixed accept into IRR; Task/Processor
 //! Priority (TPR/PPR) store/readback gates `take_interrupt` when the pending
-//! vector class is not strictly above PPR. CPUID leaf 1 EDX bit 9 (`APIC`)
-//! stays clear — presence ≠ advertised APIC.
+//! vector class is not strictly above PPR. Round-11: LVT Timer mask/vector/
+//! mode readback edge cases (mask at expiry, vector sampled at fire,
+//! reserved bits dropped). CPUID leaf 1 EDX bit 9 (`APIC`) stays clear —
+//! presence ≠ advertised APIC.
 //! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`,
-//! `docs/lapic-r10-tmr.md`, `docs/lapic-r10-tpr-ppr.md`.
+//! `docs/lapic-r10-tmr.md`, `docs/lapic-r10-tpr-ppr.md`,
+//! `docs/lapic-r11-lvt-timer.md`.
 
 /// Default Local APIC physical base (SDM Vol. 3A §10.4.4).
 pub const LAPIC_DEFAULT_BASE: u64 = 0xFEE0_0000;
@@ -474,7 +477,9 @@ impl LocalApicMmio {
                 self.svr = value & (LAPIC_SVR_VECTOR_MASK | LAPIC_SVR_SW_ENABLE);
             }
             LAPIC_REG_LVT_TIMER => {
-                // Retain vector, mask, timer mode.
+                // Spec: SDM §10.5.1 — retain vector, mask, timer mode (bit 17).
+                // TSC-deadline (bit 18) and other LVT fields are not modeled;
+                // junk bits are dropped so readback matches the stub mask.
                 self.lvt_timer =
                     value & (LAPIC_LVT_VECTOR_MASK | LAPIC_LVT_MASK | LAPIC_LVT_TIMER_PERIODIC);
             }
@@ -800,5 +805,87 @@ mod tests {
         assert_eq!(lapic.ppr(), 0x20);
         write_u32(&mut lapic, LAPIC_REG_EOI, 0);
         assert_eq!(lapic.ppr(), 0x10);
+    }
+
+    /// Spec: SDM §10.5.1 — LVT Timer readback keeps only vector/mask/periodic.
+    #[test]
+    fn lvt_timer_readback_drops_reserved_bits() {
+        let mut lapic = LocalApicMmio::new();
+        // Write vector + mask + periodic + junk (bit 18 TSC-deadline, delivery mode).
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_LVT_TIMER,
+            0x40 | LAPIC_LVT_MASK | LAPIC_LVT_TIMER_PERIODIC | (1 << 18) | (0b111 << 8),
+        );
+        let v = read_u32(&lapic, LAPIC_REG_LVT_TIMER);
+        assert_eq!(
+            v,
+            0x40 | LAPIC_LVT_MASK | LAPIC_LVT_TIMER_PERIODIC,
+            "reserved/TSC-deadline bits must not stick"
+        );
+        assert_eq!(lapic.lvt_timer(), v);
+    }
+
+    /// Spec: SDM §10.5.1 — vector is sampled when the timer fires, not at ICR write.
+    #[test]
+    fn lvt_vector_sampled_at_fire_time() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011);
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 2);
+        assert!(!lapic.tick_timer(1));
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x55); // change before expiry
+        assert!(lapic.tick_timer(1));
+        assert_eq!(lapic.pending_vector(), Some(0x55));
+    }
+
+    /// Spec: SDM §10.5.1 — masked at expiry: CCR hits 0 (one-shot) / reloads
+    /// (periodic) without latching; later unmask does not invent a fire.
+    #[test]
+    fn lvt_mask_at_expiry_and_unmask_no_retroactive_fire() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011);
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40 | LAPIC_LVT_MASK);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 1);
+        assert!(!lapic.tick_timer(1));
+        assert_eq!(lapic.timer_ccr(), 0);
+        assert!(!lapic.interrupt_pending());
+        // Unmask after one-shot expiry — no retroactive interrupt.
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40);
+        assert!(!lapic.tick_timer(10));
+        assert!(!lapic.interrupt_pending());
+
+        // Periodic masked: CCR reloads, still no pending.
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_LVT_TIMER,
+            0x41 | LAPIC_LVT_MASK | LAPIC_LVT_TIMER_PERIODIC,
+        );
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 2);
+        assert!(!lapic.tick_timer(2));
+        assert_eq!(lapic.timer_ccr(), 2);
+        assert!(!lapic.interrupt_pending());
+    }
+
+    /// Spec: SDM §10.5.1 — mode bit switch one-shot→periodic mid-countdown.
+    #[test]
+    fn lvt_mode_switch_oneshot_to_periodic_mid_count() {
+        let mut lapic = LocalApicMmio::new();
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011);
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x42); // one-shot
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 3);
+        assert!(!lapic.tick_timer(1));
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_LVT_TIMER,
+            0x42 | LAPIC_LVT_TIMER_PERIODIC,
+        );
+        assert!(lapic.tick_timer(2));
+        assert_eq!(lapic.take_interrupt(), Some(0x42));
+        // Periodic reload after fire.
+        assert_eq!(lapic.timer_ccr(), 3);
     }
 }
