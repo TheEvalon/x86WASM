@@ -875,12 +875,15 @@ impl Machine {
         self.load_rom(&rom)
     }
 
-    /// Advance PIT channel 0 (and ch2 speaker timer) by `clocks` model ticks
-    /// and sync ch0 OUT → PIC IRQ0. Also freeruns ACPI `PM_TMR` at 3× PIT.
+    /// Advance PIT channel 0, channel 1 (DRAM refresh), and channel 2 (speaker)
+    /// by `clocks` model ticks; sync ch0 OUT → PIC IRQ0; freerun ACPI `PM_TMR`
+    /// at 3× PIT.
     ///
     /// Spec: Intel 8254 ch0 OUT; Intel 8259A edge IR (low→high latches IRR);
-    /// Intel 82371AB — `PM_TMR` at 3.579545 MHz = 3 × PIT CLK into
-    /// `PciConfig::acpi_pm_io[+8]` via [`PciConfig::tick_acpi_pm`].
+    /// IBM PC/AT — ch1 OUT is the DRAM-refresh request and toggles System
+    /// Control Port B bit4 on each rising edge (no IRQ); ch2 is the speaker
+    /// timer via port `0x61`; Intel 82371AB — `PM_TMR` at 3.579545 MHz = 3 ×
+    /// PIT CLK into `PciConfig::acpi_pm_io[+8]` via [`PciConfig::tick_acpi_pm`].
     /// Guest wall-clock rate is **not** host-real-time — callers choose the quantum.
     ///
     /// When `tick_ch0` reports a rising OUT edge, IR0 is pulsed (deassert then
@@ -888,6 +891,7 @@ impl Machine {
     // --- PIT→IRQ0 (slice/device-pit-irq0); keep MachineBus edits minimal for 8042 merge ---
     pub fn tick_pit(&mut self, clocks: u64) {
         let rising = self.pit.tick_ch0(clocks);
+        let _ = self.pit.tick_ch1(clocks);
         let _ = self.pit.tick_ch2(clocks);
         // Spec: Intel 82371AB / ACPI — one PM_TMR clock path (3× PIT) for every
         // machine PIT quantum, including step-clock and host `tick_pit` calls.

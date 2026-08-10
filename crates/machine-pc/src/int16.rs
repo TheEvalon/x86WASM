@@ -9,7 +9,6 @@
 //! AH=01h (check for keystroke); IBM PC BIOS keyboard services.
 
 use crate::{Machine, MachineError};
-use x86_core::CpuState;
 
 /// AH=00h — read (wait for) next keystroke; remove from buffer.
 pub const INT16_AH_GET_KEYSTROKE: u8 = 0x00;
@@ -139,6 +138,7 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x86_core::CpuState;
 
     fn zf(cpu: &CpuState) -> bool {
         cpu.rflags & RFLAGS_ZF != 0

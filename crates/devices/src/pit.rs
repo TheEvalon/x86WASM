@@ -743,6 +743,17 @@ impl Pit8254 {
         self.port61_lo & PORT61_SPKR_DATA != 0
     }
 
+    /// Classic PC-speaker AND path: GATE2 ∧ speaker-data ∧ OUT2.
+    ///
+    /// Spec: IBM PC/AT System Control Port B — the AND of bit0 (GATE2), bit1
+    /// (speaker data), and channel-2 OUT drives the speaker transistor. This
+    /// emulator exposes the digital enable level only (no host audio).
+    pub fn speaker_output_enabled(&self) -> bool {
+        self.port61_lo & PORT61_GATE2 != 0
+            && self.port61_lo & PORT61_SPKR_DATA != 0
+            && self.out_ch2()
+    }
+
     /// Set channel 2 GATE (also updated by [`Pit8254::port61_write`]).
     pub fn set_gate_ch2(&mut self, high: bool) {
         self.channels[2].set_gate(high);
@@ -1556,11 +1567,16 @@ mod tests {
         assert!(pit.tick_ch2(1)); // terminal → OUT rising
         assert!(pit.out_ch2());
         assert_ne!(pit.port61_read() & PORT61_OUT2, 0);
+        assert!(
+            pit.speaker_output_enabled(),
+            "GATE2 ∧ SPKR_DATA ∧ OUT2 drives the speaker AND path"
+        );
 
         // GATE low pauses; OUT2 stays high (mode 0).
         pit.port61_write(PORT61_SPKR_DATA);
         assert!(!pit.channel2().gate);
         assert!(pit.out_ch2());
+        assert!(!pit.speaker_output_enabled());
         assert_ne!(pit.port61_read() & PORT61_OUT2, 0);
         assert_eq!(pit.port61_read() & PORT61_GATE2, 0);
     }

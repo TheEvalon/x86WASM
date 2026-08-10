@@ -33,9 +33,9 @@ Register authority remains `PciConfig::acpi_pm_io[PM_TMR]` (no second field).
 - No wall-clock accuracy; instruction-count / host quantum only.
 - No edit of the PCI register file in this lane — uses existing
   `PciConfig::tick_acpi_pm`.
+- Channel-1 DRAM-refresh countdown advances with [`Machine::tick_pit`]
+  (see `docs/pit-r9-port61.md`).
 - `RDTSC` is not advanced here (CPU ownership).
-- Channel-1 DRAM-refresh countdown is still a separate `tick_ch1` call
-  (see `docs/pit-r9-port61.md` when present).
 
 ## Tests
 
