@@ -1,10 +1,11 @@
 //! Host helpers for HPET Timer 0 → I/O APIC GSI delivery (R10/R11).
 //!
 //! Kept out of the `Machine` monolith so parallel lanes can merge without
-//! rewriting MMIO dispatch. Legacy PIC replacement and FSB/MSI remain out of
-//! scope — see `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`.
+//! rewriting MMIO dispatch. Legacy PIC replacement stays an explicit non-claim
+//! (`LEG_RT_CAP` clear — `docs/hpet-r14-legacy-irq.md`); FSB/MSI remains out
+//! (`docs/hpet-r12-msi-irq.md`).
 //!
-//! Ownership (R10/R11 usb-timer): this module + thin `Machine::advance_hpet` /
+//! Ownership (R10/R11/R14 usb-timer): this module + thin `Machine::advance_hpet` /
 //! `Machine::sync_hpet_irq_to_ioapic` / `Machine::advance_hpet_ioapic` /
 //! `Machine::eoi_lapic_ioapic` (HPET level re-sync) wrappers.
 

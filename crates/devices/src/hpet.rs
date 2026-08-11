@@ -18,6 +18,9 @@
 //! asserted after EOI is re-driven onto the I/O APIC GSI (host wire).
 //! Round-12: MSI/FSB capability stays **clear** (no false FSB_INT_DEL_CAP /
 //! FSB_EN); IRQ route tests deepen advertised-vs-default GSI honesty.
+//! Round-14: Legacy Replacement (`LEG_RT_CAP` / `LEG_RT_CNF`) stays **clear**
+//! so PIT IRQ0 and CMOS IRQ8 remain the real 8254/RTC sources; MSI still
+//! unsupported. See `docs/hpet-r14-legacy-irq.md`.
 //! See `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`,
 //! `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`,
 //! `docs/hpet-r12-msi-irq.md`.
@@ -48,6 +51,12 @@ pub const HPET_REG_T0_COMPARATOR: u32 = 0x108;
 
 /// `ENABLE_CNF` — General Configuration bit 0.
 pub const HPET_CFG_ENABLE: u64 = 1 << 0;
+
+/// `LEG_RT_CNF` — General Configuration bit 1 (Legacy Replacement Route).
+///
+/// Spec: IA-PC HPET 1.0a §2.3.1 — only meaningful when `LEG_RT_CAP` is set.
+/// This stub keeps `LEG_RT_CAP` clear, so writes to this bit are dropped.
+pub const HPET_CFG_LEG_RT: u64 = 1 << 1;
 
 /// Timer n Interrupt Type (`Tn_INT_TYPE_CNF`) — bit 1 (1 = level).
 pub const HPET_TN_INT_TYPE: u64 = 1 << 1;
@@ -94,7 +103,9 @@ pub const HPET_COUNT_SIZE_CAP: u64 = 0;
 /// LegacyReplacement Route Capable (`LEG_RT_CAP`) — CAPS bit 15.
 ///
 /// Honesty: clear — this stub does not implement legacy 8254/RTC replacement
-/// routing (HPET 1.0a §2.3.1).
+/// routing (HPET 1.0a §2.3.1). Only one timer is advertised (`NUM_TIM_CAP=0`),
+/// so claiming Timer0→IRQ0 / Timer1→IRQ8 would be a lie. PIT IRQ0 and CMOS
+/// IRQ8 remain the platform sources.
 pub const HPET_LEG_RT_CAP: u64 = 0;
 
 /// Vendor ID (CAPS bits 31:16) — Intel PCI vendor for a PC-compatible stub.
@@ -200,6 +211,23 @@ impl HpetMmio {
 
     pub fn config(&self) -> u64 {
         self.config
+    }
+
+    /// Whether Legacy Replacement Route is active (Timer0→IRQ0 / Timer1→IRQ8).
+    ///
+    /// Spec: HPET 1.0a §2.3.1. Always `false` while [`HPET_LEG_RT_CAP`] is clear.
+    pub fn legacy_replacement_active(&self) -> bool {
+        HPET_LEG_RT_CAP != 0 && self.config & HPET_CFG_LEG_RT != 0
+    }
+
+    /// PIC IRQ0 driven by HPET Timer 0 under legacy replacement — never in this stub.
+    pub fn drives_pic_irq0(&self) -> bool {
+        self.legacy_replacement_active() && self.irq_line()
+    }
+
+    /// PIC IRQ8 driven by HPET Timer 1 under legacy replacement — never (no Timer 1).
+    pub fn drives_pic_irq8(&self) -> bool {
+        false
     }
 
     pub fn main_counter(&self) -> u64 {
@@ -343,6 +371,8 @@ impl HpetMmio {
         if byte_index < 8 {
             self.qword_scratch[byte_index] = val;
             let raw = u64::from_le_bytes(self.qword_scratch);
+            // Spec: HPET 1.0a — LEG_RT_CNF is meaningless while LEG_RT_CAP is
+            // clear; drop it so IRQ0/IRQ8 are never claimed via this path.
             self.config = raw & HPET_CFG_ENABLE;
         }
     }
@@ -765,5 +795,43 @@ mod tests {
         assert!(hpet.advance_main_counter(5));
         assert!(hpet.irq_line());
         assert_eq!(hpet.ioapic_gsi(), 2);
+    }
+
+    /// Spec: HPET 1.0a §2.3.1 — LEG_RT_CAP clear; LEG_RT_CNF dropped; no IRQ0/IRQ8.
+    #[test]
+    fn legacy_replacement_cap_clear_and_leg_rt_cnf_dropped() {
+        let mut hpet = HpetMmio::new();
+        assert_eq!(HPET_LEG_RT_CAP, 0);
+        assert_eq!(HPET_CAPS_ID_VALUE & (1 << 15), 0);
+        assert_eq!(HPET_NUM_TIM_CAP, 0, "single timer ⇒ no Timer1→IRQ8");
+        assert_eq!(HPET_TN_FSB_INT_DEL_CAP, 0, "MSI/FSB still unsupported");
+
+        // Attempt ENABLE + LEG_RT_CNF together.
+        write_u32(
+            &mut hpet,
+            HPET_REG_CONFIG,
+            (HPET_CFG_ENABLE | HPET_CFG_LEG_RT) as u32,
+        );
+        assert_eq!(hpet.config() & HPET_CFG_ENABLE, HPET_CFG_ENABLE);
+        assert_eq!(
+            hpet.config() & HPET_CFG_LEG_RT,
+            0,
+            "LEG_RT_CNF must not stick while LEG_RT_CAP clear"
+        );
+        assert!(!hpet.legacy_replacement_active());
+
+        write_u32(&mut hpet, HPET_REG_T0_COMPARATOR, 4);
+        write_u32(
+            &mut hpet,
+            HPET_REG_T0_CONFIG,
+            (HPET_TN_INT_ENB | HPET_TN_INT_TYPE) as u32,
+        );
+        assert!(hpet.advance_main_counter(4));
+        assert!(
+            hpet.irq_line(),
+            "device irq_line still works via I/O APIC path"
+        );
+        assert!(!hpet.drives_pic_irq0());
+        assert!(!hpet.drives_pic_irq8());
     }
 }

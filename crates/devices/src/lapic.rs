@@ -26,7 +26,9 @@
 //! mode readback edge cases (mask at expiry, vector sampled at fire,
 //! reserved bits dropped). Round-12: ICR low/high store/readback + optional
 //! Self Fixed IPI; CPUID leaf 1 EDX bit 9 (`APIC`) stays clear —
-//! presence ≠ advertised APIC.
+//! presence ≠ advertised APIC. Round-14: SVR vector + soft-enable (+ sticky
+//! focus/EOI-broadcast bit 9 for firmware RMW probes) with soft-enable gating
+//! honesty — see `docs/lapic-r14-svr-stub.md`.
 //! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`,
 //! `docs/lapic-r10-tmr.md`, `docs/lapic-r10-tpr-ppr.md`,
 //! `docs/lapic-r11-lvt-timer.md`, `docs/lapic-r12-icr.md`.
@@ -96,8 +98,22 @@ pub const LAPIC_VERSION_VALUE: u32 =
 /// SVR software-enable bit (SDM §10.9 bit 8).
 pub const LAPIC_SVR_SW_ENABLE: u32 = 1 << 8;
 
+/// SVR Focus Processor Checking bit (SDM §10.9 bit 9) — presence/readback only.
+///
+/// Spec: Pentium-era focus checking; later processors treat this as reserved.
+/// This stub stores/reads the bit without implementing focus delivery.
+pub const LAPIC_SVR_FOCUS: u32 = 1 << 9;
+
+/// SVR EOI-Broadcast Suppression (SDM §10.9 bit 12) — **unsupported**.
+///
+/// Honesty: writes are dropped; this tree has no EOI broadcast fabric.
+pub const LAPIC_SVR_EOI_SUPPRESS: u32 = 1 << 12;
+
 /// SVR spurious vector field (bits 7:0).
 pub const LAPIC_SVR_VECTOR_MASK: u32 = 0xFF;
+
+/// Guest-writable SVR bits retained by this stub (vector + enable + focus).
+pub const LAPIC_SVR_WRITABLE: u32 = LAPIC_SVR_VECTOR_MASK | LAPIC_SVR_SW_ENABLE | LAPIC_SVR_FOCUS;
 
 /// LVT mask bit (bit 16).
 pub const LAPIC_LVT_MASK: u32 = 1 << 16;
@@ -238,6 +254,14 @@ impl LocalApicMmio {
 
     pub fn svr(&self) -> u32 {
         self.svr
+    }
+
+    /// Spurious interrupt vector field (SVR bits 7:0).
+    ///
+    /// Spec: SDM Vol. 3A §10.9 — delivered on spurious INTA; this stub exposes
+    /// the programmed value for firmware probes without CPU injection.
+    pub fn spurious_vector(&self) -> u8 {
+        (self.svr & LAPIC_SVR_VECTOR_MASK) as u8
     }
 
     /// Task Priority Register value (bits 7:0).
@@ -570,8 +594,10 @@ impl LocalApicMmio {
                 let _ = self.eoi();
             }
             LAPIC_REG_SVR => {
-                // Retain vector + software enable; other SVR bits dropped.
-                self.svr = value & (LAPIC_SVR_VECTOR_MASK | LAPIC_SVR_SW_ENABLE);
+                // Spec: SDM §10.9 — retain vector, software enable, and Focus
+                // Processor Checking (presence). EOI-Broadcast Suppression and
+                // other bits are dropped (unsupported).
+                self.svr = value & LAPIC_SVR_WRITABLE;
             }
             LAPIC_REG_LVT_TIMER => {
                 // Spec: SDM §10.5.1 — retain vector, mask, timer mode (bit 17).
@@ -1076,5 +1102,57 @@ mod tests {
             read_u32(&lapic, LAPIC_REG_ICR_LOW) & LAPIC_ICR_DELIVERY_MODE_MASK,
             0b100 << 8
         );
+    }
+
+    /// Spec: SDM Vol. 3A §10.9 — SVR reset, vector/enable/focus R/W; EOI suppress dropped.
+    #[test]
+    fn svr_store_readback_drops_eoi_suppress() {
+        let mut lapic = LocalApicMmio::new();
+        assert_eq!(read_u32(&lapic, LAPIC_REG_SVR), 0xFF);
+        assert_eq!(lapic.spurious_vector(), 0xFF);
+        assert!(!lapic.software_enabled());
+
+        write_u32(
+            &mut lapic,
+            LAPIC_REG_SVR,
+            0x2F | LAPIC_SVR_SW_ENABLE | LAPIC_SVR_FOCUS | LAPIC_SVR_EOI_SUPPRESS | 0xF000,
+        );
+        let v = read_u32(&lapic, LAPIC_REG_SVR);
+        assert_eq!(v & LAPIC_SVR_VECTOR_MASK, 0x2F);
+        assert_eq!(lapic.spurious_vector(), 0x2F);
+        assert_ne!(v & LAPIC_SVR_SW_ENABLE, 0);
+        assert!(lapic.software_enabled());
+        assert_ne!(v & LAPIC_SVR_FOCUS, 0);
+        assert_eq!(
+            v & LAPIC_SVR_EOI_SUPPRESS,
+            0,
+            "EOI-Broadcast Suppression must not stick"
+        );
+        assert_eq!(v & !LAPIC_SVR_WRITABLE, 0);
+    }
+
+    /// Spec: SDM §10.9 — soft-enable clear suppresses timer latch and Fixed inject;
+    /// re-enable restores delivery. CPUID.APIC stays a separate honesty gate.
+    #[test]
+    fn svr_soft_enable_gates_timer_and_inject() {
+        let mut lapic = LocalApicMmio::new();
+        assert!(!lapic.software_enabled());
+        write_u32(&mut lapic, LAPIC_REG_TIMER_DCR, 0b1011);
+        write_u32(&mut lapic, LAPIC_REG_LVT_TIMER, 0x40);
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 1);
+        assert!(!lapic.tick_timer(1), "disabled APIC must not latch timer");
+        assert!(!lapic.inject_fixed(0x50));
+
+        write_u32(&mut lapic, LAPIC_REG_SVR, LAPIC_SVR_SW_ENABLE | 0xFF);
+        assert!(lapic.software_enabled());
+        write_u32(&mut lapic, LAPIC_REG_TIMER_ICR, 1);
+        assert!(lapic.tick_timer(1));
+        assert_eq!(lapic.take_interrupt(), Some(0x40));
+        write_u32(&mut lapic, LAPIC_REG_EOI, 0);
+
+        // Soft-disable mid-flight: no further inject.
+        write_u32(&mut lapic, LAPIC_REG_SVR, 0xFF);
+        assert!(!lapic.software_enabled());
+        assert!(!lapic.inject_fixed(0x51));
     }
 }

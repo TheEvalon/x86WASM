@@ -29,6 +29,7 @@ mod post_probe;
 mod post_spin;
 mod post_trace;
 mod step_clock;
+mod uhci_wire;
 mod vga_font;
 mod vga_frame;
 mod xbcs;
@@ -1293,6 +1294,14 @@ impl Machine {
         self.pci.sync_pirq_to_pic(&mut self.pic);
     }
 
+    /// Mirror UHCI USBSTS∩USBINTR pending onto PIRQD and sync through PIRQRC.
+    ///
+    /// Spec: Intel 82371SB — USB → PIRQD#; classic ISA route IRQ11 when
+    /// `PIRQRC[D]=0x0B`. See `docs/uhci-r14-pic-irq-wire.md`.
+    pub fn sync_uhci_irq_to_pic(&mut self) -> bool {
+        uhci_wire::sync_uhci_irq_to_pic(&mut self.pci, &mut self.pic)
+    }
+
     /// Whether the platform NMI delivery path is unmasked.
     ///
     /// Spec: IBM PC/AT — CMOS index port `0x70` bit7 = 1 disables NMI.
@@ -2043,14 +2052,17 @@ impl Bus for MachineBus<'_> {
     ///
     /// Syncs PIT ch0 OUT → IRQ0, 8042 OBF∧INT1 → IRQ1, COM2 THRE → IRQ3, COM1
     /// THRE → IRQ4, FDC IRQ6, CMOS IRQF → IRQ8, 8042 AUX OBF∧INT12 → IRQ12,
-    /// primary IDE INTRQ∧¬nIEN → IRQ14, and secondary IDE → IRQ15 (level follow)
-    /// before acknowledge so edges from prior
+    /// primary IDE INTRQ∧¬nIEN → IRQ14, secondary IDE → IRQ15 (level follow),
+    /// and UHCI USBSTS∩USBINTR → PIRQD → PIRQRC ISA IRQ (classic IRQ11) before
+    /// acknowledge so edges from prior
     /// [`Machine::tick_pit`] / [`Machine::kbd_place_output`] /
     /// [`Machine::kbd_inject_aux_byte`] / [`Machine::tick_cmos`] / FDC
-    /// [`Fdc82077::assert_irq6`] / IDE completion / 16550 THR drain are visible.
+    /// [`Fdc82077::assert_irq6`] / IDE completion / 16550 THR drain /
+    /// UHCI IOC completion are visible.
     ///
     /// Spec: IBM PC/AT ISA interrupt assignment — COM1 `0x3F8` → IRQ4, COM2
     /// `0x2F8` → IRQ3. Only the NS16550A THRE source exists in this UART subset.
+    /// Spec: Intel 82371SB — USB → PIRQD# (`docs/uhci-r14-pic-irq-wire.md`).
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());
@@ -2061,6 +2073,9 @@ impl Bus for MachineBus<'_> {
         self.pic.set_irq_line(12, self.kbd.irq12_line());
         self.pic.set_irq_line(14, self.ide.irq_line());
         self.pic.set_irq_line(15, self.ide_secondary.irq_line());
+        // After discrete ISA device lines so PIRQRC can drive shared PCI IRQs
+        // (classic USB → IRQ11) without being overwritten by fixed sinks.
+        let _ = uhci_wire::sync_uhci_irq_to_pic(self.pci, self.pic);
         self.pic.poll_irq()
     }
 }
@@ -2338,6 +2353,20 @@ mod tests {
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
         m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
         m.pic.port_write(PIC_SLAVE_DATA, 1, 0x7F); // unmask slave IR7 (IRQ15)
+    }
+
+    /// Helper: classic AT DualPic cascade + unmask master IR2 and slave IR3 (IRQ11 / UHCI).
+    fn init_at_pic_unmask_irq11(m: &mut Machine) {
+        m.pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        m.pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2 (cascade)
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0xF7); // unmask slave IR3 (IRQ11)
     }
 
     /// Helper: classic AT DualPic cascade + unmask master IR6 (IRQ6 / FDC).
@@ -4534,6 +4563,95 @@ mod tests {
         m.reset();
         assert_eq!(m.pci.uhci_io, [0; 32]);
         assert_eq!(m.pci.uhci_io_base(), None);
+    }
+
+    /// Spec: Intel 82371SB + UHCI 1.1 — USBSTS∩USBINTR → PIRQD → IRQ11 via poll_external_irq.
+    #[test]
+    fn uhci_pic_irq11_via_poll_external_irq() {
+        use devices::{
+            latch_usb_interrupt, usbintr_write, usbsts_write_w1c, UHCI_CLASSIC_PIRQRC_D,
+            UHCI_PIIX_PIRQD, UHCI_USBINTR_IOC, UHCI_USBSTS_USBINT,
+        };
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq11(&mut m);
+
+        // PIRQRC[D] → IRQ11 (classic USB route; CF8 dword + lane 0xCFF).
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u32(
+                PCI_CONFIG_ADDRESS,
+                PciConfig::make_address(0, 1, 0, PCI_PIIX_ISA_PIRQRC_OFFSET, true),
+            )
+            .unwrap();
+            bus.port_out_u8(0xCFF, UHCI_CLASSIC_PIRQRC_D).unwrap();
+        }
+
+        // Latch USBINT with USBINTR.IOC (host IRQ pending).
+        usbintr_write(&mut m.pci.uhci_io, UHCI_USBINTR_IOC);
+        latch_usb_interrupt(&mut m.pci.uhci_io);
+        assert_eq!(UHCI_PIIX_PIRQD, 3);
+
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), Some(0x73)); // IRQ11 → 0x70+3
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+
+        usbsts_write_w1c(&mut m.pci.uhci_io, UHCI_USBSTS_USBINT);
+        assert!(!m.sync_uhci_irq_to_pic());
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), None);
+        }
+    }
+
+    /// Spec: Intel 82371SB — PIRQRC[D] disabled → UHCI pending does not reach DualPic.
+    #[test]
+    fn uhci_pending_pirqrc_disabled_does_not_raise_pic() {
+        use devices::{latch_usb_interrupt, usbintr_write, UHCI_USBINTR_IOC};
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq11(&mut m);
+        // Default PIRQRC[D]=0x80 (disabled).
+        usbintr_write(&mut m.pci.uhci_io, UHCI_USBINTR_IOC);
+        latch_usb_interrupt(&mut m.pci.uhci_io);
+        assert!(m.sync_uhci_irq_to_pic());
+        assert_eq!(m.pic.poll_irq(), None);
+    }
+
+    /// Spec: HPET 1.0a — Timer 0 fire does not drive PIC IRQ0/IRQ8 (legacy clear).
+    #[test]
+    fn hpet_fire_does_not_drive_pic_irq0_or_irq8() {
+        use devices::{
+            HPET_REG_CONFIG, HPET_REG_T0_COMPARATOR, HPET_REG_T0_CONFIG, HPET_TN_INT_ENB,
+        };
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        // Also unmask cascade+IRQ8 for the second poll check.
+        m.pic.port_write(PIC_MASTER_DATA, 1, 0xFA); // unmask IR0+IR2
+        m.pic.port_write(PIC_SLAVE_DATA, 1, 0xFE); // unmask IRQ8
+
+        // Program Timer 0 comparator IRQ (I/O APIC path only).
+        for (off, val) in [
+            (HPET_REG_T0_COMPARATOR, 8u32),
+            (HPET_REG_T0_CONFIG, HPET_TN_INT_ENB as u32),
+            (HPET_REG_CONFIG, 1u32),
+        ] {
+            for i in 0..4u64 {
+                let b = ((val >> (8 * i)) & 0xFF) as u8;
+                assert!(m
+                    .hpet
+                    .mmio_write_u8(devices::HPET_DEFAULT_BASE + u64::from(off) + i, b));
+            }
+        }
+        assert!(m.advance_hpet(8));
+        assert!(m.hpet.irq_line());
+        assert!(!m.hpet.drives_pic_irq0());
+        assert!(!m.hpet.drives_pic_irq8());
+        {
+            let mut bus = m.bus_mut();
+            // PIT ch0 idle + CMOS idle → no IRQ0/IRQ8 from HPET.
+            assert_eq!(bus.poll_external_irq(), None);
+        }
     }
 
     /// Spec: ATA/ATAPI + OSDev ATA PIO — MachineBus primary IDE IDENTIFY + READ/WRITE SECTORS.

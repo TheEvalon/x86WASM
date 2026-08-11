@@ -7,9 +7,12 @@
 //! accounting, no full multi-QH reclaim walks.
 //!
 //! PCI config / BAR0 I/O decode remain in [`crate::pci::PciConfig`]; this module
-//! owns schedule + PORTSC bit semantics. See `docs/uhci-r8-one-td.md`,
-//! `docs/uhci-r11-frame-list-walk.md`, `docs/uhci-r11-portsc.md`,
-//! `docs/uhci-r12-qh-horizontal.md`, `docs/uhci-r12-usbsts-usbintr.md`.
+//! owns schedule + PORTSC bit semantics. Round-14 wires host IRQ pending onto
+//! PIIX3 PIRQD → classic ISA IRQ11 via machine-pc (see
+//! `docs/uhci-r14-pic-irq-wire.md`, `docs/uhci-r14-ioc-usbsts.md`).
+//! See `docs/uhci-r8-one-td.md`, `docs/uhci-r11-frame-list-walk.md`,
+//! `docs/uhci-r11-portsc.md`, `docs/uhci-r12-qh-horizontal.md`,
+//! `docs/uhci-r12-usbsts-usbintr.md`.
 
 use crate::pci::{
     PCI_PIIX_USB_UHCI_FLBASEADD, PCI_PIIX_USB_UHCI_FRNUM, PCI_PIIX_USB_UHCI_IO_SIZE,
@@ -63,6 +66,25 @@ pub const UHCI_USBINTR_SPI: u16 = 1 << 3;
 /// Guest-writable USBINTR bits (15:4 reserved → hardwired 0).
 pub const UHCI_USBINTR_WRITABLE: u16 =
     UHCI_USBINTR_CRC | UHCI_USBINTR_RESUME | UHCI_USBINTR_IOC | UHCI_USBINTR_SPI;
+
+/// PIIX3 USB Host Controller interrupt pin index into PIRQA–D (0=A … 3=D).
+///
+/// Spec: Intel 82371SB — "For the PIIX3, the USB interrupt is output on
+/// PIRQD#." Hosts drive [`crate::pci::PciConfig::set_pirq_line`] with this
+/// index when [`uhci_interrupt_pending`] is true.
+pub const UHCI_PIIX_PIRQD: u8 = 3;
+
+/// Classic ISA IRQ used by this machine's UHCI→PIC tests / SeaBIOS-style route.
+///
+/// Spec: Intel 82371SB PIRQRC — bits 3:0 = `1011b` selects IRQ11. Firmware
+/// programs `PIRQRC[D]` (config `0x63`) to this value; the HC itself only
+/// asserts PIRQD#. Documented machine-model choice for POST USB probe honesty.
+pub const UHCI_CLASSIC_ISA_IRQ: u8 = 11;
+
+/// PIRQRC[D] byte that routes PIRQD → [`UHCI_CLASSIC_ISA_IRQ`] (IRQ11).
+///
+/// Spec: Intel 82371SB — bit7 clear enables route; bits3:0 = `0xB` → IRQ11.
+pub const UHCI_CLASSIC_PIRQRC_D: u8 = UHCI_CLASSIC_ISA_IRQ;
 
 /// Frame-list / QH / TD link Terminate bit.
 pub const UHCI_LINK_TERMINATE: u32 = 1 << 0;
@@ -455,7 +477,8 @@ pub fn usbintr_write(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize], value:
 ///
 /// Spec: UHCI 1.1 §2.1.3 — disabled sources still appear in USBSTS for polling;
 /// this helper reports whether the HC would raise an interrupt to the host.
-/// Does **not** wire DualPic / PIRQ (explicit).
+/// Machine hosts mirror this onto PIRQD ([`UHCI_PIIX_PIRQD`]) then DualPic via
+/// PIRQRC (classic IRQ11 — see `docs/uhci-r14-pic-irq-wire.md`).
 pub fn uhci_interrupt_pending(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> bool {
     let sts = usbsts_read(regs);
     let en = usbintr_read(regs);
@@ -483,6 +506,15 @@ pub fn uhci_interrupt_pending(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -
 /// to exercise status / USBINTR gating.
 pub fn latch_usb_error(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
     let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_USBERRINT;
+    set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
+}
+
+/// Host helper: latch USBSTS.USBINT (IOC-completion stub without a TD walk).
+///
+/// Spec: UHCI 1.1 §2.1.2 bit 0. Real completions also set this via
+/// [`run_one_td`] when TD.IOC is set; this helper exercises PIC / USBINTR paths.
+pub fn latch_usb_interrupt(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
+    let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_USBINT;
     set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
 }
 
@@ -1362,5 +1394,208 @@ mod tests {
         assert_ne!(usbsts_read(&regs) & UHCI_USBSTS_HCHALTED, 0);
         set_reg_u16(&mut regs, PCI_PIIX_USB_UHCI_USBCMD, UHCI_USBCMD_RS);
         assert_eq!(usbsts_read(&regs) & UHCI_USBSTS_HCHALTED, 0);
+    }
+
+    /// Spec: Intel 82371SB — USB → PIRQD; PIRQRC[D]=IRQ11 → DualPic vector 0x73.
+    #[test]
+    fn uhci_pending_routes_pirqd_to_classic_irq11() {
+        use crate::{
+            DualPic, PciConfig, PCI_CONFIG_ADDRESS, PCI_PIIX_ISA_PIRQRC_OFFSET, PIC_MASTER_CMD,
+            PIC_MASTER_DATA, PIC_SLAVE_CMD, PIC_SLAVE_DATA,
+        };
+
+        assert_eq!(UHCI_PIIX_PIRQD, 3);
+        assert_eq!(UHCI_CLASSIC_ISA_IRQ, 11);
+        assert_eq!(UHCI_CLASSIC_PIRQRC_D, 0x0B);
+
+        let mut pci = PciConfig::new();
+        let mut pic = DualPic::new();
+        // Classic AT cascade; unmask slave IR3 (IRQ11) + master cascade IR2.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x11);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x08);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x04);
+        pic.port_write(PIC_MASTER_DATA, 1, 0x01);
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x11);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x70);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x02);
+        pic.port_write(PIC_SLAVE_DATA, 1, 0x01);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xF7); // unmask IR3 (IRQ11)
+
+        // PIRQRC[D] at ISA config 0x63 → IRQ11 (CF8 dword-aligned; lane 0xCFF).
+        pci.port_write(
+            PCI_CONFIG_ADDRESS,
+            4,
+            PciConfig::make_address(0, 1, 0, PCI_PIIX_ISA_PIRQRC_OFFSET, true),
+        );
+        pci.port_write(0xCFF, 1, u32::from(UHCI_CLASSIC_PIRQRC_D));
+        assert_eq!(
+            crate::pirqrc_routed_irq(pci.pirqrc_byte(UHCI_PIIX_PIRQD)),
+            Some(UHCI_CLASSIC_ISA_IRQ)
+        );
+
+        usbintr_write(&mut pci.uhci_io, UHCI_USBINTR_IOC);
+        latch_usb_interrupt(&mut pci.uhci_io);
+        assert!(uhci_interrupt_pending(&pci.uhci_io));
+
+        pci.set_pirq_line(UHCI_PIIX_PIRQD, uhci_interrupt_pending(&pci.uhci_io));
+        pci.sync_pirq_to_pic(&mut pic);
+        assert_eq!(pic.poll_irq(), Some(0x73)); // 0x70 + IR3
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+
+        // W1C clears USBINT → deassert PIRQD → PIC idle.
+        usbsts_write_w1c(&mut pci.uhci_io, UHCI_USBSTS_USBINT);
+        assert!(!uhci_interrupt_pending(&pci.uhci_io));
+        pci.set_pirq_line(UHCI_PIIX_PIRQD, false);
+        pci.sync_pirq_to_pic(&mut pic);
+        assert_eq!(pic.poll_irq(), None);
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2/§2.1.3 — IOC completion + USBINTR.IOC raises host IRQ.
+    #[test]
+    fn ioc_completion_raises_host_irq_when_usbintr_ioc_enabled() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0008_0000u32;
+        let td = 0x0008_1000u32;
+        let buf = 0x0008_2000u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, td);
+        mem.write_u32(td, UHCI_LINK_TERMINATE);
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE | UHCI_TD_IOC);
+        mem.write_u32(
+            td + 8,
+            u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(td + 12, buf);
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+        usbintr_write(&mut pci.uhci_io, UHCI_USBINTR_IOC);
+
+        let mut device = [0xAA];
+        let xfer = run_one_td(
+            &mut pci.uhci_io,
+            true,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("IOC TD");
+        assert!(xfer.usbint);
+        assert_ne!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBINT, 0);
+        assert!(
+            uhci_interrupt_pending(&pci.uhci_io),
+            "IOC + USBSTS.USBINT + USBINTR.IOC must raise host IRQ"
+        );
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2 — USBSTS R/WC: write-0 preserves; write-1 clears
+    /// only the bits written as 1; HCHalted is not a stored R/WC bit.
+    #[test]
+    fn usbsts_w1c_preserves_unwritten_bits() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        set_reg_u16(
+            &mut regs,
+            PCI_PIIX_USB_UHCI_USBSTS,
+            UHCI_USBSTS_USBINT | UHCI_USBSTS_USBERRINT | UHCI_USBSTS_HSE,
+        );
+        // Write-0 must not clear.
+        usbsts_write_w1c(&mut regs, 0);
+        assert_eq!(
+            usbsts_read(&regs) & UHCI_USBSTS_RWC_MASK,
+            UHCI_USBSTS_USBINT | UHCI_USBSTS_USBERRINT | UHCI_USBSTS_HSE
+        );
+        // Clear only USBINT; leave USBERRINT + HSE.
+        usbsts_write_w1c(&mut regs, UHCI_USBSTS_USBINT);
+        assert_eq!(usbsts_read(&regs) & UHCI_USBSTS_USBINT, 0);
+        assert_ne!(usbsts_read(&regs) & UHCI_USBSTS_USBERRINT, 0);
+        assert_ne!(usbsts_read(&regs) & UHCI_USBSTS_HSE, 0);
+        usbsts_write_w1c(&mut regs, UHCI_USBSTS_USBERRINT | UHCI_USBSTS_HSE);
+        assert_eq!(usbsts_read(&regs) & UHCI_USBSTS_RWC_MASK, 0);
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2/§2.1.3 — clearing USBINTR.IOC drops host IRQ while
+    /// USBSTS.USBINT remains set (pollable); re-enabling IOC reasserts.
+    #[test]
+    fn usbintr_ioc_disable_drops_pending_without_clearing_usbint() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        set_reg_u16(&mut regs, PCI_PIIX_USB_UHCI_USBSTS, UHCI_USBSTS_USBINT);
+        usbintr_write(&mut regs, UHCI_USBINTR_IOC);
+        assert!(uhci_interrupt_pending(&regs));
+        usbintr_write(&mut regs, 0);
+        assert!(!uhci_interrupt_pending(&regs));
+        assert_ne!(usbsts_read(&regs) & UHCI_USBSTS_USBINT, 0);
+        usbintr_write(&mut regs, UHCI_USBINTR_IOC);
+        assert!(uhci_interrupt_pending(&regs));
+    }
+
+    /// Spec: UHCI 1.1 §2.1.2 — USBINT remains latched across a second IOC TD
+    /// until software W1C-clears it.
+    #[test]
+    fn usbint_sticky_until_w1c_across_ioc_completions() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0009_0000u32;
+        let td = 0x0009_1000u32;
+        let buf = 0x0009_2000u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, td);
+        mem.write_u32(td, UHCI_LINK_TERMINATE);
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE | UHCI_TD_IOC);
+        mem.write_u32(
+            td + 8,
+            u32::from(UHCI_PID_IN) | ((1 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(td + 12, buf);
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+        usbintr_write(&mut pci.uhci_io, UHCI_USBINTR_IOC);
+
+        let mut device = [0x11];
+        run_one_td(
+            &mut pci.uhci_io,
+            true,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("first IOC");
+        assert_ne!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBINT, 0);
+
+        // Re-arm Active+IOC; USBINT still set from first completion.
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE | UHCI_TD_IOC);
+        device[0] = 0x22;
+        run_one_td(
+            &mut pci.uhci_io,
+            true,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("second IOC");
+        assert_ne!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBINT, 0);
+        assert!(uhci_interrupt_pending(&pci.uhci_io));
+        usbsts_write_w1c(&mut pci.uhci_io, UHCI_USBSTS_USBINT);
+        assert_eq!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBINT, 0);
+        assert!(!uhci_interrupt_pending(&pci.uhci_io));
     }
 }
