@@ -1582,6 +1582,17 @@ pub struct VgaText {
     pub dac_read_channel: u8,
     /// DAC State bits 1:0 ([`VGA_DAC_STATE_READ`] / [`VGA_DAC_STATE_WRITE`]).
     pub dac_state: u8,
+    /// Last successfully programmed BIOS/VBE mode number (bits 8:0).
+    ///
+    /// Spec: VBE 2.0 Function 03h Return Current VBE Mode — host stub tracks
+    /// mode set via INT 10h AH=00h / AX=4F02h. Never sets LFB bit14.
+    /// See `docs/vga-r15-vbe-4f03-get-mode.md`.
+    vbe_current_mode: u16,
+    /// Host INT 10h AH=0Eh bell (`07h`) observation counter (no speaker path).
+    ///
+    /// Spec: RBIL INT 10h AH=0Eh — BEL is accepted; this stub increments the
+    /// counter instead of driving PC speaker. See `docs/vga-r15-int10-teletype-polish.md`.
+    host_tty_bell_count: u32,
 }
 
 impl Default for VgaText {
@@ -1613,6 +1624,8 @@ impl VgaText {
             dac_write_channel: 0,
             dac_read_channel: 0,
             dac_state: VGA_DAC_STATE_WRITE,
+            vbe_current_mode: VBE_MODE_03H_TEXT,
+            host_tty_bell_count: 0,
         };
         v.reset();
         v
@@ -1672,6 +1685,30 @@ impl VgaText {
         self.dac_write_channel = 0;
         self.dac_read_channel = 0;
         self.dac_state = VGA_DAC_STATE_WRITE;
+        self.vbe_current_mode = VBE_MODE_03H_TEXT;
+        self.host_tty_bell_count = 0;
+    }
+
+    /// Last successfully programmed BIOS/VBE mode (bits 8:0; no LFB bit14).
+    ///
+    /// Spec: VBE 2.0 Function 03h / RBIL AX=4F03h.
+    pub fn vbe_current_mode(&self) -> u16 {
+        self.vbe_current_mode & 0x01FF
+    }
+
+    /// Record a successful mode program for AX=4F03h (never sets LFB bit14).
+    pub fn set_vbe_current_mode(&mut self, mode: u16) {
+        self.vbe_current_mode = mode & 0x01FF;
+    }
+
+    /// Host teletype bell observations since last reset / take.
+    pub fn host_tty_bell_count(&self) -> u32 {
+        self.host_tty_bell_count
+    }
+
+    /// Increment host teletype bell counter (AH=0Eh AL=`07h`; no speaker).
+    pub fn note_host_tty_bell(&mut self) {
+        self.host_tty_bell_count = self.host_tty_bell_count.saturating_add(1);
     }
 
     /// True if `addr` (after A20) falls in the text plane.
