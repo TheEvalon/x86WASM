@@ -141,8 +141,11 @@ pub use post_spin::{
 };
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use post_with_media::{
-    classify_post_with_media_stop, PostWithMediaClass, PostWithMediaReport,
-    NO_MEDIA_REBOOT_CLASS_CS, NO_MEDIA_REBOOT_CLASS_IP, POST_WITH_MEDIA_BUDGET_STEPS,
+    classify_post_media_activity, classify_post_media_reboot, classify_post_with_media_stop,
+    post_report_idle_pct, PostMediaActivity, PostMediaRebootSignal, PostWithMediaClass,
+    PostWithMediaReport, NO_MEDIA_REBOOT_CLASS_CS, NO_MEDIA_REBOOT_CLASS_IP,
+    POST_MEDIA_IDLE_DOMINANT_PCT, POST_WITH_MEDIA_BUDGET_STEPS, WAIT_IRQ_CLASS_CS,
+    WAIT_IRQ_CLASS_IP,
 };
 pub use step_clock::{
     StepClock, StepTicks, ACPI_PM_CLOCKS_PER_PIT_CLOCK, ACPI_PM_TMR_MASK, CMOS_PERIODIC_HZ,
