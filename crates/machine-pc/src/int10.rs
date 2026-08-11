@@ -1,21 +1,23 @@
-//! Host INT 10h video stub (AH=00h–03h/06h–0Ah/0Eh/0Fh/13h + AX=4F00h–4F02h).
+//! Host INT 10h video stub (AH=00h–03h/05h–0Ah/0Eh/0Fh/13h + AX=4F00h–4F03h).
 //!
 //! Bring-up path only: installs a real-mode IVT pointer and services selected
 //! functions via [`Machine::service_int10`]. Not a VGA BIOS and not a full VBE
-//! implementation — host AX=4F00h/4F01h/4F02h from truthful device helpers with
-//! **no guest LFB** claim (`PhysBasePtr` stays zero; BX bit14 LFB requests fail).
+//! implementation — host AX=4F00h/4F01h/4F02h/4F03h from truthful device helpers
+//! with **no guest LFB** claim (`PhysBasePtr` stays zero; BX bit14 LFB requests
+//! fail; AX=4F03h never returns bit14).
 //!
 //! Spec: Ralf Brown's Interrupt List — INT 10h AH=00h "SET VIDEO MODE",
 //! AH=01h "SET CURSOR TYPE", AH=02h "SET CURSOR POSITION", AH=03h "GET CURSOR
-//! POSITION AND SIZE", AH=06h "SCROLL UP WINDOW", AH=07h "SCROLL DOWN WINDOW",
-//! AH=08h "READ CHARACTER AND ATTRIBUTE AT CURSOR POSITION", AH=09h "WRITE
-//! CHARACTER AND ATTRIBUTE AT CURSOR POSITION", AH=0Ah "WRITE CHARACTER ONLY
-//! AT CURSOR POSITION", AH=0Eh "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO
-//! MODE", AH=13h "WRITE STRING", AX=4F00h / AX=4F01h / AX=4F02h VBE; VESA VBE
-//! 2.0 Functions 00h–02h; FreeVGA CRTC Cursor Location / Start Address /
-//! Maximum Scan Line; IBM PC BIOS Data Area video fields at
-//! `0040:0049` / `0040:004A` / `0040:004C` / `0040:004E` / `0040:0050`–`005F` /
-//! `0040:0060` / `0040:0062` / `0040:0063` / `0040:0084`.
+//! POSITION AND SIZE", AH=05h "SELECT ACTIVE DISPLAY PAGE", AH=06h "SCROLL UP
+//! WINDOW", AH=07h "SCROLL DOWN WINDOW", AH=08h "READ CHARACTER AND ATTRIBUTE
+//! AT CURSOR POSITION", AH=09h "WRITE CHARACTER AND ATTRIBUTE AT CURSOR
+//! POSITION", AH=0Ah "WRITE CHARACTER ONLY AT CURSOR POSITION", AH=0Eh
+//! "TELETYPE OUTPUT", AH=0Fh "GET CURRENT VIDEO MODE", AH=13h "WRITE STRING",
+//! AX=4F00h / AX=4F01h / AX=4F02h / AX=4F03h VBE; VESA VBE 2.0 Functions
+//! 00h–03h; FreeVGA CRTC Cursor Location / Start Address / Maximum Scan Line;
+//! IBM PC BIOS Data Area video fields at `0040:0049` / `0040:004A` /
+//! `0040:004C` / `0040:004E` / `0040:0050`–`005F` / `0040:0060` /
+//! `0040:0062` / `0040:0063` / `0040:0084`.
 
 use crate::{Machine, MachineError};
 use devices::{
@@ -38,6 +40,8 @@ pub const INT10_AH_SET_CURSOR_TYPE: u8 = 0x01;
 pub const INT10_AH_SET_CURSOR: u8 = 0x02;
 /// AH=03h — GET CURSOR POSITION AND SIZE. Spec: RBIL INT 10h AH=03h.
 pub const INT10_AH_GET_CURSOR: u8 = 0x03;
+/// AH=05h — SELECT ACTIVE DISPLAY PAGE. Spec: RBIL INT 10h AH=05h.
+pub const INT10_AH_SET_ACTIVE_PAGE: u8 = 0x05;
 /// AH=06h — SCROLL UP WINDOW. Spec: RBIL INT 10h AH=06h.
 pub const INT10_AH_SCROLL_UP: u8 = 0x06;
 /// AH=07h — SCROLL DOWN WINDOW. Spec: RBIL INT 10h AH=07h.
@@ -62,9 +66,15 @@ pub const INT10_AL_VBE_CONTROLLER_INFO: u8 = 0x00;
 pub const INT10_AL_VBE_MODE_INFO: u8 = 0x01;
 /// AL=02h — VBE Set Mode. Spec: VBE 3.0 Function 02h / RBIL AX=4F02h.
 pub const INT10_AL_VBE_SET_MODE: u8 = 0x02;
+/// AL=03h — VBE Return Current Mode. Spec: VBE 3.0 Function 03h / RBIL AX=4F03h.
+pub const INT10_AL_VBE_GET_MODE: u8 = 0x03;
+/// AL=0Ah — VBE Protected Mode Interface. Spec: VBE 2.0 Function 0Ah.
+/// Host stub returns AX=`014Fh` (unsupported) — no PMI / no LFB claims.
+pub const INT10_AL_VBE_PMI: u8 = 0x0A;
 
 /// VBE BX bit14 — request linear framebuffer. Spec: VBE 3.0 Function 02h.
 /// This stub has **no** guest LFB; requests with this bit set fail honestly.
+/// AX=4F03h never returns this bit set.
 pub const INT10_VBE_BX_LFB: u16 = 1 << 14;
 /// VBE BX bit15 — do not clear display memory. Spec: VBE 3.0 Function 02h.
 pub const INT10_VBE_BX_NO_CLEAR: u16 = 1 << 15;
@@ -89,7 +99,7 @@ pub const BDA_VIDEO_MODE: u64 = 0x449;
 pub const BDA_VIDEO_COLS: u64 = 0x44A;
 /// BDA video page / regen buffer size in bytes (`0040:004C`). Spec: RBIL.
 pub const BDA_VIDEO_PAGE_SIZE: u64 = 0x44C;
-/// BDA current page start offset (`0040:004E`). Spec: RBIL — stub keeps `0000h`.
+/// BDA current page start offset (`0040:004E`). Spec: RBIL — AH=05h sets `page*size`.
 pub const BDA_VIDEO_PAGE_START: u64 = 0x44E;
 /// BDA cursor position for display page 0 (`0040:0050`): low=col, high=row.
 pub const BDA_CURSOR_PAGE0: u64 = 0x450;
@@ -110,6 +120,9 @@ pub const INT10_MODE03_CURSOR_START: u8 = 0x06;
 pub const INT10_MODE03_CURSOR_END: u8 = 0x07;
 /// Mode-03h BDA page size (4 KiB regen). Spec: classic IBM BIOS BDA `0040:004C`.
 pub const INT10_MODE03_PAGE_SIZE: u16 = 0x1000;
+/// Mode-03h max display page index (8 × 4 KiB in a 32 KiB text aperture).
+/// Spec: classic IBM VGA BIOS text pages 0–7.
+pub const INT10_MODE03_MAX_PAGE: u8 = 7;
 /// Mode-13h BDA page size. Spec: classic BIOS mode-13h BDA `0040:004C` (`FA00h`).
 pub const INT10_MODE13_PAGE_SIZE: u16 = 0xFA00;
 /// Color VGA CRTC index port written to BDA `0040:0063`. Spec: IBM VGA / RBIL.
@@ -162,6 +175,7 @@ impl Machine {
             INT10_AH_SET_CURSOR_TYPE => self.int10_set_cursor_type(),
             INT10_AH_SET_CURSOR => self.int10_set_cursor(),
             INT10_AH_GET_CURSOR => self.int10_get_cursor(),
+            INT10_AH_SET_ACTIVE_PAGE => self.int10_set_active_page(self.cpu.al()),
             INT10_AH_SCROLL_UP => self.int10_scroll_window(true),
             INT10_AH_SCROLL_DOWN => self.int10_scroll_window(false),
             INT10_AH_READ_CHAR_ATTR => self.int10_read_char_attr(),
@@ -219,11 +233,15 @@ impl Machine {
                 let _ =
                     self.write_bda_cursor_type(INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END);
                 self.program_crtc_cursor_type(INT10_MODE03_CURSOR_START, INT10_MODE03_CURSOR_END);
+                self.vga
+                    .set_vbe_current_mode(u16::from(INT10_MODE_03H_TEXT));
             }
             INT10_MODE_13H_GRAPHICS => {
                 self.vga.program_bios_mode13h();
                 // Mode 13h is 40 columns in the classic BDA sense (320/8).
                 self.write_bda_video(mode, 40, INT10_MODE13_PAGE_SIZE, INT10_MODE03_ROWS_MINUS_1);
+                self.vga
+                    .set_vbe_current_mode(u16::from(INT10_MODE_13H_GRAPHICS));
             }
             _ => {
                 // Unsupported mode: leave hardware alone (honest subset).
@@ -270,11 +288,11 @@ impl Machine {
 
     /// AH=02h SET CURSOR POSITION. Spec: RBIL — BH=page, DH=row, DL=col.
     ///
-    /// Page 0 only: writes BDA `0040:0050` and programs FreeVGA CRTC Cursor
-    /// Location High/Low (`0x0E`/`0x0F`) so host render matches BDA.
+    /// Pages 0–7: writes that page's BDA cursor word. CRTC Cursor Location is
+    /// programmed only when `BH` equals the active display page.
     fn int10_set_cursor(&mut self) {
         let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
-        if page != 0 {
+        if page > INT10_MODE03_MAX_PAGE {
             return;
         }
         let row = self.cpu.gpr_u8(4 + CpuState::RDX); // DH
@@ -284,17 +302,21 @@ impl Machine {
         let max_row = (VGA_TEXT_ROWS as u8).saturating_sub(1);
         let col = col.min(max_col);
         let row = row.min(max_row);
-        let _ = self.write_bda_cursor(row, col);
+        let _ = self.write_bda_cursor_page(page, row, col);
+        let active = self.read_bda_u8(BDA_ACTIVE_PAGE).unwrap_or(0);
+        if page == active {
+            self.program_crtc_cursor_location(row, col);
+        }
     }
 
     /// AH=03h GET CURSOR POSITION AND SIZE. Spec: RBIL — BH=page in;
     /// DH=row, DL=col, CH=start, CL=end out.
     fn int10_get_cursor(&mut self) {
         let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
-        if page != 0 {
+        if page > INT10_MODE03_MAX_PAGE {
             return;
         }
-        let (row, col) = self.read_bda_cursor().unwrap_or((0, 0));
+        let (row, col) = self.read_bda_cursor_page(page).unwrap_or((0, 0));
         let (start, end) = self.read_bda_cursor_type().unwrap_or_else(|| {
             (
                 self.vga.crtc_cursor_start_scanline(),
@@ -305,6 +327,29 @@ impl Machine {
         self.cpu.set_gpr_u8_low(CpuState::RDX, col); // DL
         self.cpu.set_gpr_u8(4 + CpuState::RCX, start); // CH
         self.cpu.set_gpr_u8_low(CpuState::RCX, end); // CL
+    }
+
+    /// AH=05h SELECT ACTIVE DISPLAY PAGE. Spec: RBIL — AL=page.
+    ///
+    /// Text mode only, pages 0–[`INT10_MODE03_MAX_PAGE`]. Updates BDA active
+    /// page (`0040:0062`), page start (`0040:004E`), CRTC Start Address, and
+    /// CRTC Cursor Location from that page's BDA cursor word.
+    /// See `docs/vga-r15-int10-set-page.md`.
+    fn int10_set_active_page(&mut self, page: u8) {
+        if self.vga.render_mode() != VgaRenderMode::Text {
+            return;
+        }
+        if page > INT10_MODE03_MAX_PAGE {
+            return;
+        }
+        let page_size = INT10_MODE03_PAGE_SIZE;
+        let page_start = u16::from(page).wrapping_mul(page_size);
+        let start_chars = page_start / 2;
+        let _ = self.mem.write_u8(BDA_ACTIVE_PAGE, page);
+        let _ = self.write_bda_u16(BDA_VIDEO_PAGE_START, page_start);
+        let _ = self.vga.set_text_start_address(start_chars);
+        let (row, col) = self.read_bda_cursor_page(page).unwrap_or((0, 0));
+        self.program_crtc_cursor_location(row, col);
     }
 
     /// AH=06h / AH=07h scroll window. Spec: RBIL — AL=lines (`0` = blank whole
@@ -358,6 +403,23 @@ impl Machine {
         if n == 0 {
             return;
         }
+        self.scroll_text_window_cells(up, n, fill_attr, top, left, bottom, right);
+    }
+
+    /// Shared text-cell scroll used by AH=06h/07h and teletype / write-string.
+    fn scroll_text_window_cells(
+        &mut self,
+        up: bool,
+        n: usize,
+        fill_attr: u8,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) {
+        if n == 0 || top > bottom || left > right {
+            return;
+        }
         if up {
             for row in top..=(bottom.saturating_sub(n)) {
                 for col in left..=right {
@@ -391,14 +453,14 @@ impl Machine {
 
     /// AH=08h READ CHARACTER AND ATTRIBUTE AT CURSOR POSITION.
     ///
-    /// Spec: RBIL — BH=page in; AL=character, AH=attribute out. Page 0 + text
-    /// mode only. See `docs/vga-r14-int10-read-char.md`.
+    /// Spec: RBIL — BH=page in; AL=character, AH=attribute out. Text mode;
+    /// `BH` must be 0 or the active page. See `docs/vga-r14-int10-read-char.md`.
     fn int10_read_char_attr(&mut self) {
         if self.vga.render_mode() != VgaRenderMode::Text {
             return;
         }
         let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
-        if page != 0 {
+        if !self.int10_page_service_ok(page) {
             return;
         }
         let (row, col) = self.read_bda_cursor().unwrap_or((0, 0));
@@ -434,14 +496,14 @@ impl Machine {
     /// AH=09h / AH=0Ah write character at cursor. Spec: RBIL — AL=char, BH=page,
     /// CX=count; AH=09h also uses BL=attribute. Cursor position is unchanged.
     ///
-    /// Page 0 + text mode only. Count is capped at [`INT10_WRITE_CHAR_MAX_COUNT`]
-    /// and stops at the end of the 80×25 page. Graphics / multi-page are out.
+    /// Text mode; `BH` must be 0 or the active page. Count is capped at
+    /// [`INT10_WRITE_CHAR_MAX_COUNT`] and stops at the end of the 80×25 page.
     fn int10_write_char(&mut self, with_attr: bool) {
         if self.vga.render_mode() != VgaRenderMode::Text {
             return;
         }
         let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
-        if page != 0 {
+        if !self.int10_page_service_ok(page) {
             return;
         }
         let ch = self.cpu.al();
@@ -483,15 +545,15 @@ impl Machine {
 
     /// AH=4Fh VBE dispatcher. Spec: VBE 2.0 / RBIL AX=4Fxxh.
     ///
-    /// AL=00h (controller info), AL=01h (mode info), and AL=02h (set mode for
-    /// BIOS `03h`/`13h` without LFB) are implemented. Other AL values return
-    /// AX=`014Fh` without touching guest memory. Mode info / set-mode never
-    /// advertise a guest LFB (`PhysBasePtr` / ModeAttributes D7 clear).
+    /// AL=00h–03h are implemented. Other AL values return AX=`014Fh`. Mode
+    /// info / set-mode / get-mode never advertise a guest LFB (`PhysBasePtr` /
+    /// ModeAttributes D7 clear; BX bit14 never set on 4F03h).
     fn int10_vbe(&mut self) {
         match self.cpu.al() {
             INT10_AL_VBE_CONTROLLER_INFO => self.int10_vbe_controller_info(),
             INT10_AL_VBE_MODE_INFO => self.int10_vbe_mode_info(),
             INT10_AL_VBE_SET_MODE => self.int10_vbe_set_mode(),
+            INT10_AL_VBE_GET_MODE => self.int10_vbe_get_mode(),
             _ => {
                 self.cpu.set_ax(
                     u16::from(INT10_VBE_AH_FAILED) << 8 | u16::from(INT10_VBE_AL_SUPPORTED),
@@ -601,24 +663,34 @@ impl Machine {
         debug_assert!(!self.vga.guest_lfb_available());
     }
 
+    /// AX=4F03h Return Current VBE Mode. Spec: VBE 2.0 Function 03h / RBIL AX=4F03h.
+    ///
+    /// BX = mode last programmed via AH=00h or AX=4F02h, with LFB bit clear.
+    /// See `docs/vga-r15-vbe-4f03-get-mode.md`.
+    fn int10_vbe_get_mode(&mut self) {
+        let mode = self.vga.vbe_current_mode() & INT10_VBE_BX_MODE_MASK;
+        self.cpu.set_gpr_u16(CpuState::RBX, mode);
+        self.cpu
+            .set_ax(u16::from(INT10_VBE_AH_SUCCESS) << 8 | u16::from(INT10_VBE_AL_SUPPORTED));
+        debug_assert_eq!(self.cpu.gpr_u16(CpuState::RBX) & INT10_VBE_BX_LFB, 0);
+        debug_assert!(!self.vga.guest_lfb_available());
+    }
+
     /// AH=13h WRITE STRING. Spec: RBIL — AL=write mode, BH=page, BL=attr (if
     /// chars-only), CX=length, DH/DL=start row/col, ES:BP=string.
     ///
-    /// Bounded host stub: page 0 + text mode only; CX capped at
-    /// [`INT10_WRITE_CHAR_MAX_COUNT`]; AL bits 0–1 only (cursor update /
-    /// char+attr pairs). Stops at the end of the 80×25 page (no scroll).
-    /// Spec: RBIL INT 10h AH=13h; see `docs/vga-r13-int10-write-string.md`.
+    /// R15 deepen (`docs/vga-r15-int10-write-string-deepen.md`): text mode;
+    /// `BH` 0 or active page; scroll on page overflow; cursor after wrap/scroll.
     fn int10_write_string(&mut self) {
         if self.vga.render_mode() != VgaRenderMode::Text {
             return;
         }
         let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
-        if page != 0 {
+        if !self.int10_page_service_ok(page) {
             return;
         }
         let mode = self.cpu.al();
         if mode & !0x03 != 0 {
-            // Reserved AL bits — leave hardware alone (honest subset).
             return;
         }
         let update_cursor = (mode & INT10_WRITE_STRING_UPDATE_CURSOR) != 0;
@@ -635,15 +707,18 @@ impl Machine {
         let mut col = usize::from(self.cpu.gpr_u8_low(CpuState::RDX)); // DL
         let cols = self.read_bda_cols().unwrap_or(VGA_TEXT_COLS as u16).max(1) as usize;
         let rows = VGA_TEXT_ROWS;
+        let max_row = rows.saturating_sub(1);
         let src = self
             .cpu
             .es
             .base
             .wrapping_add(u64::from(self.cpu.gpr_u16(CpuState::RBP)));
         let stride = if has_attr { 2u64 } else { 1u64 };
+        let mut last_attr = bl_attr;
         for i in 0..u64::from(count) {
-            if row >= rows {
-                break;
+            while row > max_row {
+                self.int10_scroll_up_one(last_attr);
+                row = max_row;
             }
             let off = src.wrapping_add(i.wrapping_mul(stride));
             let Ok(ch) = self.mem.read_u8(off) else {
@@ -657,32 +732,32 @@ impl Machine {
             } else {
                 bl_attr
             };
+            last_attr = attr;
             let _ = self.vga.put_char(row, col, ch, attr);
             col += 1;
             if col >= cols {
                 col = 0;
                 row += 1;
+                if row > max_row {
+                    self.int10_scroll_up_one(attr);
+                    row = max_row;
+                }
             }
         }
         if update_cursor {
-            let max_row = rows.saturating_sub(1);
-            let (out_row, out_col) = if row > max_row {
-                (max_row as u8, (cols.saturating_sub(1)) as u8)
-            } else {
-                (row as u8, col.min(cols.saturating_sub(1)) as u8)
-            };
+            let out_row = row.min(max_row) as u8;
+            let out_col = col.min(cols.saturating_sub(1)) as u8;
             let _ = self.write_bda_cursor(out_row, out_col);
         }
     }
 
     fn int10_teletype(&mut self, ch: u8) {
-        // Graphics teletype and multi-page are out of scope; only text mode.
         if self.vga.render_mode() != VgaRenderMode::Text {
             return;
         }
-        // Spec: RBIL AH=0Eh — BH = page number (page 0 only in this stub).
+        // R15: accept BH=0 or active page after AH=05h.
         let page = self.cpu.gpr_u8(4 + CpuState::RBX); // BH
-        if page != 0 {
+        if !self.int10_page_service_ok(page) {
             return;
         }
         let cols = self.read_bda_cols().unwrap_or(VGA_TEXT_COLS as u16).max(1) as u8;
@@ -690,11 +765,9 @@ impl Machine {
         let (mut row, mut col) = self.read_bda_cursor().unwrap_or((0, 0));
         match ch {
             0x0D => {
-                // CR — column 0. Spec: RBIL teletype / classic BIOS.
                 col = 0;
             }
             0x0A => {
-                // LF — next row; scroll at bottom. Spec: RBIL / classic BIOS TTY.
                 if row >= max_row {
                     self.int10_scroll_up_one(INT10_TTY_ATTR);
                 } else {
@@ -702,16 +775,17 @@ impl Machine {
                 }
             }
             0x08 => {
-                // BS — move left; do not erase (minimal TTY).
-                col = col.saturating_sub(1);
+                // BS — left one column; do not erase; do not wrap to prior row.
+                // Spec: classic IBM VGA BIOS teletype (RBIL AH=0Eh); R15 honesty.
+                if col > 0 {
+                    col -= 1;
+                }
             }
             0x07 => {
-                // Bell — no speaker path in this stub.
+                // BEL — accepted; no PC-speaker path. Host observation counter only.
+                self.vga.note_host_tty_bell();
             }
             _ => {
-                // Attr deepen: write with the cell's current attribute (default
-                // `07h`), and use that same attribute when a wrap scroll fills
-                // the blank bottom line. Spec: classic BIOS teletype scroll fill.
                 let attr = self
                     .vga
                     .attr_at(usize::from(row), usize::from(col))
@@ -733,27 +807,20 @@ impl Machine {
         let _ = self.write_bda_cursor(row.min(max_row), col.min(cols.saturating_sub(1)));
     }
 
-    /// Scroll the text viewport up one row and blank the bottom line.
-    ///
-    /// Spec: classic IBM VGA BIOS teletype / scroll — moved rows keep their
-    /// character+attribute pairs; the new bottom row is spaces with `fill_attr`.
+    /// Scroll the text viewport up one row via the shared AH=06h cell path.
     fn int10_scroll_up_one(&mut self, fill_attr: u8) {
         let cols = self
             .read_bda_cols()
             .unwrap_or(VGA_TEXT_COLS as u16)
             .max(1)
             .min(VGA_TEXT_COLS as u16) as usize;
-        for row in 0..(VGA_TEXT_ROWS - 1) {
-            for col in 0..cols {
-                let ch = self.vga.char_at(row + 1, col).unwrap_or(b' ');
-                let attr = self.vga.attr_at(row + 1, col).unwrap_or(fill_attr);
-                let _ = self.vga.put_char(row, col, ch, attr);
-            }
-        }
-        let bottom = VGA_TEXT_ROWS - 1;
-        for col in 0..cols {
-            let _ = self.vga.put_char(bottom, col, b' ', fill_attr);
-        }
+        let right = cols.saturating_sub(1);
+        let bottom = VGA_TEXT_ROWS.saturating_sub(1);
+        self.scroll_text_window_cells(true, 1, fill_attr, 0, 0, bottom, right);
+    }
+
+    fn int10_page_service_ok(&self, page: u8) -> bool {
+        page == 0 || page == self.read_bda_u8(BDA_ACTIVE_PAGE).unwrap_or(0)
     }
 
     /// Write the core BDA video fields kept coherent with AH=00/01/02/03/09/0A/0E/0F/13.
@@ -793,18 +860,25 @@ impl Machine {
         Ok(())
     }
 
-    /// Write BDA page-0 cursor and sync FreeVGA CRTC Cursor Location.
-    ///
-    /// Spec: RBIL `0040:0050`; FreeVGA CRT Controller Cursor Location High/Low
-    /// (`0x0E`/`0x0F`) — character-cell address relative to Start Address.
+    /// Write BDA cursor for the active page and sync FreeVGA CRTC Cursor Location.
     fn write_bda_cursor(&mut self, row: u8, col: u8) -> Result<(), MachineError> {
-        self.mem
-            .write_u8(BDA_CURSOR_PAGE0, col)
-            .map_err(|_| MachineError::MbrRamTooSmall)?;
-        self.mem
-            .write_u8(BDA_CURSOR_PAGE0 + 1, row)
-            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        let page = self
+            .read_bda_u8(BDA_ACTIVE_PAGE)
+            .unwrap_or(0)
+            .min(INT10_MODE03_MAX_PAGE);
+        self.write_bda_cursor_page(page, row, col)?;
         self.program_crtc_cursor_location(row, col);
+        Ok(())
+    }
+
+    fn write_bda_cursor_page(&mut self, page: u8, row: u8, col: u8) -> Result<(), MachineError> {
+        let base = BDA_CURSOR_PAGE0 + u64::from(page.min(INT10_MODE03_MAX_PAGE)) * 2;
+        self.mem
+            .write_u8(base, col)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        self.mem
+            .write_u8(base + 1, row)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
         Ok(())
     }
 
@@ -840,8 +914,17 @@ impl Machine {
     }
 
     fn read_bda_cursor(&self) -> Option<(u8, u8)> {
-        let col = self.read_bda_u8(BDA_CURSOR_PAGE0)?;
-        let row = self.read_bda_u8(BDA_CURSOR_PAGE0 + 1)?;
+        let page = self
+            .read_bda_u8(BDA_ACTIVE_PAGE)
+            .unwrap_or(0)
+            .min(INT10_MODE03_MAX_PAGE);
+        self.read_bda_cursor_page(page)
+    }
+
+    fn read_bda_cursor_page(&self, page: u8) -> Option<(u8, u8)> {
+        let base = BDA_CURSOR_PAGE0 + u64::from(page.min(INT10_MODE03_MAX_PAGE)) * 2;
+        let col = self.read_bda_u8(base)?;
+        let row = self.read_bda_u8(base + 1)?;
         Some((row, col))
     }
 
@@ -904,6 +987,12 @@ pub fn setup_int10_set_cursor(cpu: &mut CpuState, page: u8, row: u8, col: u8) {
 pub fn setup_int10_get_cursor(cpu: &mut CpuState, page: u8) {
     cpu.set_ah(INT10_AH_GET_CURSOR);
     cpu.set_gpr_u8(4 + CpuState::RBX, page); // BH
+}
+
+/// Load AH=05h select active display page (AL=page).
+pub fn setup_int10_set_active_page(cpu: &mut CpuState, page: u8) {
+    cpu.set_ah(INT10_AH_SET_ACTIVE_PAGE);
+    cpu.set_al(page);
 }
 
 /// Load AH=06h / AH=07h scroll window registers.
@@ -1014,6 +1103,12 @@ pub fn setup_int10_vbe_set_mode(cpu: &mut CpuState, bx: u16) {
     cpu.set_ah(INT10_AH_VBE);
     cpu.set_al(INT10_AL_VBE_SET_MODE);
     cpu.set_gpr_u16(CpuState::RBX, bx);
+}
+
+/// Load AX=4F03h VBE Return Current Mode.
+pub fn setup_int10_vbe_get_mode(cpu: &mut CpuState) {
+    cpu.set_ah(INT10_AH_VBE);
+    cpu.set_al(INT10_AL_VBE_GET_MODE);
 }
 
 #[cfg(test)]
@@ -1185,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn int10_ah02_ignores_nonzero_page() {
+    fn int10_ah02_stores_inactive_page_cursor_without_crtc() {
         let mut m = Machine::new(1024 * 1024);
         setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
         m.service_int10();
@@ -1193,6 +1288,9 @@ mod tests {
         m.service_int10();
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0).unwrap(), 0);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 1).unwrap(), 0);
+        assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 2).unwrap(), 4);
+        assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 3).unwrap(), 3);
+        assert_eq!(m.vga.crtc_cursor_row_col(), (0, 0));
     }
 
     #[test]
@@ -1527,7 +1625,11 @@ mod tests {
     fn int10_ax4fxx_unsupported_subfunction_fails_honestly() {
         let mut m = Machine::new(1024 * 1024);
         m.cpu.set_ah(INT10_AH_VBE);
-        m.cpu.set_al(0x03); // Get Mode — not in this stub
+        m.cpu.set_al(INT10_AL_VBE_PMI); // 4F0Ah PMI — unsupported; mode-list stays on 4F00
+        m.service_int10();
+        assert_eq!(m.cpu.ax(), 0x014F);
+        m.cpu.set_ah(INT10_AH_VBE);
+        m.cpu.set_al(0x04); // other unknown subfunction
         m.service_int10();
         assert_eq!(m.cpu.ax(), 0x014F);
     }
@@ -1779,9 +1881,236 @@ mod tests {
     fn int10_unsupported_ah_is_noop() {
         let mut m = Machine::new(1024 * 1024);
         m.vga.put_char(0, 0, b'X', 0x07);
-        m.cpu.set_ah(0x05); // SELECT ACTIVE DISPLAY PAGE — not in this stub
+        m.cpu.set_ah(0x1B);
         m.cpu.set_al(0);
         m.service_int10();
         assert_eq!(m.vga.char_at(0, 0), Some(b'X'));
+    }
+
+    #[test]
+    fn int10_ah05_sets_bda_page_and_crtc_start() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_cursor(&mut m.cpu, 1, 2, 5);
+        m.service_int10();
+        setup_int10_set_active_page(&mut m.cpu, 1);
+        m.service_int10();
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 1);
+        assert_eq!(m.read_bda_page_start(), Some(INT10_MODE03_PAGE_SIZE));
+        assert_eq!(m.vga.text_start_address(), INT10_MODE03_PAGE_SIZE / 2);
+        assert_eq!(m.vga.crtc_cursor_row_col(), (2, 5));
+        assert_eq!(m.read_bda_cursor(), Some((2, 5)));
+        setup_int10_get_mode(&mut m.cpu);
+        m.service_int10();
+        assert_eq!(m.cpu.gpr_u8(4 + CpuState::RBX), 1);
+        setup_int10_set_active_page(&mut m.cpu, 8);
+        m.service_int10();
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 1);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_13H_GRAPHICS);
+        m.service_int10();
+        setup_int10_set_active_page(&mut m.cpu, 1);
+        m.service_int10();
+        assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
+    }
+
+    #[test]
+    fn int10_ah13_scrolls_on_page_overflow_and_updates_cursor() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        assert!(m.vga.put_char(0, 0, b'T', 0x07));
+        assert!(m.vga.put_char(24, 78, b' ', 0x1E));
+        let es = 0x1000u16;
+        let bp = 0x0300u16;
+        let phys = (u64::from(es) << 4) + u64::from(bp);
+        m.mem.write_u8(phys, b'X').unwrap();
+        m.mem.write_u8(phys + 1, b'Y').unwrap();
+        setup_int10_write_string(
+            &mut m.cpu,
+            INT10_WRITE_STRING_UPDATE_CURSOR,
+            0,
+            0x1E,
+            2,
+            24,
+            78,
+            es,
+            bp,
+        );
+        m.service_int10();
+        assert_eq!(m.vga.char_at(23, 78), Some(b'X'));
+        assert_eq!(m.vga.attr_at(23, 78), Some(0x1E));
+        assert_eq!(m.vga.char_at(23, 79), Some(b'Y'));
+        assert_eq!(m.vga.char_at(24, 0), Some(b' '));
+        assert_eq!(m.vga.attr_at(24, 0), Some(0x1E));
+        assert_eq!(m.read_bda_cursor(), Some((24, 0)));
+        assert_ne!(m.vga.char_at(0, 0), Some(b'T'));
+    }
+
+    #[test]
+    fn int10_ah13_al03_char_attr_pairs_update_cursor() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        let es = 0x1000u16;
+        let bp = 0x0400u16;
+        let phys = (u64::from(es) << 4) + u64::from(bp);
+        m.mem.write_u8(phys, b'O').unwrap();
+        m.mem.write_u8(phys + 1, 0x4E).unwrap();
+        m.mem.write_u8(phys + 2, b'K').unwrap();
+        m.mem.write_u8(phys + 3, 0x2A).unwrap();
+        setup_int10_write_string(
+            &mut m.cpu,
+            INT10_WRITE_STRING_UPDATE_CURSOR | INT10_WRITE_STRING_HAS_ATTR,
+            0,
+            0x07,
+            2,
+            1,
+            10,
+            es,
+            bp,
+        );
+        m.service_int10();
+        assert_eq!(m.vga.char_at(1, 10), Some(b'O'));
+        assert_eq!(m.vga.attr_at(1, 10), Some(0x4E));
+        assert_eq!(m.vga.char_at(1, 11), Some(b'K'));
+        assert_eq!(m.vga.attr_at(1, 11), Some(0x2A));
+        assert_eq!(m.read_bda_cursor(), Some((1, 12)));
+    }
+
+    #[test]
+    fn int10_ah0e_accepts_active_page_bh_after_ah05() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_active_page(&mut m.cpu, 1);
+        m.service_int10();
+        m.cpu.set_ah(INT10_AH_TELETYPE);
+        m.cpu.set_al(b'P');
+        m.cpu.set_gpr_u8(4 + CpuState::RBX, 1);
+        m.service_int10();
+        assert_eq!(m.vga.char_at(0, 0), Some(b'P'));
+        assert_eq!(m.read_bda_cursor(), Some((0, 1)));
+        m.cpu.set_ah(INT10_AH_TELETYPE);
+        m.cpu.set_al(b'Z');
+        m.cpu.set_gpr_u8(4 + CpuState::RBX, 2); // inactive page — no-op
+        m.service_int10();
+        assert_ne!(m.vga.char_at(0, 1), Some(b'Z'));
+        assert_eq!(m.read_bda_cursor(), Some((0, 1)));
+    }
+
+    #[test]
+    fn int10_ah0e_cr_lf_bs_edge_honesty() {
+        // Spec: RBIL AH=0Eh — CR→col0; LF keeps col; BS no-erase / no prior-row wrap.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_cursor(&mut m.cpu, 0, 5, 10);
+        m.service_int10();
+        assert!(m.vga.put_char(5, 9, b'Z', 0x2F));
+        setup_int10_teletype(&mut m.cpu, 0x0D);
+        m.service_int10();
+        assert_eq!(m.read_bda_cursor(), Some((5, 0)));
+        setup_int10_set_cursor(&mut m.cpu, 0, 5, 10);
+        m.service_int10();
+        setup_int10_teletype(&mut m.cpu, 0x0A);
+        m.service_int10();
+        assert_eq!(m.read_bda_cursor(), Some((6, 10)));
+        setup_int10_teletype(&mut m.cpu, 0x08);
+        m.service_int10();
+        assert_eq!(m.read_bda_cursor(), Some((6, 9)));
+        assert_eq!(m.vga.char_at(5, 9), Some(b'Z'));
+        setup_int10_set_cursor(&mut m.cpu, 0, 0, 0);
+        m.service_int10();
+        setup_int10_teletype(&mut m.cpu, 0x08);
+        m.service_int10();
+        assert_eq!(m.read_bda_cursor(), Some((0, 0)));
+    }
+
+    #[test]
+    fn int10_ah09_0a_active_page_count_attr_edges() {
+        // Spec: RBIL AH=09h/0Ah — BH=active; CX=0 no-op; attr 00h valid; no cursor move.
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_set_active_page(&mut m.cpu, 1);
+        m.service_int10();
+        setup_int10_set_cursor(&mut m.cpu, 1, 0, 78);
+        m.service_int10();
+        setup_int10_write_char_attr(&mut m.cpu, b'X', 1, 0x4E, 0);
+        m.service_int10();
+        assert_ne!(m.vga.char_at(0, 78), Some(b'X'));
+        setup_int10_write_char_attr(&mut m.cpu, b'#', 1, 0x00, 3);
+        m.service_int10();
+        assert_eq!(m.vga.char_at(0, 78), Some(b'#'));
+        assert_eq!(m.vga.attr_at(0, 78), Some(0x00));
+        assert_eq!(m.vga.char_at(0, 79), Some(b'#'));
+        assert_eq!(m.vga.char_at(1, 0), Some(b'#'));
+        assert_eq!(m.read_bda_cursor(), Some((0, 78)));
+        setup_int10_write_char(&mut m.cpu, b'Q', 1, 1);
+        m.service_int10();
+        assert_eq!(m.vga.char_at(0, 78), Some(b'Q'));
+        assert_eq!(m.vga.attr_at(0, 78), Some(0x00));
+        setup_int10_write_char_attr(&mut m.cpu, b'Z', 2, 0x07, 1);
+        m.service_int10();
+        assert_eq!(m.vga.char_at(0, 78), Some(b'Q'));
+    }
+
+    #[test]
+    fn int10_ah0e_bell_increments_host_counter() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        assert_eq!(m.vga.host_tty_bell_count(), 0);
+        setup_int10_teletype(&mut m.cpu, 0x07);
+        m.service_int10();
+        assert_eq!(m.vga.host_tty_bell_count(), 1);
+        assert_eq!(m.read_bda_cursor(), Some((0, 0)));
+    }
+
+    #[test]
+    fn int10_ah0e_scroll_matches_ah06_cell_copy() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        assert!(m.vga.put_char(0, 0, b'A', 0x07));
+        assert!(m.vga.put_char(1, 0, b'B', 0x1E));
+        assert!(m.vga.put_char(24, 0, b'C', 0x2F));
+        setup_int10_set_cursor(&mut m.cpu, 0, 24, 0);
+        m.service_int10();
+        setup_int10_teletype(&mut m.cpu, 0x0A);
+        m.service_int10();
+        assert_eq!(m.vga.char_at(0, 0), Some(b'B'));
+        assert_eq!(m.vga.attr_at(0, 0), Some(0x1E));
+        assert_eq!(m.vga.char_at(23, 0), Some(b'C'));
+        assert_eq!(m.vga.attr_at(23, 0), Some(0x2F));
+        assert_eq!(m.vga.char_at(24, 0), Some(b' '));
+        assert_eq!(m.vga.attr_at(24, 0), Some(INT10_TTY_ATTR));
+    }
+
+    #[test]
+    fn int10_ax4f03_returns_mode_from_ah00_and_4f02_without_lfb() {
+        let mut m = Machine::new(1024 * 1024);
+        setup_int10_set_mode(&mut m.cpu, INT10_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_vbe_get_mode(&mut m.cpu);
+        m.service_int10();
+        assert_eq!(m.cpu.ax(), 0x004F);
+        assert_eq!(m.cpu.gpr_u16(CpuState::RBX), u16::from(INT10_MODE_03H_TEXT));
+        assert_eq!(m.cpu.gpr_u16(CpuState::RBX) & INT10_VBE_BX_LFB, 0);
+        setup_int10_vbe_set_mode(&mut m.cpu, VBE_MODE_13H_CHAIN4);
+        m.service_int10();
+        assert_eq!(m.cpu.ax(), 0x004F);
+        setup_int10_vbe_get_mode(&mut m.cpu);
+        m.service_int10();
+        assert_eq!(m.cpu.ax(), 0x004F);
+        assert_eq!(m.cpu.gpr_u16(CpuState::RBX), VBE_MODE_13H_CHAIN4);
+        assert_eq!(m.cpu.gpr_u16(CpuState::RBX) & INT10_VBE_BX_LFB, 0);
+        assert!(!m.vga.guest_lfb_available());
+        setup_int10_vbe_set_mode(&mut m.cpu, VBE_MODE_03H_TEXT);
+        m.service_int10();
+        setup_int10_vbe_get_mode(&mut m.cpu);
+        m.service_int10();
+        assert_eq!(m.cpu.gpr_u16(CpuState::RBX), VBE_MODE_03H_TEXT);
     }
 }
