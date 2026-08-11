@@ -355,15 +355,33 @@ impl Machine {
 }
 
 impl Machine {
-    fn int13_ok_al(&mut self, al: u8) {
+    fn int13_ok(&mut self) {
         self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_al(al);
         self.cpu.set_cf(false);
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
+    }
+
+    fn int13_ok_al(&mut self, al: u8) {
+        self.cpu.set_al(al);
+        self.int13_ok();
     }
 
     fn int13_fail(&mut self, status: u8) {
         self.cpu.set_ah(status);
         self.cpu.set_cf(true);
+        self.int13_mirror_bda_status(status);
+    }
+
+    /// Spec: RBIL BDA — last floppy status at `0040:0041` (`DL < 80h`);
+    /// last hard-disk status at `0040:0074` (`DL ≥ 80h`, including CD `E0h`).
+    fn int13_mirror_bda_status(&mut self, status: u8) {
+        let dl = self.cpu.gpr_u8_low(CpuState::RDX);
+        let addr = if dl < INT13_DRIVE_HD0 {
+            BDA_FLOPPY_STATUS
+        } else {
+            BDA_HD_STATUS
+        };
+        let _ = self.mem.write_u8(addr, status);
     }
 
     fn int13_hd_reset(&mut self) {
@@ -377,6 +395,7 @@ impl Machine {
         // via IdePrimary::reset) and clears in-flight DRQ/command state.
         self.ide.reset();
         // Spec: RBIL BDA 0040:0074 — last HD status cleared on successful reset.
+        // `int13_ok_al` also mirrors BDA; explicit clear kept for reset clarity.
         let _ = self.mem.write_u8(BDA_HD_STATUS, INT13_STATUS_OK);
         self.int13_ok_al(0);
     }
@@ -441,6 +460,8 @@ impl Machine {
         // AH=08h: CX = max cylinder/sector packed; DH = max head; DL = drive count.
         // AL unused (cleared); BL = 00h for hard disks (floppy type N/A).
         // Geometry derives from image size at fixed 16 heads / 63 spt.
+        // Mirror BDA while DL is still the HD unit number (AH=08h overwrites DL).
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
         let (max_cyl, heads, spt, _total) = self.int13_hd_geometry();
         self.cpu
             .set_gpr_u16(CpuState::RCX, pack_cx(max_cyl, spt as u8));
@@ -471,19 +492,28 @@ impl Machine {
         self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
         debug_assert_eq!(self.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING, 0);
         self.cpu.set_cf(false);
+        // AH holds extension version, not status; still mirror last-status OK.
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
     }
 
     /// Spec: IBM/MS INT 13h Extensions AH=42h — Disk Address Packet at `DS:SI`.
+    ///
+    /// On completion the DAP block-count field is rewritten to the number of
+    /// blocks successfully transferred (0 on total failure after a parseable
+    /// packet). Spec: IBM/Microsoft INT 13h Extensions.
     fn int13_hd_ext_read_from_regs(&mut self) {
         let si = self.cpu.gpr_u16(CpuState::RSI);
         let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
         match self.int13_parse_dap(dap_phys) {
             Ok(dap) => match self.int13_hd_read_lba_to_phys(dap.lba, dap.count, dap.buf) {
-                Ok(_) => {
-                    self.cpu.set_ah(INT13_STATUS_OK);
-                    self.cpu.set_cf(false);
+                Ok(n) => {
+                    let _ = self.int13_dap_set_count(dap_phys, n);
+                    self.int13_ok();
                 }
-                Err(status) => self.int13_fail(status),
+                Err(status) => {
+                    let _ = self.int13_dap_set_count(dap_phys, 0);
+                    self.int13_fail(status);
+                }
             },
             Err(status) => self.int13_fail(status),
         }
@@ -496,10 +526,7 @@ impl Machine {
         let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
         match self.int13_parse_dap(dap_phys) {
             Ok(dap) => match self.int13_hd_write_lba_from_phys(dap.lba, dap.count, dap.buf) {
-                Ok(_) => {
-                    self.cpu.set_ah(INT13_STATUS_OK);
-                    self.cpu.set_cf(false);
-                }
+                Ok(_) => self.int13_ok(),
                 Err(status) => self.int13_fail(status),
             },
             Err(status) => self.int13_fail(status),
@@ -542,8 +569,7 @@ impl Machine {
             self.int13_fail(INT13_STATUS_INVALID);
             return;
         }
-        self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_cf(false);
+        self.int13_ok();
     }
 
     /// Fixed 16/63 geometry derived from the attached IDE image size.
@@ -567,6 +593,10 @@ impl Machine {
             return Err(INT13_STATUS_INVALID);
         }
         let count = self.read_guest_u16(dap_phys + 2)?;
+        // Spec: IBM/MS INT 13h Extensions — zero block count is invalid.
+        if count == 0 {
+            return Err(INT13_STATUS_INVALID);
+        }
         let buf_off = self.read_guest_u16(dap_phys + 4)?;
         let buf_seg = self.read_guest_u16(dap_phys + 6)?;
         let lba = self.read_guest_u64(dap_phys + 8)?;
@@ -577,6 +607,11 @@ impl Machine {
         }
         let buf = (u64::from(buf_seg) << 4).wrapping_add(u64::from(buf_off));
         Ok(DiskAddressPacket { count, buf, lba })
+    }
+
+    /// Write DAP block-count field (offset 2) after AH=42h/43h completion.
+    fn int13_dap_set_count(&mut self, dap_phys: u64, count: u16) -> Result<(), u8> {
+        self.write_guest_u16(dap_phys + 2, count)
     }
 
     fn read_guest_u16(&self, phys: u64) -> Result<u16, u8> {
@@ -945,6 +980,7 @@ impl Machine {
         // Packet access (AH=42h) + EDD params (AH=48h). Removable locking out.
         self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
         self.cpu.set_cf(false);
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
     }
 
     fn int13_cd_ext_read_from_regs(&mut self) {
@@ -952,11 +988,14 @@ impl Machine {
         let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
         match self.int13_parse_dap(dap_phys) {
             Ok(dap) => match self.int13_cd_read_lba_to_phys(dap.lba, dap.count, dap.buf) {
-                Ok(_) => {
-                    self.cpu.set_ah(INT13_STATUS_OK);
-                    self.cpu.set_cf(false);
+                Ok(n) => {
+                    let _ = self.int13_dap_set_count(dap_phys, n);
+                    self.int13_ok();
                 }
-                Err(status) => self.int13_fail(status),
+                Err(status) => {
+                    let _ = self.int13_dap_set_count(dap_phys, 0);
+                    self.int13_fail(status);
+                }
             },
             Err(status) => self.int13_fail(status),
         }
@@ -997,8 +1036,7 @@ impl Machine {
             self.int13_fail(INT13_STATUS_INVALID);
             return;
         }
-        self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_cf(false);
+        self.int13_ok();
     }
 
     /// Spec: El Torito 1.0 §6.1 / RBIL INT 13h AH=4Ah — initiate disk emulation.
@@ -1032,8 +1070,7 @@ impl Machine {
             return;
         }
         // Terminate (AL=00h): no emulation state to clear for no-emul CD.
-        self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_cf(false);
+        self.int13_ok();
     }
 
     /// Fill the 19-byte El Torito specification packet at `DS:SI`.
@@ -1135,6 +1172,10 @@ impl Machine {
         if sector > FDC_1440_SECTORS_PER_TRACK || cylinder >= FDC_1440_CYLINDERS {
             return Err(INT13_STATUS_SECTOR_NOT_FOUND);
         }
+        // Spec: IBM BIOS / RBIL INT 13h AH=02h/03h/04h — multi-sector transfers
+        // advance sector→head→cylinder. Preflight the full CHS chain so a
+        // past-end request fails atomically (no partial guest buffer fill).
+        floppy_chs_range_ok(cylinder, head, sector, count)?;
         let mut phys = match mode {
             FloppyXfer::Read { dest } => dest,
             FloppyXfer::Write { src } => src,
@@ -1277,6 +1318,8 @@ impl Machine {
             self.int13_fail(INT13_STATUS_TIMEOUT);
             return;
         }
+        // Mirror BDA before AH=08h overwrites DL with drive count.
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
         self.cpu.set_gpr_u16(
             CpuState::RCX,
             pack_cx(u16::from(INT13_FLOPPY_MAX_CYLINDER), INT13_FLOPPY_SPT),
@@ -1330,6 +1373,27 @@ fn advance_floppy_chs(cylinder: u8, head: u8, sector: u8) -> Option<(u8, u8, u8)
         }
     }
     Some((cylinder, head, sector))
+}
+
+/// Preflight a floppy multi-sector CHS walk (sector→head→cylinder).
+///
+/// Spec: IBM BIOS / RBIL INT 13h AH=02h — `AL` sectors must all exist before
+/// any transfer; past last sector of media → [`INT13_STATUS_SECTOR_NOT_FOUND`].
+fn floppy_chs_range_ok(cylinder: u8, head: u8, sector: u8, count: u8) -> Result<(), u8> {
+    let mut cylinder = cylinder;
+    let mut head = head;
+    let mut sector = sector;
+    for i in 0..count {
+        if i + 1 < count {
+            let Some((c, h, s)) = advance_floppy_chs(cylinder, head, sector) else {
+                return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+            };
+            cylinder = c;
+            head = h;
+            sector = s;
+        }
+    }
+    Ok(())
 }
 
 /// Convenience: set up INT 13h AH=02h registers for a floppy read.
@@ -1550,6 +1614,64 @@ mod tests {
         m.service_int13_hd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    /// Spec: RBIL BDA + INT 13h — boundary errors set CF/AH and mirror BDA status.
+    #[test]
+    fn int13_boundary_errors_mirror_bda_status() {
+        // HD: sector-not-found → AH=04h, BDA 0040:0074.
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        m.mem.write_u8(BDA_HD_STATUS, 0x00).unwrap();
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 8, 0x0000, 0x7C00);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.cpu.al(), 0);
+        assert_eq!(
+            m.mem.read_u8(BDA_HD_STATUS).unwrap(),
+            INT13_STATUS_SECTOR_NOT_FOUND
+        );
+
+        // HD success clears BDA status.
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(BDA_HD_STATUS).unwrap(), INT13_STATUS_OK);
+
+        // Floppy: no media → AH=80h, BDA 0040:0041.
+        let mut bare = Machine::new(64 * 1024);
+        bare.mem.write_u8(BDA_FLOPPY_STATUS, 0x00).unwrap();
+        setup_int13_floppy_read(&mut bare.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        bare.service_int13_floppy();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+        assert_eq!(
+            bare.mem.read_u8(BDA_FLOPPY_STATUS).unwrap(),
+            INT13_STATUS_TIMEOUT
+        );
+
+        // Invalid drive on HD service → AH=01h.
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, 0x81);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+        assert_eq!(m.mem.read_u8(BDA_HD_STATUS).unwrap(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: AH=42h past-end mirrors HD BDA status `04h`.
+    #[test]
+    fn int13_ah42_past_end_mirrors_bda() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        m.mem.write_u8(BDA_HD_STATUS, 0x00).unwrap();
+        setup_int13_hd_ext_read(&mut m, 0x5500, 3, 2, 0x0000, 0x8000);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(
+            m.mem.read_u8(BDA_HD_STATUS).unwrap(),
+            INT13_STATUS_SECTOR_NOT_FOUND
+        );
     }
 
     /// Spec: IBM BIOS / RBIL INT 13h AH=04h — verify in-range CHS without touching RAM.
@@ -1994,6 +2116,62 @@ mod tests {
         assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
     }
 
+    /// Spec: AH=42h exact end-of-media LBA range succeeds; DAP count rewritten.
+    #[test]
+    fn int13_ah42_exact_end_rewrites_dap_count() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        // LBA 2..4 (2 blocks) is the exact tail of a 4-sector image.
+        setup_int13_hd_ext_read(&mut m, 0x5400, 2, 2, 0x0000, 0x8000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(
+            m.read_guest_u16(0x5402).unwrap(),
+            2,
+            "DAP count = transferred"
+        );
+    }
+
+    /// Spec: AH=42h one-past-end fails with AH=04h and DAP count cleared to 0.
+    #[test]
+    fn int13_ah42_past_end_clears_dap_count() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        setup_int13_hd_ext_read(&mut m, 0x5500, 3, 2, 0x0000, 0x8000);
+        // Requested count was 2.
+        assert_eq!(m.read_guest_u16(0x5502).unwrap(), 2);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(
+            m.read_guest_u16(0x5502).unwrap(),
+            0,
+            "DAP count cleared on fail"
+        );
+    }
+
+    /// Spec: AH=42h zero block count / flat FFFF:FFFF buffer → invalid.
+    #[test]
+    fn int13_ah42_rejects_zero_count_and_flat_buffer() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        write_dap(&mut m, 0x5600, 0, 0, 0x0000, 0x7000);
+        m.cpu.set_ah(INT13_AH_EXT_READ);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.cpu.set_gpr_u16(CpuState::RSI, 0x5600);
+        m.cpu.ds = x86_core::SegmentReg::real_mode(0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+
+        write_dap(&mut m, 0x5700, 0, 1, 0xFFFF, 0xFFFF);
+        m.cpu.set_ah(INT13_AH_EXT_READ);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.cpu.set_gpr_u16(CpuState::RSI, 0x5700);
+        m.cpu.ds = x86_core::SegmentReg::real_mode(0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
     /// Spec: RBIL INT 13h AH=43h — DAP LBA write from seg:off into IDE image.
     #[test]
     fn int13_ah43_ext_write_lba0() {
@@ -2100,6 +2278,135 @@ mod tests {
                 .unwrap(),
             0x2B
         );
+    }
+
+    /// Spec: AH=02h HD multi-sector may cross track via consecutive LBA
+    /// (start at SPT, count=2 → next head).
+    #[test]
+    fn int13_ah02_hd_multi_sector_crosses_track() {
+        // Need at least one full track + 1 sector (16 heads * 63 SPT is overkill;
+        // one head worth of SPT + 1 is enough for cyl0/head0/sec63 → head1/sec1).
+        let sectors = usize::from(INT13_HD_SPT) + 2;
+        let mut img = synthetic_disk(sectors);
+        let lba_spt = (usize::from(INT13_HD_SPT) - 1) * INT13_SECTOR_SIZE; // sector 63 → LBA 62
+        let lba_next = usize::from(INT13_HD_SPT) * INT13_SECTOR_SIZE; // head1 sec1 → LBA 63
+        img[lba_spt] = 0x63;
+        img[lba_next] = 0x64;
+        let mut m = Machine::with_ide(64 * 1024, img);
+        setup_int13_hd_read(&mut m.cpu, 0, 0, INT13_HD_SPT as u8, 2, 0x0000, 0x8000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu), "track-crossing multi-sector must succeed");
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0x63);
+        assert_eq!(
+            m.mem.read_u8(0x8000 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0x64
+        );
+    }
+
+    /// Spec: AH=02h HD multi-sector may cross cylinder (last head SPT → next cyl).
+    #[test]
+    fn int13_ah02_hd_multi_sector_crosses_cylinder() {
+        let spc = usize::from(INT13_HD_HEADS) * usize::from(INT13_HD_SPT);
+        let mut img = synthetic_disk(spc + 2);
+        let last_on_cyl0 = (spc - 1) * INT13_SECTOR_SIZE;
+        let first_on_cyl1 = spc * INT13_SECTOR_SIZE;
+        img[last_on_cyl0] = 0xC0;
+        img[first_on_cyl1] = 0xC1;
+        let mut m = Machine::with_ide(128 * 1024, img);
+        let last_head = (INT13_HD_HEADS - 1) as u8;
+        setup_int13_hd_read(
+            &mut m.cpu,
+            0,
+            last_head,
+            INT13_HD_SPT as u8,
+            2,
+            0x0000,
+            0x9000,
+        );
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x9000).unwrap(), 0xC0);
+        assert_eq!(
+            m.mem.read_u8(0x9000 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0xC1
+        );
+    }
+
+    /// Spec: floppy AH=02h multi-sector crosses head at SPT boundary.
+    #[test]
+    fn int13_floppy_ah02_multi_sector_crosses_head() {
+        let mut img = synthetic_floppy_boot();
+        // CHS (0,0,18) and (0,1,1).
+        let off_h0_s18 = 17 * INT13_SECTOR_SIZE;
+        let off_h1_s1 = 18 * INT13_SECTOR_SIZE;
+        img[off_h0_s18] = 0x18;
+        img[off_h1_s1] = 0x19;
+        let mut m = Machine::with_floppy(64 * 1024, img).expect("floppy");
+        setup_int13_floppy_read(&mut m.cpu, 0, 0, INT13_FLOPPY_SPT, 2, 0x0000, 0x8000);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu), "floppy head-crossing multi-sector");
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0x18);
+        assert_eq!(
+            m.mem.read_u8(0x8000 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0x19
+        );
+    }
+
+    /// Spec: floppy AH=02h multi-sector crosses cylinder at last head SPT.
+    #[test]
+    fn int13_floppy_ah02_multi_sector_crosses_cylinder() {
+        let mut img = synthetic_floppy_boot();
+        // Last sector cyl0 = (0,1,18); first of cyl1 = (1,0,1).
+        let off_c0 = (usize::from(INT13_FLOPPY_MAX_HEAD) * usize::from(INT13_FLOPPY_SPT)
+            + (usize::from(INT13_FLOPPY_SPT) - 1))
+            * INT13_SECTOR_SIZE;
+        let off_c1 = (2 * usize::from(INT13_FLOPPY_SPT)) * INT13_SECTOR_SIZE;
+        img[off_c0] = 0xA0;
+        img[off_c1] = 0xA1;
+        let mut m = Machine::with_floppy(64 * 1024, img).expect("floppy");
+        setup_int13_floppy_read(
+            &mut m.cpu,
+            0,
+            INT13_FLOPPY_MAX_HEAD,
+            INT13_FLOPPY_SPT,
+            2,
+            0x0000,
+            0x8800,
+        );
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x8800).unwrap(), 0xA0);
+        assert_eq!(
+            m.mem.read_u8(0x8800 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0xA1
+        );
+    }
+
+    /// Spec: floppy AH=02h past last media sector → AH=04h, no partial fill.
+    #[test]
+    fn int13_floppy_ah02_past_media_end_atomic_fail() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        // Poison destination; past-end must not write the first sector.
+        m.mem.write_u8(0x8000, 0xEE).unwrap();
+        setup_int13_floppy_read(
+            &mut m.cpu,
+            INT13_FLOPPY_MAX_CYLINDER,
+            INT13_FLOPPY_MAX_HEAD,
+            INT13_FLOPPY_SPT,
+            2,
+            0x0000,
+            0x8000,
+        );
+        m.service_int13_floppy();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.cpu.al(), 0);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xEE);
     }
 
     /// Spec: IBM BIOS / RBIL INT 13h AH=04h floppy — verify without buffer write.
@@ -2328,6 +2635,10 @@ mod tests {
         let mut boot = vec![0x90u8; EL_TORITO_SECTOR_BYTES];
         boot[0] = 0xF4;
         write_iso_sector(&mut img, 24, &boot);
+        // Second Mode-1 block after the boot image (multi-sector AH=42 tests).
+        let mut boot2 = vec![0x11u8; EL_TORITO_SECTOR_BYTES];
+        boot2[0] = 0xB0;
+        write_iso_sector(&mut img, 25, &boot2);
         img
     }
 
@@ -2442,6 +2753,93 @@ mod tests {
         m.service_int13_cd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+    }
+
+    /// Spec: AH=42h CD multi-block Mode-1 read + DAP count rewrite.
+    #[test]
+    fn int13_cd_ah42_multi_block_reads_boot_tail() {
+        let mut m = Machine::new(128 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        setup_int13_cd_ext_read(&mut m, 0x4000, 24, 2, 0x0000, 0x8000);
+        m.service_int13_cd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xF4);
+        assert_eq!(
+            m.mem.read_u8(0x8000 + INT13_CD_SECTOR_SIZE as u64).unwrap(),
+            0xB0
+        );
+        assert_eq!(m.read_guest_u16(0x4002).unwrap(), 2);
+    }
+
+    /// Spec: El Torito catalog readable via CD AH=42h (Mode-1 LBA).
+    #[test]
+    fn int13_cd_ah42_reads_eltorito_catalog() {
+        use firmware_interface::{EL_TORITO_BOOTABLE, EL_TORITO_KEY_55, EL_TORITO_KEY_AA};
+        let mut m = Machine::new(128 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        // Catalog LBA 20 from synthetic_eltorito_iso.
+        setup_int13_cd_ext_read(&mut m, 0x4100, 20, 1, 0x0000, 0x9000);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(0x9000 + 30).unwrap(), EL_TORITO_KEY_55);
+        assert_eq!(m.mem.read_u8(0x9000 + 31).unwrap(), EL_TORITO_KEY_AA);
+        assert_eq!(m.mem.read_u8(0x9000 + 32).unwrap(), EL_TORITO_BOOTABLE);
+        // Initial/Default load RBA = 24.
+        let rba = u32::from(m.mem.read_u8(0x9000 + 40).unwrap())
+            | (u32::from(m.mem.read_u8(0x9000 + 41).unwrap()) << 8)
+            | (u32::from(m.mem.read_u8(0x9000 + 42).unwrap()) << 16)
+            | (u32::from(m.mem.read_u8(0x9000 + 43).unwrap()) << 24);
+        assert_eq!(rba, 24);
+    }
+
+    /// Spec: CD AH=42h at El Torito load_rba matches host load_eltorito bytes.
+    #[test]
+    fn int13_cd_ah42_boot_lba_matches_eltorito_load() {
+        let iso = synthetic_eltorito_iso();
+        let mut via_int13 = Machine::new(128 * 1024);
+        via_int13.attach_atapi_cdrom_image(iso.clone());
+        let info = via_int13.inspect_atapi_el_torito().expect("catalog");
+        assert!(info.bootable);
+        setup_int13_cd_ext_read(
+            &mut via_int13,
+            0x4200,
+            u64::from(info.load_rba),
+            1,
+            0x0000,
+            0xA000,
+        );
+        via_int13.service_int13_cd();
+        assert!(!cf(&via_int13.cpu));
+
+        let mut via_load = Machine::new(128 * 1024);
+        via_load.attach_atapi_cdrom_image(iso);
+        via_load.load_eltorito_to_7c00().expect("load");
+        // El Torito sector_count=4 → 2048 bytes = one Mode-1 block.
+        for i in 0..INT13_CD_SECTOR_SIZE {
+            assert_eq!(
+                via_int13.mem.read_u8(0xA000 + i as u64).unwrap(),
+                via_load.mem.read_u8(0x7C00 + i as u64).unwrap(),
+                "mismatch at offset {i}"
+            );
+        }
+    }
+
+    /// Spec: CD AH=42h past medium end → AH=04h and DAP count 0.
+    #[test]
+    fn int13_cd_ah42_past_end_clears_dap_count() {
+        let mut m = Machine::new(128 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        let blocks = 32u16; // synthetic ISO is 32 Mode-1 sectors
+        setup_int13_cd_ext_read(&mut m, 0x4300, u64::from(blocks - 1), 2, 0x0000, 0x8000);
+        m.service_int13_cd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.read_guest_u16(0x4302).unwrap(), 0);
+        assert_eq!(
+            m.mem.read_u8(BDA_HD_STATUS).unwrap(),
+            INT13_STATUS_SECTOR_NOT_FOUND
+        );
     }
 
     /// Spec: Phoenix EDD AH=48h on CD — total blocks + sector size 2048.
