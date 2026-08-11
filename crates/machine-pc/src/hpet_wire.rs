@@ -1,15 +1,17 @@
-//! Host helpers for HPET Timer 0 → I/O APIC GSI delivery (R10/R11).
+//! Host helpers for HPET Timer 0 → I/O APIC GSI delivery (R10/R11) and
+//! main-counter freerun on the PIT tick path (R15).
 //!
 //! Kept out of the `Machine` monolith so parallel lanes can merge without
 //! rewriting MMIO dispatch. Legacy PIC replacement stays an explicit non-claim
-//! (`LEG_RT_CAP` clear — `docs/timer-r14-hpet-legacy.md`); FSB/MSI remains out
+//! (`LEG_RT_CAP` clear — `docs/timer-r14-hpet-legacy.md` /
+//! `docs/hpet-r15-main-counter.md`); FSB/MSI remains out
 //! (`docs/hpet-r12-msi-irq.md`).
 //!
-//! Ownership (R10/R11/R14 usb-timer): this module + thin `Machine::advance_hpet` /
+//! Ownership (R10/R11/R14/R15 usb-timer): this module + thin `Machine::advance_hpet` /
 //! `Machine::sync_hpet_irq_to_ioapic` / `Machine::advance_hpet_ioapic` /
-//! `Machine::eoi_lapic_ioapic` (HPET level re-sync) wrappers.
+//! `Machine::eoi_lapic_ioapic` (HPET level re-sync) / PIT freerun wrappers.
 
-use devices::{HpetMmio, IoApicDelivery, IoApicMmio, LocalApicMmio};
+use devices::{HpetMmio, IoApicDelivery, IoApicMmio, LocalApicMmio, HPET_TICKS_PER_PIT_CLOCK};
 
 use crate::ioapic_wire;
 
@@ -26,6 +28,24 @@ pub fn advance_hpet(
     let fired = hpet.advance_main_counter(delta);
     let _ = sync_hpet_irq_to_ioapic(hpet, ioapic, lapic);
     fired
+}
+
+/// Freerun the HPET main counter from a PIT-clock quantum.
+///
+/// Spec / model: IA-PC HPET 1.0a main counter + documented
+/// [`HPET_TICKS_PER_PIT_CLOCK`] ratio. No-op while `ENABLE_CNF` is clear.
+/// Does **not** claim legacy IRQ0/IRQ8 (`LEG_RT_CAP` remains clear).
+pub fn freerun_hpet_from_pit_clocks(
+    hpet: &mut HpetMmio,
+    ioapic: &mut IoApicMmio,
+    lapic: &mut LocalApicMmio,
+    pit_clocks: u64,
+) -> bool {
+    let delta = pit_clocks.saturating_mul(HPET_TICKS_PER_PIT_CLOCK);
+    if delta == 0 {
+        return false;
+    }
+    advance_hpet(hpet, ioapic, lapic, delta)
 }
 
 /// Drive the resolved HPET Timer 0 GSI from the current device `irq_line`.

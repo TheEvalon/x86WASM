@@ -28,7 +28,9 @@
 //! Self Fixed IPI; CPUID leaf 1 EDX bit 9 (`APIC`) stays clear —
 //! presence ≠ advertised APIC. Round-14: SVR vector + soft-enable (+ sticky
 //! focus/EOI-broadcast bit 9 for firmware RMW probes) with soft-enable gating
-//! honesty — see `docs/apic-r14-lapic-svr.md`.
+//! honesty — see `docs/apic-r14-lapic-svr.md`. Round-15: LDR (`D0H`) / DFR
+//! (`E0H`) sticky presence for firmware probes without logical-destination
+//! delivery — see `docs/lapic-r15-ldr-dfr.md`.
 //! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`,
 //! `docs/lapic-r10-tmr.md`, `docs/lapic-r10-tpr-ppr.md`,
 //! `docs/lapic-r11-lvt-timer.md`, `docs/lapic-r12-icr.md`.
@@ -65,6 +67,12 @@ pub const LAPIC_REG_TMR_BASE: u32 = 0x180;
 
 /// Spurious Interrupt Vector Register offset (SDM §10.9).
 pub const LAPIC_REG_SVR: u32 = 0xF0;
+
+/// Logical Destination Register offset (SDM §10.6.2.2).
+pub const LAPIC_REG_LDR: u32 = 0xD0;
+
+/// Destination Format Register offset (SDM §10.6.2.2).
+pub const LAPIC_REG_DFR: u32 = 0xE0;
 
 /// LVT Timer Register offset (SDM §10.5.1).
 pub const LAPIC_REG_LVT_TIMER: u32 = 0x320;
@@ -114,6 +122,15 @@ pub const LAPIC_SVR_VECTOR_MASK: u32 = 0xFF;
 
 /// Guest-writable SVR bits retained by this stub (vector + enable + focus).
 pub const LAPIC_SVR_WRITABLE: u32 = LAPIC_SVR_VECTOR_MASK | LAPIC_SVR_SW_ENABLE | LAPIC_SVR_FOCUS;
+
+/// LDR Logical APIC ID field (bits 31:24). Spec: SDM §10.6.2.2.
+pub const LAPIC_LDR_LOGIC_ID_MASK: u32 = 0xFF00_0000;
+
+/// DFR model field (bits 31:28). Spec: SDM §10.6.2.2 — `0xF` = Flat model.
+pub const LAPIC_DFR_MODEL_MASK: u32 = 0xF000_0000;
+
+/// DFR reset value (Flat model; remaining bits read as 1). Spec: SDM §10.6.2.2.
+pub const LAPIC_DFR_RESET: u32 = 0xFFFF_FFFF;
 
 /// LVT mask bit (bit 16).
 pub const LAPIC_LVT_MASK: u32 = 1 << 16;
@@ -178,6 +195,10 @@ pub struct LocalApicMmio {
     apic_id: u8,
     /// Spurious Interrupt Vector Register.
     svr: u32,
+    /// Logical Destination Register (bits 31:24 sticky). Spec: SDM §10.6.2.2.
+    ldr: u32,
+    /// Destination Format Register (model bits sticky). Spec: SDM §10.6.2.2.
+    dfr: u32,
     /// Task Priority Register (bits 7:0). Spec: SDM §10.8.3.1.
     tpr: u32,
     /// LVT Timer register.
@@ -221,6 +242,9 @@ impl LocalApicMmio {
             apic_id: 0,
             // Spec: SDM §10.4.7.11 — SVR reset: vector often `0xFF`, enable clear.
             svr: 0xFF,
+            // Spec: SDM §10.6.2.2 — LDR logical ID 0; DFR Flat model all-ones.
+            ldr: 0,
+            dfr: LAPIC_DFR_RESET,
             tpr: 0,
             // LVT Timer reset: masked.
             lvt_timer: LAPIC_LVT_MASK,
@@ -262,6 +286,16 @@ impl LocalApicMmio {
     /// the programmed value for firmware probes without CPU injection.
     pub fn spurious_vector(&self) -> u8 {
         (self.svr & LAPIC_SVR_VECTOR_MASK) as u8
+    }
+
+    /// Logical Destination Register (bits 31:24 sticky). Spec: SDM §10.6.2.2.
+    pub fn ldr(&self) -> u32 {
+        self.ldr
+    }
+
+    /// Destination Format Register. Spec: SDM §10.6.2.2.
+    pub fn dfr(&self) -> u32 {
+        self.dfr
     }
 
     /// Task Priority Register value (bits 7:0).
@@ -382,6 +416,8 @@ impl LocalApicMmio {
             LAPIC_REG_TPR => self.tpr & 0xFF,
             LAPIC_REG_PPR => self.ppr(),
             LAPIC_REG_EOI => 0,
+            LAPIC_REG_LDR => self.ldr,
+            LAPIC_REG_DFR => self.dfr,
             LAPIC_REG_SVR => self.svr,
             LAPIC_REG_LVT_TIMER => self.lvt_timer,
             LAPIC_REG_ICR_LOW => self.icr_low(),
@@ -598,6 +634,15 @@ impl LocalApicMmio {
                 // Processor Checking (presence). EOI-Broadcast Suppression and
                 // other bits are dropped (unsupported).
                 self.svr = value & LAPIC_SVR_WRITABLE;
+            }
+            LAPIC_REG_LDR => {
+                // Spec: SDM §10.6.2.2 — Logical APIC ID bits 31:24 sticky.
+                // No logical-destination matching is implemented in this stub.
+                self.ldr = value & LAPIC_LDR_LOGIC_ID_MASK;
+            }
+            LAPIC_REG_DFR => {
+                // Spec: SDM §10.6.2.2 — model bits 31:28 sticky; lower bits RO 1.
+                self.dfr = (value & LAPIC_DFR_MODEL_MASK) | 0x0FFF_FFFF;
             }
             LAPIC_REG_LVT_TIMER => {
                 // Spec: SDM §10.5.1 — retain vector, mask, timer mode (bit 17).
@@ -1129,6 +1174,33 @@ mod tests {
             "EOI-Broadcast Suppression must not stick"
         );
         assert_eq!(v & !LAPIC_SVR_WRITABLE, 0);
+    }
+
+    /// Spec: SDM §10.6.2.2 — LDR/DFR sticky read/write for firmware probes;
+    /// no logical delivery; CPUID.APIC stays clear (presence ≠ advertised).
+    #[test]
+    fn ldr_dfr_store_readback_sticky() {
+        let mut lapic = LocalApicMmio::new();
+        assert_eq!(read_u32(&lapic, LAPIC_REG_LDR), 0);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_DFR), LAPIC_DFR_RESET);
+        assert_eq!(lapic.ldr(), 0);
+        assert_eq!(lapic.dfr(), LAPIC_DFR_RESET);
+
+        write_u32(&mut lapic, LAPIC_REG_LDR, 0xAB00_00FF);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_LDR), 0xAB00_0000);
+        assert_eq!(lapic.ldr(), 0xAB00_0000);
+
+        // Cluster model bits 31:28 = 0; lower bits remain 1.
+        write_u32(&mut lapic, LAPIC_REG_DFR, 0x0000_1234);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_DFR), 0x0FFF_FFFF);
+        assert_eq!(lapic.dfr() & LAPIC_DFR_MODEL_MASK, 0);
+
+        write_u32(&mut lapic, LAPIC_REG_DFR, 0xF000_0000);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_DFR), LAPIC_DFR_RESET);
+
+        lapic.reset();
+        assert_eq!(read_u32(&lapic, LAPIC_REG_LDR), 0);
+        assert_eq!(read_u32(&lapic, LAPIC_REG_DFR), LAPIC_DFR_RESET);
     }
 
     /// Spec: SDM §10.9 — soft-enable clear suppresses timer latch and Fixed inject;

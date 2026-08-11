@@ -200,3 +200,23 @@ fn machine_hpet_level_eoi_no_reassert_after_status_clear() {
     assert!(!m.ioapic.remote_irr(2));
     assert!(m.lapic.take_interrupt().is_none());
 }
+
+/// Spec: HPET 1.0a + R15 model — `tick_pit` freeruns main counter at 12× when enabled;
+/// LEG_RT remains clear (no PIC IRQ0/IRQ8 claim).
+#[test]
+fn machine_tick_pit_freeruns_hpet_main_counter() {
+    let mut m = Machine::new(1024 * 1024);
+    write_u32_mmio(&mut m, HPET_DEFAULT_BASE, HPET_REG_CONFIG, 1);
+    assert_eq!(m.hpet.main_counter(), 0);
+    m.tick_pit(3);
+    assert_eq!(m.hpet.main_counter(), 3 * devices::HPET_TICKS_PER_PIT_CLOCK);
+    assert!(!m.hpet.legacy_replacement_active());
+    assert!(!m.hpet.drives_pic_irq0());
+    assert!(!m.hpet.drives_pic_irq8());
+
+    // Disabled: no further advance.
+    write_u32_mmio(&mut m, HPET_DEFAULT_BASE, HPET_REG_CONFIG, 0);
+    let frozen = m.hpet.main_counter();
+    m.tick_pit(5);
+    assert_eq!(m.hpet.main_counter(), frozen);
+}
