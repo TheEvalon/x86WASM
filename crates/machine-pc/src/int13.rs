@@ -366,19 +366,30 @@ impl Machine {
         self.cpu.set_cf(true);
     }
 
+    /// Spec: RBIL BDA `0040:0074` — last hard-disk status mirrors `AH` on HD ops.
+    fn int13_hd_ok_al(&mut self, al: u8) {
+        let _ = self.mem.write_u8(BDA_HD_STATUS, INT13_STATUS_OK);
+        self.int13_ok_al(al);
+    }
+
+    /// Spec: RBIL BDA `0040:0074` — store failing status for FreeDOS/DOS INT 13h paths.
+    fn int13_hd_fail(&mut self, status: u8) {
+        let _ = self.mem.write_u8(BDA_HD_STATUS, status);
+        self.int13_fail(status);
+    }
+
     fn int13_hd_reset(&mut self) {
         // Spec: IBM BIOS / RBIL INT 13h AH=00h — require attached fixed-disk media.
         // Empty image is treated like no media (CF + AH=80h), matching AH=08h.
         if !self.ide.present || self.ide.image.is_empty() {
-            self.int13_fail(INT13_STATUS_TIMEOUT);
+            self.int13_hd_fail(INT13_STATUS_TIMEOUT);
             return;
         }
         // Controller soft-reset preserves the image (ATA/ATAPI-6 reset semantics
         // via IdePrimary::reset) and clears in-flight DRQ/command state.
         self.ide.reset();
         // Spec: RBIL BDA 0040:0074 — last HD status cleared on successful reset.
-        let _ = self.mem.write_u8(BDA_HD_STATUS, INT13_STATUS_OK);
-        self.int13_ok_al(0);
+        self.int13_hd_ok_al(0);
     }
 
     fn int13_hd_read_from_regs(&mut self) {
@@ -390,10 +401,10 @@ impl Machine {
         let dest = self.cpu.es.base.wrapping_add(u64::from(bx));
 
         match self.int13_hd_read_chs_to_phys(cylinder, dh, sector, al, dest) {
-            Ok(n) => self.int13_ok_al(n),
+            Ok(n) => self.int13_hd_ok_al(n),
             Err(status) => {
                 self.cpu.set_al(0);
-                self.int13_fail(status);
+                self.int13_hd_fail(status);
             }
         }
     }
@@ -1505,6 +1516,51 @@ mod tests {
         assert_eq!(m.mem.read_u8(MBR_PHYS_ADDR).unwrap(), 0xF4);
         assert_eq!(m.mem.read_u8(MBR_PHYS_ADDR + 510).unwrap(), 0x55);
         assert_eq!(m.mem.read_u8(MBR_PHYS_ADDR + 511).unwrap(), 0xAA);
+    }
+
+    /// R15: AH=02h success/fail must update BDA `0040:0074` (FreeDOS/DOS status).
+    #[test]
+    fn int13_ah02_updates_bda_hd_status_ok_and_fail() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        m.mem.write_u8(BDA_HD_STATUS, 0xAA).unwrap();
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(BDA_HD_STATUS).unwrap(), INT13_STATUS_OK);
+
+        m.mem.write_u8(BDA_HD_STATUS, 0x00).unwrap();
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 8, 0x0000, 0x7C00); // OOB
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(
+            m.mem.read_u8(BDA_HD_STATUS).unwrap(),
+            INT13_STATUS_SECTOR_NOT_FOUND
+        );
+    }
+
+    /// R15 FreeDOS path: CHS read of active-partition VBR (LBA1 = C/H/S 0/0/2).
+    #[test]
+    fn int13_ah02_freedos_fat12_vbr_chs_read() {
+        use crate::fat12::synthetic_int19_freedos_fat12_hd;
+        let mut m = Machine::with_ide(64 * 1024, synthetic_int19_freedos_fat12_hd());
+        // Fixed 16/63 geometry: LBA1 = ((0*16)+0)*63 + (2-1) = 1.
+        assert_eq!(chs_to_lba(0, 0, 2), Some(1));
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 2, 1, 0x0000, 0x7C00);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(BDA_HD_STATUS).unwrap(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(0x7C00).unwrap(), 0xEB); // FAT jmp
+        assert_eq!(m.mem.read_u8(0x7C00 + 510).unwrap(), 0x55);
+        assert_eq!(m.mem.read_u8(0x7C00 + 511).unwrap(), 0xAA);
+        // Multi-sector: VBR + first FAT (FreeDOS VBR often reads FAT next).
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 2, 2, 0x0000, 0x8000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xEB);
+        assert_eq!(m.mem.read_u8(0x8200).unwrap(), 0xF8); // FAT media ID
     }
 
     /// Spec: multi-sector AH=02h copies consecutive LBAs.
