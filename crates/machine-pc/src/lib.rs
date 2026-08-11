@@ -2764,6 +2764,44 @@ mod tests {
         assert_eq!(m.pic.master.isr, 0);
     }
 
+    /// Spec: Intel 8254 mode 2 + 8259A edge IR0 — after EOI, OUT may still be
+    /// high; the next period's rising edge must re-latch IRR (SeaBIOS `wait_irq`
+    /// yields rely on repeated IRQ0 wakes). `tick_pit` pulses IR0 low→high on
+    /// each reported rising OUT so a held-high line still edges.
+    #[test]
+    fn pit_mode2_irq0_relatches_after_eoi_for_wait_irq_yields() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq0(&mut m);
+        // Mode 2, count=3 — short period for the model clock.
+        m.pit.port_write(PIT_CONTROL, 1, 0x34);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x03);
+        m.pit.port_write(PIT_CH0_DATA, 1, 0x00);
+
+        m.tick_pit(5); // load + countdown + low + rise
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), Some(0x08));
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.master.isr, 0);
+        assert_eq!(m.pic.master.irr & 0x01, 0);
+        // OUT can remain high between mode-2 periods; edge PIC must not stick.
+        assert!(m.pit.out_ch0());
+
+        // After a rise CE is N; next rise needs (N-1) countdown + low + rise = N+1.
+        m.tick_pit(4);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(
+                bus.poll_external_irq(),
+                Some(0x08),
+                "second mode-2 period must re-latch IRQ0 after EOI"
+            );
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.master.isr, 0);
+    }
+
     /// Spec: Intel 8254 mode 3 square-wave OUT edge → IRQ0 → vector 0x08.
     #[test]
     fn pit_mode3_tick_asserts_irq0() {
