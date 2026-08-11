@@ -113,8 +113,8 @@ pub use int16::{
     INT16_AH_SHIFT_STATUS, INT16_BUFFER_CAP,
 };
 pub use mbr::{
-    find_active_partition, ActivePartition, MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI,
-    MBR_SIGNATURE_LO,
+    find_active_partition, ActivePartition, Int19HandoffMedia, MBR_PHYS_ADDR, MBR_SECTOR_SIZE,
+    MBR_SIGNATURE_HI, MBR_SIGNATURE_LO,
 };
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
@@ -142,8 +142,8 @@ pub use post_spin::{
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use post_with_media::{
     classify_post_media_activity, classify_post_media_reboot, classify_post_with_media_stop,
-    post_report_idle_pct, PostMediaActivity, PostMediaRebootSignal, PostWithMediaClass,
-    PostWithMediaReport, NO_MEDIA_REBOOT_CLASS_CS, NO_MEDIA_REBOOT_CLASS_IP,
+    post_report_idle_pct, Int19HandoffReport, PostMediaActivity, PostMediaRebootSignal,
+    PostWithMediaClass, PostWithMediaReport, NO_MEDIA_REBOOT_CLASS_CS, NO_MEDIA_REBOOT_CLASS_IP,
     POST_MEDIA_IDLE_DOMINANT_PCT, POST_WITH_MEDIA_BUDGET_STEPS, WAIT_IRQ_CLASS_CS,
     WAIT_IRQ_CLASS_IP,
 };

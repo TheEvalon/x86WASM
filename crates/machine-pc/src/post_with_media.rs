@@ -269,6 +269,63 @@ impl Machine {
             honesty: "POST-with-media diagnostic only — does NOT claim POST complete, SeaBIOS INT 19h success, FreeDOS, or Linux boot.",
         })
     }
+
+    /// Host INT 19h-order load + short probe toward `0000:7C00` halt class (R15).
+    ///
+    /// Uses [`Self::host_int19_load_boot_sector`] then [`Self::probe_post`]. When
+    /// media is a synthetic HLT sector, classifies as
+    /// [`PostWithMediaClass::GuestHaltedAtBootSector`].
+    ///
+    /// Honesty: this is a **host** path that demonstrates the boot-sector
+    /// execution classify — it does **not** claim SeaBIOS INT 19h completed
+    /// (POST-with-media still stops at `F000:C897`; see
+    /// `docs/post-r15-c897-with-media.md`, `docs/boot-r15-int19-handoff.md`).
+    pub fn measure_host_int19_boot_sector(
+        &mut self,
+        chain_active_vbr: bool,
+        max_steps: u64,
+    ) -> Result<Int19HandoffReport, MachineError> {
+        if (!self.ide.present || self.ide.image.is_empty())
+            && self.fdc.read_sector(0, 0, 1).is_none()
+        {
+            self.attach_bootable_hd_for_int19();
+        }
+        let media = self.host_int19_load_boot_sector(chain_active_vbr)?;
+        let report = self.probe_post(max_steps);
+        let cf9_pulses = self.cf9.reset_pulse_count();
+        let class = classify_post_with_media_stop(&report, cf9_pulses);
+        Ok(Int19HandoffReport {
+            media,
+            class,
+            report,
+            honesty: "Host INT19-order handoff measure — does NOT claim SeaBIOS INT 19h success or OS boot.",
+        })
+    }
+}
+
+/// Host INT 19h-order handoff measure (R15; not SeaBIOS INT19 success).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Int19HandoffReport {
+    /// Which media the host helper loaded.
+    pub media: crate::mbr::Int19HandoffMedia,
+    /// Stop class (expect [`PostWithMediaClass::GuestHaltedAtBootSector`] on HLT fixtures).
+    pub class: PostWithMediaClass,
+    /// Underlying probe report.
+    pub report: PostReport,
+    /// Explicit non-claim.
+    pub honesty: &'static str,
+}
+
+impl std::fmt::Display for Int19HandoffReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "int19-handoff: media={} class={} (NOT SeaBIOS INT19 success / NOT OS boot)",
+            self.media, self.class
+        )?;
+        writeln!(f, "  honesty: {}", self.honesty)?;
+        write!(f, "{}", self.report)
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +481,33 @@ mod tests {
         // Honesty: harness records class only — does not assert POST complete.
         let _ = report.class.is_wait_irq_yield();
         eprintln!("{report}");
+    }
+
+    /// R15: host INT19 handoff reaches guest-halted-at-boot-sector (not SeaBIOS POST).
+    #[test]
+    fn measure_host_int19_boot_sector_halts_at_7c00() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_bootable_hd_for_int19();
+        let report = m
+            .measure_host_int19_boot_sector(false, 64)
+            .expect("int19-handoff");
+        assert_eq!(report.media.tag(), "hd-mbr");
+        assert_eq!(report.class, PostWithMediaClass::GuestHaltedAtBootSector);
+        assert!(matches!(report.report.stop, PostStopReason::Halted));
+        let text = report.to_string();
+        assert!(text.contains("guest-halted-at-boot-sector"));
+        assert!(text.contains("NOT SeaBIOS INT19"));
+    }
+
+    /// R15: host INT19 + VBR chain also classifies 7C00 halt.
+    #[test]
+    fn measure_host_int19_vbr_chain_halts_at_7c00() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_bootable_hd_for_int19();
+        let report = m
+            .measure_host_int19_boot_sector(true, 64)
+            .expect("int19-vbr");
+        assert_eq!(report.media.tag(), "hd-active-vbr");
+        assert_eq!(report.class, PostWithMediaClass::GuestHaltedAtBootSector);
     }
 }

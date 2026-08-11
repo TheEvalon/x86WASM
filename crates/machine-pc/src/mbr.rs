@@ -7,6 +7,10 @@
 //! physical `0x7C00`, require `0x55AA` signature, jump `CS:IP = 0000:7C00`.
 //! R14 also models the classic MBR→active-partition VBR chain as a **host**
 //! handoff (`load_active_vbr_to_7c00`) — not a claim of SeaBIOS INT 19h success.
+//! R15 adds [`Machine::host_int19_load_boot_sector`] (floppy-then-HD order) so
+//! measures can reach the `0000:7C00` halt class honestly as a **host** path
+//! while SeaBIOS POST-with-media still stops at `F000:C897`
+//! (`docs/boot-r15-int19-handoff.md`).
 
 use crate::boot_media::{MBR_PART0_OFF, MBR_PART_BOOTABLE};
 use crate::{Machine, MachineError};
@@ -33,6 +37,43 @@ pub struct ActivePartition {
     pub start_lba: u32,
     /// Sector count (little-endian dword at entry + 12).
     pub sector_count: u32,
+}
+
+/// Which media the host INT 19h-order helper loaded to `0x7C00` (R15).
+///
+/// Spec: IBM BIOS INT 19h typically tries floppy then fixed disk. This is a
+/// **host** load — not SeaBIOS INT 19h success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Int19HandoffMedia {
+    /// Floppy CHS `(0,0,1)` signed boot sector.
+    FloppyBootSector,
+    /// IDE LBA0 (MBR) signed sector.
+    HdMbr,
+    /// Active-partition VBR (host chain past MBR; optional INT19 deepen).
+    HdActiveVbr { part: ActivePartition },
+}
+
+impl Int19HandoffMedia {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::FloppyBootSector => "floppy-boot-sector",
+            Self::HdMbr => "hd-mbr",
+            Self::HdActiveVbr { .. } => "hd-active-vbr",
+        }
+    }
+}
+
+impl std::fmt::Display for Int19HandoffMedia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HdActiveVbr { part } => write!(
+                f,
+                "hd-active-vbr:lba={} type={:#04x}",
+                part.start_lba, part.part_type
+            ),
+            other => f.write_str(other.tag()),
+        }
+    }
 }
 
 /// Scan MBR bytes for the first active (`80h`) partition entry.
@@ -146,6 +187,35 @@ impl Machine {
             .read_floppy_boot_sector()?
             .ok_or(MachineError::NoBootMedia)?;
         self.install_boot_sector_at_7c00(&sector)
+    }
+
+    /// Host INT 19h-order boot-sector load to `0000:7C00` (R15).
+    ///
+    /// Order (IBM PC BIOS INT 19h spirit):
+    /// 1. Floppy CHS `(0,0,1)` when a signed floppy sector is present
+    /// 2. Else IDE LBA0 (MBR), or active-partition VBR when `chain_active_vbr`
+    ///
+    /// Does **not** claim SeaBIOS INT 19h ran. Spec: OSDev Boot Sequence /
+    /// IBM INT 19h; see `docs/boot-r15-int19-handoff.md`.
+    pub fn host_int19_load_boot_sector(
+        &mut self,
+        chain_active_vbr: bool,
+    ) -> Result<Int19HandoffMedia, MachineError> {
+        if let Some(sector) = self.read_floppy_boot_sector()? {
+            if sector[510] == MBR_SIGNATURE_LO && sector[511] == MBR_SIGNATURE_HI {
+                self.install_boot_sector_at_7c00(&sector)?;
+                return Ok(Int19HandoffMedia::FloppyBootSector);
+            }
+        }
+        if chain_active_vbr && self.ide.present && self.ide.image.len() >= MBR_SECTOR_SIZE {
+            // Prefer VBR chain only when an active partition exists; else fall through to MBR.
+            if find_active_partition(&self.ide.image[..MBR_SECTOR_SIZE]).is_some() {
+                let part = self.load_active_vbr_to_7c00()?;
+                return Ok(Int19HandoffMedia::HdActiveVbr { part });
+            }
+        }
+        self.load_mbr_to_7c00()?;
+        Ok(Int19HandoffMedia::HdMbr)
     }
 
     fn install_boot_sector_at_7c00(
@@ -424,5 +494,44 @@ mod tests {
         let part = find_active_partition(&img).expect("active");
         assert_eq!(part.index, 0);
         assert_eq!(part.start_lba, 1);
+    }
+
+    /// R15: host INT19 order prefers floppy over IDE when both present.
+    #[test]
+    fn host_int19_prefers_floppy_over_ide() {
+        use crate::boot_media::synthetic_int19_bootable_floppy;
+        let mut m = Machine::with_ide(64 * 1024, synthetic_int19_bootable_hd());
+        m.attach_floppy_image(synthetic_int19_bootable_floppy())
+            .expect("floppy");
+        let kind = m.host_int19_load_boot_sector(false).expect("int19");
+        assert_eq!(kind, Int19HandoffMedia::FloppyBootSector);
+        assert_eq!(m.cpu.ip16(), 0x7C00);
+        assert_eq!(m.mem.read_u8(0x7C00).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(0x7C01).unwrap(), b'F'); // FLOP marker
+    }
+
+    /// R15: without floppy, host INT19 loads HD MBR to 7C00.
+    #[test]
+    fn host_int19_loads_hd_mbr_when_no_floppy() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_int19_bootable_hd());
+        let kind = m.host_int19_load_boot_sector(false).expect("int19");
+        assert_eq!(kind, Int19HandoffMedia::HdMbr);
+        assert_eq!(m.cpu.ip16(), 0x7C00);
+        assert_eq!(m.mem.read_u8(0x7C00).unwrap(), 0xF4);
+        assert_eq!(m.mem.read_u8(0x7C01).unwrap(), b'I'); // INT1 marker
+    }
+
+    /// R15: chain_active_vbr loads partition VBR instead of MBR.
+    #[test]
+    fn host_int19_chain_active_vbr() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_int19_bootable_hd());
+        match m.host_int19_load_boot_sector(true).expect("int19-vbr") {
+            Int19HandoffMedia::HdActiveVbr { part } => {
+                assert_eq!(part.start_lba, 1);
+            }
+            other => panic!("unexpected {other}"),
+        }
+        assert_eq!(m.mem.read_u8(0x7C00).unwrap(), 0xF4);
+        assert_ne!(m.mem.read_u8(0x7C01).unwrap(), b'I');
     }
 }
