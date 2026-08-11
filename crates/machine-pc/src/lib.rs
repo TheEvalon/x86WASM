@@ -56,20 +56,22 @@ pub use guest_boot::{
 };
 pub use hello_rom::{build_hello_rom, EXPECTED_HELLO};
 pub use int10::{
-    setup_int10_get_cursor, setup_int10_get_mode, setup_int10_set_cursor,
-    setup_int10_set_cursor_type, setup_int10_set_mode, setup_int10_teletype,
-    setup_int10_vbe_controller_info, setup_int10_vbe_mode_info, setup_int10_write_char,
+    setup_int10_get_cursor, setup_int10_get_mode, setup_int10_read_char_attr,
+    setup_int10_scroll_window, setup_int10_set_cursor, setup_int10_set_cursor_type,
+    setup_int10_set_mode, setup_int10_teletype, setup_int10_vbe_controller_info,
+    setup_int10_vbe_mode_info, setup_int10_vbe_set_mode, setup_int10_write_char,
     setup_int10_write_char_attr, setup_int10_write_string, BDA_ACTIVE_PAGE, BDA_CRT_CTRL_BASE,
     BDA_CURSOR_PAGE0, BDA_CURSOR_TYPE, BDA_VIDEO_COLS, BDA_VIDEO_MODE, BDA_VIDEO_PAGE_SIZE,
     BDA_VIDEO_PAGE_START, BDA_VIDEO_ROWS_MINUS_1, INT10_AH_GET_CURSOR, INT10_AH_GET_MODE,
-    INT10_AH_SET_CURSOR, INT10_AH_SET_CURSOR_TYPE, INT10_AH_SET_MODE, INT10_AH_TELETYPE,
-    INT10_AH_VBE, INT10_AH_WRITE_CHAR, INT10_AH_WRITE_CHAR_ATTR, INT10_AH_WRITE_STRING,
-    INT10_AL_VBE_CONTROLLER_INFO, INT10_AL_VBE_MODE_INFO, INT10_CRT_BASE_COLOR,
-    INT10_MODE03_CURSOR_END, INT10_MODE03_CURSOR_START, INT10_MODE03_PAGE_SIZE,
-    INT10_MODE03_ROWS_MINUS_1, INT10_MODE13_PAGE_SIZE, INT10_MODE_03H_TEXT,
+    INT10_AH_READ_CHAR_ATTR, INT10_AH_SCROLL_DOWN, INT10_AH_SCROLL_UP, INT10_AH_SET_CURSOR,
+    INT10_AH_SET_CURSOR_TYPE, INT10_AH_SET_MODE, INT10_AH_TELETYPE, INT10_AH_VBE,
+    INT10_AH_WRITE_CHAR, INT10_AH_WRITE_CHAR_ATTR, INT10_AH_WRITE_STRING,
+    INT10_AL_VBE_CONTROLLER_INFO, INT10_AL_VBE_MODE_INFO, INT10_AL_VBE_SET_MODE,
+    INT10_CRT_BASE_COLOR, INT10_MODE03_CURSOR_END, INT10_MODE03_CURSOR_START,
+    INT10_MODE03_PAGE_SIZE, INT10_MODE03_ROWS_MINUS_1, INT10_MODE13_PAGE_SIZE, INT10_MODE_03H_TEXT,
     INT10_MODE_13H_GRAPHICS, INT10_VBE_AH_FAILED, INT10_VBE_AH_SUCCESS, INT10_VBE_AL_SUPPORTED,
-    INT10_VECTOR, INT10_WRITE_CHAR_MAX_COUNT, INT10_WRITE_STRING_HAS_ATTR,
-    INT10_WRITE_STRING_UPDATE_CURSOR,
+    INT10_VBE_BX_LFB, INT10_VBE_BX_MODE_MASK, INT10_VBE_BX_NO_CLEAR, INT10_VECTOR,
+    INT10_WRITE_CHAR_MAX_COUNT, INT10_WRITE_STRING_HAS_ATTR, INT10_WRITE_STRING_UPDATE_CURSOR,
 };
 pub use int13::{
     chs_to_lba, pack_cx, setup_int13_cd_check_extensions, setup_int13_cd_ext_get_params,
