@@ -1297,7 +1297,7 @@ impl Machine {
     /// Mirror UHCI USBSTS∩USBINTR pending onto PIRQD and sync through PIRQRC.
     ///
     /// Spec: Intel 82371SB — USB → PIRQD#; classic ISA route IRQ11 when
-    /// `PIRQRC[D]=0x0B`. See `docs/usb-r14-uhci-pic.md`.
+    /// `PIRQRC[D]=0x0B`. See `docs/uhci-r14-pic-irq-wire.md`.
     pub fn sync_uhci_irq_to_pic(&mut self) -> bool {
         uhci_wire::sync_uhci_irq_to_pic(&mut self.pci, &mut self.pic)
     }
@@ -2062,7 +2062,7 @@ impl Bus for MachineBus<'_> {
     ///
     /// Spec: IBM PC/AT ISA interrupt assignment — COM1 `0x3F8` → IRQ4, COM2
     /// `0x2F8` → IRQ3. Only the NS16550A THRE source exists in this UART subset.
-    /// Spec: Intel 82371SB — USB → PIRQD# (`docs/usb-r14-uhci-pic.md`).
+    /// Spec: Intel 82371SB — USB → PIRQD# (`docs/uhci-r14-pic-irq-wire.md`).
     fn poll_external_irq(&mut self) -> Option<u8> {
         self.pic.set_irq_line(0, self.pit.out_ch0());
         self.pic.set_irq_line(1, self.kbd.irq1_line());

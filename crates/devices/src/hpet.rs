@@ -20,7 +20,7 @@
 //! FSB_EN); IRQ route tests deepen advertised-vs-default GSI honesty.
 //! Round-14: Legacy Replacement (`LEG_RT_CAP` / `LEG_RT_CNF`) stays **clear**
 //! so PIT IRQ0 and CMOS IRQ8 remain the real 8254/RTC sources; MSI still
-//! unsupported. See `docs/timer-r14-hpet-legacy.md`.
+//! unsupported. See `docs/hpet-r14-legacy-irq.md`.
 //! See `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`,
 //! `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`,
 //! `docs/hpet-r12-msi-irq.md`.

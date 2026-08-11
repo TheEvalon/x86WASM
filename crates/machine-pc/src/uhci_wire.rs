@@ -2,7 +2,7 @@
 //!
 //! Spec: Intel 82371SB — USB Host Controller interrupt is hardwired to
 //! PIRQD#; PIRQRC[D] selects the ISA IRQ. This tree's classic test/route
-//! target is IRQ11 (`UHCI_CLASSIC_ISA_IRQ`). See `docs/usb-r14-uhci-pic.md`.
+//! target is IRQ11 (`UHCI_CLASSIC_ISA_IRQ`). See `docs/uhci-r14-pic-irq-wire.md`.
 //!
 //! Ownership (R14 usb-timer): this module + thin `Machine::sync_uhci_irq_to_pic`
 //! / `MachineBus::poll_external_irq` UHCI sync. Does **not** edit `pci.rs`.
