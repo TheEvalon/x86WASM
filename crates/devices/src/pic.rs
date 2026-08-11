@@ -2412,4 +2412,83 @@ mod tests {
         pic.port_write(PIC_MASTER_CMD, 1, 0x20);
         assert_eq!(pic.poll_irq(), None, "reserved IRQ0 stays edge");
     }
+
+    /// Spec: Intel 8259A OCW3 IRR/ISR — SeaBIOS `wait_irq` / `check_irqs` paths
+    /// EOI IRQ0 then may OCW3-read ISR/IRR. Sticky `RR`/`RIS` survives EOI; after
+    /// EOI ISR bit0 is clear; IRR stays clear until a new edge (OUT may still be high).
+    #[test]
+    fn irq0_ocw3_irr_isr_sticky_around_eoi_for_wait_irq() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFE); // unmask IR0
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.master.irr & 0x01, 0x01);
+
+        // Default after ICW: IRR.
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1) as u8 & 0x01, 0x01);
+
+        assert_eq!(pic.poll_irq(), Some(0x08));
+        assert_eq!(pic.master.isr & 0x01, 0x01);
+        assert_eq!(pic.master.irr & 0x01, 0);
+
+        // OCW3 select ISR (0x0B) — sticky until another OCW3 RR.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0B);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1) as u8, 0x01);
+
+        // Non-specific EOI (OCW2 0x20) — clears ISR; does not reset OCW3 select.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.master.isr, 0);
+        assert_eq!(
+            pic.port_read(PIC_MASTER_CMD, 1) as u8,
+            0,
+            "sticky ISR select still returns ISR after EOI"
+        );
+
+        // Switch to IRR: held-high IR0 must not show pending (edge).
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0A);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1) as u8 & 0x01, 0);
+        assert_eq!(pic.poll_irq(), None);
+
+        // New edge re-latches IRR while OCW3 still selects IRR.
+        pic.set_irq_line(0, false);
+        pic.set_irq_line(0, true);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1) as u8 & 0x01, 0x01);
+        assert_eq!(pic.poll_irq(), Some(0x08));
+    }
+
+    /// Spec: Intel 8259A cascade — IRQ8 ack leaves master ISR IR2 + slave ISR IR0;
+    /// OCW3 reads on both chips match `irr_isr_snapshot` (clock_poll / check_irqs).
+    #[test]
+    fn irq8_ocw3_cascade_irr_isr_view_for_wait_irq() {
+        let mut pic = DualPic::new();
+        init_at_cascade(&mut pic);
+        pic.port_write(PIC_MASTER_DATA, 1, 0xFB); // unmask cascade IR2
+        pic.port_write(PIC_SLAVE_DATA, 1, 0xFE); // unmask slave IR0 (IRQ8)
+        pic.set_irq_line(8, true);
+
+        assert_eq!(pic.poll_irq(), Some(0x70));
+        let snap = pic.irr_isr_snapshot();
+        assert_eq!(snap.master_isr, 1 << 2);
+        assert_eq!(snap.slave_isr, 1 << 0);
+        assert_eq!(snap.slave_irr & 0x01, 0);
+        assert_eq!(
+            pic.ocw3_read_irr_isr(false),
+            (snap.master_irr, snap.master_isr)
+        );
+        assert_eq!(
+            pic.ocw3_read_irr_isr(true),
+            (snap.slave_irr, snap.slave_isr)
+        );
+
+        // Guest-visible OCW3: master ISR shows cascade; slave ISR shows IR0.
+        pic.port_write(PIC_MASTER_CMD, 1, 0x0B);
+        assert_eq!(pic.port_read(PIC_MASTER_CMD, 1) as u8, 1 << 2);
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x0B);
+        assert_eq!(pic.port_read(PIC_SLAVE_CMD, 1) as u8, 1 << 0);
+
+        pic.port_write(PIC_SLAVE_CMD, 1, 0x20);
+        pic.port_write(PIC_MASTER_CMD, 1, 0x20);
+        assert_eq!(pic.slave.isr, 0);
+        assert_eq!(pic.master.isr, 0);
+    }
 }
