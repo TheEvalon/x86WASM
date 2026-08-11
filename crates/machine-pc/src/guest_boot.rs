@@ -22,7 +22,8 @@
 //! `docs/boot-r14-linux-eltorito-measure.md`,
 //! `docs/boot-r14-mbr-vbr-chain.md`,
 //! `docs/boot-r14-post-with-media.md`,
-//! `docs/boot-r15-freedos-next.md`).
+//! `docs/boot-r15-freedos-next.md`,
+//! `docs/boot-r15-linux-next.md`).
 
 use crate::boot_media::{classify_machine_int19_media, Int19BootMediaClass};
 use crate::fat12::locate_freedos_kernel_on_machine;
@@ -58,6 +59,8 @@ pub enum GuestBootMedia {
     ElTorito,
     /// [`Machine::load_active_vbr_to_7c00`] — active partition VBR → `0x7C00`.
     ActiveVbr,
+    /// [`Machine::load_bzimage_realmode_setup`] + arm entry at `+0x200` (R15).
+    BzImageSetup,
 }
 
 /// Host handoff used for FreeDOS next-gap classify (MBR vs VBR chain).
@@ -138,6 +141,7 @@ impl std::fmt::Display for GuestBootMeasure {
                 GuestBootMedia::FloppyFirst => "floppy-first",
                 GuestBootMedia::ElTorito => "eltorito",
                 GuestBootMedia::ActiveVbr => "active-vbr",
+                GuestBootMedia::BzImageSetup => "bzimage-setup",
             },
             self.stop_class()
         )?;
@@ -1050,6 +1054,132 @@ pub fn classify_eltorito_media_boot(machine: &Machine) -> ElToritoMediaBootClass
     }
 }
 
+/// El Torito catalog → boot-image payload classify (R15 deepen).
+///
+/// After a no-emul candidate is present, peek at the boot image bytes for a
+/// bzImage-shaped header vs a synthetic HLT stub. Spec: El Torito 1.0 + Linux
+/// boot.rst. Does **not** claim a serial shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ElToritoPayloadClass {
+    /// Catalog / medium classify (not a loaded no-emul peek).
+    Media(ElToritoMediaBootClass),
+    /// No-emul boot image starts with HLT / non-HdrS stub.
+    NoEmulHltStub {
+        load_rba: u32,
+        sector_count: u16,
+        load_segment: u16,
+    },
+    /// No-emul boot image parses as a Linux setup/bzImage header.
+    NoEmulBzImage {
+        load_rba: u32,
+        sector_count: u16,
+        load_segment: u16,
+        bzimage: BzImageEarlyClass,
+    },
+}
+
+impl ElToritoPayloadClass {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Media(_) => "media",
+            Self::NoEmulHltStub { .. } => "no-emul-hlt-stub",
+            Self::NoEmulBzImage { .. } => "no-emul-bzimage",
+        }
+    }
+
+    pub fn is_bzimage_candidate(&self) -> bool {
+        matches!(
+            self,
+            Self::NoEmulBzImage {
+                bzimage: BzImageEarlyClass::SetupLoadable { .. },
+                ..
+            }
+        )
+    }
+}
+
+impl std::fmt::Display for ElToritoPayloadClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Media(m) => write!(f, "media:{m}"),
+            Self::NoEmulHltStub {
+                load_rba,
+                sector_count,
+                load_segment,
+            } => write!(
+                f,
+                "no-emul-hlt-stub:rba={load_rba} sectors={sector_count} seg={load_segment:#06x}"
+            ),
+            Self::NoEmulBzImage {
+                load_rba,
+                sector_count,
+                load_segment,
+                bzimage,
+            } => write!(
+                f,
+                "no-emul-bzimage:rba={load_rba} sectors={sector_count} seg={load_segment:#06x} bz={bzimage}"
+            ),
+        }
+    }
+}
+
+/// Classify El Torito boot catalog candidacy **and** peek at the boot image payload.
+///
+/// Spec: El Torito 1.0 (`sector_count` × 512 load length from `load_rba` × 2048);
+/// Linux boot.rst header inspect. Host-only; not SeaBIOS CD INT 13h.
+pub fn classify_eltorito_boot_payload(machine: &Machine) -> ElToritoPayloadClass {
+    let media = classify_eltorito_media_boot(machine);
+    let ElToritoMediaBootClass::NoEmulCandidate {
+        load_rba,
+        sector_count,
+        load_segment,
+    } = media
+    else {
+        return ElToritoPayloadClass::Media(media);
+    };
+    let Some(image) = machine.ide.atapi_medium_image() else {
+        return ElToritoPayloadClass::Media(ElToritoMediaBootClass::NoMedium);
+    };
+    let Some(byte_len) = (sector_count as usize).checked_mul(512).filter(|n| *n > 0) else {
+        return ElToritoPayloadClass::NoEmulHltStub {
+            load_rba,
+            sector_count,
+            load_segment,
+        };
+    };
+    let Some(src_off) = (load_rba as usize).checked_mul(firmware_interface::EL_TORITO_SECTOR_BYTES)
+    else {
+        return ElToritoPayloadClass::Media(ElToritoMediaBootClass::CatalogError(
+            "load_rba overflow".into(),
+        ));
+    };
+    let Some(src_end) = src_off.checked_add(byte_len) else {
+        return ElToritoPayloadClass::Media(ElToritoMediaBootClass::CatalogError(
+            "boot image OOB".into(),
+        ));
+    };
+    if src_end > image.len() {
+        return ElToritoPayloadClass::Media(ElToritoMediaBootClass::CatalogError(
+            "boot image truncated".into(),
+        ));
+    }
+    let boot = &image[src_off..src_end];
+    let bz = classify_bzimage_setup_deeper(boot);
+    if matches!(bz, BzImageEarlyClass::SetupLoadable { .. }) {
+        return ElToritoPayloadClass::NoEmulBzImage {
+            load_rba,
+            sector_count,
+            load_segment,
+            bzimage: bz,
+        };
+    }
+    ElToritoPayloadClass::NoEmulHltStub {
+        load_rba,
+        sector_count,
+        load_segment,
+    }
+}
+
 /// Combined Linux / El Torito media boot readiness (host classify + optional measure).
 ///
 /// Spec: El Torito 1.0 + Linux `Documentation/x86/boot.rst`. Does **not** claim
@@ -1128,6 +1258,118 @@ pub fn classify_linux_media_boot(machine: &Machine, bzimage: Option<&[u8]>) -> L
     }
 }
 
+/// Next actionable gap on the Linux serial/media path (R15 deepen).
+///
+/// Spec: Linux `Documentation/x86/boot.rst` real-mode entry at setup+`0x200`.
+/// Does **not** claim a serial shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinuxNextGap {
+    /// Non-halt first failure already names the gap.
+    SeeFirstFailure,
+    /// El Torito / serial stub halted; next is real bzImage setup.
+    SyntheticMediaHalt,
+    /// Real-mode setup loaded at `0x90000` but `CS:IP` not armed at entry.
+    SetupLoadedMissingEntry,
+    /// Setup entry executed (synthetic HLT) — next is protected-mode / high kernel.
+    SetupExecutedMissingProtectedKernel,
+    /// Need a real bzImage + firmware path beyond fixtures.
+    RealKernelAndFirmware,
+}
+
+impl LinuxNextGap {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::SeeFirstFailure => "see-first-failure",
+            Self::SyntheticMediaHalt => "synthetic-media-halt",
+            Self::SetupLoadedMissingEntry => "setup-loaded-missing-entry",
+            Self::SetupExecutedMissingProtectedKernel => {
+                "setup-executed-missing-protected-kernel"
+            }
+            Self::RealKernelAndFirmware => "real-kernel-and-firmware",
+        }
+    }
+
+    pub fn host_note(&self) -> &'static str {
+        match self {
+            Self::SeeFirstFailure => "Next gap: see first-failure class (non-halt stop)",
+            Self::SyntheticMediaHalt => {
+                "Next gap: synthetic El Torito/serial halt — need bzImage setup entry; NOT a serial shell"
+            }
+            Self::SetupLoadedMissingEntry => {
+                "Next gap: real-mode setup loaded but CS:IP not at entry 0x200; NOT a serial shell"
+            }
+            Self::SetupExecutedMissingProtectedKernel => {
+                "Next gap: real-mode setup entry executed (synthetic) — missing protected kernel/jump; NOT a serial shell"
+            }
+            Self::RealKernelAndFirmware => {
+                "Next gap: real bzImage + SeaBIOS/firmware path (fixture is not progress)"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LinuxNextGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+/// Classify Linux-path next-gap after a measure / load helper (R15).
+///
+/// `setup_entry_armed` is true when [`Machine::arm_bzimage_realmode_entry`] ran.
+/// Spec: boot.rst entry at offset `0x200`. Not a shell claim.
+pub fn classify_linux_next_gap(
+    first_failure: &GuestFirstFailureClass,
+    media: &LinuxMediaBootClass,
+    setup_entry_armed: bool,
+) -> LinuxNextGap {
+    if !matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
+        return LinuxNextGap::SeeFirstFailure;
+    }
+    if setup_entry_armed {
+        return LinuxNextGap::SetupExecutedMissingProtectedKernel;
+    }
+    if matches!(
+        media,
+        LinuxMediaBootClass::BzImage(BzImageEarlyClass::SetupLoadable { .. })
+            | LinuxMediaBootClass::ElToritoPlusBzImage {
+                bzimage: BzImageEarlyClass::SetupLoadable { .. },
+                ..
+            }
+    ) {
+        return LinuxNextGap::SetupLoadedMissingEntry;
+    }
+    if media.is_boot_candidate() {
+        return LinuxNextGap::SyntheticMediaHalt;
+    }
+    LinuxNextGap::RealKernelAndFirmware
+}
+
+/// Synthetic bzImage real-mode blob: header + setup entry at `+0x200` prints `LX` then HLT.
+///
+/// Spec: Linux boot.rst — entry at offset `0x200` for protocol ≥ 2.00. Real
+/// kernels place a short jump at `0x200` so `HdrS` at `0x202` stays intact.
+/// Not a kernel; fixture for [`Machine::measure_linux_bzimage_setup_entry`].
+pub fn synthetic_linux_bzimage_setup_hlt() -> Vec<u8> {
+    let need = linux_realmode_bytes(1);
+    let mut buf = synthetic_linux_boot_protocol_header(1, 0x0200, 0, 0);
+    buf.resize(need, 0x90);
+    // Entry at +0x200: jmp short to 0x220 (keeps HdrS @ 0x202).
+    // After the 2-byte jmp, IP=0x202; rel=+0x1E → 0x220.
+    buf[0x200] = 0xEB;
+    buf[0x201] = 0x1E;
+    let code: &[u8] = &[
+        0xBA, 0xF8, 0x03, // mov dx, 0x03F8
+        0xB0, b'L', //
+        0xEE, //
+        0xB0, b'X', //
+        0xEE, //
+        0xF4, // hlt
+    ];
+    buf[0x220..0x220 + code.len()].copy_from_slice(code);
+    buf
+}
+
 /// Error from [`Machine::load_bzimage_realmode_setup`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BzImageLoadError {
@@ -1196,6 +1438,9 @@ impl Machine {
             GuestBootMedia::ElTorito => self.load_eltorito_to_7c00()?,
             GuestBootMedia::ActiveVbr => {
                 self.load_active_vbr_to_7c00()?;
+            }
+            GuestBootMedia::BzImageSetup => {
+                return Err(MachineError::NoBootMedia);
             }
         }
         let mut checkpoints = vec![
@@ -1534,6 +1779,97 @@ impl Machine {
         }
         Ok(class)
     }
+
+    /// Arm `CS:IP` at the Linux real-mode setup entry (offset `0x200` from `dest`).
+    ///
+    /// Spec: Linux `Documentation/x86/boot.rst` — for protocol ≥ 2.00 the entry
+    /// is at offset `0x200` from the start of the real-mode kernel. Uses
+    /// `CS = dest>>4`, `IP = 0x200`. Does **not** execute setup or claim a shell.
+    pub fn arm_bzimage_realmode_entry(&mut self, dest: u64) -> Result<(), BzImageLoadError> {
+        if dest & 0xF != 0 {
+            return Err(BzImageLoadError::RamTooSmall);
+        }
+        if dest > u64::from(u16::MAX) << 4 {
+            return Err(BzImageLoadError::RamTooSmall);
+        }
+        let cs = (dest >> 4) as u16;
+        self.cpu.cs = x86_core::SegmentReg::real_mode_code(cs);
+        self.cpu.set_ip16(0x0200);
+        Ok(())
+    }
+
+    /// Load synthetic bzImage setup, arm entry at `+0x200`, measure first-failure (R15).
+    ///
+    /// Advances Linux classify past El Torito/serial stub halt toward
+    /// [`LinuxNextGap::SetupExecutedMissingProtectedKernel`].
+    ///
+    /// Does **not** claim a Linux serial shell or protected-mode kernel boot.
+    pub fn measure_linux_bzimage_setup_entry(
+        &mut self,
+        max_steps: u64,
+    ) -> Result<(GuestOsMeasure, LinuxNextGap), MachineError> {
+        let image = synthetic_linux_bzimage_setup_hlt();
+        // Need ≥ ~0x90400 RAM for classic load address + setup.
+        if self.mem.ram_len() < (LINUX_REALMODE_LOAD_ADDR as usize) + linux_realmode_bytes(1) {
+            return Err(MachineError::MbrRamTooSmall);
+        }
+        // Host INT13 AH=41 probe in finish_os_measure CF-masks halt without media;
+        // attach a tiny signed sector so the setup-entry halt stays SyntheticHalt.
+        if !self.ide.present || self.ide.image.is_empty() {
+            let mut sector = vec![0x90u8; crate::mbr::MBR_SECTOR_SIZE];
+            sector[0] = 0xF4;
+            sector[510] = crate::mbr::MBR_SIGNATURE_LO;
+            sector[511] = crate::mbr::MBR_SIGNATURE_HI;
+            self.attach_ide_image(sector);
+        }
+        self.load_bzimage_realmode_setup(&image, LINUX_REALMODE_LOAD_ADDR)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        self.arm_bzimage_realmode_entry(LINUX_REALMODE_LOAD_ADDR)
+            .map_err(|_| MachineError::MbrRamTooSmall)?;
+        let mut checkpoints = vec![
+            GuestBootCheckpoint::MediaLoaded,
+            GuestBootCheckpoint::CsIpArmed,
+            GuestBootCheckpoint::ProbeStarted,
+        ];
+        let report = self.probe_post(max_steps);
+        let com1 = report.com1.clone();
+        let debug = report.debug.clone();
+        if !com1.is_empty() || !debug.is_empty() {
+            checkpoints.push(GuestBootCheckpoint::SerialObserved);
+        }
+        let vga_summary = vga_text_summary(self);
+        if !vga_summary.is_empty() {
+            checkpoints.push(GuestBootCheckpoint::VgaObserved);
+        }
+        checkpoints.push(GuestBootCheckpoint::StopRecorded);
+        let measure = GuestBootMeasure {
+            version: GUEST_BOOT_MEASURE_VERSION,
+            media: GuestBootMedia::BzImageSetup,
+            checkpoints,
+            com1,
+            debug,
+            vga_summary,
+            report,
+        };
+        let os = self.finish_os_measure(
+            GuestOsMeasureKind::LinuxSerialPath,
+            measure,
+            "bzImage real-mode setup entry measured — does NOT claim Linux serial shell or PM kernel.",
+            vec![
+                "Synthetic setup entry at +0x200 (jmp to COM1 LX + HLT) only",
+                "No protected-mode kernel / code32_start jump",
+                "No earlyprintk through a real kernel",
+                "No claim of Linux serial shell",
+            ],
+            vec![
+                "classify_linux_next_gap → setup-executed-missing-protected-kernel when armed",
+            ],
+            FreedosHandoff::MbrSector,
+        );
+        let media = classify_linux_media_boot(self, Some(&image));
+        let gap = classify_linux_next_gap(&os.first_failure, &media, true);
+        Ok((os, gap))
+    }
 }
 
 /// Compact non-blank VGA text rows (`row:text`), empty when the buffer is blank.
@@ -1694,6 +2030,24 @@ pub fn synthetic_eltorito_linux_hlt_iso() -> Vec<u8> {
     ];
     boot[..code.len()].copy_from_slice(code);
     write_iso_sector(&mut img, 24, &boot);
+    img
+}
+
+/// Synthetic El Torito no-emul ISO whose boot image is a bzImage-shaped setup stub.
+///
+/// Catalog → load peeks as [`ElToritoPayloadClass::NoEmulBzImage`]. Not a real
+/// kernel and **not** a Linux serial shell.
+pub fn synthetic_eltorito_bzimage_iso() -> Vec<u8> {
+    use firmware_interface::EL_TORITO_SECTOR_BYTES;
+    let mut img = synthetic_eltorito_linux_hlt_iso();
+    let boot = synthetic_linux_bzimage_setup_hlt();
+    let start = 24 * EL_TORITO_SECTOR_BYTES;
+    let n = boot.len().min(EL_TORITO_SECTOR_BYTES);
+    img[start..start + n].copy_from_slice(&boot[..n]);
+    // Clear remainder of the ISO sector so leftover HLT stub bytes do not linger.
+    for b in &mut img[start + n..start + EL_TORITO_SECTOR_BYTES] {
+        *b = 0;
+    }
     img
 }
 
@@ -2462,5 +2816,82 @@ mod tests {
         let text = report.to_string();
         assert!(text.contains("does NOT claim Linux"));
         assert!(!text.contains("serial shell reached"));
+    }
+
+    /// R15: arm setup entry at +0x200 (boot.rst).
+    #[test]
+    fn arm_bzimage_realmode_entry_sets_cs_ip() {
+        let mut m = Machine::new(1024 * 1024);
+        m.arm_bzimage_realmode_entry(LINUX_REALMODE_LOAD_ADDR)
+            .expect("arm");
+        assert_eq!(m.cpu.cs.selector, 0x9000);
+        assert_eq!(m.cpu.ip16(), 0x0200);
+    }
+
+    /// R15: load+arm+measure reaches setup-executed-missing-protected-kernel.
+    #[test]
+    fn measure_linux_bzimage_setup_entry_next_gap() {
+        let mut m = Machine::new(1024 * 1024);
+        let (report, gap) = m
+            .measure_linux_bzimage_setup_entry(64)
+            .expect("bzimage-setup");
+        assert_eq!(report.kind, GuestOsMeasureKind::LinuxSerialPath);
+        assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
+        assert_eq!(report.measure.media, GuestBootMedia::BzImageSetup);
+        assert_eq!(gap, LinuxNextGap::SetupExecutedMissingProtectedKernel);
+        assert_eq!(gap.tag(), "setup-executed-missing-protected-kernel");
+        assert!(report.measure.com1.contains('L') || report.measure.com1 == "LX");
+        let text = report.to_string();
+        assert!(text.contains("does NOT claim Linux"));
+        assert!(!text.contains("serial shell reached"));
+    }
+
+    /// Spec: setup loadable without arm → setup-loaded-missing-entry.
+    #[test]
+    fn classify_linux_next_gap_setup_loaded_missing_entry() {
+        let need = linux_realmode_bytes(1);
+        let mut bz = synthetic_linux_boot_protocol_header(1, 0x0200, 0, 0);
+        bz.resize(need, 0);
+        let media = LinuxMediaBootClass::BzImage(classify_bzimage_early(&bz));
+        let gap = classify_linux_next_gap(
+            &GuestFirstFailureClass::SyntheticHalt,
+            &media,
+            false,
+        );
+        assert_eq!(gap, LinuxNextGap::SetupLoadedMissingEntry);
+    }
+
+    /// R15: El Torito catalog→payload peeks HLT stub vs bzImage setup.
+    #[test]
+    fn classify_eltorito_boot_payload_hlt_vs_bzimage() {
+        let iso = synthetic_eltorito_bzimage_iso();
+        let boot = &iso[24 * firmware_interface::EL_TORITO_SECTOR_BYTES
+            ..24 * firmware_interface::EL_TORITO_SECTOR_BYTES + 2048];
+        let raw = classify_bzimage_setup_deeper(boot);
+        assert!(
+            matches!(raw, BzImageEarlyClass::SetupLoadable { .. }),
+            "raw boot bytes should be setup-loadable, got {raw}"
+        );
+
+        let mut m = Machine::new(64 * 1024);
+        assert!(matches!(
+            classify_eltorito_boot_payload(&m),
+            ElToritoPayloadClass::Media(ElToritoMediaBootClass::NoMedium)
+        ));
+        m.attach_atapi_cdrom_image(synthetic_eltorito_linux_hlt_iso());
+        match classify_eltorito_boot_payload(&m) {
+            ElToritoPayloadClass::NoEmulHltStub { .. } => {}
+            other => panic!("expected hlt stub, got {other}"),
+        }
+        assert!(!classify_eltorito_boot_payload(&m).is_bzimage_candidate());
+
+        m.attach_atapi_cdrom_image(iso);
+        match classify_eltorito_boot_payload(&m) {
+            ElToritoPayloadClass::NoEmulBzImage { bzimage, .. } => {
+                assert!(matches!(bzimage, BzImageEarlyClass::SetupLoadable { .. }));
+            }
+            other => panic!("expected bzImage payload, got {other}"),
+        }
+        assert!(classify_eltorito_boot_payload(&m).is_bzimage_candidate());
     }
 }
