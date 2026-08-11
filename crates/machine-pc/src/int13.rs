@@ -355,15 +355,33 @@ impl Machine {
 }
 
 impl Machine {
-    fn int13_ok_al(&mut self, al: u8) {
+    fn int13_ok(&mut self) {
         self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_al(al);
         self.cpu.set_cf(false);
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
+    }
+
+    fn int13_ok_al(&mut self, al: u8) {
+        self.cpu.set_al(al);
+        self.int13_ok();
     }
 
     fn int13_fail(&mut self, status: u8) {
         self.cpu.set_ah(status);
         self.cpu.set_cf(true);
+        self.int13_mirror_bda_status(status);
+    }
+
+    /// Spec: RBIL BDA — last floppy status at `0040:0041` (`DL < 80h`);
+    /// last hard-disk status at `0040:0074` (`DL ≥ 80h`, including CD `E0h`).
+    fn int13_mirror_bda_status(&mut self, status: u8) {
+        let dl = self.cpu.gpr_u8_low(CpuState::RDX);
+        let addr = if dl < INT13_DRIVE_HD0 {
+            BDA_FLOPPY_STATUS
+        } else {
+            BDA_HD_STATUS
+        };
+        let _ = self.mem.write_u8(addr, status);
     }
 
     fn int13_hd_reset(&mut self) {
@@ -377,6 +395,7 @@ impl Machine {
         // via IdePrimary::reset) and clears in-flight DRQ/command state.
         self.ide.reset();
         // Spec: RBIL BDA 0040:0074 — last HD status cleared on successful reset.
+        // `int13_ok_al` also mirrors BDA; explicit clear kept for reset clarity.
         let _ = self.mem.write_u8(BDA_HD_STATUS, INT13_STATUS_OK);
         self.int13_ok_al(0);
     }
@@ -441,6 +460,8 @@ impl Machine {
         // AH=08h: CX = max cylinder/sector packed; DH = max head; DL = drive count.
         // AL unused (cleared); BL = 00h for hard disks (floppy type N/A).
         // Geometry derives from image size at fixed 16 heads / 63 spt.
+        // Mirror BDA while DL is still the HD unit number (AH=08h overwrites DL).
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
         let (max_cyl, heads, spt, _total) = self.int13_hd_geometry();
         self.cpu
             .set_gpr_u16(CpuState::RCX, pack_cx(max_cyl, spt as u8));
@@ -471,6 +492,8 @@ impl Machine {
         self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
         debug_assert_eq!(self.cpu.gpr_u16(CpuState::RCX) & INT13_EXT_CX_LOCKING, 0);
         self.cpu.set_cf(false);
+        // AH holds extension version, not status; still mirror last-status OK.
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
     }
 
     /// Spec: IBM/MS INT 13h Extensions AH=42h — Disk Address Packet at `DS:SI`.
@@ -485,8 +508,7 @@ impl Machine {
             Ok(dap) => match self.int13_hd_read_lba_to_phys(dap.lba, dap.count, dap.buf) {
                 Ok(n) => {
                     let _ = self.int13_dap_set_count(dap_phys, n);
-                    self.cpu.set_ah(INT13_STATUS_OK);
-                    self.cpu.set_cf(false);
+                    self.int13_ok();
                 }
                 Err(status) => {
                     let _ = self.int13_dap_set_count(dap_phys, 0);
@@ -504,10 +526,7 @@ impl Machine {
         let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
         match self.int13_parse_dap(dap_phys) {
             Ok(dap) => match self.int13_hd_write_lba_from_phys(dap.lba, dap.count, dap.buf) {
-                Ok(_) => {
-                    self.cpu.set_ah(INT13_STATUS_OK);
-                    self.cpu.set_cf(false);
-                }
+                Ok(_) => self.int13_ok(),
                 Err(status) => self.int13_fail(status),
             },
             Err(status) => self.int13_fail(status),
@@ -550,8 +569,7 @@ impl Machine {
             self.int13_fail(INT13_STATUS_INVALID);
             return;
         }
-        self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_cf(false);
+        self.int13_ok();
     }
 
     /// Fixed 16/63 geometry derived from the attached IDE image size.
@@ -962,6 +980,7 @@ impl Machine {
         // Packet access (AH=42h) + EDD params (AH=48h). Removable locking out.
         self.cpu.set_gpr_u16(CpuState::RCX, INT13_EXT_CX_SUPPORTED);
         self.cpu.set_cf(false);
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
     }
 
     fn int13_cd_ext_read_from_regs(&mut self) {
@@ -969,11 +988,14 @@ impl Machine {
         let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
         match self.int13_parse_dap(dap_phys) {
             Ok(dap) => match self.int13_cd_read_lba_to_phys(dap.lba, dap.count, dap.buf) {
-                Ok(_) => {
-                    self.cpu.set_ah(INT13_STATUS_OK);
-                    self.cpu.set_cf(false);
+                Ok(n) => {
+                    let _ = self.int13_dap_set_count(dap_phys, n);
+                    self.int13_ok();
                 }
-                Err(status) => self.int13_fail(status),
+                Err(status) => {
+                    let _ = self.int13_dap_set_count(dap_phys, 0);
+                    self.int13_fail(status);
+                }
             },
             Err(status) => self.int13_fail(status),
         }
@@ -1014,8 +1036,7 @@ impl Machine {
             self.int13_fail(INT13_STATUS_INVALID);
             return;
         }
-        self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_cf(false);
+        self.int13_ok();
     }
 
     /// Spec: El Torito 1.0 §6.1 / RBIL INT 13h AH=4Ah — initiate disk emulation.
@@ -1049,8 +1070,7 @@ impl Machine {
             return;
         }
         // Terminate (AL=00h): no emulation state to clear for no-emul CD.
-        self.cpu.set_ah(INT13_STATUS_OK);
-        self.cpu.set_cf(false);
+        self.int13_ok();
     }
 
     /// Fill the 19-byte El Torito specification packet at `DS:SI`.
@@ -1298,6 +1318,8 @@ impl Machine {
             self.int13_fail(INT13_STATUS_TIMEOUT);
             return;
         }
+        // Mirror BDA before AH=08h overwrites DL with drive count.
+        self.int13_mirror_bda_status(INT13_STATUS_OK);
         self.cpu.set_gpr_u16(
             CpuState::RCX,
             pack_cx(u16::from(INT13_FLOPPY_MAX_CYLINDER), INT13_FLOPPY_SPT),
@@ -1592,6 +1614,64 @@ mod tests {
         m.service_int13_hd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_TIMEOUT);
+    }
+
+    /// Spec: RBIL BDA + INT 13h — boundary errors set CF/AH and mirror BDA status.
+    #[test]
+    fn int13_boundary_errors_mirror_bda_status() {
+        // HD: sector-not-found → AH=04h, BDA 0040:0074.
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        m.mem.write_u8(BDA_HD_STATUS, 0x00).unwrap();
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 8, 0x0000, 0x7C00);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.cpu.al(), 0);
+        assert_eq!(
+            m.mem.read_u8(BDA_HD_STATUS).unwrap(),
+            INT13_STATUS_SECTOR_NOT_FOUND
+        );
+
+        // HD success clears BDA status.
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(BDA_HD_STATUS).unwrap(), INT13_STATUS_OK);
+
+        // Floppy: no media → AH=80h, BDA 0040:0041.
+        let mut bare = Machine::new(64 * 1024);
+        bare.mem.write_u8(BDA_FLOPPY_STATUS, 0x00).unwrap();
+        setup_int13_floppy_read(&mut bare.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        bare.service_int13_floppy();
+        assert!(cf(&bare.cpu));
+        assert_eq!(bare.cpu.ah(), INT13_STATUS_TIMEOUT);
+        assert_eq!(
+            bare.mem.read_u8(BDA_FLOPPY_STATUS).unwrap(),
+            INT13_STATUS_TIMEOUT
+        );
+
+        // Invalid drive on HD service → AH=01h.
+        setup_int13_hd_read(&mut m.cpu, 0, 0, 1, 1, 0x0000, 0x7C00);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, 0x81);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+        assert_eq!(m.mem.read_u8(BDA_HD_STATUS).unwrap(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: AH=42h past-end mirrors HD BDA status `04h`.
+    #[test]
+    fn int13_ah42_past_end_mirrors_bda() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        m.mem.write_u8(BDA_HD_STATUS, 0x00).unwrap();
+        setup_int13_hd_ext_read(&mut m, 0x5500, 3, 2, 0x0000, 0x8000);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(
+            m.mem.read_u8(BDA_HD_STATUS).unwrap(),
+            INT13_STATUS_SECTOR_NOT_FOUND
+        );
     }
 
     /// Spec: IBM BIOS / RBIL INT 13h AH=04h — verify in-range CHS without touching RAM.
