@@ -13,6 +13,7 @@ mod bda_timer;
 mod boot_media;
 mod cmos_equipment;
 mod eltorito_load;
+mod fat12;
 mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
@@ -53,16 +54,25 @@ pub use boot_media::{
     synthetic_int19_bootable_hd, synthetic_int19_freedos_stub_hd, Int19BootMediaClass,
     MBR_PART0_OFF, MBR_PART_BOOTABLE, MBR_PART_TYPE_FAT12,
 };
+pub use fat12::{
+    find_freedos_names_in_root, locate_freedos_kernel_on_image, locate_freedos_kernel_on_machine,
+    parse_fat12_bpb, synthetic_int19_freedos_fat12_hd, Fat12Bpb, Fat12DirEntry, Fat12KernelLocate,
+    FAT12_NAME_COMMAND_COM, FAT12_NAME_KERNEL_SYS, FAT_ATTR_LFN, FAT_ATTR_VOLUME, FAT_DIRENT_SIZE,
+    FAT_NAME83_LEN,
+};
 pub use guest_boot::{
-    classify_bzimage_early, classify_bzimage_setup_deeper, classify_eltorito_media_boot,
-    classify_freedos_next_gap, classify_freedos_next_gap_with_handoff,
-    classify_guest_first_failure, classify_linux_media_boot, inspect_linux_boot_protocol_header,
-    linux_realmode_bytes, linux_setup_sect_count, synthetic_eltorito_linux_hlt_iso,
-    synthetic_freedos_like_disk, synthetic_linux_boot_protocol_header,
+    classify_bzimage_early, classify_bzimage_setup_deeper, classify_eltorito_boot_payload,
+    classify_eltorito_media_boot, classify_freedos_next_gap,
+    classify_freedos_next_gap_with_handoff, classify_guest_first_failure,
+    classify_linux_media_boot, classify_linux_next_gap, inspect_linux_boot_protocol_header,
+    linux_realmode_bytes, linux_setup_sect_count, synthetic_eltorito_bzimage_iso,
+    synthetic_eltorito_linux_hlt_iso, synthetic_freedos_like_disk,
+    synthetic_linux_boot_protocol_header, synthetic_linux_bzimage_setup_hlt,
     synthetic_linux_serial_stub_disk, BzImageEarlyClass, BzImageLoadError, BzImageNextStep,
-    ElToritoMediaBootClass, FreedosHandoff, FreedosNextGap, GuestBootCheckpoint, GuestBootMeasure,
-    GuestBootMedia, GuestFailureSite, GuestFirstFailureClass, GuestOsMeasure, GuestOsMeasureKind,
-    Int13ProbeSnapshot, LinuxBootProtocolError, LinuxBootProtocolHeader, LinuxMediaBootClass,
+    ElToritoMediaBootClass, ElToritoPayloadClass, FreedosHandoff, FreedosNextGap,
+    GuestBootCheckpoint, GuestBootMeasure, GuestBootMedia, GuestFailureSite,
+    GuestFirstFailureClass, GuestOsMeasure, GuestOsMeasureKind, Int13ProbeSnapshot,
+    LinuxBootProtocolError, LinuxBootProtocolHeader, LinuxMediaBootClass, LinuxNextGap,
     MediaBootReadiness, BDA_EQUIPMENT, BDA_HD_COUNT, GUEST_BOOT_MEASURE_VERSION,
     GUEST_OS_MEASURE_VERSION, LINUX_BOOT_FLAG_AA55, LINUX_BOOT_HEADER_MAGIC,
     LINUX_BOOT_HEADER_MIN_LEN, LINUX_REALMODE_LOAD_ADDR,
@@ -120,8 +130,8 @@ pub use int16::{
     INT16_AH_SHIFT_STATUS, INT16_BUFFER_CAP,
 };
 pub use mbr::{
-    find_active_partition, ActivePartition, MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI,
-    MBR_SIGNATURE_LO,
+    find_active_partition, ActivePartition, Int19HandoffMedia, MBR_PHYS_ADDR, MBR_SECTOR_SIZE,
+    MBR_SIGNATURE_HI, MBR_SIGNATURE_LO,
 };
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
@@ -148,8 +158,11 @@ pub use post_spin::{
 };
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
 pub use post_with_media::{
-    classify_post_with_media_stop, PostWithMediaClass, PostWithMediaReport,
-    NO_MEDIA_REBOOT_CLASS_CS, NO_MEDIA_REBOOT_CLASS_IP, POST_WITH_MEDIA_BUDGET_STEPS,
+    classify_post_media_activity, classify_post_media_reboot, classify_post_with_media_stop,
+    post_report_idle_pct, Int19HandoffReport, PostMediaActivity, PostMediaRebootSignal,
+    PostWithMediaClass, PostWithMediaReport, NO_MEDIA_REBOOT_CLASS_CS, NO_MEDIA_REBOOT_CLASS_IP,
+    POST_MEDIA_IDLE_DOMINANT_PCT, POST_WITH_MEDIA_BUDGET_STEPS, WAIT_IRQ_CLASS_CS,
+    WAIT_IRQ_CLASS_IP,
 };
 pub use step_clock::{
     StepClock, StepTicks, ACPI_PM_CLOCKS_PER_PIT_CLOCK, ACPI_PM_TMR_MASK, CMOS_PERIODIC_HZ,
