@@ -33,10 +33,11 @@ space/Enter); other makes store ASCII `0`.
 ## Unsupported
 
 - **No guest INT 09h BIOS body** — host helper only; IVT[9] unchanged.
-- No shift/ctrl/alt state byte (`40:17`) tracking.
-- No typematic / E0 extended-key composition into the ring.
+- No typematic / full E0 extended-key composition into the ring (R14 tracks
+  E0 for right Ctrl/Alt flags only — `docs/kbd-r14-8042-irq1-polish.md`).
 - Host `int16_buf` and BDA remain distinct stores; INT 16h only falls back
   when the host buffer is empty.
+- Shift/ctrl/alt/`40:17` tracking deepened in R14 (was absent here).
 
 ## Tests
 

@@ -35,8 +35,13 @@ mod vga_frame;
 mod xbcs;
 
 pub use bda_kbd::{
-    BDA_KBD_BUF_END_OFF, BDA_KBD_BUF_START, BDA_KBD_BUF_START_OFF, BDA_KBD_CAPACITY, BDA_KBD_HEAD,
-    BDA_KBD_TAIL, BDA_PHYS_BASE,
+    BDA_KBD_BUF_END_OFF, BDA_KBD_BUF_START, BDA_KBD_BUF_START_OFF, BDA_KBD_CAPACITY, BDA_KBD_FLAG1,
+    BDA_KBD_FLAG2, BDA_KBD_HEAD, BDA_KBD_LEDS, BDA_KBD_MODE, BDA_KBD_TAIL, BDA_PHYS_BASE,
+    KBD_FLAG1_ALT, KBD_FLAG1_CAPS_LOCK, KBD_FLAG1_CTRL, KBD_FLAG1_INSERT, KBD_FLAG1_LEFT_SHIFT,
+    KBD_FLAG1_NUM_LOCK, KBD_FLAG1_RIGHT_SHIFT, KBD_FLAG1_SCROLL_LOCK, KBD_FLAG2_CAPS_DOWN,
+    KBD_FLAG2_INSERT_DOWN, KBD_FLAG2_LEFT_ALT, KBD_FLAG2_LEFT_CTRL, KBD_FLAG2_NUM_DOWN,
+    KBD_FLAG2_PAUSE, KBD_FLAG2_SCROLL_DOWN, KBD_FLAG2_SYSREQ, KBD_LED_CAPS, KBD_LED_NUM,
+    KBD_LED_SCROLL, KBD_MODE_ENHANCED, KBD_MODE_LAST_E0, KBD_MODE_RIGHT_ALT, KBD_MODE_RIGHT_CTRL,
 };
 pub use boot_media::{
     classify_int19_boot_image, classify_machine_int19_media, synthetic_int19_bootable_floppy,
@@ -98,7 +103,10 @@ pub use int15_apm::{
     APM_AL_INSTALLATION_CHECK, APM_ERR_INTERFACE_CONNECTED, APM_ERR_INTERFACE_NOT_CONNECTED,
     APM_ERR_UNSUPPORTED, APM_VERSION_MAJOR, APM_VERSION_MINOR, INT15_AH_APM, INT15_VECTOR,
 };
-pub use int16::{Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_GET_KEYSTROKE, INT16_BUFFER_CAP};
+pub use int16::{
+    Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_EXTENDED_SHIFT_STATUS, INT16_AH_GET_KEYSTROKE,
+    INT16_AH_SHIFT_STATUS, INT16_BUFFER_CAP,
+};
 pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
@@ -1161,6 +1169,13 @@ impl Machine {
     /// Drive PIC IRQ1 from the current 8042 IRQ1 line (level follow).
     pub fn sync_kbd_irq1(&mut self) {
         self.pic.set_irq_line(1, self.kbd.irq1_line());
+    }
+
+    /// Host-side keyboard LED mask mirror (no `0xED` ACK stream).
+    ///
+    /// Spec: OSDev PS/2 Keyboard Set LEDs. Used by IRQ1→BDA lock toggles.
+    pub fn kbd_set_leds_host(&mut self, mask: u8) {
+        self.kbd.set_kbd_leds_host(mask);
     }
 
     /// Inject an auxiliary (second PS/2 port) byte and sync AUX OBF∧INT12 → IRQ12.

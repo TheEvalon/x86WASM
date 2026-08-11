@@ -26,10 +26,11 @@ AH=00/01 stub.
 
 ## Unsupported
 
-- No guest IVT INT 16h body / IRQ1 → BDA `40:1E` ring.
-- No AH=02+ (shift status, services beyond get/check).
+- No guest IVT INT 16h body / IRQ1 → BDA `40:1E` ring (see R11).
 - No typematic autorepeat into the INT 16h buffer.
 - Empty AH=00 does not spin — harness must push first.
+- AH=02h/12h shift status added in R14 (`docs/kbd-r14-int16-shift-status.md`,
+  `docs/kbd-r14-int16-ext-shift.md`).
 
 ## Tests
 

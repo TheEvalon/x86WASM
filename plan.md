@@ -1322,7 +1322,10 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-11, round-14 platform-kbd lane `slice/r14-platform-kbd` on base `9934398`): **in progress -- R14 platform-kbd lane.** Host INT 16h AH=02h shift flags from BDA `40:17`; AH=12h extended shift (Table 00588 synth from `40:18`+`40:96`); BDA equipment/keyboard flag seed for FreeDOS (bit0=floppy honesty, bit2=keyboard); 8042/IRQ1 modifier→BDA flags + ring-full drain + LED mirror. See `docs/kbd-r14-int16-shift-status.md`, `docs/kbd-r14-int16-ext-shift.md`, `docs/platform-r14-bda-equipment-kbd.md`, `docs/kbd-r14-8042-irq1-polish.md`. **Not** guest INT 09h/16h body; no buffer-full beep; no full AT keyboard; no mouse.
+
 Status (2026-08-11, round-14 usb-timer lane `slice/r14-usb-timer` on base `9934398`): **in progress -- R14 usb-timer lane.** UHCI→PIRQD→classic ISA IRQ11 PIC wire; IOC/USBSTS path raises wired IRQ; LAPIC SVR Focus presence + EOI-suppress drop (no CPUID.APIC); HPET LEG_RT_CAP/CNF clear so IRQ0/IRQ8 stay PIT/CMOS (MSI still out). See `docs/usb-r14-*.md`, `docs/apic-r14-lapic-svr.md`, `docs/timer-r14-hpet-legacy.md`.
+
 Status (2026-08-10, round-13 boot-guest lane `slice/r13-boot-guest` on base `f579e8c`): **in progress -- R13 boot-guest lane.** INT19-candidate HD/floppy attach helpers; FreeDOS measure v6 media readiness (beyond no-media reboot loop); INT 13h AH=00h HD+floppy deepen (IDE/FDC reset + BDA status); Linux bzImage setup deepen (`cmd_line_ptr`/`init_size`) + El Torito media boot classify. See `docs/boot-r13-*.md`, `docs/storage-r13-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS.
 
 Status (2026-08-10, round-13 platform-io lane `slice/r13-platform-io` on base `f579e8c`): **in progress -- R13 platform-io lane.** LPT1 control idle default `0x0C` deepen; LPT2 independence + LPT3 `0x3BC` open-bus honesty; COM3/COM4 `0x3E8`/`0x2E8` 16550 probe stubs (IER sites claimed; no shared IRQ); CMOS `0Fh` `set_shutdown_status` + Machine helpers survive CF9 pulse-reset without dispatch. See `docs/lpt-r13-*.md`, `docs/platform-r13-*.md`. **Not** IRQ7/ECP; COM3/4 IRQ share; Machine soft-reset JMP via `40:67`.
