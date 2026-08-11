@@ -1135,6 +1135,10 @@ impl Machine {
         if sector > FDC_1440_SECTORS_PER_TRACK || cylinder >= FDC_1440_CYLINDERS {
             return Err(INT13_STATUS_SECTOR_NOT_FOUND);
         }
+        // Spec: IBM BIOS / RBIL INT 13h AH=02h/03h/04h — multi-sector transfers
+        // advance sector→head→cylinder. Preflight the full CHS chain so a
+        // past-end request fails atomically (no partial guest buffer fill).
+        floppy_chs_range_ok(cylinder, head, sector, count)?;
         let mut phys = match mode {
             FloppyXfer::Read { dest } => dest,
             FloppyXfer::Write { src } => src,
@@ -1330,6 +1334,27 @@ fn advance_floppy_chs(cylinder: u8, head: u8, sector: u8) -> Option<(u8, u8, u8)
         }
     }
     Some((cylinder, head, sector))
+}
+
+/// Preflight a floppy multi-sector CHS walk (sector→head→cylinder).
+///
+/// Spec: IBM BIOS / RBIL INT 13h AH=02h — `AL` sectors must all exist before
+/// any transfer; past last sector of media → [`INT13_STATUS_SECTOR_NOT_FOUND`].
+fn floppy_chs_range_ok(cylinder: u8, head: u8, sector: u8, count: u8) -> Result<(), u8> {
+    let mut cylinder = cylinder;
+    let mut head = head;
+    let mut sector = sector;
+    for i in 0..count {
+        if i + 1 < count {
+            let Some((c, h, s)) = advance_floppy_chs(cylinder, head, sector) else {
+                return Err(INT13_STATUS_SECTOR_NOT_FOUND);
+            };
+            cylinder = c;
+            head = h;
+            sector = s;
+        }
+    }
+    Ok(())
 }
 
 /// Convenience: set up INT 13h AH=02h registers for a floppy read.
@@ -2100,6 +2125,141 @@ mod tests {
                 .unwrap(),
             0x2B
         );
+    }
+
+    /// Spec: AH=02h HD multi-sector may cross track via consecutive LBA
+    /// (start at SPT, count=2 → next head).
+    #[test]
+    fn int13_ah02_hd_multi_sector_crosses_track() {
+        // Need at least one full track + 1 sector (16 heads * 63 SPT is overkill;
+        // one head worth of SPT + 1 is enough for cyl0/head0/sec63 → head1/sec1).
+        let sectors = usize::from(INT13_HD_SPT) + 2;
+        let mut img = synthetic_disk(sectors);
+        let lba_spt = (usize::from(INT13_HD_SPT) - 1) * INT13_SECTOR_SIZE; // sector 63 → LBA 62
+        let lba_next = usize::from(INT13_HD_SPT) * INT13_SECTOR_SIZE; // head1 sec1 → LBA 63
+        img[lba_spt] = 0x63;
+        img[lba_next] = 0x64;
+        let mut m = Machine::with_ide(64 * 1024, img);
+        setup_int13_hd_read(
+            &mut m.cpu,
+            0,
+            0,
+            INT13_HD_SPT as u8,
+            2,
+            0x0000,
+            0x8000,
+        );
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu), "track-crossing multi-sector must succeed");
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0x63);
+        assert_eq!(
+            m.mem.read_u8(0x8000 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0x64
+        );
+    }
+
+    /// Spec: AH=02h HD multi-sector may cross cylinder (last head SPT → next cyl).
+    #[test]
+    fn int13_ah02_hd_multi_sector_crosses_cylinder() {
+        let spc = usize::from(INT13_HD_HEADS) * usize::from(INT13_HD_SPT);
+        let mut img = synthetic_disk(spc + 2);
+        let last_on_cyl0 = (spc - 1) * INT13_SECTOR_SIZE;
+        let first_on_cyl1 = spc * INT13_SECTOR_SIZE;
+        img[last_on_cyl0] = 0xC0;
+        img[first_on_cyl1] = 0xC1;
+        let mut m = Machine::with_ide(128 * 1024, img);
+        let last_head = (INT13_HD_HEADS - 1) as u8;
+        setup_int13_hd_read(
+            &mut m.cpu,
+            0,
+            last_head,
+            INT13_HD_SPT as u8,
+            2,
+            0x0000,
+            0x9000,
+        );
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x9000).unwrap(), 0xC0);
+        assert_eq!(
+            m.mem.read_u8(0x9000 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0xC1
+        );
+    }
+
+    /// Spec: floppy AH=02h multi-sector crosses head at SPT boundary.
+    #[test]
+    fn int13_floppy_ah02_multi_sector_crosses_head() {
+        let mut img = synthetic_floppy_boot();
+        // CHS (0,0,18) and (0,1,1).
+        let off_h0_s18 = 17 * INT13_SECTOR_SIZE;
+        let off_h1_s1 = 18 * INT13_SECTOR_SIZE;
+        img[off_h0_s18] = 0x18;
+        img[off_h1_s1] = 0x19;
+        let mut m = Machine::with_floppy(64 * 1024, img).expect("floppy");
+        setup_int13_floppy_read(&mut m.cpu, 0, 0, INT13_FLOPPY_SPT, 2, 0x0000, 0x8000);
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu), "floppy head-crossing multi-sector");
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0x18);
+        assert_eq!(
+            m.mem.read_u8(0x8000 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0x19
+        );
+    }
+
+    /// Spec: floppy AH=02h multi-sector crosses cylinder at last head SPT.
+    #[test]
+    fn int13_floppy_ah02_multi_sector_crosses_cylinder() {
+        let mut img = synthetic_floppy_boot();
+        // Last sector cyl0 = (0,1,18); first of cyl1 = (1,0,1).
+        let off_c0 = (1 * 18 + 17) * INT13_SECTOR_SIZE;
+        let off_c1 = (2 * 18) * INT13_SECTOR_SIZE;
+        img[off_c0] = 0xA0;
+        img[off_c1] = 0xA1;
+        let mut m = Machine::with_floppy(64 * 1024, img).expect("floppy");
+        setup_int13_floppy_read(
+            &mut m.cpu,
+            0,
+            INT13_FLOPPY_MAX_HEAD,
+            INT13_FLOPPY_SPT,
+            2,
+            0x0000,
+            0x8800,
+        );
+        m.service_int13_floppy();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.al(), 2);
+        assert_eq!(m.mem.read_u8(0x8800).unwrap(), 0xA0);
+        assert_eq!(
+            m.mem.read_u8(0x8800 + INT13_SECTOR_SIZE as u64).unwrap(),
+            0xA1
+        );
+    }
+
+    /// Spec: floppy AH=02h past last media sector → AH=04h, no partial fill.
+    #[test]
+    fn int13_floppy_ah02_past_media_end_atomic_fail() {
+        let mut m = Machine::with_floppy(64 * 1024, synthetic_floppy_boot()).expect("floppy");
+        // Poison destination; past-end must not write the first sector.
+        m.mem.write_u8(0x8000, 0xEE).unwrap();
+        setup_int13_floppy_read(
+            &mut m.cpu,
+            INT13_FLOPPY_MAX_CYLINDER,
+            INT13_FLOPPY_MAX_HEAD,
+            INT13_FLOPPY_SPT,
+            2,
+            0x0000,
+            0x8000,
+        );
+        m.service_int13_floppy();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.cpu.al(), 0);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xEE);
     }
 
     /// Spec: IBM BIOS / RBIL INT 13h AH=04h floppy — verify without buffer write.
