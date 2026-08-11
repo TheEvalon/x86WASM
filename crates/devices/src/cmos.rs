@@ -1424,16 +1424,9 @@ impl PortDevice for CmosRtc {
                 self.index = v & INDEX_MASK;
             }
             CMOS_DATA => {
-                let idx = self.selected_index();
-                // Status C is read-only on real RTC; ignore writes.
-                if idx == REG_STATUS_C {
-                    return;
-                }
-                let current = self.ram[idx as usize];
-                self.ram[idx as usize] = Self::mask_status_a_write(idx, v, current);
-                if idx == REG_STATUS_B {
-                    self.recompute_irqf();
-                }
+                // Route through `write_reg` so Status B gets 24/12 conversion +
+                // IRQF recompute (PIE/AIE/UIE) the same as host `write_reg` calls.
+                self.write_reg(self.selected_index(), v);
             }
             _ => {}
         }
@@ -2222,6 +2215,43 @@ mod tests {
         c.write_reg(REG_STATUS_B, DEFAULT_STATUS_B | STB_PIE);
         assert!(!c.tick(1));
         assert_eq!(c.read_reg(REG_STATUS_C) & STC_PF, 0);
+    }
+
+    /// Spec: MC146818 — enabling PIE while PF is already latched asserts IRQF
+    /// immediately (Status B write recomputes IRQF). Guest port `0x71` path must
+    /// match `write_reg` (SeaBIOS interrupt-enable / `clock_poll_irq`).
+    #[test]
+    fn port_write_pie_with_latched_pf_asserts_irq() {
+        let mut c = CmosRtc::new();
+        assert!(!c.tick(1));
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_PF, 0);
+        assert!(!c.irq_line());
+        c.port_write(CMOS_INDEX, 1, u32::from(REG_STATUS_B));
+        c.port_write(CMOS_DATA, 1, u32::from(DEFAULT_STATUS_B | STB_PIE));
+        assert!(
+            c.irq_line(),
+            "PIE∧PF must raise IRQ pin without another tick"
+        );
+        assert_ne!(c.read_reg(REG_STATUS_C) & STC_IRQF, 0);
+    }
+
+    /// Spec: MC146818 — clearing PIE while PF remains clears IRQF / IRQ pin.
+    #[test]
+    fn port_write_clear_pie_deasserts_irqf() {
+        let mut c = CmosRtc::new();
+        c.port_write(CMOS_INDEX, 1, u32::from(REG_STATUS_B));
+        c.port_write(CMOS_DATA, 1, u32::from(DEFAULT_STATUS_B | STB_PIE));
+        assert!(c.tick(1));
+        assert!(c.irq_line());
+        c.port_write(CMOS_INDEX, 1, u32::from(REG_STATUS_B));
+        c.port_write(CMOS_DATA, 1, u32::from(DEFAULT_STATUS_B)); // PIE clear
+        assert!(!c.irq_line());
+        assert_eq!(c.read_reg(REG_STATUS_C) & STC_IRQF, 0);
+        assert_ne!(
+            c.read_reg(REG_STATUS_C) & STC_PF,
+            0,
+            "PF stays until Status C read"
+        );
     }
 
     #[test]

@@ -1801,7 +1801,15 @@ impl MachineBus<'_> {
             PORT_SYSTEM_CONTROL_A => self.port92.port_read(port, size),
             // Spec: Intel APM_CNT/APM_STS fixed I/O at 0xB2/0xB3 (PIIX/PCH).
             APM_CNT_PORT | APM_STS_PORT => self.apm.port_read(port, size),
-            CMOS_INDEX | CMOS_DATA => self.cmos.port_read(port, size),
+            CMOS_INDEX => self.cmos.port_read(port, size),
+            CMOS_DATA => {
+                let value = self.cmos.port_read(port, size);
+                // Spec: MC146818 Status C read-to-clear deasserts IRQ; Status B
+                // PIE/AIE/UIE writes recompute IRQF — keep PIC IR8 following the pin
+                // so edge IRQ8 can rise/fall without waiting for the next poll.
+                self.pic.set_irq_line(8, self.cmos.irq_line());
+                value
+            }
             I8042_DATA | I8042_STATUS_CMD => self.kbd.port_read(port, size),
             0x2E8..0x2F0 => self.com4.port_read(port, size),
             0x2F8..0x300 => self.com2.port_read(port, size),
@@ -1928,7 +1936,12 @@ impl MachineBus<'_> {
             // Spec: Intel APM_CNT/APM_STS — command write stub-completes SMI
             // handshake (clears status); no architectural SMM entry.
             APM_CNT_PORT | APM_STS_PORT => self.apm.port_write(port, size, value),
-            CMOS_INDEX | CMOS_DATA => self.cmos.port_write(port, size, value),
+            CMOS_INDEX => self.cmos.port_write(port, size, value),
+            CMOS_DATA => {
+                self.cmos.port_write(port, size, value);
+                // Spec: MC146818 Status B PIE/AIE/UIE → IRQF; follow onto ISA IRQ8.
+                self.pic.set_irq_line(8, self.cmos.irq_line());
+            }
             I8042_DATA | I8042_STATUS_CMD => {
                 self.kbd.port_write(port, size, value);
                 // Spec: IBM PC AT 8042 output port bit1 → A20 gate on phys mem;
@@ -2859,6 +2872,63 @@ mod tests {
         {
             let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), None);
+        }
+    }
+
+    /// Spec: MC146818 — guest enables PIE with PF already latched via `0x70`/`0x71`;
+    /// MachineBus must follow IRQF onto PIC IR8 so the next poll delivers IRQ8
+    /// without another RTC quantum (SeaBIOS interrupt-enable / wait paths).
+    #[test]
+    fn cmos_port_enable_pie_with_pf_delivers_irq8() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq8(&mut m);
+        m.tick_cmos(1); // PF latched, PIE off → no IRQ
+        assert!(!m.cmos.irq_line());
+        {
+            let mut bus = m.bus_mut();
+            bus.port_out_u8(CMOS_INDEX, REG_STATUS_B).unwrap();
+            // Status B: 24h + PIE (same encoding as DEFAULT_STATUS_B | STB_PIE).
+            bus.port_out_u8(CMOS_DATA, 0x02 | STB_PIE).unwrap();
+            assert!(bus.cmos.irq_line());
+            // IR8 should already be edged from the Status B write sync.
+            assert_eq!(bus.poll_external_irq(), Some(0x70));
+            bus.port_out_u8(CMOS_INDEX, REG_STATUS_C).unwrap();
+            let _ = bus.port_in_u8(CMOS_DATA).unwrap();
+            assert!(!bus.cmos.irq_line());
+            bus.port_out_u8(PIC_SLAVE_CMD, 0x20).unwrap();
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        assert_eq!(m.pic.slave.isr, 0);
+        assert_eq!(m.pic.master.isr, 0);
+    }
+
+    /// Spec: Status C read-to-clear via MachineBus drops the CMOS IRQ pin; after
+    /// EOI a later period can rising-edge IRQ8 again (edge-reserved IRQ8).
+    #[test]
+    fn cmos_status_c_read_then_tick_redelivers_irq8() {
+        let mut m = Machine::new(64 * 1024);
+        init_at_pic_unmask_irq8(&mut m);
+        m.cmos.port_write(CMOS_INDEX, 1, u32::from(REG_STATUS_B));
+        m.cmos.port_write(CMOS_DATA, 1, u32::from(0x02 | STB_PIE));
+        m.tick_cmos(1);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(bus.poll_external_irq(), Some(0x70));
+            bus.port_out_u8(CMOS_INDEX, REG_STATUS_C).unwrap();
+            let stc = bus.port_in_u8(CMOS_DATA).unwrap();
+            assert_ne!(stc & STC_IRQF, 0);
+            assert!(!bus.cmos.irq_line());
+            bus.port_out_u8(PIC_SLAVE_CMD, 0x20).unwrap();
+            bus.port_out_u8(PIC_MASTER_CMD, 0x20).unwrap();
+        }
+        m.tick_cmos(1);
+        {
+            let mut bus = m.bus_mut();
+            assert_eq!(
+                bus.poll_external_irq(),
+                Some(0x70),
+                "Status C clear + pin low must allow a new IRQ8 edge"
+            );
         }
     }
 
