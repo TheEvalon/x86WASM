@@ -1322,7 +1322,7 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
-Status (2026-08-11, round-15 storage-int13 lane `slice/r15-storage-int13` on base `f7f7a60`): **in progress -- R15 storage-int13 lane.** Host INT 13h deepen for SeaBIOS/FreeDOS media reads: AH=02h multi-sector CHS edge cases; AH=42h DAP count writeback + end-of-media honesty; CF/AH + BDA status polish on boundary errors; CD El Torito follow. See `docs/storage-r15-*.md`. **Not** guest IVT BIOS body; not FreeDOS prompt.
+Status (2026-08-11, round-15 storage-int13 lane `slice/r15-storage-int13` on base `f7f7a60`): **complete -- R15 storage-int13 lane.** Host INT 13h deepen: AH=02h multi-sector CHS edges (HD+floppy); AH=42h DAP count writeback + end-of-media honesty; CF/AH + BDA status polish; CD AH=42h El Torito catalog/boot multi-block reads. See `docs/storage-r15-*.md`. **Not** guest IVT BIOS body; not FreeDOS prompt / CD boot exit.
 
 Status (2026-08-11, round-14 parallel integration `merge/m2-r14-parallel-16` on base `9934398`): **in progress -- fourteenth parallel campaign merged.** Four lanes: UHCI→IRQ11 PIC + LAPIC SVR + HPET legacy honesty; INT16 AH=02/12 + BDA equipment/8042 IRQ1; INT10 scroll/read + VBE 4F02 no-LFB; POST-with-media (past `F000:9842` → `F000:C897`) + MBR→VBR + FreeDOS v7 + Linux/El Torito. See `docs/m2-r14-parallel-integration.md`. **FreeDOS prompt / Linux serial shell still open.** Honesty: no guest LFB; no CPUID.APIC; ADR-0008 table-loader absent.
 

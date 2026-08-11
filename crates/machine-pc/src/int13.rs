@@ -2633,6 +2633,10 @@ mod tests {
         let mut boot = vec![0x90u8; EL_TORITO_SECTOR_BYTES];
         boot[0] = 0xF4;
         write_iso_sector(&mut img, 24, &boot);
+        // Second Mode-1 block after the boot image (multi-sector AH=42 tests).
+        let mut boot2 = vec![0x11u8; EL_TORITO_SECTOR_BYTES];
+        boot2[0] = 0xB0;
+        write_iso_sector(&mut img, 25, &boot2);
         img
     }
 
@@ -2747,6 +2751,95 @@ mod tests {
         m.service_int13_cd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+    }
+
+    /// Spec: AH=42h CD multi-block Mode-1 read + DAP count rewrite.
+    #[test]
+    fn int13_cd_ah42_multi_block_reads_boot_tail() {
+        let mut m = Machine::new(128 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        setup_int13_cd_ext_read(&mut m, 0x4000, 24, 2, 0x0000, 0x8000);
+        m.service_int13_cd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xF4);
+        assert_eq!(
+            m.mem
+                .read_u8(0x8000 + INT13_CD_SECTOR_SIZE as u64)
+                .unwrap(),
+            0xB0
+        );
+        assert_eq!(m.read_guest_u16(0x4002).unwrap(), 2);
+    }
+
+    /// Spec: El Torito catalog readable via CD AH=42h (Mode-1 LBA).
+    #[test]
+    fn int13_cd_ah42_reads_eltorito_catalog() {
+        use firmware_interface::{EL_TORITO_BOOTABLE, EL_TORITO_KEY_55, EL_TORITO_KEY_AA};
+        let mut m = Machine::new(128 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        // Catalog LBA 20 from synthetic_eltorito_iso.
+        setup_int13_cd_ext_read(&mut m, 0x4100, 20, 1, 0x0000, 0x9000);
+        m.service_int13();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.mem.read_u8(0x9000 + 30).unwrap(), EL_TORITO_KEY_55);
+        assert_eq!(m.mem.read_u8(0x9000 + 31).unwrap(), EL_TORITO_KEY_AA);
+        assert_eq!(m.mem.read_u8(0x9000 + 32).unwrap(), EL_TORITO_BOOTABLE);
+        // Initial/Default load RBA = 24.
+        let rba = u32::from(m.mem.read_u8(0x9000 + 40).unwrap())
+            | (u32::from(m.mem.read_u8(0x9000 + 41).unwrap()) << 8)
+            | (u32::from(m.mem.read_u8(0x9000 + 42).unwrap()) << 16)
+            | (u32::from(m.mem.read_u8(0x9000 + 43).unwrap()) << 24);
+        assert_eq!(rba, 24);
+    }
+
+    /// Spec: CD AH=42h at El Torito load_rba matches host load_eltorito bytes.
+    #[test]
+    fn int13_cd_ah42_boot_lba_matches_eltorito_load() {
+        let iso = synthetic_eltorito_iso();
+        let mut via_int13 = Machine::new(128 * 1024);
+        via_int13.attach_atapi_cdrom_image(iso.clone());
+        let info = via_int13.inspect_atapi_el_torito().expect("catalog");
+        assert!(info.bootable);
+        setup_int13_cd_ext_read(
+            &mut via_int13,
+            0x4200,
+            u64::from(info.load_rba),
+            1,
+            0x0000,
+            0xA000,
+        );
+        via_int13.service_int13_cd();
+        assert!(!cf(&via_int13.cpu));
+
+        let mut via_load = Machine::new(128 * 1024);
+        via_load.attach_atapi_cdrom_image(iso);
+        via_load.load_eltorito_to_7c00().expect("load");
+        // El Torito sector_count=4 → 2048 bytes = one Mode-1 block.
+        for i in 0..INT13_CD_SECTOR_SIZE {
+            assert_eq!(
+                via_int13.mem.read_u8(0xA000 + i as u64).unwrap(),
+                via_load.mem.read_u8(0x7C00 + i as u64).unwrap(),
+                "mismatch at offset {i}"
+            );
+        }
+    }
+
+    /// Spec: CD AH=42h past medium end → AH=04h and DAP count 0.
+    #[test]
+    fn int13_cd_ah42_past_end_clears_dap_count() {
+        let mut m = Machine::new(128 * 1024);
+        m.attach_atapi_cdrom_image(synthetic_eltorito_iso());
+        let blocks = 32u16; // synthetic ISO is 32 Mode-1 sectors
+        setup_int13_cd_ext_read(&mut m, 0x4300, u64::from(blocks - 1), 2, 0x0000, 0x8000);
+        m.service_int13_cd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.read_guest_u16(0x4302).unwrap(), 0);
+        assert_eq!(
+            m.mem.read_u8(BDA_HD_STATUS).unwrap(),
+            INT13_STATUS_SECTOR_NOT_FOUND
+        );
     }
 
     /// Spec: Phoenix EDD AH=48h on CD — total blocks + sector size 2048.
