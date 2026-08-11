@@ -1,4 +1,4 @@
-ï»¿# UHCI IOC / USBSTS deepen â€” Milestone 2 Round 14
+# UHCI IOC / USBSTS deepen — Milestone 2 Round 14
 
 ## Why
 
@@ -6,15 +6,15 @@ R12 modeled USBSTS R/WC and USBINTR gating (`docs/uhci-r12-usbsts-usbintr.md`). 
 
 ## Spec
 
-- UHCI 1.1 Â§2.1.2 USBSTS â€” USBINT set on IOC completion; software clears by writing 1
-- UHCI 1.1 Â§2.1.3 USBINTR â€” IOC enable gates host interrupt; disabled sources remain visible in USBSTS
+- UHCI 1.1 §2.1.2 USBSTS — USBINT set on IOC completion; software clears by writing 1
+- UHCI 1.1 §2.1.3 USBINTR — IOC enable gates host interrupt; disabled sources remain visible in USBSTS
 
 ## Model
 
 | Piece | Behavior |
 |---|---|
 | IOC TD completion | Always latches `USBSTS.USBINT` (pollable) |
-| `uhci_interrupt_pending` | `(USBINT âˆ§ USBINTR.IOC)` âˆ¨ â€¦ |
+| `uhci_interrupt_pending` | `(USBINT ? USBINTR.IOC)` ? … |
 | `usbsts_write_w1c` | Write-0 preserves; write-1 clears only written R/WC bits |
 | USBINTR.IOC clear | Drops host pending; **USBINT stays set** until W1C |
 | `latch_usb_interrupt` | Host helper to latch USBINT without a TD walk |
