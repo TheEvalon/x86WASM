@@ -923,6 +923,15 @@ impl I8042 {
         self.kbd_leds
     }
 
+    /// Host-side LED mask update without the `0xED` command handshake.
+    ///
+    /// Spec: OSDev PS/2 Keyboard Set LEDs bit layout. Used when BIOS-style INT
+    /// 09h toggles Caps/Num/Scroll lock so the stub LED store mirrors BDA
+    /// `40:97`. Does **not** generate ACK bytes on OBF.
+    pub fn set_kbd_leds_host(&mut self, mask: u8) {
+        self.kbd_leds = mask & KBD_LED_MASK;
+    }
+
     /// Whether any of Scroll/Num/Caps LED bits are set in the stored mask.
     pub fn kbd_leds_any(&self) -> bool {
         (self.kbd_leds & KBD_LED_MASK) != 0
@@ -2110,6 +2119,19 @@ mod tests {
         assert_eq!(k.kbd_leds(), leds);
         assert_eq!(k.status() & (STATUS_OBF | STATUS_AUX_OBF), 0);
         assert!(!k.irq12_line());
+    }
+
+    /// Spec honesty: host LED mirror for INT 09h lock toggles (no ACK / OBF).
+    #[test]
+    fn kbd_set_leds_host_no_ack() {
+        let mut k = I8042::new();
+        k.set_kbd_leds_host(KBD_LED_CAPS | KBD_LED_NUM);
+        assert_eq!(k.kbd_leds(), KBD_LED_CAPS | KBD_LED_NUM);
+        assert_eq!(
+            k.status() & STATUS_OBF,
+            0,
+            "host LED set must not raise OBF"
+        );
     }
 
     /// Spec: OSDev PS/2 Keyboard — Set Typematic Rate/Delay (`0xF3`) → ACK,
