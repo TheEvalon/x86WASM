@@ -453,7 +453,8 @@ mod tests {
         m.service_int10();
         setup_int10_set_cursor(&mut m.cpu, 0, 2, 9);
         m.service_int10();
-        assert!(!m.vga.text_font_installed());
+        // R14 host INT 10h mode 03h installs the bring-up font (not SeaVGABIOS).
+        assert!(m.vga.text_font_installed());
 
         m.map_and_invoke_vga_option_rom(&rom)
             .expect("map+invoke RETF ROM");
@@ -469,6 +470,6 @@ mod tests {
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0).unwrap(), 9);
         assert_eq!(m.mem.read_u8(BDA_CURSOR_PAGE0 + 1).unwrap(), 2);
         assert_eq!(m.mem.read_u8(BDA_ACTIVE_PAGE).unwrap(), 0);
-        assert!(!m.vga.text_font_installed());
+        assert!(m.vga.text_font_installed());
     }
 }

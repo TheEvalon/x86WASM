@@ -12,7 +12,8 @@ native builds:
 2. **Map-size honesty** — `check-option-rom.py` reports `declared_map` (header
    size×512) vs file length and any trailing unmapped bytes.
 3. **BDA / font honesty** — synthetic `RETF` option ROM does **not** mutate host
-   INT 10h BDA video fields or install a VGA font (host INT 10h ≠ SeaVGABIOS).
+   INT 10h BDA video fields or clear/replace fonts. R14 host AH=00h mode `03h`
+   installs the bring-up font; RETF preserves that state (still not SeaVGABIOS).
 4. **Windows native SeaVGABIOS remains infeasible** (reaffirmed; use WSL2/Linux).
 
 ## Tests
@@ -21,7 +22,7 @@ native builds:
 |------|---------|
 | `post_scan_skips_bad_checksum` | `55 AA` + wrong checksum → not in scan hits |
 | `invoke_rejects_bad_checksum_image` | Far-call path fails `BadChecksum` (RAM-visible image; ROM windows ignore writes) |
-| `option_rom_retf_preserves_bda_and_font` | After AH=00h + cursor + no font: RETF leaves BDA + `text_font_installed` unchanged |
+| `option_rom_retf_preserves_bda_and_font` | After AH=00h + cursor (font installed by R14 mode-set): RETF leaves BDA + `text_font_installed` unchanged |
 
 ## Windows / SeaVGABIOS
 

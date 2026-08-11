@@ -2291,6 +2291,19 @@ impl VgaText {
         (u16::from(high) << 8) | u16::from(low)
     }
 
+    /// Program CRTC Start Address High/Low (`0x0C`/`0x0D`).
+    ///
+    /// Spec: FreeVGA CRT Controller — 16-bit character index of the first
+    /// displayed cell. Host text helpers (`char_at` / `attr_at` / `put_char`)
+    /// and INT 10h cursor Location use this as the viewport origin. Protect
+    /// does not block these indexes. Returns `true` always (register file write).
+    /// See `docs/vga-r14-text-font-crtc.md`.
+    pub fn set_text_start_address(&mut self, addr: u16) -> bool {
+        self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_HIGH)] = (addr >> 8) as u8;
+        self.crtc_regs[usize::from(VGA_CRTC_START_ADDR_LOW)] = (addr & 0xFF) as u8;
+        true
+    }
+
     /// Byte offset of the first displayed cell in the text plane (`start * 2`).
     ///
     /// Spec: IBM VGA / FreeVGA — each alphanumeric cell is two bytes
@@ -2448,13 +2461,19 @@ impl VgaText {
         usize::from(self.crtc_cursor_location()) * VGA_CELL_BYTES
     }
 
-    /// Text-mode `(row, col)` for an 80-column layout from cursor location.
+    /// Text-mode viewport `(row, col)` from cursor location minus Start Address.
     ///
-    /// Spec: FreeVGA cursor location is a character index; classic mode 03h uses
-    /// 80 columns. Does not subtract Start Address (`0x0C`/`0x0D`).
+    /// Spec: FreeVGA cursor location is a character index into the refresh
+    /// buffer; host BDA cursor is viewport-relative. This helper subtracts
+    /// [`Self::text_start_address`] and divides by [`Self::text_row_pitch_chars`]
+    /// so it matches INT 10h AH=02h/03h coordinates when Start Address ≠ 0.
+    /// See `docs/vga-r14-text-font-crtc.md`.
     pub fn crtc_cursor_row_col(&self) -> (usize, usize) {
         let loc = usize::from(self.crtc_cursor_location());
-        (loc / VGA_TEXT_COLS, loc % VGA_TEXT_COLS)
+        let start = usize::from(self.text_start_address());
+        let pitch = self.text_row_pitch_chars().max(1);
+        let rel = loc.saturating_sub(start);
+        (rel / pitch, rel % pitch)
     }
 
     /// Cursor Start scanline (CRTC `0x0A` bits 4:0).
