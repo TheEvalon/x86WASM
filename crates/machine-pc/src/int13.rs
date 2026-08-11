@@ -2361,8 +2361,10 @@ mod tests {
     fn int13_floppy_ah02_multi_sector_crosses_cylinder() {
         let mut img = synthetic_floppy_boot();
         // Last sector cyl0 = (0,1,18); first of cyl1 = (1,0,1).
-        let off_c0 = (1 * 18 + 17) * INT13_SECTOR_SIZE;
-        let off_c1 = (2 * 18) * INT13_SECTOR_SIZE;
+        let off_c0 = (usize::from(INT13_FLOPPY_MAX_HEAD) * usize::from(INT13_FLOPPY_SPT)
+            + (usize::from(INT13_FLOPPY_SPT) - 1))
+            * INT13_SECTOR_SIZE;
+        let off_c1 = (2 * usize::from(INT13_FLOPPY_SPT)) * INT13_SECTOR_SIZE;
         img[off_c0] = 0xA0;
         img[off_c1] = 0xA1;
         let mut m = Machine::with_floppy(64 * 1024, img).expect("floppy");
