@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-11, round-15 parallel integration `merge/m2-r15-parallel-16` on base `f7f7a60`): **in progress -- fifteenth parallel campaign merged.** Five lanes: platform wait_irq/INT15/CMOS/BDA ticks; storage INT13 AH=02/42/CD; display INT10 page/teletype/VBE 4F03; boot C897 classify + FreeDOS v8 KERNEL.SYS locate + Linux setup-entry; UHCI PORTSC/TD + LAPIC LDR/DFR + HPET freerun. See `docs/m2-r15-parallel-integration.md`. **POST-with-media still `F000:C897` wait_irq; FreeDOS prompt / Linux serial shell still open.** Honesty: no guest LFB; no CPUID.APIC; ADR-0008 table-loader absent.
+
 Status (2026-08-11, round-15 platform-post lane `slice/r15-platform-post` tip): INT15 AH=88/E801 memory stubs; CMOS equipment/floppy↔BDA coherence; BDA 40:6C from PIT IRQ0; wait_irq PIT/PIC/RTC deepen; POST honesty docs. See `docs/int15-r15-memory-size.md`, `docs/cmos-r15-equipment.md`, `docs/platform-r15-bda-timer-ticks.md`, `docs/platform-r15-post-note.md`, `docs/platform-r15-post-remeasure.md`. **Not** POST complete.
 
 Status (2026-08-11, round-15 platform-post lane `slice/r15-platform-post` on base `f7f7a60`): **in progress -- R15 platform-post lane.** PIT IRQ0 `wait_irq` yield deepen (mode-2 re-latch after EOI); PIC IRR/ISR OCW sticky polish for IRQ0/IRQ8; CMOS Status B PIE-on-PF + MachineBus IRQ8 sync; POST-with-media remeasure note — **C897 class unchanged** (still `wait_irq` sampling; boot lane owns full diagnosis). See `docs/platform-r15-*.md`. **Not** POST complete / INT19 success.
