@@ -82,11 +82,11 @@ fn seabios_shaped_wait_irq_yields_twice_on_pit_mode2() {
     // restores IF=1; a pending edge can nest before `CLI`). Both yields must
     // still observe at least one wake, then reach DONE.
     assert!(
-        report.post_codes.iter().any(|&c| c == CODE_WAKE1),
+        report.post_codes.contains(&CODE_WAKE1),
         "first wait_irq yield must wake: {report}"
     );
     assert!(
-        report.post_codes.iter().any(|&c| c == CODE_WAKE2),
+        report.post_codes.contains(&CODE_WAKE2),
         "second wait_irq yield must wake: {report}"
     );
     assert_eq!(
