@@ -2,7 +2,7 @@
 //!
 //! Kept out of the `Machine` monolith so parallel lanes can merge without
 //! rewriting MMIO dispatch. Legacy PIC replacement stays an explicit non-claim
-//! (`LEG_RT_CAP` clear — `docs/hpet-r14-legacy-irq.md`); FSB/MSI remains out
+//! (`LEG_RT_CAP` clear — `docs/timer-r14-hpet-legacy.md`); FSB/MSI remains out
 //! (`docs/hpet-r12-msi-irq.md`).
 //!
 //! Ownership (R10/R11/R14 usb-timer): this module + thin `Machine::advance_hpet` /

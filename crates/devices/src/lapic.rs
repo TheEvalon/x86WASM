@@ -28,7 +28,7 @@
 //! Self Fixed IPI; CPUID leaf 1 EDX bit 9 (`APIC`) stays clear —
 //! presence ≠ advertised APIC. Round-14: SVR vector + soft-enable (+ sticky
 //! focus/EOI-broadcast bit 9 for firmware RMW probes) with soft-enable gating
-//! honesty — see `docs/lapic-r14-svr-stub.md`.
+//! honesty — see `docs/apic-r14-lapic-svr.md`.
 //! See `docs/lapic-r7-timer-lvt.md`, `docs/lapic-r8-eoi-isr.md`,
 //! `docs/lapic-r10-tmr.md`, `docs/lapic-r10-tpr-ppr.md`,
 //! `docs/lapic-r11-lvt-timer.md`, `docs/lapic-r12-icr.md`.

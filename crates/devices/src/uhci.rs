@@ -9,7 +9,7 @@
 //! PCI config / BAR0 I/O decode remain in [`crate::pci::PciConfig`]; this module
 //! owns schedule + PORTSC bit semantics. Round-14 wires host IRQ pending onto
 //! PIIX3 PIRQD → classic ISA IRQ11 via machine-pc (see
-//! `docs/uhci-r14-pic-irq-wire.md`, `docs/uhci-r14-ioc-usbsts.md`).
+//! `docs/usb-r14-uhci-pic.md`, `docs/usb-r14-uhci-ioc.md`).
 //! See `docs/uhci-r8-one-td.md`, `docs/uhci-r11-frame-list-walk.md`,
 //! `docs/uhci-r11-portsc.md`, `docs/uhci-r12-qh-horizontal.md`,
 //! `docs/uhci-r12-usbsts-usbintr.md`.
@@ -478,7 +478,7 @@ pub fn usbintr_write(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize], value:
 /// Spec: UHCI 1.1 §2.1.3 — disabled sources still appear in USBSTS for polling;
 /// this helper reports whether the HC would raise an interrupt to the host.
 /// Machine hosts mirror this onto PIRQD ([`UHCI_PIIX_PIRQD`]) then DualPic via
-/// PIRQRC (classic IRQ11 — see `docs/uhci-r14-pic-irq-wire.md`).
+/// PIRQRC (classic IRQ11 — see `docs/usb-r14-uhci-pic.md`).
 pub fn uhci_interrupt_pending(regs: &[u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) -> bool {
     let sts = usbsts_read(regs);
     let en = usbintr_read(regs);
