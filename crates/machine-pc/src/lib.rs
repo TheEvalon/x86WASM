@@ -28,6 +28,7 @@ mod post_code;
 mod post_probe;
 mod post_spin;
 mod post_trace;
+mod post_with_media;
 mod step_clock;
 mod vga_font;
 mod vga_frame;
@@ -44,12 +45,14 @@ pub use boot_media::{
 };
 pub use guest_boot::{
     classify_bzimage_early, classify_bzimage_setup_deeper, classify_eltorito_media_boot,
-    classify_freedos_next_gap, classify_guest_first_failure, inspect_linux_boot_protocol_header,
-    linux_realmode_bytes, linux_setup_sect_count, synthetic_freedos_like_disk,
-    synthetic_linux_boot_protocol_header, synthetic_linux_serial_stub_disk, BzImageEarlyClass,
-    BzImageLoadError, BzImageNextStep, ElToritoMediaBootClass, FreedosNextGap, GuestBootCheckpoint,
-    GuestBootMeasure, GuestBootMedia, GuestFailureSite, GuestFirstFailureClass, GuestOsMeasure,
-    GuestOsMeasureKind, Int13ProbeSnapshot, LinuxBootProtocolError, LinuxBootProtocolHeader,
+    classify_freedos_next_gap, classify_freedos_next_gap_with_handoff,
+    classify_guest_first_failure, classify_linux_media_boot, inspect_linux_boot_protocol_header,
+    linux_realmode_bytes, linux_setup_sect_count, synthetic_eltorito_linux_hlt_iso,
+    synthetic_freedos_like_disk, synthetic_linux_boot_protocol_header,
+    synthetic_linux_serial_stub_disk, BzImageEarlyClass, BzImageLoadError, BzImageNextStep,
+    ElToritoMediaBootClass, FreedosHandoff, FreedosNextGap, GuestBootCheckpoint, GuestBootMeasure,
+    GuestBootMedia, GuestFailureSite, GuestFirstFailureClass, GuestOsMeasure, GuestOsMeasureKind,
+    Int13ProbeSnapshot, LinuxBootProtocolError, LinuxBootProtocolHeader, LinuxMediaBootClass,
     MediaBootReadiness, BDA_EQUIPMENT, BDA_HD_COUNT, GUEST_BOOT_MEASURE_VERSION,
     GUEST_OS_MEASURE_VERSION, LINUX_BOOT_FLAG_AA55, LINUX_BOOT_HEADER_MAGIC,
     LINUX_BOOT_HEADER_MIN_LEN, LINUX_REALMODE_LOAD_ADDR,
@@ -98,7 +101,10 @@ pub use int15_apm::{
     APM_ERR_UNSUPPORTED, APM_VERSION_MAJOR, APM_VERSION_MINOR, INT15_AH_APM, INT15_VECTOR,
 };
 pub use int16::{Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_GET_KEYSTROKE, INT16_BUFFER_CAP};
-pub use mbr::{MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
+pub use mbr::{
+    find_active_partition, ActivePartition, MBR_PHYS_ADDR, MBR_SECTOR_SIZE, MBR_SIGNATURE_HI,
+    MBR_SIGNATURE_LO,
+};
 pub use mem::{
     MemError, PamAttributes, PamRead, PamWrite, PhysMem, WriteDisposition, PAM_BIOS_REGION,
     PAM_FIELD_MASK, PAM_FIELD_RE, PAM_FIELD_WE, PAM_REGIONS, PAM_REGION_COUNT, PAM_REGISTER_FIRST,
@@ -123,6 +129,10 @@ pub use post_spin::{
     DEFAULT_POST_SPIN_MAX_PERIOD, DEFAULT_POST_SPIN_WINDOW,
 };
 pub use post_trace::{PostTrace, PostTraceConfig, PostTraceEvent, DEFAULT_POST_TRACE_CAPACITY};
+pub use post_with_media::{
+    classify_post_with_media_stop, PostWithMediaClass, PostWithMediaReport,
+    NO_MEDIA_REBOOT_CLASS_CS, NO_MEDIA_REBOOT_CLASS_IP, POST_WITH_MEDIA_BUDGET_STEPS,
+};
 pub use step_clock::{
     StepClock, StepTicks, ACPI_PM_CLOCKS_PER_PIT_CLOCK, ACPI_PM_TMR_MASK, CMOS_PERIODIC_HZ,
     DEFAULT_PIT_CLOCKS_PER_STEP, PIT_CLOCKS_PER_CMOS_PERIOD, PIT_CLOCKS_PER_SECOND,
@@ -175,6 +185,12 @@ pub enum MachineError {
     /// Guest RAM must cover `0x7C00`..`0x7DFF` for the boot-sector copy.
     #[error("RAM too small for MBR at 0x7C00")]
     MbrRamTooSmall,
+    /// MBR has a valid signature but no active (`80h`) partition entry.
+    #[error("no active (80h) partition in MBR")]
+    NoActivePartition,
+    /// Active partition start LBA is past the attached IDE image / short sector.
+    #[error("active partition sector incomplete or out of range")]
+    IncompletePartitionSector,
     /// El Torito catalog parse failed for [`Machine::load_eltorito_to_7c00`].
     #[error(transparent)]
     ElTorito(#[from] firmware_interface::ElToritoError),

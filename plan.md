@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-11, round-14 boot-guest lane `slice/r14-boot-guest` on base `9934398`): **in progress -- R14 boot-guest lane.** POST-with-media measure vs `F000:9842`; host MBR→VBR `load_active_vbr_to_7c00`; FreeDOS measure v7 VBR-chain next-gap (`ExecutedVbrMissingCommand`); Linux/El Torito media classify+measure deepen. See `docs/boot-r14-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS.
+
 Status (2026-08-10, round-13 boot-guest lane `slice/r13-boot-guest` on base `f579e8c`): **in progress -- R13 boot-guest lane.** INT19-candidate HD/floppy attach helpers; FreeDOS measure v6 media readiness (beyond no-media reboot loop); INT 13h AH=00h HD+floppy deepen (IDE/FDC reset + BDA status); Linux bzImage setup deepen (`cmd_line_ptr`/`init_size`) + El Torito media boot classify. See `docs/boot-r13-*.md`, `docs/storage-r13-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS.
 
 Status (2026-08-10, round-13 platform-io lane `slice/r13-platform-io` on base `f579e8c`): **in progress -- R13 platform-io lane.** LPT1 control idle default `0x0C` deepen; LPT2 independence + LPT3 `0x3BC` open-bus honesty; COM3/COM4 `0x3E8`/`0x2E8` 16550 probe stubs (IER sites claimed; no shared IRQ); CMOS `0Fh` `set_shutdown_status` + Machine helpers survive CF9 pulse-reset without dispatch. See `docs/lpt-r13-*.md`, `docs/platform-r13-*.md`. **Not** IRQ7/ECP; COM3/4 IRQ share; Machine soft-reset JMP via `40:67`.

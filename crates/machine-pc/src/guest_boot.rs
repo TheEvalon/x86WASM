@@ -1,4 +1,4 @@
-//! Guest disk boot measure harness v2/v4/v6 (FreeDOS/Linux serial-path prep).
+//! Guest disk boot measure harness v2/v4/v7 (FreeDOS/Linux serial-path prep).
 //!
 //! Loads a boot sector / El Torito / synthetic FreeDOS-like image, then reuses
 //! [`Machine::probe_post`] to record the **first** stop reason plus serial
@@ -17,7 +17,11 @@
 //! `docs/boot-r12-linux-bzimage-early.md`,
 //! `docs/boot-r13-freedos-with-media.md`,
 //! `docs/boot-r13-eltorito-media-classify.md`,
-//! `docs/boot-r13-linux-setup-deeper.md`).
+//! `docs/boot-r13-linux-setup-deeper.md`,
+//! `docs/boot-r14-freedos-next-gap.md`,
+//! `docs/boot-r14-linux-eltorito-measure.md`,
+//! `docs/boot-r14-mbr-vbr-chain.md`,
+//! `docs/boot-r14-post-with-media.md`).
 
 use crate::boot_media::{classify_machine_int19_media, Int19BootMediaClass};
 use crate::post_probe::{PostFailureKind, PostReport, PostStopReason};
@@ -26,8 +30,8 @@ use crate::{Machine, MachineError};
 /// Harness schema version for CLI/report consumers (v2 checkpoints + serial).
 pub const GUEST_BOOT_MEASURE_VERSION: u32 = 2;
 
-/// FreeDOS-like / Linux-serial measure report schema (v6 = media readiness).
-pub const GUEST_OS_MEASURE_VERSION: u32 = 6;
+/// FreeDOS-like / Linux-serial measure report schema (v7 = VBR-chain next-gap).
+pub const GUEST_OS_MEASURE_VERSION: u32 = 7;
 
 /// BDA equipment list word (`0040:0010`). Spec: RBIL memory map / IBM BIOS.
 pub const BDA_EQUIPMENT: u64 = 0x410;
@@ -50,6 +54,18 @@ pub enum GuestBootMedia {
     FloppyFirst,
     /// [`Machine::load_eltorito_to_7c00`] — no-emulation CD boot image.
     ElTorito,
+    /// [`Machine::load_active_vbr_to_7c00`] — active partition VBR → `0x7C00`.
+    ActiveVbr,
+}
+
+/// Host handoff used for FreeDOS next-gap classify (MBR vs VBR chain).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FreedosHandoff {
+    /// LBA0 / MBR sector at `0x7C00` (R13 media-attached class).
+    #[default]
+    MbrSector,
+    /// Active-partition VBR at `0x7C00` (R14 chain past MBR-only).
+    ActiveVbr,
 }
 
 /// Ordered progress markers recorded during a v2 measure.
@@ -119,6 +135,7 @@ impl std::fmt::Display for GuestBootMeasure {
                 GuestBootMedia::IdePrefer => "ide-prefer",
                 GuestBootMedia::FloppyFirst => "floppy-first",
                 GuestBootMedia::ElTorito => "eltorito",
+                GuestBootMedia::ActiveVbr => "active-vbr",
             },
             self.stop_class()
         )?;
@@ -205,8 +222,11 @@ pub enum FreedosNextGap {
     /// IVT vector `0x13` is null — guest cannot reach host INT 13h without SeaBIOS.
     GuestInt13IvtMissing,
     /// INT 19h-candidate media attached — past no-media reboot-loop class; still
-    /// need SeaBIOS guest disk path / real FreeDOS (not a prompt).
+    /// need SeaBIOS guest disk path / real FreeDOS (not a prompt). MBR-only handoff.
     MediaAttachedBeyondRebootLoop,
+    /// Active-partition VBR executed (host chain) and halted — past media-attached
+    /// class; stub has no COMMAND.COM / FreeDOS kernel.
+    ExecutedVbrMissingCommand,
     /// Fixture halted cleanly without INT19-candidate media; next need is real image + POST.
     RealImageAndFirmware,
     /// Non-halt first failure already names the gap — see `first_failure`.
@@ -221,6 +241,7 @@ impl FreedosNextGap {
             Self::BdaDiskMismatch => "bda-disk-mismatch",
             Self::GuestInt13IvtMissing => "guest-int13-ivt-missing",
             Self::MediaAttachedBeyondRebootLoop => "media-attached-beyond-reboot-loop",
+            Self::ExecutedVbrMissingCommand => "executed-vbr-missing-command",
             Self::RealImageAndFirmware => "real-image-and-firmware",
             Self::SeeFirstFailure => "see-first-failure",
         }
@@ -240,6 +261,9 @@ impl FreedosNextGap {
             }
             Self::MediaAttachedBeyondRebootLoop => {
                 "Next gap: INT19-candidate media attached (past no-media reboot loop); still need SeaBIOS guest INT13 + real FreeDOS — NOT a prompt"
+            }
+            Self::ExecutedVbrMissingCommand => {
+                "Next gap: VBR executed (host MBR→VBR chain) then synthetic halt — missing COMMAND.COM / FreeDOS kernel; NOT a FreeDOS prompt"
             }
             Self::RealImageAndFirmware => {
                 "Next gap: real FreeDOS image + SeaBIOS POST (fixture halt is not progress)"
@@ -273,6 +297,23 @@ pub fn classify_freedos_next_gap(
     first_failure: &GuestFirstFailureClass,
     int13_probe: &Int13ProbeSnapshot,
 ) -> FreedosNextGap {
+    classify_freedos_next_gap_with_handoff(
+        machine,
+        first_failure,
+        int13_probe,
+        FreedosHandoff::MbrSector,
+    )
+}
+
+/// Like [`classify_freedos_next_gap`], but distinguishes MBR-only vs VBR-chain handoff.
+///
+/// Spec: OSDev Boot Sequence MBR→VBR; still not FreeDOS / COMMAND.COM.
+pub fn classify_freedos_next_gap_with_handoff(
+    machine: &Machine,
+    first_failure: &GuestFirstFailureClass,
+    int13_probe: &Int13ProbeSnapshot,
+    handoff: FreedosHandoff,
+) -> FreedosNextGap {
     if !matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
         return FreedosNextGap::SeeFirstFailure;
     }
@@ -290,7 +331,10 @@ pub fn classify_freedos_next_gap(
         return FreedosNextGap::GuestInt13IvtMissing;
     }
     if classify_machine_int19_media(machine).is_int19_candidate() {
-        return FreedosNextGap::MediaAttachedBeyondRebootLoop;
+        return match handoff {
+            FreedosHandoff::ActiveVbr => FreedosNextGap::ExecutedVbrMissingCommand,
+            FreedosHandoff::MbrSector => FreedosNextGap::MediaAttachedBeyondRebootLoop,
+        };
     }
     FreedosNextGap::RealImageAndFirmware
 }
@@ -511,7 +555,7 @@ impl Int13ProbeSnapshot {
     }
 }
 
-/// v6 OS-path measure: wraps v2 plus honesty / first-failure / next-gap / media readiness.
+/// v7 OS-path measure: wraps v2 plus honesty / first-failure / next-gap / media readiness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestOsMeasure {
     /// Schema version ([`GUEST_OS_MEASURE_VERSION`]).
@@ -990,6 +1034,84 @@ pub fn classify_eltorito_media_boot(machine: &Machine) -> ElToritoMediaBootClass
     }
 }
 
+/// Combined Linux / El Torito media boot readiness (host classify + optional measure).
+///
+/// Spec: El Torito 1.0 + Linux `Documentation/x86/boot.rst`. Does **not** claim
+/// a Linux serial shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinuxMediaBootClass {
+    /// No CD and no bzImage buffer supplied.
+    NoMedia,
+    /// Attached CD classify (may or may not be a boot candidate).
+    ElTorito(ElToritoMediaBootClass),
+    /// Host bzImage buffer classify (setup deepen).
+    BzImage(BzImageEarlyClass),
+    /// El Torito candidate **and** a separate bzImage was also classified.
+    ElToritoPlusBzImage {
+        eltorito: ElToritoMediaBootClass,
+        bzimage: BzImageEarlyClass,
+    },
+}
+
+impl LinuxMediaBootClass {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::NoMedia => "no-media",
+            Self::ElTorito(_) => "eltorito",
+            Self::BzImage(_) => "bzimage",
+            Self::ElToritoPlusBzImage { .. } => "eltorito-plus-bzimage",
+        }
+    }
+
+    /// True when El Torito is a no-emul candidate and/or bzImage setup is loadable.
+    pub fn is_boot_candidate(&self) -> bool {
+        match self {
+            Self::NoMedia => false,
+            Self::ElTorito(e) => e.is_boot_candidate(),
+            Self::BzImage(b) => matches!(b, BzImageEarlyClass::SetupLoadable { .. }),
+            Self::ElToritoPlusBzImage { eltorito, bzimage } => {
+                eltorito.is_boot_candidate()
+                    || matches!(bzimage, BzImageEarlyClass::SetupLoadable { .. })
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LinuxMediaBootClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoMedia => f.write_str("no-media"),
+            Self::ElTorito(e) => write!(f, "eltorito:{e}"),
+            Self::BzImage(b) => write!(f, "bzimage:{b}"),
+            Self::ElToritoPlusBzImage { eltorito, bzimage } => {
+                write!(f, "eltorito-plus-bzimage:cd={eltorito} bz={bzimage}")
+            }
+        }
+    }
+}
+
+/// Classify Linux-path media: optional attached El Torito CD and/or bzImage bytes.
+///
+/// Prefer CD classify when ATAPI medium is present; fold in `bzimage` when given.
+/// Spec: El Torito 1.0; Linux boot.rst. Not a serial-shell claim.
+pub fn classify_linux_media_boot(machine: &Machine, bzimage: Option<&[u8]>) -> LinuxMediaBootClass {
+    let cd = if machine.ide.is_atapi_cdrom() && machine.ide.atapi_medium_image().is_some() {
+        Some(classify_eltorito_media_boot(machine))
+    } else {
+        None
+    };
+    let bz = bzimage.map(classify_bzimage_setup_deeper);
+    match (cd, bz) {
+        (None, None) => LinuxMediaBootClass::NoMedia,
+        (Some(e), None) => LinuxMediaBootClass::ElTorito(e),
+        (None, Some(b)) => LinuxMediaBootClass::BzImage(b),
+        (Some(e), Some(b)) => LinuxMediaBootClass::ElToritoPlusBzImage {
+            eltorito: e,
+            bzimage: b,
+        },
+    }
+}
+
 /// Error from [`Machine::load_bzimage_realmode_setup`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BzImageLoadError {
@@ -1056,6 +1178,9 @@ impl Machine {
             GuestBootMedia::IdePrefer => self.load_mbr_to_7c00()?,
             GuestBootMedia::FloppyFirst => self.load_floppy_boot_to_7c00()?,
             GuestBootMedia::ElTorito => self.load_eltorito_to_7c00()?,
+            GuestBootMedia::ActiveVbr => {
+                self.load_active_vbr_to_7c00()?;
+            }
         }
         let mut checkpoints = vec![
             GuestBootCheckpoint::MediaLoaded,
@@ -1106,6 +1231,7 @@ impl Machine {
         honesty: &'static str,
         mut gaps: Vec<&'static str>,
         mut host_notes: Vec<&'static str>,
+        handoff: FreedosHandoff,
     ) -> GuestOsMeasure {
         let int13_probe = self.probe_int13_hd_extensions_status();
         let first_failure = classify_guest_first_failure(&measure.report, Some(&int13_probe));
@@ -1118,7 +1244,7 @@ impl Machine {
         let media_readiness =
             MediaBootReadiness::from_int19_class(classify_machine_int19_media(self));
         let next_gap = if kind == GuestOsMeasureKind::FreeDosLike {
-            classify_freedos_next_gap(self, &first_failure, &int13_probe)
+            classify_freedos_next_gap_with_handoff(self, &first_failure, &int13_probe, handoff)
         } else if matches!(first_failure, GuestFirstFailureClass::SyntheticHalt) {
             if media_readiness == MediaBootReadiness::Int19Candidate {
                 FreedosNextGap::MediaAttachedBeyondRebootLoop
@@ -1140,7 +1266,7 @@ impl Machine {
             }
             if kind == GuestOsMeasureKind::LinuxSerialPath {
                 host_notes.push(
-                    "Use classify_bzimage_early / classify_bzimage_setup_deeper / load_bzimage_realmode_setup on a host bzImage; no kernel exec here",
+                    "Use classify_bzimage_early / classify_bzimage_setup_deeper / classify_linux_media_boot / load_bzimage_realmode_setup on a host bzImage; no kernel exec here",
                 );
             }
         } else if kind == GuestOsMeasureKind::FreeDosLike {
@@ -1187,6 +1313,7 @@ impl Machine {
                 "No claim of COMMAND.COM or FreeDOS prompt",
             ],
             vec![],
+            FreedosHandoff::MbrSector,
         ))
     }
 
@@ -1221,6 +1348,41 @@ impl Machine {
             vec![
                 "Media readiness distinguishes no-media reboot loop from attached-candidate path",
             ],
+            FreedosHandoff::MbrSector,
+        ))
+    }
+
+    /// Attach FreeDOS stub HD and measure via **active-partition VBR** handoff.
+    ///
+    /// Past [`FreedosNextGap::MediaAttachedBeyondRebootLoop`]: host
+    /// [`Self::load_active_vbr_to_7c00`] runs the stub VBR (`FD` + HLT). With an
+    /// INT 13h IVT stub installed, next-gap is
+    /// [`FreedosNextGap::ExecutedVbrMissingCommand`].
+    ///
+    /// Still **not** a FreeDOS prompt / COMMAND.COM.
+    pub fn measure_freedos_vbr_chain(
+        &mut self,
+        max_steps: u64,
+    ) -> Result<GuestOsMeasure, MachineError> {
+        if !self.ide.present || self.ide.image.is_empty() {
+            self.attach_freedos_stub_hd_for_int19();
+        }
+        self.seed_bda_disk_equipment()?;
+        let measure = self.measure_guest_boot(GuestBootMedia::ActiveVbr, max_steps)?;
+        Ok(self.finish_os_measure(
+            GuestOsMeasureKind::FreeDosLike,
+            measure,
+            "Host MBR→VBR chain measured on FreeDOS stub — does NOT claim FreeDOS prompt or SeaBIOS INT19.",
+            vec![
+                "Active-partition VBR executed via host chain (not guest MBR code)",
+                "Synthetic VBR has no COMMAND.COM / FreeDOS kernel",
+                "Guest INT 13h still needs SeaBIOS (host subset is not an IVT body)",
+                "No claim of FreeDOS prompt",
+            ],
+            vec![
+                "VBR-chain handoff classifies past media-attached-beyond-reboot-loop when IVT is present",
+            ],
+            FreedosHandoff::ActiveVbr,
         ))
     }
 
@@ -1252,6 +1414,36 @@ impl Machine {
                 "Header inspect + classify_bzimage_early available; does not execute setup code",
             ],
             vec![],
+            FreedosHandoff::MbrSector,
+        ))
+    }
+
+    /// Attach El Torito no-emul CD (if needed) and measure first-failure.
+    ///
+    /// Host [`Self::load_eltorito_to_7c00`] then [`Self::probe_post`]. Does
+    /// **not** claim Linux serial shell or SeaBIOS CD INT 13h success.
+    pub fn measure_linux_with_eltorito_media(
+        &mut self,
+        max_steps: u64,
+    ) -> Result<GuestOsMeasure, MachineError> {
+        if !self.ide.is_atapi_cdrom() || self.ide.atapi_medium_image().is_none() {
+            self.attach_atapi_cdrom_image(synthetic_eltorito_linux_hlt_iso());
+        }
+        let measure = self.measure_guest_boot(GuestBootMedia::ElTorito, max_steps)?;
+        Ok(self.finish_os_measure(
+            GuestOsMeasureKind::LinuxSerialPath,
+            measure,
+            "El Torito no-emul media measured — does NOT claim Linux serial shell or SeaBIOS CD stack.",
+            vec![
+                "Synthetic El Torito HLT boot image only (not a bzImage / kernel)",
+                "Host load_eltorito_to_7c00 — not guest INT 13h CD path",
+                "No Linux boot protocol / earlyprintk through a real kernel",
+                "No claim of Linux serial shell",
+            ],
+            vec![
+                "classify_linux_media_boot / classify_eltorito_media_boot for candidacy",
+            ],
+            FreedosHandoff::MbrSector,
         ))
     }
 
@@ -1380,6 +1572,80 @@ pub fn synthetic_linux_serial_stub_disk() -> Vec<u8> {
     let marker = b"LINUX-SERIAL-STUB\0";
     img[crate::mbr::MBR_SECTOR_SIZE..crate::mbr::MBR_SECTOR_SIZE + marker.len()]
         .copy_from_slice(marker);
+    img
+}
+
+/// Synthetic El Torito no-emul ISO with a HLT boot image (Linux-media measure fixture).
+///
+/// Spec: El Torito 1.0 Validation + Default Entry (`88h`, media `00h`). Not a
+/// bzImage and **not** a Linux serial shell.
+pub fn synthetic_eltorito_linux_hlt_iso() -> Vec<u8> {
+    use firmware_interface::{
+        EL_TORITO_BOOTABLE, EL_TORITO_BOOT_SYSTEM_ID, EL_TORITO_KEY_55, EL_TORITO_KEY_AA,
+        EL_TORITO_MEDIA_NO_EMUL, EL_TORITO_PLATFORM_X86, EL_TORITO_SECTOR_BYTES,
+        EL_TORITO_VALIDATION_HEADER_ID, ISO9660_STANDARD_ID, ISO9660_VD_BOOT_RECORD,
+        ISO9660_VD_TERMINATOR,
+    };
+    fn write_iso_sector(img: &mut [u8], lba: u32, data: &[u8]) {
+        let start = lba as usize * EL_TORITO_SECTOR_BYTES;
+        img[start..start + data.len()].copy_from_slice(data);
+    }
+    let mut img = vec![0u8; 32 * EL_TORITO_SECTOR_BYTES];
+    let mut pvd = vec![0u8; EL_TORITO_SECTOR_BYTES];
+    pvd[0] = 1;
+    pvd[1..6].copy_from_slice(ISO9660_STANDARD_ID);
+    pvd[6] = 1;
+    write_iso_sector(&mut img, 16, &pvd);
+
+    let mut br = vec![0u8; EL_TORITO_SECTOR_BYTES];
+    br[0] = ISO9660_VD_BOOT_RECORD;
+    br[1..6].copy_from_slice(ISO9660_STANDARD_ID);
+    br[6] = 1;
+    br[7..7 + EL_TORITO_BOOT_SYSTEM_ID.len()].copy_from_slice(EL_TORITO_BOOT_SYSTEM_ID);
+    let catalog_lba = 20u32;
+    br[0x47..0x4B].copy_from_slice(&catalog_lba.to_le_bytes());
+    write_iso_sector(&mut img, 17, &br);
+
+    let mut term = vec![0u8; EL_TORITO_SECTOR_BYTES];
+    term[0] = ISO9660_VD_TERMINATOR;
+    term[1..6].copy_from_slice(ISO9660_STANDARD_ID);
+    term[6] = 1;
+    write_iso_sector(&mut img, 18, &term);
+
+    let mut cat = vec![0u8; EL_TORITO_SECTOR_BYTES];
+    let mut validation = [0u8; 32];
+    validation[0] = EL_TORITO_VALIDATION_HEADER_ID;
+    validation[1] = EL_TORITO_PLATFORM_X86;
+    validation[30] = EL_TORITO_KEY_55;
+    validation[31] = EL_TORITO_KEY_AA;
+    let mut sum = 0u16;
+    for i in (0..32).step_by(2) {
+        if i == 28 {
+            continue;
+        }
+        sum = sum.wrapping_add(u16::from_le_bytes([validation[i], validation[i + 1]]));
+    }
+    let checksum = 0u16.wrapping_sub(sum);
+    validation[28..30].copy_from_slice(&checksum.to_le_bytes());
+    cat[0..32].copy_from_slice(&validation);
+    cat[32] = EL_TORITO_BOOTABLE;
+    cat[33] = EL_TORITO_MEDIA_NO_EMUL;
+    cat[38..40].copy_from_slice(&4u16.to_le_bytes());
+    cat[40..44].copy_from_slice(&24u32.to_le_bytes());
+    write_iso_sector(&mut img, catalog_lba, &cat);
+
+    // Boot image: COM1 "LX" + HLT (linux-media first-failure fixture).
+    let mut boot = vec![0x90u8; EL_TORITO_SECTOR_BYTES];
+    let code: &[u8] = &[
+        0xBA, 0xF8, 0x03, // mov dx, 0x03F8
+        0xB0, b'L', //
+        0xEE, //
+        0xB0, b'X', //
+        0xEE, //
+        0xF4, // hlt
+    ];
+    boot[..code.len()].copy_from_slice(code);
+    write_iso_sector(&mut img, 24, &boot);
     img
 }
 
@@ -1940,7 +2206,7 @@ mod tests {
         assert!(text.contains("NOT an OS boot"));
         assert!(!text.contains("FreeDOS prompt reached"));
         assert!(text.contains("does NOT claim a FreeDOS prompt"));
-        assert!(text.contains("guest-os-measure-v6:"));
+        assert!(text.contains("guest-os-measure-v7:"));
     }
 
     /// With IVT stub + INT19 media, next-gap is beyond-reboot-loop (still not a prompt).
@@ -1958,6 +2224,47 @@ mod tests {
         let gap = classify_freedos_next_gap(&m, &GuestFirstFailureClass::SyntheticHalt, &probe);
         assert_eq!(gap, FreedosNextGap::MediaAttachedBeyondRebootLoop);
         assert_eq!(gap.tag(), "media-attached-beyond-reboot-loop");
+    }
+
+    /// R14: VBR-chain handoff past MediaAttachedBeyondRebootLoop → missing COMMAND.COM.
+    #[test]
+    fn measure_freedos_vbr_chain_classifies_executed_vbr_missing_command() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_freedos_stub_hd_for_int19();
+        m.seed_bda_disk_equipment().unwrap();
+        m.install_int13_ivt_pointer(0xF000, 0xE000).unwrap();
+        let report = m.measure_freedos_vbr_chain(64).expect("vbr-chain");
+        assert_eq!(report.version, GUEST_OS_MEASURE_VERSION);
+        assert_eq!(report.media_readiness, MediaBootReadiness::Int19Candidate);
+        assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
+        assert_eq!(report.measure.media, GuestBootMedia::ActiveVbr);
+        assert_eq!(report.next_gap, FreedosNextGap::ExecutedVbrMissingCommand);
+        assert_eq!(report.next_gap.tag(), "executed-vbr-missing-command");
+        assert!(report.measure.com1.contains('F') || report.measure.com1 == "FD");
+        let text = report.to_string();
+        assert!(text.contains("executed-vbr-missing-command"));
+        assert!(!text.contains("FreeDOS prompt reached"));
+    }
+
+    /// Spec: ActiveVbr handoff changes next-gap vs MBR-only.
+    #[test]
+    fn classify_freedos_next_gap_vbr_handoff_missing_command() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_freedos_stub_hd_for_int19();
+        m.seed_bda_disk_equipment().unwrap();
+        m.install_int13_ivt_pointer(0xF000, 0xE000).unwrap();
+        let probe = Int13ProbeSnapshot {
+            dl: 0x80,
+            ah: 0x01,
+            cf: false,
+        };
+        let gap = classify_freedos_next_gap_with_handoff(
+            &m,
+            &GuestFirstFailureClass::SyntheticHalt,
+            &probe,
+            FreedosHandoff::ActiveVbr,
+        );
+        assert_eq!(gap, FreedosNextGap::ExecutedVbrMissingCommand);
     }
 
     /// Spec: Linux boot.rst — deepen flags missing cmdline / init_size.
@@ -2019,5 +2326,53 @@ mod tests {
             other => panic!("unexpected {other}"),
         }
         assert!(classify_eltorito_media_boot(&m).is_boot_candidate());
+    }
+
+    /// R14: Linux media classify deepens El Torito + optional bzImage.
+    #[test]
+    fn classify_linux_media_boot_eltorito_and_bzimage() {
+        let mut m = Machine::new(64 * 1024);
+        assert_eq!(
+            classify_linux_media_boot(&m, None),
+            LinuxMediaBootClass::NoMedia
+        );
+        m.attach_atapi_cdrom_image(synthetic_eltorito_linux_hlt_iso());
+        match classify_linux_media_boot(&m, None) {
+            LinuxMediaBootClass::ElTorito(e) => assert!(e.is_boot_candidate()),
+            other => panic!("unexpected {other}"),
+        }
+        let need = linux_realmode_bytes(1);
+        let mut bz = synthetic_linux_boot_protocol_header(1, 0x0202, 0, 0);
+        bz.resize(need.max(0x22C), 0);
+        match classify_linux_media_boot(&m, Some(&bz)) {
+            LinuxMediaBootClass::ElToritoPlusBzImage { eltorito, bzimage } => {
+                assert!(eltorito.is_boot_candidate());
+                assert!(matches!(
+                    bzimage,
+                    BzImageEarlyClass::SetupLoadable {
+                        next: BzImageNextStep::NeedCmdlinePtr,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("unexpected {other}"),
+        }
+        assert!(classify_linux_media_boot(&m, Some(&bz)).is_boot_candidate());
+    }
+
+    /// R14: measure El Torito media — first-failure is synthetic-halt (not Linux shell).
+    #[test]
+    fn measure_linux_with_eltorito_media_first_failure() {
+        let mut m = Machine::new(64 * 1024);
+        let report = m
+            .measure_linux_with_eltorito_media(64)
+            .expect("linux-eltorito");
+        assert_eq!(report.kind, GuestOsMeasureKind::LinuxSerialPath);
+        assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
+        assert_eq!(report.measure.media, GuestBootMedia::ElTorito);
+        assert!(report.measure.com1.contains('L') || report.measure.com1 == "LX");
+        let text = report.to_string();
+        assert!(text.contains("does NOT claim Linux"));
+        assert!(!text.contains("serial shell reached"));
     }
 }
