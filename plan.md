@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-11, round-15 platform-post lane slice/r15-platform-post tip): INT15 AH=88/E801 memory stubs; CMOS equipment/floppy↔BDA coherence; BDA 40:6C from PIT IRQ0; wait_irq PIT/PIC/RTC deepen; POST honesty docs. See docs/int15-r15-memory-size.md, docs/cmos-r15-equipment.md, docs/platform-r15-bda-timer-ticks.md, docs/platform-r15-post-note.md, docs/platform-r15-post-remeasure.md. **Not** POST complete.
+
 Status (2026-08-11, round-15 platform-post lane `slice/r15-platform-post` on base `f7f7a60`): **in progress -- R15 platform-post lane.** PIT IRQ0 `wait_irq` yield deepen (mode-2 re-latch after EOI); PIC IRR/ISR OCW sticky polish for IRQ0/IRQ8; CMOS Status B PIE-on-PF + MachineBus IRQ8 sync; POST-with-media remeasure note — **C897 class unchanged** (still `wait_irq` sampling; boot lane owns full diagnosis). See `docs/platform-r15-*.md`. **Not** POST complete / INT19 success.
 
 Status (2026-08-11, round-14 parallel integration `merge/m2-r14-parallel-16` on base `9934398`): **in progress -- fourteenth parallel campaign merged.** Four lanes: UHCI→IRQ11 PIC + LAPIC SVR + HPET legacy honesty; INT16 AH=02/12 + BDA equipment/8042 IRQ1; INT10 scroll/read + VBE 4F02 no-LFB; POST-with-media (past `F000:9842` → `F000:C897`) + MBR→VBR + FreeDOS v7 + Linux/El Torito. See `docs/m2-r14-parallel-integration.md`. **FreeDOS prompt / Linux serial shell still open.** Honesty: no guest LFB; no CPUID.APIC; ADR-0008 table-loader absent.

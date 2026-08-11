@@ -9,7 +9,9 @@
 #![forbid(unsafe_code)]
 
 mod bda_kbd;
+mod bda_timer;
 mod boot_media;
+mod cmos_equipment;
 mod eltorito_load;
 mod guest_boot;
 mod hello_rom;
@@ -17,6 +19,7 @@ mod hpet_wire;
 mod int10;
 mod int13;
 mod int15_apm;
+mod int15_mem;
 mod int16;
 mod ioapic_wire;
 mod lapic_wire;
@@ -44,6 +47,7 @@ pub use bda_kbd::{
     KBD_FLAG2_PAUSE, KBD_FLAG2_SCROLL_DOWN, KBD_FLAG2_SYSREQ, KBD_LED_CAPS, KBD_LED_NUM,
     KBD_LED_SCROLL, KBD_MODE_ENHANCED, KBD_MODE_LAST_E0, KBD_MODE_RIGHT_ALT, KBD_MODE_RIGHT_CTRL,
 };
+pub use bda_timer::{BDA_TICKS_PER_DAY, BDA_TIMER_OVERFLOW, BDA_TIMER_TICKS};
 pub use boot_media::{
     classify_int19_boot_image, classify_machine_int19_media, synthetic_int19_bootable_floppy,
     synthetic_int19_bootable_hd, synthetic_int19_freedos_stub_hd, Int19BootMediaClass,
@@ -108,6 +112,7 @@ pub use int15_apm::{
     APM_AL_INSTALLATION_CHECK, APM_ERR_INTERFACE_CONNECTED, APM_ERR_INTERFACE_NOT_CONNECTED,
     APM_ERR_UNSUPPORTED, APM_VERSION_MAJOR, APM_VERSION_MINOR, INT15_AH_APM, INT15_VECTOR,
 };
+pub use int15_mem::{INT15_AH_EXT_MEM, INT15_AX_E801};
 pub use int16::{
     Int16Key, INT16_AH_CHECK_KEYSTROKE, INT16_AH_EXTENDED_SHIFT_STATUS, INT16_AH_GET_KEYSTROKE,
     INT16_AH_SHIFT_STATUS, INT16_BUFFER_CAP,
@@ -1043,6 +1048,8 @@ impl Machine {
         if rising {
             self.pic.set_irq_line(0, false);
             self.pic.set_irq_line(0, true);
+            // Spec: IBM PC BIOS INT 08h — IRQ0 advances BDA 40:6C (host helper).
+            self.on_pit_irq0_rising_bda_tick();
         } else {
             self.sync_pit_irq0();
         }
