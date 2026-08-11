@@ -11,6 +11,7 @@
 mod bda_kbd;
 mod boot_media;
 mod eltorito_load;
+mod fat12;
 mod guest_boot;
 mod hello_rom;
 mod hpet_wire;
@@ -48,6 +49,12 @@ pub use boot_media::{
     classify_int19_boot_image, classify_machine_int19_media, synthetic_int19_bootable_floppy,
     synthetic_int19_bootable_hd, synthetic_int19_freedos_stub_hd, Int19BootMediaClass,
     MBR_PART0_OFF, MBR_PART_BOOTABLE, MBR_PART_TYPE_FAT12,
+};
+pub use fat12::{
+    find_freedos_names_in_root, locate_freedos_kernel_on_image, locate_freedos_kernel_on_machine,
+    parse_fat12_bpb, synthetic_int19_freedos_fat12_hd, Fat12Bpb, Fat12DirEntry, Fat12KernelLocate,
+    FAT12_NAME_COMMAND_COM, FAT12_NAME_KERNEL_SYS, FAT_ATTR_LFN, FAT_ATTR_VOLUME, FAT_DIRENT_SIZE,
+    FAT_NAME83_LEN,
 };
 pub use guest_boot::{
     classify_bzimage_early, classify_bzimage_setup_deeper, classify_eltorito_media_boot,

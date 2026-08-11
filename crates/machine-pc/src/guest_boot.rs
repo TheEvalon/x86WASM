@@ -1,4 +1,4 @@
-//! Guest disk boot measure harness v2/v4/v7 (FreeDOS/Linux serial-path prep).
+//! Guest disk boot measure harness v2/v4/v8 (FreeDOS/Linux serial-path prep).
 //!
 //! Loads a boot sector / El Torito / synthetic FreeDOS-like image, then reuses
 //! [`Machine::probe_post`] to record the **first** stop reason plus serial
@@ -21,17 +21,19 @@
 //! `docs/boot-r14-freedos-next-gap.md`,
 //! `docs/boot-r14-linux-eltorito-measure.md`,
 //! `docs/boot-r14-mbr-vbr-chain.md`,
-//! `docs/boot-r14-post-with-media.md`).
+//! `docs/boot-r14-post-with-media.md`,
+//! `docs/boot-r15-freedos-next.md`).
 
 use crate::boot_media::{classify_machine_int19_media, Int19BootMediaClass};
+use crate::fat12::locate_freedos_kernel_on_machine;
 use crate::post_probe::{PostFailureKind, PostReport, PostStopReason};
 use crate::{Machine, MachineError};
 
 /// Harness schema version for CLI/report consumers (v2 checkpoints + serial).
 pub const GUEST_BOOT_MEASURE_VERSION: u32 = 2;
 
-/// FreeDOS-like / Linux-serial measure report schema (v7 = VBR-chain next-gap).
-pub const GUEST_OS_MEASURE_VERSION: u32 = 7;
+/// FreeDOS-like / Linux-serial measure report schema (v8 = FAT12 kernel-name next-gap).
+pub const GUEST_OS_MEASURE_VERSION: u32 = 8;
 
 /// BDA equipment list word (`0040:0010`). Spec: RBIL memory map / IBM BIOS.
 pub const BDA_EQUIPMENT: u64 = 0x410;
@@ -227,6 +229,9 @@ pub enum FreedosNextGap {
     /// Active-partition VBR executed (host chain) and halted — past media-attached
     /// class; stub has no COMMAND.COM / FreeDOS kernel.
     ExecutedVbrMissingCommand,
+    /// FAT12 root lists `KERNEL.SYS` / `COMMAND.COM` — past VBR-missing-command;
+    /// next gap is host/guest load of that file (still not a FreeDOS prompt).
+    KernelNameLocatedMissingLoad,
     /// Fixture halted cleanly without INT19-candidate media; next need is real image + POST.
     RealImageAndFirmware,
     /// Non-halt first failure already names the gap — see `first_failure`.
@@ -242,6 +247,7 @@ impl FreedosNextGap {
             Self::GuestInt13IvtMissing => "guest-int13-ivt-missing",
             Self::MediaAttachedBeyondRebootLoop => "media-attached-beyond-reboot-loop",
             Self::ExecutedVbrMissingCommand => "executed-vbr-missing-command",
+            Self::KernelNameLocatedMissingLoad => "kernel-name-located-missing-load",
             Self::RealImageAndFirmware => "real-image-and-firmware",
             Self::SeeFirstFailure => "see-first-failure",
         }
@@ -264,6 +270,9 @@ impl FreedosNextGap {
             }
             Self::ExecutedVbrMissingCommand => {
                 "Next gap: VBR executed (host MBR→VBR chain) then synthetic halt — missing COMMAND.COM / FreeDOS kernel; NOT a FreeDOS prompt"
+            }
+            Self::KernelNameLocatedMissingLoad => {
+                "Next gap: FAT12 root has KERNEL.SYS/COMMAND.COM name — missing cluster load/exec via INT13; NOT a FreeDOS prompt"
             }
             Self::RealImageAndFirmware => {
                 "Next gap: real FreeDOS image + SeaBIOS POST (fixture halt is not progress)"
@@ -332,7 +341,14 @@ pub fn classify_freedos_next_gap_with_handoff(
     }
     if classify_machine_int19_media(machine).is_int19_candidate() {
         return match handoff {
-            FreedosHandoff::ActiveVbr => FreedosNextGap::ExecutedVbrMissingCommand,
+            FreedosHandoff::ActiveVbr => {
+                // R15: FAT12 root name locate advances past executed-vbr-missing-command.
+                if locate_freedos_kernel_on_machine(machine).name_found() {
+                    FreedosNextGap::KernelNameLocatedMissingLoad
+                } else {
+                    FreedosNextGap::ExecutedVbrMissingCommand
+                }
+            }
             FreedosHandoff::MbrSector => FreedosNextGap::MediaAttachedBeyondRebootLoop,
         };
     }
@@ -1386,6 +1402,38 @@ impl Machine {
         ))
     }
 
+    /// Attach FAT12 FreeDOS stub HD (`KERNEL.SYS` root name) and measure VBR chain.
+    ///
+    /// Past [`FreedosNextGap::ExecutedVbrMissingCommand`]: host FAT12 locate finds
+    /// `KERNEL.SYS` → [`FreedosNextGap::KernelNameLocatedMissingLoad`].
+    ///
+    /// Still **not** a FreeDOS prompt — name locate ≠ cluster load/exec.
+    pub fn measure_freedos_fat12_root(
+        &mut self,
+        max_steps: u64,
+    ) -> Result<GuestOsMeasure, MachineError> {
+        if !self.ide.present || self.ide.image.is_empty() {
+            self.attach_freedos_fat12_hd_for_int19();
+        }
+        self.seed_bda_disk_equipment()?;
+        let measure = self.measure_guest_boot(GuestBootMedia::ActiveVbr, max_steps)?;
+        Ok(self.finish_os_measure(
+            GuestOsMeasureKind::FreeDosLike,
+            measure,
+            "Host FAT12 root KERNEL.SYS name locate — does NOT claim FreeDOS prompt or kernel exec.",
+            vec![
+                "FAT12 BPB + root directory walked on host (not guest INT13)",
+                "KERNEL.SYS directory name present; clusters not loaded/executed",
+                "Guest INT 13h still needs SeaBIOS (host subset is not an IVT body)",
+                "No claim of FreeDOS prompt",
+            ],
+            vec![
+                "FAT12 name locate classifies past executed-vbr-missing-command when IVT is present",
+            ],
+            FreedosHandoff::ActiveVbr,
+        ))
+    }
+
     /// Attach a synthetic Linux serial-path stub (if no IDE yet) and measure.
     ///
     /// Captures COM1 from a guest that prints a short banner then `HLT`. Does
@@ -2206,7 +2254,7 @@ mod tests {
         assert!(text.contains("NOT an OS boot"));
         assert!(!text.contains("FreeDOS prompt reached"));
         assert!(text.contains("does NOT claim a FreeDOS prompt"));
-        assert!(text.contains("guest-os-measure-v7:"));
+        assert!(text.contains("guest-os-measure-v8:"));
     }
 
     /// With IVT stub + INT19 media, next-gap is beyond-reboot-loop (still not a prompt).
@@ -2265,6 +2313,46 @@ mod tests {
             FreedosHandoff::ActiveVbr,
         );
         assert_eq!(gap, FreedosNextGap::ExecutedVbrMissingCommand);
+    }
+
+    /// R15: FAT12 root `KERNEL.SYS` name → past executed-vbr-missing-command.
+    #[test]
+    fn measure_freedos_fat12_root_classifies_kernel_name_located() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_freedos_fat12_hd_for_int19();
+        m.seed_bda_disk_equipment().unwrap();
+        m.install_int13_ivt_pointer(0xF000, 0xE000).unwrap();
+        let report = m.measure_freedos_fat12_root(64).expect("fat12-root");
+        assert_eq!(report.version, GUEST_OS_MEASURE_VERSION);
+        assert_eq!(report.media_readiness, MediaBootReadiness::Int19Candidate);
+        assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
+        assert_eq!(report.next_gap, FreedosNextGap::KernelNameLocatedMissingLoad);
+        assert_eq!(report.next_gap.tag(), "kernel-name-located-missing-load");
+        assert!(report.measure.com1.contains('F') || report.measure.com1 == "FD");
+        let text = report.to_string();
+        assert!(text.contains("kernel-name-located-missing-load"));
+        assert!(!text.contains("FreeDOS prompt reached"));
+    }
+
+    /// Spec: ActiveVbr + FAT12 KERNEL.SYS name advances next-gap.
+    #[test]
+    fn classify_freedos_next_gap_fat12_kernel_name() {
+        let mut m = Machine::new(64 * 1024);
+        m.attach_freedos_fat12_hd_for_int19();
+        m.seed_bda_disk_equipment().unwrap();
+        m.install_int13_ivt_pointer(0xF000, 0xE000).unwrap();
+        let probe = Int13ProbeSnapshot {
+            dl: 0x80,
+            ah: 0x01,
+            cf: false,
+        };
+        let gap = classify_freedos_next_gap_with_handoff(
+            &m,
+            &GuestFirstFailureClass::SyntheticHalt,
+            &probe,
+            FreedosHandoff::ActiveVbr,
+        );
+        assert_eq!(gap, FreedosNextGap::KernelNameLocatedMissingLoad);
     }
 
     /// Spec: Linux boot.rst — deepen flags missing cmdline / init_size.
