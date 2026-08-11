@@ -21,6 +21,9 @@
 //! Round-14: Legacy Replacement (`LEG_RT_CAP` / `LEG_RT_CNF`) stays **clear**
 //! so PIT IRQ0 and CMOS IRQ8 remain the real 8254/RTC sources; MSI still
 //! unsupported. See `docs/timer-r14-hpet-legacy.md`.
+//! Round-15: main-counter freerun on the host PIT tick path
+//! (`HPET_TICKS_PER_PIT_CLOCK`) when `ENABLE_CNF` is set — see
+//! `docs/hpet-r15-main-counter.md`. LEG_RT honesty from R14 is unchanged.
 //! See `docs/hpet-r7-comparator-irq.md`, `docs/hpet-r8-periodic.md`,
 //! `docs/hpet-r10-ioapic-wire.md`, `docs/hpet-r11-wrap-irq.md`,
 //! `docs/hpet-r12-msi-irq.md`.
@@ -117,6 +120,14 @@ pub const HPET_VENDOR_ID: u16 = 0x8086;
 /// (`1e15 / 14_318_180 ≈ 69_841_279`). Informational for CAPS; hosts advance
 /// the main counter in abstract ticks via [`HpetMmio::advance_main_counter`].
 pub const HPET_COUNTER_CLK_PERIOD_FS: u32 = 69_841_279;
+
+/// HPET main-counter ticks per PIT input clock (freerun model).
+///
+/// Model choice: HPET at 14.31818 MHz and PIT at 1.193182 MHz gives exactly 12
+/// HPET ticks per PIT clock. Used by machine-pc `tick_pit` / step-clock so
+/// firmware that enables the counter sees it advance without a dedicated host
+/// `advance_hpet` call. Not wall-clock accurate.
+pub const HPET_TICKS_PER_PIT_CLOCK: u64 = 12;
 
 /// Composed 64-bit General Capabilities and ID value.
 pub const HPET_CAPS_ID_VALUE: u64 = (HPET_REV_ID as u64)
@@ -296,8 +307,10 @@ impl HpetMmio {
     ///
     /// Returns `true` if this advance caused a new Timer 0 interrupt event
     /// (status bit newly set / edge latched). When `ENABLE_CNF` is clear the
-    /// counter is halted (HPET 1.0a) and this is a no-op. Not driven by the
-    /// machine step clock — hosts must call this explicitly.
+    /// counter is halted (HPET 1.0a) and this is a no-op. Round-15 hosts may
+    /// drive this from the PIT tick path at [`HPET_TICKS_PER_PIT_CLOCK`] ticks
+    /// per PIT clock when enabled (`docs/hpet-r15-main-counter.md`); explicit
+    /// `advance_hpet` remains available for tests.
     ///
     /// Spec: HPET 1.0a with `COUNT_SIZE_CAP` clear — counter is 32-bit;
     /// wrap from `0xFFFF_FFFF` → `0` is detected when the comparator lies in
@@ -833,5 +846,20 @@ mod tests {
         );
         assert!(!hpet.drives_pic_irq0());
         assert!(!hpet.drives_pic_irq8());
+    }
+
+    /// Spec: model choice — 12 HPET ticks per PIT clock (14.31818 / 1.193182).
+    #[test]
+    fn hpet_ticks_per_pit_clock_is_twelve() {
+        assert_eq!(HPET_TICKS_PER_PIT_CLOCK, 12);
+        let mut hpet = HpetMmio::new();
+        write_u32(&mut hpet, HPET_REG_CONFIG, 1);
+        // No comparator cross expected; return is fire status, not advance status.
+        let _ = hpet.advance_main_counter(HPET_TICKS_PER_PIT_CLOCK);
+        assert_eq!(hpet.main_counter(), HPET_TICKS_PER_PIT_CLOCK);
+        // Disabled: freerun no-op.
+        write_u32(&mut hpet, HPET_REG_CONFIG, 0);
+        let _ = hpet.advance_main_counter(HPET_TICKS_PER_PIT_CLOCK);
+        assert_eq!(hpet.main_counter(), HPET_TICKS_PER_PIT_CLOCK);
     }
 }

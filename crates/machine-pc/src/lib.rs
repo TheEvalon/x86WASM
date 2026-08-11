@@ -1040,6 +1040,16 @@ impl Machine {
         if pm > 0 {
             self.pci.tick_acpi_pm(pm.min(u64::from(u32::MAX)) as u32);
         }
+        // Spec / model: HPET main counter freeruns at 12× PIT when ENABLE_CNF
+        // (R15; `docs/hpet-r15-main-counter.md`). LEG_RT stays clear — no PIC claim.
+        if clocks > 0 {
+            let _ = hpet_wire::freerun_hpet_from_pit_clocks(
+                &mut self.hpet,
+                &mut self.ioapic,
+                &mut self.lapic,
+                clocks,
+            );
+        }
         if rising {
             self.pic.set_irq_line(0, false);
             self.pic.set_irq_line(0, true);
@@ -1333,6 +1343,18 @@ impl Machine {
     /// `PIRQRC[D]=0x0B`. See `docs/usb-r14-uhci-pic.md`.
     pub fn sync_uhci_irq_to_pic(&mut self) -> bool {
         uhci_wire::sync_uhci_irq_to_pic(&mut self.pci, &mut self.pic)
+    }
+
+    /// Host helper: attach device on UHCI PORTSCn and complete a Port Reset pulse.
+    ///
+    /// Spec: UHCI 1.1 §2.1.7 — see `docs/uhci-r15-portsc-reset.md`. Does not
+    /// rewrite PCI config; operates on the BAR0 register file only.
+    pub fn uhci_portsc_attach_and_reset(
+        &mut self,
+        port_index: u8,
+        low_speed: bool,
+    ) -> Result<u16, devices::UhciTdError> {
+        uhci_wire::portsc_attach_and_reset(&mut self.pci, port_index, low_speed)
     }
 
     /// Whether the platform NMI delivery path is unmasked.
@@ -4636,6 +4658,19 @@ mod tests {
             let mut bus = m.bus_mut();
             assert_eq!(bus.poll_external_irq(), None);
         }
+    }
+
+    /// Spec: UHCI 1.1 §2.1.7 — Machine host helper attaches + resets PORTSC to PED.
+    #[test]
+    fn uhci_portsc_attach_and_reset_enables_ped() {
+        use devices::{UHCI_PORTSC_CCS, UHCI_PORTSC_PED, UHCI_PORTSC_PR};
+        let mut m = Machine::new(64 * 1024);
+        let v = m
+            .uhci_portsc_attach_and_reset(0, false)
+            .expect("portsc handshake");
+        assert_ne!(v & UHCI_PORTSC_CCS, 0);
+        assert_ne!(v & UHCI_PORTSC_PED, 0);
+        assert_eq!(v & UHCI_PORTSC_PR, 0);
     }
 
     /// Spec: Intel 82371SB — PIRQRC[D] disabled → UHCI pending does not reach DualPic.

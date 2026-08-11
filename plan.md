@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-11, round-15 usb-timer lane `slice/r15-usb-timer` on base `f7f7a60`): **in progress -- R15 usb-timer lane.** UHCI PORTSC reset/connect deepen; UHCI TD short-packet/Stall honesty (UHCI 1.1); LAPIC LDR/DFR sticky stub (**no CPUID.APIC**); HPET main-counter freerun via PIT tick (12×) keeping LEG_RT clear. See `docs/uhci-r15-*.md`, `docs/lapic-r15-ldr-dfr.md`, `docs/hpet-r15-main-counter.md`.
+
 Status (2026-08-11, round-14 parallel integration `merge/m2-r14-parallel-16` on base `9934398`): **in progress -- fourteenth parallel campaign merged.** Four lanes: UHCI→IRQ11 PIC + LAPIC SVR + HPET legacy honesty; INT16 AH=02/12 + BDA equipment/8042 IRQ1; INT10 scroll/read + VBE 4F02 no-LFB; POST-with-media (past `F000:9842` → `F000:C897`) + MBR→VBR + FreeDOS v7 + Linux/El Torito. See `docs/m2-r14-parallel-integration.md`. **FreeDOS prompt / Linux serial shell still open.** Honesty: no guest LFB; no CPUID.APIC; ADR-0008 table-loader absent.
 
 Status (2026-08-11, round-14 boot-guest lane `slice/r14-boot-guest` on base `9934398`): **in progress -- R14 boot-guest lane.** POST-with-media measure vs `F000:9842`; host MBR→VBR `load_active_vbr_to_7c00`; FreeDOS measure v7 VBR-chain next-gap (`ExecutedVbrMissingCommand`); Linux/El Torito media classify+measure deepen. See `docs/boot-r14-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS.

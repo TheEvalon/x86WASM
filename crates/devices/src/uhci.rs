@@ -10,6 +10,8 @@
 //! owns schedule + PORTSC bit semantics. Round-14 wires host IRQ pending onto
 //! PIIX3 PIRQD → classic ISA IRQ11 via machine-pc (see
 //! `docs/usb-r14-uhci-pic.md`, `docs/usb-r14-uhci-ioc.md`).
+//! Round-15: PORTSC reset handshake deepen + TD short-packet / Stall honesty
+//! (`docs/uhci-r15-portsc-reset.md`, `docs/uhci-r15-td-error-bits.md`).
 //! See `docs/uhci-r8-one-td.md`, `docs/uhci-r11-frame-list-walk.md`,
 //! `docs/uhci-r11-portsc.md`, `docs/uhci-r12-qh-horizontal.md`,
 //! `docs/uhci-r12-usbsts-usbintr.md`.
@@ -98,6 +100,15 @@ pub const UHCI_TD_ACTIVE: u32 = 1 << 23;
 /// TD Control/Status Interrupt On Complete (bit 24).
 pub const UHCI_TD_IOC: u32 = 1 << 24;
 
+/// TD Control/Status Stalled (UHCI 1.1 §3.2.2 bit 22).
+pub const UHCI_TD_STALLED: u32 = 1 << 22;
+
+/// TD Control/Status Short Packet Detect enable (UHCI 1.1 §3.2.2 bit 29).
+///
+/// Presence/readback only for schedule builders; short-packet completion is
+/// indicated by Actual Length < MaxLen with Active clear and Stall clear.
+pub const UHCI_TD_SPD: u32 = 1 << 29;
+
 /// TD token PID field mask (bits 7:0).
 pub const UHCI_TD_PID_MASK: u32 = 0xFF;
 
@@ -160,17 +171,21 @@ pub const UHCI_PORTSC_PR: u16 = 1 << 12;
 /// Guest-writable PORTSC bits retained by this stub (excluding R/WC one-shots).
 const UHCI_PORTSC_WRITABLE: u16 = UHCI_PORTSC_PED | UHCI_PORTSC_PR;
 
-/// Result of a successful one-TD walk.
+/// Result of a one-TD walk (success, short packet, or stall completion).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UhciTdTransfer {
     /// Physical address of the TD that was executed.
     pub td_addr: u32,
     /// Token PID processed.
     pub pid: u8,
-    /// Bytes moved through the buffer pointer.
+    /// Bytes moved through the buffer pointer (0 on stall).
     pub bytes_copied: usize,
     /// Whether USBSTS.USBINT was latched (IOC was set).
     pub usbint: bool,
+    /// IN completed with Actual Length &lt; MaxLen (UHCI short packet).
+    pub short_packet: bool,
+    /// TD Stalled bit was set; USBERRINT latched (not a fake success).
+    pub stalled: bool,
 }
 
 /// Summary of a multi-frame / QH-horizontal schedule walk.
@@ -347,6 +362,40 @@ fn collect_frame_td_addrs<R: FnMut(u32) -> u8>(
     }
 }
 
+fn finish_td_ioc(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize], status: u32) -> bool {
+    if status & UHCI_TD_IOC != 0 {
+        let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_USBINT;
+        set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
+        true
+    } else {
+        false
+    }
+}
+
+fn complete_td_stalled<W: FnMut(u32, u8)>(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    mem_write: &mut W,
+    td_addr: u32,
+    status: u32,
+    pid: u8,
+) -> UhciTdTransfer {
+    // Spec: UHCI 1.1 §3.2.2 — Stalled clears Active; software must not treat
+    // the TD as a successful transfer. Latch USBERRINT for error probes.
+    let status =
+        (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK) | UHCI_TD_STALLED | encode_actlen(0);
+    write_phys_u32(mem_write, td_addr.wrapping_add(4), status);
+    latch_usb_error(regs);
+    let usbint = finish_td_ioc(regs, status);
+    UhciTdTransfer {
+        td_addr,
+        pid,
+        bytes_copied: 0,
+        usbint,
+        short_packet: false,
+        stalled: true,
+    }
+}
+
 fn execute_td_at<R, W>(
     regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
     device_buf: &mut [u8],
@@ -358,8 +407,23 @@ where
     R: FnMut(u32) -> u8,
     W: FnMut(u32, u8),
 {
+    execute_td_at_inner(regs, device_buf, mem_read, mem_write, td_addr, false)
+}
+
+fn execute_td_at_inner<R, W>(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    device_buf: &mut [u8],
+    mem_read: &mut R,
+    mem_write: &mut W,
+    td_addr: u32,
+    force_stall: bool,
+) -> Result<UhciTdTransfer, UhciTdError>
+where
+    R: FnMut(u32) -> u8,
+    W: FnMut(u32, u8),
+{
     let link_ptr = read_phys_u32(mem_read, td_addr);
-    let mut status = read_phys_u32(mem_read, td_addr.wrapping_add(4));
+    let status = read_phys_u32(mem_read, td_addr.wrapping_add(4));
     let token = read_phys_u32(mem_read, td_addr.wrapping_add(8));
     let buffer = read_phys_u32(mem_read, td_addr.wrapping_add(12));
     let _ = link_ptr; // TD vertical link not followed in this stub
@@ -369,23 +433,56 @@ where
     }
 
     let pid = (token & UHCI_TD_PID_MASK) as u8;
+    if force_stall {
+        return Ok(complete_td_stalled(regs, mem_write, td_addr, status, pid));
+    }
+
     let max_len = uhci_len_field(token >> UHCI_TD_MAXLEN_SHIFT).min(UHCI_TD_MAX_TRANSFER);
     if max_len == 0 {
-        status = (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK) | encode_actlen(0);
+        let status =
+            (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK & !UHCI_TD_STALLED) | encode_actlen(0);
         write_phys_u32(mem_write, td_addr.wrapping_add(4), status);
-        let usbint = status_was_ioc_and_latch(regs, status);
+        let usbint = finish_td_ioc(regs, status);
         return Ok(UhciTdTransfer {
             td_addr,
             pid,
             bytes_copied: 0,
             usbint,
+            short_packet: false,
+            stalled: false,
         });
+    }
+
+    // OUT/SETUP: device must accept the full MaxLen or Stall — never fake a
+    // short "success". IN: fewer device bytes is an honest short packet.
+    match pid {
+        UHCI_PID_OUT | UHCI_PID_SETUP if device_buf.len() < max_len => {
+            return Ok(complete_td_stalled(regs, mem_write, td_addr, status, pid));
+        }
+        UHCI_PID_IN if device_buf.is_empty() => {
+            // Zero-length IN short packet (not EmptyBuffer error / not Stall).
+            let status = (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK & !UHCI_TD_STALLED)
+                | encode_actlen(0);
+            write_phys_u32(mem_write, td_addr.wrapping_add(4), status);
+            let usbint = finish_td_ioc(regs, status);
+            return Ok(UhciTdTransfer {
+                td_addr,
+                pid,
+                bytes_copied: 0,
+                usbint,
+                short_packet: true,
+                stalled: false,
+            });
+        }
+        UHCI_PID_IN | UHCI_PID_OUT | UHCI_PID_SETUP => {}
+        other => return Err(UhciTdError::UnsupportedPid(other)),
     }
 
     if device_buf.is_empty() {
         return Err(UhciTdError::EmptyBuffer);
     }
     let n = max_len.min(device_buf.len());
+    let short_packet = pid == UHCI_PID_IN && n < max_len;
     if buffer.checked_add((n - 1) as u32).is_none() {
         return Err(UhciTdError::GuestAddressOverflow {
             phys_addr: buffer,
@@ -407,28 +504,57 @@ where
         other => return Err(UhciTdError::UnsupportedPid(other)),
     }
 
-    let ioc = status & UHCI_TD_IOC != 0;
-    status = (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK) | encode_actlen(n);
+    let status =
+        (status & !UHCI_TD_ACTIVE & !UHCI_TD_ACTLEN_MASK & !UHCI_TD_STALLED) | encode_actlen(n);
     write_phys_u32(mem_write, td_addr.wrapping_add(4), status);
-    let usbint = if ioc {
-        let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_USBINT;
-        set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
-        true
-    } else {
-        false
-    };
+    let usbint = finish_td_ioc(regs, status);
 
     Ok(UhciTdTransfer {
         td_addr,
         pid,
         bytes_copied: n,
         usbint,
+        short_packet,
+        stalled: false,
     })
 }
 
-fn bump_frnum(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
-    let frnum = (reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM).wrapping_add(1)) & 0x3FF;
-    set_reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM, frnum);
+/// Walk one Active TD and complete it as **Stalled** (USBERRINT, no fake success).
+///
+/// Spec: UHCI 1.1 §3.2.2 bit 22 + §2.1.2 USBERRINT. Used for firmware / host
+/// probes of the stall error path without inventing a successful transfer.
+pub fn run_one_td_stall<R, W>(
+    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
+    bus_master: bool,
+    mut mem_read: R,
+    mut mem_write: W,
+) -> Result<UhciTdTransfer, UhciTdError>
+where
+    R: FnMut(u32) -> u8,
+    W: FnMut(u32, u8),
+{
+    if !bus_master {
+        return Err(UhciTdError::BusMasterDisabled);
+    }
+    let usbcmd = reg_u16(regs, PCI_PIIX_USB_UHCI_USBCMD);
+    if usbcmd & UHCI_USBCMD_RS == 0 {
+        return Err(UhciTdError::NotRunning);
+    }
+
+    let flbase = reg_u32(regs, PCI_PIIX_USB_UHCI_FLBASEADD) & !0xFFF;
+    let frnum = (reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM) & 0x3FF) as u32;
+    let frame_entry_addr = flbase.wrapping_add(frnum.wrapping_mul(4));
+    let link = read_phys_u32(&mut mem_read, frame_entry_addr);
+    let td_addr = resolve_td_addr(&mut mem_read, link)?;
+    let mut empty: [u8; 0] = [];
+    execute_td_at_inner(
+        regs,
+        &mut empty,
+        &mut mem_read,
+        &mut mem_write,
+        td_addr,
+        true,
+    )
 }
 
 /// Read USBSTS with HCHalted overlay when USBCMD.RS is clear.
@@ -646,19 +772,9 @@ where
     })
 }
 
-fn status_was_ioc_and_latch(
-    regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
-    status_before_clear: u32,
-) -> bool {
-    // Caller already cleared Active; check IOC from the value written path used IOC bit.
-    // For zero-length we pass post-update status which still retains IOC.
-    if status_before_clear & UHCI_TD_IOC != 0 {
-        let sts = reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS) | UHCI_USBSTS_USBINT;
-        set_reg_u16(regs, PCI_PIIX_USB_UHCI_USBSTS, sts);
-        true
-    } else {
-        false
-    }
+fn bump_frnum(regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize]) {
+    let frnum = (reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM).wrapping_add(1)) & 0x3FF;
+    set_reg_u16(regs, PCI_PIIX_USB_UHCI_FRNUM, frnum);
 }
 
 fn portsc_offset(port_index: u8) -> Result<u8, UhciTdError> {
@@ -681,8 +797,10 @@ pub fn portsc_read(
 /// Guest PORTSC write: R/WC CSC/PEDC, retain PED/PR, preserve RO CCS/LS.
 ///
 /// Spec: UHCI 1.1 §2.1.7 — firmware probe typically pulses PR then enables PED
-/// when CCS is set. Ending reset (PR 1→0) while CCS is set auto-sets PED and
-/// PEDC so a connect is enabled after reset.
+/// when CCS is set. Round-15 deepen:
+/// - asserting PR clears PED (+ PEDC if was enabled)
+/// - PED does not stick while PR is set or CCS is clear
+/// - ending reset (PR 1→0) while CCS is set auto-sets PED and PEDC
 pub fn portsc_write(
     regs: &mut [u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize],
     port_index: u8,
@@ -691,9 +809,6 @@ pub fn portsc_write(
     let off = portsc_offset(port_index)?;
     let old = reg_u16(regs, off);
     let ro = old & (UHCI_PORTSC_CCS | UHCI_PORTSC_LS);
-    let mut next = ro;
-    next |= value & UHCI_PORTSC_WRITABLE;
-    // R/WC: write-1 clears CSC / PEDC.
     let mut csc = old & UHCI_PORTSC_CSC;
     let mut pedc = old & UHCI_PORTSC_PEDC;
     if value & UHCI_PORTSC_CSC != 0 {
@@ -702,16 +817,38 @@ pub fn portsc_write(
     if value & UHCI_PORTSC_PEDC != 0 {
         pedc = 0;
     }
-    // Reset end (PR 1→0) with device present → enable port.
+
     let pr_was = old & UHCI_PORTSC_PR != 0;
-    let pr_now = next & UHCI_PORTSC_PR != 0;
-    if pr_was && !pr_now && ro & UHCI_PORTSC_CCS != 0 && next & UHCI_PORTSC_PED == 0 {
-        next |= UHCI_PORTSC_PED;
+    let ped_was = old & UHCI_PORTSC_PED != 0;
+    let wr = value & UHCI_PORTSC_WRITABLE;
+    let pr_now = wr & UHCI_PORTSC_PR != 0;
+    let mut ped = wr & UHCI_PORTSC_PED != 0;
+
+    // Spec: UHCI 1.1 §2.1.7 — starting Port Reset disables the port.
+    if !pr_was && pr_now && ped_was {
         pedc = UHCI_PORTSC_PEDC;
     }
-    // Software PED clear while connected latches PEDC.
-    if old & UHCI_PORTSC_PED != 0 && next & UHCI_PORTSC_PED == 0 {
+    if pr_now {
+        ped = false;
+    }
+    // Connect-status honesty: PED cannot enable with CCS clear.
+    if ro & UHCI_PORTSC_CCS == 0 {
+        ped = false;
+    }
+    // Reset end (PR 1→0) with device present → enable port.
+    if pr_was && !pr_now && ro & UHCI_PORTSC_CCS != 0 {
+        ped = true;
         pedc = UHCI_PORTSC_PEDC;
+    } else if ped_was && !ped {
+        pedc = UHCI_PORTSC_PEDC;
+    }
+
+    let mut next = ro;
+    if ped {
+        next |= UHCI_PORTSC_PED;
+    }
+    if pr_now {
+        next |= UHCI_PORTSC_PR;
     }
     next |= csc | pedc | UHCI_PORTSC_RESERVED1;
     set_reg_u16(regs, off, next);
@@ -1282,6 +1419,44 @@ mod tests {
         assert_ne!(end & UHCI_PORTSC_CCS, 0);
     }
 
+    /// Spec: UHCI 1.1 §2.1.7 — asserting PR clears PED and latches PEDC.
+    #[test]
+    fn portsc_pr_assert_clears_ped() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        portsc_attach_device(&mut regs, 0, false).unwrap();
+        portsc_write(&mut regs, 0, UHCI_PORTSC_PR).unwrap();
+        portsc_write(&mut regs, 0, 0).unwrap(); // end reset → PED
+        assert_ne!(portsc_read(&regs, 0).unwrap() & UHCI_PORTSC_PED, 0);
+        // Clear PEDC from reset-end so the next latch is unambiguous.
+        portsc_write(&mut regs, 0, UHCI_PORTSC_PED | UHCI_PORTSC_PEDC).unwrap();
+
+        let mid = portsc_write(&mut regs, 0, UHCI_PORTSC_PR).unwrap();
+        assert_ne!(mid & UHCI_PORTSC_PR, 0);
+        assert_eq!(mid & UHCI_PORTSC_PED, 0);
+        assert_ne!(mid & UHCI_PORTSC_PEDC, 0);
+        assert_ne!(mid & UHCI_PORTSC_CCS, 0);
+    }
+
+    /// Spec: UHCI 1.1 §2.1.7 — PED does not stick with CCS clear (connect honesty).
+    #[test]
+    fn portsc_ped_ignored_while_disconnected() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        let v = portsc_write(&mut regs, 0, UHCI_PORTSC_PED).unwrap();
+        assert_eq!(v & UHCI_PORTSC_CCS, 0);
+        assert_eq!(v & UHCI_PORTSC_PED, 0);
+    }
+
+    /// Spec: UHCI 1.1 §2.1.7 — PED write ignored while PR is asserted.
+    #[test]
+    fn portsc_ped_ignored_while_reset_active() {
+        let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
+        portsc_attach_device(&mut regs, 0, false).unwrap();
+        let v = portsc_write(&mut regs, 0, UHCI_PORTSC_PR | UHCI_PORTSC_PED).unwrap();
+        assert_ne!(v & UHCI_PORTSC_PR, 0);
+        assert_eq!(v & UHCI_PORTSC_PED, 0);
+        assert_ne!(v & UHCI_PORTSC_CCS, 0);
+    }
+
     #[test]
     fn portsc_detach_clears_ccs_and_ped() {
         let mut regs = [0u8; PCI_PIIX_USB_UHCI_IO_SIZE as usize];
@@ -1294,6 +1469,150 @@ mod tests {
         assert_eq!(v & UHCI_PORTSC_PED, 0);
         assert_ne!(v & UHCI_PORTSC_CSC, 0);
         assert_ne!(v & UHCI_PORTSC_PEDC, 0);
+    }
+
+    /// Spec: UHCI 1.1 §3.2.2 — IN short packet: ActLen &lt; MaxLen, Active clear, Stall clear.
+    #[test]
+    fn td_in_short_packet_sets_actlen_not_stall() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0008_0000u32;
+        let td = 0x0008_1000u32;
+        let buf = 0x0008_2000u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, td);
+        mem.write_u32(td, UHCI_LINK_TERMINATE);
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE | UHCI_TD_SPD);
+        // MaxLen = 8; device provides 3 → short packet.
+        mem.write_u32(
+            td + 8,
+            u32::from(UHCI_PID_IN) | ((8 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(td + 12, buf);
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+
+        let mut device = [0x11, 0x22, 0x33];
+        let xfer = run_one_td(
+            &mut pci.uhci_io,
+            true,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("short IN");
+        assert_eq!(xfer.bytes_copied, 3);
+        assert!(xfer.short_packet);
+        assert!(!xfer.stalled);
+        let status = mem.read_u32(td + 4);
+        assert_eq!(status & UHCI_TD_ACTIVE, 0);
+        assert_eq!(status & UHCI_TD_STALLED, 0);
+        assert_eq!(uhci_len_field(status), 3);
+        assert_eq!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBERRINT, 0);
+        assert_eq!(mem.get(buf), 0x11);
+        assert_eq!(mem.get(buf + 2), 0x33);
+    }
+
+    /// Spec: UHCI 1.1 §3.2.2 — Stall clears Active, sets Stalled, latches USBERRINT.
+    #[test]
+    fn td_stall_sets_stalled_and_usberrint() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x0009_0000u32;
+        let td = 0x0009_1000u32;
+        let buf = 0x0009_2000u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, td);
+        mem.write_u32(td, UHCI_LINK_TERMINATE);
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE | UHCI_TD_IOC);
+        mem.write_u32(
+            td + 8,
+            u32::from(UHCI_PID_IN) | ((8 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(td + 12, buf);
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+        usbintr_write(&mut pci.uhci_io, UHCI_USBINTR_CRC | UHCI_USBINTR_IOC);
+
+        let xfer = run_one_td_stall(&mut pci.uhci_io, true, |a| mem.get(a), |a, v| mem.set(a, v))
+            .expect("stall");
+        assert!(xfer.stalled);
+        assert!(!xfer.short_packet);
+        assert_eq!(xfer.bytes_copied, 0);
+        assert!(xfer.usbint);
+        let status = mem.read_u32(td + 4);
+        assert_eq!(status & UHCI_TD_ACTIVE, 0);
+        assert_ne!(status & UHCI_TD_STALLED, 0);
+        assert_ne!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBERRINT, 0);
+        assert_ne!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBINT, 0);
+        assert!(uhci_interrupt_pending(&pci.uhci_io));
+    }
+
+    /// Spec: UHCI 1.1 — OUT shorter than MaxLen is Stall, not fake short success.
+    #[test]
+    fn td_out_short_device_buf_stalls() {
+        let mut pci = PciConfig::new();
+        let bar = 0xD000u16;
+        enable_uhci_io(&mut pci, bar);
+
+        let flbase = 0x000A_0000u32;
+        let td = 0x000A_1000u32;
+        let buf = 0x000A_2000u32;
+        let mem = FakeMem::new();
+        mem.write_u32(flbase, td);
+        mem.write_u32(td, UHCI_LINK_TERMINATE);
+        mem.write_u32(td + 4, UHCI_TD_ACTIVE);
+        mem.write_u32(
+            td + 8,
+            u32::from(UHCI_PID_OUT) | ((4 - 1) << UHCI_TD_MAXLEN_SHIFT),
+        );
+        mem.write_u32(td + 12, buf);
+        for i in 0..4u32 {
+            mem.set(buf + i, 0xAA);
+        }
+
+        write_uhci_reg(&mut pci, bar, PCI_PIIX_USB_UHCI_FLBASEADD, 4, flbase);
+        write_uhci_reg(
+            &mut pci,
+            bar,
+            PCI_PIIX_USB_UHCI_USBCMD,
+            2,
+            u32::from(UHCI_USBCMD_RS),
+        );
+
+        let mut device = [0u8; 2]; // too short for MaxLen=4
+        let xfer = run_one_td(
+            &mut pci.uhci_io,
+            true,
+            &mut device,
+            |a| mem.get(a),
+            |a, v| mem.set(a, v),
+        )
+        .expect("OUT stall");
+        assert!(xfer.stalled);
+        assert!(!xfer.short_packet);
+        let status = mem.read_u32(td + 4);
+        assert_ne!(status & UHCI_TD_STALLED, 0);
+        assert_eq!(status & UHCI_TD_ACTIVE, 0);
+        assert_ne!(usbsts_read(&pci.uhci_io) & UHCI_USBSTS_USBERRINT, 0);
     }
 
     /// Spec: UHCI 1.1 §2.1.2/§2.1.3 — IOC latches USBINT; USBINTR.IOC gates host IRQ.
