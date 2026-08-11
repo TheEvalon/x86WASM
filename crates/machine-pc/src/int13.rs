@@ -2125,7 +2125,11 @@ mod tests {
         m.service_int13_hd();
         assert!(!cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
-        assert_eq!(m.read_guest_u16(0x5402).unwrap(), 2, "DAP count = transferred");
+        assert_eq!(
+            m.read_guest_u16(0x5402).unwrap(),
+            2,
+            "DAP count = transferred"
+        );
     }
 
     /// Spec: AH=42h one-past-end fails with AH=04h and DAP count cleared to 0.
@@ -2138,7 +2142,11 @@ mod tests {
         m.service_int13_hd();
         assert!(cf(&m.cpu));
         assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
-        assert_eq!(m.read_guest_u16(0x5502).unwrap(), 0, "DAP count cleared on fail");
+        assert_eq!(
+            m.read_guest_u16(0x5502).unwrap(),
+            0,
+            "DAP count cleared on fail"
+        );
     }
 
     /// Spec: AH=42h zero block count / flat FFFF:FFFF buffer → invalid.
@@ -2285,15 +2293,7 @@ mod tests {
         img[lba_spt] = 0x63;
         img[lba_next] = 0x64;
         let mut m = Machine::with_ide(64 * 1024, img);
-        setup_int13_hd_read(
-            &mut m.cpu,
-            0,
-            0,
-            INT13_HD_SPT as u8,
-            2,
-            0x0000,
-            0x8000,
-        );
+        setup_int13_hd_read(&mut m.cpu, 0, 0, INT13_HD_SPT as u8, 2, 0x0000, 0x8000);
         m.service_int13_hd();
         assert!(!cf(&m.cpu), "track-crossing multi-sector must succeed");
         assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
@@ -2764,9 +2764,7 @@ mod tests {
         assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
         assert_eq!(m.mem.read_u8(0x8000).unwrap(), 0xF4);
         assert_eq!(
-            m.mem
-                .read_u8(0x8000 + INT13_CD_SECTOR_SIZE as u64)
-                .unwrap(),
+            m.mem.read_u8(0x8000 + INT13_CD_SECTOR_SIZE as u64).unwrap(),
             0xB0
         );
         assert_eq!(m.read_guest_u16(0x4002).unwrap(), 2);
