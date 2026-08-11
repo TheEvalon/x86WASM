@@ -58,10 +58,11 @@ pub use fat12::{
 };
 pub use guest_boot::{
     classify_bzimage_early, classify_bzimage_setup_deeper, classify_eltorito_boot_payload,
-    classify_eltorito_media_boot, classify_freedos_next_gap, classify_freedos_next_gap_with_handoff,
-    classify_guest_first_failure, classify_linux_media_boot, classify_linux_next_gap,
-    inspect_linux_boot_protocol_header, linux_realmode_bytes, linux_setup_sect_count,
-    synthetic_eltorito_bzimage_iso, synthetic_eltorito_linux_hlt_iso, synthetic_freedos_like_disk,
+    classify_eltorito_media_boot, classify_freedos_next_gap,
+    classify_freedos_next_gap_with_handoff, classify_guest_first_failure,
+    classify_linux_media_boot, classify_linux_next_gap, inspect_linux_boot_protocol_header,
+    linux_realmode_bytes, linux_setup_sect_count, synthetic_eltorito_bzimage_iso,
+    synthetic_eltorito_linux_hlt_iso, synthetic_freedos_like_disk,
     synthetic_linux_boot_protocol_header, synthetic_linux_bzimage_setup_hlt,
     synthetic_linux_serial_stub_disk, BzImageEarlyClass, BzImageLoadError, BzImageNextStep,
     ElToritoMediaBootClass, ElToritoPayloadClass, FreedosHandoff, FreedosNextGap,

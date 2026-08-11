@@ -1282,9 +1282,7 @@ impl LinuxNextGap {
             Self::SeeFirstFailure => "see-first-failure",
             Self::SyntheticMediaHalt => "synthetic-media-halt",
             Self::SetupLoadedMissingEntry => "setup-loaded-missing-entry",
-            Self::SetupExecutedMissingProtectedKernel => {
-                "setup-executed-missing-protected-kernel"
-            }
+            Self::SetupExecutedMissingProtectedKernel => "setup-executed-missing-protected-kernel",
             Self::RealKernelAndFirmware => "real-kernel-and-firmware",
         }
     }
@@ -2680,7 +2678,10 @@ mod tests {
         assert_eq!(report.version, GUEST_OS_MEASURE_VERSION);
         assert_eq!(report.media_readiness, MediaBootReadiness::Int19Candidate);
         assert_eq!(report.first_failure, GuestFirstFailureClass::SyntheticHalt);
-        assert_eq!(report.next_gap, FreedosNextGap::KernelNameLocatedMissingLoad);
+        assert_eq!(
+            report.next_gap,
+            FreedosNextGap::KernelNameLocatedMissingLoad
+        );
         assert_eq!(report.next_gap.tag(), "kernel-name-located-missing-load");
         assert!(report.measure.com1.contains('F') || report.measure.com1 == "FD");
         let text = report.to_string();
@@ -2853,11 +2854,7 @@ mod tests {
         let mut bz = synthetic_linux_boot_protocol_header(1, 0x0200, 0, 0);
         bz.resize(need, 0);
         let media = LinuxMediaBootClass::BzImage(classify_bzimage_early(&bz));
-        let gap = classify_linux_next_gap(
-            &GuestFirstFailureClass::SyntheticHalt,
-            &media,
-            false,
-        );
+        let gap = classify_linux_next_gap(&GuestFirstFailureClass::SyntheticHalt, &media, false);
         assert_eq!(gap, LinuxNextGap::SetupLoadedMissingEntry);
     }
 

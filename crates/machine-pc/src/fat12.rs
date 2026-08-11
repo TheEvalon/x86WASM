@@ -11,8 +11,8 @@
 //! OSDev FAT; `docs/boot-r15-freedos-next.md`.
 
 use crate::boot_media::{
-    classify_int19_boot_image, Int19BootMediaClass, MBR_PART_TYPE_FAT12, MBR_PART0_OFF,
-    MBR_PART_BOOTABLE,
+    classify_int19_boot_image, Int19BootMediaClass, MBR_PART0_OFF, MBR_PART_BOOTABLE,
+    MBR_PART_TYPE_FAT12,
 };
 use crate::mbr::{MBR_SECTOR_SIZE, MBR_SIGNATURE_HI, MBR_SIGNATURE_LO};
 use crate::Machine;
@@ -56,7 +56,7 @@ impl Fat12Bpb {
     pub fn root_dir_sectors(self) -> u32 {
         let bytes = u32::from(self.root_entry_count) * FAT_DIRENT_SIZE as u32;
         let bps = u32::from(self.bytes_per_sector.max(1));
-        (bytes + bps - 1) / bps
+        bytes.div_ceil(bps)
     }
 }
 
@@ -255,12 +255,11 @@ pub fn find_freedos_names_in_root(root: &[u8]) -> Fat12KernelLocate {
 /// Host-only: reads VBR BPB + root directory sectors. Does not load clusters.
 pub fn locate_freedos_kernel_on_image(image: &[u8]) -> Fat12KernelLocate {
     match classify_int19_boot_image(image) {
-        Int19BootMediaClass::TooShort => return Fat12KernelLocate::NoMedia,
+        Int19BootMediaClass::TooShort => Fat12KernelLocate::NoMedia,
         Int19BootMediaClass::HdActivePartition {
             part_lba,
             part_type,
-        } if part_type == MBR_PART_TYPE_FAT12 || part_type == 0x04 || part_type == 0x06 =>
-        {
+        } if part_type == MBR_PART_TYPE_FAT12 || part_type == 0x04 || part_type == 0x06 => {
             let vbr_off = (part_lba as usize).saturating_mul(MBR_SECTOR_SIZE);
             if vbr_off + MBR_SECTOR_SIZE > image.len() {
                 return Fat12KernelLocate::BadBpb;
@@ -386,17 +385,23 @@ pub fn synthetic_int19_freedos_fat12_hd() -> Vec<u8> {
 
     // FAT1 / FAT2 media ID + EOF for cluster 2
     let fat_off = vbr_off + MBR_SECTOR_SIZE; // reserved=1 → first FAT
-    // FAT12: two reserved clusters + cluster2 = EOF (0xFFF)
-    // bytes: F8 FF FF (media+EOC cluster1) then FF 0F for cluster2 EOC packed...
-    // cluster 0 = 0xFF8, cluster 1 = 0xFFF, cluster 2 = 0xFFF
-    // packed: F8 FF FF FF 0F
+                                             // FAT12: two reserved clusters + cluster2 = EOF (0xFFF)
+                                             // bytes: F8 FF FF (media+EOC cluster1) then FF 0F for cluster2 EOC packed...
+                                             // cluster 0 = 0xFF8, cluster 1 = 0xFFF, cluster 2 = 0xFFF
+                                             // packed: F8 FF FF FF 0F
     img[fat_off] = 0xF8;
     img[fat_off + 1] = 0xFF;
     img[fat_off + 2] = 0xFF;
     img[fat_off + 3] = 0xFF;
     img[fat_off + 4] = 0x0F;
     let fat2_off = fat_off + MBR_SECTOR_SIZE;
-    let fat_bytes = [img[fat_off], img[fat_off + 1], img[fat_off + 2], img[fat_off + 3], img[fat_off + 4]];
+    let fat_bytes = [
+        img[fat_off],
+        img[fat_off + 1],
+        img[fat_off + 2],
+        img[fat_off + 3],
+        img[fat_off + 4],
+    ];
     img[fat2_off..fat2_off + 5].copy_from_slice(&fat_bytes);
 
     // Root directory (1 sector for 16 entries)
