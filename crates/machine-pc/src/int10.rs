@@ -407,6 +407,7 @@ impl Machine {
     }
 
     /// Shared text-cell scroll used by AH=06h/07h and teletype / write-string.
+    #[allow(clippy::too_many_arguments)] // window geometry mirrors AH=06h/07h register arity
     fn scroll_text_window_cells(
         &mut self,
         up: bool,
@@ -777,9 +778,7 @@ impl Machine {
             0x08 => {
                 // BS — left one column; do not erase; do not wrap to prior row.
                 // Spec: classic IBM VGA BIOS teletype (RBIL AH=0Eh); R15 honesty.
-                if col > 0 {
-                    col -= 1;
-                }
+                col = col.saturating_sub(1);
             }
             0x07 => {
                 // BEL — accepted; no PC-speaker path. Host observation counter only.
