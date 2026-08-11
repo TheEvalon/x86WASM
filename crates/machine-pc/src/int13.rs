@@ -474,16 +474,24 @@ impl Machine {
     }
 
     /// Spec: IBM/MS INT 13h Extensions AH=42h — Disk Address Packet at `DS:SI`.
+    ///
+    /// On completion the DAP block-count field is rewritten to the number of
+    /// blocks successfully transferred (0 on total failure after a parseable
+    /// packet). Spec: IBM/Microsoft INT 13h Extensions.
     fn int13_hd_ext_read_from_regs(&mut self) {
         let si = self.cpu.gpr_u16(CpuState::RSI);
         let dap_phys = self.cpu.ds.base.wrapping_add(u64::from(si));
         match self.int13_parse_dap(dap_phys) {
             Ok(dap) => match self.int13_hd_read_lba_to_phys(dap.lba, dap.count, dap.buf) {
-                Ok(_) => {
+                Ok(n) => {
+                    let _ = self.int13_dap_set_count(dap_phys, n);
                     self.cpu.set_ah(INT13_STATUS_OK);
                     self.cpu.set_cf(false);
                 }
-                Err(status) => self.int13_fail(status),
+                Err(status) => {
+                    let _ = self.int13_dap_set_count(dap_phys, 0);
+                    self.int13_fail(status);
+                }
             },
             Err(status) => self.int13_fail(status),
         }
@@ -567,6 +575,10 @@ impl Machine {
             return Err(INT13_STATUS_INVALID);
         }
         let count = self.read_guest_u16(dap_phys + 2)?;
+        // Spec: IBM/MS INT 13h Extensions — zero block count is invalid.
+        if count == 0 {
+            return Err(INT13_STATUS_INVALID);
+        }
         let buf_off = self.read_guest_u16(dap_phys + 4)?;
         let buf_seg = self.read_guest_u16(dap_phys + 6)?;
         let lba = self.read_guest_u64(dap_phys + 8)?;
@@ -577,6 +589,11 @@ impl Machine {
         }
         let buf = (u64::from(buf_seg) << 4).wrapping_add(u64::from(buf_off));
         Ok(DiskAddressPacket { count, buf, lba })
+    }
+
+    /// Write DAP block-count field (offset 2) after AH=42h/43h completion.
+    fn int13_dap_set_count(&mut self, dap_phys: u64, count: u16) -> Result<(), u8> {
+        self.write_guest_u16(dap_phys + 2, count)
     }
 
     fn read_guest_u16(&self, phys: u64) -> Result<u16, u8> {
@@ -2013,6 +2030,54 @@ mod tests {
         m.cpu.set_ah(INT13_AH_EXT_READ);
         m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
         m.cpu.set_gpr_u16(CpuState::RSI, 0x5300);
+        m.cpu.ds = x86_core::SegmentReg::real_mode(0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+    }
+
+    /// Spec: AH=42h exact end-of-media LBA range succeeds; DAP count rewritten.
+    #[test]
+    fn int13_ah42_exact_end_rewrites_dap_count() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        // LBA 2..4 (2 blocks) is the exact tail of a 4-sector image.
+        setup_int13_hd_ext_read(&mut m, 0x5400, 2, 2, 0x0000, 0x8000);
+        m.service_int13_hd();
+        assert!(!cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_OK);
+        assert_eq!(m.read_guest_u16(0x5402).unwrap(), 2, "DAP count = transferred");
+    }
+
+    /// Spec: AH=42h one-past-end fails with AH=04h and DAP count cleared to 0.
+    #[test]
+    fn int13_ah42_past_end_clears_dap_count() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(4));
+        setup_int13_hd_ext_read(&mut m, 0x5500, 3, 2, 0x0000, 0x8000);
+        // Requested count was 2.
+        assert_eq!(m.read_guest_u16(0x5502).unwrap(), 2);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_SECTOR_NOT_FOUND);
+        assert_eq!(m.read_guest_u16(0x5502).unwrap(), 0, "DAP count cleared on fail");
+    }
+
+    /// Spec: AH=42h zero block count / flat FFFF:FFFF buffer → invalid.
+    #[test]
+    fn int13_ah42_rejects_zero_count_and_flat_buffer() {
+        let mut m = Machine::with_ide(64 * 1024, synthetic_disk(2));
+        write_dap(&mut m, 0x5600, 0, 0, 0x0000, 0x7000);
+        m.cpu.set_ah(INT13_AH_EXT_READ);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.cpu.set_gpr_u16(CpuState::RSI, 0x5600);
+        m.cpu.ds = x86_core::SegmentReg::real_mode(0);
+        m.service_int13_hd();
+        assert!(cf(&m.cpu));
+        assert_eq!(m.cpu.ah(), INT13_STATUS_INVALID);
+
+        write_dap(&mut m, 0x5700, 0, 1, 0xFFFF, 0xFFFF);
+        m.cpu.set_ah(INT13_AH_EXT_READ);
+        m.cpu.set_gpr_u8_low(CpuState::RDX, INT13_DRIVE_HD0);
+        m.cpu.set_gpr_u16(CpuState::RSI, 0x5700);
         m.cpu.ds = x86_core::SegmentReg::real_mode(0);
         m.service_int13_hd();
         assert!(cf(&m.cpu));
