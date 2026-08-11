@@ -1322,6 +1322,8 @@ Exit criteria:
 
 Estimated effort: 3 to 5 months
 
+Status (2026-08-11, round-14 boot-guest lane `slice/r14-boot-guest` on base `9934398`): **in progress -- R14 boot-guest lane.** POST-with-media measure vs `F000:9842`; host MBR→VBR `load_active_vbr_to_7c00`; FreeDOS measure v7 VBR-chain next-gap (`ExecutedVbrMissingCommand`); Linux/El Torito media classify+measure deepen. See `docs/boot-r14-*.md`. **Not** FreeDOS prompt / Linux shell; host INT 13h still not SeaBIOS.
+
 Status (2026-08-11, round-14 platform-kbd lane `slice/r14-platform-kbd` on base `9934398`): **in progress -- R14 platform-kbd lane.** Host INT 16h AH=02h shift flags from BDA `40:17`; AH=12h extended shift (Table 00588 synth from `40:18`+`40:96`); BDA equipment/keyboard flag seed for FreeDOS (bit0=floppy honesty, bit2=keyboard); 8042/IRQ1 modifier→BDA flags + ring-full drain + LED mirror. See `docs/kbd-r14-int16-shift-status.md`, `docs/kbd-r14-int16-ext-shift.md`, `docs/platform-r14-bda-equipment-kbd.md`, `docs/kbd-r14-8042-irq1-polish.md`. **Not** guest INT 09h/16h body; no buffer-full beep; no full AT keyboard; no mouse.
 
 Status (2026-08-11, round-14 usb-timer lane `slice/r14-usb-timer` on base `9934398`): **in progress -- R14 usb-timer lane.** UHCI→PIRQD→classic ISA IRQ11 PIC wire; IOC/USBSTS path raises wired IRQ; LAPIC SVR Focus presence + EOI-suppress drop (no CPUID.APIC); HPET LEG_RT_CAP/CNF clear so IRQ0/IRQ8 stay PIT/CMOS (MSI still out). See `docs/usb-r14-*.md`, `docs/apic-r14-lapic-svr.md`, `docs/timer-r14-hpet-legacy.md`.
